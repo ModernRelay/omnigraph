@@ -1891,13 +1891,7 @@ mod tests {
         let token = first.candidate_token().unwrap();
         let (authority, mut metadata) = present_authority(&first, token, ATTEMPT_X, 0);
         assert!(
-            classify_admission(
-                STREAM_INCARNATION,
-                &first,
-                None,
-                Some(&metadata),
-            )
-            .is_err(),
+            classify_admission(STREAM_INCARNATION, &first, None, Some(&metadata),).is_err(),
             "a base attribution without selected token authority must not reset to an empty chain"
         );
         assert!(
@@ -1945,13 +1939,7 @@ mod tests {
         let successor = request(WRITE_Y, Some(token), "actor:alice", payload(2));
 
         assert!(
-            classify_admission(
-                STREAM_INCARNATION,
-                &successor,
-                Some(&authority),
-                None,
-            )
-            .is_err()
+            classify_admission(STREAM_INCARNATION, &successor, Some(&authority), None,).is_err()
         );
         metadata.stream_token = successor.candidate_token().unwrap();
         assert!(

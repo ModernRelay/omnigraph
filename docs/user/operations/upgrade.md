@@ -17,7 +17,7 @@ message that **names the release line that wrote it** and the exact commands —
 so you can fetch the right old binary without guessing:
 
 ```
-__manifest is stamped at internal schema v4, but this omnigraph reads only v11.
+__manifest is stamped at internal schema v4, but this omnigraph reads only v12.
 This graph was created by omnigraph 0.8.x. Rebuild it: with an omnigraph
 0.8.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
 binary run `omnigraph init --schema <schema.pg> <new-graph>` and `omnigraph load
@@ -39,15 +39,16 @@ from that line (the latest is safest):
 | internal schema v5–v8 | no published release (see below) | a source build at the matching commit |
 | internal schema v9 | omnigraph 0.9.x | the latest 0.9.x |
 | internal schema v10 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v11 | unreleased (current 0.10.0-dev source builds) | — current format; no rebuild needed |
+| internal schema v11 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
+| internal schema v12 | unreleased (current 0.10.0-dev source builds) | — current format; no rebuild needed |
 
 **Stamps v5–v8 never shipped.** The storage format advanced five times inside
 the single 0.8.1 → 0.9.0 development window, so the only graphs carrying those
 stamps came from source builds off `main`; no published binary reads them and
 the refusal message names them `0.9.0-dev`. If you have one, export it with a
 build of the commit that created it, then load into a fresh current-format
-graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10 and
-v11 are written by 0.10.0-dev source builds until the 0.10.0 release ships.
+graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10–v12 are
+written by 0.10.0-dev source builds until the 0.10.0 release ships.
 
 You can also check versions before you hit a refusal:
 
@@ -117,6 +118,28 @@ complete. Do not use force-init to turn the old root into the new format.
   `append`/`merge` writes copy external payloads instead, as described below.
 - **Server deployments**: take the graph out of the serving set, rebuild it offline
   with the CLI, then point the cluster at the rebuilt graph (`cluster apply`).
+
+## Migrating from internal schema v11 to v12
+
+Internal schema v12 replaces lifecycle state-v2's inline receipt history with
+lifecycle-v3 fixed-size ledger-chain/current pointers and an authenticated
+WAL-tail commitment. Recovery-v14 owns the hidden enrollment, writer-claim,
+ordinary/drain-fold, and terminal lifecycle-receipt participants. This change
+is deliberately not an in-place reinterpretation of v11 state.
+
+Before exporting, use the final v11 source build that created the graph:
+
+1. Gracefully stop every writer-capable process for the graph.
+2. Explicitly disable the streaming profile.
+3. Verify that the graph is clean, disabled, and unenrolled. Ordinary export
+   does not encode lifecycle, WAL, claim, token-sequencing, or receipt
+   authority; do not treat it as an authority migration.
+4. Export the visible logical graph.
+
+Then use the v12 binary to initialize a **different** root, load the export,
+apply cluster configuration, and restart serving. Verify row/vector/blob
+fidelity and the v12 stamp before cutover. Keep the v11 root unchanged through
+the rollback window. A v12 binary refuses v11, and a v11 binary refuses v12.
 
 ## Migrating from internal schema v10 to v11
 

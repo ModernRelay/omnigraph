@@ -86,8 +86,7 @@ a v9 binary refuse a streaming-capable graph instead of writing blind to the
 freeze. A v9 graph crosses by export/init/load rebuild. The genuine v9↔v10
 fence remains historical upgrade evidence.
 
-Internal schema **v11 is the currently served format** (unreleased — current
-0.10.0-dev source builds until the 0.10.0 release). It replaces the v10
+Internal schema v11 replaced the v10
 boolean payload with stream-profile protocol v2: a bounded receipt-chain
 reference plus strict `DISABLED`, delegated `ENABLED`, planned `DISABLING`, and
 receipt/cut-bound `RETIRED` states. `DISABLING` carries a drain-only fold
@@ -101,25 +100,36 @@ authority minted for the cluster-booted server; embedded SDK and direct
 BranchMerge is refused while the profile is `ENABLED` or `DISABLING` even
 through that runtime because no token-aware merge transition exists.
 
-V11 raises the recovery-sidecar ceiling from v12 to v13 for that bounded
+V11 raised the recovery-sidecar ceiling from v12 to v13 for that bounded
 profile-authority tranche. `StreamProfileChange` is the only emitted and
 accepted v13 discriminator. It owns the exact token-ledger
 `ProfileManagementReceipt` transaction; only the terminal manifest CAS that
 selects its achieved token witness and the next profile together makes either
-authoritative. Unknown or later lifecycle variants fail closed. Recovery-v10
-enrollment and recovery-v12 ordinary private fold payloads keep their exact
-meanings, and v13 is not another fold envelope. Checked offline apply can
-complete disable when no lifecycle rows exist or every existing lane is
-already `SEALED`; a non-`SEALED` lane and all `RETIRED` state remain
-fail-closed. There is no public firehose ingress,
-production enrollment, drain, claim, lifecycle-correction, or streaming
-transport surface in this format. Activating the remaining lifecycle families
-requires another strict graph/recovery strand rather than assigning new
-meaning to v11/v13.
+authoritative.
 
-A v10 graph crosses by export/init/load rebuild into a different root. Because
-`MIN_SUPPORTED == CURRENT == 11`, v11 refuses v10 and a v10 binary refuses
-v11.
+Internal schema **v12 is the currently served format** (unreleased — current
+0.10.0-dev source builds until the 0.10.0 release). It replaces lifecycle
+state-v2's inline receipt histories with lifecycle-v3 fixed-size
+ledger-chain/current pointers and an authenticated WAL-tail commitment. The
+recovery-sidecar ceiling is v14. Its active hidden discriminators are
+`StreamEnrollmentV2`, `StreamClaim`, `StreamFoldV2`, `StreamDrainFold`, and
+`StreamLifecycleReceipt`; resume/correction/retirement/ledger-maintenance/
+sealed-maintenance/rebind vocabulary decodes fail-closed. Cold writer claims
+are recovery-covered before Lance is invoked. Ordinary and drain folds bind
+the selected current claim and exact authenticated full-generation projection.
+The restartable private quiesce path handles never-written and non-empty lanes
+through `OPEN → DRAINING → SEALED`.
+
+Recovery-v13 remains exactly the v11 profile-change protocol. Historical
+recovery-v10 enrollment and recovery-v12 lifecycle-v2 folds retain their old
+wire meanings and are refused under lifecycle-v3 rather than synthesized.
+There is still no public firehose ingress, public production enrollment or
+quiesce verb, resume/abort, correction/retirement, maintenance bridge, or
+streaming transport surface.
+
+A v11 graph crosses by export/init/load rebuild into a different root. Because
+`MIN_SUPPORTED == CURRENT == 12`, v12 refuses v11 and a v11 binary refuses
+v12.
 
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,

@@ -753,7 +753,7 @@ jobs:
       - test
       - firehose_pr_smoke
       - firehose_dependency_rebuild
-      - v10_v11_format_fence
+      - v11_v12_format_fence
       - test_aws_feature
       - rustfs_integration
     if: >-
@@ -765,7 +765,7 @@ jobs:
       needs.test.result == 'success' &&
       needs.firehose_pr_smoke.result == 'success' &&
       needs.firehose_dependency_rebuild.result == 'success' &&
-      needs.v10_v11_format_fence.result == 'success' &&
+      needs.v11_v12_format_fence.result == 'success' &&
       needs.test_aws_feature.result == 'success' &&
       needs.rustfs_integration.result == 'success'
     concurrency:
@@ -839,8 +839,8 @@ jobs:
           compression-level: 0
           retention-days: 90
 
-  v10_v11_format_fence:
-    name: V10 ↔ V11 Format Fence
+  v11_v12_format_fence:
+    name: V11 ↔ V12 Format Fence
     needs: classify_changes
     if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
@@ -873,29 +873,29 @@ jobs:
         with:
           workspaces: |
             . -> target
-          key: crossversion-v10-v11
+          key: crossversion-v11-v12
 
       # CI pins only the immediate predecessor. Older seams remain env-gated
       # and on-demand, per docs/dev/testing.md.
-      - name: Build genuine final-v10 CLI
+      - name: Build genuine final-v11 CLI
         env:
-          # Last v10-writing main commit before protocol-v2 profile authority
-          # activates v11. Keep this immutable: HEAD^ stops being v10 after
-          # the first v11 merge.
-          FINAL_INTERNAL_V10_COMMIT: 9cf0a84ef2806f1ae38bc19707c0f35a65525866
+          # Last v11-writing main commit before lifecycle-v3 ledger-chain
+          # authority activates v12. Keep this immutable: HEAD^ stops being
+          # v11 after the first v12 merge.
+          FINAL_INTERNAL_V11_COMMIT: 5589529cd784759c33cb34bdadd10b912955d4bd
         run: |
           set -euo pipefail
-          v10_source="$RUNNER_TEMP/omnigraph-final-v10"
-          v10_bin="$RUNNER_TEMP/omnigraph-final-v10-bin"
-          git fetch --no-tags --depth=1 origin "$FINAL_INTERNAL_V10_COMMIT"
-          git worktree add --detach "$v10_source" "$FINAL_INTERNAL_V10_COMMIT"
+          v11_source="$RUNNER_TEMP/omnigraph-final-v11"
+          v11_bin="$RUNNER_TEMP/omnigraph-final-v11-bin"
+          git fetch --no-tags --depth=1 origin "$FINAL_INTERNAL_V11_COMMIT"
+          git worktree add --detach "$v11_source" "$FINAL_INTERNAL_V11_COMMIT"
           cargo build --locked \
-            --manifest-path "$v10_source/Cargo.toml" \
+            --manifest-path "$v11_source/Cargo.toml" \
             --package omnigraph-cli \
             --bin omnigraph \
             --target-dir "$GITHUB_WORKSPACE/target"
-          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v10_bin"
-          test -x "$v10_bin"
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v11_bin"
+          test -x "$v11_bin"
           cargo clean --target-dir "$GITHUB_WORKSPACE/target" \
             --package omnigraph-compiler \
             --package omnigraph-policy \
@@ -904,23 +904,23 @@ jobs:
             --package omnigraph-cluster \
             --package omnigraph-server \
             --package omnigraph-cli
-          echo "OMNIGRAPH_V10_BIN=$v10_bin" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_V11_BIN=$v11_bin" >> "$GITHUB_ENV"
 
-      - name: Run exact v10↔v11 refusal and rebuild fence
+      - name: Run exact v11↔v12 refusal and rebuild fence
         run: |
           set -euo pipefail
-          test_log="$RUNNER_TEMP/v10-v11-format-fence.log"
+          test_log="$RUNNER_TEMP/v11-v12-format-fence.log"
           cargo test --locked -p omnigraph-cli --test crossversion_upgrade \
-            current_v11_refuses_and_rebuilds_genuine_v10_and_v10_refuses_v11 \
+            current_v12_refuses_and_rebuilds_genuine_v11_and_v11_refuses_v12 \
             -- --exact --nocapture 2>&1 | tee "$test_log"
-          if grep -Fq "skipping immediate-predecessor v10 upgrade test" "$test_log"; then
-            echo "::error::v10↔v11 format fence skipped despite a configured predecessor binary"
+          if grep -Fq "skipping immediate-predecessor v11 upgrade test" "$test_log"; then
+            echo "::error::v11↔v12 format fence skipped despite a configured predecessor binary"
             exit 1
           fi
-          grep -Eq "test current_v11_refuses_and_rebuilds_genuine_v10_and_v10_refuses_v11 \.\.\. ok" "$test_log" \
-            || { echo "::error::exact v10↔v11 format fence did not execute normally"; exit 1; }
+          grep -Eq "test current_v12_refuses_and_rebuilds_genuine_v11_and_v11_refuses_v12 \.\.\. ok" "$test_log" \
+            || { echo "::error::exact v11↔v12 format fence did not execute normally"; exit 1; }
           grep -Eq "test result: ok\. 1 passed; 0 failed" "$test_log" \
-            || { echo "::error::v10↔v11 format fence matched the wrong test set"; exit 1; }
+            || { echo "::error::v11↔v12 format fence matched the wrong test set"; exit 1; }
 
   test_aws_feature:
     name: Test omnigraph-server --features aws

@@ -1220,19 +1220,36 @@ rules:
             transaction_uuid: "33333333-3333-4333-8333-333333333333".to_string(),
             manifest_e_tag: None,
         };
+        let enrollment_receipt = crate::db::manifest::stream::EnrollmentReceipt::new(
+            "44444444-4444-4444-8444-444444444444".to_string(),
+            format!("sha256:{}", "d".repeat(64)),
+            "55555555-5555-4555-8555-555555555555".to_string(),
+            binding.clone(),
+        )
+        .unwrap();
+        let binding_scope_id = "77777777-7777-4777-8777-777777777777";
+        let binding_receipt = crate::db::manifest::stream::BindingReceipt::new(
+            crate::db::manifest::stream::stream_graph_identity_digest("stream-profile-test-domain")
+                .unwrap(),
+            table.identity,
+            &crate::db::manifest::stream::binding_receipt_chain_genesis(),
+            binding_scope_id,
+            enrollment_receipt.stream_incarnation_id.clone(),
+            binding.clone(),
+            "INITIAL_ENROLLMENT",
+            1,
+        )
+        .unwrap();
         let lifecycle = StreamLifecycleEntry::new_open_enrollment(
             table.identity,
             table.table_key.clone(),
-            binding.clone(),
+            binding,
+            binding_scope_id.to_string(),
             head,
             BTreeMap::from([(shard_id, 1)]),
-            crate::db::manifest::stream::EnrollmentReceipt::new(
-                "44444444-4444-4444-8444-444444444444".to_string(),
-                format!("sha256:{}", "d".repeat(64)),
-                "55555555-5555-4555-8555-555555555555".to_string(),
-                binding,
-            )
-            .unwrap(),
+            enrollment_receipt,
+            binding_receipt.record_id.clone(),
+            binding_receipt.next_chain_ref().unwrap(),
         )
         .unwrap();
         coordinator

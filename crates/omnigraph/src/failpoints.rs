@@ -260,6 +260,10 @@ pub mod names {
     /// Recovery may reconstruct the exact/exact confirmation and roll forward.
     pub const STREAM_FOLD_POST_TOKEN_COMMIT_PRE_CONFIRM: &str =
         "stream_fold.post_token_commit_pre_confirm";
+    /// Lifecycle receipt intent is durable, but its immutable token-ledger
+    /// transaction has not been invoked.
+    pub const STREAM_LIFECYCLE_RECEIPT_POST_SIDECAR_PRE_TOKEN_COMMIT: &str =
+        "stream_lifecycle_receipt.post_sidecar_pre_token_commit";
     /// Reload owns the schema gate and is about to read/publish one contract view.
     pub const SCHEMA_RELOAD_BEFORE_CONTRACT_READ: &str = "schema_reload.before_contract_read";
     /// Injects a retryable `RowLevelCasContention` from `load_publish_state` so a

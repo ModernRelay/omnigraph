@@ -81,10 +81,15 @@ use crate::error::{OmniError, Result};
 ///   discriminated `DISABLED | ENABLED | DISABLING | RETIRED` authority and
 ///   upgrades `_stream_tokens.lance` to the tagged current-token/control-ledger
 ///   schema. Profile changes use recovery-v13 and immutable management receipts.
+/// - v12 — RFC-026 F2 lifecycle tranche replaces inline lane receipt vectors
+///   with lifecycle-v3 bounded ledger-chain/current pointers and authenticated
+///   incremental WAL-tail authority. Claim/drain effects use recovery-v14;
+///   historical recovery-v10 enrollment and recovery-v12 ordinary fold retain
+///   their exact lifecycle-v2 wire types and are never reinterpreted.
 ///
-/// v1–v10 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
+/// v1–v11 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
 /// is kept for provenance and to document what each stamp value meant.
-pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 11;
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 12;
 
 /// The oldest on-disk internal-schema stamp this binary will open. With no
 /// in-place migration, this equals `INTERNAL_MANIFEST_SCHEMA_VERSION`: a graph
@@ -103,7 +108,8 @@ pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_
 /// stamped each version (verify with
 /// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
 /// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5–v8 unreleased,
-/// v9 0.9.x, v10–v11 unreleased (0.10.0-dev pending the 0.10.0 release).
+/// v9 0.9.x, v10–v12 unreleased. V10 and v11 are source-only predecessors;
+/// only v12 is the 0.10.0 release candidate.
 ///
 /// v5 through v8 never reached a published release: the format advanced five
 /// times (RFC-028 identity, RFC-023 key fencing, and the three RFC-026 stream
@@ -111,9 +117,11 @@ pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_
 /// graphs carrying those stamps came from source builds off `main`. An earlier
 /// revision of this table optimistically assigned each of them its own release
 /// line (0.9.x–0.12.x); those releases do not exist and naming them here would
-/// send an operator hunting for a binary that was never published. V10 follows
-/// the corrected two-step: it is written only by 0.10.0-dev source builds until
-/// the 0.10.0 release-prep commit flips its entry to the published line.
+/// send an operator hunting for a binary that was never published. V10 and v11
+/// remain 0.10.0-dev permanently because each was superseded before release.
+/// V12 follows the corrected two-step: it is written only by 0.10.0-dev source
+/// builds until the 0.10.0 release-prep commit flips only its entry to the
+/// published line.
 pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
     match stamp {
         1 => "0.3.1 or earlier",
@@ -128,11 +136,12 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         // The published line whose binaries serve v9 — the string the gated
         // v9↔v10 crossversion fence asserts inside the v10 refusal message.
         9 => "0.9.x",
-        // Unreachable in refusals while CURRENT == 11 (the sub-floor path
-        // consults 1–10 only; the ceiling path never consults the map). It
-        // exists for the table's honesty and the next bump; release-prep for
-        // 0.10.0 flips it to "0.10.x".
-        10..=11 => "0.10.0-dev",
+        // Unreachable in refusals while CURRENT == 12 (the sub-floor path
+        // consults 1–11 only; the ceiling path never consults the map). It
+        // exists for the table's honesty and the next bump. Release-prep for
+        // 0.10.0 MUST split this arm and flip only stamp 12 to "0.10.x";
+        // stamps 10 and 11 remain source-only "0.10.0-dev" formats.
+        10..=12 => "0.10.0-dev",
         // Worded to read naturally after "created by omnigraph " if a future
         // bump ever leaves a gap.
         _ => "an unrecognized older release",
@@ -212,12 +221,12 @@ mod tests {
     use super::*;
 
     /// The guard accepts exactly the single served version and refuses anything
-    /// below the floor or above the ceiling. With `MIN == CURRENT == 11` the
-    /// live range is exactly `[11, 11]`.
+    /// below the floor or above the ceiling. With `MIN == CURRENT == 12` the
+    /// live range is exactly `[12, 12]`.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
-        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 11);
-        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 11);
+        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 12);
+        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 12);
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
             assert!(
                 refuse_if_stamp_unsupported(stamp).is_ok(),
@@ -251,6 +260,7 @@ mod tests {
         assert_eq!(release_for_internal_schema_version(9), "0.9.x");
         assert_eq!(release_for_internal_schema_version(10), "0.10.0-dev");
         assert_eq!(release_for_internal_schema_version(11), "0.10.0-dev");
+        assert_eq!(release_for_internal_schema_version(12), "0.10.0-dev");
         assert_eq!(
             release_for_internal_schema_version(99),
             "an unrecognized older release"
@@ -298,5 +308,19 @@ mod tests {
             "got: {v10_err}"
         );
         assert!(v10_err.contains("omnigraph export"), "got: {v10_err}");
+
+        // The v11 refusal strings are asserted by the genuine-binary v11↔v12
+        // seam (`OMNIGRAPH_V11_BIN`). Pin them locally so release-prep cannot
+        // accidentally relabel the source-only v11 stamp while updating v12.
+        let v11_err = refuse_if_stamp_unsupported(11).unwrap_err().to_string();
+        assert!(
+            v11_err.contains("created by omnigraph 0.10.0-dev"),
+            "got: {v11_err}"
+        );
+        assert!(
+            v11_err.contains("with an omnigraph 0.10.0-dev binary"),
+            "got: {v11_err}"
+        );
+        assert!(v11_err.contains("omnigraph export"), "got: {v11_err}");
     }
 }

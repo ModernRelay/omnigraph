@@ -30,6 +30,11 @@ use sha2::{Digest, Sha256};
 use crate::error::{OmniError, Result};
 
 use super::layout::{stream_token_authority_object_id, stream_token_uri};
+use super::stream::{
+    BINDING_RECEIPT_TAG, BindingReceipt, CLAIM_ATTEMPT_EFFECT_TAG, CLAIM_RECEIPT_TAG,
+    ClaimAttemptEffect, ClaimReceipt, ENROLLMENT_RECEIPT_V2_TAG, EnrollmentReceiptV2,
+    MANAGEMENT_RECEIPT_TAG, ManagementReceipt,
+};
 use super::stream_profile::{PROFILE_MANAGEMENT_RECEIPT_TAG, ProfileManagementReceipt};
 use super::stream_token::{
     PayloadDigest, StreamRowOrigin, StreamTerminalCorrection, StreamToken, StreamTokenAuthorityRow,
@@ -41,6 +46,147 @@ pub(crate) const STREAM_TOKEN_DATASET_PATH: &str = "_stream_tokens.lance";
 pub(crate) const STREAM_TOKEN_AUTHORITY_SCHEMA_VERSION: u32 = 2;
 const STREAM_TOKEN_AUTHORITY_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const CURRENT_TOKEN_RECORD_TAG: &str = "CURRENT_TOKEN_V1";
+const MAX_LIFECYCLE_LEDGER_RECORDS_PER_TRANSACTION: usize = 8;
+const MAX_LIFECYCLE_LEDGER_RECORD_JSON_BYTES: usize = 16 * 1024;
+const MAX_LIFECYCLE_LEDGER_TRANSACTION_JSON_BYTES: usize =
+    MAX_LIFECYCLE_LEDGER_RECORDS_PER_TRANSACTION * MAX_LIFECYCLE_LEDGER_RECORD_JSON_BYTES;
+const MAX_LIFECYCLE_LEDGER_TRANSACTION_ARROW_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LifecycleLedgerEnvelope {
+    record_id: String,
+    record_tag: String,
+    record_lookup_key: String,
+    record_payload_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LifecycleLedgerRecord {
+    EnrollmentReceiptV2(EnrollmentReceiptV2),
+    BindingReceipt(BindingReceipt),
+    ManagementReceipt(ManagementReceipt),
+    ClaimAttemptEffect(ClaimAttemptEffect),
+    ClaimReceipt(ClaimReceipt),
+}
+
+impl LifecycleLedgerRecord {
+    fn record_id(&self) -> &str {
+        match self {
+            Self::EnrollmentReceiptV2(value) => &value.record_id,
+            Self::BindingReceipt(value) => &value.record_id,
+            Self::ManagementReceipt(value) => &value.record_id,
+            Self::ClaimAttemptEffect(value) => &value.record_id,
+            Self::ClaimReceipt(value) => &value.record_id,
+        }
+    }
+
+    fn record_tag(&self) -> &'static str {
+        match self {
+            Self::EnrollmentReceiptV2(_) => ENROLLMENT_RECEIPT_V2_TAG,
+            Self::BindingReceipt(_) => BINDING_RECEIPT_TAG,
+            Self::ManagementReceipt(_) => MANAGEMENT_RECEIPT_TAG,
+            Self::ClaimAttemptEffect(_) => CLAIM_ATTEMPT_EFFECT_TAG,
+            Self::ClaimReceipt(_) => CLAIM_RECEIPT_TAG,
+        }
+    }
+
+    fn record_lookup_key(&self) -> &str {
+        match self {
+            Self::EnrollmentReceiptV2(value) => &value.record_lookup_key,
+            Self::BindingReceipt(value) => &value.record_lookup_key,
+            Self::ManagementReceipt(value) => &value.record_lookup_key,
+            Self::ClaimAttemptEffect(value) => &value.record_lookup_key,
+            Self::ClaimReceipt(value) => &value.record_lookup_key,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::EnrollmentReceiptV2(value) => value.validate(),
+            Self::BindingReceipt(value) => value.validate(),
+            Self::ManagementReceipt(value) => value.validate(value.to_revision),
+            Self::ClaimAttemptEffect(value) => value.validate(),
+            Self::ClaimReceipt(value) => value.validate(),
+        }
+    }
+
+    fn to_envelope(&self) -> Result<LifecycleLedgerEnvelope> {
+        self.validate()?;
+        let record_payload_json = match self {
+            Self::EnrollmentReceiptV2(value) => serde_json::to_string(value),
+            Self::BindingReceipt(value) => serde_json::to_string(value),
+            Self::ManagementReceipt(value) => serde_json::to_string(value),
+            Self::ClaimAttemptEffect(value) => serde_json::to_string(value),
+            Self::ClaimReceipt(value) => serde_json::to_string(value),
+        }
+        .map_err(|error| {
+            OmniError::manifest_internal(format!(
+                "failed to encode lifecycle ledger record: {error}"
+            ))
+        })?;
+        Ok(LifecycleLedgerEnvelope {
+            record_id: self.record_id().to_string(),
+            record_tag: self.record_tag().to_string(),
+            record_lookup_key: self.record_lookup_key().to_string(),
+            record_payload_json,
+        })
+    }
+
+    fn from_envelope(envelope: LifecycleLedgerEnvelope) -> Result<Self> {
+        let record = match envelope.record_tag.as_str() {
+            ENROLLMENT_RECEIPT_V2_TAG => Self::EnrollmentReceiptV2(
+                serde_json::from_str(&envelope.record_payload_json).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to decode lifecycle enrollment receipt: {error}"
+                    ))
+                })?,
+            ),
+            BINDING_RECEIPT_TAG => Self::BindingReceipt(
+                serde_json::from_str(&envelope.record_payload_json).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to decode lifecycle binding receipt: {error}"
+                    ))
+                })?,
+            ),
+            MANAGEMENT_RECEIPT_TAG => Self::ManagementReceipt(
+                serde_json::from_str(&envelope.record_payload_json).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to decode lifecycle management receipt: {error}"
+                    ))
+                })?,
+            ),
+            CLAIM_ATTEMPT_EFFECT_TAG => Self::ClaimAttemptEffect(
+                serde_json::from_str(&envelope.record_payload_json).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to decode lifecycle claim-attempt effect: {error}"
+                    ))
+                })?,
+            ),
+            CLAIM_RECEIPT_TAG => Self::ClaimReceipt(
+                serde_json::from_str(&envelope.record_payload_json).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to decode lifecycle claim receipt: {error}"
+                    ))
+                })?,
+            ),
+            other => {
+                return Err(OmniError::manifest_internal(format!(
+                    "lifecycle ledger decoder received unsupported trusted record tag '{other}'"
+                )));
+            }
+        };
+        record.validate()?;
+        if envelope.record_id != record.record_id()
+            || envelope.record_tag != record.record_tag()
+            || envelope.record_lookup_key != record.record_lookup_key()
+        {
+            return Err(OmniError::manifest_internal(
+                "lifecycle ledger physical envelope differs from its canonical payload",
+            ));
+        }
+        Ok(record)
+    }
+}
 
 /// Canonical schema descriptor hashed into the manifest authority row.
 ///
@@ -778,6 +924,634 @@ pub(crate) async fn stream_token_rows_for_keys(
     Ok(selected)
 }
 
+pub(crate) fn lifecycle_ledger_records_to_batch(
+    records: &[LifecycleLedgerRecord],
+) -> Result<RecordBatch> {
+    let envelopes = records
+        .iter()
+        .map(LifecycleLedgerRecord::to_envelope)
+        .collect::<Result<Vec<_>>>()?;
+    lifecycle_ledger_envelopes_to_batch(&envelopes)
+}
+
+pub(crate) fn lifecycle_ledger_records_from_batch(
+    batch: &RecordBatch,
+) -> Result<Vec<LifecycleLedgerRecord>> {
+    lifecycle_ledger_envelopes_from_batch(batch, None)?
+        .into_iter()
+        .map(LifecycleLedgerRecord::from_envelope)
+        .collect()
+}
+
+fn lifecycle_ledger_envelopes_to_batch(rows: &[LifecycleLedgerEnvelope]) -> Result<RecordBatch> {
+    if rows.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "lifecycle ledger staging requires at least one immutable record",
+        ));
+    }
+    if rows.len() > MAX_LIFECYCLE_LEDGER_RECORDS_PER_TRANSACTION {
+        return Err(OmniError::resource_limit(
+            "stream_lifecycle_ledger_transaction_rows",
+            MAX_LIFECYCLE_LEDGER_RECORDS_PER_TRANSACTION as u64,
+            u64::try_from(rows.len()).unwrap_or(u64::MAX),
+        ));
+    }
+
+    let mut seen_ids = std::collections::HashSet::with_capacity(rows.len());
+    let mut seen_lookup_keys = std::collections::HashSet::with_capacity(rows.len());
+    let mut total_json_bytes = 0_usize;
+    for row in rows {
+        for (name, value) in [
+            ("record_id", row.record_id.as_str()),
+            ("record_tag", row.record_tag.as_str()),
+            ("record_lookup_key", row.record_lookup_key.as_str()),
+        ] {
+            if value.is_empty() || value.trim() != value {
+                return Err(OmniError::manifest_internal(format!(
+                    "lifecycle ledger {name} must be non-empty canonical text"
+                )));
+            }
+        }
+        if !seen_ids.insert(row.record_id.as_str()) {
+            return Err(OmniError::manifest_internal(
+                "lifecycle ledger transaction contains a duplicate immutable record id",
+            ));
+        }
+        if !seen_lookup_keys.insert(row.record_lookup_key.as_str()) {
+            return Err(OmniError::manifest_internal(
+                "lifecycle ledger transaction contains a duplicate record lookup key",
+            ));
+        }
+        let payload_bytes = row.record_payload_json.len();
+        if payload_bytes > MAX_LIFECYCLE_LEDGER_RECORD_JSON_BYTES {
+            return Err(OmniError::resource_limit(
+                "stream_lifecycle_ledger_record_json_bytes",
+                MAX_LIFECYCLE_LEDGER_RECORD_JSON_BYTES as u64,
+                u64::try_from(payload_bytes).unwrap_or(u64::MAX),
+            ));
+        }
+        total_json_bytes = total_json_bytes.checked_add(payload_bytes).ok_or_else(|| {
+            OmniError::manifest_internal(
+                "lifecycle ledger transaction JSON-byte accounting overflow",
+            )
+        })?;
+        if total_json_bytes > MAX_LIFECYCLE_LEDGER_TRANSACTION_JSON_BYTES {
+            return Err(OmniError::resource_limit(
+                "stream_lifecycle_ledger_transaction_json_bytes",
+                MAX_LIFECYCLE_LEDGER_TRANSACTION_JSON_BYTES as u64,
+                u64::try_from(total_json_bytes).unwrap_or(u64::MAX),
+            ));
+        }
+    }
+
+    let ids = rows
+        .iter()
+        .map(|row| row.record_id.as_str())
+        .collect::<Vec<_>>();
+    let tags = rows
+        .iter()
+        .map(|row| row.record_tag.as_str())
+        .collect::<Vec<_>>();
+    let lookup_keys = rows
+        .iter()
+        .map(|row| row.record_lookup_key.as_str())
+        .collect::<Vec<_>>();
+    let payloads = rows
+        .iter()
+        .map(|row| row.record_payload_json.as_str())
+        .collect::<Vec<_>>();
+    let null_string =
+        || Arc::new(StringArray::from(vec![None::<String>; rows.len()])) as Arc<dyn Array>;
+    let batch = RecordBatch::try_new(
+        stream_token_schema(),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(StringArray::from(tags)),
+            Arc::new(StringArray::from(lookup_keys)),
+            Arc::new(UInt64Array::from(vec![None::<u64>; rows.len()])),
+            Arc::new(UInt64Array::from(vec![None::<u64>; rows.len()])),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            Arc::new(UInt64Array::from(vec![None::<u64>; rows.len()])),
+            null_string(),
+            Arc::new(UInt32Array::from(vec![None::<u32>; rows.len()])),
+            null_string(),
+            null_string(),
+            Arc::new(StringArray::from(payloads)),
+        ],
+    )
+    .map_err(|error| {
+        OmniError::manifest_internal(format!("failed to build lifecycle ledger batch: {error}"))
+    })?;
+    let arrow_bytes = u64::try_from(batch.get_array_memory_size())
+        .map_err(|_| OmniError::manifest_internal("lifecycle ledger Arrow size exceeds u64"))?;
+    if arrow_bytes > MAX_LIFECYCLE_LEDGER_TRANSACTION_ARROW_BYTES {
+        return Err(OmniError::resource_limit(
+            "stream_lifecycle_ledger_transaction_arrow_bytes",
+            MAX_LIFECYCLE_LEDGER_TRANSACTION_ARROW_BYTES,
+            arrow_bytes,
+        ));
+    }
+    Ok(batch)
+}
+
+fn lifecycle_ledger_envelopes_from_batch(
+    batch: &RecordBatch,
+    expected_tag: Option<&str>,
+) -> Result<Vec<LifecycleLedgerEnvelope>> {
+    if batch.schema().as_ref() != stream_token_schema().as_ref() {
+        return Err(OmniError::manifest_internal(
+            "lifecycle ledger scan returned a non-v2 physical schema",
+        ));
+    }
+    if batch.num_rows() > MAX_LIFECYCLE_LEDGER_RECORDS_PER_TRANSACTION {
+        return Err(OmniError::resource_limit(
+            "stream_lifecycle_ledger_transaction_rows",
+            MAX_LIFECYCLE_LEDGER_RECORDS_PER_TRANSACTION as u64,
+            u64::try_from(batch.num_rows()).unwrap_or(u64::MAX),
+        ));
+    }
+    let arrow_bytes = u64::try_from(batch.get_array_memory_size())
+        .map_err(|_| OmniError::manifest_internal("lifecycle ledger Arrow size exceeds u64"))?;
+    if arrow_bytes > MAX_LIFECYCLE_LEDGER_TRANSACTION_ARROW_BYTES {
+        return Err(OmniError::resource_limit(
+            "stream_lifecycle_ledger_transaction_arrow_bytes",
+            MAX_LIFECYCLE_LEDGER_TRANSACTION_ARROW_BYTES,
+            arrow_bytes,
+        ));
+    }
+
+    let ids = required_string_array(batch, "id")?;
+    let tags = required_string_array(batch, "record_tag")?;
+    let lookup_keys = required_string_array(batch, "record_lookup_key")?;
+    let payloads = required_string_array(batch, "record_payload_json")?;
+    let control_null_columns = [
+        "stable_table_id",
+        "table_incarnation_id",
+        "logical_id",
+        "origin_enrollment_id",
+        "stream_incarnation_id",
+        "current_token",
+        "write_id",
+        "predecessor_token",
+        "disposition",
+        "contributor_id",
+        "payload_digest",
+        "origin_kind",
+        "origin_id",
+        "origin_ordinal",
+        "fold_base_token",
+        "chain_depth",
+        "terminal_correction_actor",
+        "terminal_correction_operation_id",
+    ];
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    let mut seen_ids = std::collections::HashSet::with_capacity(batch.num_rows());
+    let mut seen_lookup_keys = std::collections::HashSet::with_capacity(batch.num_rows());
+    let mut total_json_bytes = 0_usize;
+    for index in 0..batch.num_rows() {
+        require_non_null(ids, index, "id")?;
+        require_non_null(tags, index, "record_tag")?;
+        require_non_null(lookup_keys, index, "record_lookup_key")?;
+        require_non_null(payloads, index, "record_payload_json")?;
+        if expected_tag.is_some_and(|expected| tags.value(index) != expected) {
+            return Err(OmniError::manifest_internal(format!(
+                "lifecycle ledger decoder expected trusted record tag '{}' but received '{}'",
+                expected_tag.expect("checked above"),
+                tags.value(index)
+            )));
+        }
+        for name in control_null_columns {
+            let column = batch.column_by_name(name).ok_or_else(|| {
+                OmniError::manifest_internal(format!("lifecycle ledger batch is missing '{name}'"))
+            })?;
+            if !column.is_null(index) {
+                return Err(OmniError::manifest_internal(format!(
+                    "lifecycle ledger row has non-null current-token column '{name}'"
+                )));
+            }
+        }
+        let payload_bytes = payloads.value(index).len();
+        if payload_bytes > MAX_LIFECYCLE_LEDGER_RECORD_JSON_BYTES {
+            return Err(OmniError::resource_limit(
+                "stream_lifecycle_ledger_record_json_bytes",
+                MAX_LIFECYCLE_LEDGER_RECORD_JSON_BYTES as u64,
+                u64::try_from(payload_bytes).unwrap_or(u64::MAX),
+            ));
+        }
+        total_json_bytes = total_json_bytes.checked_add(payload_bytes).ok_or_else(|| {
+            OmniError::manifest_internal(
+                "lifecycle ledger transaction JSON-byte accounting overflow",
+            )
+        })?;
+        if total_json_bytes > MAX_LIFECYCLE_LEDGER_TRANSACTION_JSON_BYTES {
+            return Err(OmniError::resource_limit(
+                "stream_lifecycle_ledger_transaction_json_bytes",
+                MAX_LIFECYCLE_LEDGER_TRANSACTION_JSON_BYTES as u64,
+                u64::try_from(total_json_bytes).unwrap_or(u64::MAX),
+            ));
+        }
+        if !seen_ids.insert(ids.value(index)) {
+            return Err(OmniError::manifest_internal(
+                "lifecycle ledger batch contains a duplicate immutable record id",
+            ));
+        }
+        if !seen_lookup_keys.insert(lookup_keys.value(index)) {
+            return Err(OmniError::manifest_internal(
+                "lifecycle ledger batch contains a duplicate record lookup key",
+            ));
+        }
+        rows.push(LifecycleLedgerEnvelope {
+            record_id: ids.value(index).to_string(),
+            record_tag: tags.value(index).to_string(),
+            record_lookup_key: lookup_keys.value(index).to_string(),
+            record_payload_json: payloads.value(index).to_string(),
+        });
+    }
+    Ok(rows)
+}
+
+async fn lookup_lifecycle_ledger_envelope(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    expected_tag: &str,
+    record_lookup_key: &str,
+) -> Result<Option<LifecycleLedgerEnvelope>> {
+    validate_exact_dataset(dataset, authority).await?;
+    for (name, value) in [
+        ("record tag", expected_tag),
+        ("record lookup key", record_lookup_key),
+    ] {
+        if value.is_empty() || value.trim() != value {
+            return Err(OmniError::manifest_internal(format!(
+                "lifecycle ledger {name} must be non-empty canonical text"
+            )));
+        }
+    }
+    let mut scanner = dataset.scan();
+    scanner.filter_expr(
+        col("record_tag")
+            .eq(lit(expected_tag))
+            .and(col("record_lookup_key").eq(lit(record_lookup_key))),
+    );
+    scanner.batch_size(2);
+    scanner.batch_size_bytes(MAX_LIFECYCLE_LEDGER_TRANSACTION_ARROW_BYTES);
+    scanner
+        .limit(Some(2), None)
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let mut stream = scanner
+        .try_into_stream()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let mut selected = None;
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?
+    {
+        for row in lifecycle_ledger_envelopes_from_batch(&batch, Some(expected_tag))? {
+            if selected.replace(row).is_some() {
+                return Err(OmniError::manifest_internal(format!(
+                    "stream-token ledger contains duplicate {expected_tag} operation rows"
+                )));
+            }
+        }
+    }
+    if selected
+        .as_ref()
+        .is_some_and(|row| row.record_lookup_key != record_lookup_key)
+    {
+        return Err(OmniError::manifest_internal(
+            "lifecycle ledger exact lookup returned a row for another lookup key",
+        ));
+    }
+    Ok(selected)
+}
+
+pub(crate) async fn lookup_lifecycle_ledger_record(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    expected_tag: &str,
+    record_lookup_key: &str,
+) -> Result<Option<LifecycleLedgerRecord>> {
+    lookup_lifecycle_ledger_envelope(dataset, authority, expected_tag, record_lookup_key)
+        .await?
+        .map(LifecycleLedgerRecord::from_envelope)
+        .transpose()
+}
+
+/// Resolve one manifest-selected immutable ledger head by its exact record ID.
+///
+/// Lifecycle rows retain the selected record ID rather than the operation
+/// lookup key.  This probe is deliberately capped at two rows so a duplicate
+/// unenforced primary key is diagnosed instead of silently choosing one.
+pub(crate) async fn lookup_lifecycle_ledger_record_by_id(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    expected_tag: &str,
+    record_id: &str,
+) -> Result<Option<LifecycleLedgerRecord>> {
+    validate_exact_dataset(dataset, authority).await?;
+    for (name, value) in [("record tag", expected_tag), ("record id", record_id)] {
+        if value.is_empty() || value.trim() != value {
+            return Err(OmniError::manifest_internal(format!(
+                "lifecycle ledger {name} must be non-empty canonical text"
+            )));
+        }
+    }
+    let mut scanner = dataset.scan();
+    scanner.filter_expr(
+        col("record_tag")
+            .eq(lit(expected_tag))
+            .and(col("id").eq(lit(record_id))),
+    );
+    scanner.batch_size(2);
+    scanner.batch_size_bytes(MAX_LIFECYCLE_LEDGER_TRANSACTION_ARROW_BYTES);
+    scanner
+        .limit(Some(2), None)
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let mut stream = scanner
+        .try_into_stream()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let mut selected = None;
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?
+    {
+        for row in lifecycle_ledger_envelopes_from_batch(&batch, Some(expected_tag))? {
+            if selected.replace(row).is_some() {
+                return Err(OmniError::manifest_internal(format!(
+                    "stream-token ledger contains duplicate immutable record id '{record_id}'"
+                )));
+            }
+        }
+    }
+    if selected
+        .as_ref()
+        .is_some_and(|row| row.record_id != record_id)
+    {
+        return Err(OmniError::manifest_internal(
+            "lifecycle ledger exact lookup returned a row for another record id",
+        ));
+    }
+    selected
+        .map(LifecycleLedgerRecord::from_envelope)
+        .transpose()
+}
+
+pub(crate) async fn lookup_enrollment_receipt_v2(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    graph_identity_digest: &str,
+    identity: TableIdentity,
+    enrollment_request_id: &str,
+) -> Result<Option<EnrollmentReceiptV2>> {
+    let lookup_key = EnrollmentReceiptV2::lookup_key_for(
+        graph_identity_digest,
+        identity,
+        enrollment_request_id,
+    )?;
+    match lookup_lifecycle_ledger_record(dataset, authority, ENROLLMENT_RECEIPT_V2_TAG, &lookup_key)
+        .await?
+    {
+        Some(LifecycleLedgerRecord::EnrollmentReceiptV2(value)) => Ok(Some(value)),
+        None => Ok(None),
+        Some(_) => Err(OmniError::manifest_internal(
+            "enrollment receipt lookup decoded another lifecycle ledger family",
+        )),
+    }
+}
+
+pub(crate) async fn lookup_binding_receipt(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    graph_identity_digest: &str,
+    identity: TableIdentity,
+    binding_scope_id: &str,
+    operation_id: &str,
+) -> Result<Option<BindingReceipt>> {
+    let lookup_key = BindingReceipt::lookup_key_for(
+        graph_identity_digest,
+        identity,
+        binding_scope_id,
+        operation_id,
+    )?;
+    match lookup_lifecycle_ledger_record(dataset, authority, BINDING_RECEIPT_TAG, &lookup_key)
+        .await?
+    {
+        Some(LifecycleLedgerRecord::BindingReceipt(value)) => Ok(Some(value)),
+        None => Ok(None),
+        Some(_) => Err(OmniError::manifest_internal(
+            "binding receipt lookup decoded another lifecycle ledger family",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn lookup_management_receipt(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    graph_identity_digest: &str,
+    identity: TableIdentity,
+    stream_incarnation_id: &str,
+    operation_kind: &str,
+    operation_id: &str,
+) -> Result<Option<ManagementReceipt>> {
+    let lookup_key = ManagementReceipt::lookup_key_for(
+        graph_identity_digest,
+        identity,
+        stream_incarnation_id,
+        operation_kind,
+        operation_id,
+    )?;
+    match lookup_lifecycle_ledger_record(dataset, authority, MANAGEMENT_RECEIPT_TAG, &lookup_key)
+        .await?
+    {
+        Some(LifecycleLedgerRecord::ManagementReceipt(value)) => Ok(Some(value)),
+        None => Ok(None),
+        Some(_) => Err(OmniError::manifest_internal(
+            "management receipt lookup decoded another lifecycle ledger family",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn lookup_claim_attempt_effect(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    graph_identity_digest: &str,
+    identity: TableIdentity,
+    binding_scope_id: &str,
+    claim_id: &str,
+    ordinal: u64,
+) -> Result<Option<ClaimAttemptEffect>> {
+    let lookup_key = ClaimAttemptEffect::lookup_key_for(
+        graph_identity_digest,
+        identity,
+        binding_scope_id,
+        claim_id,
+        ordinal,
+    )?;
+    match lookup_lifecycle_ledger_record(dataset, authority, CLAIM_ATTEMPT_EFFECT_TAG, &lookup_key)
+        .await?
+    {
+        Some(LifecycleLedgerRecord::ClaimAttemptEffect(value)) => Ok(Some(value)),
+        None => Ok(None),
+        Some(_) => Err(OmniError::manifest_internal(
+            "claim-attempt lookup decoded another lifecycle ledger family",
+        )),
+    }
+}
+
+pub(crate) async fn lookup_claim_receipt(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    graph_identity_digest: &str,
+    identity: TableIdentity,
+    binding_scope_id: &str,
+    claim_id: &str,
+) -> Result<Option<ClaimReceipt>> {
+    let lookup_key =
+        ClaimReceipt::lookup_key_for(graph_identity_digest, identity, binding_scope_id, claim_id)?;
+    match lookup_lifecycle_ledger_record(dataset, authority, CLAIM_RECEIPT_TAG, &lookup_key).await?
+    {
+        Some(LifecycleLedgerRecord::ClaimReceipt(value)) => Ok(Some(value)),
+        None => Ok(None),
+        Some(_) => Err(OmniError::manifest_internal(
+            "claim receipt lookup decoded another lifecycle ledger family",
+        )),
+    }
+}
+
+async fn stage_lifecycle_ledger_envelopes(
+    dataset: Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    rows: &[LifecycleLedgerEnvelope],
+) -> Result<crate::table_store::StagedWrite> {
+    validate_exact_dataset(&dataset, authority).await?;
+    let batch = lifecycle_ledger_envelopes_to_batch(rows)?;
+    let row_count = u64::try_from(batch.num_rows())
+        .map_err(|_| OmniError::manifest_internal("lifecycle ledger row count exceeds u64"))?;
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+    let mut builder =
+        MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+    builder
+        .when_matched(WhenMatched::Fail)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .use_index(false)
+        .conflict_retries(0)
+        .source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+    let uncommitted = builder
+        .try_build()
+        .map_err(|error| OmniError::Lance(error.to_string()))?
+        .execute_uncommitted(stream)
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    if uncommitted.transaction.read_version != authority.current_head_witness.table_version {
+        return Err(OmniError::manifest_internal(format!(
+            "lifecycle ledger staged transaction read version {} does not match manifest-selected version {}",
+            uncommitted.transaction.read_version, authority.current_head_witness.table_version
+        )));
+    }
+    crate::table_store::staged_exact_id_upsert_result(
+        &dataset,
+        uncommitted,
+        row_count,
+        "stage_lifecycle_ledger_records",
+    )
+}
+
+pub(crate) async fn stage_lifecycle_ledger_records(
+    dataset: Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    records: &[LifecycleLedgerRecord],
+) -> Result<crate::table_store::StagedWrite> {
+    let envelopes = records
+        .iter()
+        .map(LifecycleLedgerRecord::to_envelope)
+        .collect::<Result<Vec<_>>>()?;
+    stage_lifecycle_ledger_envelopes(dataset, authority, &envelopes).await
+}
+
+pub(crate) async fn stage_enrollment_receipt_v2(
+    dataset: Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    receipt: &EnrollmentReceiptV2,
+) -> Result<crate::table_store::StagedWrite> {
+    stage_lifecycle_ledger_records(
+        dataset,
+        authority,
+        &[LifecycleLedgerRecord::EnrollmentReceiptV2(receipt.clone())],
+    )
+    .await
+}
+
+pub(crate) async fn stage_binding_receipt(
+    dataset: Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    receipt: &BindingReceipt,
+) -> Result<crate::table_store::StagedWrite> {
+    stage_lifecycle_ledger_records(
+        dataset,
+        authority,
+        &[LifecycleLedgerRecord::BindingReceipt(receipt.clone())],
+    )
+    .await
+}
+
+pub(crate) async fn stage_management_receipt(
+    dataset: Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    receipt: &ManagementReceipt,
+) -> Result<crate::table_store::StagedWrite> {
+    stage_lifecycle_ledger_records(
+        dataset,
+        authority,
+        &[LifecycleLedgerRecord::ManagementReceipt(receipt.clone())],
+    )
+    .await
+}
+
+pub(crate) async fn stage_claim_attempt_effect(
+    dataset: Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    receipt: &ClaimAttemptEffect,
+) -> Result<crate::table_store::StagedWrite> {
+    stage_lifecycle_ledger_records(
+        dataset,
+        authority,
+        &[LifecycleLedgerRecord::ClaimAttemptEffect(receipt.clone())],
+    )
+    .await
+}
+
+pub(crate) async fn stage_claim_receipt(
+    dataset: Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    receipt: &ClaimReceipt,
+) -> Result<crate::table_store::StagedWrite> {
+    stage_lifecycle_ledger_records(
+        dataset,
+        authority,
+        &[LifecycleLedgerRecord::ClaimReceipt(receipt.clone())],
+    )
+    .await
+}
+
 const MAX_PROFILE_MANAGEMENT_RECEIPT_JSON_BYTES: usize = 64 * 1024;
 
 /// Encode one immutable profile-management ledger row using the tagged v2
@@ -1315,6 +2089,11 @@ fn validate_head_witness(witness: &CurrentHeadWitness) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::manifest::stream::{
+        ClaimAttemptClassification, ClaimAttemptEffectPreimage, ClaimProfile, ClaimReceiptPreimage,
+        ClaimTerminalClassification, StreamPhysicalBinding, binding_receipt_chain_genesis,
+        claim_attempt_chain_genesis, claim_receipt_chain_genesis, management_receipt_chain_genesis,
+    };
     use crate::db::manifest::stream_profile::{
         FoldDelegation, ProfileManagementResult, ReceiptChainRef, StreamProfileMode,
         StreamProfileState, stream_profile_management_request_digest,
@@ -1412,6 +2191,185 @@ mod tests {
         .unwrap()
     }
 
+    fn lifecycle_envelope(record_tag: &str, ordinal: usize) -> LifecycleLedgerEnvelope {
+        LifecycleLedgerEnvelope {
+            record_id: format!("sha256:{:064x}", ordinal + 1),
+            record_tag: record_tag.to_string(),
+            record_lookup_key: format!("{record_tag}:lookup:{ordinal}"),
+            record_payload_json: format!(r#"{{"ordinal":{ordinal}}}"#),
+        }
+    }
+
+    fn typed_lifecycle_records() -> Vec<LifecycleLedgerRecord> {
+        let identity = TableIdentity::new(7, 9).unwrap();
+        let graph_digest = format!("sha256:{}", "1".repeat(64));
+        let stream_incarnation_id = "22222222-2222-4222-8222-222222222222";
+        let binding_scope_id = "33333333-3333-4333-8333-333333333333";
+        let enrollment_id = "44444444-4444-4444-8444-444444444444";
+        let shard_id = "55555555-5555-4555-8555-555555555555";
+        let physical_binding = StreamPhysicalBinding {
+            stable_table_id: identity.stable_table_id,
+            table_incarnation_id: identity.table_incarnation_id,
+            table_location: "nodes/0000000000000007-0000000000000009".to_string(),
+            table_branch: None,
+            enrollment_id: enrollment_id.to_string(),
+            shard_ids: vec![shard_id.to_string()],
+            stream_config_version: crate::db::manifest::stream::STREAM_CONFIG_VERSION,
+            stream_config_hash: format!("sha256:{}", "2".repeat(64)),
+        };
+        let enrollment = EnrollmentReceiptV2::new(
+            graph_digest.clone(),
+            identity,
+            &binding_receipt_chain_genesis(),
+            "11111111-1111-4111-8111-111111111111",
+            format!("sha256:{}", "3".repeat(64)),
+            "operator:alice",
+            stream_incarnation_id,
+            binding_scope_id,
+            physical_binding.clone(),
+            1_700_000_000_000_001,
+        )
+        .unwrap();
+        let binding = BindingReceipt::new(
+            graph_digest.clone(),
+            identity,
+            &enrollment.next_chain_ref().unwrap(),
+            binding_scope_id,
+            stream_incarnation_id,
+            physical_binding,
+            "INITIAL_ENROLLMENT",
+            1_700_000_000_000_002,
+        )
+        .unwrap();
+        let management = ManagementReceipt::new(
+            graph_digest.clone(),
+            identity,
+            stream_incarnation_id,
+            binding_scope_id,
+            &management_receipt_chain_genesis(),
+            "66666666-6666-4666-8666-666666666666",
+            "QUIESCE",
+            1,
+            2,
+            "operator:alice",
+            serde_json::json!({"drain_id":"66666666-6666-4666-8666-666666666666"}),
+            serde_json::json!({"lifecycle":"SEALED","revision":2}),
+            1_700_000_000_000_003,
+        )
+        .unwrap();
+        let claim_id = "77777777-7777-4777-8777-777777777777";
+        let attempt_id = "88888888-8888-4888-8888-888888888888";
+        let tail_prior_position = 0;
+        let tail_position = 10;
+        let tail_segment_entry_count = tail_position - tail_prior_position;
+        let sentinel_digest = format!("sha256:{}", "4".repeat(64));
+        let terminal_effect_digest = format!("sha256:{}", "5".repeat(64));
+        let attempt = ClaimAttemptEffect::new(
+            &claim_attempt_chain_genesis(),
+            ClaimAttemptEffectPreimage {
+                graph_identity_digest: graph_digest.clone(),
+                identity,
+                stream_incarnation_id: stream_incarnation_id.to_string(),
+                binding_scope_id: binding_scope_id.to_string(),
+                enrollment_id: enrollment_id.to_string(),
+                shard_id: shard_id.to_string(),
+                claim_id: claim_id.to_string(),
+                attempt_id: attempt_id.to_string(),
+                attempt_plan_digest: format!("sha256:{}", "6".repeat(64)),
+                bound_prestate_digest: format!("sha256:{}", "7".repeat(64)),
+                storage_envelope_digest: None,
+                planned_sentinel_position: tail_position,
+                planned_sentinel_digest: sentinel_digest.clone(),
+                achieved_shard_manifest_version: Some(2),
+                achieved_writer_epoch: Some(2),
+                observed_sentinel_position: Some(tail_position),
+                observed_sentinel_digest: Some(sentinel_digest.clone()),
+                attempt_terminal_effect_digest: terminal_effect_digest.clone(),
+                classification: ClaimAttemptClassification::StockManifestPlusSentinel,
+            },
+        )
+        .unwrap();
+        let attempt_chain = attempt.next_attempt_chain_ref().unwrap();
+        let stream_configuration_digest = format!("sha256:{}", "8".repeat(64));
+        let physical_binding_digest = format!("sha256:{}", "9".repeat(64));
+        let tail_segment_digest = format!("sha256:{}", "b".repeat(64));
+        let tail_empty_fence_digest = format!("sha256:{}", "e".repeat(64));
+        let tail_lww_digest = format!("sha256:{}", "f".repeat(64));
+        let prior_tail =
+            crate::db::manifest::stream::AuthenticatedWalTail::genesis(binding_scope_id).unwrap();
+        let tail_chain_digest = crate::db::manifest::stream::authenticated_wal_tail_chain_digest(
+            binding_scope_id,
+            enrollment_id,
+            shard_id,
+            stream_incarnation_id,
+            &stream_configuration_digest,
+            &physical_binding_digest,
+            tail_prior_position,
+            tail_position,
+            tail_segment_entry_count,
+            &tail_segment_digest,
+            &prior_tail.chain_digest,
+            1,
+            &tail_empty_fence_digest,
+            &tail_lww_digest,
+        )
+        .unwrap();
+        let claim = ClaimReceipt::new(
+            &claim_receipt_chain_genesis(),
+            ClaimReceiptPreimage {
+                graph_identity_digest: graph_digest,
+                identity,
+                claim_id: claim_id.to_string(),
+                lifecycle_operation_id: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string()),
+                binding_scope_id: binding_scope_id.to_string(),
+                enrollment_id: enrollment_id.to_string(),
+                shard_id: shard_id.to_string(),
+                stream_incarnation_id: stream_incarnation_id.to_string(),
+                stream_configuration_digest,
+                physical_binding_digest,
+                recovery_operation_id: "claim-recovery-1".to_string(),
+                claim_kind: "DRAIN_FENCE".to_string(),
+                profile: ClaimProfile::RetainAll,
+                claim_operation_digest: format!("sha256:{}", "a".repeat(64)),
+                attempt_count: attempt_chain.record_count,
+                attempt_chain_head_id: attempt_chain.head_record_id.unwrap(),
+                attempt_effect_chain_digest: attempt_chain.chain_digest,
+                terminal_attempt_id: attempt_id.to_string(),
+                terminal_pre_shard_manifest_version: 1,
+                achieved_shard_manifest_version: 2,
+                achieved_writer_epoch: 2,
+                sentinel_position: tail_position,
+                sentinel_digest,
+                replay_cursor: 0,
+                authenticated_tail_prior_position: tail_prior_position,
+                authenticated_tail_position: tail_position,
+                authenticated_tail_published_prefix_position: 0,
+                authenticated_tail_segment_entry_count: tail_segment_entry_count,
+                authenticated_tail_segment_digest: tail_segment_digest.clone(),
+                authenticated_tail_segment_lww_projection_digest: format!(
+                    "sha256:{}",
+                    "b".repeat(64)
+                ),
+                authenticated_tail_prior_chain_digest: prior_tail.chain_digest,
+                authenticated_tail_segment_count: 1,
+                authenticated_tail_chain_digest: tail_chain_digest,
+                authenticated_tail_empty_fence_state_digest: tail_empty_fence_digest,
+                authenticated_tail_lww_projection_digest: tail_lww_digest,
+                terminal_effect_digest,
+                terminal_classification: ClaimTerminalClassification::StockManifestPlusSentinel,
+                recorded_at: 1_700_000_000_000_004,
+            },
+        )
+        .unwrap();
+        vec![
+            LifecycleLedgerRecord::EnrollmentReceiptV2(enrollment),
+            LifecycleLedgerRecord::BindingReceipt(binding),
+            LifecycleLedgerRecord::ManagementReceipt(management),
+            LifecycleLedgerRecord::ClaimAttemptEffect(attempt),
+            LifecycleLedgerRecord::ClaimReceipt(claim),
+        ]
+    }
+
     #[test]
     fn token_authority_row_batch_round_trips_exactly() {
         let row = authority_row();
@@ -1445,6 +2403,79 @@ mod tests {
                 .contains("current-token decoder received trusted record tag"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn lifecycle_ledger_batch_is_disjoint_and_bounded() {
+        let first = lifecycle_envelope("STREAM_BINDING_RECEIPT_V1", 0);
+        let second = lifecycle_envelope("STREAM_CLAIM_RECEIPT_V1", 1);
+        let batch = lifecycle_ledger_envelopes_to_batch(&[first.clone(), second.clone()]).unwrap();
+        assert_eq!(
+            lifecycle_ledger_envelopes_from_batch(&batch, None).unwrap(),
+            vec![first.clone(), second]
+        );
+        let error = stream_token_rows_from_batch(&batch).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("current-token decoder received trusted record tag"),
+            "{error}"
+        );
+        let error =
+            lifecycle_ledger_envelopes_from_batch(&batch, Some(&first.record_tag)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("lifecycle ledger decoder expected trusted record tag"),
+            "{error}"
+        );
+
+        let too_many = (0..=MAX_LIFECYCLE_LEDGER_RECORDS_PER_TRANSACTION)
+            .map(|ordinal| lifecycle_envelope("STREAM_BINDING_RECEIPT_V1", ordinal))
+            .collect::<Vec<_>>();
+        let error = lifecycle_ledger_envelopes_to_batch(&too_many).unwrap_err();
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit,
+                actual,
+            } if resource == "stream_lifecycle_ledger_transaction_rows"
+                && limit == MAX_LIFECYCLE_LEDGER_RECORDS_PER_TRANSACTION as u64
+                && actual == too_many.len() as u64
+        ));
+
+        let duplicate_lookup = LifecycleLedgerEnvelope {
+            record_id: format!("sha256:{}", "f".repeat(64)),
+            ..first.clone()
+        };
+        let error = lifecycle_ledger_envelopes_to_batch(&[first, duplicate_lookup]).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate record lookup key"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn typed_lifecycle_ledger_records_round_trip_with_disjoint_domains() {
+        let records = typed_lifecycle_records();
+        let batch = lifecycle_ledger_records_to_batch(&records).unwrap();
+        assert_eq!(
+            lifecycle_ledger_records_from_batch(&batch).unwrap(),
+            records
+        );
+        let tags = records
+            .iter()
+            .map(LifecycleLedgerRecord::record_tag)
+            .collect::<std::collections::BTreeSet<_>>();
+        let lookup_keys = records
+            .iter()
+            .map(LifecycleLedgerRecord::record_lookup_key)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(tags.len(), records.len());
+        assert_eq!(lookup_keys.len(), records.len());
+        assert!(!tags.contains(CURRENT_TOKEN_RECORD_TAG));
+        assert!(!tags.contains(PROFILE_MANAGEMENT_RECEIPT_TAG));
     }
 
     #[test]
@@ -1622,6 +2653,159 @@ mod tests {
         assert!(
             duplicate.is_err(),
             "WhenMatched::Fail must make immutable receipt rebinding impossible"
+        );
+    }
+
+    #[tokio::test]
+    async fn heterogeneous_lifecycle_ledger_stage_is_atomic_and_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let session = crate::lance_access::control_session();
+        let authority = initialize_stream_token_authority(root, &session)
+            .await
+            .unwrap();
+        let dataset = open_stream_token_authority_at(root, &authority, &session)
+            .await
+            .unwrap();
+        let records = typed_lifecycle_records();
+        let enrollment = match &records[0] {
+            LifecycleLedgerRecord::EnrollmentReceiptV2(value) => value.clone(),
+            _ => unreachable!(),
+        };
+        let binding = match &records[1] {
+            LifecycleLedgerRecord::BindingReceipt(value) => value.clone(),
+            _ => unreachable!(),
+        };
+        let management = match &records[2] {
+            LifecycleLedgerRecord::ManagementReceipt(value) => value.clone(),
+            _ => unreachable!(),
+        };
+        let attempt = match &records[3] {
+            LifecycleLedgerRecord::ClaimAttemptEffect(value) => value.clone(),
+            _ => unreachable!(),
+        };
+        let claim = match &records[4] {
+            LifecycleLedgerRecord::ClaimReceipt(value) => value.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            lookup_enrollment_receipt_v2(
+                &dataset,
+                &authority,
+                &enrollment.graph_identity_digest,
+                enrollment.identity,
+                &enrollment.enrollment_request_id,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let staged = stage_lifecycle_ledger_records(dataset.clone(), &authority, &records)
+            .await
+            .unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+
+        let store = crate::table_store::TableStore::new(root, Arc::clone(&session));
+        let (achieved, _) = store
+            .commit_staged_exact(Arc::new(dataset), staged)
+            .await
+            .unwrap();
+        let next = stream_token_authority_entry_for_dataset(&achieved)
+            .await
+            .unwrap();
+        assert_eq!(
+            lookup_enrollment_receipt_v2(
+                &achieved,
+                &next,
+                &enrollment.graph_identity_digest,
+                enrollment.identity,
+                &enrollment.enrollment_request_id,
+            )
+            .await
+            .unwrap(),
+            Some(enrollment.clone())
+        );
+        assert_eq!(
+            lookup_binding_receipt(
+                &achieved,
+                &next,
+                &binding.graph_identity_digest,
+                binding.identity,
+                &binding.binding_scope_id,
+                &binding.operation_id,
+            )
+            .await
+            .unwrap(),
+            Some(binding.clone())
+        );
+        assert_eq!(
+            lookup_lifecycle_ledger_record_by_id(
+                &achieved,
+                &next,
+                BINDING_RECEIPT_TAG,
+                &binding.record_id,
+            )
+            .await
+            .unwrap(),
+            Some(LifecycleLedgerRecord::BindingReceipt(binding))
+        );
+        assert_eq!(
+            lookup_management_receipt(
+                &achieved,
+                &next,
+                &management.graph_identity_digest,
+                management.identity,
+                &management.stream_incarnation_id,
+                &management.operation_kind,
+                &management.operation_id,
+            )
+            .await
+            .unwrap(),
+            Some(management)
+        );
+        assert_eq!(
+            lookup_claim_attempt_effect(
+                &achieved,
+                &next,
+                &attempt.graph_identity_digest,
+                attempt.identity,
+                &attempt.binding_scope_id,
+                &attempt.claim_id,
+                attempt.ordinal,
+            )
+            .await
+            .unwrap(),
+            Some(attempt)
+        );
+        assert_eq!(
+            lookup_claim_receipt(
+                &achieved,
+                &next,
+                &claim.graph_identity_digest,
+                claim.identity,
+                &claim.binding_scope_id,
+                &claim.claim_id,
+            )
+            .await
+            .unwrap(),
+            Some(claim.clone())
+        );
+        assert_eq!(
+            lookup_lifecycle_ledger_record_by_id(
+                &achieved,
+                &next,
+                CLAIM_RECEIPT_TAG,
+                &claim.record_id,
+            )
+            .await
+            .unwrap(),
+            Some(LifecycleLedgerRecord::ClaimReceipt(claim))
+        );
+        assert!(
+            stage_enrollment_receipt_v2(achieved, &next, &enrollment)
+                .await
+                .is_err(),
+            "WhenMatched::Fail must reject rebinding an immutable lifecycle record"
         );
     }
 }

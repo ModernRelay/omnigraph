@@ -3,7 +3,7 @@
 **Audience:** maintainers, contributors, and coding agents — internal
 **Type:** narrative reference ("the book"), read top-to-bottom
 **Status:** living document
-**Surveyed:** OmniGraph 0.9.0 development (`main`), with RFC-026's private B2 compare-and-chain/token-fold core, unbounded retain-all profile, and bounded profile-authority tranche implemented; Lance 9.0.0; internal manifest schema v11
+**Surveyed:** OmniGraph 0.9.0 development (`main`), with RFC-026's private B2 compare-and-chain core, unbounded retain-all profile, bounded profile authority, and hidden lifecycle-v3 quiescence tranche implemented; Lance 9.0.0; internal manifest schema v12
 
 ---
 
@@ -322,7 +322,7 @@ Two mechanisms make concurrent publishes safe:
   N-writer convergence tests).
 
 The internal manifest schema is stamped
-(`omnigraph:internal_schema_version`, currently v9) and **strict
+(`omnigraph:internal_schema_version`, currently v12) and **strict
 single-version** — see [the strand model](#schema-and-migration--the-strand-model).
 
 ---
@@ -487,9 +487,11 @@ writer describes its physical effects to the shared coordinator:
 | Schema apply | v9 (`protocol_v7` payload) | exact `Overwrite` per rewritten table + strict read-version-zero `Create` per new type; a pure rename retains its existing identity/path/version. The payload also carries the schema registration/rename/tombstone delta (a metadata-only apply has an empty effect set but still arms — schema staging is durable state) |
 | EnsureIndices | v9 (`protocol_v8` payload) | one pre-minted *mixed* CreateIndex transaction per table (every missing BTREE + FTS + full-table vector together) |
 | Optimize | v9 (bounded payload) | compaction + index folds have **no** public caller-controlled Lance transaction identity, so Optimize keeps looser, bounded provenance inside the identity-bearing envelope: one graph-wide sidecar pinning the complete productive set, one monotonic batch CAS for visibility. Exact provenance is trigger-gated on upstream API + distributed fencing |
-| StreamEnrollment *(internal Phase A foundation)* | v10 (`protocol_v10` payload) | exact main-only `N -> N + 1` singleton MemWAL initialization plus one pre-minted empty unsharded shard. No effect retires; index-only provisions the shard; the complete state publishes pointer + `OPEN`. Once an effect exists, recovery is roll-forward-only. There is no production enrollment or row caller |
-| StreamFold *(private B2 core)* | v12 (`protocol_v12` payload) | one proven drained no-roll generation becomes an exact staged keyed base transaction carrying its Lance `MergedGeneration` plus an exact staged `_stream_tokens.lance` transaction. The intent binds both prestates/transactions, planned token winners, fixed lineage, lifecycle state-v2, and attribution. Only exact+exact reaches one graph-manifest CAS publishing both pointers and the fold commitment. It folds already-normalized physical rows, including already-normalized vectors, with no external embedding or unspecified derivation. V11 is historical v8 state; only the feature-gated private seam can invoke v12 |
 | StreamProfileChange *(bounded profile authority)* | v13 (`protocol_v13` payload) | one exact `ProfileManagementReceipt` token-ledger transaction plus a fixed protocol-v2 next profile. Only the achieved receipt witness and that profile reach the sole manifest CAS. `DISABLING` is restart/resume-owned; unknown v13 variants fail closed |
+| StreamEnrollmentV2 *(hidden lifecycle-v3 foundation)* | v14 | exact main-only `N -> N + 1` singleton MemWAL initialization, one pre-minted empty shard, and immutable enrollment/binding ledger receipts. Exact physical and ledger outcomes select pointer, heads, and `OPEN` together; once an effect exists, recovery is roll-forward-only |
+| StreamClaim *(hidden writer authority)* | v14 | an immutable attempt/checkpoint/terminal ledger chain surrounds Lance's manifest-first epoch claim and fence sentinel. The terminal receipt authenticates the bounded WAL suffix and full current-generation LWW projection; restart continues the exact pending lane claim before minting another |
+| StreamFoldV2 / StreamDrainFold *(hidden lifecycle-v3 fold)* | v14 | one current ClaimReceipt and proven no-roll cut become exact staged base and `_stream_tokens.lance` transactions. Only exact+exact reaches the graph-manifest CAS publishing both pointers, lifecycle successor, lineage, and attribution. DrainFold additionally binds the active drain operation |
+| StreamLifecycleReceipt *(hidden terminal management)* | v14 | one exact immutable receipt and lineage-neutral `SEALED` transition; an empty lane creates no fake base fold, and restart after physical seal reuses the receipt-bound cut |
 
 First-touch tables (a branch's first write to a table) follow
 **sidecar-before-ref** ordering: the recovery intent that names the
@@ -519,25 +521,31 @@ exact one-generation fold as a guarded HEAD/witness transition. Private B2a
 added no format or transition: it established the unbounded retain-all posture,
 with no canonical durable MemWAL deletion.
 
-Schema v9/config-v3/state-v2/recovery-v12 implements the private
-compare-and-chain row/fold subset. V10 added graph-global enablement; current
-schema v11 replaces its boolean with checked profile protocol v2 and exact
-recovery-v13 `StreamProfileChange`. Canonical payload and token digests plus
+Schema v9/config-v3/state-v2/recovery-v12 implemented the private
+compare-and-chain row/fold subset. V10 added graph-global enablement; v11
+replaced its boolean with checked profile protocol v2 and exact recovery-v13
+`StreamProfileChange`. Current v12 replaces lifecycle-v2 inline history with
+lifecycle-v3 fixed-size ledger heads and activates recovery-v14 enrollment,
+writer claims, ordinary/drain folds, and terminal lifecycle receipts.
+Canonical payload and token digests plus
 trusted hidden row metadata bind each admission. A pre-wait authority capture
 is provisional; the adapter recaptures lifecycle/binding/HEAD/token authority
 after shared admission and same-key queue ownership. The manifest-selected
 `_stream_tokens.lance` participant and base table commit through exact
-transactions owned by one v12 intent, and their sole manifest CAS also stores
-the fold-attribution commitment. Recovery-v11 is historical only; v13 does not
-reinterpret the ordinary v12 fold. Managed reclamation
+transactions owned by the matching v14 fold intent, and their sole manifest
+CAS also stores the fold-attribution commitment. Historical recovery-v10
+enrollment, recovery-v11 B1 fold, and recovery-v12 lifecycle-v2 fold keep
+their wire meanings and are refused under v12. Managed reclamation
 remains a deferred Lance-owned optimization, not an activation gate.
 
 The graph-scoped Cedar vocabulary, checked stopped/offline and runtime profile
 ownership, and embedded manifest-only read-only status are active.
 `DISABLING` persists its exact restart/resume plan, and terminal disable can
 finish when no lifecycle rows exist or every existing lane is already
-`SEALED`; it cannot drain a non-`SEALED` lane. Explicit production enrollment, enrolled-lane
-`OPEN -> DRAINING -> SEALED -> OPEN` operations, bounded
+`SEALED`; the current cluster apply does not invoke the hidden drain.
+The crate-private lifecycle core does implement restartable empty and non-empty
+`OPEN -> DRAINING -> SEALED`, but no production control or transport invokes
+it. Explicit production enrollment/quiesce, `SEALED -> OPEN`, bounded
 `REPLACE`/`WITHDRAW` correction, exclusive-cut physical status, every public
 row surface, and CLI/HTTP/OpenAPI parity remain inactive. Phase D owns future
 automatic operation-scoped drain and atomic witness advancement/rebind. Resume
@@ -569,14 +577,18 @@ this recovery WAL:
   original actor — so history is what the writer intended, not a synthetic
   recovery artifact.
 
-Private StreamFold has one deliberate pre-arm prelude: under exclusive
-admission it seals, drains, retires, and independently proves an immutable
-fresh-tier generation before writing the v12 sidecar. That cut is not a
-base-table or graph-visible effect and remains fold-only after a proven
-effect-free failure. The sidecar is durable before either exact staged Lance
-transaction. Only the exact base plus exact token-table outcome may publish the
-fixed pointers, lineage, attribution, and refreshed lifecycle witness; exact
-base-only recovery may complete only the pre-minted token transaction.
+The lifecycle-v3 fold path first selects a recovery-covered current claim.
+Under exclusive admission, a drain fold seals, drains, retires, and
+independently proves an immutable fresh-tier generation before writing the v14
+fold sidecar. That cut is not a base-table or graph-visible effect and remains
+fold-only after a proven effect-free failure. The sidecar is durable before
+either exact staged Lance transaction. Only the exact base plus exact
+token-table outcome may publish the fixed pointers, lineage, attribution, and
+lifecycle successor; exact base-only recovery may complete only the pre-minted
+token transaction. Empty quiescence instead proves the exact claim-bound empty
+cut without inventing a generation. Recovery-v14
+`StreamLifecycleReceipt(QuiesceFinalize)` selects the terminal management
+receipt and canonical `SEALED` successor together.
 
 The exactness is the security property. Recovery never adopts a foreign commit
 that happens to sit at the expected version; never reparents a prepared write
@@ -598,21 +610,16 @@ When recovery runs:
   schema-apply state (fixed manifest outcome visible, schema identity not yet
   live) rather than lying.
 
-The established writers emit identity-bearing schema-v9 envelopes. RFC-026
-Phase A adds the dedicated schema-v10 `StreamEnrollment` envelope; its exact
-public-state classifier is roll-forward-only once an initializer or shard
-effect exists. Current private B2 adds schema-v12 `StreamFold`: both exact
-participants and exact MemWAL merge progress are classifiable, and only their
-complete confirmed outcome may publish the fixed pointers, lifecycle, lineage,
-and attribution. Schema-v11 is retained as historical v8 syntax but is refused
-under v9 because it lacks the token participant and complete state-v2 outcome.
-Current recovery-v13 `StreamProfileChange` owns one exact
+The established writers emit identity-bearing schema-v9 envelopes. Historical
+RFC-026 Phase A used recovery-v10 `StreamEnrollment`, and the lifecycle-v2 B2
+fold used recovery-v12 `StreamFold`; both retain their wire meaning but are
+refused under current v12. Recovery-v13 `StreamProfileChange` owns one exact
 `ProfileManagementReceipt` token transaction and publishes only its achieved
 witness plus the fixed protocol-v2 profile.
-The five established graph-visible
-writer classes map to six `SidecarKind`s because Mutation and Load remain
-distinct; `StreamEnrollment` is the seventh, `StreamFold` the eighth, and
-`StreamProfileChange` the ninth.
+Recovery-v14 activates `StreamEnrollmentV2`, `StreamClaim`, `StreamFoldV2`,
+`StreamDrainFold`, and `StreamLifecycleReceipt`; its registered
+resume/correction/retirement/token-maintenance/sealed-maintenance/rebind
+families decode but cannot execute.
 Historical payload field names such as `protocol_v3`,
 `protocol_v4`, `protocol_v7`, `protocol_v8`, `protocol_v10`, and
 `protocol_v12`/`protocol_v13` describe retained per-writer payload shapes, not older active
@@ -734,7 +741,7 @@ enum bumps no table version. Destructive or narrowing changes are refused
 
 **Storage versioning is strict single-version** (the strand model,
 [versioning.md](versioning.md)): this binary reads exactly one internal
-manifest schema (`MIN_SUPPORTED == CURRENT == 9`). An older graph is refused
+manifest schema (`MIN_SUPPORTED == CURRENT == 12`). An older graph is refused
 with a self-service export/import rebuild recipe naming the right old release;
 a newer graph is refused with "upgrade omnigraph". There is deliberately no
 in-place migration dispatcher — that machinery is permanent liability (every
@@ -782,15 +789,16 @@ stamp turns "older binary meets streaming-capable graph" into a refusal
 instead of a writer blind to the freeze. V9 crosses by export/init/load
 rebuild, in both directions.
 
-The currently served v11 format preserves v10 and the ordinary private
-recovery-v12 fold byte-for-byte, replaces the profile boolean with checked
-profile protocol v2, and adds recovery-v13 `StreamProfileChange`.
+V11 preserves v10, replaces the profile boolean with checked profile protocol
+v2, and adds recovery-v13 `StreamProfileChange`.
 `DISABLING` owns an explicit restart/resume plan and drain-only continuation;
-`RETIRED` decodes fail closed. Public ingress/enrollment, enrolled-lane
-claim/drain, correction/retirement, and maintenance remain inactive. Their
-complete lifecycle family requires another strict graph/recovery strand because
-it was not pre-registered under v11/v13. V10 crosses through the same
-export/init/load rebuild rule.
+`RETIRED` decodes fail closed. The currently served v12 format replaces inline
+lifecycle histories with lifecycle-v3 fixed-size ledger heads and activates
+the recovery-v14 enrollment, claim, ordinary/drain fold, and terminal
+management families. Its feature-gated hidden seam can quiesce empty and
+non-empty lanes but exposes no production verb. Historical v10 enrollment and
+v12 lifecycle-v2 fold sidecars are refused rather than reinterpreted. V10 and
+v11 cross through the same export/init/load rebuild rule.
 
 ---
 
@@ -1081,8 +1089,8 @@ receipt and complete physical-output envelope remain documented limits on any
 future bounded-storage claim, not blockers for this profile. B2a itself
 activated no schema or product surface.
 
-**Implemented private B2 token/fold core and bounded profile authority; row and
-enrolled-lane lifecycle controls remain inactive:**
+**Implemented private B2 token/fold, bounded profile authority, and hidden
+lifecycle core; public row and lifecycle controls remain inactive:**
 Internal schema v9/config-v3/state-v2 adds canonical payload and token digests,
 trusted hidden row metadata, exact compare-and-chain/idempotency classification,
 same-generation token overlays, and the manifest-selected graph-global
@@ -1097,12 +1105,11 @@ remains non-exported.
 The graph-scoped `stream_ingest` / `stream_manage` Cedar vocabulary is
 registered. V11 adds opaque checked stopped/offline and runtime profile owners,
 resumable `DISABLING`, fail-closed `RETIRED`, and exact recovery-v13 profile
-receipts without changing recovery-v12 fold meaning. Embedded
-`Omnigraph::stream_status` projects durable manifest authority read-only.
-Explicit production enrollment, enrolled-lane lifecycle mutation/correction with
-monotonic revisions and bounded terminal receipts, exclusive-cut physical
-status, retirement, public row admission, and CLI/HTTP/OpenAPI parity remain
-inactive and require another strict format strand. The
+receipts. V12 adds lifecycle-v3 fixed-size ledger heads and recovery-v14
+claim/quiesce/fold authority. Embedded `Omnigraph::stream_status` projects
+durable manifest authority read-only. Explicit production enrollment/quiesce,
+correction/retirement, exclusive-cut physical status, public row admission,
+and CLI/HTTP/OpenAPI parity remain inactive. The
 retain-all profile adds no storage admission watermark. Managed reclamation
 remains deferred Lance-owned work.
 Two checked-in RC.1
@@ -1121,12 +1128,14 @@ physical access shape)**; checkpoint-pinned retention **(RFC-025,
 research-blocked after Gate 0 rejected the current compacted registry-access
 shape)**;
 public MemWAL row admission and later lifecycle/read phases **(RFC-026, draft;
-private v9 compare-and-chain/token-fold core, unbounded retain-all, and bounded
-v11/profile-v2 checked authority implemented; managed reclamation is optional
-later work; public strict activation still requires another format strand for
-explicit enrollment, enrolled-lane lifecycle/correction/retirement,
-exclusive-cut physical status, row admission, and transport-parity evidence;
-the Cedar vocabulary and embedded manifest-only status are active)**;
+private v9 compare-and-chain/token-fold core, unbounded retain-all, bounded
+v11/profile-v2 checked authority, and hidden v12/lifecycle-v3 quiescence
+implemented; managed reclamation is optional later work; F3 can activate the
+already-registered recovery-v14 same-format resume/correction/retirement and
+maintenance exits before public enrollment, quiesce, exclusive-cut physical
+status, row admission, and transport-parity evidence; F5 dead-letter
+disposition remains the next planned strict format strand; the Cedar
+vocabulary and embedded manifest-only status are active)**;
 lineage-based merge deltas
 **(RFC-027, research-blocked)**; background reconciler; planner
 statistics/cost model; policy pushdown; ingest-time embeddings; per-query
@@ -1144,7 +1153,7 @@ resource budgets.
 | **R4: Manifest authority access grows with commit count.** Current-state resolution folds history; a selective index does not by itself bound the complete physical read. | Medium | `optimize` compacts internal tables (keeps periodically-optimized shipped paths flat where separately cost-gated). RFC-024 Gate A rejected durable heads because representative RustFS latest-manifest reads/bytes grow despite flat exact-BTREE row/range work. RFC-025 Gate 0 independently rejected checkpoint-registry activation: at local 10→1,000 on RC.1, uncompacted reconciled work and the eight-fragment tail stay flat, but compacted list/cleanup scan bytes grow 17,012→38,000 cold and 12,336→15,064 warm; exact-show bytes and operation counts also grow. Both RFCs are research-blocked; v8 retains the journal fold and internal-table *cleanup* remains deferred behind the resurrection watermark. |
 | **R5: Schema identity corruption or alias/identity drift.** Internal schema v5 introduced stable IDs/incarnation as durable authority; v6, v7, and v8 preserve them. | Medium | Open/init validate the SchemaIR domain and exact bidirectional IR↔manifest identity/path/alias contract; every active recovery envelope carries the identity pair; zero, duplicate, missing, or mismatched identity fails closed. |
 | **R6: Merge cost at divergence** — full-width classification and history-growing manifest folds. | Medium | Coherent coordinator scans plus retained probe handles reduced the pre-slice measured depth-5/depth-80 baseline from 59/651 manifest reads to 40/410 and cap the common fast-forward route at three internal opens and three scans, but the uncompacted-history slope remains. `merge_cost.rs` keeps both facts visible; O(delta) merge is blocked on a real deletion-delta source **(RFC-027)**; fragment adoption is **(draft RFC-0001)**. |
-| **R7: No public streaming row path** — production writes are still capped by the `graph_head` CAS rate; high-frequency small writes remain wasteful outside the private evidence seam. | Medium | MemWAL is the strategic substrate. Phase A makes its opaque initializer + separate shard effect recoverable for one main-only/unsharded/single-live-writer-process empty enrollment. The bounded worker provides watcher-plus-post-fence acknowledgement and conservative replay; its legal high-entropy near-cap shape closes under logical dense-slice accounting, with physical RSS guarded only as a remeasurement tripwire. Private B2a selects unbounded retain-all with no canonical MemWAL deletion or storage quota. Schema v9 adds canonical compare-and-chain tokens, trusted attribution, post-admission authority recapture, graph-global token authority, and recovery-v12 exact base+token publication with durable fold attribution. V11 adds checked profile authority, resumable `DISABLING`, and exact recovery-v13 profile receipt recovery without changing the fold. Public row activation remains closed on explicit enrollment, enrolled-lane lifecycle/correction/retirement, exclusive-cut physical status, and CLI/HTTP/OpenAPI parity; the lifecycle family requires another strict strand. Managed reclamation and a whole-root history budget are optional later work; a public exact enrollment receipt plus reversible admission seal gates broader overlapping-process topology. |
+| **R7: No public streaming row path** — production writes are still capped by the `graph_head` CAS rate; high-frequency small writes remain wasteful outside the private evidence seam. | Medium | MemWAL is the strategic substrate. The bounded worker provides watcher-plus-post-fence acknowledgement and conservative replay; its legal high-entropy near-cap shape closes under logical dense-slice accounting, with physical RSS guarded only as a remeasurement tripwire. Private B2a selects unbounded retain-all with no canonical MemWAL deletion or storage quota. Schema v9 adds compare-and-chain tokens and graph-global token authority; v11 adds checked profile authority and exact recovery-v13 profile receipts. Current v12/lifecycle-v3 and recovery-v14 cover immutable enrollment/binding receipts, recovery-covered writer claims, exact ordinary/drain folds, and restartable hidden empty/non-empty quiescence. Public row activation remains closed on supported enrollment/quiesce, correction/retirement, physical status, and CLI/HTTP/OpenAPI parity. Managed reclamation and a whole-root history budget are optional later work; a public exact enrollment receipt plus reversible admission seal gates broader overlapping-process topology. |
 | **R8: Some operations lack enforced memory/time budgets.** | Medium | Known gap, narrowed and accepted for RFC-023. Its direct-substrate instrument rejected the first whole-delta fenced adopt (~447 MB peak at 100K × 256 versus ~74 MB Append), and the first corrected production 10K series failed at 30.0× / 108,625,920 bytes overhead; both negative results remain evidence. Mutation/Load now refuses a keyed table above 8,192 rows / 32 MiB before arm, while BranchMerge uses a recovery-enrolled chain with the same per-chunk bounds and a 1,024-transaction ceiling. The inductive certificate route removes the general diff, temporary delta, target preflight, and target join without weakening that chain. Final five-pair production medians passed at 31/8 ms (3.875×) for 10K and 136/35 ms (~3.886×) for 100K; maximum signed paired RSS overheads were 24,297,472 and 32,604,160 bytes. Inclusive row/transaction ceilings, byte refusal (including materialized blobs), operation-wide validation retention, exact source/target incarnation revalidation, second-generation certificate composition, and both between-chunk recovery directions are pinned; other operations still need explicit bounds. |
 | **R9: Local-FS conditional-write emulation** (`write_text_if_match` check-then-act gap). | Low | All current callers sit behind the cluster lock protocol; S3 uses true conditional puts; close before admitting any lock-free caller. |
 | **R10: Doc/spec drift as the system grows** — this document included. | Low | Maintenance contract (same-PR doc updates, `check-agents-md.sh` link CI, "don't lie" stale markers); this canon defers to area docs by construction. |
@@ -1172,17 +1181,18 @@ Live design questions, each owned by an RFC or a known gap — not a wishlist:
    shape must pass the original cold/warm,
    compacted/uncompacted local and object-store gate; the answer is not to
    weaken the gate or add a second authority dataset.
-4. **Which capability owns the next rebuild boundary after v11?** RFC-028
+4. **Which capability owns the next rebuild boundary after v12?** RFC-028
    activated stable identity in v5; RFC-023 assigned exact-`id` fencing to v6;
    RFC-026 Phase A assigned lifecycle/enrollment authority to v7, and private
    Phase B1 assigned the data-bearing config-v2/recovery-v11 core to v8. The
    private B2 row/fold slice assigns config-v3/state-v2, graph-global
    token authority, and recovery-v12 to v9; the genuine v8↔v9 gate is green.
    V10 adds the genesis profile; v11 adds checked profile-v2 authority and
-   recovery-v13 `StreamProfileChange` while preserving ordinary recovery-v12.
-   Because v13 did not pre-register the complete lifecycle family,
-   enrolled-lane claim/drain, correction/retirement, exclusive-cut physical
-   status, row admission, and transport surfaces require a new strict strand.
+   recovery-v13 `StreamProfileChange`. V12 adds lifecycle-v3/recovery-v14:
+   hidden enrollment, claim, ordinary/drain fold, and terminal quiescence are
+   implemented, while registered resume/correction/retirement/maintenance/
+   rebind families remain fail-closed. F3 may activate those same-format exits;
+   F5's dead-letter/replay vocabulary is the next planned strict strand.
    RFC-024's heads, RFC-025's retention, and later RFC-026 phases remain
    independently reviewable. Any later format activation requires its own
    export/init/load rebuild unless capabilities deliberately co-release after
@@ -1215,7 +1225,7 @@ The plan of record is the RFC-022…028 family (all under
 | [0023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | Substrate-native keyed-write fencing via Lance's unenforced-PK filter; fleet/format activation barrier | **Implemented** (2026-07-15) |
 | [0024 — Durable table heads](../rfcs/0024-durable-table-heads.md) | Materialized head-row research; the first exact-BTREE candidate bounded scan work but failed the full latest-manifest/object-byte cost gate | **Research blocked** |
 | [0025 — Checkpoint-pinned retention](../rfcs/0025-checkpoint-retention.md) | Named checkpoints as authoritative retention roots, materialized as Lance tags; current in-manifest registry lookup rejected by Gate 0 | **Research-blocked** |
-| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: bounded watcher-plus-post-fence acknowledgement, canonical compare-and-chain tokens and trusted hidden attribution, recovery-v12 exact base+token graph-atomic fold, unbounded retain-all, and v11/profile-v2 checked authority with recovery-v13 profile receipts. Ordinary fold meaning is unchanged. Public enrollment, enrolled-lane claim/drain, correction/retirement, exclusive-cut status, and transport surfaces remain inactive and require another strict lifecycle strand | **Draft; private B2 token/fold, retain-all, and bounded profile-authority tranches implemented; no public row path** |
+| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: bounded watcher-plus-post-fence acknowledgement, canonical compare-and-chain tokens and trusted hidden attribution, unbounded retain-all, checked profile-v2 authority with recovery-v13 receipts, and v12/lifecycle-v3 recovery-v14 enrollment, claim, ordinary/drain fold, and terminal receipt authority. Hidden empty/non-empty quiescence is implemented; public enrollment/quiesce, correction/retirement, physical status, and transport surfaces remain inactive | **Draft; private lifecycle core implemented; no public row path** |
 | [0027 — Lineage merge deltas](../rfcs/0027-lineage-merge-deltas.md) | O(delta) merge classification from row-version lineage | Research-blocked |
 
 Deliberately split, not one mega-format: identity, key fencing, head rows,

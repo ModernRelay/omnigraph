@@ -471,14 +471,13 @@ RFC-026 stream-config v2 plus recovery-v11 for the private B1 row/fold core.
 V9 preserves those worker mechanics and activates stream-config v3, lifecycle
 state v2, trusted hidden attribution, the manifest-selected token participant,
 and recovery-v12's exact base-plus-token fold. V10 adds the required
-disabled-from-genesis profile singleton and reserved dead-letter slot. The
-currently served v11 format replaces the profile boolean with protocol-v2
-checked authority and adds recovery-v13 `StreamProfileChange`, while preserving
-the ordinary private recovery-v12 fold byte-for-byte. Its `DISABLING` state is
-explicit and restart/resume-owned; public ingress/enrollment, enrolled-lane
-claim/drain, correction, and retirement remain inactive. Those lifecycle
-effects require another strict graph/recovery strand because they were not
-pre-registered under v11/v13. None of the later formats reinterprets or
+disabled-from-genesis profile singleton and reserved dead-letter slot. V11
+replaces the profile boolean with protocol-v2 checked authority and adds
+recovery-v13 `StreamProfileChange`. The currently served v12 format replaces
+inline lifecycle history with lifecycle-v3 ledger heads and recovery-v14
+hidden enrollment, claim, ordinary/drain-fold, and terminal receipt authority.
+Public ingress/enrollment/quiesce, correction, and retirement remain inactive.
+None of the later formats reinterprets or
 backfills v5 in place. A v5
 graph was never served with a
 partial combination such as identity-bearing IR over name-keyed manifest rows.

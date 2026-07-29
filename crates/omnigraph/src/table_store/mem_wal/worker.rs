@@ -18,9 +18,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array};
+use arrow_schema::Schema as ArrowSchema;
+use arrow_select::take::take;
+use futures::TryStreamExt;
 use lance::Dataset;
-use lance::dataset::mem_wal::scanner::InMemoryMemTables;
+use lance::dataset::mem_wal::scanner::{
+    FlushedGeneration as ScannerFlushedGeneration, InMemoryMemTables, LsmScanner, ShardSnapshot,
+};
 use lance::dataset::mem_wal::write::BatchStore;
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, ShardManifestStore, ShardWriter, ShardWriterConfig, schema_with_tombstone,
@@ -32,13 +37,15 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, watch};
 
+use crate::db::manifest::stream::{ClaimReceipt, stream_physical_binding_digest};
 use crate::db::manifest::stream_token::{
     STREAM_PAYLOAD_DIGEST_VERSION, STREAM_PAYLOAD_ENCODING_VERSION,
     STREAM_TOKEN_DERIVATION_VERSION, STREAM_TOKEN_WIRE_VERSION, StreamTokenAuthorityRow,
     TrustedStreamRowMetadata,
 };
 use crate::db::manifest::{
-    STREAM_CONFIG_VERSION, StreamLifecycleEntry, StreamPhysicalBinding, TableIdentity,
+    STREAM_CONFIG_VERSION, StreamLifecycle, StreamLifecycleEntry, StreamPhysicalBinding,
+    TableIdentity,
 };
 use crate::error::{OmniError, Result as OmniResult};
 
@@ -613,6 +620,7 @@ pub(crate) enum PassiveB1PhysicalState {
     /// The shard manifest has no unmerged flushed generation. Durable WAL may
     /// still replay into the active MemTable when the first writer claims it.
     AdmitOrReplay {
+        shard_manifest_version: u64,
         current_generation: u64,
         replay_after_wal_entry_position: u64,
         writer_epoch: u64,
@@ -805,6 +813,7 @@ pub(crate) async fn validate_b1_lifecycle_physical_state(
     let (_, unmerged) = exact_unmerged_generations(&manifest, &details)?;
     match unmerged.as_slice() {
         [] => Ok(PassiveB1PhysicalState::AdmitOrReplay {
+            shard_manifest_version: manifest.version,
             current_generation: manifest.current_generation,
             replay_after_wal_entry_position: manifest.replay_after_wal_entry_position,
             writer_epoch: manifest.writer_epoch,
@@ -817,6 +826,8 @@ pub(crate) async fn validate_b1_lifecycle_physical_state(
             }
             Ok(PassiveB1PhysicalState::FoldOnlyFlushed(
                 FlushedGenerationState {
+                    shard_manifest_version: manifest.version,
+                    writer_epoch: manifest.writer_epoch,
                     generation: generation.generation,
                     path: generation.path.clone(),
                     replay_after_wal_entry_position: manifest.replay_after_wal_entry_position,
@@ -906,16 +917,11 @@ fn account_batch(batch: &RecordBatch) -> Result<GenerationAccounting, MemWalWork
 /// would therefore make the same durable generation legal before a restart
 /// and corrupt after it. The RFC-026 limit is the memory needed by dense buffers
 /// for the selected slice; allocator/RSS amplification is measured separately.
-pub(crate) fn b1_logical_batch_bytes(
-    batch: &RecordBatch,
-) -> Result<u64, MemWalWorkerError> {
+pub(crate) fn b1_logical_batch_bytes(batch: &RecordBatch) -> Result<u64, MemWalWorkerError> {
     batch.columns().iter().try_fold(0_u64, |total, column| {
-        let bytes = column
-            .to_data()
-            .get_slice_memory_size()
-            .map_err(|error| MemWalWorkerError::state(format!(
-                "logical Arrow slice accounting failed: {error}"
-            )))?;
+        let bytes = column.to_data().get_slice_memory_size().map_err(|error| {
+            MemWalWorkerError::state(format!("logical Arrow slice accounting failed: {error}"))
+        })?;
         total
             .checked_add(u64::try_from(bytes).map_err(|_| {
                 MemWalWorkerError::state("logical Arrow slice size does not fit u64")
@@ -999,6 +1005,8 @@ impl std::fmt::Debug for ReplayGenerationState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FlushedGenerationState {
+    pub(crate) shard_manifest_version: u64,
+    pub(crate) writer_epoch: u64,
     pub(crate) generation: u64,
     pub(crate) path: String,
     pub(crate) replay_after_wal_entry_position: u64,
@@ -1117,6 +1125,8 @@ fn classify_active_snapshot(
         {
             Ok(ActiveStreamDisposition::FoldOnlyFlushed(
                 FlushedGenerationState {
+                    shard_manifest_version: manifest.version,
+                    writer_epoch: manifest.writer_epoch,
                     generation: generation.generation,
                     path: generation.path.clone(),
                     replay_after_wal_entry_position: manifest.replay_after_wal_entry_position,
@@ -1135,6 +1145,150 @@ fn classify_active_snapshot(
                 .collect::<Vec<_>>()
         ))),
     }
+}
+
+/// Reconstruct the complete LWW projection of one already-flushed unmerged
+/// generation before publishing a successor claim.
+///
+/// The successor's authenticated WAL suffix may contain only its fence
+/// sentinel even though the immutable generation contains acknowledged PUTs
+/// from the predecessor. Reading that exact generation is therefore required;
+/// preserving the prior receipt would miss data flushed after the prior claim.
+pub(crate) async fn scan_flushed_generation_projection(
+    dataset: &Dataset,
+    table_root_uri: &str,
+    shard_id: ShardId,
+    flushed: &FlushedGenerationState,
+) -> Result<Vec<RecordBatch>, MemWalWorkerError> {
+    let current_generation = flushed
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| MemWalWorkerError::state("flushed generation successor overflow"))?;
+    let schema: ArrowSchema = dataset.schema().into();
+    let snapshot = ShardSnapshot {
+        shard_id,
+        spec_id: UNSHARDED_SPEC_ID,
+        current_generation,
+        flushed_generations: vec![ScannerFlushedGeneration {
+            generation: flushed.generation,
+            path: flushed.path.clone(),
+        }],
+    };
+    let mut scanner = LsmScanner::without_base_table(
+        Arc::new(schema),
+        table_root_uri.to_string(),
+        vec![snapshot],
+        vec!["id".to_string()],
+    )
+    .with_session(dataset.session());
+    if let Some(store_params) = dataset.store_params() {
+        scanner = scanner.with_store_params(store_params.clone());
+    }
+    scanner = scanner
+        .limit(
+            Some(
+                i64::try_from(B1_MAX_GENERATION_ROWS + 1)
+                    .expect("B1 row bound plus sentinel fits i64"),
+            ),
+            None,
+        )
+        .map_err(|error| MemWalWorkerError::lance("flushed projection row bound", error))?;
+    let mut stream = scanner
+        .try_into_stream()
+        .await
+        .map_err(|error| MemWalWorkerError::lance("flushed projection scan planning", error))?;
+    let mut accounting = GenerationAccounting::default();
+    let mut batches = Vec::new();
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .map_err(|error| MemWalWorkerError::lance("flushed projection scan", error))?
+    {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        if batch
+            .column_by_name(lance::dataset::mem_wal::TOMBSTONE)
+            .is_some()
+        {
+            return Err(MemWalWorkerError::state(
+                "fresh-only flushed projection unexpectedly exposed Lance's tombstone column",
+            ));
+        }
+        let raw_accounting = accounting.checked_add(account_batch(&batch)?)?;
+        if raw_accounting.rows > B1_MAX_GENERATION_ROWS {
+            return Err(MemWalWorkerError::ResourceLimit {
+                resource: "stream_claim_current_generation_rows",
+                limit: B1_MAX_GENERATION_ROWS,
+                actual: raw_accounting.rows,
+            });
+        }
+        if raw_accounting.arrow_bytes > B1_MAX_GENERATION_ARROW_BYTES {
+            return Err(MemWalWorkerError::ResourceLimit {
+                resource: "stream_claim_current_generation_arrow_bytes",
+                limit: B1_MAX_GENERATION_ARROW_BYTES,
+                actual: raw_accounting.arrow_bytes,
+            });
+        }
+        // LsmScanner returns the live LWW projection and deliberately omits
+        // its internal tombstone. Claim hashing is defined over the exact
+        // stored-generation schema, so restore the known-false column before
+        // applying the generation bound and retaining the projection.
+        let stored_schema = schema_with_tombstone(batch.schema().as_ref());
+        let mut stored_columns = batch.columns().to_vec();
+        stored_columns
+            .push(Arc::new(BooleanArray::from(vec![false; batch.num_rows()])) as ArrayRef);
+        let batch = RecordBatch::try_new(stored_schema, stored_columns)
+            .map_err(|error| MemWalWorkerError::lance("projection tombstone restore", error))?;
+        accounting = accounting.checked_add(account_batch(&batch)?)?;
+        if accounting.rows > B1_MAX_GENERATION_ROWS {
+            return Err(MemWalWorkerError::ResourceLimit {
+                resource: "stream_claim_current_generation_rows",
+                limit: B1_MAX_GENERATION_ROWS,
+                actual: accounting.rows,
+            });
+        }
+        if accounting.arrow_bytes > B1_MAX_GENERATION_ARROW_BYTES {
+            return Err(MemWalWorkerError::ResourceLimit {
+                resource: "stream_claim_current_generation_arrow_bytes",
+                limit: B1_MAX_GENERATION_ARROW_BYTES,
+                actual: accounting.arrow_bytes,
+            });
+        }
+        if accounting.batches > B1_MAX_GENERATION_BATCHES {
+            return Err(MemWalWorkerError::ResourceLimit {
+                resource: "stream_claim_current_generation_batches",
+                limit: B1_MAX_GENERATION_BATCHES as u64,
+                actual: accounting.batches as u64,
+            });
+        }
+
+        // Scanner output can be a small slice over a much larger backing
+        // allocation. Copy every selected row into dense owned arrays so the
+        // retained projection is bounded by the same logical accounting used
+        // above, independent of allocator capacity or source-file layout.
+        let row_count = u32::try_from(batch.num_rows())
+            .map_err(|_| MemWalWorkerError::state("projection batch row count exceeds u32"))?;
+        let indices = UInt32Array::from_iter_values(0..row_count);
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|column| {
+                take(column.as_ref(), &indices, None)
+                    .map_err(|error| MemWalWorkerError::lance("projection densification", error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        batches.push(
+            RecordBatch::try_new(batch.schema(), columns)
+                .map_err(|error| MemWalWorkerError::lance("projection batch rebuild", error))?,
+        );
+    }
+    if accounting.rows == 0 {
+        return Err(MemWalWorkerError::state(
+            "flushed current-generation projection scan returned no rows",
+        ));
+    }
+    Ok(batches)
 }
 
 /// Isolated RC.1 bridge: prove this is still the exact replay-derived active
@@ -1209,14 +1363,38 @@ impl ClaimedMemWalWorker {
 
     pub(crate) async fn classify(
         self,
+        dataset: &Dataset,
+        table_root_uri: &str,
         details: &MemWalIndexDetails,
         epoch_floor: u64,
     ) -> Result<OpenedMemWalWorker, WorkerOpenFailure> {
         match classify_active_state(&self.writer, details, epoch_floor).await {
-            Ok(disposition) => Ok(OpenedMemWalWorker {
-                claimed: self,
-                disposition,
-            }),
+            Ok(disposition) => {
+                let flushed_projection = match &disposition {
+                    ActiveStreamDisposition::FoldOnlyFlushed(flushed) => {
+                        match scan_flushed_generation_projection(
+                            dataset,
+                            table_root_uri,
+                            self.writer().shard_id(),
+                            flushed,
+                        )
+                        .await
+                        {
+                            Ok(batches) => Some(batches),
+                            Err(error) => {
+                                return Err(WorkerOpenFailure::claimed(error, self));
+                            }
+                        }
+                    }
+                    ActiveStreamDisposition::AdmitEmpty
+                    | ActiveStreamDisposition::FoldOnlyReplay(_) => None,
+                };
+                Ok(OpenedMemWalWorker {
+                    claimed: self,
+                    disposition,
+                    flushed_projection,
+                })
+            }
             Err(error) => Err(WorkerOpenFailure::claimed(error, self)),
         }
     }
@@ -1225,16 +1403,38 @@ impl ClaimedMemWalWorker {
 pub(crate) struct OpenedMemWalWorker {
     claimed: ClaimedMemWalWorker,
     disposition: ActiveStreamDisposition,
+    /// Dense, bounded LWW winners reconstructed from the exact immutable
+    /// unmerged generation authenticated by `disposition`.
+    ///
+    /// This is consumed by terminal claim publication. Keeping it separate
+    /// from `FlushedGenerationState` prevents the resident fold-only worker
+    /// from retaining a redundant generation-sized projection afterward.
+    flushed_projection: Option<Vec<RecordBatch>>,
+}
+
+/// Bounded physical input for the claim receipt's full current-generation LWW
+/// commitment. A fence-only successor can authenticate an empty WAL suffix
+/// while replaying rows from the prior epoch, so claim publication must not
+/// derive this authority from the suffix alone.
+pub(crate) enum CurrentGenerationProjectionSource {
+    Empty,
+    Replay(Vec<RecordBatch>),
+    /// Defensive compatibility shape for an explicitly proven empty suffix.
+    /// Normal and recovery opens recompute `Replay`; terminal publication must
+    /// reject this shape if a newly authenticated suffix carries any row.
+    PreservePrior,
 }
 
 impl OpenedMemWalWorker {
     pub(crate) async fn classify(
         writer: ShardWriter,
+        dataset: &Dataset,
+        table_root_uri: &str,
         details: &MemWalIndexDetails,
         epoch_floor: u64,
     ) -> Result<Self, WorkerOpenFailure> {
         ClaimedMemWalWorker::new(writer)
-            .classify(details, epoch_floor)
+            .classify(dataset, table_root_uri, details, epoch_floor)
             .await
     }
 
@@ -1244,6 +1444,32 @@ impl OpenedMemWalWorker {
 
     pub(crate) fn into_claimed(self) -> ClaimedMemWalWorker {
         self.claimed
+    }
+
+    pub(crate) fn current_generation_projection_source(
+        &mut self,
+    ) -> Result<CurrentGenerationProjectionSource, MemWalWorkerError> {
+        match &self.disposition {
+            ActiveStreamDisposition::AdmitEmpty => Ok(CurrentGenerationProjectionSource::Empty),
+            ActiveStreamDisposition::FoldOnlyReplay(replay) => {
+                Ok(CurrentGenerationProjectionSource::Replay(
+                    replay
+                        .batch_store
+                        .iter()
+                        .map(|stored| stored.data.clone())
+                        .collect(),
+                ))
+            }
+            ActiveStreamDisposition::FoldOnlyFlushed(_) => self
+                .flushed_projection
+                .take()
+                .map(CurrentGenerationProjectionSource::Replay)
+                .ok_or_else(|| {
+                    MemWalWorkerError::state(
+                        "flushed current-generation projection was already consumed",
+                    )
+                }),
+        }
     }
 
     fn put_refusal(&self, table_key: &str) -> Option<OmniError> {
@@ -1426,6 +1652,12 @@ enum WorkerMode {
     FoldReplay(ReplayGenerationState),
     FoldFlushed(FlushedGenerationState),
     Retiring,
+}
+
+#[derive(Clone, Copy)]
+enum EmptyCutPolicy {
+    Reject,
+    ReturnFence,
 }
 
 struct MemWalWorker {
@@ -1869,6 +2101,16 @@ impl OpeningFoldUsagePermit {
         self.transferred = true;
         Ok(())
     }
+
+    fn into_fold_usage(mut self, inflight: InFlightPermit) -> FoldUsagePermit {
+        self.transferred = true;
+        FoldUsagePermit {
+            registry: Arc::clone(&self.registry),
+            key: self.key,
+            usage: self.usage,
+            _inflight: inflight,
+        }
+    }
 }
 
 impl Drop for OpeningFoldUsagePermit {
@@ -1968,9 +2210,7 @@ impl MemWalWorkerRegistry {
     /// blobs or allocate canonical payload bytes. The ordinary inflight slot
     /// moves from this permit into the queued/worker corridor; scratch remains
     /// reserved until canonical hashing is complete.
-    pub(crate) fn reserve_b2_preprocessing(
-        self: &Arc<Self>,
-    ) -> OmniResult<B2PreprocessingPermit> {
+    pub(crate) fn reserve_b2_preprocessing(self: &Arc<Self>) -> OmniResult<B2PreprocessingPermit> {
         let inflight = self
             .reserve_inflight_core()
             .map_err(Self::worker_error_to_omni)?;
@@ -2125,14 +2365,8 @@ impl MemWalWorkerRegistry {
         let inflight = self
             .reserve_inflight_core()
             .map_err(Self::worker_error_to_omni)?;
-        self.reserve_put_input_with_inflight(
-            key,
-            table_key,
-            batch,
-            acquire_authority,
-            inflight,
-        )
-        .await
+        self.reserve_put_input_with_inflight(key, table_key, batch, acquire_authority, inflight)
+            .await
     }
 
     /// B2 sibling of [`Self::reserve_put_input`]. Preprocessing already owns
@@ -2156,14 +2390,8 @@ impl MemWalWorkerRegistry {
             ));
         }
         let inflight = preprocessing.take_inflight();
-        self.reserve_put_input_with_inflight(
-            key,
-            table_key,
-            batch,
-            acquire_authority,
-            inflight,
-        )
-        .await
+        self.reserve_put_input_with_inflight(key, table_key, batch, acquire_authority, inflight)
+            .await
     }
 
     async fn reserve_put_input_with_inflight<F, Fut>(
@@ -2348,10 +2576,7 @@ impl MemWalWorkerRegistry {
                 .clone();
         }
         projected.extend(updates.clone());
-        Ok(projected
-            .into_values()
-            .map(|row| row.authority)
-            .collect())
+        Ok(projected.into_values().map(|row| row.authority).collect())
     }
 
     fn release_queued_charge(&self, key: StreamWorkerKey, charge: GenerationAccounting) {
@@ -3817,12 +4042,284 @@ impl MemWalWorkerRegistry {
         let inflight = self.reserve_inflight_core()?;
         let registry = Arc::clone(self);
         crate::instrumentation::spawn_with_query_io_probes(async move {
-            registry
-                .seal_and_drain_background(key, table_key, authority, opener, inflight)
-                .await
+            match registry
+                .seal_and_drain_background(
+                    key,
+                    table_key,
+                    authority,
+                    opener,
+                    inflight,
+                    EmptyCutPolicy::Reject,
+                )
+                .await?
+            {
+                QuiesceCut::Generation(cut) => Ok(cut),
+                QuiesceCut::Empty(_) => unreachable!("empty cuts are refused by seal_and_drain"),
+            }
         })
         .await
         .map_err(|error| MemWalWorkerError::state(format!("seal task failed: {error}")))?
+    }
+
+    /// Retire any resident writer, claim a fresh writer under the same
+    /// exclusive admission lease, and return its exact empty or generation
+    /// cut. A resident writer is never reused: lifecycle quiescence must be
+    /// proven against a fresh epoch claim after the old owner has settled.
+    pub(crate) async fn quiesce_cut(
+        self: &Arc<Self>,
+        key: StreamWorkerKey,
+        table_key: String,
+        authority: CheckedExclusiveStreamAuthority,
+        opener: WorkerOpener,
+    ) -> Result<QuiesceCut, MemWalWorkerError> {
+        let inflight = self.reserve_inflight_core()?;
+        let registry = Arc::clone(self);
+        crate::instrumentation::spawn_with_query_io_probes(async move {
+            registry
+                .quiesce_cut_background(key, table_key, authority, opener, inflight)
+                .await
+        })
+        .await
+        .map_err(|error| MemWalWorkerError::state(format!("quiesce task failed: {error}")))?
+    }
+
+    /// Reconstruct a DRAINING cut without claiming a successor writer epoch.
+    ///
+    /// This is the restart path after a terminal drain claim has already been
+    /// published. It first retires any process-local owner, then authenticates
+    /// passive physical state against the manifest-selected current claim. An
+    /// exact flushed generation can be reused directly; an exact empty
+    /// projection can be sealed directly; a non-empty unsealed replay returns
+    /// the still-held authority so the caller can run one unique fresh claim.
+    pub(crate) async fn passive_quiesce_cut(
+        self: &Arc<Self>,
+        key: StreamWorkerKey,
+        authority: CheckedExclusiveStreamAuthority,
+        dataset: Dataset,
+        draining: StreamLifecycleEntry,
+        current_claim: ClaimReceipt,
+    ) -> Result<PassiveQuiesceDisposition, MemWalWorkerError> {
+        let inflight = self.reserve_inflight_core()?;
+        let registry = Arc::clone(self);
+        crate::instrumentation::spawn_with_query_io_probes(async move {
+            registry
+                .passive_quiesce_cut_background(
+                    key,
+                    authority,
+                    dataset,
+                    draining,
+                    current_claim,
+                    inflight,
+                )
+                .await
+        })
+        .await
+        .map_err(|error| {
+            MemWalWorkerError::state(format!("passive quiesce task failed: {error}"))
+        })?
+    }
+
+    async fn passive_quiesce_cut_background(
+        self: Arc<Self>,
+        key: StreamWorkerKey,
+        authority: CheckedExclusiveStreamAuthority,
+        dataset: Dataset,
+        draining: StreamLifecycleEntry,
+        current_claim: ClaimReceipt,
+        inflight: InFlightPermit,
+    ) -> Result<PassiveQuiesceDisposition, MemWalWorkerError> {
+        validate_passive_drain_claim(key, &draining, &current_claim)?;
+        let slot = self.slot(key);
+        let authority = self
+            .retire_current_owner_for_quiesce(&slot, key, authority)
+            .await?;
+        let physical = validate_b1_lifecycle_physical_state(&dataset, &draining).await?;
+        self.passive_disposition_from_physical(
+            key,
+            authority,
+            &draining,
+            &current_claim,
+            physical,
+            inflight,
+        )
+    }
+
+    fn passive_disposition_from_physical(
+        self: &Arc<Self>,
+        key: StreamWorkerKey,
+        authority: CheckedExclusiveStreamAuthority,
+        draining: &StreamLifecycleEntry,
+        current_claim: &ClaimReceipt,
+        physical: PassiveB1PhysicalState,
+        inflight: InFlightPermit,
+    ) -> Result<PassiveQuiesceDisposition, MemWalWorkerError> {
+        match physical {
+            PassiveB1PhysicalState::FoldOnlyFlushed(flushed) => {
+                validate_passive_flushed_claim_physical_cut(
+                    current_claim,
+                    flushed.shard_manifest_version,
+                    flushed.writer_epoch,
+                    flushed.replay_after_wal_entry_position,
+                )?;
+                let reservation = self.reserve_fold_opening_usage(key)?;
+                let fold_usage = reservation.into_fold_usage(inflight);
+                Ok(PassiveQuiesceDisposition::Reusable(QuiesceCut::Generation(
+                    SealedGenerationCut {
+                        key,
+                        writer_epoch: flushed.writer_epoch,
+                        shard_manifest_version: flushed.shard_manifest_version,
+                        generation: flushed.generation,
+                        path: flushed.path,
+                        replay_after_wal_entry_position: flushed.replay_after_wal_entry_position,
+                        _exclusive_authority: authority,
+                        _fold_usage: fold_usage,
+                    },
+                )))
+            }
+            PassiveB1PhysicalState::AdmitOrReplay {
+                shard_manifest_version,
+                current_generation,
+                replay_after_wal_entry_position,
+                writer_epoch,
+            } => {
+                validate_passive_claim_epoch(
+                    current_claim,
+                    shard_manifest_version,
+                    writer_epoch,
+                )?;
+                drop(inflight);
+                let base_merged_generation =
+                    current_generation.checked_sub(1).ok_or_else(|| {
+                        MemWalWorkerError::state(
+                            "passive empty successor has generation zero",
+                        )
+                    })?;
+                if draining
+                    .selected_claim_empty_cut_disposition(
+                        current_claim,
+                        shard_manifest_version,
+                        writer_epoch,
+                        replay_after_wal_entry_position,
+                        current_generation,
+                        base_merged_generation,
+                    )
+                    .is_some()
+                {
+                    Ok(PassiveQuiesceDisposition::Reusable(QuiesceCut::Empty(
+                        EmptyFenceCut {
+                            key,
+                            writer_epoch,
+                            shard_manifest_version,
+                            current_generation,
+                            replay_after_wal_entry_position,
+                            _exclusive_authority: authority,
+                        },
+                    )))
+                } else {
+                    validate_passive_unflushed_claim_physical_cut(
+                        current_claim,
+                        shard_manifest_version,
+                        writer_epoch,
+                        replay_after_wal_entry_position,
+                    )?;
+                    if current_claim.proves_empty_current_generation() {
+                        return Err(MemWalWorkerError::state(
+                            "passive empty claim does not prove the observed generation topology",
+                        ));
+                    }
+                    Ok(PassiveQuiesceDisposition::FreshClaimRequired(authority))
+                }
+            }
+        }
+    }
+
+    async fn quiesce_cut_background(
+        self: Arc<Self>,
+        key: StreamWorkerKey,
+        table_key: String,
+        authority: CheckedExclusiveStreamAuthority,
+        opener: WorkerOpener,
+        inflight: InFlightPermit,
+    ) -> Result<QuiesceCut, MemWalWorkerError> {
+        let slot = self.slot(key);
+        let authority = self
+            .retire_current_owner_for_quiesce(&slot, key, authority)
+            .await?;
+        self.seal_and_drain_background(
+            key,
+            table_key,
+            authority,
+            opener,
+            inflight,
+            EmptyCutPolicy::ReturnFence,
+        )
+        .await
+    }
+
+    async fn retire_current_owner_for_quiesce(
+        self: &Arc<Self>,
+        slot: &Arc<RegistrySlot>,
+        key: StreamWorkerKey,
+        authority: CheckedExclusiveStreamAuthority,
+    ) -> Result<CheckedExclusiveStreamAuthority, MemWalWorkerError> {
+        let worker = {
+            let state = slot.state.lock().await;
+            match &*state {
+                RegistrySlotState::Vacant => return Ok(authority),
+                RegistrySlotState::Opening(_) => {
+                    return Err(MemWalWorkerError::state(
+                        "cannot quiesce while a cold stream claim is in progress",
+                    ));
+                }
+                RegistrySlotState::Active(worker) => Arc::clone(worker),
+                RegistrySlotState::Retiring(_) => {
+                    return Err(MemWalWorkerError::Retiring {
+                        key,
+                        reason: "prior retirement has not completed".to_string(),
+                    });
+                }
+            }
+        };
+
+        *worker.mode.lock().await = WorkerMode::Retiring;
+        let retirement = self.begin_abort(slot, &worker).await;
+        match tokio::time::timeout(self.limits.abort_deadline, retirement.clone().wait()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.retain_existing_exclusive_retirement(
+                    slot,
+                    Arc::clone(&worker),
+                    retirement,
+                    authority,
+                );
+                return Err(error);
+            }
+            Err(_) => {
+                self.retain_existing_exclusive_retirement(
+                    slot,
+                    Arc::clone(&worker),
+                    retirement,
+                    authority,
+                );
+                return Err(MemWalWorkerError::state(format!(
+                    "resident writer abort did not settle within {} ms before fresh quiesce claim",
+                    self.limits.abort_deadline.as_millis()
+                )));
+            }
+        }
+
+        let mut state = slot.state.lock().await;
+        if !matches!(&*state, RegistrySlotState::Retiring(_)) {
+            drop(state);
+            self.release_worker_usage(&worker);
+            return Err(MemWalWorkerError::state(
+                "resident writer slot changed after quiesce retirement",
+            ));
+        }
+        *state = RegistrySlotState::Vacant;
+        drop(state);
+        self.release_worker_usage(&worker);
+        Ok(authority)
     }
 
     async fn seal_and_drain_background(
@@ -3832,7 +4329,8 @@ impl MemWalWorkerRegistry {
         authority: CheckedExclusiveStreamAuthority,
         opener: WorkerOpener,
         inflight: InFlightPermit,
-    ) -> Result<SealedGenerationCut, MemWalWorkerError> {
+        empty_cut_policy: EmptyCutPolicy,
+    ) -> Result<QuiesceCut, MemWalWorkerError> {
         let seal_deadline = self.limits.seal_deadline;
         let deadline = tokio::time::Instant::now() + seal_deadline;
         let slot = self.slot(key);
@@ -3977,11 +4475,82 @@ impl MemWalWorkerRegistry {
         if matches!(&*mode, WorkerMode::Admit(accounting) if accounting.batches == 0) {
             *mode = WorkerMode::Retiring;
             drop(mode);
-            self.retain_exclusive_retirement(&slot, &worker, authority)
-                .await;
-            return Err(MemWalWorkerError::state(
-                "cannot seal an empty admitted generation; empty claimed writer is retiring",
-            ));
+            if matches!(empty_cut_policy, EmptyCutPolicy::Reject) {
+                self.retain_exclusive_retirement(&slot, &worker, authority)
+                    .await;
+                return Err(MemWalWorkerError::state(
+                    "cannot seal an empty admitted generation; empty claimed writer is retiring",
+                ));
+            }
+
+            let proof_worker = Arc::clone(&worker);
+            let mut physical_cut =
+                tokio::spawn(async move { prove_empty_fence_cut(&proof_worker.writer).await });
+            let cut = match tokio::time::timeout_at(deadline, &mut physical_cut).await {
+                Ok(Ok(Ok(cut))) => cut,
+                Ok(Ok(Err(error))) => {
+                    self.retain_exclusive_retirement(&slot, &worker, authority)
+                        .await;
+                    return Err(error);
+                }
+                Ok(Err(error)) => {
+                    self.retain_exclusive_retirement(&slot, &worker, authority)
+                        .await;
+                    return Err(MemWalWorkerError::state(format!(
+                        "empty-cut proof owner task failed: {error}"
+                    )));
+                }
+                Err(_) => {
+                    self.retain_exclusive_after_settle(&slot, &worker, authority, async move {
+                        let _ = physical_cut.await;
+                    });
+                    return Err(MemWalWorkerError::state(format!(
+                        "empty-cut proof did not settle within {} ms; fence outcome is ambiguous",
+                        seal_deadline.as_millis()
+                    )));
+                }
+            };
+
+            let retirement = self.begin_abort(&slot, &worker).await;
+            let abort_deadline =
+                deadline.min(tokio::time::Instant::now() + self.limits.abort_deadline);
+            match tokio::time::timeout_at(abort_deadline, retirement.clone().wait()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    self.retain_existing_exclusive_retirement(
+                        &slot,
+                        Arc::clone(&worker),
+                        retirement,
+                        authority,
+                    );
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.retain_existing_exclusive_retirement(
+                        &slot,
+                        Arc::clone(&worker),
+                        retirement,
+                        authority,
+                    );
+                    return Err(MemWalWorkerError::state(format!(
+                        "empty writer abort did not settle within the {} ms seal deadline",
+                        seal_deadline.as_millis()
+                    )));
+                }
+            }
+            let mut slot_state = slot.state.lock().await;
+            *slot_state = RegistrySlotState::Vacant;
+            drop(slot_state);
+            self.release_worker_usage(&worker);
+            drop(inflight);
+            return Ok(QuiesceCut::Empty(EmptyFenceCut {
+                key,
+                writer_epoch: worker.writer.epoch(),
+                shard_manifest_version: cut.shard_manifest_version,
+                current_generation: cut.current_generation,
+                replay_after_wal_entry_position: cut.replay_after_wal_entry_position,
+                _exclusive_authority: authority,
+            }));
         }
         let plan = match &*mode {
             WorkerMode::Admit(_) => PhysicalSealPlan::SealActive(None),
@@ -4131,7 +4700,7 @@ impl MemWalWorkerRegistry {
         };
         *slot_state = RegistrySlotState::Vacant;
         drop(slot_state);
-        Ok(SealedGenerationCut {
+        Ok(QuiesceCut::Generation(SealedGenerationCut {
             key,
             writer_epoch: worker.writer.epoch(),
             shard_manifest_version: cut.shard_manifest_version,
@@ -4140,7 +4709,7 @@ impl MemWalWorkerRegistry {
             replay_after_wal_entry_position: cut.replay_after_wal_entry_position,
             _exclusive_authority: authority,
             _fold_usage: fold_usage,
-        })
+        }))
     }
 
     async fn retain_exclusive_retirement(
@@ -4207,6 +4776,121 @@ impl MemWalWorkerRegistry {
     }
 }
 
+fn validate_passive_drain_claim(
+    key: StreamWorkerKey,
+    draining: &StreamLifecycleEntry,
+    current_claim: &ClaimReceipt,
+) -> Result<(), MemWalWorkerError> {
+    draining
+        .validate()
+        .map_err(|error| MemWalWorkerError::config(error.to_string()))?;
+    current_claim
+        .validate()
+        .map_err(|error| MemWalWorkerError::config(error.to_string()))?;
+    let drain = draining.drain.as_ref().ok_or_else(|| {
+        MemWalWorkerError::state("passive quiesce requires an exact DRAINING lifecycle")
+    })?;
+    let physical_binding_digest = stream_physical_binding_digest(&draining.binding)
+        .map_err(|error| MemWalWorkerError::config(error.to_string()))?;
+    let expected_claim_chain = current_claim
+        .next_chain_ref()
+        .map_err(|error| MemWalWorkerError::config(error.to_string()))?;
+    let epoch_floor = draining
+        .epoch_floor_by_shard
+        .get(&key.shard_id.to_string())
+        .copied()
+        .ok_or_else(|| {
+            MemWalWorkerError::state("passive quiesce lifecycle omits the bound shard epoch")
+        })?;
+    let drain_target_epoch = drain
+        .target_epoch_floor_by_shard
+        .get(&key.shard_id.to_string())
+        .copied()
+        .ok_or_else(|| {
+            MemWalWorkerError::state("passive quiesce drain omits the bound shard epoch target")
+        })?;
+    if draining.lifecycle != StreamLifecycle::Draining
+        || draining.strict_block.is_some()
+        || draining.identity != key.identity
+        || draining.binding.enrollment_id != key.enrollment_id.to_string()
+        || draining.binding.shard_ids != vec![key.shard_id.to_string()]
+        || current_claim.identity != key.identity
+        || current_claim.lifecycle_operation_id.as_deref() != Some(drain.drain_id.as_str())
+        || current_claim.binding_scope_id != draining.binding_scope_id
+        || current_claim.enrollment_id != draining.binding.enrollment_id
+        || current_claim.shard_id != key.shard_id.to_string()
+        || current_claim.stream_incarnation_id != draining.enrollment_receipt.stream_incarnation_id
+        || current_claim.stream_configuration_digest != draining.binding.stream_config_hash
+        || current_claim.physical_binding_digest != physical_binding_digest
+        || draining.current_claim_receipt_id.as_deref() != Some(current_claim.record_id.as_str())
+        || expected_claim_chain != draining.claim_receipt_chain
+        || current_claim.authenticated_tail_position != draining.authenticated_wal_tail.position
+        || current_claim.authenticated_tail_segment_count
+            != draining.authenticated_wal_tail.segment_count
+        || current_claim.authenticated_tail_chain_digest
+            != draining.authenticated_wal_tail.chain_digest
+        || current_claim.authenticated_tail_lww_projection_digest
+            != draining.authenticated_wal_tail.lww_projection_digest
+        || current_claim.sentinel_position != draining.authenticated_wal_tail.position
+        || epoch_floor != current_claim.achieved_writer_epoch
+        || drain_target_epoch != current_claim.achieved_writer_epoch
+    {
+        return Err(MemWalWorkerError::state(
+            "passive quiesce claim differs from current drain, binding, receipt-chain, lifecycle/drain epoch, sentinel, cursor, or authenticated-tail authority",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_passive_claim_epoch(
+    current_claim: &ClaimReceipt,
+    shard_manifest_version: u64,
+    writer_epoch: u64,
+) -> Result<(), MemWalWorkerError> {
+    if shard_manifest_version < current_claim.achieved_shard_manifest_version
+        || writer_epoch != current_claim.achieved_writer_epoch
+    {
+        return Err(MemWalWorkerError::state(format!(
+            "passive quiesce physical cut (manifest={shard_manifest_version}, epoch={writer_epoch}) differs from current claim (manifest={}, epoch={})",
+            current_claim.achieved_shard_manifest_version,
+            current_claim.achieved_writer_epoch,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_passive_flushed_claim_physical_cut(
+    current_claim: &ClaimReceipt,
+    shard_manifest_version: u64,
+    writer_epoch: u64,
+    replay_after_wal_entry_position: u64,
+) -> Result<(), MemWalWorkerError> {
+    validate_passive_claim_epoch(current_claim, shard_manifest_version, writer_epoch)?;
+    if replay_after_wal_entry_position != current_claim.sentinel_position {
+        return Err(MemWalWorkerError::state(format!(
+            "passive flushed quiesce cursor {replay_after_wal_entry_position} differs from current claim sentinel {}",
+            current_claim.sentinel_position,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_passive_unflushed_claim_physical_cut(
+    current_claim: &ClaimReceipt,
+    shard_manifest_version: u64,
+    writer_epoch: u64,
+    replay_after_wal_entry_position: u64,
+) -> Result<(), MemWalWorkerError> {
+    validate_passive_claim_epoch(current_claim, shard_manifest_version, writer_epoch)?;
+    if replay_after_wal_entry_position != current_claim.replay_cursor {
+        return Err(MemWalWorkerError::state(format!(
+            "passive unflushed quiesce cursor {replay_after_wal_entry_position} differs from current claim replay cursor {}",
+            current_claim.replay_cursor,
+        )));
+    }
+    Ok(())
+}
+
 fn key_identity(key: StreamWorkerKey) -> TableIdentity {
     key.identity
 }
@@ -4217,6 +4901,49 @@ struct ProvenCut {
     generation: u64,
     path: String,
     replay_after_wal_entry_position: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProvenEmptyCut {
+    shard_manifest_version: u64,
+    current_generation: u64,
+    replay_after_wal_entry_position: u64,
+}
+
+async fn prove_empty_fence_cut(writer: &ShardWriter) -> Result<ProvenEmptyCut, MemWalWorkerError> {
+    writer
+        .check_fenced()
+        .await
+        .map_err(|error| MemWalWorkerError::lance("empty-cut writer fence check", error))?;
+    let in_memory = writer
+        .in_memory_memtable_refs()
+        .await
+        .map_err(|error| MemWalWorkerError::lance("empty-cut in-memory proof", error))?;
+    if !in_memory.frozen.is_empty() || in_memory.active.batch_store.iter().len() != 0 {
+        return Err(MemWalWorkerError::state(
+            "empty-cut in-memory state is not one empty active generation",
+        ));
+    }
+    let manifest = writer
+        .manifest()
+        .await
+        .map_err(|error| MemWalWorkerError::lance("empty-cut manifest proof", error))?
+        .ok_or_else(|| MemWalWorkerError::state("empty-cut shard manifest is absent"))?;
+    if manifest.shard_id != writer.shard_id()
+        || manifest.shard_spec_id != UNSHARDED_SPEC_ID
+        || manifest.status != ShardStatus::Active
+        || manifest.writer_epoch != writer.epoch()
+        || manifest.current_generation != in_memory.active.generation
+    {
+        return Err(MemWalWorkerError::state(format!(
+            "empty-cut manifest does not prove the freshly claimed empty writer: {manifest:?}"
+        )));
+    }
+    Ok(ProvenEmptyCut {
+        shard_manifest_version: manifest.version,
+        current_generation: manifest.current_generation,
+        replay_after_wal_entry_position: manifest.replay_after_wal_entry_position,
+    })
 }
 
 async fn prove_existing_flushed_cut(
@@ -4230,12 +4957,19 @@ async fn prove_existing_flushed_cut(
     )
     .await
     .and_then(|cut| {
-        if cut.path == expected.path {
+        if cut.path == expected.path
+            // Lance may publish later bookkeeping versions for the same
+            // claimed epoch after the flushed cut was first classified. The
+            // generation, path, cursor, and writer epoch are the authority;
+            // the manifest version must only be monotonic.
+            && cut.shard_manifest_version >= expected.shard_manifest_version
+            && writer.epoch() == expected.writer_epoch
+        {
             Ok(cut)
         } else {
             Err(MemWalWorkerError::state(format!(
-                "flushed generation path changed: expected {}, observed {}",
-                expected.path, cut.path
+                "flushed generation proof changed: expected={expected:?}, observed={cut:?}, writer_epoch={}",
+                writer.epoch()
             )))
         }
     })
@@ -4292,6 +5026,53 @@ async fn prove_post_drain_cut(
     })
 }
 
+/// A physical quiescence cut obtained after retiring any cached writer under
+/// exclusive admission. Ordinary quiescence makes a fresh epoch claim;
+/// restart recovery may instead authenticate an already-published claim and
+/// reuse its exact passive cut.
+pub(crate) enum QuiesceCut {
+    Empty(EmptyFenceCut),
+    Generation(SealedGenerationCut),
+}
+
+/// Restart-time outcome of passive DRAINING inspection.
+///
+/// The fresh-claim branch returns the exclusive token explicitly, preventing
+/// the caller from accidentally opening an admission window between passive
+/// proof and its unique successor claim.
+pub(crate) enum PassiveQuiesceDisposition {
+    Reusable(QuiesceCut),
+    FreshClaimRequired(CheckedExclusiveStreamAuthority),
+}
+
+impl QuiesceCut {
+    pub(crate) fn into_exclusive_authority(self) -> CheckedExclusiveStreamAuthority {
+        match self {
+            Self::Empty(cut) => cut.into_exclusive_authority(),
+            Self::Generation(cut) => cut.into_exclusive_authority(),
+        }
+    }
+}
+
+/// Exact proof that a freshly claimed writer owned one empty active
+/// generation before it was retired. The exclusive admission lease remains
+/// held so graph orchestration can publish the lifecycle transition without
+/// reopening the stream.
+pub(crate) struct EmptyFenceCut {
+    pub(crate) key: StreamWorkerKey,
+    pub(crate) writer_epoch: u64,
+    pub(crate) shard_manifest_version: u64,
+    pub(crate) current_generation: u64,
+    pub(crate) replay_after_wal_entry_position: u64,
+    _exclusive_authority: CheckedExclusiveStreamAuthority,
+}
+
+impl EmptyFenceCut {
+    pub(crate) fn into_exclusive_authority(self) -> CheckedExclusiveStreamAuthority {
+        self._exclusive_authority
+    }
+}
+
 /// Immutable fresh-tier cut plus the still-held exclusive admission lease.
 pub(crate) struct SealedGenerationCut {
     pub(crate) key: StreamWorkerKey,
@@ -4316,6 +5097,16 @@ impl SealedGenerationCut {
             }],
         }
     }
+
+    pub(crate) fn into_exclusive_authority(self) -> CheckedExclusiveStreamAuthority {
+        let Self {
+            _exclusive_authority,
+            _fold_usage,
+            ..
+        } = self;
+        drop(_fold_usage);
+        _exclusive_authority
+    }
 }
 
 #[cfg(test)]
@@ -4323,11 +5114,241 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
 
-    use arrow_array::{Int32Array, StringArray};
+    use arrow_array::{Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use lance::dataset::mem_wal::DatasetMemWalExt;
+    // forbidden-api-allow: test-only raw Lance fixture mutation and reopen
+    use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
+    use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
+    use lance_file::version::LanceFileVersion;
     use lance_index::mem_wal::{MergedGeneration, ShardingField, ShardingSpec};
 
+    use super::super::{
+        MemWalEnrollmentPlan, capture_pre_enrollment_head, initialize_index_from_exact_no_effect,
+        provision_shard_from_exact_index_only,
+    };
     use super::*;
+
+    fn test_digest(nibble: char) -> String {
+        format!("sha256:{}", nibble.to_string().repeat(64))
+    }
+
+    fn passive_test_drain_and_claim(
+        key: StreamWorkerKey,
+        achieved_shard_manifest_version: u64,
+        achieved_writer_epoch: u64,
+        sentinel_position: u64,
+        sentinel_only: bool,
+    ) -> (StreamLifecycleEntry, ClaimReceipt) {
+        use crate::db::manifest::stream::{
+            AuthenticatedWalTail, BindingReceipt, ClaimProfile, ClaimReceiptPreimage,
+            ClaimTerminalClassification, CurrentHeadWitness, DrainDescriptor, DrainGoal,
+            EnrollmentReceipt, QUIESCE_REQUEST_PROTOCOL_VERSION, QuiesceRequestPayload,
+            authenticated_wal_tail_chain_digest, binding_receipt_chain_genesis,
+            stream_graph_identity_digest,
+        };
+        use lance::dataset::refs::BranchIdentifier;
+
+        assert!(achieved_shard_manifest_version > 1);
+        assert!(achieved_writer_epoch > 1);
+        assert!(sentinel_position > 0);
+        let graph_identity_digest =
+            stream_graph_identity_digest("passive-worker-test-domain").unwrap();
+        let enrollment_request_id = ShardId::new_v4().to_string();
+        let stream_incarnation_id = ShardId::new_v4().to_string();
+        let binding_scope_id = ShardId::new_v4().to_string();
+        let binding = StreamPhysicalBinding {
+            stable_table_id: key.identity.stable_table_id,
+            table_incarnation_id: key.identity.table_incarnation_id,
+            table_location: format!(
+                "nodes/{}-{}",
+                key.identity.stable_table_id, key.identity.table_incarnation_id
+            ),
+            table_branch: None,
+            enrollment_id: key.enrollment_id.to_string(),
+            shard_ids: vec![key.shard_id.to_string()],
+            stream_config_version: STREAM_CONFIG_VERSION,
+            stream_config_hash: stream_config_v3_hash(),
+        };
+        let enrollment_receipt = EnrollmentReceipt::new(
+            enrollment_request_id,
+            test_digest('1'),
+            stream_incarnation_id.clone(),
+            binding.clone(),
+        )
+        .unwrap();
+        let binding_receipt = BindingReceipt::new(
+            graph_identity_digest.clone(),
+            key.identity,
+            &binding_receipt_chain_genesis(),
+            &binding_scope_id,
+            &stream_incarnation_id,
+            binding.clone(),
+            "INITIAL_ENROLLMENT",
+            1,
+        )
+        .unwrap();
+        let initial_epoch = achieved_writer_epoch - 1;
+        let open = StreamLifecycleEntry::new_open_enrollment(
+            key.identity,
+            "node:PassiveTest".to_string(),
+            binding.clone(),
+            binding_scope_id.clone(),
+            CurrentHeadWitness {
+                branch_identifier: BranchIdentifier::main(),
+                table_version: 1,
+                transaction_uuid: ShardId::new_v4().to_string(),
+                manifest_e_tag: None,
+            },
+            BTreeMap::from([(key.shard_id.to_string(), initial_epoch)]),
+            enrollment_receipt,
+            binding_receipt.record_id.clone(),
+            binding_receipt.next_chain_ref().unwrap(),
+        )
+        .unwrap();
+        let drain_id = ShardId::new_v4().to_string();
+        let mut draining = open.clone();
+        draining.lifecycle = StreamLifecycle::Draining;
+        draining.lifecycle_revision += 1;
+        let operation_request_payload = QuiesceRequestPayload {
+            protocol_version: QUIESCE_REQUEST_PROTOCOL_VERSION,
+            graph_identity_digest: graph_identity_digest.clone(),
+            identity: key.identity,
+            stream_incarnation_id: stream_incarnation_id.clone(),
+            binding_scope_id: binding_scope_id.clone(),
+            enrollment_id: binding.enrollment_id.clone(),
+            drain_id: drain_id.clone(),
+            expected_lifecycle_revision: open.lifecycle_revision,
+            goal: DrainGoal::Sealed,
+            physical_binding_digest: stream_physical_binding_digest(&binding).unwrap(),
+            expected_current_head_witness: open.current_head_witness.clone(),
+            target_epoch_floor_by_shard: BTreeMap::from([(
+                key.shard_id.to_string(),
+                initial_epoch,
+            )]),
+            seal_override: None,
+        };
+        let operation_request_digest = operation_request_payload.request_digest().unwrap();
+        draining.drain = Some(DrainDescriptor {
+            drain_id: drain_id.clone(),
+            operation_expected_revision: open.lifecycle_revision,
+            operation_request_digest,
+            goal: DrainGoal::Sealed,
+            initiating_actor: "operator:test".to_string(),
+            initiated_at: 1,
+            expected_binding: binding.clone(),
+            expected_current_head_witness: open.current_head_witness.clone(),
+            operation_request_payload,
+            target_epoch_floor_by_shard: BTreeMap::from([(
+                key.shard_id.to_string(),
+                initial_epoch,
+            )]),
+            guarded_operation: None,
+            seal_override: None,
+        });
+        draining.validate().unwrap();
+
+        let prior_tail = draining.authenticated_wal_tail.clone();
+        let prior_position = if sentinel_only {
+            sentinel_position - 1
+        } else {
+            0
+        };
+        let entry_count = sentinel_position - prior_position;
+        let segment_projection_digest = test_digest(if sentinel_only { '7' } else { '6' });
+        let full_projection_digest = test_digest('7');
+        let segment_digest = test_digest('3');
+        let empty_fence_digest = test_digest('4');
+        let tail_chain_digest = authenticated_wal_tail_chain_digest(
+            &binding_scope_id,
+            &key.enrollment_id.to_string(),
+            &key.shard_id.to_string(),
+            &stream_incarnation_id,
+            &binding.stream_config_hash,
+            &stream_physical_binding_digest(&binding).unwrap(),
+            prior_position,
+            sentinel_position,
+            entry_count,
+            &segment_digest,
+            &prior_tail.chain_digest,
+            1,
+            &empty_fence_digest,
+            &full_projection_digest,
+        )
+        .unwrap();
+        let claim = ClaimReceipt::new(
+            &draining.claim_receipt_chain,
+            ClaimReceiptPreimage {
+                graph_identity_digest,
+                identity: key.identity,
+                claim_id: ShardId::new_v4().to_string(),
+                lifecycle_operation_id: Some(drain_id),
+                binding_scope_id: binding_scope_id.clone(),
+                enrollment_id: key.enrollment_id.to_string(),
+                shard_id: key.shard_id.to_string(),
+                stream_incarnation_id,
+                stream_configuration_digest: binding.stream_config_hash.clone(),
+                physical_binding_digest: stream_physical_binding_digest(&binding).unwrap(),
+                recovery_operation_id: "passive-worker-test-claim".to_string(),
+                claim_kind: "DRAIN_FENCE".to_string(),
+                profile: ClaimProfile::RetainAll,
+                claim_operation_digest: test_digest('2'),
+                attempt_count: 1,
+                attempt_chain_head_id: test_digest('8'),
+                attempt_effect_chain_digest: test_digest('9'),
+                terminal_attempt_id: ShardId::new_v4().to_string(),
+                terminal_pre_shard_manifest_version: achieved_shard_manifest_version - 1,
+                achieved_shard_manifest_version,
+                achieved_writer_epoch,
+                sentinel_position,
+                sentinel_digest: test_digest('a'),
+                replay_cursor: if sentinel_only {
+                    sentinel_position - 1
+                } else {
+                    sentinel_position
+                },
+                authenticated_tail_prior_position: prior_position,
+                authenticated_tail_position: sentinel_position,
+                authenticated_tail_published_prefix_position: 0,
+                authenticated_tail_segment_entry_count: entry_count,
+                authenticated_tail_segment_digest: segment_digest,
+                authenticated_tail_segment_lww_projection_digest: segment_projection_digest,
+                authenticated_tail_prior_chain_digest: prior_tail.chain_digest,
+                authenticated_tail_segment_count: 1,
+                authenticated_tail_chain_digest: tail_chain_digest.clone(),
+                authenticated_tail_empty_fence_state_digest: empty_fence_digest,
+                authenticated_tail_lww_projection_digest: full_projection_digest.clone(),
+                terminal_effect_digest: test_digest('b'),
+                terminal_classification: ClaimTerminalClassification::StockManifestPlusSentinel,
+                recorded_at: 2,
+            },
+        )
+        .unwrap();
+        let mut adopted = draining;
+        adopted.lifecycle_revision += 1;
+        adopted.claim_receipt_chain = claim.next_chain_ref().unwrap();
+        adopted.current_claim_receipt_id = Some(claim.record_id.clone());
+        adopted.authenticated_wal_tail = AuthenticatedWalTail {
+            binding_scope_id,
+            position: sentinel_position,
+            segment_count: 1,
+            chain_digest: tail_chain_digest,
+            lww_projection_digest: full_projection_digest,
+        };
+        *adopted
+            .epoch_floor_by_shard
+            .get_mut(&key.shard_id.to_string())
+            .unwrap() = achieved_writer_epoch;
+        *adopted
+            .drain
+            .as_mut()
+            .unwrap()
+            .target_epoch_floor_by_shard
+            .get_mut(&key.shard_id.to_string())
+            .unwrap() = achieved_writer_epoch;
+        adopted.validate().unwrap();
+        (adopted, claim)
+    }
 
     fn details(enrollment_id: ShardId) -> MemWalIndexDetails {
         MemWalIndexDetails {
@@ -4382,6 +5403,381 @@ mod tests {
             abort_deadline: Duration::from_secs(1),
             idle_timeout: Duration::from_secs(30),
         }
+    }
+
+    struct EnrolledWorkerFixture {
+        _dir: tempfile::TempDir,
+        uri: String,
+        dataset: Dataset,
+        details: MemWalIndexDetails,
+        plan: MemWalEnrollmentPlan,
+        key: StreamWorkerKey,
+        initial_epoch: u64,
+    }
+
+    async fn fresh_worker_dataset(uri: &str) -> Dataset {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false).with_metadata(HashMap::from([(
+                LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
+                "true".to_string(),
+            )])),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let seed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["seed"])),
+                Arc::new(Int32Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(seed)], schema);
+        // forbidden-api-allow: test-only exact worker fixture construction
+        Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn enrolled_worker_fixture(label: &str) -> EnrolledWorkerFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{label}.lance"));
+        let uri = path.to_str().unwrap().to_string();
+        let mut dataset = fresh_worker_dataset(&uri).await;
+        let before = capture_pre_enrollment_head(&dataset).await.unwrap();
+        let plan = MemWalEnrollmentPlan::new(ShardId::new_v4(), ShardId::new_v4()).unwrap();
+        initialize_index_from_exact_no_effect(&mut dataset, &before, &plan)
+            .await
+            .unwrap();
+        let (_, shard) = provision_shard_from_exact_index_only(&dataset, &before, &plan)
+            .await
+            .unwrap();
+        // forbidden-api-allow: test-only raw Lance fixture reopen
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let details = dataset.mem_wal_index_details().await.unwrap().unwrap();
+        let key = StreamWorkerKey::new(
+            TableIdentity::new(59, 61).unwrap(),
+            plan.enrollment_id,
+            plan.shard_id,
+        )
+        .unwrap();
+        EnrolledWorkerFixture {
+            _dir: dir,
+            uri,
+            dataset,
+            details,
+            plan,
+            key,
+            initial_epoch: shard.writer_epoch,
+        }
+    }
+
+    fn fresh_worker_opener(
+        dataset: Dataset,
+        table_root_uri: String,
+        details: MemWalIndexDetails,
+        enrollment_id: ShardId,
+        shard_id: ShardId,
+        epoch_floor: u64,
+    ) -> WorkerOpener {
+        Box::new(move || {
+            Box::pin(async move {
+                let config = reconstruct_b1_writer_config(&details, enrollment_id, shard_id)
+                    .map_err(WorkerOpenFailure::unclaimed)?;
+                let writer = dataset
+                    .mem_wal_writer(shard_id, config)
+                    .await
+                    .map_err(|error| {
+                        WorkerOpenFailure::unclaimed(MemWalWorkerError::lance(
+                            "test writer claim",
+                            error,
+                        ))
+                    })?;
+                OpenedMemWalWorker::classify(
+                    writer,
+                    &dataset,
+                    &table_root_uri,
+                    &details,
+                    epoch_floor,
+                )
+                .await
+            })
+        })
+    }
+
+    async fn claim_opened_worker(
+        dataset: &Dataset,
+        table_root_uri: &str,
+        details: &MemWalIndexDetails,
+        plan: &MemWalEnrollmentPlan,
+        epoch_floor: u64,
+    ) -> OpenedMemWalWorker {
+        let config =
+            reconstruct_b1_writer_config(details, plan.enrollment_id, plan.shard_id).unwrap();
+        let writer = dataset.mem_wal_writer(plan.shard_id, config).await.unwrap();
+        match OpenedMemWalWorker::classify(writer, dataset, table_root_uri, details, epoch_floor)
+            .await
+        {
+            Ok(opened) => opened,
+            Err(failure) => {
+                let (error, _) = failure.into_parts();
+                panic!("test writer classification failed: {error}");
+            }
+        }
+    }
+
+    async fn install_cached_worker(
+        registry: &Arc<MemWalWorkerRegistry>,
+        key: StreamWorkerKey,
+        opened: OpenedMemWalWorker,
+    ) -> Arc<MemWalWorker> {
+        assert!(matches!(
+            &opened.disposition,
+            ActiveStreamDisposition::AdmitEmpty
+        ));
+        registry.reserve_resident(key.identity).unwrap();
+        let worker = Arc::new(MemWalWorker::from_opened(
+            key,
+            "node:Test".to_string(),
+            opened,
+        ));
+        registry.register_initial_worker_usage(&worker).unwrap();
+        let slot = registry.slot(key);
+        let mut state = slot.state.lock().await;
+        assert!(matches!(&*state, RegistrySlotState::Vacant));
+        *state = RegistrySlotState::Active(Arc::clone(&worker));
+        worker
+    }
+
+    async fn assert_real_empty_quiesce(
+        fixture: &EnrolledWorkerFixture,
+        expected_generation: u64,
+        expected_cursor: u64,
+    ) -> u64 {
+        let registry = MemWalWorkerRegistry::for_root(
+            &format!(
+                "memory://real-empty-quiesce/{}/{}",
+                fixture.key,
+                ShardId::new_v4()
+            ),
+            limits(),
+        )
+        .unwrap();
+        let opened = claim_opened_worker(
+            &fixture.dataset,
+            &fixture.uri,
+            &fixture.details,
+            &fixture.plan,
+            fixture.initial_epoch,
+        )
+        .await;
+        let old_worker = install_cached_worker(&registry, fixture.key, opened).await;
+        let old_epoch = old_worker.writer.epoch();
+        let old_manifest = old_worker.writer.manifest().await.unwrap().unwrap();
+        assert_eq!(old_manifest.current_generation, expected_generation);
+        assert_eq!(
+            old_manifest.replay_after_wal_entry_position,
+            expected_cursor
+        );
+
+        let admission = Arc::new(tokio::sync::RwLock::new(()));
+        let exclusive = Arc::clone(&admission).write_owned().await;
+        let opener = fresh_worker_opener(
+            fixture.dataset.clone(),
+            fixture.uri.clone(),
+            fixture.details.clone(),
+            fixture.plan.enrollment_id,
+            fixture.plan.shard_id,
+            fixture.initial_epoch,
+        );
+        let cut = registry
+            .quiesce_cut(
+                fixture.key,
+                "node:Test".to_string(),
+                CheckedExclusiveStreamAuthority::from_exclusive_admission(exclusive),
+                opener,
+            )
+            .await
+            .unwrap();
+        let QuiesceCut::Empty(cut) = cut else {
+            panic!("an empty reopened shard must return EmptyFenceCut");
+        };
+        assert_eq!(cut.key, fixture.key);
+        assert!(
+            cut.writer_epoch > old_epoch,
+            "quiesce must retire epoch {old_epoch} and cut from a fresh successor, got {}",
+            cut.writer_epoch
+        );
+        assert!(
+            cut.shard_manifest_version > old_manifest.version,
+            "the fresh epoch claim must advance the shard manifest"
+        );
+        assert_eq!(cut.current_generation, expected_generation);
+        assert_eq!(cut.replay_after_wal_entry_position, expected_cursor);
+        assert!(
+            old_worker.writer.check_fenced().await.is_err(),
+            "the cached prior owner must be fenced by the fresh claim"
+        );
+        {
+            let slot = registry.slot(fixture.key);
+            assert!(matches!(
+                &*slot.state.lock().await,
+                RegistrySlotState::Vacant
+            ));
+            let usage = registry.usage.lock().unwrap();
+            assert_eq!(usage.resident_writers_root, 0);
+            assert_eq!(usage.reserved_arrow_bytes, 0);
+            assert_eq!(usage.pending_generations, 0);
+            assert_eq!(usage.inflight_calls, 0);
+        }
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                Arc::clone(&admission).read_owned(),
+            )
+            .await
+            .is_err(),
+            "the returned empty cut must retain exclusive admission"
+        );
+        let fresh_epoch = cut.writer_epoch;
+        let authority = cut.into_exclusive_authority();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                Arc::clone(&admission).read_owned(),
+            )
+            .await
+            .is_err(),
+            "extracting authority must transfer rather than release it"
+        );
+        drop(authority);
+        tokio::time::timeout(Duration::from_secs(2), admission.read_owned())
+            .await
+            .expect("dropping extracted authority must release admission");
+        fresh_epoch
+    }
+
+    async fn assert_ordinary_seal_still_refuses_empty(fixture: &EnrolledWorkerFixture) {
+        let registry = MemWalWorkerRegistry::for_root(
+            &format!(
+                "memory://ordinary-empty-seal/{}/{}",
+                fixture.key,
+                ShardId::new_v4()
+            ),
+            limits(),
+        )
+        .unwrap();
+        let admission = Arc::new(tokio::sync::RwLock::new(()));
+        let exclusive = Arc::clone(&admission).write_owned().await;
+        let opener = fresh_worker_opener(
+            fixture.dataset.clone(),
+            fixture.uri.clone(),
+            fixture.details.clone(),
+            fixture.plan.enrollment_id,
+            fixture.plan.shard_id,
+            fixture.initial_epoch,
+        );
+        let error = match registry
+            .seal_and_drain(
+                fixture.key,
+                "node:Test".to_string(),
+                CheckedExclusiveStreamAuthority::from_exclusive_admission(exclusive),
+                opener,
+            )
+            .await
+        {
+            Ok(_) => panic!("ordinary seal_and_drain must continue to refuse an empty generation"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("cannot seal an empty admitted generation")
+        );
+        tokio::time::timeout(Duration::from_secs(2), admission.read_owned())
+            .await
+            .expect("empty refusal must retire its claimed writer and release admission");
+        let slot = registry.slot(fixture.key);
+        assert!(matches!(
+            &*slot.state.lock().await,
+            RegistrySlotState::Vacant
+        ));
+    }
+
+    async fn fold_and_reopen_empty_fixture(fixture: &mut EnrolledWorkerFixture) -> u64 {
+        let config = reconstruct_b1_writer_config(
+            &fixture.details,
+            fixture.plan.enrollment_id,
+            fixture.plan.shard_id,
+        )
+        .unwrap();
+        let writer = fixture
+            .dataset
+            .mem_wal_writer(fixture.plan.shard_id, config)
+            .await
+            .unwrap();
+        assert!(writer.epoch() > fixture.initial_epoch);
+        let (_, watcher) = writer.put_no_wait(vec![batch(1)]).await.unwrap();
+        watcher
+            .expect("durable test writer must return a watcher")
+            .wait()
+            .await
+            .unwrap();
+        writer.check_fenced().await.unwrap();
+        let expected_cursor = writer.wal_stats().next_wal_entry_position.saturating_sub(1);
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+        let physical_cut = prove_post_drain_cut(&writer, 1, Some(expected_cursor))
+            .await
+            .unwrap();
+        assert_eq!(physical_cut.generation, 1);
+        writer.abort().await.unwrap();
+
+        let source = batch(1);
+        let reader = RecordBatchIterator::new([Ok(source.clone())], source.schema());
+        let mut builder =
+            // forbidden-api-allow: test-only raw Lance fixture mutation
+            MergeInsertBuilder::try_new(Arc::new(fixture.dataset.clone()), vec!["id".to_string()])
+                .unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .use_index(false)
+            .conflict_retries(0)
+            .mark_generations_as_merged(vec![MergedGeneration::new(
+                fixture.plan.shard_id,
+                physical_cut.generation,
+            )]);
+        let (dataset, stats) = builder
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(reader))
+            .await
+            .unwrap();
+        assert_eq!(stats.num_inserted_rows, 1);
+        drop(dataset);
+
+        // forbidden-api-allow: test-only raw Lance fixture reopen
+        fixture.dataset = Dataset::open(&fixture.uri).await.unwrap();
+        fixture.details = fixture
+            .dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fixture.details.merged_generations,
+            vec![MergedGeneration::new(fixture.plan.shard_id, 1)]
+        );
+        expected_cursor
     }
 
     #[test]
@@ -4791,6 +6187,336 @@ mod tests {
             .expect("continuation must run")
             .expect("continuation signal");
         assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiesce_never_written_enrolled_shard_uses_fresh_empty_epoch() {
+        let fixture = enrolled_worker_fixture("never-written-empty-quiesce").await;
+        assert_eq!(fixture.initial_epoch, 1);
+        let fresh_epoch = assert_real_empty_quiesce(&fixture, 1, 0).await;
+        assert!(
+            fresh_epoch >= 3,
+            "one cached owner must be retired before the fresh empty cut"
+        );
+        assert_ordinary_seal_still_refuses_empty(&fixture).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiesce_folded_reopened_empty_shard_uses_fresh_empty_epoch() {
+        let mut fixture = enrolled_worker_fixture("folded-reopened-empty-quiesce").await;
+        let cursor = fold_and_reopen_empty_fixture(&mut fixture).await;
+        assert!(cursor > 0);
+        let fresh_epoch = assert_real_empty_quiesce(&fixture, 2, cursor).await;
+        assert!(
+            fresh_epoch >= 4,
+            "fold writer and cached owner must both precede the fresh empty cut"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reopened_flushed_data_generation_replays_full_current_projection() {
+        let mut fixture = enrolled_worker_fixture("flushed-projection-reopen").await;
+        let config = reconstruct_b1_writer_config(
+            &fixture.details,
+            fixture.plan.enrollment_id,
+            fixture.plan.shard_id,
+        )
+        .unwrap();
+        let writer = fixture
+            .dataset
+            .mem_wal_writer(fixture.plan.shard_id, config)
+            .await
+            .unwrap();
+        let flushed_epoch = writer.epoch();
+        let (_, watcher) = writer.put_no_wait(vec![batch(1)]).await.unwrap();
+        watcher
+            .expect("durable test writer must return a watcher")
+            .wait()
+            .await
+            .unwrap();
+        writer.check_fenced().await.unwrap();
+        let expected_cursor = writer.wal_stats().next_wal_entry_position.saturating_sub(1);
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+        let cut = prove_post_drain_cut(&writer, 1, Some(expected_cursor))
+            .await
+            .unwrap();
+        assert_eq!(cut.generation, 1);
+        writer.abort().await.unwrap();
+
+        // forbidden-api-allow: test-only raw Lance fixture reopen
+        fixture.dataset = Dataset::open(&fixture.uri).await.unwrap();
+        fixture.details = fixture
+            .dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap();
+        let config = reconstruct_b1_writer_config(
+            &fixture.details,
+            fixture.plan.enrollment_id,
+            fixture.plan.shard_id,
+        )
+        .unwrap();
+        let successor = fixture
+            .dataset
+            .mem_wal_writer(fixture.plan.shard_id, config)
+            .await
+            .unwrap();
+        let mut opened = match OpenedMemWalWorker::classify(
+            successor,
+            &fixture.dataset,
+            &fixture.uri,
+            &fixture.details,
+            flushed_epoch,
+        )
+        .await
+        {
+            Ok(opened) => opened,
+            Err(failure) => {
+                let (error, _) = failure.into_parts();
+                panic!("flushed successor classification failed: {error}");
+            }
+        };
+        assert!(matches!(
+            &opened.disposition,
+            ActiveStreamDisposition::FoldOnlyFlushed(flushed)
+                if flushed.generation == cut.generation && flushed.path == cut.path
+        ));
+        let CurrentGenerationProjectionSource::Replay(batches) = opened
+            .current_generation_projection_source()
+            .expect("flushed projection must be available exactly once")
+        else {
+            panic!("a data-bearing flushed generation must replay its full projection");
+        };
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let ids = batches[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let tombstones = batches[0]
+            .column_by_name(lance::dataset::mem_wal::TOMBSTONE)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!(ids.value(0), "id-0");
+        assert!(!tombstones.value(0));
+        assert!(
+            opened.current_generation_projection_source().is_err(),
+            "the generation-sized projection must not remain resident after claim publication takes it"
+        );
+        opened.writer().abort().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn passive_quiesce_reuses_current_claim_flushed_generation_without_fresh_claim() {
+        let key = StreamWorkerKey::new(
+            TableIdentity::new(67, 71).unwrap(),
+            ShardId::new_v4(),
+            ShardId::new_v4(),
+        )
+        .unwrap();
+        let (draining, claim) = passive_test_drain_and_claim(key, 7, 3, 2, false);
+        validate_passive_drain_claim(key, &draining, &claim).unwrap();
+        let registry = MemWalWorkerRegistry::for_root(
+            &format!("memory://passive-flushed/{}", ShardId::new_v4()),
+            limits(),
+        )
+        .unwrap();
+        let admission = Arc::new(tokio::sync::RwLock::new(()));
+        let exclusive = Arc::clone(&admission).write_owned().await;
+        let inflight = registry.reserve_inflight_core().unwrap();
+        let disposition = registry
+            .passive_disposition_from_physical(
+                key,
+                CheckedExclusiveStreamAuthority::from_exclusive_admission(exclusive),
+                &draining,
+                &claim,
+                PassiveB1PhysicalState::FoldOnlyFlushed(FlushedGenerationState {
+                    shard_manifest_version: 8,
+                    writer_epoch: 3,
+                    generation: 1,
+                    path: "_mem_wal/test/generation-1.lance".to_string(),
+                    replay_after_wal_entry_position: 2,
+                }),
+                inflight,
+            )
+            .unwrap();
+        let PassiveQuiesceDisposition::Reusable(QuiesceCut::Generation(cut)) = disposition else {
+            panic!("the exact already-flushed claim cut must be reusable");
+        };
+        assert_eq!(cut.writer_epoch, 3);
+        assert_eq!(cut.shard_manifest_version, 8);
+        assert_eq!(cut.generation, 1);
+        assert_eq!(cut.replay_after_wal_entry_position, 2);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                Arc::clone(&admission).read_owned()
+            )
+            .await
+            .is_err(),
+            "the reusable generation cut must retain exclusive admission"
+        );
+        drop(cut.into_exclusive_authority());
+        tokio::time::timeout(Duration::from_secs(1), admission.read_owned())
+            .await
+            .expect("dropping transferred authority must release admission");
+        let usage = registry.usage.lock().unwrap();
+        assert_eq!(usage.resident_writers_root, 0);
+        assert_eq!(usage.pending_generations, 0);
+        assert_eq!(usage.inflight_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn passive_quiesce_nonempty_unsealed_replay_requires_fresh_claim_and_preserves_authority()
+    {
+        let key = StreamWorkerKey::new(
+            TableIdentity::new(73, 79).unwrap(),
+            ShardId::new_v4(),
+            ShardId::new_v4(),
+        )
+        .unwrap();
+        let (draining, claim) = passive_test_drain_and_claim(key, 9, 4, 2, false);
+        validate_passive_drain_claim(key, &draining, &claim).unwrap();
+        let registry = MemWalWorkerRegistry::for_root(
+            &format!("memory://passive-replay/{}", ShardId::new_v4()),
+            limits(),
+        )
+        .unwrap();
+        let admission = Arc::new(tokio::sync::RwLock::new(()));
+        let exclusive = Arc::clone(&admission).write_owned().await;
+        let inflight = registry.reserve_inflight_core().unwrap();
+        let disposition = registry
+            .passive_disposition_from_physical(
+                key,
+                CheckedExclusiveStreamAuthority::from_exclusive_admission(exclusive),
+                &draining,
+                &claim,
+                PassiveB1PhysicalState::AdmitOrReplay {
+                    shard_manifest_version: 9,
+                    current_generation: 1,
+                    replay_after_wal_entry_position: 2,
+                    writer_epoch: 4,
+                },
+                inflight,
+            )
+            .unwrap();
+        let PassiveQuiesceDisposition::FreshClaimRequired(authority) = disposition else {
+            panic!("nonempty unsealed replay must require one fresh claim");
+        };
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                Arc::clone(&admission).read_owned()
+            )
+            .await
+            .is_err(),
+            "fresh-claim handoff must retain exclusive admission"
+        );
+        assert_eq!(registry.usage.lock().unwrap().inflight_calls, 0);
+        drop(authority);
+        tokio::time::timeout(Duration::from_secs(1), admission.read_owned())
+            .await
+            .expect("dropping returned authority must release admission");
+    }
+
+    #[tokio::test]
+    async fn passive_quiesce_reuses_current_empty_claim_without_fresh_claim() {
+        let key = StreamWorkerKey::new(
+            TableIdentity::new(83, 89).unwrap(),
+            ShardId::new_v4(),
+            ShardId::new_v4(),
+        )
+        .unwrap();
+        let (draining, claim) = passive_test_drain_and_claim(key, 11, 5, 1, true);
+        validate_passive_drain_claim(key, &draining, &claim).unwrap();
+        let registry = MemWalWorkerRegistry::for_root(
+            &format!("memory://passive-empty/{}", ShardId::new_v4()),
+            limits(),
+        )
+        .unwrap();
+        let admission = Arc::new(tokio::sync::RwLock::new(()));
+        let exclusive = Arc::clone(&admission).write_owned().await;
+        let inflight = registry.reserve_inflight_core().unwrap();
+        let disposition = registry
+            .passive_disposition_from_physical(
+                key,
+                CheckedExclusiveStreamAuthority::from_exclusive_admission(exclusive),
+                &draining,
+                &claim,
+                PassiveB1PhysicalState::AdmitOrReplay {
+                    shard_manifest_version: 12,
+                    current_generation: 1,
+                    replay_after_wal_entry_position: 0,
+                    writer_epoch: 5,
+                },
+                inflight,
+            )
+            .unwrap();
+        let PassiveQuiesceDisposition::Reusable(QuiesceCut::Empty(cut)) = disposition else {
+            panic!("an exact sentinel-only current claim must reuse its empty cut");
+        };
+        assert_eq!(cut.writer_epoch, 5);
+        assert_eq!(cut.shard_manifest_version, 12);
+        assert_eq!(cut.current_generation, 1);
+        assert_eq!(cut.replay_after_wal_entry_position, 0);
+        drop(cut.into_exclusive_authority());
+        tokio::time::timeout(Duration::from_secs(1), admission.read_owned())
+            .await
+            .expect("dropping empty-cut authority must release admission");
+        assert_eq!(registry.usage.lock().unwrap().inflight_calls, 0);
+    }
+
+    #[test]
+    fn passive_quiesce_refuses_foreign_drain_epoch_and_cursor_authority() {
+        let key = StreamWorkerKey::new(
+            TableIdentity::new(97, 101).unwrap(),
+            ShardId::new_v4(),
+            ShardId::new_v4(),
+        )
+        .unwrap();
+        let (draining, claim) = passive_test_drain_and_claim(key, 13, 6, 2, false);
+        let foreign_key = StreamWorkerKey::new(
+            TableIdentity::new(103, 107).unwrap(),
+            key.enrollment_id,
+            key.shard_id,
+        )
+        .unwrap();
+        assert!(validate_passive_drain_claim(foreign_key, &draining, &claim).is_err());
+        let mut future_target = draining.clone();
+        *future_target
+            .drain
+            .as_mut()
+            .unwrap()
+            .target_epoch_floor_by_shard
+            .get_mut(&key.shard_id.to_string())
+            .unwrap() = claim.achieved_writer_epoch + 1;
+        *future_target
+            .epoch_floor_by_shard
+            .get_mut(&key.shard_id.to_string())
+            .unwrap() = claim.achieved_writer_epoch + 1;
+        future_target.validate().unwrap();
+        assert!(validate_passive_drain_claim(key, &future_target, &claim).is_err());
+        assert!(validate_passive_claim_epoch(&claim, 13, 7).is_err());
+        assert!(
+            validate_passive_unflushed_claim_physical_cut(&claim, 13, 6, 1).is_err()
+        );
+        validate_passive_unflushed_claim_physical_cut(&claim, 14, 6, 2).unwrap();
+        validate_passive_flushed_claim_physical_cut(&claim, 14, 6, 2).unwrap();
+
+        let (_, stock_empty) = passive_test_drain_and_claim(key, 15, 7, 1, true);
+        validate_passive_unflushed_claim_physical_cut(&stock_empty, 15, 7, 0).unwrap();
+        assert!(
+            validate_passive_unflushed_claim_physical_cut(&stock_empty, 15, 7, 1).is_err()
+        );
+        validate_passive_flushed_claim_physical_cut(&stock_empty, 16, 7, 1).unwrap();
+        assert!(
+            validate_passive_flushed_claim_physical_cut(&stock_empty, 16, 7, 0).is_err()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -31,6 +31,7 @@ use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
 use lance::Dataset;
 use omnigraph_compiler::catalog::{Catalog, EdgeType};
+use sha2::{Digest, Sha256};
 
 use crate::db::{Omnigraph, Snapshot};
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
@@ -48,6 +49,20 @@ pub(crate) struct Violation {
     pub row_id: Option<String>,
     pub kind: MergeConflictKind,
     pub message: String,
+    /// Structured, validator-owned identities for a future bounded stream
+    /// correction. One logical violation may expose several current stream
+    /// keys (for example, the changed edges contributing to a cardinality
+    /// overflow). The lifecycle layer refuses to mint a repairable DataBlock
+    /// when this set is empty.
+    pub corrections: Vec<ViolationCorrectionEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViolationCorrectionEvidence {
+    pub logical_key: String,
+    pub field_path_or_group: Vec<String>,
+    pub violation_instance_id: String,
+    pub allowed_actions: Vec<String>,
 }
 
 impl Violation {
@@ -95,8 +110,30 @@ pub(crate) type ChangeSet = HashMap<String, TableChange>;
 /// (nodes **and** edges) — Δ-scoped to the changed rows. Reuses the loader
 /// leaves so the merge and write paths share one implementation; including the
 /// enum check here is what closes the merge-vs-write drift.
-pub(crate) fn evaluate_value_constraints(changeset: &ChangeSet, catalog: &Catalog) -> Vec<Violation> {
+pub(crate) fn evaluate_value_constraints(
+    changeset: &ChangeSet,
+    catalog: &Catalog,
+) -> Vec<Violation> {
     let mut violations = Vec::new();
+    evaluate_value_constraints_with_sink(changeset, catalog, &mut |violation| {
+        violations.push(violation);
+        Ok(())
+    })
+    .expect("the compatibility violation collector is infallible");
+    violations
+}
+
+/// Sink form of [`evaluate_value_constraints`]. Leaf validators still produce
+/// at most one error per invocation, but this avoids retaining their aggregate
+/// across every changed table and batch.
+fn evaluate_value_constraints_with_sink<F>(
+    changeset: &ChangeSet,
+    catalog: &Catalog,
+    sink: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Violation) -> Result<()>,
+{
     for (table_key, change) in changeset {
         if let Some(type_name) = table_key.strip_prefix("node:") {
             let Some(node_type) = catalog.node_types.get(type_name) else {
@@ -104,10 +141,11 @@ pub(crate) fn evaluate_value_constraints(changeset: &ChangeSet, catalog: &Catalo
             };
             for batch in change.value_batches() {
                 if let Err(err) = validate_value_constraints(batch, node_type) {
-                    violations.push(value_violation(table_key, err));
+                    sink(value_violation(table_key, err))?;
                 }
-                if let Err(err) = validate_enum_constraints(batch, &node_type.properties, type_name) {
-                    violations.push(value_violation(table_key, err));
+                if let Err(err) = validate_enum_constraints(batch, &node_type.properties, type_name)
+                {
+                    sink(value_violation(table_key, err))?;
                 }
             }
         } else if let Some(type_name) = table_key.strip_prefix("edge:") {
@@ -117,13 +155,14 @@ pub(crate) fn evaluate_value_constraints(changeset: &ChangeSet, catalog: &Catalo
             // Edges carry no @range/@check (NodeType-only), but their properties
             // can be enum-typed — the check the merge path was missing.
             for batch in change.value_batches() {
-                if let Err(err) = validate_enum_constraints(batch, &edge_type.properties, type_name) {
-                    violations.push(value_violation(table_key, err));
+                if let Err(err) = validate_enum_constraints(batch, &edge_type.properties, type_name)
+                {
+                    sink(value_violation(table_key, err))?;
                 }
             }
         }
     }
-    violations
+    Ok(())
 }
 
 /// Wrap a leaf-check error as a value-constraint [`Violation`]. The message is
@@ -135,6 +174,10 @@ fn value_violation(table_key: &str, err: OmniError) -> Violation {
         row_id: None,
         kind: MergeConflictKind::ValueConstraintViolation,
         message: err.to_string(),
+        // Stream admission rejects row-local range/check/enum failures before
+        // they can enter a retained generation. There is therefore no current
+        // stream winner to address from this surface-neutral fallback.
+        corrections: Vec::new(),
     }
 }
 
@@ -263,7 +306,11 @@ impl<'a> CommittedState<'a> {
     /// Write path: existence/uniqueness read `committed` (the write's pinned
     /// base); cardinality reads the live committed branch snapshot via `db`
     /// (#298).
-    pub(crate) fn write(committed: &'a Snapshot, db: &'a Omnigraph, branch: Option<&'a str>) -> Self {
+    pub(crate) fn write(
+        committed: &'a Snapshot,
+        db: &'a Omnigraph,
+        branch: Option<&'a str>,
+    ) -> Self {
         Self {
             committed: Some(committed),
             overwritten: HashSet::new(),
@@ -649,60 +696,97 @@ pub(crate) async fn evaluate(
     catalog: &Catalog,
 ) -> Result<Vec<Violation>> {
     let mut violations = Vec::new();
-    for constraint in constraints {
-        match constraint {
-            Constraint::Value => {
-                violations.extend(evaluate_value_constraints(changeset, catalog));
-            }
-            Constraint::Unique {
-                table_key,
-                columns,
-                is_key,
-            } => {
-                if let Some(change) = changeset.get(table_key) {
-                    violations.extend(
-                        evaluate_unique(table_key, columns, *is_key, change, committed).await?,
-                    );
+    evaluate_with_sink(constraints, changeset, committed, catalog, |violation| {
+        violations.push(violation);
+        Ok(())
+    })
+    .await?;
+    Ok(violations)
+}
+
+/// Run the declared constraints while emitting each violation as soon as it is
+/// produced. Constraint order, per-constraint ordering, and messages are
+/// identical to [`evaluate`]; unlike that compatibility wrapper, this entry
+/// point does not retain a graph-wide violation vector.
+///
+/// A fallible sink may observe a successful prefix before either it or a later
+/// validator returns an error. The returned count includes only violations the
+/// sink accepted.
+pub(crate) async fn evaluate_with_sink<F>(
+    constraints: &[Constraint],
+    changeset: &ChangeSet,
+    committed: &CommittedState<'_>,
+    catalog: &Catalog,
+    mut sink: F,
+) -> Result<usize>
+where
+    F: FnMut(Violation) -> Result<()>,
+{
+    let mut violation_count = 0usize;
+    {
+        let mut emit = |violation| {
+            let next_count = violation_count
+                .checked_add(1)
+                .ok_or_else(|| OmniError::manifest("integrity violation count overflow"))?;
+            sink(violation)?;
+            violation_count = next_count;
+            Ok(())
+        };
+
+        for constraint in constraints {
+            match constraint {
+                Constraint::Value => {
+                    evaluate_value_constraints_with_sink(changeset, catalog, &mut emit)?;
                 }
-            }
-            Constraint::EdgeRi {
-                table_key,
-                from_type,
-                to_type,
-            } => {
-                // Run when the edge itself has a delta OR when a referenced node
-                // type has deletions (path-b can strand a committed target edge
-                // even if this edge table has no delta of its own).
-                let node_deleted = |node_type: &str| {
-                    changeset
-                        .get(&format!("node:{node_type}"))
-                        .map(|change| !change.deleted_ids.is_empty())
-                        .unwrap_or(false)
-                };
-                let change = changeset.get(table_key);
-                if change.is_some() || node_deleted(from_type) || node_deleted(to_type) {
-                    violations.extend(
-                        evaluate_edge_ri(table_key, from_type, to_type, change, changeset, committed)
-                            .await?,
-                    );
+                Constraint::Unique {
+                    table_key,
+                    columns,
+                    is_key,
+                } => {
+                    if let Some(change) = changeset.get(table_key) {
+                        evaluate_unique(table_key, columns, *is_key, change, committed, &mut emit)
+                            .await?;
+                    }
                 }
-            }
-            Constraint::Cardinality { table_key } => {
-                if let Some(change) = changeset.get(table_key) {
-                    let Some(type_name) = table_key.strip_prefix("edge:") else {
-                        continue;
+                Constraint::EdgeRi {
+                    table_key,
+                    from_type,
+                    to_type,
+                } => {
+                    // Run when the edge itself has a delta OR when a referenced node
+                    // type has deletions (path-b can strand a committed target edge
+                    // even if this edge table has no delta of its own).
+                    let node_deleted = |node_type: &str| {
+                        changeset
+                            .get(&format!("node:{node_type}"))
+                            .map(|change| !change.deleted_ids.is_empty())
+                            .unwrap_or(false)
                     };
-                    if let Some(edge_type) = catalog.edge_types.get(type_name) {
-                        violations.extend(
-                            evaluate_cardinality(table_key, edge_type, change, changeset, committed)
-                                .await?,
-                        );
+                    let change = changeset.get(table_key);
+                    if change.is_some() || node_deleted(from_type) || node_deleted(to_type) {
+                        evaluate_edge_ri(
+                            table_key, from_type, to_type, change, changeset, committed, &mut emit,
+                        )
+                        .await?;
+                    }
+                }
+                Constraint::Cardinality { table_key } => {
+                    if let Some(change) = changeset.get(table_key) {
+                        let Some(type_name) = table_key.strip_prefix("edge:") else {
+                            continue;
+                        };
+                        if let Some(edge_type) = catalog.edge_types.get(type_name) {
+                            evaluate_cardinality(
+                                table_key, edge_type, change, changeset, committed, &mut emit,
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
         }
     }
-    Ok(violations)
+    Ok(violation_count)
 }
 
 /// Uniqueness for one `@unique`/`@key` group on `table_key`, evaluated against
@@ -719,14 +803,18 @@ pub(crate) async fn evaluate(
 ///    SURVIVING committed row (not itself in the delta, not deleted). `@key` is
 ///    id-backed, so a committed holder of a key value is the same row (an
 ///    upsert) — self-excluded — so the probe is skipped.
-async fn evaluate_unique(
+async fn evaluate_unique<F>(
     table_key: &str,
     columns: &[String],
     is_key: bool,
     change: &TableChange,
     committed: &CommittedState<'_>,
-) -> Result<Vec<Violation>> {
-    let mut violations = Vec::new();
+    sink: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Violation) -> Result<()>,
+{
+    let mut has_within_batch_violation = false;
     let delta_ids = delta_id_set(change)?;
     let deleted: HashSet<&String> = change.deleted_ids.iter().collect();
 
@@ -752,7 +840,20 @@ async fn evaluate_unique(
                 continue;
             };
             if let Some(prior) = seen_in_batch.insert(key.clone(), id.clone()) {
-                violations.push(unique_violation(table_key, columns, &key, &id, &prior));
+                let correctable_ids = if prior == id {
+                    vec![id.as_str()]
+                } else {
+                    vec![id.as_str(), prior.as_str()]
+                };
+                sink(unique_violation(
+                    table_key,
+                    columns,
+                    &key,
+                    &id,
+                    &prior,
+                    &correctable_ids,
+                ))?;
+                has_within_batch_violation = true;
             }
             // Typed literals from the row's Arrow columns for the committed probe
             // (a stringified key would compare a typed column to Utf8). `key` is
@@ -765,10 +866,12 @@ async fn evaluate_unique(
             final_by_id.insert(id, (key, values));
         }
     }
-    // A within-batch duplicate is an unambiguous bulk-input error; report it
-    // without the coalesced cross-row pass (which would re-report the same pair).
-    if !violations.is_empty() {
-        return Ok(violations);
+    // Preserve the established bulk-input contract and error ordering: a
+    // within-batch duplicate is reported before the coalesced cross-row and
+    // committed passes. Structured correction evidence is canonicalized
+    // independently inside `unique_violation`.
+    if has_within_batch_violation {
+        return Ok(());
     }
 
     // Deterministic order — no HashMap iteration in violation ordering.
@@ -781,7 +884,14 @@ async fn evaluate_unique(
     for (id, (key, _)) in &entries {
         if let Some(other) = holder_by_key.insert(key, id) {
             if other != id {
-                violations.push(unique_violation(table_key, columns, key, id, other));
+                sink(unique_violation(
+                    table_key,
+                    columns,
+                    key,
+                    id,
+                    other,
+                    &[id.as_str(), other.as_str()],
+                ))?;
             }
         }
     }
@@ -802,13 +912,20 @@ async fn evaluate_unique(
             };
             for holder in holders {
                 if !delta_ids.contains(holder) && !deleted.contains(holder) {
-                    violations.push(unique_violation(table_key, columns, key, id, holder));
+                    sink(unique_violation(
+                        table_key,
+                        columns,
+                        key,
+                        id,
+                        holder,
+                        &[id.as_str()],
+                    ))?;
                     break;
                 }
             }
         }
     }
-    Ok(violations)
+    Ok(())
 }
 
 /// Edge referential integrity for added∪changed edges: each endpoint must exist
@@ -819,17 +936,20 @@ async fn evaluate_unique(
 /// cascade-removed or surface as a structural `DeleteVsUpdate`). So checking the
 /// edge delta is sufficient and equivalent to the old full scan on all reachable
 /// inputs.
-async fn evaluate_edge_ri(
+async fn evaluate_edge_ri<F>(
     edge_table: &str,
     from_type: &str,
     to_type: &str,
     change: Option<&TableChange>,
     changeset: &ChangeSet,
     committed: &CommittedState<'_>,
-) -> Result<Vec<Violation>> {
+    sink: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Violation) -> Result<()>,
+{
     let from_table = format!("node:{from_type}");
     let to_table = format!("node:{to_type}");
-    let mut violations = Vec::new();
     // Delta edge ids — excluded from path-b (path-a already covers them).
     let mut delta_edge_ids: HashSet<String> = HashSet::new();
 
@@ -850,14 +970,15 @@ async fn evaluate_edge_ri(
         if !edges.is_empty() {
             let srcs: Vec<String> = edges.iter().map(|(_, src, _)| src.clone()).collect();
             let dsts: Vec<String> = edges.iter().map(|(_, _, dst)| dst.clone()).collect();
-            let from_exist = merged_node_existence(&from_table, &srcs, changeset, committed).await?;
+            let from_exist =
+                merged_node_existence(&from_table, &srcs, changeset, committed).await?;
             let to_exist = merged_node_existence(&to_table, &dsts, changeset, committed).await?;
             for (id, src, dst) in &edges {
                 if !from_exist.contains(src) {
-                    violations.push(orphan_violation(edge_table, id, "src", src, from_type));
+                    sink(orphan_violation(edge_table, id, "src", src, from_type))?;
                 }
                 if !to_exist.contains(dst) {
-                    violations.push(orphan_violation(edge_table, id, "dst", dst, to_type));
+                    sink(orphan_violation(edge_table, id, "dst", dst, to_type))?;
                 }
             }
         }
@@ -890,15 +1011,15 @@ async fn evaluate_edge_ri(
                 continue;
             }
             if from_set.contains(&src) {
-                violations.push(orphan_violation(edge_table, &id, "src", &src, from_type));
+                sink(orphan_violation(edge_table, &id, "src", &src, from_type))?;
             }
             if to_set.contains(&dst) {
-                violations.push(orphan_violation(edge_table, &id, "dst", &dst, to_type));
+                sink(orphan_violation(edge_table, &id, "dst", &dst, to_type))?;
             }
         }
     }
 
-    Ok(violations)
+    Ok(())
 }
 
 /// Which of `ids` exist in the merged node table `node_table` = `target ± delta`:
@@ -939,17 +1060,21 @@ async fn merged_node_existence(
 /// new src of each delta edge AND the old committed src of each changed/deleted
 /// edge id, so moving an edge off a src recounts the vacated src. A src that is
 /// itself a deleted node is skipped.
-async fn evaluate_cardinality(
+async fn evaluate_cardinality<F>(
     edge_table: &str,
     edge_type: &EdgeType,
     change: &TableChange,
     changeset: &ChangeSet,
     committed: &CommittedState<'_>,
-) -> Result<Vec<Violation>> {
+    sink: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Violation) -> Result<()>,
+{
     let card = &edge_type.cardinality;
     // Default unbounded cardinality can never be violated — skip the lookups.
     if card.min == 0 && card.max.is_none() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let delta_edges = delta_edge_src(change)?;
     let removed_ids: Vec<String> = change.deleted_ids.clone();
@@ -971,8 +1096,12 @@ async fn evaluate_cardinality(
     // in `deleted_ids`). `moved_from` are the changed ids' OLD committed srcs: an
     // upsert that moves an edge's src vacates its old src, which must be
     // recounted or a drop below @card min is missed.
-    let removed_edges = committed.committed_edges(edge_table, "id", &removed_ids).await?;
-    let moved_from = committed.committed_edges(edge_table, "id", &changed_ids).await?;
+    let removed_edges = committed
+        .committed_edges(edge_table, "id", &removed_ids)
+        .await?;
+    let moved_from = committed
+        .committed_edges(edge_table, "id", &changed_ids)
+        .await?;
 
     let deleted_src_nodes: HashSet<String> = changeset
         .get(&format!("node:{}", edge_type.from_type))
@@ -988,7 +1117,7 @@ async fn evaluate_cardinality(
     }
     affected.retain(|src| !deleted_src_nodes.contains(src));
     if affected.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     let affected_vec: Vec<String> = affected.iter().cloned().collect();
@@ -1012,33 +1141,65 @@ async fn evaluate_cardinality(
         per_src.entry(src.clone()).or_default().insert(id.clone());
     }
 
-    let mut violations = Vec::new();
     for src in &affected {
         let count = per_src.get(src).map(|ids| ids.len() as u32).unwrap_or(0);
         if let Some(max) = card.max {
             if count > max {
-                violations.push(cardinality_violation(
+                let mut correction_keys = delta_by_id
+                    .iter()
+                    .filter(|(_, candidate_src)| *candidate_src == src)
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                correction_keys.sort();
+                sink(cardinality_violation(
                     edge_table,
                     &edge_type.name,
                     src,
                     count,
                     "max",
                     max,
-                ));
+                    &correction_keys,
+                    &["REPLACE", "WITHDRAW"],
+                ))?;
             }
         }
         if count < card.min {
-            violations.push(cardinality_violation(
+            // A minimum violation can be repaired by withdrawing/replacing
+            // either a delta edge currently landing on this source or a delta
+            // edge that moved away from it. Keep both identities: the former
+            // covers a fresh under-min source, while the latter can restore the
+            // manifest-visible source it vacated.
+            let mut correction_keys = delta_by_id
+                .iter()
+                .filter(|(_, candidate_src)| *candidate_src == src)
+                .map(|(id, _)| id.clone())
+                .chain(
+                    moved_from
+                        .iter()
+                        .filter(|(id, old_src)| {
+                            old_src == src
+                                && delta_by_id
+                                    .get(id)
+                                    .is_some_and(|current_src| current_src != src)
+                        })
+                        .map(|(id, _)| id.clone()),
+                )
+                .collect::<Vec<_>>();
+            correction_keys.sort();
+            correction_keys.dedup();
+            sink(cardinality_violation(
                 edge_table,
                 &edge_type.name,
                 src,
                 count,
                 "min",
                 card.min,
-            ));
+                &correction_keys,
+                &["REPLACE", "WITHDRAW"],
+            ))?;
         }
     }
-    Ok(violations)
+    Ok(())
 }
 
 /// Canonical `@unique` violation message, matching the write path's format
@@ -1052,11 +1213,19 @@ fn unique_violation(
     key: &[String],
     id: &str,
     other: &str,
+    correctable_ids: &[&str],
 ) -> Violation {
     let type_name = table_key
         .strip_prefix("node:")
         .or_else(|| table_key.strip_prefix("edge:"))
         .unwrap_or(table_key);
+    let mut participants = [id, other];
+    participants.sort();
+    let mut discriminator = key.to_vec();
+    discriminator.extend(participants.into_iter().map(str::to_string));
+    let mut correctable_ids = correctable_ids.to_vec();
+    correctable_ids.sort();
+    correctable_ids.dedup();
     Violation {
         table_key: table_key.to_string(),
         row_id: Some(id.to_string()),
@@ -1066,6 +1235,21 @@ fn unique_violation(
             format_tuple(columns),
             format_tuple(key)
         ),
+        corrections: correctable_ids
+            .into_iter()
+            .map(|logical_key| ViolationCorrectionEvidence {
+                logical_key: logical_key.to_string(),
+                field_path_or_group: columns.to_vec(),
+                violation_instance_id: violation_instance_id(
+                    "UNIQUE_VIOLATION",
+                    table_key,
+                    logical_key,
+                    columns,
+                    discriminator.iter().map(String::as_str),
+                ),
+                allowed_actions: vec!["REPLACE".to_string(), "WITHDRAW".to_string()],
+            })
+            .collect(),
     }
 }
 
@@ -1083,6 +1267,18 @@ fn orphan_violation(
         row_id: Some(edge_id.to_string()),
         kind: MergeConflictKind::OrphanEdge,
         message: format!("{label} '{endpoint}' not found in {node_type}"),
+        corrections: vec![ViolationCorrectionEvidence {
+            logical_key: edge_id.to_string(),
+            field_path_or_group: vec![label.to_string()],
+            violation_instance_id: violation_instance_id(
+                "ORPHAN_EDGE",
+                edge_table,
+                edge_id,
+                &[label.to_string()],
+                [endpoint, node_type].into_iter(),
+            ),
+            allowed_actions: vec!["REPLACE".to_string(), "WITHDRAW".to_string()],
+        }],
     }
 }
 
@@ -1093,7 +1289,16 @@ fn cardinality_violation(
     count: u32,
     bound: &str,
     limit: u32,
+    correction_keys: &[String],
+    allowed_actions: &[&str],
 ) -> Violation {
+    let discriminator = [
+        edge_name.to_string(),
+        src.to_string(),
+        count.to_string(),
+        bound.to_string(),
+        limit.to_string(),
+    ];
     Violation {
         table_key: edge_table.to_string(),
         row_id: None,
@@ -1101,7 +1306,62 @@ fn cardinality_violation(
         message: format!(
             "@card violation on edge {edge_name}: source '{src}' has {count} edges ({bound} {limit})"
         ),
+        corrections: correction_keys
+            .iter()
+            .map(|logical_key| ViolationCorrectionEvidence {
+                logical_key: logical_key.clone(),
+                field_path_or_group: vec!["src".to_string()],
+                violation_instance_id: violation_instance_id(
+                    "CARDINALITY_VIOLATION",
+                    edge_table,
+                    logical_key,
+                    &["src".to_string()],
+                    discriminator.iter().map(String::as_str),
+                ),
+                allowed_actions: allowed_actions
+                    .iter()
+                    .map(|action| (*action).to_string())
+                    .collect(),
+            })
+            .collect(),
     }
+}
+
+fn violation_instance_id<'a>(
+    kind: &str,
+    table_key: &str,
+    logical_key: &str,
+    field_path_or_group: &[String],
+    discriminator: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"omnigraph.validator-violation-instance.v1\0");
+    hash_violation_field(&mut hasher, kind.as_bytes());
+    hash_violation_field(&mut hasher, table_key.as_bytes());
+    hash_violation_field(&mut hasher, logical_key.as_bytes());
+    hasher.update(
+        u64::try_from(field_path_or_group.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for field in field_path_or_group {
+        hash_violation_field(&mut hasher, field.as_bytes());
+    }
+    let discriminator = discriminator.into_iter().collect::<Vec<_>>();
+    hasher.update(
+        u64::try_from(discriminator.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for field in discriminator {
+        hash_violation_field(&mut hasher, field.as_bytes());
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn hash_violation_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(bytes);
 }
 
 #[cfg(test)]
@@ -1114,7 +1374,8 @@ mod tests {
     use omnigraph_compiler::catalog::build_catalog;
     use omnigraph_compiler::schema::parser::parse_schema;
 
-    const DOC_SCHEMA: &str = "node Doc {\n  slug: String @key\n  status: enum(draft, published)\n}\n";
+    const DOC_SCHEMA: &str =
+        "node Doc {\n  slug: String @key\n  status: enum(draft, published)\n}\n";
 
     fn catalog(src: &str) -> Catalog {
         build_catalog(&parse_schema(src).unwrap()).unwrap()
@@ -1122,15 +1383,53 @@ mod tests {
 
     /// A change-set touching only `Doc.status` with the given values.
     fn status_change(values: &[&str]) -> ChangeSet {
-        let schema = Arc::new(Schema::new(vec![Field::new("status", DataType::Utf8, true)]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values.to_vec())) as _])
-                .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+        let ids = (0..values.len())
+            .map(|index| format!("doc-{index}"))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(ids)) as _,
+                Arc::new(StringArray::from(values.to_vec())) as _,
+            ],
+        )
+        .unwrap();
         let mut change = TableChange::default();
         change.changed.push(batch);
         let mut cs = ChangeSet::new();
         cs.insert("node:Doc".to_string(), change);
         cs
+    }
+
+    fn duplicate_slug_change() -> ChangeSet {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("slug", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["doc-0", "doc-1", "doc-2", "doc-3"])) as _,
+                Arc::new(StringArray::from(vec!["alpha", "alpha", "beta", "beta"])) as _,
+                Arc::new(StringArray::from(vec![
+                    "bogus",
+                    "draft",
+                    "draft",
+                    "published",
+                ])) as _,
+            ],
+        )
+        .unwrap();
+        let mut change = TableChange::default();
+        change.changed.push(batch);
+        let mut changeset = ChangeSet::new();
+        changeset.insert("node:Doc".to_string(), change);
+        changeset
     }
 
     /// The merge path previously validated `@range`/`@check` but NOT enum
@@ -1141,13 +1440,203 @@ mod tests {
         let v = evaluate_value_constraints(&status_change(&["bogus"]), &catalog(DOC_SCHEMA));
         assert_eq!(v.len(), 1, "expected one enum violation, got {v:?}");
         assert_eq!(v[0].kind, MergeConflictKind::ValueConstraintViolation);
-        assert!(v[0].message.contains("bogus"), "message was: {}", v[0].message);
+        assert!(
+            v[0].message.contains("bogus"),
+            "message was: {}",
+            v[0].message
+        );
+        assert!(v[0].corrections.is_empty());
     }
 
     #[test]
     fn evaluator_accepts_valid_delta() {
         assert!(
             evaluate_value_constraints(&status_change(&["draft"]), &catalog(DOC_SCHEMA)).is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_evaluator_matches_collecting_order_and_messages() {
+        let catalog = catalog(DOC_SCHEMA);
+        let constraints = vec![
+            Constraint::Value,
+            Constraint::Unique {
+                table_key: "node:Doc".to_string(),
+                columns: vec!["slug".to_string()],
+                is_key: true,
+            },
+        ];
+        let changeset = duplicate_slug_change();
+        let committed = CommittedState {
+            committed: None,
+            overwritten: HashSet::new(),
+            live: None,
+        };
+
+        let collected = evaluate(&constraints, &changeset, &committed, &catalog)
+            .await
+            .unwrap();
+        let mut streamed = Vec::new();
+        let count = evaluate_with_sink(
+            &constraints,
+            &changeset,
+            &committed,
+            &catalog,
+            |violation| {
+                streamed.push(violation);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count, collected.len());
+        assert_eq!(streamed.len(), collected.len());
+        assert_eq!(collected.len(), 3, "one value then two unique violations");
+        assert_eq!(
+            collected
+                .iter()
+                .map(|violation| (&violation.kind, violation.row_id.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (&MergeConflictKind::ValueConstraintViolation, None),
+                (&MergeConflictKind::UniqueViolation, Some("doc-1")),
+                (&MergeConflictKind::UniqueViolation, Some("doc-3")),
+            ]
+        );
+        for (actual, expected) in streamed.iter().zip(&collected) {
+            assert_eq!(actual.table_key, expected.table_key);
+            assert_eq!(actual.row_id, expected.row_id);
+            assert_eq!(actual.kind, expected.kind);
+            assert_eq!(actual.message, expected.message);
+            assert_eq!(actual.corrections, expected.corrections);
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_evaluator_propagates_sink_failure_without_buffering_later_violations() {
+        let catalog = catalog(DOC_SCHEMA);
+        let constraints = vec![Constraint::Unique {
+            table_key: "node:Doc".to_string(),
+            columns: vec!["slug".to_string()],
+            is_key: true,
+        }];
+        let changeset = duplicate_slug_change();
+        let committed = CommittedState {
+            committed: None,
+            overwritten: HashSet::new(),
+            live: None,
+        };
+        let mut observed = Vec::new();
+
+        let error = evaluate_with_sink(
+            &constraints,
+            &changeset,
+            &committed,
+            &catalog,
+            |violation| {
+                observed.push(violation.row_id);
+                Err(OmniError::manifest("test sink stopped"))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("test sink stopped"));
+        assert_eq!(observed, [Some("doc-1".to_string())]);
+    }
+
+    #[test]
+    fn cardinality_violation_names_each_correctable_delta_key() {
+        let violation = cardinality_violation(
+            "edge:WorksAt",
+            "WorksAt",
+            "alice",
+            3,
+            "max",
+            1,
+            &["edge-1".to_string(), "edge-2".to_string()],
+            &["REPLACE", "WITHDRAW"],
+        );
+        assert_eq!(violation.corrections.len(), 2);
+        assert_eq!(violation.corrections[0].logical_key, "edge-1");
+        assert_eq!(violation.corrections[1].logical_key, "edge-2");
+        assert!(
+            violation
+                .corrections
+                .iter()
+                .all(|correction| correction.field_path_or_group == ["src"])
+        );
+
+        let minimum = cardinality_violation(
+            "edge:WorksAt",
+            "WorksAt",
+            "alice",
+            0,
+            "min",
+            1,
+            &["edge-1".to_string()],
+            &["REPLACE", "WITHDRAW"],
+        );
+        assert_eq!(
+            minimum.corrections[0].allowed_actions,
+            ["REPLACE", "WITHDRAW"],
+            "withdrawing a blocked move restores its manifest-visible source"
+        );
+    }
+
+    #[tokio::test]
+    async fn min_cardinality_violation_names_fresh_delta_edge() {
+        const MIN_CARD_SCHEMA: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person @card(2..)
+"#;
+        let catalog = catalog(MIN_CARD_SCHEMA);
+        let edge_type = catalog.edge_types.get("Knows").unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("src", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["edge-1"])) as _,
+                Arc::new(StringArray::from(vec!["alice"])) as _,
+            ],
+        )
+        .unwrap();
+        let mut change = TableChange::default();
+        change.added.push(batch);
+        let mut changeset = ChangeSet::new();
+        changeset.insert("edge:Knows".to_string(), change);
+        let committed = CommittedState {
+            committed: None,
+            overwritten: HashSet::new(),
+            live: None,
+        };
+        let mut violations = Vec::new();
+
+        evaluate_cardinality(
+            "edge:Knows",
+            edge_type,
+            changeset.get("edge:Knows").unwrap(),
+            &changeset,
+            &committed,
+            &mut |violation| {
+                violations.push(violation);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].kind, MergeConflictKind::CardinalityViolation);
+        assert_eq!(violations[0].corrections.len(), 1);
+        assert_eq!(violations[0].corrections[0].logical_key, "edge-1");
+        assert_eq!(
+            violations[0].corrections[0].allowed_actions,
+            ["REPLACE", "WITHDRAW"]
         );
     }
 

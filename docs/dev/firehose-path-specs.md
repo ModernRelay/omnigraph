@@ -1,12 +1,13 @@
 # Firehose Path — Implementation Specs
 
 **Type:** implementation plan for in-flight work
-**Status:** slices F0–F1 and the bounded F2 profile-authority tranche are
-implemented. F2 selected internal schema v11/profile protocol v2 plus
-recovery-v13 `StreamProfileChange`; the ordinary private fold remains
-byte-for-byte recovery-v12. Public ingress, production enrollment, claim/drain,
-correction, and maintenance integration remain later and require another strict
-format/recovery strand before activation.
+**Status:** slices F0–F1, F2 profile authority, and the hidden F2 lifecycle
+tranche are implemented. The lifecycle tranche selects internal schema v12,
+lifecycle protocol v3, and recovery-v14 exact enrollment/claim/fold/drain/
+terminal-receipt owners. It implements restartable empty and non-empty
+`OPEN → DRAINING → SEALED` behind private test seams. Public ingress and
+operator lifecycle verbs, resume/abort, correction/retirement, and maintenance
+integration remain inactive.
 **Design authority:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) — this
 file never overrides it. Where they disagree, the RFC wins and this file is
 wrong. §4.7 records the selected experimental profile; §4.3/§4.6 record the
@@ -65,9 +66,10 @@ The format corollary is equally strict: **a format that can create terminal
 authority ordinary export cannot represent must ship its own safe exit before
 that authority becomes reachable.** A later strict-strand binary cannot rescue
 an older root it refuses to open. V11 reserves a fail-closed `RETIRED` profile
-shape, but does not activate retirement or correction. The next lifecycle strand
-must activate an irreversible retirement/export path before `WITHDRAWN` becomes
-reachable; F5 must extend that path before `DEAD_LETTERED` becomes reachable.
+shape, while recovery-v14 reserves the lifecycle retirement discriminator
+without activating it. F3 must activate an irreversible retirement/export path
+before `WITHDRAWN` becomes reachable; F5 must extend that path before
+`DEAD_LETTERED` becomes reachable.
 
 ---
 
@@ -85,13 +87,18 @@ reachable; F5 must extend that path before `DEAD_LETTERED` becomes reachable.
 | Capability-bound stopped/offline apply and served-runtime ownership | `omnigraph-control-authority`, cluster/server adapters | F2 profile authority |
 | Protocol-v2 profile state (`DISABLED`, `ENABLED`, resumable `DISABLING`, fail-closed `RETIRED`) | `db/manifest/stream_profile.rs` | F2 profile authority |
 | Exact token-ledger `ProfileManagementReceipt` + recovery-v13 `StreamProfileChange` | manifest recovery/token store | F2 profile authority |
+| Lifecycle-v3 fixed-size binding/management/claim chains + authenticated WAL-tail authority | manifest stream/token store | F2 lifecycle |
+| Recovery-v14 exact enrollment, claim, ordinary/drain fold, and lifecycle receipt | manifest recovery | F2 lifecycle |
+| Hidden empty/non-empty quiesce, including claim-before-seal and seal-before-fold restart | engine/worker private seams | F2 lifecycle |
 
-Internal schema is **v11** and the profile protocol is **v2**. Recovery-v13 has
-one emitted discriminator, `StreamProfileChange`: it owns the exact
+Internal schema is **v12**, profile protocol is **v2**, and lifecycle protocol
+is **v3**. Recovery-v13 remains exactly `StreamProfileChange`: it owns the exact
 `ProfileManagementReceipt` token-ledger transaction, and only its achieved token
-witness plus fixed next profile may reach the terminal manifest CAS. Unknown or
-later v13 variants fail closed. The existing private ordinary fold remains
-byte-for-byte recovery-v12; v13 does not change fold meaning.
+witness plus fixed next profile may reach the terminal manifest CAS.
+Recovery-v14 activates `StreamEnrollmentV2`, `StreamClaim`, `StreamFoldV2`,
+`StreamDrainFold`, and `StreamLifecycleReceipt`; its remaining registered
+families fail closed. Historical recovery-v10 enrollment and recovery-v12
+lifecycle-v2 folds are not reinterpreted.
 
 The historical v10 bump also reserved the *shape* of the fold-attribution
 dead-letter object reference
@@ -106,20 +113,26 @@ starts with a full format/recovery audit and assumes a new strand.
 Behind `#[cfg(feature = "failpoints")] #[doc(hidden)]` seams only:
 
 - **Enrollment** — `db/omnigraph/stream_enrollment.rs::enroll_stream_table_b1`,
-  recovery-v10, one empty unsharded shard on main.
+  recovery-v14 `StreamEnrollmentV2`, one empty unsharded shard on main plus
+  immutable enrollment and binding ledger receipts.
 - **Put / acknowledge** — charge → shared admission → same-key queue → worker;
   ack requires watcher success *and* the same writer's post-durability
   `check_fenced()`; any post-invocation ambiguity is `AckUnknown` + retirement.
 - **Compare-and-chain tokens** — canonical payload/token digests, trusted
   hidden row metadata, same-generation overlays, graph-global
   `_stream_tokens.lance` selected by `__manifest`.
-- **Fold** — `db/omnigraph/stream_ingest.rs::stream_fold_phase_b1`, recovery-v12,
-  exact base + token participants, one manifest CAS.
+- **Claim** — the sole cold opener arms recovery-v14 before invoking Lance,
+  checkpoints manifest-only attempts in the ledger, and selects one terminal
+  claim receipt with the lifecycle epoch/tail successor.
+- **Fold** — `db/omnigraph/stream_ingest.rs::stream_fold_phase_b1`,
+  recovery-v14 `StreamFoldV2`, exact base + token participants, selected current
+  claim/tail authority, and one lineage-bearing manifest CAS.
 - **Physical drain** — `table_store/mem_wal/worker.rs::seal_and_drain` →
   `force_seal_active` → `wait_for_flush_drain` → `prove_post_drain_cut`, with
-  detached ownership and exclusive-admission carry-through, **for a non-empty
-  admitted or replayed generation**. The current worker explicitly refuses to
-  seal an empty admitted generation.
+  detached ownership and exclusive-admission carry-through. `quiesce_cut`
+  additionally handles a fresh empty claimed generation, while
+  `passive_quiesce_cut` reuses an exact already-flushed receipt-bound cut after
+  restart.
 - **Retain-all** — no GC, no canonical `_mem_wal` deletion, loud exhaustion.
 
 Topology is fixed for the whole plan: **main-only, unsharded, one resident
@@ -127,16 +140,13 @@ writer, one externally enforced live writer process, upsert-only.**
 
 ### 1.3 The honest summary
 
-The private non-empty put/fold seam is closed and tested. The public protocol
-is not. Profile mutation now requires an opaque checked stopped/offline or
-served-runtime owner, and `DISABLING` persists an exact restart/resume plan plus
-drain-only continuation authority. This tranche can finish disable when no
-lifecycle rows exist or every existing lane is already `SEALED`; it cannot
-drain a non-`SEALED` lane and does not activate the enrolled-lane claim/drain
-protocol. There is
-still no effectful claim-receipt producer, empty-lane quiesce, caller-facing
-ingest, dead-letter authority, fold scheduler, correction path, or `SEALED`
-maintenance integration.
+The private put/fold/claim/quiesce seam is closed and tested; the public
+protocol is not. Profile mutation requires an opaque checked stopped/offline or
+served-runtime owner, and `DISABLING` persists an exact continuation plan. The
+hidden lifecycle core can now drain a non-`SEALED` lane to `SEALED`, but no
+cluster/CLI/HTTP/SDK management path invokes it yet. There is still no
+caller-facing ingest, serial fold scheduler, dead-letter authority, resume or
+abort-drain, correction/retirement, or `SEALED` maintenance/rebind integration.
 
 ---
 
@@ -146,9 +156,9 @@ maintenance integration.
 |---|---|---|---|
 | ~~F0~~ | Enablement authority | v10 | shipped |
 | ~~F1~~ | Cedar split + read-only status | — | shipped |
-| ~~F2 profile authority~~ | Capability-bound cluster control/runtime delegation, profile protocol v2, resumable `DISABLING`, exact profile receipt recovery | internal v11 + recovery v13 `StreamProfileChange` only; ordinary fold stays v12 | shipped |
-| **F2 lifecycle tranche** | Claim receipts + drain `OPEN→DRAINING→SEALED`, including enrolled-lane disable continuation | another strict graph/recovery strand, versions not yet selected | after profile authority |
-| **F3** | Resume / abort-drain + safe `SEALED` maintenance bridge + activate `WITHDRAWN` retirement before correction can create it | co-land with or follow the next lifecycle strand after audit | after F2 lifecycle |
+| ~~F2 profile authority~~ | Capability-bound cluster control/runtime delegation, profile protocol v2, resumable `DISABLING`, exact profile receipt recovery | internal v11 + recovery v13 `StreamProfileChange` only; historical ordinary fold remained recovery v12 | shipped |
+| ~~F2 lifecycle tranche~~ | Claim receipts + hidden drain `OPEN→DRAINING→SEALED`, empty and non-empty, with restart continuation | internal v12 + lifecycle v3 + recovery v14 | implemented; public control activation remains closed |
+| **F3** | Resume / abort-drain + safe `SEALED` maintenance bridge + activate `WITHDRAWN` retirement before correction can create it | activate the registered fail-closed v14 families in the existing v12 strand | after F2 lifecycle |
 | **F4** | Hidden ingest vertical slice + lazy enrollment | audit | after F3 |
 | **F5** | Fold driver + terminal dead-letter authority + extend retirement for `DEAD_LETTERED` | a new strand after lifecycle activation | after F4 |
 | **F6** | Guardrails + acceptance evidence | — | after F5 |
@@ -161,12 +171,12 @@ then each content-preserving maintenance owner and rebind; F5 may land the
 serial driver, terminal authority/object recovery, then operations/replay.
 Every sub-PR preserves the refusal for behavior it has not integrated.
 
-The plan now contains **at least three** strict export/init/load rebuilds before
-F7: the shipped v10→v11/v13 profile-authority tranche, another strand for the
-complete lifecycle family, and F5's complete dead-letter/replay tranche. F4 may
-require another strand if its enrollment receipt/payload cannot co-land with the
-lifecycle family. Any additional strand requires an RFC/spec amendment and
-explicit approval before selecting versions; it is not an automatic fallback.
+The plan contains **three** strict export/init/load rebuilds before F7: the
+v10→v11/v13 profile-authority tranche, the implemented v11→v12/v14 lifecycle
+tranche, and F5's complete dead-letter/replay tranche. F4's enrollment
+receipt/payload co-landed in v12/v14, so it does not require a fourth strand.
+Any additional strand requires an RFC/spec amendment and explicit approval;
+it is not an automatic fallback.
 
 The lifecycle tranche plus F3 are the operator lifecycle and maintenance
 bridge. They ship **no row-admission or acknowledgement capability**; the
@@ -185,10 +195,9 @@ See §10 for the ordering rationale.
 
 ## 3. F2 lifecycle tranche — the drain path (`OPEN → DRAINING → SEALED`)
 
-This section specifies future behavior. It is not part of the v11/v13
-profile-authority tranche and cannot reuse recovery-v13 for new meanings. The
-complete lifecycle family must select another strict graph/recovery strand
-before any claim or drain effect becomes reachable.
+This section records the implemented hidden v12/v14 behavior. It is not a
+public management contract: production control-plane and transport activation
+remain closed until F3 completes lifecycle exits and maintenance integration.
 
 ### 3.1 Goal
 
@@ -199,16 +208,25 @@ writer a sidecar-covered witness/rebind transition.
 
 ### 3.2 What exists
 
-- The complete state-v2 vocabulary: `StreamLifecycle`, `DrainDescriptor`,
+- The lifecycle-v3 vocabulary: `StreamLifecycle`, `DrainDescriptor`,
   `SealedProof`, `ManagementReceipt`, `ClaimReceipt`, `StrictBlock`,
   `LastFoldSummary` — all in `db/manifest/stream.rs`, all with per-state
   validators enforced by `StreamLifecycleEntry::validate`.
+- `QuiesceRequestPayload`, the typed immutable request preimage retained inside
+  every drain descriptor. It binds protocol/graph/table/stream/binding/
+  enrollment/drain identity, the original lifecycle revision and goal, the
+  physical-binding digest, original HEAD witness, original epoch targets, and
+  a null fresh-request override. Its digest is recomputed from that object.
+  The descriptor's current goal, HEAD witness, achieved epoch targets, and
+  authenticated disable-adoption override are separate mutable continuation
+  authority and never rewrite the request preimage.
 - The full-entry lifecycle CAS: `ManifestChange::SetStreamLifecycle`, with the
   publisher requiring the witness to match the batch's effective table pointer.
 - Physical seal/drain/abort in `worker.rs` (§1.2).
-- A working `OPEN` fold to fork from.
+- Recovery-v14 claim, ordinary-fold, drain-fold, and terminal-receipt owners,
+  including exact participant and selected-ledger validation.
 
-### 3.3 Profile authority implemented; lifecycle work remaining
+### 3.3 Implemented hidden lifecycle path; public activation remaining
 
 1. **Implemented: close the ambient profile-writer gap.** Replace public
    `Omnigraph::set_streaming_enabled_as` with a narrow capability-bound
@@ -346,8 +364,8 @@ writer a sidecar-covered witness/rebind transition.
    active delegation only; the first disable CAS consumes it into the narrower
    plan continuation, so `DISABLING` has no admission-authorizing delegation.
    `RETIRED` carries its mandatory immutable retirement receipt/cut reference
-   and has no outgoing transition. V11 decodes that dormant state fail-closed;
-   the next lifecycle strand must add the exact `DISABLED → RETIRED` transition
+   and has no outgoing transition. V12 still decodes that dormant state
+   fail-closed; F3 must activate the exact `DISABLED → RETIRED` transition
    before `WITHDRAWN` becomes reachable.
 
    Disable is a durable multi-publication operation, not a retrying error. The
@@ -381,7 +399,7 @@ writer a sidecar-covered witness/rebind transition.
      epoch targets, initiating actor/time, and guarded-operation nullness,
      changes only the goal to `SEALED`, records the disable-operation override,
      increments lifecycle revision, and atomically publishes a terminal
-     management-ledger receipt through the next lifecycle recovery strand's
+     management-ledger receipt through recovery-v14
      `StreamLifecycleReceipt(kind = DisableDrainAdoption)`.
      Its deterministic adoption ID is derived from the disable operation,
      table identity, and existing drain ID. Receipt lookup precedes row/revision
@@ -450,18 +468,18 @@ writer a sidecar-covered witness/rebind transition.
 3. **The receipt ledger and bounded hot authority.** V11 removes inline profile
    history from `stream_profile`. The manifest-selected
    `_stream_tokens.lance` dataset gains tagged immutable
-   `ProfileManagementReceipt` rows. The next lifecycle strand extends this
-   mechanism with `EnrollmentReceiptV2`, `BindingReceipt`,
+   `ProfileManagementReceipt` rows. V12/recovery-v14 extends this mechanism
+   with `EnrollmentReceiptV2`, `BindingReceipt`,
    `ManagementReceipt`, `ClaimAttemptEffect`, and terminal `ClaimReceipt`; F5
    later adds fold-bound `DeadLetterRecord` and replay-checkpoint rows. A row has a
    deterministic identity derived from graph, stable table/incarnation and
    binding scope where applicable, receipt tag, operation ID, and attempt or
    checkpoint ordinal. Retain-all preserves every row, but the hot profile—and,
-   after the lifecycle strand, lifecycle rows—retain only bounded current
+   lifecycle rows—retain only bounded current
    receipt IDs, counts, domain-separated chain digests, and tail commitments.
    They never contain a history `Vec`. V11 gives current-token and
    profile-receipt rows disjoint trusted row tags and canonical key domains; the
-   next strand extends the control-ledger tags without reinterpreting them.
+   v12 strand extends the control-ledger tags without reinterpreting them.
    Every token probe constrains the
    current-token tag and token lookup key, while every receipt probe constrains
    a ledger tag; a receipt can neither collide with nor materialize as a
@@ -469,8 +487,8 @@ writer a sidecar-covered witness/rebind transition.
 
    Every v11 profile-receipt append is an exact pre-minted
    `_stream_tokens.lance` transaction owned by recovery-v13
-   `StreamProfileChange`. Future control-ledger appends use the separately
-   selected lifecycle recovery strand.
+   `StreamProfileChange`. Active v12 lifecycle-ledger appends use their
+   separately selected recovery-v14 owners.
    Later-format tags, including F5 `DeadLetterRecord` and replay-checkpoint
    rows, use their strand's matching recovery envelope and do not reinterpret
    v13. The sole graph-manifest CAS advances the selected token-dataset pointer
@@ -496,25 +514,25 @@ writer a sidecar-covered witness/rebind transition.
 
    A scalar index alone is **not** a no-scan proof: Lance scans fragments
    appended after that index's coverage until `optimize_indices` folds them in.
-   The lifecycle tranche therefore also lands a manifest-derived token-ledger
-   coverage reconciler and its own
-   `StreamTokenLedgerIndexMaintenance` recovery envelope. Under the
-   graph-global recovery barrier and root token gate, it uses the existing
-   Optimize-style exact-effect classification and auto-cleanup stripping to
-   advance only the selected token-dataset pointer to a content-identical,
-   newly covered version without weakening B2a retain-all. It does not alter
-   current token rows, receipt chains, or logical results. Logical
-   operations remain correct through Lance's uncovered-fragment fallback and
-   never fail merely because this derived maintenance is late; status reports
-   uncovered-fragment count/age and the last reconciliation error. The
-   lifecycle control owner and, later, the F5 supervisor schedule reconciliation from
-   selected dataset state rather than an in-memory job queue. F6 must measure
-   and publish the trigger target, prove old indexed history is not rescanned,
-   and show that the uncovered tail and lookup I/O stay within the accepted
+   V12 reserves `StreamTokenLedgerIndexMaintenance` but keeps it fail-closed;
+   the hidden lifecycle tranche does not claim a coverage reconciler. Logical
+   operations remain correct through Lance's uncovered-fragment fallback.
+   F3 must implement the manifest-derived reconciler, and F6 must measure and
+   publish its trigger target, prove old indexed history is not rescanned, and
+   show that the uncovered tail and lookup I/O stay within the accepted
    steady-state envelope before activation.
 
-   `ManagementReceipt` still needs bounded canonical request **and result**
-   preimages, builders, and digest recomputation in validation. The §4.3 lookup
+   `ManagementReceipt` now carries bounded canonical request **and result**
+   payloads with digest recomputation in validation. A quiesce request is one
+   typed immutable `QuiesceRequestPayload`; it is not reconstructed from the
+   descriptor's mutable current fields. The payload fixes the protocol and
+   graph identity, stable table/incarnation, stream incarnation, binding scope,
+   enrollment and drain IDs, original expected lifecycle revision and goal,
+   physical-binding digest, original HEAD witness, original target-epoch map,
+   and a null fresh-request seal override. Claims, folds, and disable adoption
+   may advance the descriptor's current HEAD/target, or authenticate the sole
+   `OPEN_AFTER_FOLD → SEALED` override, without changing that payload or its
+   digest. The §4.3 lookup
    order is terminal indexed ledger receipt first; then an exact matching
    in-progress `DrainDescriptor`/sidecar (same operation ID, request digest,
    and original expected revision), which resumes that plan; only then the
@@ -529,9 +547,9 @@ writer a sidecar-covered witness/rebind transition.
    sidecar-owned until the same lifecycle CAS publishes its complete terminal
    `ClaimReceipt` ledger row, names it with `current_claim_receipt_id`, and
    advances both the top-level epoch floor and any active drain target to the
-   exact achieved epoch. The fold must bind and carry that already-produced
-   receipt when it advances the epoch floor; today it preserves empty claim
-   history. No effectful claim may finalize through the `(None, None)` state.
+   exact achieved epoch. The v14 fold binds and carries that already-produced
+   receipt and authenticated tail; it does not mint a claim receipt itself.
+   No effectful claim may finalize through the `(None, None)` state.
 
    Claim retries are durably incremental rather than capped or accumulated
    inline. The sidecar owns only the current Lance attempt. Recovery first
@@ -545,16 +563,13 @@ writer a sidecar-covered witness/rebind transition.
    not require an arbitrary cross-restart retry cap. A contradictory or
    unclassifiable attempt remains recovery-owned and uses F3's reason-gated
    authority repair; it is never converted into another blind Lance call.
-5. **`OPEN → DRAINING` CAS** with a production `DrainDescriptor` builder
-   (today constructed only in tests).
-6. **Drain-mode fold.** §4.3 forbids implementing this as the `OPEN` fold with
-   a relaxed check: it must bind the complete expected `DRAINING` row and
-   `drain_id`. Requires a `DRAINING`-accepting variant of
-   `capture_stream_authority` (which today refuses any lifecycle but `Open`)
-   and a dedicated recovery mode, since the current schema-v12 `StreamFold`
-   validator requires `prior.lifecycle == Open` and byte-identical
-   drain/block/proof slots. The fold consumes an injected
-   `CheckedExclusiveStreamAuthority`; it does not reacquire admission.
+5. **`OPEN → DRAINING` CAS** with the crate-private `DrainDescriptor` builder,
+   currently reachable only through the feature-gated hidden quiesce seam.
+6. **Drain-mode fold.** This is not the historical `OPEN` fold with a relaxed
+   check. Recovery-v14 `StreamDrainFold` binds the complete expected
+   `DRAINING` row, `drain_id`, selected current claim, authenticated cut, and
+   recomputed full-generation LWW projection. The fold consumes injected
+   exclusive stream authority rather than reacquiring admission.
 7. **The empty-lane path.** An enrolled-but-empty or already-folded lane has no
    generation for `seal_and_drain`, and the current worker rejects attempting
    to seal one. Under the still-held exclusive lease, settle every owner. If
@@ -566,14 +581,17 @@ writer a sidecar-covered witness/rebind transition.
    calling Lance: exact no-effect may retire, but any
    manifest/sentinel effect must publish its complete `ClaimReceipt` and
    current ID into the `DRAINING` row while advancing both its top-level epoch
-   floor and `drain.target_epoch_floor_by_shard` to the achieved epoch before
-   proof construction. Then classify and commit the fence-only WAL segment,
+   floor and mutable `drain.target_epoch_floor_by_shard` to the achieved epoch
+   before proof construction. Immutable `drain.operation_request_payload`
+   remains the complete original preimage for terminal receipt/recovery
+   verification even when the current HEAD, target, goal, or override evolves.
+   Then classify and commit the fence-only WAL segment,
    prove shard/base merge agreement directly, and proceed without inventing a
    generation or calling `stage_stream_fold`. `(None, None)` is never a
    `SealedProof` input.
 8. **Incremental authenticated WAL-tail commitment and
-   `verified_empty_digest`.** The digest field and its `sha256:` validator
-   exist in `SealedProof`; **no producer does.** V11 adds bounded current
+   `verified_empty_digest`.** Lifecycle-v3 constructs and validates this
+   digest from the exact current claim and empty-cut evidence. V12 adds bounded current
    per-binding fields for the committed WAL cursor, segment count, segment-
    chain digest, current segment LWW-projection digest, and current
    claim-receipt ID. A rebind starts a new scoped genesis; the old scope
@@ -584,7 +602,18 @@ writer a sidecar-covered witness/rebind transition.
    `(prior_authenticated_cursor, achieved_sentinel_cursor]`. It densifies and
    charges each page, rejects gaps, duplicates, foreign
    binding/shard/epoch records, and authenticates trusted metadata plus
-   token-chain continuity. The no-roll delta is bounded by one
+   token-chain continuity. If the latest manifest-selected
+   `LastFoldSummary(outcome = PUBLISHED)` cut falls inside that delta, claim
+   preparation treats it as the candidate published-prefix boundary and fixes
+   that position in recovery. The terminal `ClaimReceipt` then owns the exact
+   authenticated boundary; later empty proof reads the receipt and never
+   reclassifies from the replaceable summary. Entries through the cut are a
+   published prefix: each key's internal chain must terminate at exact current
+   token authority. Entries after the cut are the active suffix, whose first
+   occurrence starts a fresh depth-one chain from that same current token/base
+   authority. A raw Lance replay cursor can also cover an unmerged generation,
+   so it is only a physical upper bound and never chooses the published-prefix
+   boundary. The no-roll delta is bounded by one
    8,192-row/32-MiB generation plus bounded control records. A claim-only or
    empty-lane cycle therefore commits a bounded control-only delta before
    another claim, so repeated empty cycles advance the cursor instead of
@@ -594,18 +623,20 @@ writer a sidecar-covered witness/rebind transition.
    plan.
 
    The terminal `ClaimReceipt` commits, with domain separation, the prior chain
-   digest, exact lower/upper cursor, record count/digest, decoded empty-fence
-   state, binding/configuration/incarnation, and LWW projection commitment. Its
-   exact ledger transaction and lifecycle update are owned by the future claim
-   recovery envelope;
+   digest, exact lower/upper cursor, receipt-owned published-prefix position,
+   record count/digest, decoded empty-fence state,
+   binding/configuration/incarnation, and active-suffix plus cumulative LWW
+   projection commitments. Its
+   exact ledger transaction and lifecycle update are owned by recovery-v14
+   `StreamClaim`;
    only their sole graph-manifest CAS advances the selected token pointer and
    lifecycle cursor/count/chain. It has no base-table or current-token effect.
    A failed or unclassifiable claim does not advance the segment cursor.
 
-   Recovery-v12 remains byte-for-byte the ordinary private `StreamFold`.
-   The next lifecycle recovery strand adds `StreamFoldV2` for an ordinary
-   `OPEN` fold over the expanded lifecycle and keeps the separate drain-fold
-   variant. `StreamFoldV2` owns the same exact
+   Historical recovery-v12 remains byte-for-byte the lifecycle-v2
+   `StreamFold` and is refused under v12. Recovery-v14 `StreamFoldV2` owns an
+   ordinary `OPEN` fold over lifecycle-v3, while `StreamDrainFold` is the
+   separate drain variant. `StreamFoldV2` owns the same exact
    base+token effects as v12, preserves the current claim/tail commitments
    byte-for-byte, and publishes no segment receipt. A drain fold additionally
    binds the current claim receipt and recomputes its LWW projection before its
@@ -619,7 +650,7 @@ writer a sidecar-covered witness/rebind transition.
    replaceable `LastFoldSummary` as authority.
 9. **`DRAINING → SEALED`** publishing the exact proof, current claim receipt,
    terminal management receipt, and complete empty-cut authority atomically
-   through the next lifecycle recovery strand's
+   through recovery-v14
    `StreamLifecycleReceipt(kind = QuiesceFinalize)`.
    `StreamLifecycleReceipt` is the ledger-plus-manifest recovery owner for
    these two metadata-only lifecycle transitions. Before its ledger effect it
@@ -667,21 +698,19 @@ writer a sidecar-covered witness/rebind transition.
   retirement receipt ID and cut digest, but its transition and read/export
   activation remain inactive. Unknown v13 discriminators and unsupported
   transitions fail closed.
-- **The complete lifecycle family was not pre-registered.** Claim,
-  `StreamEnrollmentV2`, ordinary fold-v2, drain-fold,
-  `StreamLifecycleReceipt`, resume/abort, correction, retirement,
-  token-ledger-index maintenance, sealed maintenance, and rebind must select
-  another strict graph/recovery strand before any such effect becomes
-  reachable. Historical `protocol_v10` enrollment and `protocol_v12`
-  base-plus-token fold remain byte-for-byte unchanged. In particular, the next
-  strand must activate same-format retirement before correction can create
-  `WITHDRAWN`; F5 must extend that exit before `DEAD_LETTERED`.
-- **The v10↔v11 boundary requires genuine binary evidence.** The
-  old-binary/new-format refusal and export/init/load rebuild test must use a
-  genuine v10 binary, not a stamp rewrite. Until that gate is green, the format
-  implementation is incomplete even though the shapes and refusals are fixed.
-  `SidecarKind` has nine current variants, three stream-specific
-  (`StreamEnrollment`, `StreamFold`, and `StreamProfileChange`).
+- **The v12 lifecycle family is closed and selectively active.** Recovery-v14
+  activates claim, `StreamEnrollmentV2`, ordinary fold-v2, drain-fold, and
+  `StreamLifecycleReceipt`. Resume/abort, correction, retirement,
+  token-ledger-index maintenance, sealed maintenance, and rebind are registered
+  but fail closed. Historical recovery-v10 enrollment and recovery-v12
+  lifecycle-v2 base-plus-token fold retain their exact meanings and are refused
+  under lifecycle-v3. F3 must activate same-format retirement before correction
+  can create `WITHDRAWN`; F5 must extend that exit before `DEAD_LETTERED`.
+- **The v11↔v12 boundary requires genuine binary evidence.** The
+  old-binary/new-format refusal and export/init/load rebuild test uses the
+  immutable final-v11 binary, not a stamp rewrite. The fixture is clean,
+  disabled, and unenrolled because ordinary export does not transfer stream
+  authority.
 
 ### 3.6 Evidence
 
@@ -765,9 +794,9 @@ Extend existing owners; do not open a new silo.
   already walks `None→OPEN→DRAINING→SEALED` — extend with stale-`expected`
   refusal and revision monotonicity.
 - `db/manifest/stream.rs` in-source tests own per-state validation.
-- `memwal_stream.rs` owns drain with a resident generation. Add separate
-  enrolled-never-written and already-folded empty-lane cells; there is no
-  current empty-generation fast path to extend.
+- `memwal_stream.rs` owns drain with a resident generation, while worker and
+  lifecycle tests own enrolled-never-written, already-folded empty, passive
+  flushed-cut reuse, and fresh-claim-required restart decisions.
 - `failpoints.rs` owns every lifecycle-CAS crash boundary; extend
   `assert_open_stream_lifecycle_conflict` with DRAINING/SEALED variants.
 - New: revision-fence cells (stale refusal, lost-response replay returning the
@@ -780,29 +809,22 @@ Extend existing owners; do not open a new silo.
   block plus retry, and crash at segment publication; repeated empty claim
   cycles advance a control-only cursor, and the streaming LWW projection
   byte-matches the fold token plan without a genesis scan.
-- Current format/recovery cells keep an ordinary fold byte-for-byte on v12 and
-  crash v13 `StreamProfileChange` before/after its exact profile-receipt ledger
-  transaction and sole manifest CAS; only the exact receipt/profile pair may
-  become authoritative, and an unselected ledger version remains inert.
-- Future lifecycle-strand cells must crash its ordinary/drain folds at every
-  participant and crash `StreamLifecycleReceipt` before/after its ledger
-  transaction and terminal manifest CAS. They must preserve the current
-  claim/tail commitment exactly and prove that folds never append a claim
-  segment receipt.
-- **F2 co-lands the v10→v11 operator path** in
+- Current format/recovery cells retain v13 `StreamProfileChange` exactly and
+  exercise recovery-v14 ordinary/drain folds at both participants plus
+  `StreamLifecycleReceipt` before/after its ledger transaction and terminal
+  manifest CAS. They preserve the selected claim/tail commitment exactly and
+  prove folds never append a claim receipt.
+- **The lifecycle tranche co-lands the v11→v12 operator path** in
   `docs/user/operations/upgrade.md`, the cluster operator guide, and the release
-  notes for the binary that introduces internal v11. The old v10 binary
+  notes for the binary that introduces internal v12. The old v11 binary
   gracefully stops every writer, applies an
   explicit disabled profile, verifies terminal disabled state and zero
   production enrollments, and exports the visible logical graph; the operator
-  then initializes a fresh v11 root, loads that export, applies cluster config,
-  and restarts. V11 never opens or migrates a v10 root in place. V10 exposed no
-  production enrollment/row caller, so any private/dev v10 lifecycle, pending
-  WAL, or enrollment fixture is outside the supported rebuild contract and
-  must be quarantined rather than claimed transferred by ordinary export; v10's
-  ordinary exporter does not certify the absence of test-only stream state.
-  This refusal/rebuild guidance lands with F2's immediate format bump, not
-  later public activation.
+  then initializes a fresh v12 root, loads that export, applies cluster config,
+  and restarts. V12 never opens or migrates a v11 root in place. The genuine
+  cross-version fixture is deliberately clean, disabled, and unenrolled; any
+  private/dev lifecycle, pending WAL, or receipt authority must be quarantined
+  rather than claimed transferred by ordinary export.
 - F2 also updates the mutation/CLI/error and cluster-configuration user docs
   for the behavior it changes immediately: under `ENABLED`, Mutation/Load/delete
   are served-runtime-only; under `DISABLING`, they are closed, and BranchMerge
@@ -907,7 +929,24 @@ writer.
 
    - `DataBlock` retains today's authenticated generation cut plus canonical
      validator correction view and continues through RFC-026 §4.4
-     `StreamCorrection`.
+     `StreamCorrection`. The current shape requires validator contract v1, a
+     selected claim-chain head, a replay cursor equal to the authenticated WAL
+     tail, and a writer epoch equal to both the shard floor and active drain
+     target. Manifest decode checks those relations so an exact retry may
+     return the durable token without reopening the WAL. Validator contract v1
+     streams validation violations directly into a bounded evidence collector
+     while `DRAINING`, without first retaining a global violation vector. It
+     caps the detailed canonical-JSON correction view at 8,192 deduplicated
+     entries and 32 MiB of complete canonical records. Overflow is itself a
+     deterministic terminal, not an error: `CORRECTION_VIEW_OVERFLOW` commits
+     one projection entry per exact current-winner `(logical key, token)`, with
+     a stable item ID and `REPLACE` as its sole action. Entries are ordered by
+     raw UTF-8 logical key and then token bytes and hashed incrementally with
+     domain-separated length framing, including the table key once for the
+     aggregate; no expanded JSON aggregate is retained. The projection is
+     independently bounded by the 8,192-key acknowledged generation and the
+     existing input/token byte envelopes, so adding schema constraints cannot
+     strand a drain.
    - `AuthorityBlock` records a reason/failure phase, the complete expected
      lifecycle/binding/base/token/shard authority digest, a bounded canonical
      observed-authority classification, exact proof references (recovery
@@ -926,8 +965,9 @@ writer.
    and requires byte-identical evidence digest. Either disagreement fails
    closed.
 
-   A persistent eligible authority block uses the future lifecycle strand's
-   `StreamAuthorityCorrection`, addressed by `block_token`, caller operation
+   A persistent eligible authority block will use the registered but
+   fail-closed recovery-v14 `StreamAuthorityCorrection` once F3 activates it,
+   addressed by `block_token`, caller operation
    ID, expected revision, and a complete reason-gated repair-plan digest. The
    repair may adopt a binding/witness only from exact transaction and content
    proof, rebind by materializing a fresh base from the manifest-visible base
@@ -996,9 +1036,9 @@ writer.
    the same token-authority witness and every other plan input; any movement
    refuses effect-free `StreamRetirementPlanChanged`.
 
-   The future lifecycle recovery strand's `StreamAuthorityRetirement` pre-mints
-   the immutable ledger receipt transaction and exact receipt-bearing output
-   token version. Its sole
+   Registered recovery-v14 `StreamAuthorityRetirement`, once F3 activates it,
+   pre-mints the immutable ledger receipt transaction and exact receipt-bearing
+   output token version. Its sole
    manifest CAS revalidates the pre-retirement witness, selects that output
    pointer, advances the profile revision and receipt-chain commitment, and
    publishes `DISABLED → RETIRED`. This control-only CAS appends no ordinary
@@ -1169,7 +1209,7 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
      witness is optional only for an effect-free challenge and mandatory before
      arming. It enforces `stream_ingest`, validates the checked cluster runtime,
      and reuses the existing physical enrollment mechanics before any NDJSON
-     body is opened, but arms only the future lifecycle strand's
+     body is opened, but arms only recovery-v14
      `StreamEnrollmentV2`; it never
      serializes the fuller intent beneath historical `protocol_v10`.
      It byte-revalidates the complete witness under the adapter's ReadSet.
@@ -1207,12 +1247,10 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
      predecessor decision.
 
    This activates the actor-bound `EnrollmentReceiptV2` and
-   `StreamEnrollmentV2` selected in the future lifecycle strand; neither exists
-   beneath v11/recovery-v13. If implementation audit shows either shape could
-   not co-land with that strand, F4 stops for another RFC/spec amendment and
-   explicit approval of a new ordinary graph/recovery strand with
-   predecessor-binary and historical-sidecar refusal before prepare becomes
-   reachable.
+   `StreamEnrollmentV2` selected by the implemented hidden
+   v12/lifecycle-v3/recovery-v14 tranche; neither exists beneath
+   v11/recovery-v13. F4 exposes that existing authority through prepare and
+   does not mint a second enrollment shape or another ordinary format strand.
 
    Enrollment acquires graph-profile shared before the table lease. Under the
    same exclusive table admission lease and existing schema/main/token/table
@@ -2035,7 +2073,7 @@ lands a production writer or claims an SLO before F6.
 | Receipt history | Tagged immutable rows live in manifest-selected `_stream_tokens.lance`; hot profile/lifecycle rows retain bounded current pointers/count/chain commitments; newest-first pagination follows exact indexed predecessor IDs instead of sorting a Lance range, and recovery-covered derived index reconciliation keeps old history index-addressed while the correct uncovered-tail fallback remains explicit and observable |
 | Quiesce ownership | One exclusive admission lease; folds consume injected checked authority |
 | Empty lane | Dedicated fence/tail/empty-proof path with an incremental authenticated WAL-segment cursor/chain; never scan from genesis or invent/seal an empty generation |
-| Lifecycle format | The bounded profile tranche selects internal v11/profile-v2 + recovery-v13 `StreamProfileChange` only; recovery-v12 ordinary fold meaning is unchanged. The full lifecycle/claim/enrollment/correction/retirement family requires another strict strand, and F5 requires a later dead-letter/replay strand. The plan therefore has at least three rebuilds before F7; any additional split requires explicit amendment. |
+| Lifecycle format | Internal v12/lifecycle-v3 + recovery-v14 activates hidden enrollment, claim, ordinary/drain fold, and terminal lifecycle receipt with fixed-size ledger-chain/current authority. F3's remaining registered lifecycle exits stay fail-closed; F5 still requires the later dead-letter/replay strand. The plan therefore has three rebuilds before F7; any additional split requires explicit amendment. |
 | Maintenance | Explicit lifecycle-aware integration per writer; no generic `SEALED` bypass |
 | Public ordering | Hidden F4/F5 → evidence F6 → atomic served/remote activation F7 |
 | Dead letter | One terminal LWW candidate per losing key; two-pass conditional-create 1-MiB chunks (max 256/256 MiB) plus ≤64-KiB manifest, with pre-effect structural block on expansion |

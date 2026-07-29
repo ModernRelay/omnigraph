@@ -144,6 +144,11 @@ async fn publish_recovery_commit(
                 let RecoveryProtocolV13::StreamProfileChange(protocol) = protocol;
                 &protocol.lineage
             })
+        })
+        .or_else(|| match sidecar.protocol_v14.as_deref() {
+            Some(RecoveryProtocolV14::StreamFoldV2(protocol))
+            | Some(RecoveryProtocolV14::StreamDrainFold(protocol)) => Some(&protocol.lineage),
+            _ => None,
         });
     let exact_rollback_id = sidecar
         .protocol_v3
@@ -221,6 +226,12 @@ async fn publish_recovery_commit(
     if matches!(kind, RecoveryKind::RolledForward) {
         if let Some(protocol) = sidecar.protocol_v12.as_ref() {
             intent.stream_fold_attribution = Some(protocol.token.attribution_summary.clone());
+        } else if let Some(
+            RecoveryProtocolV14::StreamFoldV2(protocol)
+            | RecoveryProtocolV14::StreamDrainFold(protocol),
+        ) = sidecar.protocol_v14.as_deref()
+        {
+            intent.stream_fold_attribution = Some(protocol.token.attribution_summary.clone());
         }
     }
     let publisher = GraphNamespacePublisher::new_with_session(
@@ -273,6 +284,11 @@ async fn publish_recovery_commit(
                 let RecoveryProtocolV13::StreamProfileChange(protocol) = protocol;
                 &protocol.authority
             })
+        })
+        .or_else(|| match sidecar.protocol_v14.as_deref() {
+            Some(RecoveryProtocolV14::StreamFoldV2(protocol))
+            | Some(RecoveryProtocolV14::StreamDrainFold(protocol)) => Some(&protocol.authority),
+            _ => None,
         });
     let precondition = match (exact_authority, kind) {
         (Some(authority), RecoveryKind::RolledForward) => {
@@ -294,12 +310,16 @@ async fn publish_recovery_commit(
 pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 
 /// Max sidecar JSON shape/semantics version this binary writes and understands.
-/// The reader accepts every version `<= ` this and refuses only versions ABOVE
+/// The parser accepts every version `<= ` this and refuses only versions ABOVE
 /// it (an older binary cannot guess semantics a newer writer baked in — see
-/// [`SidecarSchemaError`] and [`parse_sidecar`]). Bump this whenever a change
-/// alters how an existing field is *interpreted* (not merely adds an optional
-/// one), and add a fixed `*_SCHEMA_VERSION` floor like the one below so older
-/// generations keep their original semantics.
+/// [`SidecarSchemaError`] and [`parse_sidecar`]). Parsing preserves each
+/// generation's wire meaning; it does not promise that every historical
+/// generation remains executable under a later graph format. The recovery
+/// dispatcher explicitly refuses a historical protocol when the current
+/// manifest authority cannot safely represent its outcome. Bump this whenever
+/// a change alters how an existing field is *interpreted* (not merely adds an
+/// optional one), and add a fixed `*_SCHEMA_VERSION` floor like the one below
+/// so older generations keep their original wire semantics.
 ///
 /// v1 → v2: Phase-B confirmation. A `BranchMerge` sidecar at v2 carries
 /// `confirmed_version` and is classified strictly (unconfirmed ⇒ partial ⇒ roll
@@ -354,10 +374,10 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 ///
 /// v9 → v10: RFC-026 bounded MemWAL enrollment. Schema v10 is reserved for
 /// one main-branch table, an exact pre-enrollment HEAD witness, a pre-minted
-/// enrollment/shard namespace, and one fixed lifecycle binding. Recovery is
-/// roll-forward-only: it may complete the exact index-only gap and publish the
-/// exact empty enrollment, but it never restores the base table or deletes
-/// MemWAL objects.
+/// enrollment/shard namespace, and one fixed lifecycle binding. In the
+/// lifecycle-v1 graph format that emitted it, recovery was roll-forward-only:
+/// it could complete the exact index-only gap and publish the exact empty
+/// enrollment, but never restored the base table or deleted MemWAL objects.
 ///
 /// v10 → v11: RFC-026 bounded MemWAL fold. Schema v11 was reserved for one
 /// exact, roll-forward-only base-table transaction that atomically applies one
@@ -375,15 +395,24 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// complete prior lifecycle, and a digest/count summary of the winning trusted
 /// attribution. EffectsConfirmed binds both achieved HEAD witnesses, the
 /// exact base-table manifest update, the next token-table authority pointer,
-/// and the complete next lifecycle. Recovery may publish only exact/exact or
-/// discard exact-no-effect/no-effect; either partial or any foreign movement
-/// remains `RecoveryRequired`.
+/// and the complete next lifecycle. In lifecycle-v2, recovery could publish
+/// only exact/exact or discard exact-no-effect/no-effect; either partial or any
+/// foreign movement remained `RecoveryRequired`.
 ///
 /// v12 → v13: RFC-026 F2 profile management. The minimal first v11 slice
 /// reserves only `StreamProfileChange`: one immutable receipt transaction plus
 /// the exact prior/next profile authority. Later lifecycle, drain, claim, and
 /// rebind families require another explicitly versioned strand.
-pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 13;
+///
+/// v13 → v14: RFC-026 lifecycle-v3 recovery vocabulary. The closed
+/// discriminator reserves every family in the lifecycle strand, while this
+/// slice activates only `StreamLifecycleReceipt`: one immutable management
+/// receipt plus the exact prior→next lifecycle publication. Historical v10,
+/// v11, v12, and v13 payload fields and wire meanings remain unchanged.
+/// Lifecycle-v3 cannot synthesize v10's binding-ledger authority, v11's
+/// token/state-v2 authority, or v12's lifecycle-v2 outcome, so those three
+/// generations decode and then fail closed; v13 remains executable.
+pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 14;
 
 /// The only recovery generation emitted by the manifest-v5 write paths.
 pub(crate) const IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION: u32 = 9;
@@ -399,6 +428,11 @@ pub(crate) const STREAM_FOLD_SIDECAR_SCHEMA_VERSION: u32 = 12;
 
 /// Exact profile-management receipt/profile publication generation.
 pub(crate) const STREAM_PROFILE_CHANGE_SIDECAR_SCHEMA_VERSION: u32 = 13;
+
+/// Closed lifecycle-v3 recovery generation. Only `StreamLifecycleReceipt` is
+/// executable in the first slice; every other decoded discriminator remains
+/// fail-closed until its exact classifier is implemented.
+pub(crate) const STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION: u32 = 14;
 
 /// Schema v11 is the first sidecar allowed to describe data-bearing MemWAL
 /// state, which is bound to stream-config v2 rather than Phase A's config-v1.
@@ -513,6 +547,28 @@ pub(crate) enum SidecarKind {
     /// RFC-026 F2 — append one immutable profile-management receipt and select
     /// it with the exact next graph-global stream profile.
     StreamProfileChange,
+    /// RFC-026 lifecycle-v3 enrollment with immutable ledger provenance.
+    StreamEnrollmentV2,
+    /// RFC-026 lifecycle-v3 writer-epoch claim and receipt publication.
+    StreamClaim,
+    /// RFC-026 lifecycle-v3 ordinary fold.
+    StreamFoldV2,
+    /// RFC-026 lifecycle-v3 drain-bound fold.
+    StreamDrainFold,
+    /// RFC-026 lifecycle-v3 metadata-only terminal receipt publication.
+    StreamLifecycleReceipt,
+    /// RFC-026 lifecycle-v3 resume/abort-drain family.
+    StreamResume,
+    /// RFC-026 lifecycle-v3 data/authority correction family.
+    StreamCorrection,
+    /// RFC-026 lifecycle-v3 terminal authority retirement.
+    StreamAuthorityRetirement,
+    /// RFC-026 lifecycle-v3 token-ledger index maintenance.
+    StreamTokenLedgerIndexMaintenance,
+    /// RFC-026 lifecycle-v3 same-binding sealed maintenance.
+    StreamSealedMaintenance,
+    /// RFC-026 lifecycle-v3 physical binding replacement.
+    StreamRebind,
 }
 
 /// Which recovery-classification semantics a sidecar's tables use. Resolved once
@@ -546,9 +602,32 @@ pub(crate) enum ClassificationMode {
     StreamFold,
     /// Specialized profile receipt + manifest authority transition.
     StreamProfileChange,
+    /// Closed recovery-v14 vocabulary. Generic table recovery must never
+    /// classify these intents from table pins.
+    StreamProtocolV14,
 }
 
 impl SidecarKind {
+    fn is_stream_recovery(self) -> bool {
+        matches!(
+            self,
+            Self::StreamEnrollment
+                | Self::StreamFold
+                | Self::StreamProfileChange
+                | Self::StreamEnrollmentV2
+                | Self::StreamClaim
+                | Self::StreamFoldV2
+                | Self::StreamDrainFold
+                | Self::StreamLifecycleReceipt
+                | Self::StreamResume
+                | Self::StreamCorrection
+                | Self::StreamAuthorityRetirement
+                | Self::StreamTokenLedgerIndexMaintenance
+                | Self::StreamSealedMaintenance
+                | Self::StreamRebind
+        )
+    }
+
     /// Recovery intents whose unpublished physical state can change authority
     /// observed by every graph writer, even on another branch or table.
     ///
@@ -558,7 +637,20 @@ impl SidecarKind {
     pub(crate) fn is_graph_global_barrier(self) -> bool {
         matches!(
             self,
-            Self::SchemaApply | Self::StreamFold | Self::StreamProfileChange
+            Self::SchemaApply
+                | Self::StreamFold
+                | Self::StreamProfileChange
+                | Self::StreamEnrollmentV2
+                | Self::StreamClaim
+                | Self::StreamFoldV2
+                | Self::StreamDrainFold
+                | Self::StreamLifecycleReceipt
+                | Self::StreamResume
+                | Self::StreamCorrection
+                | Self::StreamAuthorityRetirement
+                | Self::StreamTokenLedgerIndexMaintenance
+                | Self::StreamSealedMaintenance
+                | Self::StreamRebind
         )
     }
 
@@ -605,6 +697,17 @@ impl SidecarKind {
             SidecarKind::StreamEnrollment => ClassificationMode::StreamEnrollment,
             SidecarKind::StreamFold => ClassificationMode::StreamFold,
             SidecarKind::StreamProfileChange => ClassificationMode::StreamProfileChange,
+            SidecarKind::StreamEnrollmentV2
+            | SidecarKind::StreamClaim
+            | SidecarKind::StreamFoldV2
+            | SidecarKind::StreamDrainFold
+            | SidecarKind::StreamLifecycleReceipt
+            | SidecarKind::StreamResume
+            | SidecarKind::StreamCorrection
+            | SidecarKind::StreamAuthorityRetirement
+            | SidecarKind::StreamTokenLedgerIndexMaintenance
+            | SidecarKind::StreamSealedMaintenance
+            | SidecarKind::StreamRebind => ClassificationMode::StreamProtocolV14,
         }
     }
 }
@@ -1158,14 +1261,14 @@ pub(crate) struct RecoveryProtocolV12 {
     pub generation_cut: RecoveryStreamFoldCut,
     pub merged_generation: MergedGeneration,
     pub effect_phase: RecoveryEffectPhase,
-    pub prior_lifecycle: super::StreamLifecycleEntry,
+    pub prior_lifecycle: super::stream::LegacyStreamLifecycleEntryV2,
     /// Complete logical post-fold state fixed before either Lance effect. Its
     /// HEAD witness carries the planned `(main, N+1, transaction UUID)` and a
     /// null e-tag output slot. Confirmation/recovery substitutes only the exact
     /// achieved e-tag-bearing witness; every other field is immutable.
-    pub planned_next_lifecycle: super::StreamLifecycleEntry,
+    pub planned_next_lifecycle: super::stream::LegacyStreamLifecycleEntryV2,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_lifecycle: Option<super::StreamLifecycleEntry>,
+    pub next_lifecycle: Option<super::stream::LegacyStreamLifecycleEntryV2>,
     pub base: RecoveryStreamFoldBaseEffect,
     pub token: RecoveryStreamFoldTokenEffect,
 }
@@ -1213,6 +1316,377 @@ pub(crate) struct RecoveryStreamProfileChangeV13 {
 #[serde(tag = "kind", content = "payload", deny_unknown_fields)]
 pub(crate) enum RecoveryProtocolV13 {
     StreamProfileChange(RecoveryStreamProfileChangeV13),
+}
+
+/// Table lane whose outer stream-admission gate owns a recovery-v14 intent.
+///
+/// Recovery-v14 control effects may have no base-table participant, so table
+/// pins are not a complete coordination surface. This explicit scope is
+/// immutable across Armed → EffectsConfirmed rewrites and lets discovery take
+/// the correct admission gate before rereading the sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamAdmissionScope {
+    pub identity: TableIdentity,
+    /// The lifecycle-v3 strand is canonical-main only. Keeping the resolved
+    /// branch explicit prevents a future named-ref shape from silently sharing
+    /// today's admission semantics.
+    pub table_branch: Option<String>,
+    /// Never-reused physical binding namespace. It is not part of the queue
+    /// key, but binds the sidecar to the exact lifecycle lane it may advance.
+    pub binding_scope_id: String,
+}
+
+/// Typed bounded placeholder for a recovery-v14 family whose exact effect
+/// classifier is deliberately inactive in this slice. Decoding the closed
+/// discriminator is safe; processing it always fails closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamProtocolV14Scaffold {
+    pub authority: RecoveryAuthorityToken,
+    pub admission_scope: RecoveryStreamAdmissionScope,
+    pub operation_id: String,
+}
+
+/// Exact immutable token-ledger participant for lifecycle-v3 enrollment.
+///
+/// Both initial records are staged in one pre-minted transaction. Recovery
+/// may recreate that transaction from the complete bounded records, but may
+/// never synthesize either receipt from a physical MemWAL effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamEnrollmentV2TokenEffect {
+    pub prior_authority: super::StreamTokenAuthorityEntry,
+    pub planned_enrollment_receipt: super::stream::EnrollmentReceiptV2,
+    pub planned_binding_receipt: super::stream::BindingReceipt,
+    pub planned_transaction: StagedTransactionIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_transaction: Option<StagedTransactionIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_head: Option<super::CurrentHeadWitness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_authority: Option<super::StreamTokenAuthorityEntry>,
+}
+
+/// Recovery-v14 owner for one exact physical enrollment plus its initial
+/// lifecycle-v3 ledger authority.
+///
+/// The base-table initializer retains Phase A's exact N/N+1 classifier and
+/// pre-minted empty shard. The token participant is an exact N/N+1 immutable
+/// receipt transaction. Only after both are proven does confirmation bind the
+/// derived table update and complete OPEN lifecycle; one terminal manifest CAS
+/// then selects the table pointer, token pointer, and lifecycle together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamEnrollmentV2V14 {
+    pub authority: RecoveryAuthorityToken,
+    pub lineage: RecoveryLineageIntent,
+    pub admission_scope: RecoveryStreamAdmissionScope,
+    pub prior_manifest_version: u64,
+    pub profile: super::StreamProfileEntry,
+    pub effect_phase: RecoveryEffectPhase,
+    pub baseline_head: super::CurrentHeadWitness,
+    pub enrollment_plan: MemWalEnrollmentPlan,
+    pub intended_binding: super::StreamPhysicalBinding,
+    pub prior_row_count: u64,
+    pub legacy_enrollment_receipt: super::stream::EnrollmentReceipt,
+    pub token: RecoveryStreamEnrollmentV2TokenEffect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_update: Option<RecoveryConfirmedTableUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_lifecycle: Option<super::StreamLifecycleEntry>,
+}
+
+/// Drain-only proof carried by the shared lifecycle-v3 fold envelope.
+///
+/// The digest is produced by the bounded `LsmScanner::without_base_table`
+/// preflight. Recovery does not rerun that logical scan after either physical
+/// participant may have moved; it instead verifies that the immutable plan
+/// bound the exact current claim and its already authenticated full-generation
+/// projection before the first effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamDrainFoldAuthorityV14 {
+    pub drain_id: String,
+    pub recomputed_lww_projection_digest: String,
+}
+
+/// Recovery-v14 owner for the exact base+token fold transaction pair.
+///
+/// `StreamFoldV2` and `StreamDrainFold` deliberately share this physical
+/// payload and classifier. Their only difference is lifecycle authorization:
+/// the ordinary discriminator requires `OPEN`; the drain discriminator
+/// requires the exact active drain, its current claim receipt, and a
+/// byte-identical recomputed LWW projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamFoldV14 {
+    pub authority: RecoveryAuthorityToken,
+    pub lineage: RecoveryLineageIntent,
+    pub admission_scope: RecoveryStreamAdmissionScope,
+    pub prior_manifest_version: u64,
+    pub profile: super::StreamProfileEntry,
+    pub binding: super::StreamPhysicalBinding,
+    pub prior_merged_generation: Option<MergedGeneration>,
+    pub generation_cut: RecoveryStreamFoldCut,
+    pub merged_generation: MergedGeneration,
+    pub effect_phase: RecoveryEffectPhase,
+    pub prior_lifecycle: super::StreamLifecycleEntry,
+    /// Full immutable receipt selected by `prior_lifecycle`. Both fold modes
+    /// bind it; a fold never advances or replaces claim authority.
+    pub current_claim_receipt: super::stream::ClaimReceipt,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_authority: Option<RecoveryStreamDrainFoldAuthorityV14>,
+    /// Complete logical successor fixed before either Lance participant. The
+    /// achieved base ETag may replace only the planned null ETag during
+    /// confirmation.
+    pub planned_next_lifecycle: super::StreamLifecycleEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_lifecycle: Option<super::StreamLifecycleEntry>,
+    pub base: RecoveryStreamFoldBaseEffect,
+    pub token: RecoveryStreamFoldTokenEffect,
+}
+
+/// Lifecycle-receipt subkinds supported by the active v14 metadata processor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum RecoveryStreamLifecycleReceiptKind {
+    QuiesceFinalize,
+    DisableDrainAdoption,
+}
+
+/// Exact immutable lifecycle-ledger participant. The raw token dataset HEAD is
+/// inspected only to classify whether this pre-minted transaction happened;
+/// graph authority remains the manifest-selected `prior_authority` until the
+/// sole terminal CAS selects `next_authority`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamLifecycleReceiptEffect {
+    pub prior_authority: super::StreamTokenAuthorityEntry,
+    pub planned_receipt: super::stream::ManagementReceipt,
+    pub planned_transaction: StagedTransactionIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_transaction: Option<StagedTransactionIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_head: Option<super::CurrentHeadWitness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_authority: Option<super::StreamTokenAuthorityEntry>,
+}
+
+/// Recovery-v14 owner for one metadata-only lifecycle transition.
+///
+/// This payload intentionally has no lineage and no base-table effect. It
+/// fixes the graph/profile/lifecycle prestate, one exact immutable receipt
+/// transaction, and the complete next lifecycle. Only the exact receipt plus
+/// the sole token-pointer/lifecycle manifest CAS may become authoritative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamLifecycleReceiptV14 {
+    pub authority: RecoveryAuthorityToken,
+    pub admission_scope: RecoveryStreamAdmissionScope,
+    pub prior_manifest_version: u64,
+    pub change_kind: RecoveryStreamLifecycleReceiptKind,
+    pub effect_phase: RecoveryEffectPhase,
+    pub profile: super::StreamProfileEntry,
+    pub prior_lifecycle: super::StreamLifecycleEntry,
+    /// Exact immutable claim selected by the prior token authority when this
+    /// receipt terminally seals a drain. Metadata-only drain adoption has no
+    /// physical empty-cut proof and must keep this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_claim_receipt: Option<super::stream::ClaimReceipt>,
+    pub next_lifecycle: super::StreamLifecycleEntry,
+    pub receipt: RecoveryStreamLifecycleReceiptEffect,
+}
+
+/// Immutable logical claim authority reconstructed through the pure
+/// lifecycle-v3 claim planner during every sidecar validation.
+///
+/// The sidecar stores both the caller inputs and the resulting digests. That
+/// makes the wire self-contained while preventing recovery from accepting a
+/// caller-chosen digest that the ordinary claim path would not have produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamClaimOperationV14 {
+    pub graph_identity_digest: String,
+    pub claim_id: String,
+    pub recovery_operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_operation_id: Option<String>,
+    pub claim_kind: String,
+    pub profile: super::stream::ClaimProfile,
+    pub shard_id: String,
+    pub initial_shard_manifest_version: u64,
+    pub initial_writer_epoch: u64,
+    pub initial_replay_cursor: u64,
+    pub initial_current_generation: u64,
+    pub initial_base_merged_generation: u64,
+    /// Exact manifest-selected published-fold boundary used while
+    /// authenticating this claim. Recovery stores it independently so a
+    /// replaced LastFoldSummary cannot retarget the operation.
+    pub folded_replay_cursor: u64,
+    pub claim_contract_version: u32,
+    pub bound_prestate_digest: String,
+    pub claim_operation_digest: String,
+}
+
+/// The only physical claim invocation plan retained by a recovery sidecar.
+///
+/// Retried attempts replace this value; they never append to an inline
+/// history. `prior_attempt_chain` on [`RecoveryStreamClaimV14`] is the fixed-
+/// size commitment to all already selected attempts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamClaimAttemptV14 {
+    pub attempt_id: String,
+    pub pre_shard_manifest_version: u64,
+    pub pre_writer_epoch: u64,
+    pub pre_replay_cursor: u64,
+    pub planned_sentinel_position: u64,
+    pub planned_writer_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_envelope_digest: Option<String>,
+    pub planned_sentinel_digest: String,
+    pub bound_prestate_digest: String,
+    pub attempt_plan_digest: String,
+}
+
+/// Durable progress of one bounded current claim attempt.
+///
+/// `CheckpointVisible` is deliberately terminal only for the current attempt,
+/// not for the claim operation. Its sidecar stays present until the same
+/// operation durably replaces it with the next `AttemptArmed` plan or publishes
+/// a terminal receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum RecoveryStreamClaimPhaseV14 {
+    AttemptArmed,
+    EffectFreeClassified,
+    LedgerArmed,
+    LedgerEffectsConfirmed,
+    CheckpointVisible,
+}
+
+/// Exact token-ledger transaction containing the current immutable attempt
+/// effect and, for terminal success, its immutable claim receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamClaimLedgerEffectV14 {
+    pub planned_transaction: StagedTransactionIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_transaction: Option<StagedTransactionIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_head: Option<super::CurrentHeadWitness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_authority: Option<super::StreamTokenAuthorityEntry>,
+}
+
+/// Terminal receipt and the one exact lifecycle row it is permitted to
+/// select. The attempt row and receipt share one token-ledger transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamClaimTerminalV14 {
+    pub receipt: super::stream::ClaimReceipt,
+    pub next_lifecycle: super::StreamLifecycleEntry,
+}
+
+/// Recovery-v14 owner for one logical writer claim.
+///
+/// The hot shape is constant-size for any number of attempts: one selected
+/// chain reference, one current attempt plan, at most one classified attempt
+/// row, and at most one terminal receipt. No attempt authority is written into
+/// the lifecycle row before terminal publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamClaimV14 {
+    pub authority: RecoveryAuthorityToken,
+    pub admission_scope: RecoveryStreamAdmissionScope,
+    pub prior_manifest_version: u64,
+    pub stream_profile: super::StreamProfileEntry,
+    pub prior_lifecycle: super::StreamLifecycleEntry,
+    pub prior_token_authority: super::StreamTokenAuthorityEntry,
+    pub operation: RecoveryStreamClaimOperationV14,
+    pub prior_attempt_chain: super::stream_profile::ReceiptChainRef,
+    pub current_attempt: RecoveryStreamClaimAttemptV14,
+    pub phase: RecoveryStreamClaimPhaseV14,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classified_attempt: Option<super::stream::ClaimAttemptEffect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<RecoveryStreamClaimLedgerEffectV14>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<RecoveryStreamClaimTerminalV14>,
+}
+
+/// Recovery-v14 is a closed discriminator. The vocabulary is fixed before
+/// public lifecycle activation so an unknown future meaning is rejected by
+/// serde rather than guessed. Enrollment-v2, claim, ordinary/drain fold, and
+/// lifecycle-receipt processors are active; the remaining scaffold variants
+/// stay bounded and fail closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", deny_unknown_fields)]
+pub(crate) enum RecoveryProtocolV14 {
+    StreamEnrollmentV2(RecoveryStreamEnrollmentV2V14),
+    StreamClaim(RecoveryStreamClaimV14),
+    StreamFoldV2(RecoveryStreamFoldV14),
+    StreamDrainFold(RecoveryStreamFoldV14),
+    StreamLifecycleReceipt(RecoveryStreamLifecycleReceiptV14),
+    StreamResume(RecoveryStreamProtocolV14Scaffold),
+    StreamCorrection(RecoveryStreamProtocolV14Scaffold),
+    StreamAuthorityRetirement(RecoveryStreamProtocolV14Scaffold),
+    StreamTokenLedgerIndexMaintenance(RecoveryStreamProtocolV14Scaffold),
+    StreamSealedMaintenance(RecoveryStreamProtocolV14Scaffold),
+    StreamRebind(RecoveryStreamProtocolV14Scaffold),
+}
+
+impl RecoveryProtocolV14 {
+    fn admission_scope(&self) -> &RecoveryStreamAdmissionScope {
+        match self {
+            Self::StreamFoldV2(protocol) | Self::StreamDrainFold(protocol) => {
+                &protocol.admission_scope
+            }
+            Self::StreamResume(protocol)
+            | Self::StreamCorrection(protocol)
+            | Self::StreamAuthorityRetirement(protocol)
+            | Self::StreamTokenLedgerIndexMaintenance(protocol)
+            | Self::StreamSealedMaintenance(protocol)
+            | Self::StreamRebind(protocol) => &protocol.admission_scope,
+            Self::StreamEnrollmentV2(protocol) => &protocol.admission_scope,
+            Self::StreamClaim(protocol) => &protocol.admission_scope,
+            Self::StreamLifecycleReceipt(protocol) => &protocol.admission_scope,
+        }
+    }
+
+    fn authority(&self) -> &RecoveryAuthorityToken {
+        match self {
+            Self::StreamFoldV2(protocol) | Self::StreamDrainFold(protocol) => &protocol.authority,
+            Self::StreamResume(protocol)
+            | Self::StreamCorrection(protocol)
+            | Self::StreamAuthorityRetirement(protocol)
+            | Self::StreamTokenLedgerIndexMaintenance(protocol)
+            | Self::StreamSealedMaintenance(protocol)
+            | Self::StreamRebind(protocol) => &protocol.authority,
+            Self::StreamEnrollmentV2(protocol) => &protocol.authority,
+            Self::StreamClaim(protocol) => &protocol.authority,
+            Self::StreamLifecycleReceipt(protocol) => &protocol.authority,
+        }
+    }
+
+    fn writer_kind(&self) -> SidecarKind {
+        match self {
+            Self::StreamEnrollmentV2(_) => SidecarKind::StreamEnrollmentV2,
+            Self::StreamClaim(_) => SidecarKind::StreamClaim,
+            Self::StreamFoldV2(_) => SidecarKind::StreamFoldV2,
+            Self::StreamDrainFold(_) => SidecarKind::StreamDrainFold,
+            Self::StreamLifecycleReceipt(_) => SidecarKind::StreamLifecycleReceipt,
+            Self::StreamResume(_) => SidecarKind::StreamResume,
+            Self::StreamCorrection(_) => SidecarKind::StreamCorrection,
+            Self::StreamAuthorityRetirement(_) => SidecarKind::StreamAuthorityRetirement,
+            Self::StreamTokenLedgerIndexMaintenance(_) => {
+                SidecarKind::StreamTokenLedgerIndexMaintenance
+            }
+            Self::StreamSealedMaintenance(_) => SidecarKind::StreamSealedMaintenance,
+            Self::StreamRebind(_) => SidecarKind::StreamRebind,
+        }
+    }
 }
 
 /// Schema-v6 EnsureIndices rollback identity retained for compatibility.
@@ -1302,10 +1776,23 @@ pub(crate) struct RecoverySidecar {
     /// Exact RFC-026 F2 profile-management payload (schema v13 only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v13: Option<Box<RecoveryProtocolV13>>,
+    /// Closed RFC-026 lifecycle-v3 payload (schema v14 only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_v14: Option<Box<RecoveryProtocolV14>>,
     /// EnsureIndices-only fixed rollback identity. It does not make the
     /// physical index effects exact; it only makes compensation retry-safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensure_indices_rollback_v6: Option<RecoveryEnsureIndicesRollbackV6>,
+}
+
+impl RecoverySidecar {
+    /// Explicit recovery-v14 admission lane. Older generations derive their
+    /// gates from table pins; v14 control-only intents may have no such pin.
+    pub(crate) fn stream_admission_scope(&self) -> Option<&RecoveryStreamAdmissionScope> {
+        self.protocol_v14
+            .as_deref()
+            .map(RecoveryProtocolV14::admission_scope)
+    }
 }
 
 /// Opaque handle returned by [`write_sidecar`] so the caller can delete
@@ -1672,6 +2159,7 @@ async fn reread_sidecar_under_gates(
         || current.writer_kind != listed.writer_kind
         || current.branch != listed.branch
         || current_keys != listed_keys
+        || current.stream_admission_scope() != listed.stream_admission_scope()
     {
         return Err(OmniError::manifest_internal(format!(
             "recovery sidecar '{}' changed its coordination keys while recovery waited for gates",
@@ -1698,10 +2186,10 @@ pub(crate) fn parse_sidecar(sidecar_uri: &str, body: &str) -> Result<RecoverySid
             sidecar_uri, err
         ))
     })?;
-    // Accept every version we were built to understand (`<= max`); refuse only
-    // versions NEWER than us. Interpreting older generations with their original
-    // semantics (rather than refusing them) is what avoids billing operators to
-    // drain pre-upgrade sidecars; classification then dispatches by version.
+    // Accept every wire version we were built to understand (`<= max`); refuse
+    // only versions NEWER than us. Shape admission is not a recoverability
+    // promise: version-specific dispatch may still refuse a historical protocol
+    // when the current graph format cannot represent its authority or outcome.
     if peek.schema_version > SIDECAR_SCHEMA_VERSION {
         return Err(SidecarSchemaError {
             sidecar_uri: sidecar_uri.to_string(),
@@ -1767,6 +2255,14 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             STREAM_PROFILE_CHANGE_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
         )));
     }
+    if sidecar.protocol_v14.is_some()
+        && sidecar.schema_version != STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION
+    {
+        return Err(malformed(format!(
+            "protocol_v14 requires schema-v{}, found schema-v{}",
+            STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
+        )));
+    }
 
     if sidecar.schema_version < EXACT_EFFECT_IDENTITY_SCHEMA_VERSION {
         if sidecar.protocol_v3.is_some()
@@ -1777,6 +2273,7 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             || sidecar.protocol_v11.is_some()
             || sidecar.protocol_v12.is_some()
             || sidecar.protocol_v13.is_some()
+            || sidecar.protocol_v14.is_some()
         {
             return Err(malformed(
                 "an exact-effect protocol is present on a pre-v3 sidecar".to_string(),
@@ -1801,6 +2298,10 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
         return validate_stream_profile_change_v13_shape(sidecar_uri, sidecar);
     }
 
+    if sidecar.schema_version == STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION {
+        return validate_stream_protocol_v14_shape(sidecar_uri, sidecar);
+    }
+
     if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
         return match sidecar.writer_kind {
             SidecarKind::Mutation | SidecarKind::Load => {
@@ -1818,6 +2319,19 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             )),
             SidecarKind::StreamProfileChange => Err(malformed(
                 "StreamProfileChange requires the dedicated schema-v13 envelope".to_string(),
+            )),
+            SidecarKind::StreamEnrollmentV2
+            | SidecarKind::StreamClaim
+            | SidecarKind::StreamFoldV2
+            | SidecarKind::StreamDrainFold
+            | SidecarKind::StreamLifecycleReceipt
+            | SidecarKind::StreamResume
+            | SidecarKind::StreamCorrection
+            | SidecarKind::StreamAuthorityRetirement
+            | SidecarKind::StreamTokenLedgerIndexMaintenance
+            | SidecarKind::StreamSealedMaintenance
+            | SidecarKind::StreamRebind => Err(malformed(
+                "lifecycle-v3 stream writer requires the dedicated schema-v14 envelope".to_string(),
             )),
         };
     }
@@ -1842,6 +2356,7 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             || sidecar.protocol_v11.is_some()
             || sidecar.protocol_v12.is_some()
             || sidecar.protocol_v13.is_some()
+            || sidecar.protocol_v14.is_some()
         {
             return Err(malformed(
                 "schema-v5 SchemaApply must target main and cannot carry v3/v4 protocols"
@@ -1875,6 +2390,7 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
         || sidecar.protocol_v11.is_some()
         || sidecar.protocol_v12.is_some()
         || sidecar.protocol_v13.is_some()
+        || sidecar.protocol_v14.is_some()
     {
         return Err(malformed(
             "a writer-specific exact protocol is present on the wrong sidecar generation"
@@ -1940,6 +2456,7 @@ fn validate_mutation_load_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) ->
         || sidecar.protocol_v8.is_some()
         || sidecar.protocol_v10.is_some()
         || sidecar.protocol_v11.is_some()
+        || sidecar.protocol_v12.is_some()
         || sidecar.ensure_indices_rollback_v6.is_some()
         || sidecar.merge_source_commit_id.is_some()
         || sidecar.schema_apply_manifest_published
@@ -3135,6 +3652,1701 @@ fn validate_stream_profile_change_v13_shape(
     Ok(())
 }
 
+fn validate_stream_admission_scope<F>(
+    malformed: &F,
+    scope: &RecoveryStreamAdmissionScope,
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    scope
+        .identity
+        .validate()
+        .map_err(|error| malformed(format!("invalid recovery-v14 lane identity: {error}")))?;
+    if scope.table_branch.is_some() {
+        return Err(malformed(
+            "recovery-v14 stream admission supports canonical main only".to_string(),
+        ));
+    }
+    validate_canonical_uuid_text(
+        malformed,
+        "recovery-v14 binding_scope_id",
+        &scope.binding_scope_id,
+        false,
+    )
+    .map(|_| ())
+}
+
+fn validate_stream_protocol_v14_common<F>(
+    malformed: &F,
+    sidecar: &RecoverySidecar,
+    protocol: &RecoveryProtocolV14,
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    if sidecar.writer_kind != protocol.writer_kind() {
+        return Err(malformed(format!(
+            "recovery-v14 discriminator {:?} does not match writer kind {:?}",
+            protocol.writer_kind(),
+            sidecar.writer_kind
+        )));
+    }
+    validate_authority_identity(malformed, protocol.authority())?;
+    if protocol.authority().branch_identifier != lance::dataset::refs::BranchIdentifier::main() {
+        return Err(malformed(
+            "recovery-v14 authority must name canonical main".to_string(),
+        ));
+    }
+    validate_stream_admission_scope(malformed, protocol.admission_scope())?;
+    if sidecar.tables.len() > 1
+        || sidecar.tables.first().is_some_and(|pin| {
+            pin.identity != protocol.admission_scope().identity
+                || pin.table_branch != protocol.admission_scope().table_branch
+        })
+    {
+        return Err(malformed(
+            "recovery-v14 table pins must be empty or contain only the explicit admission lane"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn stream_enrollment_v2_expected_lifecycle(
+    protocol: &RecoveryStreamEnrollmentV2V14,
+    diagnostic_table_key: String,
+    head: super::CurrentHeadWitness,
+) -> Result<super::StreamLifecycleEntry> {
+    super::StreamLifecycleEntry::new_open_enrollment(
+        protocol.admission_scope.identity,
+        diagnostic_table_key,
+        protocol.intended_binding.clone(),
+        protocol.admission_scope.binding_scope_id.clone(),
+        head,
+        BTreeMap::from([(protocol.enrollment_plan.shard_id.to_string(), 1_u64)]),
+        protocol.legacy_enrollment_receipt.clone(),
+        protocol.token.planned_binding_receipt.record_id.clone(),
+        protocol.token.planned_binding_receipt.next_chain_ref()?,
+    )
+}
+
+fn validate_stream_enrollment_v2_v14_shape<F>(
+    malformed: &F,
+    sidecar: &RecoverySidecar,
+    protocol: &RecoveryStreamEnrollmentV2V14,
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    if sidecar.tables.len() != 1
+        || sidecar.actor_id.is_none()
+        || protocol.prior_manifest_version == 0
+    {
+        return Err(malformed(
+            "StreamEnrollmentV2 requires one table pin, an authenticated actor, and an exact prior manifest version"
+                .to_string(),
+        ));
+    }
+    let pin = &sidecar.tables[0];
+    let expected_post = pin.expected_version.checked_add(1).ok_or_else(|| {
+        malformed("StreamEnrollmentV2 table version overflows its exact N+1 outcome".to_string())
+    })?;
+    if pin.identity != protocol.admission_scope.identity
+        || pin.expected_version == 0
+        || pin.table_branch.is_some()
+        || pin.confirmed_version.is_some()
+        || pin.post_commit_pin != expected_post
+        || protocol.baseline_head.table_version != pin.expected_version
+        || protocol.baseline_head.branch_identifier
+            != lance::dataset::refs::BranchIdentifier::main()
+        || protocol.baseline_head.transaction_uuid.is_empty()
+        || protocol
+            .baseline_head
+            .manifest_e_tag
+            .as_ref()
+            .is_some_and(|e_tag| e_tag.is_empty() || e_tag.trim() != e_tag)
+    {
+        return Err(malformed(
+            "StreamEnrollmentV2 pin and exact main-branch baseline witness disagree".to_string(),
+        ));
+    }
+    validate_canonical_uuid_text(
+        malformed,
+        "StreamEnrollmentV2 baseline transaction UUID",
+        &protocol.baseline_head.transaction_uuid,
+        false,
+    )?;
+    if protocol.lineage.branch.is_some()
+        || protocol.lineage.merged_parent_commit_id.is_some()
+        || protocol.lineage.graph_commit_id.is_empty()
+        || sidecar.actor_id != protocol.lineage.actor_id
+        || protocol
+            .authority
+            .graph_head
+            .as_ref()
+            .is_some_and(|head| head == &protocol.lineage.graph_commit_id)
+    {
+        return Err(malformed(
+            "StreamEnrollmentV2 lineage must be a distinct fixed canonical-main commit owned by the authenticated actor"
+                .to_string(),
+        ));
+    }
+    protocol
+        .profile
+        .validate()
+        .map_err(|error| malformed(format!("invalid exact stream profile prestate: {error}")))?;
+
+    let binding = &protocol.intended_binding;
+    let canonical_path = super::table_path_for_identity(&pin.table_key, pin.identity)
+        .map_err(|error| malformed(format!("invalid StreamEnrollmentV2 binding path: {error}")))?;
+    if binding
+        .identity()
+        .map_err(|error| malformed(format!("invalid StreamEnrollmentV2 binding: {error}")))?
+        != pin.identity
+        || binding.table_location != canonical_path
+        || binding.table_branch.is_some()
+        || binding.enrollment_id != protocol.enrollment_plan.enrollment_id.to_string()
+        || binding.shard_ids != vec![protocol.enrollment_plan.shard_id.to_string()]
+        || binding.stream_config_version != super::stream::STREAM_CONFIG_VERSION
+        || binding.stream_config_hash != protocol.enrollment_plan.stream_config_hash()
+        || protocol.admission_scope.binding_scope_id
+            == protocol.enrollment_plan.enrollment_id.to_string()
+        || protocol.admission_scope.binding_scope_id
+            == protocol.enrollment_plan.shard_id.to_string()
+    {
+        return Err(malformed(
+            "StreamEnrollmentV2 physical binding differs from its pin, admission scope, or pre-minted plan"
+                .to_string(),
+        ));
+    }
+    MemWalEnrollmentPlan::new(
+        protocol.enrollment_plan.enrollment_id,
+        protocol.enrollment_plan.shard_id,
+    )
+    .map_err(|error| malformed(format!("invalid StreamEnrollmentV2 plan: {error}")))?;
+
+    protocol
+        .legacy_enrollment_receipt
+        .validate()
+        .map_err(|error| malformed(format!("invalid legacy enrollment provenance: {error}")))?;
+    let enrollment = &protocol.token.planned_enrollment_receipt;
+    enrollment
+        .validate()
+        .map_err(|error| malformed(format!("invalid enrollment-v2 ledger receipt: {error}")))?;
+    let binding_receipt = &protocol.token.planned_binding_receipt;
+    binding_receipt
+        .validate()
+        .map_err(|error| malformed(format!("invalid initial binding ledger receipt: {error}")))?;
+    let graph_identity_digest =
+        super::stream::stream_graph_identity_digest(&protocol.authority.schema_identity_domain)
+            .map_err(|error| malformed(format!("invalid graph identity digest: {error}")))?;
+    let expected_intent_digest = super::stream_enrollment_intent_digest_v1(
+        pin.identity,
+        &binding.table_location,
+        &protocol.authority.schema_identity_domain,
+        &protocol.authority.schema_ir_hash,
+        protocol.authority.schema_identity_version,
+        &protocol.baseline_head,
+        &binding.stream_config_hash,
+    )
+    .map_err(|error| malformed(format!("invalid StreamEnrollmentV2 intent: {error}")))?;
+    let enrollment_chain = enrollment
+        .next_chain_ref()
+        .map_err(|error| malformed(format!("invalid enrollment-v2 chain head: {error}")))?;
+    if enrollment.graph_identity_digest != graph_identity_digest
+        || enrollment.identity != pin.identity
+        || enrollment.enrollment_intent_digest != expected_intent_digest
+        || Some(enrollment.actor_id.as_str()) != sidecar.actor_id.as_deref()
+        || enrollment.binding_scope_id != protocol.admission_scope.binding_scope_id
+        || enrollment.physical_binding != *binding
+        || protocol.legacy_enrollment_receipt.enrollment_request_id
+            != enrollment.enrollment_request_id
+        || protocol.legacy_enrollment_receipt.enrollment_intent_digest
+            != enrollment.enrollment_intent_digest
+        || protocol.legacy_enrollment_receipt.stream_incarnation_id
+            != enrollment.stream_incarnation_id
+        || protocol.legacy_enrollment_receipt.physical_binding != *binding
+        || binding_receipt.graph_identity_digest != graph_identity_digest
+        || binding_receipt.identity != pin.identity
+        || binding_receipt.binding_scope_id != protocol.admission_scope.binding_scope_id
+        || binding_receipt.stream_incarnation_id != enrollment.stream_incarnation_id
+        || binding_receipt.physical_binding != *binding
+        || binding_receipt.operation_id != enrollment.enrollment_request_id
+        || binding_receipt.chain_ordinal
+            != enrollment.chain_ordinal.checked_add(1).ok_or_else(|| {
+                malformed("StreamEnrollmentV2 binding chain ordinal overflow".to_string())
+            })?
+        || binding_receipt.predecessor_record_id.as_deref() != Some(enrollment.record_id.as_str())
+        || binding_receipt.prior_chain_digest != enrollment_chain.chain_digest
+    {
+        return Err(malformed(
+            "StreamEnrollmentV2 receipts do not bind the exact actor, intent, incarnation, binding, and contiguous initial chain"
+                .to_string(),
+        ));
+    }
+
+    protocol
+        .token
+        .prior_authority
+        .validate()
+        .map_err(|error| malformed(format!("invalid prior stream-token authority: {error}")))?;
+    let planned = &protocol.token.planned_transaction;
+    if planned.read_version
+        != protocol
+            .token
+            .prior_authority
+            .current_head_witness
+            .table_version
+        || planned.uuid
+            == protocol
+                .token
+                .prior_authority
+                .current_head_witness
+                .transaction_uuid
+    {
+        return Err(malformed(
+            "StreamEnrollmentV2 token transaction must read the selected version and use a fresh UUID"
+                .to_string(),
+        ));
+    }
+    validate_canonical_uuid_text(
+        malformed,
+        "StreamEnrollmentV2 planned token transaction UUID",
+        &planned.uuid,
+        false,
+    )?;
+    let expected_token_post = planned
+        .read_version
+        .checked_add(1)
+        .ok_or_else(|| malformed("StreamEnrollmentV2 token version overflow".to_string()))?;
+    match (
+        protocol.effect_phase,
+        protocol.token.confirmed_transaction.as_ref(),
+        protocol.token.confirmed_head.as_ref(),
+        protocol.token.next_authority.as_ref(),
+        protocol.confirmed_update.as_ref(),
+        protocol.next_lifecycle.as_ref(),
+    ) {
+        (RecoveryEffectPhase::Armed, None, None, None, None, None) => {}
+        (
+            RecoveryEffectPhase::EffectsConfirmed,
+            Some(confirmed_transaction),
+            Some(confirmed_head),
+            Some(next_authority),
+            Some(update),
+            Some(lifecycle),
+        ) => {
+            if confirmed_transaction != planned
+                || confirmed_head.branch_identifier
+                    != lance::dataset::refs::BranchIdentifier::main()
+                || confirmed_head.table_version != expected_token_post
+                || confirmed_head.transaction_uuid != planned.uuid
+                || next_authority.current_head_witness != *confirmed_head
+                || next_authority.location != protocol.token.prior_authority.location
+                || next_authority.schema_version != protocol.token.prior_authority.schema_version
+                || next_authority.schema_hash != protocol.token.prior_authority.schema_hash
+                || update.table_version != pin.post_commit_pin
+                || update.table_branch.is_some()
+                || update.row_count != protocol.prior_row_count
+                || lifecycle.identity != pin.identity
+                || lifecycle.diagnostic_table_key != pin.table_key
+                || lifecycle.current_head_witness.table_version != pin.post_commit_pin
+            {
+                return Err(malformed(
+                    "confirmed StreamEnrollmentV2 differs from its exact table/token N+1 outcome"
+                        .to_string(),
+                ));
+            }
+            next_authority.validate().map_err(|error| {
+                malformed(format!(
+                    "invalid confirmed StreamEnrollmentV2 token authority: {error}"
+                ))
+            })?;
+            let expected = stream_enrollment_v2_expected_lifecycle(
+                protocol,
+                pin.table_key.clone(),
+                lifecycle.current_head_witness.clone(),
+            )
+            .map_err(|error| {
+                malformed(format!(
+                    "failed to reconstruct confirmed StreamEnrollmentV2 lifecycle: {error}"
+                ))
+            })?;
+            if lifecycle != &expected {
+                return Err(malformed(
+                    "confirmed StreamEnrollmentV2 lifecycle is not the exact OPEN lifecycle-v3 genesis"
+                        .to_string(),
+                ));
+            }
+        }
+        _ => {
+            return Err(malformed(
+                "StreamEnrollmentV2 confirmation fields must be all absent while Armed and all exact while EffectsConfirmed"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl RecoveryStreamClaimOperationV14 {
+    fn from_prepared(
+        prepared: &crate::db::omnigraph::stream_lifecycle::PreparedClaimOperation,
+    ) -> Self {
+        Self {
+            graph_identity_digest: prepared.graph_identity_digest.clone(),
+            claim_id: prepared.claim_id.clone(),
+            recovery_operation_id: prepared.recovery_operation_id.clone(),
+            lifecycle_operation_id: prepared.lifecycle_operation_id.clone(),
+            claim_kind: prepared.claim_kind.clone(),
+            profile: prepared.profile,
+            shard_id: prepared.shard_id.clone(),
+            initial_shard_manifest_version: prepared.initial_shard_manifest_version,
+            initial_writer_epoch: prepared.initial_writer_epoch,
+            initial_replay_cursor: prepared.initial_replay_cursor,
+            initial_current_generation: prepared.initial_current_generation,
+            initial_base_merged_generation: prepared.initial_base_merged_generation,
+            folded_replay_cursor: prepared.folded_replay_cursor,
+            claim_contract_version: prepared.claim_contract_version,
+            bound_prestate_digest: prepared.bound_prestate_digest.clone(),
+            claim_operation_digest: prepared.claim_operation_digest.clone(),
+        }
+    }
+
+    fn rebuild(
+        &self,
+        lifecycle: &super::StreamLifecycleEntry,
+    ) -> Result<crate::db::omnigraph::stream_lifecycle::PreparedClaimOperation> {
+        crate::db::omnigraph::stream_lifecycle::prepare_claim_operation(
+            lifecycle,
+            crate::db::omnigraph::stream_lifecycle::ClaimOperationRequest {
+                graph_identity_digest: self.graph_identity_digest.clone(),
+                claim_id: self.claim_id.clone(),
+                recovery_operation_id: self.recovery_operation_id.clone(),
+                lifecycle_operation_id: self.lifecycle_operation_id.clone(),
+                claim_kind: self.claim_kind.clone(),
+                profile: self.profile,
+                shard_id: self.shard_id.clone(),
+                initial_shard_manifest_version: self.initial_shard_manifest_version,
+                initial_writer_epoch: self.initial_writer_epoch,
+                initial_replay_cursor: self.initial_replay_cursor,
+                initial_current_generation: self.initial_current_generation,
+                initial_base_merged_generation: self.initial_base_merged_generation,
+                claim_contract_version: self.claim_contract_version,
+            },
+        )
+    }
+}
+
+impl RecoveryStreamClaimAttemptV14 {
+    fn from_prepared(
+        prepared: &crate::db::omnigraph::stream_lifecycle::PreparedClaimAttempt,
+    ) -> Self {
+        Self {
+            attempt_id: prepared.attempt_id.clone(),
+            pre_shard_manifest_version: prepared.pre_shard_manifest_version,
+            pre_writer_epoch: prepared.pre_writer_epoch,
+            pre_replay_cursor: prepared.pre_replay_cursor,
+            planned_sentinel_position: prepared.planned_sentinel_position,
+            planned_writer_epoch: prepared.planned_writer_epoch,
+            storage_envelope_digest: prepared.storage_envelope_digest.clone(),
+            planned_sentinel_digest: prepared.planned_sentinel_digest.clone(),
+            bound_prestate_digest: prepared.bound_prestate_digest.clone(),
+            attempt_plan_digest: prepared.attempt_plan_digest.clone(),
+        }
+    }
+
+    fn rebuild(
+        &self,
+        operation: &crate::db::omnigraph::stream_lifecycle::PreparedClaimOperation,
+    ) -> Result<crate::db::omnigraph::stream_lifecycle::PreparedClaimAttempt> {
+        crate::db::omnigraph::stream_lifecycle::prepare_claim_attempt(
+            operation,
+            crate::db::omnigraph::stream_lifecycle::ClaimAttemptRequest {
+                attempt_id: self.attempt_id.clone(),
+                pre_shard_manifest_version: self.pre_shard_manifest_version,
+                pre_writer_epoch: self.pre_writer_epoch,
+                pre_replay_cursor: self.pre_replay_cursor,
+                planned_sentinel_position: self.planned_sentinel_position,
+                planned_writer_epoch: self.planned_writer_epoch,
+                storage_envelope_digest: self.storage_envelope_digest.clone(),
+            },
+        )
+    }
+}
+
+fn rebuild_stream_claim_prepared_attempt_v14(
+    protocol: &RecoveryStreamClaimV14,
+) -> Result<crate::db::omnigraph::stream_lifecycle::PreparedClaimAttempt> {
+    let operation = protocol.operation.rebuild(&protocol.prior_lifecycle)?;
+    if protocol.operation != RecoveryStreamClaimOperationV14::from_prepared(&operation) {
+        return Err(OmniError::manifest_internal(
+            "StreamClaim logical operation differs from the canonical claim planner output",
+        ));
+    }
+    let attempt = protocol.current_attempt.rebuild(&operation)?;
+    if protocol.current_attempt != RecoveryStreamClaimAttemptV14::from_prepared(&attempt) {
+        return Err(OmniError::manifest_internal(
+            "StreamClaim current attempt differs from the canonical claim planner output",
+        ));
+    }
+    Ok(attempt)
+}
+
+fn claim_attempt_evidence_v14(
+    effect: &super::stream::ClaimAttemptEffect,
+) -> Result<crate::db::omnigraph::stream_lifecycle::ClaimAttemptEvidence> {
+    use super::stream::ClaimAttemptClassification;
+    use crate::db::omnigraph::stream_lifecycle::ClaimAttemptEvidence;
+
+    let evidence = match effect.classification {
+        ClaimAttemptClassification::NoEffect => ClaimAttemptEvidence::NoEffect,
+        ClaimAttemptClassification::AbortedNoEffect => ClaimAttemptEvidence::AbortedNoEffect,
+        ClaimAttemptClassification::StockManifestOnly => ClaimAttemptEvidence::StockManifestOnly {
+            achieved_shard_manifest_version: effect.achieved_shard_manifest_version.ok_or_else(
+                || {
+                    OmniError::manifest_internal(
+                        "stock-manifest claim attempt omits its achieved manifest version",
+                    )
+                },
+            )?,
+            achieved_writer_epoch: effect.achieved_writer_epoch.ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "stock-manifest claim attempt omits its achieved writer epoch",
+                )
+            })?,
+        },
+        ClaimAttemptClassification::StockManifestPlusSentinel => {
+            ClaimAttemptEvidence::StockManifestPlusSentinel {
+                achieved_shard_manifest_version: effect
+                    .achieved_shard_manifest_version
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "terminal stock claim omits its achieved manifest version",
+                        )
+                    })?,
+                achieved_writer_epoch: effect.achieved_writer_epoch.ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "terminal stock claim omits its achieved writer epoch",
+                    )
+                })?,
+            }
+        }
+        ClaimAttemptClassification::PatchedSentinelOnly => {
+            ClaimAttemptEvidence::PatchedSentinelOnly
+        }
+        ClaimAttemptClassification::PatchedSentinelPlusNamingManifest => {
+            ClaimAttemptEvidence::PatchedSentinelPlusNamingManifest {
+                achieved_shard_manifest_version: effect
+                    .achieved_shard_manifest_version
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "terminal patched claim omits its achieved manifest version",
+                        )
+                    })?,
+                achieved_writer_epoch: effect.achieved_writer_epoch.ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "terminal patched claim omits its achieved writer epoch",
+                    )
+                })?,
+            }
+        }
+    };
+    Ok(evidence)
+}
+
+fn claim_attempt_is_effect_free_v14(effect: &super::stream::ClaimAttemptEffect) -> bool {
+    matches!(
+        effect.classification,
+        super::stream::ClaimAttemptClassification::NoEffect
+            | super::stream::ClaimAttemptClassification::AbortedNoEffect
+    )
+}
+
+fn claim_attempt_is_terminal_v14(effect: &super::stream::ClaimAttemptEffect) -> bool {
+    matches!(
+        effect.classification,
+        super::stream::ClaimAttemptClassification::StockManifestPlusSentinel
+            | super::stream::ClaimAttemptClassification::PatchedSentinelPlusNamingManifest
+    )
+}
+
+fn rebuild_stream_claim_effect_v14(
+    protocol: &RecoveryStreamClaimV14,
+    prepared: &crate::db::omnigraph::stream_lifecycle::PreparedClaimAttempt,
+) -> Result<Option<super::stream::ClaimAttemptEffect>> {
+    let Some(effect) = protocol.classified_attempt.as_ref() else {
+        return Ok(None);
+    };
+    let rebuilt = crate::db::omnigraph::stream_lifecycle::build_claim_attempt_effect(
+        &protocol.prior_attempt_chain,
+        prepared,
+        claim_attempt_evidence_v14(effect)?,
+    )?;
+    if &rebuilt != effect {
+        return Err(OmniError::manifest_internal(
+            "StreamClaim classified attempt differs from its exact armed plan and prior chain",
+        ));
+    }
+    Ok(Some(rebuilt))
+}
+
+fn rebuild_stream_claim_terminal_v14(
+    protocol: &RecoveryStreamClaimV14,
+    prepared: &crate::db::omnigraph::stream_lifecycle::PreparedClaimAttempt,
+    effect: &super::stream::ClaimAttemptEffect,
+) -> Result<Option<RecoveryStreamClaimTerminalV14>> {
+    let Some(terminal) = protocol.terminal.as_ref() else {
+        return Ok(None);
+    };
+    let receipt = &terminal.receipt;
+    let attempt_chain = effect.next_attempt_chain_ref()?;
+    let segment = crate::db::omnigraph::stream_lifecycle::AuthenticatedClaimWalSegment {
+        identity: protocol.prior_lifecycle.identity,
+        binding_scope_id: protocol.prior_lifecycle.binding_scope_id.clone(),
+        enrollment_id: protocol.prior_lifecycle.binding.enrollment_id.clone(),
+        shard_id: protocol.operation.shard_id.clone(),
+        stream_incarnation_id: protocol
+            .prior_lifecycle
+            .enrollment_receipt
+            .stream_incarnation_id
+            .clone(),
+        prior_writer_epoch: protocol.operation.initial_writer_epoch,
+        achieved_writer_epoch: receipt.achieved_writer_epoch,
+        prior_position: receipt.authenticated_tail_prior_position,
+        position: receipt.authenticated_tail_position,
+        published_prefix_position: receipt.authenticated_tail_published_prefix_position,
+        entry_count: receipt.authenticated_tail_segment_entry_count,
+        // These accounting facts are intentionally not receipt authority;
+        // the authenticated segment and terminal digests bind the logical
+        // rows. The pure terminal builder does not consume them.
+        row_count: 0,
+        arrow_bytes: 0,
+        sentinel_digest: receipt.sentinel_digest.clone(),
+        segment_digest: receipt.authenticated_tail_segment_digest.clone(),
+        empty_fence_state_digest: receipt.authenticated_tail_empty_fence_state_digest.clone(),
+        suffix_lww_projection_digest: receipt
+            .authenticated_tail_segment_lww_projection_digest
+            .clone(),
+    };
+    let built = crate::db::omnigraph::stream_lifecycle::build_terminal_claim(
+        &protocol.prior_lifecycle.claim_receipt_chain,
+        prepared,
+        effect,
+        &attempt_chain,
+        &segment,
+        &receipt.authenticated_tail_lww_projection_digest,
+        receipt.replay_cursor,
+        receipt.recorded_at,
+    )?;
+    let next_lifecycle = crate::db::omnigraph::stream_lifecycle::build_claim_adoption_row(
+        &protocol.prior_lifecycle,
+        &built,
+    )?;
+    if built.receipt != terminal.receipt || next_lifecycle != terminal.next_lifecycle {
+        return Err(OmniError::manifest_internal(
+            "StreamClaim terminal receipt or lifecycle differs from the canonical claim adoption",
+        ));
+    }
+    Ok(Some(terminal.clone()))
+}
+
+fn validate_stream_claim_v14_shape<F>(
+    malformed: &F,
+    sidecar: &RecoverySidecar,
+    protocol: &RecoveryStreamClaimV14,
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    if !sidecar.tables.is_empty() || protocol.prior_manifest_version == 0 {
+        return Err(malformed(
+            "StreamClaim requires one exact prior manifest and no base-table participant"
+                .to_string(),
+        ));
+    }
+    protocol
+        .stream_profile
+        .validate()
+        .map_err(|error| malformed(format!("invalid exact StreamClaim profile: {error}")))?;
+    let profile_authorized = match protocol.prior_lifecycle.lifecycle {
+        super::StreamLifecycle::Open => {
+            protocol.stream_profile.mode() == super::StreamProfileMode::Enabled
+        }
+        super::StreamLifecycle::Draining => matches!(
+            protocol.stream_profile.mode(),
+            super::StreamProfileMode::Enabled | super::StreamProfileMode::Disabling
+        ),
+        super::StreamLifecycle::Sealed => false,
+    };
+    if !profile_authorized {
+        return Err(malformed(
+            "StreamClaim profile authority does not permit its exact OPEN or DRAINING lifecycle"
+                .to_string(),
+        ));
+    }
+    protocol
+        .prior_lifecycle
+        .validate()
+        .map_err(|error| malformed(format!("invalid prior StreamClaim lifecycle: {error}")))?;
+    protocol.prior_token_authority.validate().map_err(|error| {
+        malformed(format!(
+            "invalid prior StreamClaim token authority: {error}"
+        ))
+    })?;
+    if protocol.admission_scope.identity != protocol.prior_lifecycle.identity
+        || protocol.admission_scope.table_branch != protocol.prior_lifecycle.binding.table_branch
+        || protocol.admission_scope.binding_scope_id != protocol.prior_lifecycle.binding_scope_id
+    {
+        return Err(malformed(
+            "StreamClaim admission scope differs from its exact lifecycle binding".to_string(),
+        ));
+    }
+
+    let prepared = rebuild_stream_claim_prepared_attempt_v14(protocol)
+        .map_err(|error| malformed(error.to_string()))?;
+    let classified = rebuild_stream_claim_effect_v14(protocol, &prepared)
+        .map_err(|error| malformed(error.to_string()))?;
+    let terminal = match classified.as_ref() {
+        Some(effect) => rebuild_stream_claim_terminal_v14(protocol, &prepared, effect)
+            .map_err(|error| malformed(error.to_string()))?,
+        None => {
+            if protocol.terminal.is_some() {
+                return Err(malformed(
+                    "StreamClaim terminal receipt requires its current classified attempt"
+                        .to_string(),
+                ));
+            }
+            None
+        }
+    };
+
+    let ledger = protocol.ledger.as_ref();
+    match protocol.phase {
+        RecoveryStreamClaimPhaseV14::AttemptArmed => {
+            if classified.is_some() || ledger.is_some() || terminal.is_some() {
+                return Err(malformed(
+                    "AttemptArmed StreamClaim may retain only one current attempt plan".to_string(),
+                ));
+            }
+        }
+        RecoveryStreamClaimPhaseV14::EffectFreeClassified => {
+            if classified
+                .as_ref()
+                .is_none_or(|effect| !claim_attempt_is_effect_free_v14(effect))
+                || ledger.is_some()
+                || terminal.is_some()
+            {
+                return Err(malformed(
+                    "EffectFreeClassified StreamClaim requires one exact no-effect attempt and no ledger plan"
+                        .to_string(),
+                ));
+            }
+        }
+        RecoveryStreamClaimPhaseV14::LedgerArmed
+        | RecoveryStreamClaimPhaseV14::LedgerEffectsConfirmed
+        | RecoveryStreamClaimPhaseV14::CheckpointVisible => {
+            let effect = classified.as_ref().ok_or_else(|| {
+                malformed("ledger-owned StreamClaim omits its classified attempt".to_string())
+            })?;
+            let ledger = ledger.ok_or_else(|| {
+                malformed("ledger-owned StreamClaim omits its token transaction".to_string())
+            })?;
+            if claim_attempt_is_terminal_v14(effect) != terminal.is_some() {
+                return Err(malformed(
+                    "StreamClaim terminal receipt presence disagrees with its attempt classification"
+                        .to_string(),
+                ));
+            }
+            if protocol.phase == RecoveryStreamClaimPhaseV14::CheckpointVisible
+                && terminal.is_some()
+            {
+                return Err(malformed(
+                    "a terminal StreamClaim cannot stop at CheckpointVisible".to_string(),
+                ));
+            }
+            validate_stream_claim_ledger_v14_shape(malformed, protocol, ledger)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_stream_claim_ledger_v14_shape<F>(
+    malformed: &F,
+    protocol: &RecoveryStreamClaimV14,
+    ledger: &RecoveryStreamClaimLedgerEffectV14,
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    let planned = &ledger.planned_transaction;
+    if planned.read_version
+        != protocol
+            .prior_token_authority
+            .current_head_witness
+            .table_version
+        || planned.uuid
+            == protocol
+                .prior_token_authority
+                .current_head_witness
+                .transaction_uuid
+    {
+        return Err(malformed(
+            "StreamClaim ledger transaction must read the selected token version and use a fresh UUID"
+                .to_string(),
+        ));
+    }
+    validate_canonical_uuid_text(
+        malformed,
+        "StreamClaim planned transaction UUID",
+        &planned.uuid,
+        false,
+    )?;
+    let expected_version = planned
+        .read_version
+        .checked_add(1)
+        .ok_or_else(|| malformed("stream-token version overflow".to_string()))?;
+    match (
+        protocol.phase,
+        ledger.confirmed_transaction.as_ref(),
+        ledger.confirmed_head.as_ref(),
+        ledger.next_authority.as_ref(),
+    ) {
+        (RecoveryStreamClaimPhaseV14::LedgerArmed, None, None, None) => {}
+        (
+            RecoveryStreamClaimPhaseV14::LedgerEffectsConfirmed
+            | RecoveryStreamClaimPhaseV14::CheckpointVisible,
+            Some(transaction),
+            Some(head),
+            Some(authority),
+        ) => {
+            if transaction != planned
+                || head.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
+                || head.table_version != expected_version
+                || head.transaction_uuid != planned.uuid
+                || authority.current_head_witness != *head
+                || authority.location != protocol.prior_token_authority.location
+                || authority.schema_version != protocol.prior_token_authority.schema_version
+                || authority.schema_hash != protocol.prior_token_authority.schema_hash
+            {
+                return Err(malformed(
+                    "confirmed StreamClaim ledger effect differs from its exact planned N+1 transaction"
+                        .to_string(),
+                ));
+            }
+            authority.validate().map_err(|error| {
+                malformed(format!(
+                    "invalid confirmed StreamClaim token authority: {error}"
+                ))
+            })?;
+        }
+        _ => {
+            return Err(malformed(
+                "StreamClaim confirmation fields disagree with its durable phase".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_stream_lifecycle_receipt_delta<F>(
+    malformed: &F,
+    sidecar: &RecoverySidecar,
+    protocol: &RecoveryStreamLifecycleReceiptV14,
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    use super::stream::{DrainGoal, StreamLifecycle};
+    use super::stream_profile::StreamProfileState;
+
+    if !sidecar.tables.is_empty() {
+        return Err(malformed(
+            "StreamLifecycleReceipt has no base-table participant".to_string(),
+        ));
+    }
+    protocol
+        .profile
+        .validate()
+        .map_err(|error| malformed(format!("invalid exact stream profile prestate: {error}")))?;
+    protocol
+        .next_lifecycle
+        .validate_successor_of(&protocol.prior_lifecycle)
+        .map_err(|error| malformed(format!("invalid lifecycle successor: {error}")))?;
+    if protocol.admission_scope.identity != protocol.prior_lifecycle.identity
+        || protocol.admission_scope.binding_scope_id != protocol.prior_lifecycle.binding_scope_id
+    {
+        return Err(malformed(
+            "StreamLifecycleReceipt admission scope differs from its exact lifecycle lane"
+                .to_string(),
+        ));
+    }
+
+    let receipt = &protocol.receipt.planned_receipt;
+    receipt
+        .validate(protocol.next_lifecycle.lifecycle_revision)
+        .map_err(|error| malformed(format!("invalid lifecycle management receipt: {error}")))?;
+    let expected_graph_digest =
+        super::stream::stream_graph_identity_digest(&protocol.authority.schema_identity_domain)
+            .map_err(|error| malformed(format!("invalid graph identity digest: {error}")))?;
+    let next_chain = receipt
+        .next_chain_ref()
+        .map_err(|error| malformed(format!("invalid next management chain: {error}")))?;
+    if receipt.graph_identity_digest != expected_graph_digest
+        || receipt.identity != protocol.prior_lifecycle.identity
+        || receipt.stream_incarnation_id
+            != protocol
+                .prior_lifecycle
+                .enrollment_receipt
+                .stream_incarnation_id
+        || receipt.binding_scope_id != protocol.prior_lifecycle.binding_scope_id
+        || receipt.chain_ordinal
+            != protocol
+                .prior_lifecycle
+                .management_receipt_chain
+                .record_count
+                .checked_add(1)
+                .ok_or_else(|| malformed("management receipt-chain count overflow".to_string()))?
+        || receipt.predecessor_record_id
+            != protocol
+                .prior_lifecycle
+                .management_receipt_chain
+                .head_record_id
+        || receipt.prior_chain_digest
+            != protocol
+                .prior_lifecycle
+                .management_receipt_chain
+                .chain_digest
+        || next_chain != protocol.next_lifecycle.management_receipt_chain
+        || receipt.to_revision != protocol.next_lifecycle.lifecycle_revision
+        || Some(receipt.actor_id.as_str()) != sidecar.actor_id.as_deref()
+    {
+        return Err(malformed(
+            "StreamLifecycleReceipt receipt does not bind its exact lane, prior chain, actor, and next revision"
+                .to_string(),
+        ));
+    }
+
+    let mut expected = protocol.prior_lifecycle.clone();
+    expected.lifecycle_revision = protocol.next_lifecycle.lifecycle_revision;
+    expected.management_receipt_chain = next_chain;
+    match protocol.change_kind {
+        RecoveryStreamLifecycleReceiptKind::QuiesceFinalize => {
+            if !matches!(
+                &protocol.profile.state,
+                StreamProfileState::Enabled { .. } | StreamProfileState::Disabling { .. }
+            ) {
+                return Err(malformed(
+                    "QuiesceFinalize requires the exact ENABLED or DISABLING profile prestate"
+                        .to_string(),
+                ));
+            }
+            let prior_drain = protocol.prior_lifecycle.drain.as_ref().ok_or_else(|| {
+                malformed("QuiesceFinalize requires one prior drain descriptor".to_string())
+            })?;
+            let current_claim_receipt =
+                protocol.current_claim_receipt.as_ref().ok_or_else(|| {
+                    malformed("QuiesceFinalize requires the exact current ClaimReceipt".to_string())
+                })?;
+            let sealed_proof = protocol
+                .next_lifecycle
+                .sealed_proof
+                .as_ref()
+                .ok_or_else(|| {
+                    malformed("QuiesceFinalize requires one exact sealed proof".to_string())
+                })?;
+            let expected_result_payload = super::stream::stream_quiesce_result_payload(
+                receipt.to_revision,
+            )
+            .map_err(|error| {
+                malformed(format!(
+                    "QuiesceFinalize has an invalid semantic result revision: {error}"
+                ))
+            })?;
+            let expected_result_digest =
+                super::stream::ManagementReceipt::result_digest_for(&expected_result_payload)
+                    .map_err(|error| {
+                        malformed(format!(
+                            "QuiesceFinalize result commitment cannot be derived: {error}"
+                        ))
+                    })?;
+            if protocol.prior_lifecycle.lifecycle != StreamLifecycle::Draining
+                || protocol.next_lifecycle.lifecycle != StreamLifecycle::Sealed
+                || protocol.prior_lifecycle.strict_block.is_some()
+                || prior_drain.goal != DrainGoal::Sealed
+                || prior_drain.operation_request_payload.graph_identity_digest
+                    != expected_graph_digest
+                || receipt.operation_kind != "QUIESCE"
+                || receipt.operation_id != prior_drain.drain_id
+                || receipt.request_digest != prior_drain.operation_request_digest
+                || receipt.from_revision != prior_drain.operation_expected_revision
+                || receipt.actor_id != prior_drain.initiating_actor
+                || receipt.result_payload != expected_result_payload
+                || receipt.result_digest != expected_result_digest
+                || sealed_proof.drain_id != prior_drain.drain_id
+            {
+                return Err(malformed(
+                    "QuiesceFinalize does not bind the exact unblocked SEALED drain and terminal receipt"
+                        .to_string(),
+                ));
+            }
+            let evidence = crate::db::omnigraph::stream_lifecycle::EmptyCutEvidence {
+                shard_manifest_version: sealed_proof.shard_manifest_version,
+                writer_epoch: sealed_proof.writer_epoch,
+                replay_cursor: sealed_proof.replay_cursor,
+                current_generation: sealed_proof.current_generation,
+                base_merged_generation: sealed_proof.base_merged_generation,
+            };
+            let rebuilt = crate::db::omnigraph::stream_lifecycle::build_draining_to_sealed(
+                &protocol.prior_lifecycle,
+                receipt,
+                current_claim_receipt,
+                evidence,
+            )
+            .map_err(|error| {
+                malformed(format!(
+                    "QuiesceFinalize cannot reconstruct its exact SEALED lifecycle: {error}"
+                ))
+            })?;
+            let rebuilt_bytes = serde_json::to_vec(&rebuilt).map_err(|error| {
+                malformed(format!(
+                    "QuiesceFinalize reconstructed lifecycle cannot be encoded: {error}"
+                ))
+            })?;
+            let proposed_bytes = serde_json::to_vec(&protocol.next_lifecycle).map_err(|error| {
+                malformed(format!(
+                    "QuiesceFinalize proposed lifecycle cannot be encoded: {error}"
+                ))
+            })?;
+            if proposed_bytes != rebuilt_bytes {
+                return Err(malformed(
+                    "QuiesceFinalize next lifecycle is not byte-identical to the canonical SEALED reconstruction"
+                        .to_string(),
+                ));
+            }
+            expected.lifecycle = StreamLifecycle::Sealed;
+            expected.drain = None;
+            expected.strict_block = None;
+            expected.sealed_proof = protocol.next_lifecycle.sealed_proof.clone();
+        }
+        RecoveryStreamLifecycleReceiptKind::DisableDrainAdoption => {
+            if protocol.current_claim_receipt.is_some() {
+                return Err(malformed(
+                    "DisableDrainAdoption cannot carry a current ClaimReceipt".to_string(),
+                ));
+            }
+            let prior_drain = protocol.prior_lifecycle.drain.as_ref().ok_or_else(|| {
+                malformed("DisableDrainAdoption requires one prior drain descriptor".to_string())
+            })?;
+            let next_drain = protocol.next_lifecycle.drain.as_ref().ok_or_else(|| {
+                malformed("DisableDrainAdoption requires one next drain descriptor".to_string())
+            })?;
+            let adoption = next_drain.seal_override.as_ref().ok_or_else(|| {
+                malformed("DisableDrainAdoption requires its exact seal override".to_string())
+            })?;
+            let disable_plan = match &protocol.profile.state {
+                StreamProfileState::Disabling { disable_plan } => disable_plan,
+                _ => {
+                    return Err(malformed(
+                        "DisableDrainAdoption requires the exact DISABLING profile prestate"
+                            .to_string(),
+                    ));
+                }
+            };
+            let mut expected_drain = prior_drain.clone();
+            expected_drain.goal = DrainGoal::Sealed;
+            expected_drain.seal_override = Some(adoption.clone());
+            let expected_result_payload =
+                super::stream::stream_disable_drain_adoption_result_payload(receipt.to_revision)
+                    .map_err(|error| {
+                        malformed(format!(
+                            "DisableDrainAdoption has an invalid semantic result revision: {error}"
+                        ))
+                    })?;
+            let expected_result_digest =
+                super::stream::ManagementReceipt::result_digest_for(&expected_result_payload)
+                    .map_err(|error| {
+                        malformed(format!(
+                            "DisableDrainAdoption result commitment cannot be derived: {error}"
+                        ))
+                    })?;
+            if protocol.prior_lifecycle.lifecycle != StreamLifecycle::Draining
+                || protocol.next_lifecycle.lifecycle != StreamLifecycle::Draining
+                || prior_drain.goal != DrainGoal::OpenAfterFold
+                || prior_drain.seal_override.is_some()
+                || next_drain != &expected_drain
+                || receipt.operation_kind != "DISABLE_DRAIN_ADOPTION"
+                || receipt.from_revision != protocol.prior_lifecycle.lifecycle_revision
+                || adoption.disable_operation_id != disable_plan.operation_id
+                || adoption.profile_revision != protocol.profile.profile_revision
+                || adoption.management_receipt_id != receipt.record_id
+                || adoption.request_digest != receipt.request_digest
+                || adoption.adopted_at != receipt.recorded_at
+                || receipt.actor_id != disable_plan.actor
+                || receipt.result_payload != expected_result_payload
+                || receipt.result_digest != expected_result_digest
+            {
+                return Err(malformed(
+                    "DisableDrainAdoption changes more than the exact goal/override/revision/receipt chain"
+                        .to_string(),
+                ));
+            }
+            expected.drain = Some(expected_drain);
+        }
+    }
+    if protocol.next_lifecycle != expected {
+        return Err(malformed(
+            "StreamLifecycleReceipt next lifecycle changes authority outside its permitted subkind delta"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stream_lifecycle_receipt_v14_shape<F>(
+    malformed: &F,
+    sidecar: &RecoverySidecar,
+    protocol: &RecoveryStreamLifecycleReceiptV14,
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    if protocol.prior_manifest_version == 0 || sidecar.actor_id.is_none() {
+        return Err(malformed(
+            "StreamLifecycleReceipt requires an exact prior manifest version and authenticated actor"
+                .to_string(),
+        ));
+    }
+    validate_stream_lifecycle_receipt_delta(malformed, sidecar, protocol)?;
+    protocol
+        .receipt
+        .prior_authority
+        .validate()
+        .map_err(|error| malformed(format!("invalid prior stream-token authority: {error}")))?;
+    let planned = &protocol.receipt.planned_transaction;
+    if planned.read_version
+        != protocol
+            .receipt
+            .prior_authority
+            .current_head_witness
+            .table_version
+        || planned.uuid
+            == protocol
+                .receipt
+                .prior_authority
+                .current_head_witness
+                .transaction_uuid
+    {
+        return Err(malformed(
+            "StreamLifecycleReceipt transaction must read the selected token version and use a fresh UUID"
+                .to_string(),
+        ));
+    }
+    validate_canonical_uuid_text(
+        malformed,
+        "StreamLifecycleReceipt planned transaction UUID",
+        &planned.uuid,
+        false,
+    )?;
+    let expected_token_post = planned
+        .read_version
+        .checked_add(1)
+        .ok_or_else(|| malformed("stream-token version overflow".to_string()))?;
+    match (
+        protocol.effect_phase,
+        protocol.receipt.confirmed_transaction.as_ref(),
+        protocol.receipt.confirmed_head.as_ref(),
+        protocol.receipt.next_authority.as_ref(),
+    ) {
+        (RecoveryEffectPhase::Armed, None, None, None) => {}
+        (
+            RecoveryEffectPhase::EffectsConfirmed,
+            Some(confirmed_transaction),
+            Some(confirmed_head),
+            Some(next_authority),
+        ) => {
+            if confirmed_transaction != planned
+                || confirmed_head.branch_identifier
+                    != lance::dataset::refs::BranchIdentifier::main()
+                || confirmed_head.table_version != expected_token_post
+                || confirmed_head.transaction_uuid != planned.uuid
+                || next_authority.current_head_witness != *confirmed_head
+                || next_authority.location != protocol.receipt.prior_authority.location
+                || next_authority.schema_version != protocol.receipt.prior_authority.schema_version
+                || next_authority.schema_hash != protocol.receipt.prior_authority.schema_hash
+            {
+                return Err(malformed(
+                    "confirmed StreamLifecycleReceipt differs from its exact planned N+1 ledger effect"
+                        .to_string(),
+                ));
+            }
+            next_authority.validate().map_err(|error| {
+                malformed(format!(
+                    "invalid confirmed StreamLifecycleReceipt token authority: {error}"
+                ))
+            })?;
+        }
+        _ => {
+            return Err(malformed(
+                "StreamLifecycleReceipt confirmation fields must be all absent while Armed and all exact while EffectsConfirmed"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn stream_fold_v14_generation_cut(
+    cut: &RecoveryStreamFoldCut,
+) -> super::stream::StreamGenerationCut {
+    super::stream::StreamGenerationCut {
+        shard_id: cut.shard_id.to_string(),
+        writer_epoch: cut.writer_epoch,
+        shard_manifest_version: cut.shard_manifest_version,
+        replay_after_wal_entry_position: cut.replay_after_wal_entry_position,
+        generation: cut.generation,
+        generation_path: cut.generation_path.clone(),
+    }
+}
+
+fn validate_stream_fold_v14_next_lifecycle<F>(
+    malformed: &F,
+    sidecar: &RecoverySidecar,
+    protocol: &RecoveryStreamFoldV14,
+    next: &super::StreamLifecycleEntry,
+    base_head: &super::CurrentHeadWitness,
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    next.validate_successor_of(&protocol.prior_lifecycle)
+        .map_err(|error| {
+            malformed(format!(
+                "invalid StreamFoldV14 lifecycle successor: {error}"
+            ))
+        })?;
+    let summary = next.last_fold_summary.as_ref().ok_or_else(|| {
+        malformed("StreamFoldV14 successor omits its exact fold summary".to_string())
+    })?;
+    let expected_summary_operation_id = protocol
+        .drain_authority
+        .as_ref()
+        .map_or(sidecar.operation_id.as_str(), |drain| drain.drain_id.as_str());
+    if summary.operation_id != expected_summary_operation_id
+        || summary.graph_commit_id.as_deref() != Some(protocol.lineage.graph_commit_id.as_str())
+        || summary.exact_generation_cut != stream_fold_v14_generation_cut(&protocol.generation_cut)
+        || summary.outcome != super::stream::LastFoldOutcome::Published
+        || summary.recorded_at != protocol.lineage.created_at
+    {
+        return Err(malformed(
+            "StreamFoldV14 summary differs from its fixed operation, lineage, generation cut, or publication outcome"
+                .to_string(),
+        ));
+    }
+
+    let mut expected = protocol.prior_lifecycle.clone();
+    expected.current_head_witness = base_head.clone();
+    expected.lifecycle_revision = expected
+        .lifecycle_revision
+        .checked_add(1)
+        .ok_or_else(|| malformed("StreamFoldV14 lifecycle revision overflow".to_string()))?;
+    expected.last_fold_summary = Some(summary.clone());
+    if let Some(drain) = expected.drain.as_mut() {
+        // A DRAINING row duplicates its current base witness inside the durable
+        // restart descriptor. Advancing both copies is the sole permitted
+        // descriptor delta; drain identity, goal, actor, floors, and overrides
+        // remain byte-identical.
+        drain.expected_current_head_witness = base_head.clone();
+    }
+    if next != &expected {
+        return Err(malformed(
+            "StreamFoldV14 successor changes authority outside HEAD/revision/fold-summary and the DRAINING duplicate witness"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stream_fold_v14_current_claim<F>(
+    malformed: &F,
+    protocol: &RecoveryStreamFoldV14,
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    let lifecycle = &protocol.prior_lifecycle;
+    let receipt = &protocol.current_claim_receipt;
+    receipt.validate().map_err(|error| {
+        malformed(format!(
+            "invalid selected StreamFoldV14 claim receipt: {error}"
+        ))
+    })?;
+    let expected_graph_digest =
+        super::stream::stream_graph_identity_digest(&protocol.authority.schema_identity_domain)
+            .map_err(|error| malformed(format!("invalid graph identity digest: {error}")))?;
+    let expected_binding_digest = super::stream::stream_physical_binding_digest(&protocol.binding)
+        .map_err(|error| malformed(format!("invalid fold physical-binding digest: {error}")))?;
+    let expected_claim_chain = receipt
+        .next_chain_ref()
+        .map_err(|error| malformed(format!("invalid selected claim chain: {error}")))?;
+    let epoch_floor = lifecycle
+        .epoch_floor_by_shard
+        .get(&protocol.generation_cut.shard_id.to_string())
+        .copied()
+        .ok_or_else(|| {
+            malformed("StreamFoldV14 lifecycle omits its shard epoch floor".to_string())
+        })?;
+    if receipt.graph_identity_digest != expected_graph_digest
+        || receipt.identity != lifecycle.identity
+        || receipt.binding_scope_id != lifecycle.binding_scope_id
+        || receipt.enrollment_id != lifecycle.binding.enrollment_id
+        || receipt.shard_id != protocol.generation_cut.shard_id.to_string()
+        || receipt.stream_incarnation_id != lifecycle.enrollment_receipt.stream_incarnation_id
+        || receipt.stream_configuration_digest != lifecycle.binding.stream_config_hash
+        || receipt.physical_binding_digest != expected_binding_digest
+        || lifecycle.current_claim_receipt_id.as_deref() != Some(receipt.record_id.as_str())
+        || lifecycle.claim_receipt_chain != expected_claim_chain
+        || lifecycle.authenticated_wal_tail.binding_scope_id != receipt.binding_scope_id
+        || lifecycle.authenticated_wal_tail.position != receipt.authenticated_tail_position
+        || lifecycle.authenticated_wal_tail.segment_count
+            != receipt.authenticated_tail_segment_count
+        || lifecycle.authenticated_wal_tail.chain_digest != receipt.authenticated_tail_chain_digest
+        || lifecycle.authenticated_wal_tail.lww_projection_digest
+            != receipt.authenticated_tail_lww_projection_digest
+        || epoch_floor != receipt.achieved_writer_epoch
+        || protocol.generation_cut.writer_epoch != receipt.achieved_writer_epoch
+        || protocol.generation_cut.shard_manifest_version < receipt.achieved_shard_manifest_version
+    {
+        return Err(malformed(
+            "StreamFoldV14 current claim does not bind the exact selected lane, receipt chain, authenticated tail, epoch, and physical cut"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stream_fold_v14_shape<F>(
+    malformed: &F,
+    sidecar: &RecoverySidecar,
+    protocol: &RecoveryStreamFoldV14,
+    drain_mode: bool,
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    use super::stream::StreamLifecycle;
+
+    if sidecar.tables.len() != 1
+        || sidecar.actor_id.as_deref() != Some(STREAM_FOLD_ACTOR)
+        || protocol.lineage.actor_id.as_deref() != Some(STREAM_FOLD_ACTOR)
+        || sidecar.actor_id != protocol.lineage.actor_id
+        || protocol.prior_manifest_version == 0
+        || protocol.lineage.branch.is_some()
+        || protocol.lineage.merged_parent_commit_id.is_some()
+        || protocol.lineage.graph_commit_id.is_empty()
+        || protocol
+            .authority
+            .graph_head
+            .as_ref()
+            .is_some_and(|head| head == &protocol.lineage.graph_commit_id)
+    {
+        return Err(malformed(
+            "StreamFoldV14 requires one base pin, an exact prior manifest, and distinct canonical-main lineage owned by omnigraph:stream-fold"
+                .to_string(),
+        ));
+    }
+    protocol
+        .profile
+        .validate()
+        .map_err(|error| malformed(format!("invalid StreamFoldV14 profile: {error}")))?;
+    let profile_authorized = if drain_mode {
+        matches!(
+            protocol.profile.mode(),
+            super::StreamProfileMode::Enabled | super::StreamProfileMode::Disabling
+        )
+    } else {
+        protocol.profile.mode() == super::StreamProfileMode::Enabled
+    };
+    if !profile_authorized {
+        return Err(malformed(
+            "StreamFoldV14 profile authority does not permit its exact ordinary or drain mode"
+                .to_string(),
+        ));
+    }
+    protocol
+        .prior_lifecycle
+        .validate()
+        .map_err(|error| malformed(format!("invalid prior StreamFoldV14 lifecycle: {error}")))?;
+    protocol
+        .token
+        .prior_authority
+        .validate()
+        .map_err(|error| malformed(format!("invalid prior stream-token authority: {error}")))?;
+
+    let pin = &sidecar.tables[0];
+    let expected_post = pin
+        .expected_version
+        .checked_add(1)
+        .ok_or_else(|| malformed("StreamFoldV14 base-table version overflows".to_string()))?;
+    let lifecycle = &protocol.prior_lifecycle;
+    let binding = &protocol.binding;
+    let canonical_path = super::table_path_for_identity(&pin.table_key, pin.identity)
+        .map_err(|error| malformed(format!("invalid StreamFoldV14 binding path: {error}")))?;
+    if pin.identity != protocol.admission_scope.identity
+        || pin.identity != lifecycle.identity
+        || pin.expected_version == 0
+        || pin.post_commit_pin != expected_post
+        || pin.table_branch.is_some()
+        || lifecycle.diagnostic_table_key != pin.table_key
+        || lifecycle.binding != *binding
+        || lifecycle.binding_scope_id != protocol.admission_scope.binding_scope_id
+        || protocol.admission_scope.table_branch != binding.table_branch
+        || lifecycle.current_head_witness.table_version != pin.expected_version
+        || lifecycle.current_head_witness.branch_identifier
+            != lance::dataset::refs::BranchIdentifier::main()
+        || binding
+            .identity()
+            .map_err(|error| malformed(format!("invalid StreamFoldV14 binding: {error}")))?
+            != pin.identity
+        || binding.table_location != canonical_path
+        || binding.table_branch.is_some()
+        || binding.shard_ids != vec![protocol.generation_cut.shard_id.to_string()]
+        || binding.stream_config_version != super::stream::STREAM_CONFIG_VERSION
+        || binding.stream_config_hash != stream_config_v3_hash()
+    {
+        return Err(malformed(
+            "StreamFoldV14 pin, admission lane, binding, lifecycle, and prior base witness disagree"
+                .to_string(),
+        ));
+    }
+    validate_stream_fold_v14_current_claim(malformed, protocol)?;
+
+    match (
+        drain_mode,
+        lifecycle.lifecycle,
+        protocol.drain_authority.as_ref(),
+        protocol
+            .current_claim_receipt
+            .lifecycle_operation_id
+            .as_deref(),
+    ) {
+        (false, StreamLifecycle::Open, None, None) => {}
+        (true, StreamLifecycle::Draining, Some(authority), Some(claim_drain_id)) => {
+            let drain = lifecycle.drain.as_ref().ok_or_else(|| {
+                malformed("StreamDrainFold requires an active drain descriptor".to_string())
+            })?;
+            if lifecycle.strict_block.is_some()
+                || authority.drain_id != drain.drain_id
+                || claim_drain_id != drain.drain_id
+                || authority.recomputed_lww_projection_digest
+                    != lifecycle.authenticated_wal_tail.lww_projection_digest
+                || authority.recomputed_lww_projection_digest
+                    != protocol
+                        .current_claim_receipt
+                        .authenticated_tail_lww_projection_digest
+                || protocol.generation_cut.replay_after_wal_entry_position
+                    != protocol.current_claim_receipt.sentinel_position
+            {
+                return Err(malformed(
+                    "StreamDrainFold does not bind the unblocked active drain, its exact claim/cut, and recomputed full-generation LWW projection"
+                        .to_string(),
+                ));
+            }
+        }
+        _ => {
+            return Err(malformed(
+                "ordinary and drain folds require distinct exact OPEN versus DRAINING claim authority"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let cut = &protocol.generation_cut;
+    if cut.shard_manifest_version == 0
+        || cut.replay_after_wal_entry_position == 0
+        || cut.generation == 0
+        || cut.generation_path.is_empty()
+        || cut.generation_path.trim() != cut.generation_path
+        || protocol.merged_generation.shard_id != cut.shard_id
+        || protocol.merged_generation.generation != cut.generation
+    {
+        return Err(malformed(
+            "StreamFoldV14 carries an invalid generation cut or merged-generation result"
+                .to_string(),
+        ));
+    }
+    match protocol.prior_merged_generation.as_ref() {
+        Some(prior)
+            if prior.shard_id == cut.shard_id
+                && prior.generation > 0
+                && prior
+                    .generation
+                    .checked_add(1)
+                    .is_some_and(|next| next == cut.generation) => {}
+        None if cut.generation == 1 => {}
+        _ => {
+            return Err(malformed(
+                "StreamFoldV14 cut is not the exact successor of selected merge progress"
+                    .to_string(),
+            ));
+        }
+    }
+
+    if protocol.base.planned_transaction.read_version != pin.expected_version
+        || protocol.base.planned_transaction.uuid == lifecycle.current_head_witness.transaction_uuid
+    {
+        return Err(malformed(
+            "StreamFoldV14 base transaction must read the selected N and use a fresh UUID"
+                .to_string(),
+        ));
+    }
+    validate_canonical_uuid_text(
+        malformed,
+        "StreamFoldV14 base transaction UUID",
+        &protocol.base.planned_transaction.uuid,
+        false,
+    )?;
+    if protocol.token.planned_transaction.read_version
+        != protocol
+            .token
+            .prior_authority
+            .current_head_witness
+            .table_version
+        || protocol.token.planned_transaction.uuid
+            == protocol
+                .token
+                .prior_authority
+                .current_head_witness
+                .transaction_uuid
+    {
+        return Err(malformed(
+            "StreamFoldV14 token transaction must read the selected token N and use a fresh UUID"
+                .to_string(),
+        ));
+    }
+    validate_canonical_uuid_text(
+        malformed,
+        "StreamFoldV14 token transaction UUID",
+        &protocol.token.planned_transaction.uuid,
+        false,
+    )?;
+    validate_stream_fold_attribution_summary(malformed, &protocol.token.attribution_summary)?;
+    if protocol.token.planned_rows.is_empty()
+        || protocol.token.planned_rows.len()
+            > crate::table_store::mem_wal::B1_MAX_GENERATION_ROWS as usize
+    {
+        return Err(malformed(format!(
+            "StreamFoldV14 token plan must contain 1..={} bounded rows",
+            crate::table_store::mem_wal::B1_MAX_GENERATION_ROWS
+        )));
+    }
+    super::token_store::validate_stream_token_plan_bounds(&protocol.token.planned_rows)
+        .map_err(|error| malformed(format!("invalid bounded StreamFoldV14 token plan: {error}")))?;
+    let mut prior_id = None;
+    for row in &protocol.token.planned_rows {
+        row.validate()
+            .map_err(|error| malformed(format!("invalid StreamFoldV14 token row: {error}")))?;
+        if row.identity != pin.identity
+            || row.origin_enrollment_id != binding.enrollment_id
+            || row.stream_incarnation_id != lifecycle.enrollment_receipt.stream_incarnation_id
+            || prior_id.is_some_and(|prior| prior >= row.logical_id.as_str())
+        {
+            return Err(malformed(
+                "StreamFoldV14 token rows must bind the lane and be strictly ordered by logical id"
+                    .to_string(),
+            ));
+        }
+        prior_id = Some(row.logical_id.as_str());
+    }
+    let attribution =
+        super::stream_token::stream_fold_attribution_commitment(&protocol.token.planned_rows)
+            .map_err(|error| malformed(format!("invalid StreamFoldV14 attribution: {error}")))?;
+    if attribution != protocol.token.attribution_summary {
+        return Err(malformed(
+            "StreamFoldV14 token rows differ from their exact attribution commitment".to_string(),
+        ));
+    }
+
+    let planned_head = super::CurrentHeadWitness {
+        branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+        table_version: expected_post,
+        transaction_uuid: protocol.base.planned_transaction.uuid.clone(),
+        manifest_e_tag: None,
+    };
+    validate_stream_fold_v14_next_lifecycle(
+        malformed,
+        sidecar,
+        protocol,
+        &protocol.planned_next_lifecycle,
+        &planned_head,
+    )?;
+    let expected_token_post = protocol
+        .token
+        .planned_transaction
+        .read_version
+        .checked_add(1)
+        .ok_or_else(|| malformed("StreamFoldV14 token version overflow".to_string()))?;
+    match (
+        protocol.effect_phase,
+        protocol.base.confirmed_transaction.as_ref(),
+        protocol.base.confirmed_merged_generation.as_ref(),
+        protocol.base.confirmed_head.as_ref(),
+        protocol.base.confirmed_update.as_ref(),
+        protocol.token.confirmed_transaction.as_ref(),
+        protocol.token.confirmed_head.as_ref(),
+        protocol.token.next_authority.as_ref(),
+        protocol.next_lifecycle.as_ref(),
+    ) {
+        (RecoveryEffectPhase::Armed, None, None, None, None, None, None, None, None)
+            if pin.confirmed_version.is_none() => {}
+        (
+            RecoveryEffectPhase::EffectsConfirmed,
+            Some(base_transaction),
+            Some(merged),
+            Some(base_head),
+            Some(base_update),
+            Some(token_transaction),
+            Some(token_head),
+            Some(next_authority),
+            Some(next_lifecycle),
+        ) => {
+            if base_transaction != &protocol.base.planned_transaction
+                || merged != &protocol.merged_generation
+                || base_head.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
+                || base_head.table_version != expected_post
+                || base_head.transaction_uuid != protocol.base.planned_transaction.uuid
+                || protocol
+                    .prior_lifecycle
+                    .current_head_witness
+                    .manifest_e_tag
+                    .as_ref()
+                    .is_some_and(|prior_e_tag| {
+                        base_head
+                            .manifest_e_tag
+                            .as_ref()
+                            .is_none_or(|achieved_e_tag| achieved_e_tag == prior_e_tag)
+                    })
+                || base_update.table_version != expected_post
+                || base_update.table_branch.is_some()
+                || pin.confirmed_version != Some(expected_post)
+                || token_transaction != &protocol.token.planned_transaction
+                || token_head.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
+                || token_head.table_version != expected_token_post
+                || token_head.transaction_uuid != protocol.token.planned_transaction.uuid
+                || next_authority.current_head_witness != *token_head
+                || next_authority.location != protocol.token.prior_authority.location
+                || next_authority.schema_version != protocol.token.prior_authority.schema_version
+                || next_authority.schema_hash != protocol.token.prior_authority.schema_hash
+            {
+                return Err(malformed(
+                    "confirmed StreamFoldV14 fields differ from an exact planned base+token N+1 outcome"
+                        .to_string(),
+                ));
+            }
+            next_authority.validate().map_err(|error| {
+                malformed(format!(
+                    "invalid confirmed StreamFoldV14 token authority: {error}"
+                ))
+            })?;
+            let mut expected_next = protocol.planned_next_lifecycle.clone();
+            expected_next.current_head_witness = base_head.clone();
+            if let Some(drain) = expected_next.drain.as_mut() {
+                drain.expected_current_head_witness = base_head.clone();
+            }
+            if next_lifecycle != &expected_next {
+                return Err(malformed(
+                    "confirmed StreamFoldV14 lifecycle differs from its plan outside the achieved base witness"
+                        .to_string(),
+                ));
+            }
+            validate_stream_fold_v14_next_lifecycle(
+                malformed,
+                sidecar,
+                protocol,
+                next_lifecycle,
+                base_head,
+            )?;
+        }
+        _ => {
+            return Err(malformed(
+                "StreamFoldV14 confirmation must be wholly absent while Armed or exact for both participants and lifecycle while EffectsConfirmed"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_stream_protocol_v14_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+    if sidecar.branch.is_some()
+        || sidecar.protocol_v3.is_some()
+        || sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v8.is_some()
+        || sidecar.protocol_v10.is_some()
+        || sidecar.protocol_v11.is_some()
+        || sidecar.protocol_v12.is_some()
+        || sidecar.protocol_v13.is_some()
+        || sidecar.ensure_indices_rollback_v6.is_some()
+        || sidecar.merge_source_commit_id.is_some()
+        || !sidecar.additional_registrations.is_empty()
+        || !sidecar.tombstones.is_empty()
+        || sidecar.schema_apply_manifest_published
+        || sidecar.schema_apply_target_schema_ir_hash.is_some()
+    {
+        return Err(malformed(
+            "schema-v14 must target canonical main and carry only protocol_v14 recovery authority"
+                .to_string(),
+        ));
+    }
+    let protocol = sidecar
+        .protocol_v14
+        .as_deref()
+        .ok_or_else(|| malformed("missing required protocol_v14 payload".to_string()))?;
+    validate_stream_protocol_v14_common(&malformed, sidecar, protocol)?;
+    match protocol {
+        RecoveryProtocolV14::StreamEnrollmentV2(protocol) => {
+            validate_stream_enrollment_v2_v14_shape(&malformed, sidecar, protocol)
+        }
+        RecoveryProtocolV14::StreamClaim(protocol) => {
+            validate_stream_claim_v14_shape(&malformed, sidecar, protocol)
+        }
+        RecoveryProtocolV14::StreamFoldV2(protocol) => {
+            validate_stream_fold_v14_shape(&malformed, sidecar, protocol, false)
+        }
+        RecoveryProtocolV14::StreamDrainFold(protocol) => {
+            validate_stream_fold_v14_shape(&malformed, sidecar, protocol, true)
+        }
+        RecoveryProtocolV14::StreamLifecycleReceipt(protocol) => {
+            validate_stream_lifecycle_receipt_v14_shape(&malformed, sidecar, protocol)
+        }
+        RecoveryProtocolV14::StreamResume(protocol)
+        | RecoveryProtocolV14::StreamCorrection(protocol)
+        | RecoveryProtocolV14::StreamAuthorityRetirement(protocol)
+        | RecoveryProtocolV14::StreamTokenLedgerIndexMaintenance(protocol)
+        | RecoveryProtocolV14::StreamSealedMaintenance(protocol)
+        | RecoveryProtocolV14::StreamRebind(protocol) => {
+            if protocol.operation_id.is_empty()
+                || protocol.operation_id.trim() != protocol.operation_id
+                || protocol.operation_id != sidecar.operation_id
+            {
+                return Err(malformed(
+                    "inactive recovery-v14 scaffold must bind the exact sidecar operation"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 fn validate_stream_fold_attribution_summary<F>(
     malformed: &F,
     summary: &RecoveryStreamFoldAttributionSummary,
@@ -3153,7 +5365,7 @@ fn validate_stream_fold_next_lifecycle<F>(
     malformed: &F,
     sidecar: &RecoverySidecar,
     protocol: &RecoveryProtocolV12,
-    next: &super::StreamLifecycleEntry,
+    next: &super::stream::LegacyStreamLifecycleEntryV2,
     base_head: &super::CurrentHeadWitness,
 ) -> Result<()>
 where
@@ -4408,7 +6620,8 @@ fn classify_table_observation(
         // fail closed if specialized dispatch is ever bypassed.
         ClassificationMode::StreamEnrollment
         | ClassificationMode::StreamFold
-        | ClassificationMode::StreamProfileChange => IncompletePhaseB,
+        | ClassificationMode::StreamProfileChange
+        | ClassificationMode::StreamProtocolV14 => IncompletePhaseB,
     }
 }
 
@@ -4573,24 +6786,28 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
         } else {
             _shared_profile_guard = Some(write_queue.acquire_stream_profile_shared().await);
         }
-        let admission_keys = sidecar
-            .tables
-            .iter()
-            .map(|pin| {
+        let admission_keys = if let Some(scope) = sidecar.stream_admission_scope() {
+            vec![
                 crate::db::write_queue::StreamAdmissionKey::for_resolved_ref(
-                    pin.identity,
-                    pin.table_branch.as_deref(),
-                )
-            })
-            .collect::<Vec<_>>();
+                    scope.identity,
+                    scope.table_branch.as_deref(),
+                ),
+            ]
+        } else {
+            sidecar
+                .tables
+                .iter()
+                .map(|pin| {
+                    crate::db::write_queue::StreamAdmissionKey::for_resolved_ref(
+                        pin.identity,
+                        pin.table_branch.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         let mut _shared_admission_guards = Vec::new();
         let mut _exclusive_admission_guards = Vec::new();
-        if matches!(
-            sidecar.writer_kind,
-            SidecarKind::StreamEnrollment
-                | SidecarKind::StreamFold
-                | SidecarKind::StreamProfileChange
-        ) {
+        if sidecar.writer_kind.is_stream_recovery() {
             _exclusive_admission_guards = write_queue
                 .acquire_stream_exclusive_many(&admission_keys)
                 .await;
@@ -5146,231 +7363,6 @@ enum StreamEnrollmentCleanup {
     BestEffortAfterVisible,
 }
 
-/// Recover one bounded RFC-026 enrollment intent.
-///
-/// This adapter deliberately has no rollback branch. The only destructive
-/// action available here is deleting a sidecar after exact classification has
-/// proved that neither enrollment effect exists. Once the singleton index is
-/// present, recovery either completes the pre-minted empty shard and publishes
-/// the fixed lifecycle outcome, or retains the sidecar and fails closed.
-async fn process_stream_enrollment_sidecar_v10(
-    root_uri: &str,
-    storage: &std::sync::Arc<dyn StorageAdapter>,
-    snapshot: &Snapshot,
-    sidecar: &RecoverySidecar,
-    cleanup_policy: StreamEnrollmentCleanup,
-) -> Result<bool> {
-    let protocol = sidecar.protocol_v10.as_ref().ok_or_else(|| {
-        OmniError::manifest_internal("schema-v10 StreamEnrollment is missing protocol_v10")
-    })?;
-    let pin = sidecar.tables.first().ok_or_else(|| {
-        OmniError::manifest_internal("schema-v10 StreamEnrollment has no table pin")
-    })?;
-    let manifest_entry = snapshot_entry_for_pin(snapshot, pin)
-        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?
-        .ok_or_else(|| {
-            OmniError::recovery_required(
-                sidecar.operation_id.clone(),
-                format!(
-                    "stream enrollment table identity {} is no longer live in the manifest",
-                    pin.identity
-                ),
-            )
-        })?;
-    if manifest_entry.table_path != protocol.intended_binding.table_location
-        || manifest_entry.table_branch.is_some()
-    {
-        return Err(OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            format!(
-                "stream enrollment manifest authority changed for identity {}: expected path '{}' on main, found path '{}' ref {:?} version {}",
-                pin.identity,
-                protocol.intended_binding.table_location,
-                manifest_entry.table_path,
-                manifest_entry.table_branch,
-                manifest_entry.table_version,
-            ),
-        ));
-    }
-
-    let anchor = crate::instrumentation::open_dataset(
-        &pin.table_path,
-        crate::instrumentation::VersionResolution::At(pin.expected_version),
-        None,
-        crate::instrumentation::table_wrapper(),
-    )
-    .await
-    .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-    let mut state =
-        classify_enrollment(&anchor, &protocol.baseline_head, &protocol.enrollment_plan)
-            .await
-            .map_err(|error| {
-                OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
-            })?;
-
-    if matches!(state, MemWalEnrollmentState::ExactNoEffect) {
-        if snapshot.stream_lifecycle(pin.identity).is_some()
-            || manifest_entry.table_version != pin.expected_version
-        {
-            return Err(OmniError::recovery_required(
-                sidecar.operation_id.clone(),
-                "manifest contains stream lifecycle authority but the exact enrollment effects are absent",
-            ));
-        }
-        delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
-        return Ok(true);
-    }
-
-    // Publication may have succeeded before audit/sidecar cleanup. In that
-    // state the live graph head is intentionally the fixed lineage id rather
-    // than the pre-effect authority, so recognize the exact visible outcome
-    // before comparing against arm-time authority.
-    if let MemWalEnrollmentState::ExactIndexAndExpectedEmptyShard {
-        receipt,
-        shard_manifest,
-    } = &state
-    {
-        let lifecycle = stream_enrollment_lifecycle(sidecar, receipt, shard_manifest)
-            .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-        if stream_enrollment_original_visible(root_uri, sidecar, &lifecycle)
-            .await
-            .map_err(|error| stream_enrollment_effect_error(sidecar, error))?
-        {
-            return finalize_visible_stream_enrollment(
-                root_uri,
-                storage.as_ref(),
-                sidecar,
-                cleanup_policy,
-            )
-            .await
-            .map_err(|error| stream_enrollment_effect_error(sidecar, error));
-        }
-    }
-
-    let live_authority = read_live_recovery_authority(root_uri, storage, None)
-        .await
-        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-    if live_authority != protocol.authority {
-        return Err(OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            "stream enrollment graph/schema authority changed after recovery was armed",
-        ));
-    }
-
-    if matches!(state, MemWalEnrollmentState::ExactIndexOnly(_)) {
-        provision_shard_from_exact_index_only(
-            &anchor,
-            &protocol.baseline_head,
-            &protocol.enrollment_plan,
-        )
-        .await
-        .map_err(|error| {
-            OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
-        })?;
-        state = classify_enrollment(&anchor, &protocol.baseline_head, &protocol.enrollment_plan)
-            .await
-            .map_err(|error| {
-                OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
-            })?;
-    }
-
-    let MemWalEnrollmentState::ExactIndexAndExpectedEmptyShard {
-        receipt,
-        shard_manifest,
-    } = state
-    else {
-        return Err(OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            "stream enrollment did not converge to the exact index-plus-empty-shard state",
-        ));
-    };
-    let lifecycle = stream_enrollment_lifecycle(sidecar, &receipt, &shard_manifest)
-        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-
-    if stream_enrollment_original_visible(root_uri, sidecar, &lifecycle)
-        .await
-        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?
-    {
-        return finalize_visible_stream_enrollment(
-            root_uri,
-            storage.as_ref(),
-            sidecar,
-            cleanup_policy,
-        )
-        .await
-        .map_err(|error| stream_enrollment_effect_error(sidecar, error));
-    }
-    if snapshot.stream_lifecycle(pin.identity).is_some()
-        || manifest_entry.table_version != pin.expected_version
-    {
-        return Err(OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            "a different stream lifecycle row is already visible for the enrollment identity",
-        ));
-    }
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::STREAM_ENROLLMENT_POST_SHARD_PRE_MANIFEST,
-    )
-    .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-
-    let successor = anchor
-        .checkout_version(receipt.head.table_version)
-        .await
-        .map_err(|error| {
-            stream_enrollment_effect_error(sidecar, OmniError::Lance(error.to_string()))
-        })?;
-    let version_metadata =
-        super::TableVersionMetadata::from_dataset(root_uri, &manifest_entry.table_path, &successor)
-            .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-    let updates = vec![
-        ManifestChange::Update(SubTableUpdate {
-            identity: pin.identity,
-            table_key: pin.table_key.clone(),
-            table_version: receipt.head.table_version,
-            table_branch: None,
-            row_count: manifest_entry.row_count,
-            version_metadata,
-        }),
-        ManifestChange::SetStreamLifecycle {
-            expected: None,
-            next: lifecycle,
-        },
-    ];
-    let expected = HashMap::from([(
-        pin.identity,
-        TableVersionExpectation {
-            table_key: pin.table_key.clone(),
-            table_version: pin.expected_version,
-        },
-    )]);
-    let (_, graph_commit_id) = publish_recovery_commit(
-        root_uri,
-        sidecar,
-        RecoveryKind::RolledForward,
-        &updates,
-        &expected,
-    )
-    .await
-    .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-    record_audit(
-        root_uri,
-        sidecar,
-        graph_commit_id,
-        RecoveryKind::RolledForward,
-        vec![TableOutcome {
-            table_key: pin.table_key.clone(),
-            from_version: pin.expected_version,
-            to_version: receipt.head.table_version,
-        }],
-    )
-    .await
-    .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-    cleanup_visible_stream_enrollment_sidecar(root_uri, storage.as_ref(), sidecar, cleanup_policy)
-        .await
-        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-    Ok(true)
-}
-
 async fn cleanup_visible_stream_enrollment_sidecar(
     root_uri: &str,
     storage: &dyn StorageAdapter,
@@ -5397,34 +7389,644 @@ async fn cleanup_visible_stream_enrollment_sidecar(
     }
 }
 
-/// Once exact classification observes either enrollment effect, every failure
-/// is an unresolved durable operation. Preserve an already-typed recovery
-/// error and convert lower-level I/O, failpoint, audit, or publication errors
-/// so callers never mistake partial format state for an ordinary retry.
-fn stream_enrollment_effect_error(sidecar: &RecoverySidecar, error: OmniError) -> OmniError {
-    match error {
-        OmniError::RecoveryRequired { .. } => error,
-        other => OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            format!(
-                "stream enrollment completion failed while a durable effect may exist: {other}"
-            ),
-        ),
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEnrollmentV2TokenState {
+    ExactNoEffect,
+    ExactEffect,
 }
 
-/// Writer-side entry into the same exact recovery adapter used on reopen.
-/// Callers retain exclusive stream admission and the normal write gates while
-/// this completes; exposing one implementation prevents the success path and
-/// crash path from learning different enrollment semantics.
-#[allow(dead_code)] // Reached by the intentionally dormant Phase-A orchestrator.
-pub(crate) async fn complete_stream_enrollment_sidecar_v10(
+struct ObservedStreamEnrollmentV2Token {
+    state: StreamEnrollmentV2TokenState,
+    transaction: Option<StagedTransactionIdentity>,
+    authority: super::StreamTokenAuthorityEntry,
+}
+
+fn stream_enrollment_v2_protocol(sidecar: &RecoverySidecar) -> &RecoveryStreamEnrollmentV2V14 {
+    let RecoveryProtocolV14::StreamEnrollmentV2(protocol) = sidecar
+        .protocol_v14
+        .as_deref()
+        .expect("validated schema-v14 StreamEnrollmentV2")
+    else {
+        unreachable!("validated StreamEnrollmentV2 writer kind");
+    };
+    protocol
+}
+
+fn stream_enrollment_v2_error(
+    sidecar: &RecoverySidecar,
+    reason: impl std::fmt::Display,
+) -> OmniError {
+    OmniError::recovery_required(
+        sidecar.operation_id.clone(),
+        format!("StreamEnrollmentV2 recovery cannot prove an exact outcome: {reason}"),
+    )
+}
+
+async fn observe_stream_enrollment_v2_token(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<ObservedStreamEnrollmentV2Token> {
+    let protocol = stream_enrollment_v2_protocol(sidecar);
+    let session = crate::lance_access::control_session();
+    let dataset = crate::instrumentation::open_dataset(
+        &super::layout::stream_token_uri(root_uri),
+        crate::instrumentation::VersionResolution::Latest,
+        Some(&session),
+        crate::instrumentation::table_wrapper(),
+    )
+    .await
+    .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    let authority = super::token_store::stream_token_authority_entry_for_dataset(&dataset)
+        .await
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    if authority == protocol.token.prior_authority {
+        return Ok(ObservedStreamEnrollmentV2Token {
+            state: StreamEnrollmentV2TokenState::ExactNoEffect,
+            transaction: None,
+            authority,
+        });
+    }
+    let transaction = dataset
+        .read_transaction()
+        .await
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))?
+        .ok_or_else(|| {
+            stream_enrollment_v2_error(sidecar, "stream-token HEAD has no transaction")
+        })?;
+    let transaction = StagedTransactionIdentity::from(&transaction);
+    let planned = &protocol.token.planned_transaction;
+    let expected_version = planned
+        .read_version
+        .checked_add(1)
+        .ok_or_else(|| stream_enrollment_v2_error(sidecar, "stream-token version overflow"))?;
+    if authority.location != protocol.token.prior_authority.location
+        || authority.schema_version != protocol.token.prior_authority.schema_version
+        || authority.schema_hash != protocol.token.prior_authority.schema_hash
+        || authority.current_head_witness.table_version != expected_version
+        || authority.current_head_witness.transaction_uuid != planned.uuid
+        || transaction != *planned
+    {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "raw stream-token HEAD is neither the selected prior witness nor the exact planned N+1 enrollment-ledger transaction",
+        ));
+    }
+    let enrollment = &protocol.token.planned_enrollment_receipt;
+    let observed_enrollment = super::token_store::lookup_enrollment_receipt_v2(
+        &dataset,
+        &authority,
+        &enrollment.graph_identity_digest,
+        enrollment.identity,
+        &enrollment.enrollment_request_id,
+    )
+    .await
+    .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    if observed_enrollment.as_ref() != Some(enrollment) {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "exact enrollment-ledger transaction does not contain the planned EnrollmentReceiptV2",
+        ));
+    }
+    let binding = &protocol.token.planned_binding_receipt;
+    let observed_binding = super::token_store::lookup_binding_receipt(
+        &dataset,
+        &authority,
+        &binding.graph_identity_digest,
+        binding.identity,
+        &binding.binding_scope_id,
+        &binding.operation_id,
+    )
+    .await
+    .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    if observed_binding.as_ref() != Some(binding) {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "exact enrollment-ledger transaction does not contain the planned BindingReceipt",
+        ));
+    }
+    if protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+        && (protocol.token.confirmed_transaction.as_ref() != Some(planned)
+            || protocol.token.confirmed_head.as_ref() != Some(&authority.current_head_witness)
+            || protocol.token.next_authority.as_ref() != Some(&authority))
+    {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "durable enrollment confirmation differs from the exact observed token effect",
+        ));
+    }
+    Ok(ObservedStreamEnrollmentV2Token {
+        state: StreamEnrollmentV2TokenState::ExactEffect,
+        transaction: Some(transaction),
+        authority,
+    })
+}
+
+async fn finish_missing_stream_enrollment_v2_token(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<ObservedStreamEnrollmentV2Token> {
+    let protocol = stream_enrollment_v2_protocol(sidecar);
+    if protocol.effect_phase != RecoveryEffectPhase::Armed {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "cannot finish a missing token effect after enrollment confirmation",
+        ));
+    }
+    let session = crate::lance_access::control_session();
+    let dataset = super::token_store::open_stream_token_authority_at(
+        root_uri,
+        &protocol.token.prior_authority,
+        &session,
+    )
+    .await
+    .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    let records = [
+        super::token_store::LifecycleLedgerRecord::EnrollmentReceiptV2(
+            protocol.token.planned_enrollment_receipt.clone(),
+        ),
+        super::token_store::LifecycleLedgerRecord::BindingReceipt(
+            protocol.token.planned_binding_receipt.clone(),
+        ),
+    ];
+    let mut staged = super::token_store::stage_lifecycle_ledger_records(
+        dataset.clone(),
+        &protocol.token.prior_authority,
+        &records,
+    )
+    .await
+    .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    staged
+        .bind_transaction_identity(&protocol.token.planned_transaction)
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    let table_store = crate::table_store::TableStore::new(root_uri, session);
+    let (achieved, committed) = table_store
+        .commit_staged_exact(std::sync::Arc::new(dataset), staged)
+        .await
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    let expected_version = protocol
+        .token
+        .planned_transaction
+        .read_version
+        .checked_add(1)
+        .ok_or_else(|| stream_enrollment_v2_error(sidecar, "stream-token version overflow"))?;
+    if committed != protocol.token.planned_transaction
+        || achieved.version().version != expected_version
+    {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "recovery committed a non-exact StreamEnrollmentV2 token transaction",
+        ));
+    }
+    observe_stream_enrollment_v2_token(root_uri, sidecar).await
+}
+
+fn stream_enrollment_v2_manifest_is_prior(snapshot: &Snapshot, sidecar: &RecoverySidecar) -> bool {
+    let protocol = stream_enrollment_v2_protocol(sidecar);
+    let pin = &sidecar.tables[0];
+    snapshot.version() == protocol.prior_manifest_version
+        && snapshot.stream_profile() == &protocol.profile
+        && snapshot.stream_token_authority() == &protocol.token.prior_authority
+        && snapshot.stream_lifecycle(pin.identity).is_none()
+        && snapshot_entry_by_identity(snapshot, pin.identity).is_some_and(|entry| {
+            entry.table_key == pin.table_key
+                && entry.table_path == protocol.intended_binding.table_location
+                && entry.table_version == pin.expected_version
+                && entry.table_branch.is_none()
+                && entry.row_count == protocol.prior_row_count
+        })
+}
+
+fn stream_enrollment_v2_lineage_matches(
+    commit: &super::GraphLineageRow,
+    protocol: &RecoveryStreamEnrollmentV2V14,
+) -> bool {
+    commit.manifest_branch.is_none()
+        && commit.parent_commit_id.as_ref() == protocol.authority.graph_head.as_ref()
+        && commit.merged_parent_commit_id.is_none()
+        && commit.actor_id == protocol.lineage.actor_id
+        && commit.created_at == protocol.lineage.created_at
+        && commit.stream_fold_attribution.is_none()
+}
+
+async fn stream_enrollment_v2_original_visible(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let protocol = stream_enrollment_v2_protocol(sidecar);
+    if protocol.effect_phase != RecoveryEffectPhase::EffectsConfirmed {
+        return Ok(false);
+    }
+    let update = protocol
+        .confirmed_update
+        .as_ref()
+        .expect("validated confirmed enrollment update");
+    let lifecycle = protocol
+        .next_lifecycle
+        .as_ref()
+        .expect("validated confirmed enrollment lifecycle");
+    let next_authority = protocol
+        .token
+        .next_authority
+        .as_ref()
+        .expect("validated confirmed enrollment token authority");
+    let (commits, _) = ManifestCoordinator::read_graph_lineage_at(root_uri, None).await?;
+    let Some(commit) = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id)
+    else {
+        return Ok(false);
+    };
+    if !stream_enrollment_v2_lineage_matches(commit, protocol) {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "fixed enrollment graph commit has mismatched lineage",
+        ));
+    }
+    let committed =
+        ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version).await?;
+    let pin = &sidecar.tables[0];
+    let exact_manifest_version = protocol
+        .prior_manifest_version
+        .checked_add(1)
+        .ok_or_else(|| stream_enrollment_v2_error(sidecar, "manifest version overflow"))?;
+    let entry_matches = snapshot_entry_by_identity(&committed, pin.identity).is_some_and(|entry| {
+        entry.table_key == pin.table_key
+            && entry.table_path == protocol.intended_binding.table_location
+            && entry.table_version == update.table_version
+            && entry.table_branch == update.table_branch
+            && entry.row_count == update.row_count
+            && entry.version_metadata == update.version_metadata
+    });
+    if committed.version() != exact_manifest_version
+        || committed.stream_profile() != &protocol.profile
+        || committed.stream_token_authority() != next_authority
+        || committed.stream_lifecycle(pin.identity) != Some(lifecycle)
+        || !entry_matches
+    {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "fixed enrollment graph commit differs from the exact table/token/lifecycle outcome",
+        ));
+    }
+    Ok(true)
+}
+
+async fn finalize_visible_stream_enrollment_v2(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    cleanup_policy: StreamEnrollmentCleanup,
+) -> Result<bool> {
+    let protocol = stream_enrollment_v2_protocol(sidecar);
+    let pin = &sidecar.tables[0];
+    let update = protocol
+        .confirmed_update
+        .as_ref()
+        .expect("validated confirmed enrollment update");
+    let expected_outcomes = vec![TableOutcome {
+        table_key: pin.table_key.clone(),
+        from_version: pin.expected_version,
+        to_version: update.table_version,
+    }];
+    let expected_writer_kind = format!("{:?}", sidecar.writer_kind);
+    let mut audit = RecoveryAudit::open(root_uri)
+        .await
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    let records = audit
+        .list()
+        .await
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    let operation_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.operation_id == sidecar.operation_id)
+        .collect();
+    if operation_records.iter().any(|record| {
+        record.graph_commit_id != protocol.lineage.graph_commit_id
+            || record.recovery_kind != RecoveryKind::RolledForward
+            || record.recovery_for_actor != sidecar.actor_id
+            || record.sidecar_writer_kind != expected_writer_kind
+            || record.per_table_outcomes != expected_outcomes
+    }) {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "recovery audit row differs from the exact enrollment outcome",
+        ));
+    }
+    if operation_records.is_empty() {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)
+            .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id: protocol.lineage.graph_commit_id.clone(),
+                recovery_kind: RecoveryKind::RolledForward,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: expected_writer_kind,
+                per_table_outcomes: expected_outcomes,
+                created_at: crate::db::now_micros()
+                    .map_err(|error| stream_enrollment_v2_error(sidecar, error))?,
+            })
+            .await
+            .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    }
+    cleanup_visible_stream_enrollment_sidecar(root_uri, storage, sidecar, cleanup_policy)
+        .await
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    Ok(true)
+}
+
+async fn publish_stream_enrollment_v2_v14(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<u64> {
+    let protocol = stream_enrollment_v2_protocol(sidecar);
+    let pin = &sidecar.tables[0];
+    let update = protocol
+        .confirmed_update
+        .as_ref()
+        .expect("validated confirmed enrollment update");
+    let lifecycle = protocol
+        .next_lifecycle
+        .as_ref()
+        .expect("validated confirmed enrollment lifecycle");
+    let next_authority = protocol
+        .token
+        .next_authority
+        .as_ref()
+        .expect("validated confirmed enrollment token authority");
+    let changes = vec![
+        ManifestChange::Update(SubTableUpdate {
+            identity: pin.identity,
+            table_key: pin.table_key.clone(),
+            table_version: update.table_version,
+            table_branch: update.table_branch.clone(),
+            row_count: update.row_count,
+            version_metadata: update.version_metadata.clone(),
+        }),
+        ManifestChange::SetStreamTokenAuthority {
+            expected: protocol.token.prior_authority.clone(),
+            next: next_authority.clone(),
+        },
+        ManifestChange::SetStreamLifecycle {
+            expected: None,
+            next: lifecycle.clone(),
+        },
+        ManifestChange::SetStreamProfile {
+            expected: protocol.profile.clone(),
+            next: protocol.profile.clone(),
+        },
+    ];
+    let expected = HashMap::from([(
+        pin.identity,
+        TableVersionExpectation {
+            table_key: pin.table_key.clone(),
+            table_version: pin.expected_version,
+        },
+    )]);
+    let publisher = GraphNamespacePublisher::new_with_session(
+        root_uri,
+        None,
+        crate::lance_access::control_session(),
+    );
+    let precondition = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
+        None,
+        protocol.authority.branch_identifier.clone(),
+        protocol.authority.graph_head.clone(),
+    ));
+    let intent = LineageIntent::from(&protocol.lineage);
+    let outcome = publisher
+        .publish_with_precondition(&changes, &expected, Some(&intent), &precondition)
+        .await
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    let expected_manifest_version = protocol
+        .prior_manifest_version
+        .checked_add(1)
+        .ok_or_else(|| stream_enrollment_v2_error(sidecar, "manifest version overflow"))?;
+    if outcome.dataset.version().version != expected_manifest_version {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            format!(
+                "terminal manifest CAS reached version {}, expected exact version {expected_manifest_version}",
+                outcome.dataset.version().version
+            ),
+        ));
+    }
+    Ok(outcome.dataset.version().version)
+}
+
+async fn observed_stream_enrollment_v2_confirmation(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+    receipt: &crate::table_store::mem_wal::MemWalEnrollmentReceipt,
+) -> Result<(RecoveryConfirmedTableUpdate, super::StreamLifecycleEntry)> {
+    let protocol = stream_enrollment_v2_protocol(sidecar);
+    let pin = &sidecar.tables[0];
+    let anchor = crate::instrumentation::open_dataset(
+        &pin.table_path,
+        crate::instrumentation::VersionResolution::At(receipt.head.table_version),
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await
+    .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    let row_count = anchor
+        .count_rows(None)
+        .await
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))? as u64;
+    if row_count != protocol.prior_row_count {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "exact MemWAL CreateIndex successor changed the logical row count",
+        ));
+    }
+    let version_metadata = super::TableVersionMetadata::from_dataset(
+        root_uri,
+        &protocol.intended_binding.table_location,
+        &anchor,
+    )
+    .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    let update = RecoveryConfirmedTableUpdate {
+        table_version: receipt.head.table_version,
+        table_branch: None,
+        row_count,
+        version_metadata,
+    };
+    let lifecycle = stream_enrollment_v2_expected_lifecycle(
+        protocol,
+        pin.table_key.clone(),
+        receipt.head.clone(),
+    )
+    .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    Ok((update, lifecycle))
+}
+
+async fn process_stream_enrollment_sidecar_v14(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+    cleanup_policy: StreamEnrollmentCleanup,
+) -> Result<bool> {
+    validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
+    let protocol = stream_enrollment_v2_protocol(sidecar);
+    let pin = &sidecar.tables[0];
+
+    let mut anchor = crate::instrumentation::open_dataset(
+        &pin.table_path,
+        crate::instrumentation::VersionResolution::At(pin.expected_version),
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await
+    .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    let mut base = classify_enrollment(&anchor, &protocol.baseline_head, &protocol.enrollment_plan)
+        .await
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    let mut token = observe_stream_enrollment_v2_token(root_uri, sidecar).await?;
+
+    if stream_enrollment_v2_original_visible(root_uri, sidecar).await? {
+        let MemWalEnrollmentState::ExactIndexAndExpectedEmptyShard { receipt, .. } = &base else {
+            return Err(stream_enrollment_v2_error(
+                sidecar,
+                "visible enrollment manifest outcome is not backed by the exact index-plus-empty-shard effect",
+            ));
+        };
+        let (update, lifecycle) =
+            observed_stream_enrollment_v2_confirmation(root_uri, sidecar, receipt).await?;
+        if token.state != StreamEnrollmentV2TokenState::ExactEffect
+            || token.transaction.as_ref() != protocol.token.confirmed_transaction.as_ref()
+            || Some(&token.authority) != protocol.token.next_authority.as_ref()
+            || protocol.confirmed_update.as_ref() != Some(&update)
+            || protocol.next_lifecycle.as_ref() != Some(&lifecycle)
+        {
+            return Err(stream_enrollment_v2_error(
+                sidecar,
+                "visible enrollment manifest outcome differs from its exact confirmed effects",
+            ));
+        }
+        return finalize_visible_stream_enrollment_v2(
+            root_uri,
+            storage.as_ref(),
+            sidecar,
+            cleanup_policy,
+        )
+        .await;
+    }
+    if !stream_enrollment_v2_manifest_is_prior(snapshot, sidecar) {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "manifest version, profile, table pointer, lifecycle slot, or selected token authority differs from both exact outcomes",
+        ));
+    }
+    let live_authority = read_live_recovery_authority(root_uri, storage, None)
+        .await
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    if live_authority != protocol.authority {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "graph/schema authority changed after enrollment recovery was armed",
+        ));
+    }
+
+    if matches!(base, MemWalEnrollmentState::ExactNoEffect)
+        && token.state == StreamEnrollmentV2TokenState::ExactNoEffect
+    {
+        if protocol.effect_phase != RecoveryEffectPhase::Armed {
+            return Err(stream_enrollment_v2_error(
+                sidecar,
+                "EffectsConfirmed enrollment has no physical or token effect",
+            ));
+        }
+        delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
+            .await
+            .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+        return Ok(true);
+    }
+
+    // Once either exact participant exists, recovery owns every remaining
+    // exact prefix. It never compensates the index, shard, or immutable ledger.
+    if matches!(base, MemWalEnrollmentState::ExactNoEffect) {
+        crate::table_store::mem_wal::initialize_index_from_exact_no_effect(
+            &mut anchor,
+            &protocol.baseline_head,
+            &protocol.enrollment_plan,
+        )
+        .await
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+        base = classify_enrollment(&anchor, &protocol.baseline_head, &protocol.enrollment_plan)
+            .await
+            .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    }
+    if matches!(base, MemWalEnrollmentState::ExactIndexOnly(_)) {
+        provision_shard_from_exact_index_only(
+            &anchor,
+            &protocol.baseline_head,
+            &protocol.enrollment_plan,
+        )
+        .await
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+        base = classify_enrollment(&anchor, &protocol.baseline_head, &protocol.enrollment_plan)
+            .await
+            .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    }
+    let MemWalEnrollmentState::ExactIndexAndExpectedEmptyShard { receipt, .. } = &base else {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "physical enrollment did not converge to the exact index-plus-empty-shard state",
+        ));
+    };
+
+    if token.state == StreamEnrollmentV2TokenState::ExactNoEffect {
+        token = finish_missing_stream_enrollment_v2_token(root_uri, sidecar).await?;
+    }
+    if token.state != StreamEnrollmentV2TokenState::ExactEffect {
+        return Err(stream_enrollment_v2_error(
+            sidecar,
+            "token enrollment did not converge to the exact immutable ledger transaction",
+        ));
+    }
+    let (update, lifecycle) =
+        observed_stream_enrollment_v2_confirmation(root_uri, sidecar, receipt).await?;
+    let mut confirmed = sidecar.clone();
+    if protocol.effect_phase == RecoveryEffectPhase::Armed {
+        confirm_stream_enrollment_sidecar_v14(
+            root_uri,
+            storage.as_ref(),
+            &mut confirmed,
+            token
+                .transaction
+                .clone()
+                .expect("exact enrollment token effect has a transaction"),
+            token.authority.current_head_witness.clone(),
+            token.authority.clone(),
+            update,
+            lifecycle,
+        )
+        .await
+        .map_err(|error| stream_enrollment_v2_error(sidecar, error))?;
+    }
+    crate::failpoints::maybe_fail(
+        crate::failpoints::names::STREAM_ENROLLMENT_POST_SHARD_PRE_MANIFEST,
+    )
+    .map_err(|error| stream_enrollment_v2_error(&confirmed, error))?;
+    publish_stream_enrollment_v2_v14(root_uri, &confirmed).await?;
+    if !stream_enrollment_v2_original_visible(root_uri, &confirmed).await? {
+        return Err(stream_enrollment_v2_error(
+            &confirmed,
+            "terminal manifest CAS did not select the exact table, token, and lifecycle outcome",
+        ));
+    }
+    finalize_visible_stream_enrollment_v2(root_uri, storage.as_ref(), &confirmed, cleanup_policy)
+        .await
+}
+
+pub(crate) async fn complete_stream_enrollment_sidecar_v14(
     root_uri: &str,
     storage: std::sync::Arc<dyn StorageAdapter>,
     snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
 ) -> Result<()> {
-    process_stream_enrollment_sidecar_v10(
+    process_stream_enrollment_sidecar_v14(
         root_uri,
         &storage,
         snapshot,
@@ -5433,113 +8035,6 @@ pub(crate) async fn complete_stream_enrollment_sidecar_v10(
     )
     .await
     .map(|_| ())
-}
-
-fn stream_enrollment_lifecycle(
-    sidecar: &RecoverySidecar,
-    receipt: &crate::table_store::mem_wal::MemWalEnrollmentReceipt,
-    shard_manifest: &lance_index::mem_wal::ShardManifest,
-) -> Result<super::StreamLifecycleEntry> {
-    let protocol = sidecar
-        .protocol_v10
-        .as_ref()
-        .expect("validated StreamEnrollment protocol");
-    let pin = &sidecar.tables[0];
-    let lifecycle = super::StreamLifecycleEntry::new_open_enrollment(
-        pin.identity,
-        pin.table_key.clone(),
-        protocol.intended_binding.clone(),
-        receipt.head.clone(),
-        BTreeMap::from([(
-            protocol.enrollment_plan.shard_id.to_string(),
-            shard_manifest.writer_epoch,
-        )]),
-        protocol.enrollment_receipt.clone(),
-    )?;
-    Ok(lifecycle)
-}
-
-async fn stream_enrollment_original_visible(
-    root_uri: &str,
-    sidecar: &RecoverySidecar,
-    expected_lifecycle: &super::StreamLifecycleEntry,
-) -> Result<bool> {
-    let protocol = sidecar
-        .protocol_v10
-        .as_ref()
-        .expect("validated StreamEnrollment protocol");
-    let pin = &sidecar.tables[0];
-    let (commits, _) = ManifestCoordinator::read_graph_lineage_at(root_uri, None).await?;
-    let Some(commit) = commits
-        .iter()
-        .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id)
-    else {
-        return Ok(false);
-    };
-    if commit.manifest_branch.is_some()
-        || commit.parent_commit_id.as_ref() != protocol.authority.graph_head.as_ref()
-        || commit.merged_parent_commit_id.is_some()
-        || commit.actor_id != protocol.lineage.actor_id
-        || commit.created_at != protocol.lineage.created_at
-    {
-        return Err(OmniError::manifest_internal(format!(
-            "StreamEnrollment sidecar '{}' found fixed commit '{}' with mismatched lineage",
-            sidecar.operation_id, protocol.lineage.graph_commit_id
-        )));
-    }
-    let committed =
-        ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version).await?;
-    let entry_matches = snapshot_entry_by_identity(&committed, pin.identity).is_some_and(|entry| {
-        entry.table_key == pin.table_key
-            && entry.table_path == protocol.intended_binding.table_location
-            && entry.table_version == expected_lifecycle.current_head_witness.table_version
-            && entry.table_branch.is_none()
-    });
-    if !entry_matches || committed.stream_lifecycle(pin.identity) != Some(expected_lifecycle) {
-        return Err(OmniError::manifest_internal(format!(
-            "StreamEnrollment sidecar '{}' found fixed commit '{}' but its table/lifecycle outcome differs",
-            sidecar.operation_id, protocol.lineage.graph_commit_id
-        )));
-    }
-    Ok(true)
-}
-
-async fn finalize_visible_stream_enrollment(
-    root_uri: &str,
-    storage: &dyn StorageAdapter,
-    sidecar: &RecoverySidecar,
-    cleanup_policy: StreamEnrollmentCleanup,
-) -> Result<bool> {
-    let protocol = sidecar
-        .protocol_v10
-        .as_ref()
-        .expect("validated StreamEnrollment protocol");
-    let pin = &sidecar.tables[0];
-    let mut audit = RecoveryAudit::open(root_uri).await?;
-    let already_recorded = audit.list().await?.iter().any(|record| {
-        record.operation_id == sidecar.operation_id
-            && record.recovery_kind == RecoveryKind::RolledForward
-    });
-    if !already_recorded {
-        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
-        audit
-            .append(RecoveryAuditRecord {
-                graph_commit_id: protocol.lineage.graph_commit_id.clone(),
-                recovery_kind: RecoveryKind::RolledForward,
-                recovery_for_actor: sidecar.actor_id.clone(),
-                operation_id: sidecar.operation_id.clone(),
-                sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
-                per_table_outcomes: vec![TableOutcome {
-                    table_key: pin.table_key.clone(),
-                    from_version: pin.expected_version,
-                    to_version: pin.post_commit_pin,
-                }],
-                created_at: crate::db::now_micros()?,
-            })
-            .await?;
-    }
-    cleanup_visible_stream_enrollment_sidecar(root_uri, storage, sidecar, cleanup_policy).await?;
-    Ok(true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6204,6 +8699,43 @@ fn classify_stream_fold_v12_effect_matrix(
     }
 }
 
+fn stream_fold_protocol_v14(sidecar: &RecoverySidecar) -> &RecoveryStreamFoldV14 {
+    match sidecar.protocol_v14.as_deref() {
+        Some(RecoveryProtocolV14::StreamFoldV2(protocol))
+        | Some(RecoveryProtocolV14::StreamDrainFold(protocol)) => protocol,
+        _ => panic!("validated lifecycle-v3 fold sidecar"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFoldV14EffectMatrix {
+    EffectFree,
+    Complete,
+    BaseOnly,
+    TokenOnly,
+}
+
+/// One physical classifier for both lifecycle-authorized fold discriminators.
+fn classify_stream_fold_v14_effect_matrix(
+    base: StreamFoldParticipantState,
+    token: StreamFoldParticipantState,
+) -> StreamFoldV14EffectMatrix {
+    match (base, token) {
+        (StreamFoldParticipantState::ExactNoEffect, StreamFoldParticipantState::ExactNoEffect) => {
+            StreamFoldV14EffectMatrix::EffectFree
+        }
+        (StreamFoldParticipantState::ExactEffect, StreamFoldParticipantState::ExactEffect) => {
+            StreamFoldV14EffectMatrix::Complete
+        }
+        (StreamFoldParticipantState::ExactEffect, StreamFoldParticipantState::ExactNoEffect) => {
+            StreamFoldV14EffectMatrix::BaseOnly
+        }
+        (StreamFoldParticipantState::ExactNoEffect, StreamFoldParticipantState::ExactEffect) => {
+            StreamFoldV14EffectMatrix::TokenOnly
+        }
+    }
+}
+
 struct ObservedStreamFoldBaseV12 {
     state: StreamFoldParticipantState,
     head: super::CurrentHeadWitness,
@@ -6587,19 +9119,360 @@ async fn finish_missing_stream_fold_token_v12(
     })
 }
 
-async fn validate_stream_fold_token_rows_against_base_v12(
+struct ObservedStreamFoldBaseV14 {
+    state: StreamFoldParticipantState,
+    head: super::CurrentHeadWitness,
+    transaction: StagedTransactionIdentity,
+    exact_update: Option<RecoveryConfirmedTableUpdate>,
+}
+
+fn classify_stream_fold_base_v14_observation(
+    pin: &SidecarTablePin,
+    protocol: &RecoveryStreamFoldV14,
+    observed_head: &super::CurrentHeadWitness,
+    observed_transaction: &StagedTransactionIdentity,
+    transaction_merged_generations: Option<&[MergedGeneration]>,
+    observed_merged_generation: Option<&MergedGeneration>,
+) -> std::result::Result<StreamFoldParticipantState, String> {
+    if observed_head.branch_identifier != lance::dataset::refs::BranchIdentifier::main() {
+        return Err("observed StreamFoldV14 base HEAD is not canonical main".to_string());
+    }
+    if observed_head.table_version == pin.expected_version {
+        if observed_head != &protocol.prior_lifecycle.current_head_witness
+            || observed_merged_generation != protocol.prior_merged_generation.as_ref()
+        {
+            return Err(
+                "StreamFoldV14 base N state differs from its exact lifecycle or merge-progress prestate"
+                    .to_string(),
+            );
+        }
+        return Ok(StreamFoldParticipantState::ExactNoEffect);
+    }
+    if observed_head.table_version != pin.post_commit_pin
+        || observed_transaction != &protocol.base.planned_transaction
+        || observed_head.transaction_uuid != protocol.base.planned_transaction.uuid
+    {
+        return Err(
+            "StreamFoldV14 base HEAD is neither exact N nor its pre-minted N+1 transaction"
+                .to_string(),
+        );
+    }
+    let Some(transaction_merged_generations) = transaction_merged_generations else {
+        return Err("StreamFoldV14 base N+1 is not a Lance Update transaction".to_string());
+    };
+    if transaction_merged_generations != std::slice::from_ref(&protocol.merged_generation)
+        || observed_merged_generation != Some(&protocol.merged_generation)
+    {
+        return Err(
+            "StreamFoldV14 base N+1 does not carry its one exact merged-generation cut".to_string(),
+        );
+    }
+    if protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+        && (protocol.base.confirmed_transaction.as_ref()
+            != Some(&protocol.base.planned_transaction)
+            || protocol.base.confirmed_merged_generation.as_ref()
+                != Some(&protocol.merged_generation)
+            || protocol.base.confirmed_head.as_ref() != Some(observed_head)
+            || protocol
+                .base
+                .confirmed_update
+                .as_ref()
+                .is_none_or(|update| {
+                    update.table_version != observed_head.table_version
+                        || update.table_branch.is_some()
+                })
+            || pin.confirmed_version != Some(observed_head.table_version))
+    {
+        return Err(
+            "StreamFoldV14 durable base confirmation differs from the exact observed N+1 effect"
+                .to_string(),
+        );
+    }
+    Ok(StreamFoldParticipantState::ExactEffect)
+}
+
+async fn observe_stream_fold_base_v14(
     root_uri: &str,
     sidecar: &RecoverySidecar,
+) -> Result<ObservedStreamFoldBaseV14> {
+    let protocol = stream_fold_protocol_v14(sidecar);
+    let pin = &sidecar.tables[0];
+    let dataset = crate::instrumentation::open_dataset(
+        &pin.table_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await
+    .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+    let head = capture_current_head_witness(&dataset)
+        .await
+        .map_err(|error| {
+            stream_fold_effect_error(sidecar, OmniError::manifest_internal(error.to_string()))
+        })?;
+    let transaction = dataset
+        .read_transaction()
+        .await
+        .map_err(|error| stream_fold_effect_error(sidecar, OmniError::Lance(error.to_string())))?
+        .ok_or_else(|| {
+            stream_fold_effect_error(
+                sidecar,
+                OmniError::manifest_internal("StreamFoldV14 base HEAD has no transaction"),
+            )
+        })?;
+    let transaction_identity = StagedTransactionIdentity::from(&transaction);
+    let transaction_merged_generations = match &transaction.operation {
+        lance::dataset::transaction::Operation::Update {
+            merged_generations, ..
+        } => Some(merged_generations.as_slice()),
+        _ => None,
+    };
+    let details = dataset
+        .mem_wal_index_details()
+        .await
+        .map_err(|error| stream_fold_effect_error(sidecar, OmniError::Lance(error.to_string())))?
+        .ok_or_else(|| {
+            stream_fold_effect_error(
+                sidecar,
+                OmniError::manifest_internal(
+                    "StreamFoldV14 base no longer contains its MemWAL index",
+                ),
+            )
+        })?;
+    validate_stream_config_v3_binding(&details, &protocol.binding).map_err(|error| {
+        stream_fold_effect_error(
+            sidecar,
+            OmniError::manifest_internal(format!(
+                "StreamFoldV14 config-v3 validation failed: {error}"
+            )),
+        )
+    })?;
+    if details
+        .merged_generations
+        .iter()
+        .any(|progress| progress.shard_id != protocol.generation_cut.shard_id)
+    {
+        return Err(stream_fold_effect_error(
+            sidecar,
+            OmniError::manifest_internal(
+                "StreamFoldV14 MemWAL index has foreign-shard merge progress",
+            ),
+        ));
+    }
+    let mut progress = details
+        .merged_generations
+        .iter()
+        .filter(|progress| progress.shard_id == protocol.generation_cut.shard_id);
+    let observed_merged_generation = progress.next();
+    if progress.next().is_some() {
+        return Err(stream_fold_effect_error(
+            sidecar,
+            OmniError::manifest_internal("StreamFoldV14 MemWAL index has duplicate shard progress"),
+        ));
+    }
+    let state = classify_stream_fold_base_v14_observation(
+        pin,
+        protocol,
+        &head,
+        &transaction_identity,
+        transaction_merged_generations,
+        observed_merged_generation,
+    )
+    .map_err(|reason| OmniError::recovery_required(sidecar.operation_id.clone(), reason))?;
+    let exact_update = if state == StreamFoldParticipantState::ExactEffect {
+        let row_count = u64::try_from(dataset.count_rows(None).await.map_err(|error| {
+            stream_fold_effect_error(sidecar, OmniError::Lance(error.to_string()))
+        })?)
+        .map_err(|_| {
+            stream_fold_effect_error(
+                sidecar,
+                OmniError::manifest_internal("StreamFoldV14 base row count exceeds u64"),
+            )
+        })?;
+        let version_metadata = super::TableVersionMetadata::from_dataset(
+            root_uri,
+            &protocol.binding.table_location,
+            &dataset,
+        )
+        .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+        Some(RecoveryConfirmedTableUpdate {
+            table_version: head.table_version,
+            table_branch: None,
+            row_count,
+            version_metadata,
+        })
+    } else {
+        None
+    };
+    if protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+        && protocol.base.confirmed_update.as_ref() != exact_update.as_ref()
+    {
+        return Err(stream_fold_effect_error(
+            sidecar,
+            OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                "StreamFoldV14 confirmed base update differs from observed Lance output",
+            ),
+        ));
+    }
+    Ok(ObservedStreamFoldBaseV14 {
+        state,
+        head,
+        transaction: transaction_identity,
+        exact_update,
+    })
+}
+
+struct ObservedStreamFoldTokenV14 {
+    state: StreamFoldParticipantState,
+    head: super::CurrentHeadWitness,
+    transaction: StagedTransactionIdentity,
+    authority: super::StreamTokenAuthorityEntry,
+}
+
+fn classify_stream_fold_token_v14_observation(
+    protocol: &RecoveryStreamFoldV14,
+    observed_authority: &super::StreamTokenAuthorityEntry,
+    observed_transaction: &StagedTransactionIdentity,
+) -> std::result::Result<StreamFoldParticipantState, String> {
+    let effect = &protocol.token;
+    if observed_authority == &effect.prior_authority {
+        return Ok(StreamFoldParticipantState::ExactNoEffect);
+    }
+    let expected_version = effect
+        .prior_authority
+        .current_head_witness
+        .table_version
+        .checked_add(1)
+        .ok_or_else(|| "StreamFoldV14 token prior version overflows".to_string())?;
+    if observed_authority.location != effect.prior_authority.location
+        || observed_authority.schema_version != effect.prior_authority.schema_version
+        || observed_authority.schema_hash != effect.prior_authority.schema_hash
+        || observed_authority.current_head_witness.table_version != expected_version
+        || observed_authority.current_head_witness.transaction_uuid
+            != effect.planned_transaction.uuid
+        || observed_transaction != &effect.planned_transaction
+    {
+        return Err(
+            "StreamFoldV14 token HEAD is neither selected N nor the exact pre-minted N+1 effect"
+                .to_string(),
+        );
+    }
+    if protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+        && (effect.confirmed_transaction.as_ref() != Some(&effect.planned_transaction)
+            || effect.confirmed_head.as_ref() != Some(&observed_authority.current_head_witness)
+            || effect.next_authority.as_ref() != Some(observed_authority))
+    {
+        return Err(
+            "StreamFoldV14 durable token confirmation differs from exact observed N+1".to_string(),
+        );
+    }
+    Ok(StreamFoldParticipantState::ExactEffect)
+}
+
+async fn observe_stream_fold_token_v14(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<ObservedStreamFoldTokenV14> {
+    let protocol = stream_fold_protocol_v14(sidecar);
+    let token_uri = super::layout::stream_token_uri(root_uri);
+    let session = crate::lance_access::control_session();
+    let dataset = crate::instrumentation::open_dataset(
+        &token_uri,
+        crate::instrumentation::VersionResolution::Latest,
+        Some(&session),
+        crate::instrumentation::table_wrapper(),
+    )
+    .await
+    .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+    let authority = super::token_store::stream_token_authority_entry_for_dataset(&dataset)
+        .await
+        .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+    let transaction = dataset
+        .read_transaction()
+        .await
+        .map_err(|error| stream_fold_effect_error(sidecar, OmniError::Lance(error.to_string())))?
+        .ok_or_else(|| {
+            stream_fold_effect_error(
+                sidecar,
+                OmniError::manifest_internal("StreamFoldV14 token HEAD has no transaction"),
+            )
+        })?;
+    let transaction = StagedTransactionIdentity::from(&transaction);
+    let state = classify_stream_fold_token_v14_observation(protocol, &authority, &transaction)
+        .map_err(|reason| OmniError::recovery_required(sidecar.operation_id.clone(), reason))?;
+    Ok(ObservedStreamFoldTokenV14 {
+        state,
+        head: authority.current_head_witness.clone(),
+        transaction,
+        authority,
+    })
+}
+
+async fn finish_missing_stream_fold_token_v14(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<ObservedStreamFoldTokenV14> {
+    let protocol = stream_fold_protocol_v14(sidecar);
+    if protocol.effect_phase != RecoveryEffectPhase::Armed {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "confirmed StreamFoldV14 cannot recreate a missing token effect",
+        ));
+    }
+    let session = crate::lance_access::control_session();
+    let dataset = super::token_store::open_stream_token_authority_at(
+        root_uri,
+        &protocol.token.prior_authority,
+        &session,
+    )
+    .await
+    .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+    let mut staged = super::token_store::stage_stream_token_upsert(
+        dataset.clone(),
+        &protocol.token.prior_authority,
+        &protocol.token.planned_rows,
+    )
+    .await
+    .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+    staged
+        .bind_transaction_identity(&protocol.token.planned_transaction)
+        .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+    let table_store = crate::table_store::TableStore::new(root_uri, session);
+    let (achieved, committed) = table_store
+        .commit_staged_exact(std::sync::Arc::new(dataset), staged)
+        .await
+        .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+    let authority = super::token_store::stream_token_authority_entry_for_dataset(&achieved)
+        .await
+        .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+    let state = classify_stream_fold_token_v14_observation(protocol, &authority, &committed)
+        .map_err(|reason| OmniError::recovery_required(sidecar.operation_id.clone(), reason))?;
+    if state != StreamFoldParticipantState::ExactEffect {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "StreamFoldV14 token recovery did not achieve its exact planned N+1 effect",
+        ));
+    }
+    Ok(ObservedStreamFoldTokenV14 {
+        state,
+        head: authority.current_head_witness.clone(),
+        transaction: committed,
+        authority,
+    })
+}
+
+async fn validate_stream_fold_token_rows_against_base(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+    binding: &super::StreamPhysicalBinding,
+    planned_rows: &[super::stream_token::StreamTokenAuthorityRow],
 ) -> Result<()> {
-    let protocol = sidecar
-        .protocol_v12
-        .as_ref()
-        .expect("validated schema-v12 StreamFold protocol");
     let pin = &sidecar.tables[0];
     let uri = format!(
         "{}/{}",
         root_uri.trim_end_matches('/'),
-        protocol.binding.table_location.trim_start_matches('/')
+        binding.table_location.trim_start_matches('/')
     );
     let session = crate::lance_access::control_session();
     let dataset = crate::instrumentation::open_dataset(
@@ -6610,9 +9483,7 @@ async fn validate_stream_fold_token_rows_against_base_v12(
     )
     .await
     .map_err(|error| stream_fold_effect_error(sidecar, error))?;
-    let exact_ids = protocol
-        .token
-        .planned_rows
+    let exact_ids = planned_rows
         .iter()
         .map(|row| row.logical_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
@@ -6648,9 +9519,7 @@ async fn validate_stream_fold_token_rows_against_base_v12(
         .try_into_stream()
         .await
         .map_err(|error| stream_fold_effect_error(sidecar, OmniError::Lance(error.to_string())))?;
-    let planned = protocol
-        .token
-        .planned_rows
+    let planned = planned_rows
         .iter()
         .map(|row| (row.logical_id.as_str(), row))
         .collect::<BTreeMap<_, _>>();
@@ -6770,39 +9639,45 @@ async fn validate_stream_fold_token_rows_against_base_v12(
     Ok(())
 }
 
-fn validate_stream_fold_v12_manifest_prestate(
-    snapshot: &Snapshot,
+async fn validate_stream_fold_token_rows_against_base_v12(
+    root_uri: &str,
     sidecar: &RecoverySidecar,
-) -> Result<super::SubTableEntry> {
+) -> Result<()> {
     let protocol = sidecar
         .protocol_v12
         .as_ref()
         .expect("validated schema-v12 StreamFold protocol");
-    let pin = &sidecar.tables[0];
-    let entry = snapshot_entry_for_pin(snapshot, pin)
-        .map_err(|error| stream_fold_effect_error(sidecar, error))?
-        .cloned()
-        .ok_or_else(|| {
-            OmniError::recovery_required(
-                sidecar.operation_id.clone(),
-                format!(
-                    "StreamFold table identity {} is no longer live in the manifest",
-                    pin.identity
-                ),
-            )
-        })?;
-    if entry.table_path != protocol.binding.table_location
-        || entry.table_branch.is_some()
-        || entry.table_version != pin.expected_version
-        || snapshot.stream_lifecycle(pin.identity) != Some(&protocol.prior_lifecycle)
-        || snapshot.stream_token_authority() != &protocol.token.prior_authority
-    {
-        return Err(OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            "StreamFold manifest base pointer, complete prior lifecycle, or manifest-selected token authority changed after recovery was armed",
-        ));
-    }
-    Ok(entry)
+    validate_stream_fold_token_rows_against_base(
+        root_uri,
+        sidecar,
+        &protocol.binding,
+        &protocol.token.planned_rows,
+    )
+    .await
+}
+
+async fn validate_stream_fold_token_rows_against_base_v14(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    let protocol = stream_fold_protocol_v14(sidecar);
+    validate_stream_fold_token_rows_against_base(
+        root_uri,
+        sidecar,
+        &protocol.binding,
+        &protocol.token.planned_rows,
+    )
+    .await
+}
+
+fn validate_stream_fold_v12_manifest_prestate(
+    _snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<super::SubTableEntry> {
+    Err(OmniError::recovery_required(
+        sidecar.operation_id.clone(),
+        "historical schema-v12 lifecycle-v2 prestate cannot be compared with lifecycle-v3 manifest authority",
+    ))
 }
 
 fn stream_fold_v12_lineage_matches(
@@ -6818,64 +9693,13 @@ fn stream_fold_v12_lineage_matches(
 }
 
 async fn stream_fold_v12_original_visible(
-    root_uri: &str,
+    _root_uri: &str,
     sidecar: &RecoverySidecar,
 ) -> Result<bool> {
-    let protocol = sidecar
-        .protocol_v12
-        .as_ref()
-        .expect("validated schema-v12 StreamFold protocol");
-    if protocol.effect_phase != RecoveryEffectPhase::EffectsConfirmed {
-        return Ok(false);
-    }
-    let pin = &sidecar.tables[0];
-    let base_update = protocol
-        .base
-        .confirmed_update
-        .as_ref()
-        .expect("validated confirmed base update");
-    let next_lifecycle = protocol
-        .next_lifecycle
-        .as_ref()
-        .expect("validated confirmed next lifecycle");
-    let next_token_authority = protocol
-        .token
-        .next_authority
-        .as_ref()
-        .expect("validated confirmed token authority");
-    let (commits, _) = ManifestCoordinator::read_graph_lineage_at(root_uri, None).await?;
-    let Some(commit) = commits
-        .iter()
-        .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id)
-    else {
-        return Ok(false);
-    };
-    if !stream_fold_v12_lineage_matches(commit, protocol) {
-        return Err(OmniError::manifest_internal(format!(
-            "StreamFold sidecar '{}' found fixed commit '{}' with mismatched lineage",
-            sidecar.operation_id, protocol.lineage.graph_commit_id
-        )));
-    }
-    let committed =
-        ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version).await?;
-    let entry_matches = snapshot_entry_by_identity(&committed, pin.identity).is_some_and(|entry| {
-        entry.table_key == pin.table_key
-            && entry.table_path == protocol.binding.table_location
-            && entry.table_version == base_update.table_version
-            && entry.table_branch.is_none()
-            && entry.row_count == base_update.row_count
-            && entry.version_metadata == base_update.version_metadata
-    });
-    if !entry_matches
-        || committed.stream_lifecycle(pin.identity) != Some(next_lifecycle)
-        || committed.stream_token_authority() != next_token_authority
-    {
-        return Err(OmniError::manifest_internal(format!(
-            "StreamFold sidecar '{}' found fixed commit '{}' but its base/lifecycle/token outcome differs",
-            sidecar.operation_id, protocol.lineage.graph_commit_id
-        )));
-    }
-    Ok(true)
+    Err(OmniError::recovery_required(
+        sidecar.operation_id.clone(),
+        "historical schema-v12 lifecycle-v2 outcome cannot be adopted by lifecycle-v3",
+    ))
 }
 
 async fn finalize_visible_stream_fold_v12(
@@ -6937,184 +9761,16 @@ async fn finalize_visible_stream_fold_v12(
 }
 
 async fn process_stream_fold_sidecar_v12(
-    root_uri: &str,
-    storage: &std::sync::Arc<dyn StorageAdapter>,
-    snapshot: &Snapshot,
+    _root_uri: &str,
+    _storage: &std::sync::Arc<dyn StorageAdapter>,
+    _snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
-    cleanup_policy: StreamFoldCleanup,
+    _cleanup_policy: StreamFoldCleanup,
 ) -> Result<bool> {
-    let observed_base = observe_stream_fold_base_v12(root_uri, sidecar).await?;
-    let mut observed_token = observe_stream_fold_token_v12(root_uri, sidecar).await?;
-    let mut matrix =
-        classify_stream_fold_v12_effect_matrix(observed_base.state, observed_token.state);
-
-    if stream_fold_v12_original_visible(root_uri, sidecar)
-        .await
-        .map_err(|error| stream_fold_effect_error(sidecar, error))?
-    {
-        if matrix != StreamFoldV12EffectMatrix::Complete {
-            return Err(OmniError::recovery_required(
-                sidecar.operation_id.clone(),
-                "fixed StreamFold graph commit is visible without both exact physical effects",
-            ));
-        }
-        return finalize_visible_stream_fold_v12(
-            root_uri,
-            storage.as_ref(),
-            sidecar,
-            cleanup_policy,
-        )
-        .await
-        .map_err(|error| stream_fold_effect_error(sidecar, error));
-    }
-
-    let manifest_entry = validate_stream_fold_v12_manifest_prestate(snapshot, sidecar)?;
-    let protocol = sidecar
-        .protocol_v12
-        .as_ref()
-        .expect("validated schema-v12 StreamFold protocol");
-    let live_authority = read_live_recovery_authority(root_uri, storage, None)
-        .await
-        .map_err(|error| stream_fold_effect_error(sidecar, error))?;
-    if live_authority != protocol.authority {
-        return Err(OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            "StreamFold graph/schema authority changed after recovery was armed",
-        ));
-    }
-    if observed_base.state == StreamFoldParticipantState::ExactEffect {
-        validate_stream_fold_token_rows_against_base_v12(root_uri, sidecar).await?;
-    }
-
-    if matrix == StreamFoldV12EffectMatrix::Partial
-        && observed_base.state == StreamFoldParticipantState::ExactEffect
-        && observed_token.state == StreamFoldParticipantState::ExactNoEffect
-    {
-        observed_token = finish_missing_stream_fold_token_v12(root_uri, sidecar).await?;
-        matrix = classify_stream_fold_v12_effect_matrix(observed_base.state, observed_token.state);
-    }
-
-    match matrix {
-        StreamFoldV12EffectMatrix::EffectFree => {
-            if protocol.effect_phase != RecoveryEffectPhase::Armed {
-                return Err(OmniError::recovery_required(
-                    sidecar.operation_id.clone(),
-                    "EffectsConfirmed StreamFold has no corresponding physical effects",
-                ));
-            }
-            delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
-                .await?;
-            return Ok(true);
-        }
-        StreamFoldV12EffectMatrix::Partial => {
-            return Err(OmniError::recovery_required(
-                sidecar.operation_id.clone(),
-                "StreamFold has an unreachable token-only/base-missing prefix; it remains owned and cannot be published or adopted",
-            ));
-        }
-        StreamFoldV12EffectMatrix::Complete => {}
-    }
-
-    let mut confirmed = sidecar.clone();
-    if protocol.effect_phase == RecoveryEffectPhase::Armed {
-        let update = observed_base
-            .exact_update
-            .as_ref()
-            .expect("exact base effect has a reconstructed update");
-        confirm_stream_fold_sidecar_v12(
-            root_uri,
-            storage.as_ref(),
-            &mut confirmed,
-            observed_base.transaction.clone(),
-            protocol.merged_generation.clone(),
-            observed_base.head.clone(),
-            SubTableUpdate {
-                identity: pin_identity(sidecar),
-                table_key: sidecar.tables[0].table_key.clone(),
-                table_version: update.table_version,
-                table_branch: update.table_branch.clone(),
-                row_count: update.row_count,
-                version_metadata: update.version_metadata.clone(),
-            },
-            observed_token.transaction.clone(),
-            observed_token.head.clone(),
-            observed_token.authority.clone(),
-        )
-        .await
-        .map_err(|error| stream_fold_effect_error(sidecar, error))?;
-    }
-    let confirmed_protocol = confirmed
-        .protocol_v12
-        .as_ref()
-        .expect("confirmed schema-v12 StreamFold protocol");
-    let confirmed_update = confirmed_protocol
-        .base
-        .confirmed_update
-        .as_ref()
-        .expect("confirmed StreamFold base update");
-    let next_lifecycle = confirmed_protocol
-        .next_lifecycle
-        .as_ref()
-        .expect("confirmed StreamFold next lifecycle")
-        .clone();
-    let next_token_authority = confirmed_protocol
-        .token
-        .next_authority
-        .as_ref()
-        .expect("confirmed StreamFold token authority")
-        .clone();
-    let updates = vec![
-        ManifestChange::Update(SubTableUpdate {
-            identity: pin_identity(&confirmed),
-            table_key: confirmed.tables[0].table_key.clone(),
-            table_version: confirmed_update.table_version,
-            table_branch: confirmed_update.table_branch.clone(),
-            row_count: confirmed_update.row_count,
-            version_metadata: confirmed_update.version_metadata.clone(),
-        }),
-        ManifestChange::SetStreamTokenAuthority {
-            expected: confirmed_protocol.token.prior_authority.clone(),
-            next: next_token_authority,
-        },
-        ManifestChange::SetStreamLifecycle {
-            expected: Some(confirmed_protocol.prior_lifecycle.clone()),
-            next: next_lifecycle,
-        },
-    ];
-    let expected = HashMap::from([(
-        pin_identity(&confirmed),
-        TableVersionExpectation {
-            table_key: confirmed.tables[0].table_key.clone(),
-            table_version: manifest_entry.table_version,
-        },
-    )]);
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
-    let (_, graph_commit_id) = publish_recovery_commit(
-        root_uri,
-        &confirmed,
-        RecoveryKind::RolledForward,
-        &updates,
-        &expected,
-    )
-    .await
-    .map_err(|error| stream_fold_effect_error(&confirmed, error))?;
-    record_audit(
-        root_uri,
-        &confirmed,
-        graph_commit_id,
-        RecoveryKind::RolledForward,
-        vec![TableOutcome {
-            table_key: confirmed.tables[0].table_key.clone(),
-            from_version: confirmed.tables[0].expected_version,
-            to_version: confirmed_update.table_version,
-        }],
-    )
-    .await
-    .map_err(|error| stream_fold_effect_error(&confirmed, error))?;
-    cleanup_visible_stream_fold_sidecar(root_uri, storage.as_ref(), &confirmed, cleanup_policy)
-        .await
-        .map_err(|error| stream_fold_effect_error(&confirmed, error))?;
-    Ok(true)
+    Err(OmniError::recovery_required(
+        sidecar.operation_id.clone(),
+        "historical schema-v12 StreamFold cannot publish lifecycle-v2 authority into lifecycle-v3",
+    ))
 }
 
 #[allow(dead_code)]
@@ -7156,12 +9812,429 @@ pub(crate) async fn finalize_effect_free_stream_fold_sidecar_v12(
 
 #[allow(dead_code)]
 pub(crate) async fn complete_stream_fold_sidecar_v12(
+    _root_uri: &str,
+    _storage: std::sync::Arc<dyn StorageAdapter>,
+    _snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    Err(OmniError::recovery_required(
+        sidecar.operation_id.clone(),
+        "historical schema-v12 StreamFold cannot be completed under lifecycle-v3",
+    ))
+}
+
+fn stream_fold_v14_manifest_is_prior(snapshot: &Snapshot, sidecar: &RecoverySidecar) -> bool {
+    let protocol = stream_fold_protocol_v14(sidecar);
+    let pin = &sidecar.tables[0];
+    snapshot.version() == protocol.prior_manifest_version
+        && snapshot.stream_profile() == &protocol.profile
+        && snapshot.stream_token_authority() == &protocol.token.prior_authority
+        && snapshot.stream_lifecycle(pin.identity) == Some(&protocol.prior_lifecycle)
+        && snapshot_entry_by_identity(snapshot, pin.identity).is_some_and(|entry| {
+            entry.table_key == pin.table_key
+                && entry.table_path == protocol.binding.table_location
+                && entry.table_version == pin.expected_version
+                && entry.table_branch.is_none()
+        })
+}
+
+async fn validate_stream_fold_current_claim_ledger_v14(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    let protocol = stream_fold_protocol_v14(sidecar);
+    let session = crate::lance_access::control_session();
+    let dataset = super::token_store::open_stream_token_authority_at(
+        root_uri,
+        &protocol.token.prior_authority,
+        &session,
+    )
+    .await
+    .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+    let graph_digest =
+        super::stream::stream_graph_identity_digest(&protocol.authority.schema_identity_domain)
+            .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+    let selected = super::token_store::lookup_claim_receipt(
+        &dataset,
+        &protocol.token.prior_authority,
+        &graph_digest,
+        protocol.prior_lifecycle.identity,
+        &protocol.prior_lifecycle.binding_scope_id,
+        &protocol.current_claim_receipt.claim_id,
+    )
+    .await
+    .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+    if selected.as_ref() != Some(&protocol.current_claim_receipt) {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "StreamFoldV14 selected token version does not contain its exact current ClaimReceipt",
+        ));
+    }
+    Ok(())
+}
+
+async fn stream_fold_v14_original_visible(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let protocol = stream_fold_protocol_v14(sidecar);
+    if protocol.effect_phase != RecoveryEffectPhase::EffectsConfirmed {
+        return Ok(false);
+    }
+    let (commits, _) = ManifestCoordinator::read_graph_lineage_at(root_uri, None).await?;
+    let Some(commit) = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id)
+    else {
+        return Ok(false);
+    };
+    let expected_manifest_version =
+        protocol
+            .prior_manifest_version
+            .checked_add(1)
+            .ok_or_else(|| {
+                OmniError::recovery_required(
+                    sidecar.operation_id.clone(),
+                    "StreamFoldV14 prior manifest version overflows",
+                )
+            })?;
+    if commit.manifest_branch.is_some()
+        || commit.manifest_version != expected_manifest_version
+        || commit.parent_commit_id.as_ref() != protocol.authority.graph_head.as_ref()
+        || commit.merged_parent_commit_id.is_some()
+        || commit.actor_id != protocol.lineage.actor_id
+        || commit.created_at != protocol.lineage.created_at
+        || commit.stream_fold_attribution.as_ref() != Some(&protocol.token.attribution_summary)
+    {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "StreamFoldV14 fixed lineage exists with different parent, actor, timestamp, or attribution",
+        ));
+    }
+    let committed =
+        ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version).await?;
+    let pin = &sidecar.tables[0];
+    let update = protocol
+        .base
+        .confirmed_update
+        .as_ref()
+        .expect("validated confirmed StreamFoldV14 update");
+    let next_lifecycle = protocol
+        .next_lifecycle
+        .as_ref()
+        .expect("validated confirmed StreamFoldV14 lifecycle");
+    let next_token = protocol
+        .token
+        .next_authority
+        .as_ref()
+        .expect("validated confirmed StreamFoldV14 token authority");
+    let exact = snapshot_entry_by_identity(&committed, pin.identity).is_some_and(|entry| {
+        entry.table_key == pin.table_key
+            && entry.table_path == protocol.binding.table_location
+            && entry.table_version == update.table_version
+            && entry.table_branch.is_none()
+            && entry.row_count == update.row_count
+            && entry.version_metadata == update.version_metadata
+    }) && committed.stream_lifecycle(pin.identity) == Some(next_lifecycle)
+        && committed.stream_token_authority() == next_token
+        && committed.stream_profile() == &protocol.profile;
+    if !exact {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "StreamFoldV14 fixed lineage is visible with a different table/token/lifecycle/profile outcome",
+        ));
+    }
+    Ok(true)
+}
+
+async fn finalize_visible_stream_fold_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    cleanup_policy: StreamFoldCleanup,
+) -> Result<bool> {
+    let protocol = stream_fold_protocol_v14(sidecar);
+    let pin = &sidecar.tables[0];
+    let update = protocol
+        .base
+        .confirmed_update
+        .as_ref()
+        .expect("validated confirmed StreamFoldV14 update");
+    let outcomes = vec![TableOutcome {
+        table_key: pin.table_key.clone(),
+        from_version: pin.expected_version,
+        to_version: update.table_version,
+    }];
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    let records = audit.list().await?;
+    let expected_writer_kind = format!("{:?}", sidecar.writer_kind);
+    let operation_records = records
+        .iter()
+        .filter(|record| record.operation_id == sidecar.operation_id)
+        .collect::<Vec<_>>();
+    if operation_records.iter().any(|record| {
+        record.graph_commit_id != protocol.lineage.graph_commit_id
+            || record.recovery_kind != RecoveryKind::RolledForward
+            || record.recovery_for_actor != sidecar.actor_id
+            || record.sidecar_writer_kind != expected_writer_kind
+            || record.per_table_outcomes != outcomes
+    }) {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "StreamFoldV14 recovery audit differs from its fixed outcome",
+        ));
+    }
+    if operation_records.is_empty() {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id: protocol.lineage.graph_commit_id.clone(),
+                recovery_kind: RecoveryKind::RolledForward,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: expected_writer_kind,
+                per_table_outcomes: outcomes,
+                created_at: crate::db::now_micros()?,
+            })
+            .await?;
+    }
+    cleanup_visible_stream_fold_sidecar(root_uri, storage, sidecar, cleanup_policy).await?;
+    Ok(true)
+}
+
+async fn process_stream_fold_sidecar_v14(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+    cleanup_policy: StreamFoldCleanup,
+) -> Result<bool> {
+    validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
+    let mut base = observe_stream_fold_base_v14(root_uri, sidecar).await?;
+    let mut token = observe_stream_fold_token_v14(root_uri, sidecar).await?;
+
+    if stream_fold_v14_original_visible(root_uri, sidecar).await? {
+        if classify_stream_fold_v14_effect_matrix(base.state, token.state)
+            != StreamFoldV14EffectMatrix::Complete
+        {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                "visible StreamFoldV14 lineage lacks both exact physical effects",
+            ));
+        }
+        validate_stream_fold_token_rows_against_base_v14(root_uri, sidecar).await?;
+        return finalize_visible_stream_fold_v14(
+            root_uri,
+            storage.as_ref(),
+            sidecar,
+            cleanup_policy,
+        )
+        .await;
+    }
+
+    if !stream_fold_v14_manifest_is_prior(snapshot, sidecar) {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "StreamFoldV14 manifest table/token/profile/lifecycle prestate changed after arm",
+        ));
+    }
+    let protocol = stream_fold_protocol_v14(sidecar);
+    let live_authority = read_live_recovery_authority(root_uri, storage, None)
+        .await
+        .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+    if live_authority != protocol.authority {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "StreamFoldV14 graph/schema authority changed after arm",
+        ));
+    }
+    validate_stream_fold_current_claim_ledger_v14(root_uri, sidecar).await?;
+
+    match classify_stream_fold_v14_effect_matrix(base.state, token.state) {
+        StreamFoldV14EffectMatrix::EffectFree => {
+            if protocol.effect_phase != RecoveryEffectPhase::Armed {
+                return Err(OmniError::recovery_required(
+                    sidecar.operation_id.clone(),
+                    "confirmed StreamFoldV14 has no physical participant effects",
+                ));
+            }
+            delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
+                .await?;
+            return Ok(true);
+        }
+        StreamFoldV14EffectMatrix::TokenOnly => {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                "StreamFoldV14 token-only outcome is impossible in commit order and cannot reconstruct base data",
+            ));
+        }
+        StreamFoldV14EffectMatrix::BaseOnly => {
+            token = finish_missing_stream_fold_token_v14(root_uri, sidecar).await?;
+        }
+        StreamFoldV14EffectMatrix::Complete => {}
+    }
+    if base.state != StreamFoldParticipantState::ExactEffect
+        || token.state != StreamFoldParticipantState::ExactEffect
+    {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "StreamFoldV14 did not converge to both exact effects",
+        ));
+    }
+    validate_stream_fold_token_rows_against_base_v14(root_uri, sidecar).await?;
+
+    let mut confirmed = sidecar.clone();
+    if protocol.effect_phase == RecoveryEffectPhase::Armed {
+        let exact_update = base
+            .exact_update
+            .clone()
+            .expect("exact StreamFoldV14 base has reconstructed update");
+        confirm_stream_fold_sidecar_v14(
+            root_uri,
+            storage.as_ref(),
+            &mut confirmed,
+            base.transaction.clone(),
+            protocol.merged_generation.clone(),
+            base.head.clone(),
+            SubTableUpdate {
+                identity: sidecar.tables[0].identity,
+                table_key: sidecar.tables[0].table_key.clone(),
+                table_version: exact_update.table_version,
+                table_branch: exact_update.table_branch,
+                row_count: exact_update.row_count,
+                version_metadata: exact_update.version_metadata,
+            },
+            token.transaction.clone(),
+            token.head.clone(),
+            token.authority.clone(),
+        )
+        .await
+        .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+        // Re-read after the confirmation rewrite so all following references
+        // are to the byte-identical durable envelope.
+        base = observe_stream_fold_base_v14(root_uri, &confirmed).await?;
+    }
+    let confirmed_protocol = stream_fold_protocol_v14(&confirmed);
+    let update = confirmed_protocol
+        .base
+        .confirmed_update
+        .as_ref()
+        .expect("confirmed StreamFoldV14 base update");
+    let next_lifecycle = confirmed_protocol
+        .next_lifecycle
+        .as_ref()
+        .expect("confirmed StreamFoldV14 lifecycle")
+        .clone();
+    let next_token = confirmed_protocol
+        .token
+        .next_authority
+        .as_ref()
+        .expect("confirmed StreamFoldV14 token authority")
+        .clone();
+    let changes = vec![
+        ManifestChange::Update(SubTableUpdate {
+            identity: confirmed.tables[0].identity,
+            table_key: confirmed.tables[0].table_key.clone(),
+            table_version: update.table_version,
+            table_branch: update.table_branch.clone(),
+            row_count: update.row_count,
+            version_metadata: update.version_metadata.clone(),
+        }),
+        ManifestChange::SetStreamTokenAuthority {
+            expected: confirmed_protocol.token.prior_authority.clone(),
+            next: next_token,
+        },
+        ManifestChange::SetStreamLifecycle {
+            expected: Some(confirmed_protocol.prior_lifecycle.clone()),
+            next: next_lifecycle,
+        },
+        ManifestChange::SetStreamProfile {
+            expected: confirmed_protocol.profile.clone(),
+            next: confirmed_protocol.profile.clone(),
+        },
+    ];
+    let expected = HashMap::from([(
+        confirmed.tables[0].identity,
+        TableVersionExpectation {
+            table_key: confirmed.tables[0].table_key.clone(),
+            table_version: confirmed.tables[0].expected_version,
+        },
+    )]);
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    let (manifest_version, graph_commit_id) = publish_recovery_commit(
+        root_uri,
+        &confirmed,
+        RecoveryKind::RolledForward,
+        &changes,
+        &expected,
+    )
+    .await
+    .map_err(|error| stream_fold_effect_error(&confirmed, error))?;
+    if manifest_version
+        != confirmed_protocol
+            .prior_manifest_version
+            .checked_add(1)
+            .ok_or_else(|| {
+                OmniError::recovery_required(
+                    confirmed.operation_id.clone(),
+                    "StreamFoldV14 prior manifest version overflows",
+                )
+            })?
+        || graph_commit_id != confirmed_protocol.lineage.graph_commit_id
+    {
+        return Err(OmniError::recovery_required(
+            confirmed.operation_id.clone(),
+            "StreamFoldV14 publish returned a different exact manifest version or lineage ID",
+        ));
+    }
+    // `base` is deliberately retained through the publish so an accidental
+    // future refactor cannot classify before confirmation and then drop the
+    // exact-effect evidence prior to CAS.
+    debug_assert_eq!(base.state, StreamFoldParticipantState::ExactEffect);
+    finalize_visible_stream_fold_v14(root_uri, storage.as_ref(), &confirmed, cleanup_policy).await
+}
+
+pub(crate) async fn finalize_effect_free_stream_fold_sidecar_v14(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
+    if stream_fold_protocol_v14(sidecar).effect_phase != RecoveryEffectPhase::Armed
+        || !stream_fold_v14_manifest_is_prior(snapshot, sidecar)
+    {
+        return Ok(false);
+    }
+    let protocol = stream_fold_protocol_v14(sidecar);
+    let live_authority = read_live_recovery_authority(root_uri, storage, None)
+        .await
+        .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+    if live_authority != protocol.authority {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "StreamFoldV14 graph/schema authority changed before effect-free retirement",
+        ));
+    }
+    validate_stream_fold_current_claim_ledger_v14(root_uri, sidecar).await?;
+    let base = observe_stream_fold_base_v14(root_uri, sidecar).await?;
+    let token = observe_stream_fold_token_v14(root_uri, sidecar).await?;
+    if classify_stream_fold_v14_effect_matrix(base.state, token.state)
+        != StreamFoldV14EffectMatrix::EffectFree
+    {
+        return Ok(false);
+    }
+    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+pub(crate) async fn complete_stream_fold_sidecar_v14(
     root_uri: &str,
     storage: std::sync::Arc<dyn StorageAdapter>,
     snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
 ) -> Result<()> {
-    process_stream_fold_sidecar_v12(
+    process_stream_fold_sidecar_v14(
         root_uri,
         &storage,
         snapshot,
@@ -7509,6 +10582,1085 @@ pub(crate) async fn complete_stream_profile_change_sidecar_v13(
         .map(|_| ())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamLifecycleReceiptEffectState {
+    ExactNoEffect,
+    ExactEffect,
+}
+
+struct ObservedStreamLifecycleReceiptEffect {
+    state: StreamLifecycleReceiptEffectState,
+    transaction: Option<StagedTransactionIdentity>,
+    authority: super::StreamTokenAuthorityEntry,
+}
+
+fn stream_lifecycle_receipt_protocol(
+    sidecar: &RecoverySidecar,
+) -> &RecoveryStreamLifecycleReceiptV14 {
+    let RecoveryProtocolV14::StreamLifecycleReceipt(protocol) = sidecar
+        .protocol_v14
+        .as_deref()
+        .expect("validated schema-v14 StreamLifecycleReceipt")
+    else {
+        unreachable!("validated lifecycle-receipt writer kind");
+    };
+    protocol
+}
+
+fn stream_lifecycle_receipt_error(
+    sidecar: &RecoverySidecar,
+    reason: impl std::fmt::Display,
+) -> OmniError {
+    OmniError::recovery_required(
+        sidecar.operation_id.clone(),
+        format!("StreamLifecycleReceipt recovery cannot prove an exact outcome: {reason}"),
+    )
+}
+
+async fn validate_stream_lifecycle_receipt_current_claim_ledger_v14(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    let protocol = stream_lifecycle_receipt_protocol(sidecar);
+    let Some(current_claim_receipt) = protocol.current_claim_receipt.as_ref() else {
+        debug_assert_eq!(
+            protocol.change_kind,
+            RecoveryStreamLifecycleReceiptKind::DisableDrainAdoption
+        );
+        return Ok(());
+    };
+    let session = crate::lance_access::control_session();
+    let dataset = super::token_store::open_stream_token_authority_at(
+        root_uri,
+        &protocol.receipt.prior_authority,
+        &session,
+    )
+    .await
+    .map_err(|error| stream_lifecycle_receipt_error(sidecar, error))?;
+    let graph_digest =
+        super::stream::stream_graph_identity_digest(&protocol.authority.schema_identity_domain)
+            .map_err(|error| stream_lifecycle_receipt_error(sidecar, error))?;
+    let selected = super::token_store::lookup_claim_receipt(
+        &dataset,
+        &protocol.receipt.prior_authority,
+        &graph_digest,
+        protocol.prior_lifecycle.identity,
+        &protocol.prior_lifecycle.binding_scope_id,
+        &current_claim_receipt.claim_id,
+    )
+    .await
+    .map_err(|error| stream_lifecycle_receipt_error(sidecar, error))?;
+    let Some(selected) = selected else {
+        return Err(stream_lifecycle_receipt_error(
+            sidecar,
+            "selected prior token authority does not contain the exact current ClaimReceipt",
+        ));
+    };
+    let selected_bytes = serde_json::to_vec(&selected)
+        .map_err(|error| stream_lifecycle_receipt_error(sidecar, error))?;
+    let carried_bytes = serde_json::to_vec(current_claim_receipt)
+        .map_err(|error| stream_lifecycle_receipt_error(sidecar, error))?;
+    if selected_bytes != carried_bytes {
+        return Err(stream_lifecycle_receipt_error(
+            sidecar,
+            "selected prior token authority ClaimReceipt is not byte-identical to the carried current receipt",
+        ));
+    }
+    Ok(())
+}
+
+async fn observe_stream_lifecycle_receipt_effect_v14(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<ObservedStreamLifecycleReceiptEffect> {
+    let protocol = stream_lifecycle_receipt_protocol(sidecar);
+    let session = crate::lance_access::control_session();
+    let dataset = crate::instrumentation::open_dataset(
+        &super::layout::stream_token_uri(root_uri),
+        crate::instrumentation::VersionResolution::Latest,
+        Some(&session),
+        crate::instrumentation::table_wrapper(),
+    )
+    .await
+    .map_err(|error| stream_lifecycle_receipt_error(sidecar, error))?;
+    let authority = super::token_store::stream_token_authority_entry_for_dataset(&dataset)
+        .await
+        .map_err(|error| stream_lifecycle_receipt_error(sidecar, error))?;
+    if authority == protocol.receipt.prior_authority {
+        return Ok(ObservedStreamLifecycleReceiptEffect {
+            state: StreamLifecycleReceiptEffectState::ExactNoEffect,
+            transaction: None,
+            authority,
+        });
+    }
+    let transaction = dataset
+        .read_transaction()
+        .await
+        .map_err(|error| stream_lifecycle_receipt_error(sidecar, error))?
+        .ok_or_else(|| {
+            stream_lifecycle_receipt_error(sidecar, "stream-token HEAD has no transaction")
+        })?;
+    let transaction = StagedTransactionIdentity::from(&transaction);
+    let planned = &protocol.receipt.planned_transaction;
+    let expected_version = planned
+        .read_version
+        .checked_add(1)
+        .ok_or_else(|| stream_lifecycle_receipt_error(sidecar, "stream-token version overflow"))?;
+    if authority.location != protocol.receipt.prior_authority.location
+        || authority.schema_version != protocol.receipt.prior_authority.schema_version
+        || authority.schema_hash != protocol.receipt.prior_authority.schema_hash
+        || authority.current_head_witness.table_version != expected_version
+        || authority.current_head_witness.transaction_uuid != planned.uuid
+        || transaction != *planned
+    {
+        return Err(stream_lifecycle_receipt_error(
+            sidecar,
+            "raw stream-token HEAD is neither the selected prior witness nor the exact planned N+1 lifecycle-ledger transaction",
+        ));
+    }
+    let receipt = &protocol.receipt.planned_receipt;
+    let observed_receipt = super::token_store::lookup_management_receipt(
+        &dataset,
+        &authority,
+        &receipt.graph_identity_digest,
+        receipt.identity,
+        &receipt.stream_incarnation_id,
+        &receipt.operation_kind,
+        &receipt.operation_id,
+    )
+    .await
+    .map_err(|error| stream_lifecycle_receipt_error(sidecar, error))?;
+    if observed_receipt.as_ref() != Some(receipt) {
+        return Err(stream_lifecycle_receipt_error(
+            sidecar,
+            "exact lifecycle-ledger transaction does not contain the planned immutable management receipt",
+        ));
+    }
+    Ok(ObservedStreamLifecycleReceiptEffect {
+        state: StreamLifecycleReceiptEffectState::ExactEffect,
+        transaction: Some(transaction),
+        authority,
+    })
+}
+
+fn stream_lifecycle_receipt_manifest_is_prior_v14(
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> bool {
+    let protocol = stream_lifecycle_receipt_protocol(sidecar);
+    snapshot.version() == protocol.prior_manifest_version
+        && snapshot.stream_profile() == &protocol.profile
+        && snapshot.stream_token_authority() == &protocol.receipt.prior_authority
+        && snapshot.stream_lifecycle(protocol.admission_scope.identity)
+            == Some(&protocol.prior_lifecycle)
+}
+
+fn stream_lifecycle_receipt_manifest_is_next_v14(
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> bool {
+    let protocol = stream_lifecycle_receipt_protocol(sidecar);
+    let Some(next_authority) = protocol.receipt.next_authority.as_ref() else {
+        return false;
+    };
+    snapshot.version() > protocol.prior_manifest_version
+        && snapshot.stream_profile() == &protocol.profile
+        && snapshot.stream_token_authority() == next_authority
+        && snapshot.stream_lifecycle(protocol.admission_scope.identity)
+            == Some(&protocol.next_lifecycle)
+}
+
+fn stream_lifecycle_receipt_audit_reference(sidecar: &RecoverySidecar) -> String {
+    stream_lifecycle_receipt_protocol(sidecar)
+        .authority
+        .graph_head
+        .clone()
+        .unwrap_or_else(|| format!("stream-lifecycle:{}", sidecar.operation_id))
+}
+
+async fn finalize_visible_stream_lifecycle_receipt_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let expected_reference = stream_lifecycle_receipt_audit_reference(sidecar);
+    let expected_outcomes = Vec::new();
+    let expected_writer_kind = format!("{:?}", sidecar.writer_kind);
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    let records = audit.list().await?;
+    let operation_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.operation_id == sidecar.operation_id)
+        .collect();
+    if operation_records.iter().any(|record| {
+        record.graph_commit_id != expected_reference
+            || record.recovery_kind != RecoveryKind::RolledForward
+            || record.recovery_for_actor != sidecar.actor_id
+            || record.sidecar_writer_kind != expected_writer_kind
+            || record.per_table_outcomes != expected_outcomes
+    }) {
+        return Err(stream_lifecycle_receipt_error(
+            sidecar,
+            "recovery audit row differs from the exact lineage-neutral lifecycle outcome",
+        ));
+    }
+    if operation_records.is_empty() {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id: expected_reference,
+                recovery_kind: RecoveryKind::RolledForward,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: expected_writer_kind,
+                per_table_outcomes: expected_outcomes,
+                created_at: crate::db::now_micros()?,
+            })
+            .await?;
+    }
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+async fn publish_stream_lifecycle_receipt_v14(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<u64> {
+    let protocol = stream_lifecycle_receipt_protocol(sidecar);
+    let next_authority = protocol
+        .receipt
+        .next_authority
+        .as_ref()
+        .expect("validated confirmed lifecycle receipt authority")
+        .clone();
+    let changes = vec![
+        ManifestChange::SetStreamTokenAuthority {
+            expected: protocol.receipt.prior_authority.clone(),
+            next: next_authority,
+        },
+        ManifestChange::SetStreamLifecycle {
+            expected: Some(protocol.prior_lifecycle.clone()),
+            next: protocol.next_lifecycle.clone(),
+        },
+        // A no-op profile change is an exact read assertion in the publisher's
+        // retrying manifest CAS. It prevents a lifecycle receipt prepared under
+        // another profile/disable plan from being selected.
+        ManifestChange::SetStreamProfile {
+            expected: protocol.profile.clone(),
+            next: protocol.profile.clone(),
+        },
+    ];
+    let publisher = GraphNamespacePublisher::new_with_session(
+        root_uri,
+        None,
+        crate::lance_access::control_session(),
+    );
+    let precondition = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
+        None,
+        protocol.authority.branch_identifier.clone(),
+        protocol.authority.graph_head.clone(),
+    ));
+    let outcome = publisher
+        .publish_with_precondition(&changes, &HashMap::new(), None, &precondition)
+        .await
+        .map_err(|error| stream_lifecycle_receipt_error(sidecar, error))?;
+    Ok(outcome.dataset.version().version)
+}
+
+async fn process_stream_lifecycle_receipt_sidecar_v14(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
+    let live_authority = read_live_recovery_authority(root_uri, storage, None)
+        .await
+        .map_err(|error| stream_lifecycle_receipt_error(sidecar, error))?;
+    if live_authority != stream_lifecycle_receipt_protocol(sidecar).authority {
+        return Err(stream_lifecycle_receipt_error(
+            sidecar,
+            "graph/schema authority changed after recovery was armed",
+        ));
+    }
+    validate_stream_lifecycle_receipt_current_claim_ledger_v14(root_uri, sidecar).await?;
+    let observed = observe_stream_lifecycle_receipt_effect_v14(root_uri, sidecar).await?;
+    if stream_lifecycle_receipt_manifest_is_next_v14(snapshot, sidecar) {
+        let protocol = stream_lifecycle_receipt_protocol(sidecar);
+        if protocol.effect_phase != RecoveryEffectPhase::EffectsConfirmed
+            || observed.state != StreamLifecycleReceiptEffectState::ExactEffect
+            || observed.transaction.as_ref() != protocol.receipt.confirmed_transaction.as_ref()
+            || Some(&observed.authority) != protocol.receipt.next_authority.as_ref()
+        {
+            return Err(stream_lifecycle_receipt_error(
+                sidecar,
+                "visible lifecycle outcome is not backed by the exact confirmed ledger effect",
+            ));
+        }
+        return finalize_visible_stream_lifecycle_receipt_v14(root_uri, storage.as_ref(), sidecar)
+            .await;
+    }
+    if !stream_lifecycle_receipt_manifest_is_prior_v14(snapshot, sidecar) {
+        return Err(stream_lifecycle_receipt_error(
+            sidecar,
+            "manifest version, profile, lifecycle, or selected token authority differs from both exact outcomes",
+        ));
+    }
+    if observed.state == StreamLifecycleReceiptEffectState::ExactNoEffect {
+        if stream_lifecycle_receipt_protocol(sidecar).effect_phase != RecoveryEffectPhase::Armed {
+            return Err(stream_lifecycle_receipt_error(
+                sidecar,
+                "EffectsConfirmed sidecar has no lifecycle-ledger effect",
+            ));
+        }
+        delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+        return Ok(true);
+    }
+
+    let mut confirmed = sidecar.clone();
+    if stream_lifecycle_receipt_protocol(sidecar).effect_phase == RecoveryEffectPhase::Armed {
+        confirm_stream_lifecycle_receipt_sidecar_v14(
+            root_uri,
+            storage.as_ref(),
+            &mut confirmed,
+            observed
+                .transaction
+                .clone()
+                .expect("exact lifecycle receipt has a transaction"),
+            observed.authority.current_head_witness.clone(),
+            observed.authority,
+        )
+        .await
+        .map_err(|error| stream_lifecycle_receipt_error(sidecar, error))?;
+    }
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    publish_stream_lifecycle_receipt_v14(root_uri, &confirmed).await?;
+    let fresh = fresh_snapshot_for_sidecar(root_uri, storage, &confirmed).await?;
+    if !stream_lifecycle_receipt_manifest_is_next_v14(&fresh, &confirmed) {
+        return Err(stream_lifecycle_receipt_error(
+            &confirmed,
+            "terminal manifest CAS did not select the exact token pointer and lifecycle",
+        ));
+    }
+    finalize_visible_stream_lifecycle_receipt_v14(root_uri, storage.as_ref(), &confirmed).await
+}
+
+pub(crate) async fn complete_stream_lifecycle_receipt_sidecar_v14(
+    root_uri: &str,
+    storage: std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    process_stream_lifecycle_receipt_sidecar_v14(root_uri, &storage, snapshot, sidecar)
+        .await
+        .map(|_| ())
+}
+
+/// Deterministic result of explicitly settling one recovery-v14 claim.
+///
+/// Generic recovery maps `AttemptPending` and `CheckpointVisible` to `false`
+/// so ordinary writers remain blocked. Full open may still succeed: the
+/// bounded sidecar is durable and a same-operation continuation can resume it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecoveryStreamClaimOutcomeV14 {
+    EffectFree,
+    AttemptPending {
+        prior_attempt_chain: super::stream_profile::ReceiptChainRef,
+        token_authority: super::StreamTokenAuthorityEntry,
+    },
+    CheckpointVisible {
+        prior_attempt_chain: super::stream_profile::ReceiptChainRef,
+        token_authority: super::StreamTokenAuthorityEntry,
+    },
+    TerminalVisible {
+        lifecycle: super::StreamLifecycleEntry,
+        token_authority: super::StreamTokenAuthorityEntry,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamClaimLedgerObservationState {
+    ExactNoEffect,
+    ExactEffect,
+}
+
+struct ObservedStreamClaimLedgerV14 {
+    state: StreamClaimLedgerObservationState,
+    transaction: Option<StagedTransactionIdentity>,
+    authority: super::StreamTokenAuthorityEntry,
+}
+
+fn stream_claim_protocol_v14(sidecar: &RecoverySidecar) -> &RecoveryStreamClaimV14 {
+    let RecoveryProtocolV14::StreamClaim(protocol) = sidecar
+        .protocol_v14
+        .as_deref()
+        .expect("validated schema-v14 StreamClaim")
+    else {
+        unreachable!("validated StreamClaim writer kind");
+    };
+    protocol
+}
+
+fn stream_claim_protocol_v14_mut(sidecar: &mut RecoverySidecar) -> &mut RecoveryStreamClaimV14 {
+    let RecoveryProtocolV14::StreamClaim(protocol) = sidecar
+        .protocol_v14
+        .as_deref_mut()
+        .expect("validated schema-v14 StreamClaim")
+    else {
+        unreachable!("validated StreamClaim writer kind");
+    };
+    protocol
+}
+
+fn stream_claim_error_v14(sidecar: &RecoverySidecar, reason: impl std::fmt::Display) -> OmniError {
+    OmniError::recovery_required(
+        sidecar.operation_id.clone(),
+        format!("StreamClaim recovery cannot prove an exact outcome: {reason}"),
+    )
+}
+
+async fn rewrite_stream_claim_sidecar_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    validate_sidecar_shape(&uri, sidecar)?;
+    let json = serde_json::to_string_pretty(sidecar).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize recovery-v14 StreamClaim sidecar: {error}"
+        ))
+    })?;
+    storage.write_text(&uri, &json).await
+}
+
+fn stream_claim_ledger_records_v14(
+    protocol: &RecoveryStreamClaimV14,
+) -> Vec<super::token_store::LifecycleLedgerRecord> {
+    let mut records = vec![
+        super::token_store::LifecycleLedgerRecord::ClaimAttemptEffect(
+            protocol
+                .classified_attempt
+                .clone()
+                .expect("validated ledger-owned claim attempt"),
+        ),
+    ];
+    if let Some(terminal) = &protocol.terminal {
+        records.push(super::token_store::LifecycleLedgerRecord::ClaimReceipt(
+            terminal.receipt.clone(),
+        ));
+    }
+    records
+}
+
+async fn observe_stream_claim_ledger_v14(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<ObservedStreamClaimLedgerV14> {
+    let protocol = stream_claim_protocol_v14(sidecar);
+    let ledger = protocol
+        .ledger
+        .as_ref()
+        .expect("validated ledger-owned StreamClaim");
+    let session = crate::lance_access::control_session();
+    let dataset = crate::instrumentation::open_dataset(
+        &super::layout::stream_token_uri(root_uri),
+        crate::instrumentation::VersionResolution::Latest,
+        Some(&session),
+        crate::instrumentation::table_wrapper(),
+    )
+    .await
+    .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    let authority = super::token_store::stream_token_authority_entry_for_dataset(&dataset)
+        .await
+        .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    if authority == protocol.prior_token_authority {
+        return Ok(ObservedStreamClaimLedgerV14 {
+            state: StreamClaimLedgerObservationState::ExactNoEffect,
+            transaction: None,
+            authority,
+        });
+    }
+    let transaction = dataset
+        .read_transaction()
+        .await
+        .map_err(|error| stream_claim_error_v14(sidecar, error))?
+        .ok_or_else(|| stream_claim_error_v14(sidecar, "stream-token HEAD has no transaction"))?;
+    let transaction = StagedTransactionIdentity::from(&transaction);
+    let expected_version = ledger
+        .planned_transaction
+        .read_version
+        .checked_add(1)
+        .ok_or_else(|| stream_claim_error_v14(sidecar, "stream-token version overflow"))?;
+    if authority.location != protocol.prior_token_authority.location
+        || authority.schema_version != protocol.prior_token_authority.schema_version
+        || authority.schema_hash != protocol.prior_token_authority.schema_hash
+        || authority.current_head_witness.table_version != expected_version
+        || authority.current_head_witness.transaction_uuid != ledger.planned_transaction.uuid
+        || transaction != ledger.planned_transaction
+    {
+        return Err(stream_claim_error_v14(
+            sidecar,
+            "raw stream-token HEAD is neither the selected prior witness nor the exact planned N+1 claim-ledger transaction",
+        ));
+    }
+    let effect = protocol
+        .classified_attempt
+        .as_ref()
+        .expect("validated ledger-owned claim attempt");
+    let observed_effect = super::token_store::lookup_claim_attempt_effect(
+        &dataset,
+        &authority,
+        &effect.graph_identity_digest,
+        effect.identity,
+        &effect.binding_scope_id,
+        &effect.claim_id,
+        effect.ordinal,
+    )
+    .await
+    .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    if observed_effect.as_ref() != Some(effect) {
+        return Err(stream_claim_error_v14(
+            sidecar,
+            "exact claim-ledger transaction does not contain the planned immutable attempt effect",
+        ));
+    }
+    let observed_receipt = super::token_store::lookup_claim_receipt(
+        &dataset,
+        &authority,
+        &protocol.operation.graph_identity_digest,
+        protocol.admission_scope.identity,
+        &protocol.admission_scope.binding_scope_id,
+        &protocol.operation.claim_id,
+    )
+    .await
+    .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    match (protocol.terminal.as_ref(), observed_receipt.as_ref()) {
+        (Some(terminal), Some(observed)) if observed == &terminal.receipt => {}
+        (None, None) => {}
+        _ => {
+            return Err(stream_claim_error_v14(
+                sidecar,
+                "exact claim-ledger transaction has a missing, foreign, or unexpected terminal receipt",
+            ));
+        }
+    }
+    Ok(ObservedStreamClaimLedgerV14 {
+        state: StreamClaimLedgerObservationState::ExactEffect,
+        transaction: Some(transaction),
+        authority,
+    })
+}
+
+fn stream_claim_manifest_is_prior_v14(snapshot: &Snapshot, sidecar: &RecoverySidecar) -> bool {
+    let protocol = stream_claim_protocol_v14(sidecar);
+    snapshot.version() == protocol.prior_manifest_version
+        && snapshot.stream_profile() == &protocol.stream_profile
+        && snapshot.stream_token_authority() == &protocol.prior_token_authority
+        && snapshot.stream_lifecycle(protocol.admission_scope.identity)
+            == Some(&protocol.prior_lifecycle)
+}
+
+fn stream_claim_manifest_is_checkpoint_v14(snapshot: &Snapshot, sidecar: &RecoverySidecar) -> bool {
+    let protocol = stream_claim_protocol_v14(sidecar);
+    let Some(next_authority) = protocol
+        .ledger
+        .as_ref()
+        .and_then(|ledger| ledger.next_authority.as_ref())
+    else {
+        return false;
+    };
+    protocol.terminal.is_none()
+        && snapshot.version() > protocol.prior_manifest_version
+        && snapshot.stream_profile() == &protocol.stream_profile
+        && snapshot.stream_token_authority() == next_authority
+        && snapshot.stream_lifecycle(protocol.admission_scope.identity)
+            == Some(&protocol.prior_lifecycle)
+}
+
+fn stream_claim_manifest_is_terminal_v14(snapshot: &Snapshot, sidecar: &RecoverySidecar) -> bool {
+    let protocol = stream_claim_protocol_v14(sidecar);
+    let (Some(ledger), Some(terminal)) = (protocol.ledger.as_ref(), protocol.terminal.as_ref())
+    else {
+        return false;
+    };
+    let Some(next_authority) = ledger.next_authority.as_ref() else {
+        return false;
+    };
+    snapshot.version() > protocol.prior_manifest_version
+        && snapshot.stream_profile() == &protocol.stream_profile
+        && snapshot.stream_token_authority() == next_authority
+        && snapshot.stream_lifecycle(protocol.admission_scope.identity)
+            == Some(&terminal.next_lifecycle)
+}
+
+async fn publish_stream_claim_checkpoint_v14(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<u64> {
+    let protocol = stream_claim_protocol_v14(sidecar);
+    let next_authority = protocol
+        .ledger
+        .as_ref()
+        .and_then(|ledger| ledger.next_authority.as_ref())
+        .expect("validated confirmed StreamClaim ledger")
+        .clone();
+    let changes = vec![
+        ManifestChange::SetStreamTokenAuthority {
+            expected: protocol.prior_token_authority.clone(),
+            next: next_authority,
+        },
+        // Byte-identical lifecycle/profile writes are exact CAS assertions.
+        // The logical checkpoint changes only the selected token pointer.
+        ManifestChange::SetStreamLifecycle {
+            expected: Some(protocol.prior_lifecycle.clone()),
+            next: protocol.prior_lifecycle.clone(),
+        },
+        ManifestChange::SetStreamProfile {
+            expected: protocol.stream_profile.clone(),
+            next: protocol.stream_profile.clone(),
+        },
+    ];
+    let publisher = GraphNamespacePublisher::new_with_session(
+        root_uri,
+        None,
+        crate::lance_access::control_session(),
+    );
+    let precondition = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
+        None,
+        protocol.authority.branch_identifier.clone(),
+        protocol.authority.graph_head.clone(),
+    ));
+    let outcome = publisher
+        .publish_with_precondition(&changes, &HashMap::new(), None, &precondition)
+        .await
+        .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    Ok(outcome.dataset.version().version)
+}
+
+async fn publish_stream_claim_terminal_v14(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<u64> {
+    let protocol = stream_claim_protocol_v14(sidecar);
+    let ledger = protocol
+        .ledger
+        .as_ref()
+        .expect("validated terminal StreamClaim ledger");
+    let terminal = protocol
+        .terminal
+        .as_ref()
+        .expect("validated terminal StreamClaim");
+    let changes = vec![
+        ManifestChange::SetStreamTokenAuthority {
+            expected: protocol.prior_token_authority.clone(),
+            next: ledger
+                .next_authority
+                .as_ref()
+                .expect("validated confirmed StreamClaim authority")
+                .clone(),
+        },
+        ManifestChange::SetStreamLifecycle {
+            expected: Some(protocol.prior_lifecycle.clone()),
+            next: terminal.next_lifecycle.clone(),
+        },
+        ManifestChange::SetStreamProfile {
+            expected: protocol.stream_profile.clone(),
+            next: protocol.stream_profile.clone(),
+        },
+    ];
+    let publisher = GraphNamespacePublisher::new_with_session(
+        root_uri,
+        None,
+        crate::lance_access::control_session(),
+    );
+    let precondition = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
+        None,
+        protocol.authority.branch_identifier.clone(),
+        protocol.authority.graph_head.clone(),
+    ));
+    let outcome = publisher
+        .publish_with_precondition(&changes, &HashMap::new(), None, &precondition)
+        .await
+        .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    Ok(outcome.dataset.version().version)
+}
+
+async fn restage_missing_stream_claim_ledger_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+) -> Result<RecoverySidecar> {
+    let protocol = stream_claim_protocol_v14(sidecar);
+    if protocol.phase != RecoveryStreamClaimPhaseV14::LedgerArmed {
+        return Err(stream_claim_error_v14(
+            sidecar,
+            "only LedgerArmed may recreate a missing immutable ledger transaction",
+        ));
+    }
+    let session = crate::lance_access::control_session();
+    let dataset = super::token_store::open_stream_token_authority_at(
+        root_uri,
+        &protocol.prior_token_authority,
+        &session,
+    )
+    .await
+    .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    let records = stream_claim_ledger_records_v14(protocol);
+    let staged = super::token_store::stage_lifecycle_ledger_records(
+        dataset.clone(),
+        &protocol.prior_token_authority,
+        &records,
+    )
+    .await
+    .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    let planned_transaction = staged.transaction_identity();
+
+    // The original staged fragments are not restart authority. Before invoking
+    // Lance again, durably replace only the current ledger transaction identity
+    // while preserving the logical records and every claim/attempt digest.
+    let mut rebound = sidecar.clone();
+    let ledger = stream_claim_protocol_v14_mut(&mut rebound)
+        .ledger
+        .as_mut()
+        .expect("validated ledger-owned StreamClaim");
+    ledger.planned_transaction = planned_transaction.clone();
+    ledger.confirmed_transaction = None;
+    ledger.confirmed_head = None;
+    ledger.next_authority = None;
+    rewrite_stream_claim_sidecar_v14(root_uri, storage, &rebound)
+        .await
+        .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+
+    let table_store = crate::table_store::TableStore::new(root_uri, session);
+    let (achieved, committed_transaction) = table_store
+        .commit_staged_exact(std::sync::Arc::new(dataset), staged)
+        .await
+        .map_err(|error| stream_claim_error_v14(&rebound, error))?;
+    if committed_transaction != planned_transaction {
+        return Err(stream_claim_error_v14(
+            &rebound,
+            "recreated ledger commit returned another transaction identity",
+        ));
+    }
+    let next_authority = super::token_store::stream_token_authority_entry_for_dataset(&achieved)
+        .await
+        .map_err(|error| stream_claim_error_v14(&rebound, error))?;
+    let mut confirmed = rebound;
+    confirm_stream_claim_sidecar_v14(
+        root_uri,
+        storage,
+        &mut confirmed,
+        committed_transaction,
+        next_authority.current_head_witness.clone(),
+        next_authority,
+    )
+    .await
+    .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    Ok(confirmed)
+}
+
+fn stream_claim_checkpoint_outcome_v14(
+    sidecar: &RecoverySidecar,
+) -> Result<RecoveryStreamClaimOutcomeV14> {
+    let protocol = stream_claim_protocol_v14(sidecar);
+    let effect = protocol
+        .classified_attempt
+        .as_ref()
+        .ok_or_else(|| stream_claim_error_v14(sidecar, "checkpoint has no attempt effect"))?;
+    let next_chain = effect
+        .next_attempt_chain_ref()
+        .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    let next_authority = protocol
+        .ledger
+        .as_ref()
+        .and_then(|ledger| ledger.next_authority.clone())
+        .ok_or_else(|| stream_claim_error_v14(sidecar, "checkpoint has no token authority"))?;
+    Ok(RecoveryStreamClaimOutcomeV14::CheckpointVisible {
+        prior_attempt_chain: next_chain,
+        token_authority: next_authority,
+    })
+}
+
+async fn mark_stream_claim_checkpoint_visible_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+) -> Result<RecoverySidecar> {
+    if stream_claim_protocol_v14(sidecar).phase == RecoveryStreamClaimPhaseV14::CheckpointVisible {
+        return Ok(sidecar.clone());
+    }
+    let mut checkpoint = sidecar.clone();
+    stream_claim_protocol_v14_mut(&mut checkpoint).phase =
+        RecoveryStreamClaimPhaseV14::CheckpointVisible;
+    rewrite_stream_claim_sidecar_v14(root_uri, storage, &checkpoint)
+        .await
+        .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    Ok(checkpoint)
+}
+
+fn stream_claim_terminal_outcome_v14(
+    sidecar: &RecoverySidecar,
+) -> Result<RecoveryStreamClaimOutcomeV14> {
+    let protocol = stream_claim_protocol_v14(sidecar);
+    let lifecycle = protocol
+        .terminal
+        .as_ref()
+        .map(|terminal| terminal.next_lifecycle.clone())
+        .ok_or_else(|| stream_claim_error_v14(sidecar, "terminal outcome has no lifecycle"))?;
+    let token_authority = protocol
+        .ledger
+        .as_ref()
+        .and_then(|ledger| ledger.next_authority.clone())
+        .ok_or_else(|| {
+            stream_claim_error_v14(sidecar, "terminal outcome has no token authority")
+        })?;
+    Ok(RecoveryStreamClaimOutcomeV14::TerminalVisible {
+        lifecycle,
+        token_authority,
+    })
+}
+
+async fn finalize_visible_stream_claim_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+) -> Result<RecoveryStreamClaimOutcomeV14> {
+    let protocol = stream_claim_protocol_v14(sidecar);
+    let expected_reference = protocol
+        .authority
+        .graph_head
+        .clone()
+        .unwrap_or_else(|| format!("stream-claim:{}", sidecar.operation_id));
+    let expected_writer_kind = format!("{:?}", sidecar.writer_kind);
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    let records = audit.list().await?;
+    let operation_records = records
+        .iter()
+        .filter(|record| record.operation_id == sidecar.operation_id)
+        .collect::<Vec<_>>();
+    if operation_records.iter().any(|record| {
+        record.graph_commit_id != expected_reference
+            || record.recovery_kind != RecoveryKind::RolledForward
+            || record.recovery_for_actor != sidecar.actor_id
+            || record.sidecar_writer_kind != expected_writer_kind
+            || !record.per_table_outcomes.is_empty()
+    }) {
+        return Err(stream_claim_error_v14(
+            sidecar,
+            "recovery audit row differs from the exact lineage-neutral terminal claim",
+        ));
+    }
+    if operation_records.is_empty() {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id: expected_reference,
+                recovery_kind: RecoveryKind::RolledForward,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: expected_writer_kind,
+                per_table_outcomes: Vec::new(),
+                created_at: crate::db::now_micros()?,
+            })
+            .await?;
+    }
+    let outcome = stream_claim_terminal_outcome_v14(sidecar)?;
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(outcome)
+}
+
+async fn process_stream_claim_sidecar_v14_typed(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<RecoveryStreamClaimOutcomeV14> {
+    validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
+    let live_authority = read_live_recovery_authority(root_uri, storage, None)
+        .await
+        .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    if live_authority != stream_claim_protocol_v14(sidecar).authority {
+        return Err(stream_claim_error_v14(
+            sidecar,
+            "graph/schema authority changed after the claim was armed",
+        ));
+    }
+    let protocol = stream_claim_protocol_v14(sidecar);
+    match protocol.phase {
+        RecoveryStreamClaimPhaseV14::AttemptArmed => {
+            if !stream_claim_manifest_is_prior_v14(snapshot, sidecar) {
+                return Err(stream_claim_error_v14(
+                    sidecar,
+                    "AttemptArmed manifest differs from its exact prior authority",
+                ));
+            }
+            return Ok(RecoveryStreamClaimOutcomeV14::AttemptPending {
+                prior_attempt_chain: protocol.prior_attempt_chain.clone(),
+                token_authority: protocol.prior_token_authority.clone(),
+            });
+        }
+        RecoveryStreamClaimPhaseV14::EffectFreeClassified => {
+            if !stream_claim_manifest_is_prior_v14(snapshot, sidecar) {
+                return Err(stream_claim_error_v14(
+                    sidecar,
+                    "effect-free claim classification lost its exact prior authority",
+                ));
+            }
+            delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
+                .await?;
+            return Ok(RecoveryStreamClaimOutcomeV14::EffectFree);
+        }
+        RecoveryStreamClaimPhaseV14::LedgerArmed
+        | RecoveryStreamClaimPhaseV14::LedgerEffectsConfirmed
+        | RecoveryStreamClaimPhaseV14::CheckpointVisible => {}
+    }
+
+    let observed = observe_stream_claim_ledger_v14(root_uri, sidecar).await?;
+    if stream_claim_manifest_is_terminal_v14(snapshot, sidecar) {
+        let ledger = stream_claim_protocol_v14(sidecar)
+            .ledger
+            .as_ref()
+            .expect("validated terminal ledger");
+        if !matches!(
+            stream_claim_protocol_v14(sidecar).phase,
+            RecoveryStreamClaimPhaseV14::LedgerEffectsConfirmed
+        ) || observed.state != StreamClaimLedgerObservationState::ExactEffect
+            || observed.transaction.as_ref() != ledger.confirmed_transaction.as_ref()
+            || Some(&observed.authority) != ledger.next_authority.as_ref()
+        {
+            return Err(stream_claim_error_v14(
+                sidecar,
+                "visible terminal lifecycle is not backed by the exact confirmed claim ledger",
+            ));
+        }
+        return finalize_visible_stream_claim_v14(root_uri, storage.as_ref(), sidecar).await;
+    }
+    if stream_claim_manifest_is_checkpoint_v14(snapshot, sidecar) {
+        let ledger = stream_claim_protocol_v14(sidecar)
+            .ledger
+            .as_ref()
+            .expect("validated checkpoint ledger");
+        if !matches!(
+            stream_claim_protocol_v14(sidecar).phase,
+            RecoveryStreamClaimPhaseV14::LedgerEffectsConfirmed
+                | RecoveryStreamClaimPhaseV14::CheckpointVisible
+        ) || observed.state != StreamClaimLedgerObservationState::ExactEffect
+            || observed.transaction.as_ref() != ledger.confirmed_transaction.as_ref()
+            || Some(&observed.authority) != ledger.next_authority.as_ref()
+        {
+            return Err(stream_claim_error_v14(
+                sidecar,
+                "visible checkpoint is not backed by the exact confirmed attempt ledger",
+            ));
+        }
+        let checkpoint =
+            mark_stream_claim_checkpoint_visible_v14(root_uri, storage.as_ref(), sidecar).await?;
+        return stream_claim_checkpoint_outcome_v14(&checkpoint);
+    }
+    if !stream_claim_manifest_is_prior_v14(snapshot, sidecar) {
+        return Err(stream_claim_error_v14(
+            sidecar,
+            "manifest profile, lifecycle, token pointer, or version differs from every exact claim outcome",
+        ));
+    }
+
+    let mut confirmed = sidecar.clone();
+    if observed.state == StreamClaimLedgerObservationState::ExactNoEffect {
+        match stream_claim_protocol_v14(sidecar).phase {
+            RecoveryStreamClaimPhaseV14::LedgerArmed => {
+                confirmed =
+                    restage_missing_stream_claim_ledger_v14(root_uri, storage.as_ref(), sidecar)
+                        .await?;
+            }
+            RecoveryStreamClaimPhaseV14::LedgerEffectsConfirmed
+            | RecoveryStreamClaimPhaseV14::CheckpointVisible => {
+                return Err(stream_claim_error_v14(
+                    sidecar,
+                    "confirmed/checkpoint claim sidecar has no raw ledger effect",
+                ));
+            }
+            RecoveryStreamClaimPhaseV14::AttemptArmed
+            | RecoveryStreamClaimPhaseV14::EffectFreeClassified => {
+                unreachable!("handled before ledger observation")
+            }
+        }
+    } else if stream_claim_protocol_v14(sidecar).phase == RecoveryStreamClaimPhaseV14::LedgerArmed {
+        confirm_stream_claim_sidecar_v14(
+            root_uri,
+            storage.as_ref(),
+            &mut confirmed,
+            observed
+                .transaction
+                .clone()
+                .expect("exact StreamClaim ledger has a transaction"),
+            observed.authority.current_head_witness.clone(),
+            observed.authority,
+        )
+        .await
+        .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    }
+
+    let confirmed_protocol = stream_claim_protocol_v14(&confirmed);
+    if confirmed_protocol.phase != RecoveryStreamClaimPhaseV14::LedgerEffectsConfirmed {
+        return Err(stream_claim_error_v14(
+            &confirmed,
+            "claim ledger effect did not reach durable confirmation",
+        ));
+    }
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    if confirmed_protocol.terminal.is_some() {
+        publish_stream_claim_terminal_v14(root_uri, &confirmed).await?;
+    } else {
+        publish_stream_claim_checkpoint_v14(root_uri, &confirmed).await?;
+    }
+    let fresh = fresh_snapshot_for_sidecar(root_uri, storage, &confirmed).await?;
+    if confirmed_protocol.terminal.is_some() {
+        if !stream_claim_manifest_is_terminal_v14(&fresh, &confirmed) {
+            return Err(stream_claim_error_v14(
+                &confirmed,
+                "terminal manifest CAS did not select the exact token pointer and lifecycle",
+            ));
+        }
+        finalize_visible_stream_claim_v14(root_uri, storage.as_ref(), &confirmed).await
+    } else {
+        if !stream_claim_manifest_is_checkpoint_v14(&fresh, &confirmed) {
+            return Err(stream_claim_error_v14(
+                &confirmed,
+                "checkpoint manifest CAS did not select the exact token pointer with byte-identical lifecycle",
+            ));
+        }
+        let checkpoint =
+            mark_stream_claim_checkpoint_visible_v14(root_uri, storage.as_ref(), &confirmed)
+                .await?;
+        stream_claim_checkpoint_outcome_v14(&checkpoint)
+    }
+}
+
+async fn process_stream_claim_sidecar_v14(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let outcome =
+        process_stream_claim_sidecar_v14_typed(root_uri, storage, snapshot, sidecar).await?;
+    Ok(matches!(
+        outcome,
+        RecoveryStreamClaimOutcomeV14::EffectFree
+            | RecoveryStreamClaimOutcomeV14::TerminalVisible { .. }
+    ))
+}
+
+pub(crate) async fn complete_stream_claim_sidecar_v14(
+    root_uri: &str,
+    storage: std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<RecoveryStreamClaimOutcomeV14> {
+    process_stream_claim_sidecar_v14_typed(root_uri, &storage, snapshot, sidecar).await
+}
+
 async fn process_sidecar(
     root_uri: &str,
     storage: &std::sync::Arc<dyn StorageAdapter>,
@@ -7522,19 +11674,10 @@ async fn process_sidecar(
     // untouched -- callers must not treat that as a completed heal (no
     // schema reload / cache invalidation is warranted).
     if sidecar.schema_version == STREAM_ENROLLMENT_SIDECAR_SCHEMA_VERSION {
-        // The v10 classifier deliberately carries the complete exact physical
-        // inventory and roll-forward path. Keep that large future off the
-        // stack of every ordinary v9 recovery call; without this indirection,
-        // merely adding the unreachable v10 branch made deep EnsureIndices
-        // recovery tests overflow Tokio's worker stack.
-        return Box::pin(process_stream_enrollment_sidecar_v10(
-            root_uri,
-            storage,
-            snapshot,
-            sidecar,
-            StreamEnrollmentCleanup::Required,
-        ))
-        .await;
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "historical schema-v10 StreamEnrollment cannot be recovered under lifecycle-v3 because it lacks immutable binding-ledger authority; rebuild or use the matching historical binary",
+        ));
     }
     if sidecar.schema_version == LEGACY_STREAM_FOLD_SIDECAR_SCHEMA_VERSION {
         return Err(OmniError::recovery_required(
@@ -7543,18 +11686,56 @@ async fn process_sidecar(
         ));
     }
     if sidecar.schema_version == STREAM_FOLD_SIDECAR_SCHEMA_VERSION {
-        return Box::pin(process_stream_fold_sidecar_v12(
-            root_uri,
-            storage,
-            snapshot,
-            sidecar,
-            StreamFoldCleanup::Required,
-        ))
-        .await;
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "historical schema-v12 StreamFold cannot be recovered under lifecycle-v3 because its lifecycle-v2 authority cannot be synthesized; rebuild or use the matching historical binary",
+        ));
     }
     if sidecar.schema_version == STREAM_PROFILE_CHANGE_SIDECAR_SCHEMA_VERSION {
         return process_stream_profile_change_sidecar_v13(root_uri, storage, snapshot, sidecar)
             .await;
+    }
+    if sidecar.schema_version == STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION {
+        return match sidecar
+            .protocol_v14
+            .as_deref()
+            .expect("validated schema-v14 payload")
+        {
+            RecoveryProtocolV14::StreamEnrollmentV2(_) => {
+                process_stream_enrollment_sidecar_v14(
+                    root_uri,
+                    storage,
+                    snapshot,
+                    sidecar,
+                    StreamEnrollmentCleanup::Required,
+                )
+                .await
+            }
+            RecoveryProtocolV14::StreamClaim(_) => {
+                process_stream_claim_sidecar_v14(root_uri, storage, snapshot, sidecar).await
+            }
+            RecoveryProtocolV14::StreamFoldV2(_) | RecoveryProtocolV14::StreamDrainFold(_) => {
+                process_stream_fold_sidecar_v14(
+                    root_uri,
+                    storage,
+                    snapshot,
+                    sidecar,
+                    StreamFoldCleanup::Required,
+                )
+                .await
+            }
+            RecoveryProtocolV14::StreamLifecycleReceipt(_) => {
+                process_stream_lifecycle_receipt_sidecar_v14(root_uri, storage, snapshot, sidecar)
+                    .await
+            }
+            protocol => Err(OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                format!(
+                    "recovery-v14 discriminator {:?} is reserved but its exact processor is inactive",
+                    protocol.writer_kind()
+                ),
+            )),
+        };
     }
 
     // Recovery is itself a physical writer. Valid Phase-A operation ordering
@@ -7623,6 +11804,21 @@ async fn process_sidecar(
             SidecarKind::StreamProfileChange => {
                 return Err(OmniError::manifest_internal(
                     "StreamProfileChange appeared outside its schema-v13 recovery envelope",
+                ));
+            }
+            SidecarKind::StreamEnrollmentV2
+            | SidecarKind::StreamClaim
+            | SidecarKind::StreamFoldV2
+            | SidecarKind::StreamDrainFold
+            | SidecarKind::StreamLifecycleReceipt
+            | SidecarKind::StreamResume
+            | SidecarKind::StreamCorrection
+            | SidecarKind::StreamAuthorityRetirement
+            | SidecarKind::StreamTokenLedgerIndexMaintenance
+            | SidecarKind::StreamSealedMaintenance
+            | SidecarKind::StreamRebind => {
+                return Err(OmniError::manifest_internal(
+                    "lifecycle-v3 stream writer appeared outside its schema-v14 recovery envelope",
                 ));
             }
         }
@@ -10779,15 +14975,10 @@ pub(crate) async fn ensure_read_only_schema_coherent(
     }
 
     for sidecar in sidecars {
-        if matches!(
-            sidecar.writer_kind,
-            SidecarKind::StreamEnrollment
-                | SidecarKind::StreamFold
-                | SidecarKind::StreamProfileChange
-        ) {
+        if sidecar.writer_kind.is_stream_recovery() {
             return Err(OmniError::recovery_required(
                 sidecar.operation_id,
-                "read-only open cannot resolve an active MemWAL enrollment/fold intent; run a read-write open to prove no effect or roll the exact stream effect forward",
+                "read-only open cannot resolve an active stream recovery intent; run a read-write open to prove no effect or roll the exact stream effect forward",
             ));
         }
         if !matches!(sidecar.writer_kind, SidecarKind::SchemaApply) {
@@ -12046,45 +16237,10 @@ fn new_unvalidated_sidecar(
         protocol_v11: None,
         protocol_v12: None,
         protocol_v13: None,
+
+        protocol_v14: None,
         ensure_indices_rollback_v6: None,
     }
-}
-
-/// Arm one exact roll-forward-only RFC-026 bounded enrollment intent.
-///
-/// The caller has already captured the exact main-branch baseline and holds
-/// exclusive stream admission plus the ordinary schema/branch/table gates.
-/// This constructor fixes the only physical successor and lifecycle binding
-/// recovery may publish; no later confirmation rewrite is needed because the
-/// N+1 transaction witness is read back from Lance's exact public state.
-#[allow(dead_code)] // Reached by the intentionally dormant Phase-A orchestrator.
-pub(crate) fn new_stream_enrollment_sidecar_v10(
-    actor_id: Option<String>,
-    table: SidecarTablePin,
-    authority: RecoveryAuthorityToken,
-    lineage: RecoveryLineageIntent,
-    baseline_head: super::CurrentHeadWitness,
-    enrollment_plan: MemWalEnrollmentPlan,
-    intended_binding: super::StreamPhysicalBinding,
-    enrollment_receipt: super::EnrollmentReceipt,
-) -> Result<RecoverySidecar> {
-    let mut sidecar = new_unvalidated_sidecar(
-        STREAM_ENROLLMENT_SIDECAR_SCHEMA_VERSION,
-        SidecarKind::StreamEnrollment,
-        None,
-        actor_id,
-        vec![table],
-    );
-    sidecar.protocol_v10 = Some(RecoveryProtocolV10 {
-        authority,
-        lineage,
-        baseline_head,
-        enrollment_plan,
-        intended_binding,
-        enrollment_receipt,
-    });
-    validate_sidecar_shape("<new-stream-enrollment-sidecar-v10>", &sidecar)?;
-    Ok(sidecar)
 }
 
 /// Arm one exact roll-forward-only RFC-026 one-generation fold.
@@ -12144,12 +16300,36 @@ pub(crate) fn new_stream_fold_sidecar_v11(
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(crate) fn new_stream_fold_sidecar_v12(
-    actor_id: Option<String>,
+    _actor_id: Option<String>,
+    _table: SidecarTablePin,
+    _authority: RecoveryAuthorityToken,
+    _lineage: RecoveryLineageIntent,
+    _binding: super::StreamPhysicalBinding,
+    _prior_lifecycle: super::StreamLifecycleEntry,
+    _planned_next_lifecycle: super::StreamLifecycleEntry,
+    _prior_merged_generation: Option<MergedGeneration>,
+    _generation_cut: RecoveryStreamFoldCut,
+    _base_planned_transaction: StagedTransactionIdentity,
+    _prior_token_authority: super::StreamTokenAuthorityEntry,
+    _token_planned_transaction: StagedTransactionIdentity,
+    _token_planned_rows: Vec<super::stream_token::StreamTokenAuthorityRow>,
+    _attribution_summary: RecoveryStreamFoldAttributionSummary,
+) -> Result<RecoverySidecar> {
+    Err(OmniError::manifest_internal(
+        "historical schema-v12 StreamFold construction is inactive under lifecycle-v3; use StreamFoldV2",
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_stream_fold_sidecar_v14_inner(
+    drain_authority: Option<RecoveryStreamDrainFoldAuthorityV14>,
     table: SidecarTablePin,
     authority: RecoveryAuthorityToken,
     lineage: RecoveryLineageIntent,
-    binding: super::StreamPhysicalBinding,
+    prior_manifest_version: u64,
+    profile: super::StreamProfileEntry,
     prior_lifecycle: super::StreamLifecycleEntry,
+    current_claim_receipt: super::stream::ClaimReceipt,
     mut planned_next_lifecycle: super::StreamLifecycleEntry,
     prior_merged_generation: Option<MergedGeneration>,
     generation_cut: RecoveryStreamFoldCut,
@@ -12159,27 +16339,51 @@ pub(crate) fn new_stream_fold_sidecar_v12(
     token_planned_rows: Vec<super::stream_token::StreamTokenAuthorityRow>,
     attribution_summary: RecoveryStreamFoldAttributionSummary,
 ) -> Result<RecoverySidecar> {
+    let writer_kind = if drain_authority.is_some() {
+        SidecarKind::StreamDrainFold
+    } else {
+        SidecarKind::StreamFoldV2
+    };
+    let binding = prior_lifecycle.binding.clone();
+    let admission_scope = RecoveryStreamAdmissionScope {
+        identity: prior_lifecycle.identity,
+        table_branch: binding.table_branch.clone(),
+        binding_scope_id: prior_lifecycle.binding_scope_id.clone(),
+    };
     let merged_generation =
         MergedGeneration::new(generation_cut.shard_id, generation_cut.generation);
     let mut sidecar = new_unvalidated_sidecar(
-        STREAM_FOLD_SIDECAR_SCHEMA_VERSION,
-        SidecarKind::StreamFold,
+        STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION,
+        writer_kind,
         None,
-        actor_id,
+        Some(STREAM_FOLD_ACTOR.to_string()),
         vec![table],
     );
-    if let Some(summary) = planned_next_lifecycle.last_fold_summary.as_mut() {
-        summary.operation_id = sidecar.operation_id.clone();
-    }
-    sidecar.protocol_v12 = Some(Box::new(RecoveryProtocolV12 {
+    let summary = planned_next_lifecycle
+        .last_fold_summary
+        .as_mut()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(
+                "StreamFoldV14 construction requires a complete planned fold summary",
+            )
+        })?;
+    summary.operation_id = drain_authority
+        .as_ref()
+        .map_or_else(|| sidecar.operation_id.clone(), |drain| drain.drain_id.clone());
+    let protocol = RecoveryStreamFoldV14 {
         authority,
         lineage,
+        admission_scope,
+        prior_manifest_version,
+        profile,
         binding,
         prior_merged_generation,
         generation_cut,
         merged_generation,
         effect_phase: RecoveryEffectPhase::Armed,
         prior_lifecycle,
+        current_claim_receipt,
+        drain_authority,
         planned_next_lifecycle,
         next_lifecycle: None,
         base: RecoveryStreamFoldBaseEffect {
@@ -12198,9 +16402,99 @@ pub(crate) fn new_stream_fold_sidecar_v12(
             confirmed_head: None,
             next_authority: None,
         },
+    };
+    sidecar.protocol_v14 = Some(Box::new(match writer_kind {
+        SidecarKind::StreamFoldV2 => RecoveryProtocolV14::StreamFoldV2(protocol),
+        SidecarKind::StreamDrainFold => RecoveryProtocolV14::StreamDrainFold(protocol),
+        _ => unreachable!("selected by the local fold constructor"),
     }));
-    validate_sidecar_shape("<new-stream-fold-sidecar-v12>", &sidecar)?;
+    validate_sidecar_shape("<new-stream-fold-sidecar-v14>", &sidecar)?;
     Ok(sidecar)
+}
+
+/// Arm an ordinary lifecycle-v3 `OPEN` fold before either Lance participant
+/// may move.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new_stream_fold_v2_sidecar_v14(
+    table: SidecarTablePin,
+    authority: RecoveryAuthorityToken,
+    lineage: RecoveryLineageIntent,
+    prior_manifest_version: u64,
+    profile: super::StreamProfileEntry,
+    prior_lifecycle: super::StreamLifecycleEntry,
+    current_claim_receipt: super::stream::ClaimReceipt,
+    planned_next_lifecycle: super::StreamLifecycleEntry,
+    prior_merged_generation: Option<MergedGeneration>,
+    generation_cut: RecoveryStreamFoldCut,
+    base_planned_transaction: StagedTransactionIdentity,
+    prior_token_authority: super::StreamTokenAuthorityEntry,
+    token_planned_transaction: StagedTransactionIdentity,
+    token_planned_rows: Vec<super::stream_token::StreamTokenAuthorityRow>,
+    attribution_summary: RecoveryStreamFoldAttributionSummary,
+) -> Result<RecoverySidecar> {
+    new_stream_fold_sidecar_v14_inner(
+        None,
+        table,
+        authority,
+        lineage,
+        prior_manifest_version,
+        profile,
+        prior_lifecycle,
+        current_claim_receipt,
+        planned_next_lifecycle,
+        prior_merged_generation,
+        generation_cut,
+        base_planned_transaction,
+        prior_token_authority,
+        token_planned_transaction,
+        token_planned_rows,
+        attribution_summary,
+    )
+}
+
+/// Arm a lifecycle-v3 `DRAINING` fold. The current claim and scanner digest
+/// are fixed before either participant and remain immutable through recovery.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new_stream_drain_fold_sidecar_v14(
+    table: SidecarTablePin,
+    authority: RecoveryAuthorityToken,
+    lineage: RecoveryLineageIntent,
+    prior_manifest_version: u64,
+    profile: super::StreamProfileEntry,
+    prior_lifecycle: super::StreamLifecycleEntry,
+    drain_id: String,
+    current_claim_receipt: super::stream::ClaimReceipt,
+    recomputed_lww_projection_digest: String,
+    planned_next_lifecycle: super::StreamLifecycleEntry,
+    prior_merged_generation: Option<MergedGeneration>,
+    generation_cut: RecoveryStreamFoldCut,
+    base_planned_transaction: StagedTransactionIdentity,
+    prior_token_authority: super::StreamTokenAuthorityEntry,
+    token_planned_transaction: StagedTransactionIdentity,
+    token_planned_rows: Vec<super::stream_token::StreamTokenAuthorityRow>,
+    attribution_summary: RecoveryStreamFoldAttributionSummary,
+) -> Result<RecoverySidecar> {
+    new_stream_fold_sidecar_v14_inner(
+        Some(RecoveryStreamDrainFoldAuthorityV14 {
+            drain_id,
+            recomputed_lww_projection_digest,
+        }),
+        table,
+        authority,
+        lineage,
+        prior_manifest_version,
+        profile,
+        prior_lifecycle,
+        current_claim_receipt,
+        planned_next_lifecycle,
+        prior_merged_generation,
+        generation_cut,
+        base_planned_transaction,
+        prior_token_authority,
+        token_planned_transaction,
+        token_planned_rows,
+        attribution_summary,
+    )
 }
 
 /// Arm the exact immutable receipt transaction for one terminal profile
@@ -12299,6 +16593,792 @@ pub(crate) async fn confirm_stream_profile_change_sidecar_v13(
     let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
         OmniError::manifest_internal(format!(
             "failed to serialize confirmed StreamProfileChange sidecar: {error}"
+        ))
+    })?;
+    storage.write_text(&uri, &json).await?;
+    *sidecar = confirmed;
+    Ok(())
+}
+
+/// Arm one exact lifecycle-v3 enrollment before either physical participant.
+///
+/// The physical binding and both immutable initial ledger records are complete
+/// logical inputs. The base-table successor witness and token-table successor
+/// witness remain confirmation outputs, but recovery may derive them only from
+/// the exact N+1 classifiers fixed here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new_stream_enrollment_sidecar_v14(
+    actor_id: String,
+    table: SidecarTablePin,
+    authority: RecoveryAuthorityToken,
+    lineage: RecoveryLineageIntent,
+    prior_manifest_version: u64,
+    profile: super::StreamProfileEntry,
+    baseline_head: super::CurrentHeadWitness,
+    enrollment_plan: MemWalEnrollmentPlan,
+    intended_binding: super::StreamPhysicalBinding,
+    prior_row_count: u64,
+    legacy_enrollment_receipt: super::stream::EnrollmentReceipt,
+    enrollment_receipt: super::stream::EnrollmentReceiptV2,
+    binding_receipt: super::stream::BindingReceipt,
+    prior_token_authority: super::StreamTokenAuthorityEntry,
+    planned_token_transaction: StagedTransactionIdentity,
+) -> Result<RecoverySidecar> {
+    let admission_scope = RecoveryStreamAdmissionScope {
+        identity: table.identity,
+        table_branch: table.table_branch.clone(),
+        binding_scope_id: enrollment_receipt.binding_scope_id.clone(),
+    };
+    let mut sidecar = new_unvalidated_sidecar(
+        STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION,
+        SidecarKind::StreamEnrollmentV2,
+        None,
+        Some(actor_id),
+        vec![table],
+    );
+    sidecar.protocol_v14 = Some(Box::new(RecoveryProtocolV14::StreamEnrollmentV2(
+        RecoveryStreamEnrollmentV2V14 {
+            authority,
+            lineage,
+            admission_scope,
+            prior_manifest_version,
+            profile,
+            effect_phase: RecoveryEffectPhase::Armed,
+            baseline_head,
+            enrollment_plan,
+            intended_binding,
+            prior_row_count,
+            legacy_enrollment_receipt,
+            token: RecoveryStreamEnrollmentV2TokenEffect {
+                prior_authority: prior_token_authority,
+                planned_enrollment_receipt: enrollment_receipt,
+                planned_binding_receipt: binding_receipt,
+                planned_transaction: planned_token_transaction,
+                confirmed_transaction: None,
+                confirmed_head: None,
+                next_authority: None,
+            },
+            confirmed_update: None,
+            next_lifecycle: None,
+        },
+    )));
+    validate_sidecar_shape("<new-stream-enrollment-sidecar-v14>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Bind both exact achieved enrollment participants before the sole terminal
+/// table-pointer/token-pointer/lifecycle manifest CAS.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn confirm_stream_enrollment_sidecar_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    committed_token_transaction: StagedTransactionIdentity,
+    achieved_token_head: super::CurrentHeadWitness,
+    next_token_authority: super::StreamTokenAuthorityEntry,
+    confirmed_update: RecoveryConfirmedTableUpdate,
+    next_lifecycle: super::StreamLifecycleEntry,
+) -> Result<()> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    validate_sidecar_shape(&uri, sidecar)?;
+    let protocol = stream_enrollment_v2_protocol(sidecar);
+    if protocol.effect_phase != RecoveryEffectPhase::Armed
+        || committed_token_transaction != protocol.token.planned_transaction
+        || achieved_token_head.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
+        || achieved_token_head.table_version
+            != committed_token_transaction
+                .read_version
+                .checked_add(1)
+                .ok_or_else(|| OmniError::manifest_internal("stream-token version overflow"))?
+        || achieved_token_head.transaction_uuid != committed_token_transaction.uuid
+        || next_token_authority.current_head_witness != achieved_token_head
+        || confirmed_update.table_version != sidecar.tables[0].post_commit_pin
+        || confirmed_update.table_branch.is_some()
+        || next_lifecycle.identity != sidecar.tables[0].identity
+        || next_lifecycle.current_head_witness.table_version != sidecar.tables[0].post_commit_pin
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "StreamEnrollmentV2 sidecar '{}' confirmation differs from its exact planned N+1 participants",
+            sidecar.operation_id
+        )));
+    }
+    let mut confirmed = sidecar.clone();
+    let Some(RecoveryProtocolV14::StreamEnrollmentV2(protocol)) =
+        confirmed.protocol_v14.as_deref_mut()
+    else {
+        unreachable!("validated v14 enrollment sidecar");
+    };
+    protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+    protocol.token.confirmed_transaction = Some(committed_token_transaction);
+    protocol.token.confirmed_head = Some(achieved_token_head);
+    protocol.token.next_authority = Some(next_token_authority);
+    protocol.confirmed_update = Some(confirmed_update);
+    protocol.next_lifecycle = Some(next_lifecycle);
+    validate_sidecar_shape(&uri, &confirmed)?;
+    let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize confirmed StreamEnrollmentV2 sidecar: {error}"
+        ))
+    })?;
+    storage.write_text(&uri, &json).await?;
+    *sidecar = confirmed;
+    Ok(())
+}
+
+/// Arm one exact current claim attempt before invoking Lance.
+///
+/// The caller supplies the pure planner output. Recovery serializes only its
+/// canonical preimages/digests plus the fixed selected attempt-chain head; it
+/// never retains prior attempt bodies.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new_stream_claim_sidecar_v14(
+    actor_id: Option<String>,
+    authority: RecoveryAuthorityToken,
+    prior_manifest_version: u64,
+    stream_profile: super::StreamProfileEntry,
+    prior_lifecycle: super::StreamLifecycleEntry,
+    prior_token_authority: super::StreamTokenAuthorityEntry,
+    prior_attempt_chain: super::stream_profile::ReceiptChainRef,
+    current_attempt: &crate::db::omnigraph::stream_lifecycle::PreparedClaimAttempt,
+) -> Result<RecoverySidecar> {
+    if current_attempt.operation.identity != prior_lifecycle.identity
+        || current_attempt.operation.binding_scope_id != prior_lifecycle.binding_scope_id
+    {
+        return Err(OmniError::manifest_internal(
+            "StreamClaim prepared attempt belongs to another lifecycle lane",
+        ));
+    }
+    let admission_scope = RecoveryStreamAdmissionScope {
+        identity: prior_lifecycle.identity,
+        table_branch: prior_lifecycle.binding.table_branch.clone(),
+        binding_scope_id: prior_lifecycle.binding_scope_id.clone(),
+    };
+    let mut sidecar = new_unvalidated_sidecar(
+        STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION,
+        SidecarKind::StreamClaim,
+        None,
+        actor_id,
+        Vec::new(),
+    );
+    sidecar.protocol_v14 = Some(Box::new(RecoveryProtocolV14::StreamClaim(
+        RecoveryStreamClaimV14 {
+            authority,
+            admission_scope,
+            prior_manifest_version,
+            stream_profile,
+            prior_lifecycle,
+            prior_token_authority,
+            operation: RecoveryStreamClaimOperationV14::from_prepared(&current_attempt.operation),
+            prior_attempt_chain,
+            current_attempt: RecoveryStreamClaimAttemptV14::from_prepared(current_attempt),
+            phase: RecoveryStreamClaimPhaseV14::AttemptArmed,
+            classified_attempt: None,
+            ledger: None,
+            terminal: None,
+        },
+    )));
+    validate_sidecar_shape("<new-stream-claim-sidecar-v14>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Reconstruct the exact pure claim plan retained by an `AttemptArmed`
+/// sidecar. Explicit same-operation continuation uses this API to inspect the
+/// physical shard without first invoking the generic recovery barrier.
+pub(crate) fn prepared_stream_claim_attempt_v14(
+    sidecar: &RecoverySidecar,
+) -> Result<crate::db::omnigraph::stream_lifecycle::PreparedClaimAttempt> {
+    validate_sidecar_shape("<prepared-stream-claim-attempt-v14>", sidecar)?;
+    rebuild_stream_claim_prepared_attempt_v14(stream_claim_protocol_v14(sidecar))
+}
+
+fn validate_classified_stream_claim_attempt_v14(
+    sidecar: &RecoverySidecar,
+    effect: &super::stream::ClaimAttemptEffect,
+) -> Result<()> {
+    let protocol = stream_claim_protocol_v14(sidecar);
+    if protocol.phase != RecoveryStreamClaimPhaseV14::AttemptArmed {
+        return Err(OmniError::manifest_internal(
+            "only AttemptArmed may bind a fresh StreamClaim classification",
+        ));
+    }
+    let prepared = rebuild_stream_claim_prepared_attempt_v14(protocol)?;
+    let rebuilt = crate::db::omnigraph::stream_lifecycle::build_claim_attempt_effect(
+        &protocol.prior_attempt_chain,
+        &prepared,
+        claim_attempt_evidence_v14(effect)?,
+    )?;
+    if &rebuilt != effect {
+        return Err(OmniError::manifest_internal(
+            "classified StreamClaim attempt differs from the exact current plan",
+        ));
+    }
+    Ok(())
+}
+
+/// Persist exact physical no-effect evidence. Explicit completion may then
+/// remove the sidecar without minting a claim receipt or ledger checkpoint.
+pub(crate) async fn classify_effect_free_stream_claim_sidecar_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    effect: super::stream::ClaimAttemptEffect,
+) -> Result<()> {
+    validate_classified_stream_claim_attempt_v14(sidecar, &effect)?;
+    if !claim_attempt_is_effect_free_v14(&effect) {
+        return Err(OmniError::manifest_internal(
+            "effect-free StreamClaim classification received an authority-bearing effect",
+        ));
+    }
+    let mut classified = sidecar.clone();
+    let protocol = stream_claim_protocol_v14_mut(&mut classified);
+    protocol.phase = RecoveryStreamClaimPhaseV14::EffectFreeClassified;
+    protocol.classified_attempt = Some(effect);
+    rewrite_stream_claim_sidecar_v14(root_uri, storage, &classified).await?;
+    *sidecar = classified;
+    Ok(())
+}
+
+/// Bind one nonterminal classified attempt and its exact immutable ledger
+/// transaction. The subsequent pointer-only manifest CAS leaves the lifecycle
+/// byte-identical and keeps this sidecar durable.
+pub(crate) async fn arm_stream_claim_checkpoint_sidecar_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    effect: super::stream::ClaimAttemptEffect,
+    planned_transaction: StagedTransactionIdentity,
+) -> Result<()> {
+    validate_classified_stream_claim_attempt_v14(sidecar, &effect)?;
+    if claim_attempt_is_terminal_v14(&effect) {
+        return Err(OmniError::manifest_internal(
+            "terminal StreamClaim effect requires a terminal receipt",
+        ));
+    }
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    let mut armed = sidecar.clone();
+    let protocol = stream_claim_protocol_v14_mut(&mut armed);
+    protocol.phase = RecoveryStreamClaimPhaseV14::LedgerArmed;
+    protocol.classified_attempt = Some(effect);
+    protocol.ledger = Some(RecoveryStreamClaimLedgerEffectV14 {
+        planned_transaction,
+        confirmed_transaction: None,
+        confirmed_head: None,
+        next_authority: None,
+    });
+    rewrite_stream_claim_sidecar_v14(root_uri, storage, &armed).await?;
+    *sidecar = armed;
+    Ok(())
+}
+
+/// Bind the terminal current attempt, immutable claim receipt, exact next
+/// lifecycle, and their shared token-ledger transaction before invoking it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn arm_stream_claim_terminal_sidecar_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    effect: super::stream::ClaimAttemptEffect,
+    receipt: super::stream::ClaimReceipt,
+    next_lifecycle: super::StreamLifecycleEntry,
+    planned_transaction: StagedTransactionIdentity,
+) -> Result<()> {
+    validate_classified_stream_claim_attempt_v14(sidecar, &effect)?;
+    if !claim_attempt_is_terminal_v14(&effect) {
+        return Err(OmniError::manifest_internal(
+            "nonterminal StreamClaim effect cannot bind a claim receipt",
+        ));
+    }
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    let mut armed = sidecar.clone();
+    let protocol = stream_claim_protocol_v14_mut(&mut armed);
+    protocol.phase = RecoveryStreamClaimPhaseV14::LedgerArmed;
+    protocol.classified_attempt = Some(effect);
+    protocol.ledger = Some(RecoveryStreamClaimLedgerEffectV14 {
+        planned_transaction,
+        confirmed_transaction: None,
+        confirmed_head: None,
+        next_authority: None,
+    });
+    protocol.terminal = Some(RecoveryStreamClaimTerminalV14 {
+        receipt,
+        next_lifecycle,
+    });
+    rewrite_stream_claim_sidecar_v14(root_uri, storage, &armed).await?;
+    *sidecar = armed;
+    Ok(())
+}
+
+/// Bind the exact achieved token-ledger N+1 before either checkpoint or
+/// terminal manifest publication.
+pub(crate) async fn confirm_stream_claim_sidecar_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    committed_transaction: StagedTransactionIdentity,
+    achieved_head: super::CurrentHeadWitness,
+    next_authority: super::StreamTokenAuthorityEntry,
+) -> Result<()> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    validate_sidecar_shape(&uri, sidecar)?;
+    let protocol = stream_claim_protocol_v14(sidecar);
+    let ledger = protocol.ledger.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "confirm_stream_claim_sidecar_v14 requires a ledger-owned sidecar",
+        )
+    })?;
+    if protocol.phase != RecoveryStreamClaimPhaseV14::LedgerArmed
+        || committed_transaction != ledger.planned_transaction
+        || achieved_head.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
+        || achieved_head.table_version
+            != committed_transaction
+                .read_version
+                .checked_add(1)
+                .ok_or_else(|| OmniError::manifest_internal("stream-token version overflow"))?
+        || achieved_head.transaction_uuid != committed_transaction.uuid
+        || next_authority.current_head_witness != achieved_head
+        || next_authority.location != protocol.prior_token_authority.location
+        || next_authority.schema_version != protocol.prior_token_authority.schema_version
+        || next_authority.schema_hash != protocol.prior_token_authority.schema_hash
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "StreamClaim sidecar '{}' confirmation differs from its exact planned N+1 ledger effect",
+            sidecar.operation_id
+        )));
+    }
+    let mut confirmed = sidecar.clone();
+    let protocol = stream_claim_protocol_v14_mut(&mut confirmed);
+    protocol.phase = RecoveryStreamClaimPhaseV14::LedgerEffectsConfirmed;
+    let ledger = protocol
+        .ledger
+        .as_mut()
+        .expect("validated ledger-owned StreamClaim");
+    ledger.confirmed_transaction = Some(committed_transaction);
+    ledger.confirmed_head = Some(achieved_head);
+    ledger.next_authority = Some(next_authority);
+    rewrite_stream_claim_sidecar_v14(root_uri, storage, &confirmed).await?;
+    *sidecar = confirmed;
+    Ok(())
+}
+
+/// Receipt-first result for an explicit same-operation claim continuation.
+///
+/// A terminal selected receipt wins even if stale sidecar cleanup was lost.
+/// Otherwise the caller receives the one exact pending sidecar and reconstructed
+/// physical plan, without first running the generic write-entry healer that the
+/// pending claim itself intentionally blocks.
+#[derive(Debug, Clone)]
+pub(crate) enum RecoveryStreamClaimContinuationV14 {
+    TerminalVisible {
+        lifecycle: super::StreamLifecycleEntry,
+        token_authority: super::StreamTokenAuthorityEntry,
+    },
+    Pending {
+        sidecar: RecoverySidecar,
+        attempt: crate::db::omnigraph::stream_lifecycle::PreparedClaimAttempt,
+    },
+}
+
+async fn selected_stream_claim_terminal_v14(
+    snapshot: &Snapshot,
+    graph_identity_digest: &str,
+    identity: TableIdentity,
+    binding_scope_id: &str,
+    claim_id: &str,
+    recovery_operation_id: &str,
+) -> Result<Option<RecoveryStreamClaimOutcomeV14>> {
+    let lifecycle = match snapshot.stream_lifecycle(identity) {
+        Some(lifecycle) if lifecycle.binding_scope_id == binding_scope_id => lifecycle,
+        Some(_) => {
+            return Err(OmniError::recovery_required(
+                recovery_operation_id,
+                "selected lifecycle belongs to another StreamClaim binding scope",
+            ));
+        }
+        None => return Ok(None),
+    };
+    let dataset = snapshot.open_stream_token_authority().await?;
+    let receipt = super::token_store::lookup_claim_receipt(
+        &dataset,
+        snapshot.stream_token_authority(),
+        graph_identity_digest,
+        identity,
+        binding_scope_id,
+        claim_id,
+    )
+    .await?;
+    let Some(receipt) = receipt else {
+        return Ok(None);
+    };
+    if receipt.recovery_operation_id != recovery_operation_id {
+        return Err(OmniError::recovery_required(
+            recovery_operation_id,
+            "selected ClaimReceipt has the same claim ID but another recovery operation",
+        ));
+    }
+    let receipt_chain = receipt.next_chain_ref()?;
+    let expected_lifecycle_operation_id = match lifecycle.lifecycle {
+        super::stream::StreamLifecycle::Open => None,
+        super::stream::StreamLifecycle::Draining => lifecycle
+            .drain
+            .as_ref()
+            .map(|drain| drain.drain_id.as_str()),
+        super::stream::StreamLifecycle::Sealed => {
+            return Err(OmniError::recovery_required(
+                recovery_operation_id,
+                "a selected ordinary ClaimReceipt cannot target SEALED lifecycle authority",
+            ));
+        }
+    };
+    if lifecycle.current_claim_receipt_id.as_deref() != Some(receipt.record_id.as_str())
+        || lifecycle.claim_receipt_chain != receipt_chain
+        || receipt.lifecycle_operation_id.as_deref() != expected_lifecycle_operation_id
+        || lifecycle.identity != receipt.identity
+        || lifecycle.binding_scope_id != receipt.binding_scope_id
+        || lifecycle.binding.enrollment_id != receipt.enrollment_id
+        || lifecycle.enrollment_receipt.stream_incarnation_id != receipt.stream_incarnation_id
+        || lifecycle.binding.stream_config_hash != receipt.stream_configuration_digest
+        || super::stream::stream_physical_binding_digest(&lifecycle.binding)?
+            != receipt.physical_binding_digest
+        || lifecycle.authenticated_wal_tail.position != receipt.authenticated_tail_position
+        || lifecycle.authenticated_wal_tail.segment_count
+            != receipt.authenticated_tail_segment_count
+        || lifecycle.authenticated_wal_tail.chain_digest != receipt.authenticated_tail_chain_digest
+        || lifecycle.authenticated_wal_tail.lww_projection_digest
+            != receipt.authenticated_tail_lww_projection_digest
+        || lifecycle
+            .epoch_floor_by_shard
+            .get(&receipt.shard_id)
+            .copied()
+            != Some(receipt.achieved_writer_epoch)
+        || lifecycle.drain.as_ref().is_some_and(|drain| {
+            drain
+                .target_epoch_floor_by_shard
+                .get(&receipt.shard_id)
+                .is_none_or(|target| *target < receipt.achieved_writer_epoch)
+        })
+    {
+        return Err(OmniError::recovery_required(
+            recovery_operation_id,
+            "selected ClaimReceipt differs from the current lifecycle, tail, or epoch authority",
+        ));
+    }
+    Ok(Some(RecoveryStreamClaimOutcomeV14::TerminalVisible {
+        lifecycle: lifecycle.clone(),
+        token_authority: snapshot.stream_token_authority().clone(),
+    }))
+}
+
+/// Look up one claim occurrence without invoking the generic recovery barrier.
+///
+/// The exact lane plus both logical IDs are mandatory. A same claim ID under a
+/// different recovery operation or a matching operation under another lane is
+/// a conflict, never an adoptable pending intent.
+pub(crate) async fn lookup_stream_claim_continuation_v14(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    graph_identity_digest: &str,
+    identity: TableIdentity,
+    binding_scope_id: &str,
+    claim_id: &str,
+    recovery_operation_id: &str,
+) -> Result<Option<RecoveryStreamClaimContinuationV14>> {
+    if let Some(RecoveryStreamClaimOutcomeV14::TerminalVisible {
+        lifecycle,
+        token_authority,
+    }) = selected_stream_claim_terminal_v14(
+        snapshot,
+        graph_identity_digest,
+        identity,
+        binding_scope_id,
+        claim_id,
+        recovery_operation_id,
+    )
+    .await?
+    {
+        return Ok(Some(RecoveryStreamClaimContinuationV14::TerminalVisible {
+            lifecycle,
+            token_authority,
+        }));
+    }
+
+    let mut exact = None;
+    for sidecar in list_sidecars(root_uri, storage.as_ref()).await? {
+        let Some(RecoveryProtocolV14::StreamClaim(protocol)) = sidecar.protocol_v14.as_deref()
+        else {
+            continue;
+        };
+        if protocol.operation.claim_id != claim_id {
+            continue;
+        }
+        if protocol.operation.graph_identity_digest != graph_identity_digest
+            || protocol.admission_scope.identity != identity
+            || protocol.admission_scope.binding_scope_id != binding_scope_id
+        {
+            return Err(OmniError::recovery_required(
+                recovery_operation_id,
+                "pending StreamClaim with the same claim ID belongs to another lifecycle lane",
+            ));
+        }
+        if protocol.operation.recovery_operation_id != recovery_operation_id {
+            return Err(OmniError::recovery_required(
+                recovery_operation_id,
+                "pending StreamClaim has the same claim ID but another recovery operation",
+            ));
+        }
+        if exact.replace(sidecar).is_some() {
+            return Err(OmniError::recovery_required(
+                recovery_operation_id,
+                "multiple pending StreamClaim sidecars own the same lane and occurrence",
+            ));
+        }
+    }
+    let Some(sidecar) = exact else {
+        return Ok(None);
+    };
+    let attempt = prepared_stream_claim_attempt_v14(&sidecar)?;
+    Ok(Some(RecoveryStreamClaimContinuationV14::Pending {
+        sidecar,
+        attempt,
+    }))
+}
+
+/// Replace a selected nonterminal attempt checkpoint with one next attempt plan
+/// for the same logical claim. The selected receipt is checked first by the
+/// higher-level helper below; this primitive additionally requires the exact
+/// checkpoint snapshot and never replaces an unclassified active attempt.
+pub(crate) async fn rearm_stream_claim_checkpoint_sidecar_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    snapshot: &Snapshot,
+    sidecar: &mut RecoverySidecar,
+    next_attempt: &crate::db::omnigraph::stream_lifecycle::PreparedClaimAttempt,
+) -> Result<()> {
+    validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
+    let protocol = stream_claim_protocol_v14(sidecar);
+    if protocol.phase != RecoveryStreamClaimPhaseV14::CheckpointVisible
+        || !stream_claim_manifest_is_checkpoint_v14(snapshot, sidecar)
+        || RecoveryStreamClaimOperationV14::from_prepared(&next_attempt.operation)
+            != protocol.operation
+    {
+        return Err(stream_claim_error_v14(
+            sidecar,
+            "rearm requires the exact selected checkpoint and same logical claim operation",
+        ));
+    }
+    let next_chain = protocol
+        .classified_attempt
+        .as_ref()
+        .expect("validated checkpoint attempt")
+        .next_attempt_chain_ref()
+        .map_err(|error| stream_claim_error_v14(sidecar, error))?;
+    let next_authority = protocol
+        .ledger
+        .as_ref()
+        .and_then(|ledger| ledger.next_authority.clone())
+        .expect("validated checkpoint token authority");
+    let mut rearmed = sidecar.clone();
+    let protocol = stream_claim_protocol_v14_mut(&mut rearmed);
+    protocol.prior_manifest_version = snapshot.version();
+    protocol.prior_token_authority = next_authority;
+    protocol.prior_attempt_chain = next_chain;
+    protocol.current_attempt = RecoveryStreamClaimAttemptV14::from_prepared(next_attempt);
+    protocol.phase = RecoveryStreamClaimPhaseV14::AttemptArmed;
+    protocol.classified_attempt = None;
+    protocol.ledger = None;
+    protocol.terminal = None;
+    rewrite_stream_claim_sidecar_v14(root_uri, storage, &rearmed).await?;
+    *sidecar = rearmed;
+    Ok(())
+}
+
+/// Receipt-first same-operation continuation that consumes a visible attempt
+/// checkpoint and durably arms exactly one caller-supplied next attempt.
+///
+/// An `AttemptArmed` result is returned untouched so the caller can inspect its
+/// physical effect through `prepared_stream_claim_attempt_v14`; the helper
+/// never skips that classifier or replaces an in-flight plan.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn receipt_first_rearm_stream_claim_sidecar_v14(
+    root_uri: &str,
+    storage: std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    graph_identity_digest: &str,
+    identity: TableIdentity,
+    binding_scope_id: &str,
+    claim_id: &str,
+    recovery_operation_id: &str,
+    next_attempt: &crate::db::omnigraph::stream_lifecycle::PreparedClaimAttempt,
+) -> Result<Option<RecoveryStreamClaimOutcomeV14>> {
+    let continuation = lookup_stream_claim_continuation_v14(
+        root_uri,
+        &storage,
+        snapshot,
+        graph_identity_digest,
+        identity,
+        binding_scope_id,
+        claim_id,
+        recovery_operation_id,
+    )
+    .await?;
+    let Some(continuation) = continuation else {
+        return Ok(None);
+    };
+    let mut sidecar = match continuation {
+        RecoveryStreamClaimContinuationV14::TerminalVisible {
+            lifecycle,
+            token_authority,
+        } => {
+            return Ok(Some(RecoveryStreamClaimOutcomeV14::TerminalVisible {
+                lifecycle,
+                token_authority,
+            }));
+        }
+        RecoveryStreamClaimContinuationV14::Pending { sidecar, .. } => sidecar,
+    };
+    let outcome = complete_stream_claim_sidecar_v14(
+        root_uri,
+        std::sync::Arc::clone(&storage),
+        snapshot,
+        &sidecar,
+    )
+    .await?;
+    match outcome {
+        RecoveryStreamClaimOutcomeV14::CheckpointVisible {
+            prior_attempt_chain,
+            token_authority,
+        } => {
+            let latest = list_sidecars(root_uri, storage.as_ref())
+                .await?
+                .into_iter()
+                .find(|candidate| candidate.operation_id == sidecar.operation_id)
+                .ok_or_else(|| {
+                    stream_claim_error_v14(
+                        &sidecar,
+                        "checkpoint sidecar disappeared before same-operation rearm",
+                    )
+                })?;
+            sidecar = latest;
+            let checkpoint_snapshot =
+                fresh_snapshot_for_sidecar(root_uri, &storage, &sidecar).await?;
+            rearm_stream_claim_checkpoint_sidecar_v14(
+                root_uri,
+                storage.as_ref(),
+                &checkpoint_snapshot,
+                &mut sidecar,
+                next_attempt,
+            )
+            .await?;
+            Ok(Some(RecoveryStreamClaimOutcomeV14::CheckpointVisible {
+                prior_attempt_chain,
+                token_authority,
+            }))
+        }
+        other => Ok(Some(other)),
+    }
+}
+
+/// Arm one exact lifecycle-v3 management receipt before its immutable token-
+/// ledger transaction. This owner has no base-table effect and no graph
+/// lineage; its only terminal manifest batch selects the exact token pointer,
+/// exact prior→next lifecycle, and unchanged profile prestate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new_stream_lifecycle_receipt_sidecar_v14(
+    actor_id: String,
+    authority: RecoveryAuthorityToken,
+    prior_manifest_version: u64,
+    change_kind: RecoveryStreamLifecycleReceiptKind,
+    profile: super::StreamProfileEntry,
+    prior_lifecycle: super::StreamLifecycleEntry,
+    current_claim_receipt: Option<super::stream::ClaimReceipt>,
+    next_lifecycle: super::StreamLifecycleEntry,
+    prior_token_authority: super::StreamTokenAuthorityEntry,
+    planned_receipt: super::stream::ManagementReceipt,
+    planned_transaction: StagedTransactionIdentity,
+) -> Result<RecoverySidecar> {
+    let admission_scope = RecoveryStreamAdmissionScope {
+        identity: prior_lifecycle.identity,
+        table_branch: prior_lifecycle.binding.table_branch.clone(),
+        binding_scope_id: prior_lifecycle.binding_scope_id.clone(),
+    };
+    let mut sidecar = new_unvalidated_sidecar(
+        STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION,
+        SidecarKind::StreamLifecycleReceipt,
+        None,
+        Some(actor_id),
+        Vec::new(),
+    );
+    sidecar.protocol_v14 = Some(Box::new(RecoveryProtocolV14::StreamLifecycleReceipt(
+        RecoveryStreamLifecycleReceiptV14 {
+            authority,
+            admission_scope,
+            prior_manifest_version,
+            change_kind,
+            effect_phase: RecoveryEffectPhase::Armed,
+            profile,
+            prior_lifecycle,
+            current_claim_receipt,
+            next_lifecycle,
+            receipt: RecoveryStreamLifecycleReceiptEffect {
+                prior_authority: prior_token_authority,
+                planned_receipt,
+                planned_transaction,
+                confirmed_transaction: None,
+                confirmed_head: None,
+                next_authority: None,
+            },
+        },
+    )));
+    validate_sidecar_shape("<new-stream-lifecycle-receipt-sidecar-v14>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Bind the exact achieved lifecycle-ledger N+1 effect before the sole
+/// lineage-neutral token-pointer/lifecycle manifest CAS.
+pub(crate) async fn confirm_stream_lifecycle_receipt_sidecar_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    committed_transaction: StagedTransactionIdentity,
+    achieved_head: super::CurrentHeadWitness,
+    next_authority: super::StreamTokenAuthorityEntry,
+) -> Result<()> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    validate_sidecar_shape(&uri, sidecar)?;
+    let protocol = stream_lifecycle_receipt_protocol(sidecar);
+    if protocol.effect_phase != RecoveryEffectPhase::Armed
+        || committed_transaction != protocol.receipt.planned_transaction
+        || achieved_head.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
+        || achieved_head.table_version
+            != committed_transaction
+                .read_version
+                .checked_add(1)
+                .ok_or_else(|| OmniError::manifest_internal("stream-token version overflow"))?
+        || achieved_head.transaction_uuid != committed_transaction.uuid
+        || next_authority.current_head_witness != achieved_head
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "StreamLifecycleReceipt sidecar '{}' confirmation differs from its exact planned N+1 ledger effect",
+            sidecar.operation_id
+        )));
+    }
+    let mut confirmed = sidecar.clone();
+    let Some(RecoveryProtocolV14::StreamLifecycleReceipt(protocol)) =
+        confirmed.protocol_v14.as_deref_mut()
+    else {
+        unreachable!("validated v14 lifecycle-receipt sidecar");
+    };
+    protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+    protocol.receipt.confirmed_transaction = Some(committed_transaction);
+    protocol.receipt.confirmed_head = Some(achieved_head);
+    protocol.receipt.next_authority = Some(next_authority);
+    validate_sidecar_shape(&uri, &confirmed)?;
+    let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize confirmed StreamLifecycleReceipt sidecar: {error}"
         ))
     })?;
     storage.write_text(&uri, &json).await?;
@@ -12487,6 +17567,110 @@ pub(crate) async fn confirm_stream_fold_sidecar_v12(
     Ok(())
 }
 
+/// Bind both exact lifecycle-v3 fold participants in one durable sidecar
+/// rewrite. The implementation is shared by ordinary and drain folds.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn confirm_stream_fold_sidecar_v14(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    base_committed_transaction: StagedTransactionIdentity,
+    confirmed_merged_generation: MergedGeneration,
+    achieved_base_head: super::CurrentHeadWitness,
+    base_update: SubTableUpdate,
+    token_committed_transaction: StagedTransactionIdentity,
+    achieved_token_head: super::CurrentHeadWitness,
+    next_token_authority: super::StreamTokenAuthorityEntry,
+) -> Result<()> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    validate_sidecar_shape(&uri, sidecar)?;
+    let protocol = match sidecar.protocol_v14.as_deref() {
+        Some(RecoveryProtocolV14::StreamFoldV2(protocol))
+        | Some(RecoveryProtocolV14::StreamDrainFold(protocol)) => protocol,
+        _ => {
+            return Err(OmniError::manifest_internal(
+                "confirm_stream_fold_sidecar_v14 requires a lifecycle-v3 fold sidecar",
+            ));
+        }
+    };
+    if protocol.effect_phase != RecoveryEffectPhase::Armed {
+        return Err(OmniError::manifest_internal(format!(
+            "StreamFoldV14 sidecar '{}' is already EffectsConfirmed",
+            sidecar.operation_id
+        )));
+    }
+    let pin = &sidecar.tables[0];
+    if base_committed_transaction != protocol.base.planned_transaction
+        || confirmed_merged_generation != protocol.merged_generation
+        || achieved_base_head.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
+        || achieved_base_head.table_version != pin.post_commit_pin
+        || achieved_base_head.transaction_uuid != base_committed_transaction.uuid
+        || base_update.identity != pin.identity
+        || base_update.table_key != pin.table_key
+        || base_update.table_version != pin.post_commit_pin
+        || base_update.table_branch.is_some()
+        || token_committed_transaction != protocol.token.planned_transaction
+        || achieved_token_head.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
+        || achieved_token_head.table_version
+            != protocol
+                .token
+                .planned_transaction
+                .read_version
+                .checked_add(1)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("StreamFoldV14 token version overflow")
+                })?
+        || achieved_token_head.transaction_uuid != token_committed_transaction.uuid
+        || next_token_authority.current_head_witness != achieved_token_head
+        || next_token_authority.location != protocol.token.prior_authority.location
+        || next_token_authority.schema_version != protocol.token.prior_authority.schema_version
+        || next_token_authority.schema_hash != protocol.token.prior_authority.schema_hash
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "StreamFoldV14 sidecar '{}' confirmation differs from its exact base+token N+1 plan; leaving recovery Armed",
+            sidecar.operation_id
+        )));
+    }
+
+    let mut confirmed = sidecar.clone();
+    let confirmed_protocol = match confirmed.protocol_v14.as_deref_mut() {
+        Some(RecoveryProtocolV14::StreamFoldV2(protocol))
+        | Some(RecoveryProtocolV14::StreamDrainFold(protocol)) => protocol,
+        _ => unreachable!("validated lifecycle-v3 fold sidecar"),
+    };
+    confirmed_protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+    confirmed_protocol.base.confirmed_transaction = Some(base_committed_transaction);
+    confirmed_protocol.base.confirmed_merged_generation = Some(confirmed_merged_generation);
+    confirmed_protocol.base.confirmed_head = Some(achieved_base_head.clone());
+    confirmed_protocol.base.confirmed_update = Some(RecoveryConfirmedTableUpdate {
+        table_version: base_update.table_version,
+        table_branch: base_update.table_branch,
+        row_count: base_update.row_count,
+        version_metadata: base_update.version_metadata,
+    });
+    confirmed_protocol.token.confirmed_transaction = Some(token_committed_transaction);
+    confirmed_protocol.token.confirmed_head = Some(achieved_token_head);
+    confirmed_protocol.token.next_authority = Some(next_token_authority);
+    let mut next_lifecycle = confirmed_protocol.planned_next_lifecycle.clone();
+    next_lifecycle.current_head_witness = achieved_base_head.clone();
+    if let Some(drain) = next_lifecycle.drain.as_mut() {
+        drain.expected_current_head_witness = achieved_base_head;
+    }
+    confirmed_protocol.next_lifecycle = Some(next_lifecycle);
+    confirmed.tables[0].confirmed_version = Some(base_update.table_version);
+
+    validate_sidecar_shape(&uri, &confirmed)?;
+    let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize confirmed StreamFoldV14 sidecar: {error}"
+        ))
+    })?;
+    storage.write_text(&uri, &json).await?;
+    *sidecar = confirmed;
+    Ok(())
+}
+
 /// Arm the narrow schema-v6 EnsureIndices recovery bridge. Index effects still
 /// use the legacy loose classifier, but compensation gets a stable lineage id
 /// so a crash after rollback publish cannot be misread as roll-forward.
@@ -12601,6 +17785,8 @@ pub(crate) fn new_ensure_indices_sidecar_v9(
         protocol_v11: None,
         protocol_v12: None,
         protocol_v13: None,
+
+        protocol_v14: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-ensure-indices-v9-sidecar>", &sidecar)?;
@@ -12859,6 +18045,8 @@ pub(crate) fn new_occ_sidecar_v9(
         protocol_v11: None,
         protocol_v12: None,
         protocol_v13: None,
+
+        protocol_v14: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-occ-sidecar>", &sidecar)?;
@@ -13047,6 +18235,8 @@ pub(crate) fn new_schema_apply_sidecar_v9(
         protocol_v11: None,
         protocol_v12: None,
         protocol_v13: None,
+
+        protocol_v14: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-schema-apply-v9-sidecar>", &sidecar)?;
@@ -13216,6 +18406,8 @@ pub(crate) fn new_branch_merge_sidecar_v9(
         protocol_v11: None,
         protocol_v12: None,
         protocol_v13: None,
+
+        protocol_v14: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-branch-merge-sidecar>", &sidecar)?;
@@ -13531,6 +18723,502 @@ mod tests {
         }
     }
 
+    fn open_lifecycle_v3(
+        identity: TableIdentity,
+        table_key: &str,
+        binding: super::super::stream::StreamPhysicalBinding,
+        head: super::super::stream::CurrentHeadWitness,
+        epoch_floor: u64,
+        enrollment_receipt: super::super::stream::EnrollmentReceipt,
+    ) -> super::super::stream::StreamLifecycleEntry {
+        use super::super::stream::{
+            BindingReceipt, binding_receipt_chain_genesis, stream_graph_identity_digest,
+        };
+
+        let binding_scope_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let binding_receipt = BindingReceipt::new(
+            stream_graph_identity_digest("domain-a").unwrap(),
+            identity,
+            &binding_receipt_chain_genesis(),
+            binding_scope_id,
+            enrollment_receipt.stream_incarnation_id.clone(),
+            binding.clone(),
+            "INITIAL_ENROLLMENT",
+            1,
+        )
+        .unwrap();
+        super::super::stream::StreamLifecycleEntry::new_open_enrollment(
+            identity,
+            table_key.to_string(),
+            binding.clone(),
+            binding_scope_id.to_string(),
+            head,
+            BTreeMap::from([(binding.shard_ids[0].clone(), epoch_floor)]),
+            enrollment_receipt,
+            binding_receipt.record_id.clone(),
+            binding_receipt.next_chain_ref().unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn stream_claim_sidecar_v14() -> (
+        RecoverySidecar,
+        crate::db::omnigraph::stream_lifecycle::PreparedClaimAttempt,
+    ) {
+        use crate::db::manifest::stream::{
+            ClaimProfile, EnrollmentReceipt, claim_attempt_chain_genesis,
+            stream_graph_identity_digest,
+        };
+        use crate::db::manifest::stream_profile::{
+            FoldDelegation, ReceiptChainRef, StreamProfileEntry, StreamProfileState,
+        };
+        use crate::db::manifest::{
+            CurrentHeadWitness, STREAM_CONFIG_VERSION, StreamPhysicalBinding,
+        };
+        use crate::db::omnigraph::stream_lifecycle::{
+            ClaimAttemptRequest, ClaimOperationRequest, prepare_claim_attempt,
+            prepare_claim_operation,
+        };
+
+        let identity = test_identity("node:Person");
+        let shard_id = "22222222-2222-4222-8222-222222222222";
+        let binding = StreamPhysicalBinding {
+            stable_table_id: identity.stable_table_id,
+            table_incarnation_id: identity.table_incarnation_id,
+            table_location: crate::db::manifest::table_path_for_identity("node:Person", identity)
+                .unwrap(),
+            table_branch: None,
+            enrollment_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            shard_ids: vec![shard_id.to_string()],
+            stream_config_version: STREAM_CONFIG_VERSION,
+            stream_config_hash: stream_config_v3_hash(),
+        };
+        let head = CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 5,
+            transaction_uuid: "33333333-3333-4333-8333-333333333333".to_string(),
+            manifest_e_tag: Some("base-etag".to_string()),
+        };
+        let enrollment = EnrollmentReceipt::new(
+            "44444444-4444-4444-8444-444444444444".to_string(),
+            format!("sha256:{}", "1".repeat(64)),
+            "55555555-5555-4555-8555-555555555555".to_string(),
+            binding.clone(),
+        )
+        .unwrap();
+        let lifecycle = open_lifecycle_v3(identity, "node:Person", binding, head, 1, enrollment);
+        let delegation = FoldDelegation::issue(
+            "66666666-6666-4666-8666-666666666666",
+            format!("sha256:{}", "2".repeat(64)),
+            "declaration-1",
+            format!("sha256:{}", "3".repeat(64)),
+            2,
+            "act-operator",
+            5,
+        )
+        .unwrap();
+        let profile = StreamProfileEntry {
+            profile_revision: 2,
+            profile_receipt_chain: ReceiptChainRef::genesis(),
+            state: StreamProfileState::Enabled {
+                active_fold_delegation: delegation,
+            },
+        };
+        profile.validate().unwrap();
+        let graph_identity_digest = stream_graph_identity_digest("domain-a").unwrap();
+        let operation = prepare_claim_operation(
+            &lifecycle,
+            ClaimOperationRequest {
+                graph_identity_digest,
+                claim_id: "77777777-7777-4777-8777-777777777777".to_string(),
+                lifecycle_operation_id: None,
+                recovery_operation_id: "claim-recovery-1".to_string(),
+                claim_kind: "COLD_OPEN".to_string(),
+                profile: ClaimProfile::RetainAll,
+                shard_id: shard_id.to_string(),
+                initial_shard_manifest_version: 1,
+                initial_writer_epoch: 1,
+                initial_replay_cursor: 0,
+                initial_current_generation: 1,
+                initial_base_merged_generation: 0,
+                claim_contract_version: 1,
+            },
+        )
+        .unwrap();
+        let attempt = prepare_claim_attempt(
+            &operation,
+            ClaimAttemptRequest {
+                attempt_id: "88888888-8888-4888-8888-888888888888".to_string(),
+                pre_shard_manifest_version: 1,
+                pre_writer_epoch: 1,
+                pre_replay_cursor: 0,
+                planned_sentinel_position: 1,
+                planned_writer_epoch: 2,
+                storage_envelope_digest: None,
+            },
+        )
+        .unwrap();
+        let prior_token_authority = super::super::token_store::StreamTokenAuthorityEntry {
+            location: super::super::token_store::STREAM_TOKEN_DATASET_PATH.to_string(),
+            schema_version: super::super::token_store::STREAM_TOKEN_AUTHORITY_SCHEMA_VERSION,
+            schema_hash: super::super::token_store::stream_token_schema_hash(),
+            current_head_witness: CurrentHeadWitness {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                table_version: 1,
+                transaction_uuid: "99999999-9999-4999-8999-999999999999".to_string(),
+                manifest_e_tag: None,
+            },
+        };
+        let sidecar = new_stream_claim_sidecar_v14(
+            Some("act-operator".to_string()),
+            RecoveryAuthorityToken {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                graph_head: Some("01H000000000000000000000C1".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
+                schema_ir_hash: "schema-hash".to_string(),
+                schema_identity_version: 1,
+            },
+            7,
+            profile,
+            lifecycle,
+            prior_token_authority,
+            claim_attempt_chain_genesis(),
+            &attempt,
+        )
+        .unwrap();
+        (sidecar, attempt)
+    }
+
+    fn stream_fold_sidecar_v14(drain_mode: bool) -> RecoverySidecar {
+        use crate::db::manifest::stream::{
+            ClaimProfile, DrainDescriptor, DrainGoal, EnrollmentReceipt, LastFoldOutcome,
+            LastFoldSummary, StreamGenerationCut, StreamLifecycle, claim_attempt_chain_genesis,
+            stream_graph_identity_digest,
+        };
+        use crate::db::manifest::stream_profile::{
+            FoldDelegation, ReceiptChainRef, StreamProfileEntry, StreamProfileState,
+        };
+        use crate::db::manifest::{
+            CurrentHeadWitness, STREAM_CONFIG_VERSION, StreamPhysicalBinding,
+        };
+        use crate::db::omnigraph::stream_lifecycle::{
+            AuthenticatedClaimWalSegment, ClaimAttemptEvidence, ClaimAttemptRequest,
+            ClaimOperationRequest, build_claim_adoption_row, build_claim_attempt_effect,
+            build_terminal_claim, prepare_claim_attempt, prepare_claim_operation,
+        };
+
+        let identity = test_identity("node:Person");
+        let shard_id = "22222222-2222-4222-8222-222222222222";
+        let drain_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let binding = StreamPhysicalBinding {
+            stable_table_id: identity.stable_table_id,
+            table_incarnation_id: identity.table_incarnation_id,
+            table_location: crate::db::manifest::table_path_for_identity("node:Person", identity)
+                .unwrap(),
+            table_branch: None,
+            enrollment_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            shard_ids: vec![shard_id.to_string()],
+            stream_config_version: STREAM_CONFIG_VERSION,
+            stream_config_hash: stream_config_v3_hash(),
+        };
+        let head = CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 5,
+            transaction_uuid: "33333333-3333-4333-8333-333333333333".to_string(),
+            manifest_e_tag: Some("base-etag".to_string()),
+        };
+        let enrollment = EnrollmentReceipt::new(
+            "44444444-4444-4444-8444-444444444444".to_string(),
+            format!("sha256:{}", "1".repeat(64)),
+            "55555555-5555-4555-8555-555555555555".to_string(),
+            binding.clone(),
+        )
+        .unwrap();
+        let mut preclaim = open_lifecycle_v3(
+            identity,
+            "node:Person",
+            binding.clone(),
+            head.clone(),
+            1,
+            enrollment,
+        );
+        if drain_mode {
+            let operation_request_payload = crate::db::manifest::stream::QuiesceRequestPayload {
+                protocol_version: crate::db::manifest::stream::QUIESCE_REQUEST_PROTOCOL_VERSION,
+                graph_identity_digest: stream_graph_identity_digest("domain-a").unwrap(),
+                identity,
+                stream_incarnation_id: preclaim.enrollment_receipt.stream_incarnation_id.clone(),
+                binding_scope_id: preclaim.binding_scope_id.clone(),
+                enrollment_id: binding.enrollment_id.clone(),
+                drain_id: drain_id.to_string(),
+                expected_lifecycle_revision: 1,
+                goal: DrainGoal::Sealed,
+                physical_binding_digest:
+                    crate::db::manifest::stream::stream_physical_binding_digest(&binding).unwrap(),
+                expected_current_head_witness: head.clone(),
+                target_epoch_floor_by_shard: BTreeMap::from([(shard_id.to_string(), 1)]),
+                seal_override: None,
+            };
+            let operation_request_digest = operation_request_payload.request_digest().unwrap();
+            preclaim.lifecycle = StreamLifecycle::Draining;
+            preclaim.lifecycle_revision = 2;
+            preclaim.drain = Some(DrainDescriptor {
+                drain_id: drain_id.to_string(),
+                operation_expected_revision: 1,
+                operation_request_digest,
+                goal: DrainGoal::Sealed,
+                initiating_actor: "act-operator".to_string(),
+                initiated_at: 5,
+                expected_binding: binding.clone(),
+                expected_current_head_witness: head.clone(),
+                operation_request_payload,
+                target_epoch_floor_by_shard: BTreeMap::from([(shard_id.to_string(), 1)]),
+                guarded_operation: None,
+                seal_override: None,
+            });
+            preclaim.validate().unwrap();
+        }
+        let delegation = FoldDelegation::issue(
+            "66666666-6666-4666-8666-666666666666",
+            format!("sha256:{}", "3".repeat(64)),
+            "declaration-1",
+            format!("sha256:{}", "4".repeat(64)),
+            2,
+            "act-operator",
+            5,
+        )
+        .unwrap();
+        let profile = StreamProfileEntry {
+            profile_revision: 2,
+            profile_receipt_chain: ReceiptChainRef::genesis(),
+            state: StreamProfileState::Enabled {
+                active_fold_delegation: delegation,
+            },
+        };
+        let operation = prepare_claim_operation(
+            &preclaim,
+            ClaimOperationRequest {
+                graph_identity_digest: stream_graph_identity_digest("domain-a").unwrap(),
+                claim_id: "77777777-7777-4777-8777-777777777777".to_string(),
+                recovery_operation_id: "fold-claim-recovery".to_string(),
+                lifecycle_operation_id: drain_mode.then(|| drain_id.to_string()),
+                claim_kind: if drain_mode {
+                    "DRAIN_FENCE".to_string()
+                } else {
+                    "COLD_OPEN".to_string()
+                },
+                profile: ClaimProfile::RetainAll,
+                shard_id: shard_id.to_string(),
+                initial_shard_manifest_version: 1,
+                initial_writer_epoch: 1,
+                initial_replay_cursor: 0,
+                initial_current_generation: 1,
+                initial_base_merged_generation: 0,
+                claim_contract_version: 1,
+            },
+        )
+        .unwrap();
+        let attempt = prepare_claim_attempt(
+            &operation,
+            ClaimAttemptRequest {
+                attempt_id: "88888888-8888-4888-8888-888888888888".to_string(),
+                pre_shard_manifest_version: 1,
+                pre_writer_epoch: 1,
+                pre_replay_cursor: 0,
+                planned_sentinel_position: 1,
+                planned_writer_epoch: 2,
+                storage_envelope_digest: None,
+            },
+        )
+        .unwrap();
+        let effect = build_claim_attempt_effect(
+            &claim_attempt_chain_genesis(),
+            &attempt,
+            ClaimAttemptEvidence::StockManifestPlusSentinel {
+                achieved_shard_manifest_version: 2,
+                achieved_writer_epoch: 2,
+            },
+        )
+        .unwrap();
+        let attempt_chain = effect.next_attempt_chain_ref().unwrap();
+        let lww_digest = format!("sha256:{}", "5".repeat(64));
+        let segment = AuthenticatedClaimWalSegment {
+            identity,
+            binding_scope_id: preclaim.binding_scope_id.clone(),
+            enrollment_id: binding.enrollment_id.clone(),
+            shard_id: shard_id.to_string(),
+            stream_incarnation_id: preclaim.enrollment_receipt.stream_incarnation_id.clone(),
+            prior_writer_epoch: 1,
+            achieved_writer_epoch: 2,
+            prior_position: 0,
+            position: 1,
+            published_prefix_position: 0,
+            entry_count: 1,
+            row_count: 0,
+            arrow_bytes: 0,
+            sentinel_digest: attempt.planned_sentinel_digest.clone(),
+            segment_digest: format!("sha256:{}", "6".repeat(64)),
+            empty_fence_state_digest: format!("sha256:{}", "7".repeat(64)),
+            suffix_lww_projection_digest: lww_digest.clone(),
+        };
+        let built = build_terminal_claim(
+            &preclaim.claim_receipt_chain,
+            &attempt,
+            &effect,
+            &attempt_chain,
+            &segment,
+            &lww_digest,
+            1,
+            10,
+        )
+        .unwrap();
+        let current_claim = built.receipt.clone();
+        let prior_lifecycle = build_claim_adoption_row(&preclaim, &built).unwrap();
+        let base_transaction = transaction(5, "99999999-9999-4999-8999-999999999999");
+        let planned_head = CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 6,
+            transaction_uuid: base_transaction.uuid.clone(),
+            manifest_e_tag: None,
+        };
+        let lineage = RecoveryLineageIntent {
+            graph_commit_id: "01H000000000000000000000F4".to_string(),
+            branch: None,
+            actor_id: Some(STREAM_FOLD_ACTOR.to_string()),
+            merged_parent_commit_id: None,
+            created_at: 20,
+        };
+        let generation_cut = RecoveryStreamFoldCut {
+            shard_id: ShardId::parse_str(shard_id).unwrap(),
+            writer_epoch: 2,
+            shard_manifest_version: 2,
+            replay_after_wal_entry_position: 1,
+            generation: 1,
+            generation_path: "_mem_wal/shard/gen_1".to_string(),
+        };
+        let mut next_lifecycle = prior_lifecycle.clone();
+        next_lifecycle.current_head_witness = planned_head.clone();
+        next_lifecycle.lifecycle_revision += 1;
+        if let Some(drain) = next_lifecycle.drain.as_mut() {
+            drain.expected_current_head_witness = planned_head;
+        }
+        next_lifecycle.last_fold_summary = Some(LastFoldSummary {
+            operation_id: "constructor-replaces-this".to_string(),
+            graph_commit_id: Some(lineage.graph_commit_id.clone()),
+            exact_generation_cut: StreamGenerationCut {
+                shard_id: shard_id.to_string(),
+                writer_epoch: 2,
+                shard_manifest_version: 2,
+                replay_after_wal_entry_position: 1,
+                generation: 1,
+                generation_path: "_mem_wal/shard/gen_1".to_string(),
+            },
+            outcome: LastFoldOutcome::Published,
+            input_rows: 1,
+            input_bytes: 1,
+            visible_rows: 1,
+            visible_bytes: 1,
+            recorded_at: lineage.created_at,
+        });
+        let contributor =
+            super::super::stream_token::TrustedContributorId::new("actor:test").unwrap();
+        let request = super::super::stream_token::AdmissionRequest {
+            identity,
+            logical_id: "person-1".to_string(),
+            envelope: super::super::stream_token::StreamWriteEnvelope {
+                stream_incarnation_id: prior_lifecycle
+                    .enrollment_receipt
+                    .stream_incarnation_id
+                    .clone(),
+                write_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+                predecessor_token: None,
+            },
+            contributor_id: contributor,
+            payload_digest: super::super::stream_token::PayloadDigest::from_bytes([9; 32]),
+        };
+        let metadata = super::super::stream_token::TrustedStreamRowMetadata::new_admission(
+            &request,
+            request.candidate_token().unwrap(),
+            None,
+            1,
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_string(),
+            0,
+        )
+        .unwrap();
+        let token_rows = vec![
+            super::super::stream_token::StreamTokenAuthorityRow::from_present_metadata(
+                identity,
+                "person-1".to_string(),
+                binding.enrollment_id.clone(),
+                &metadata,
+            )
+            .unwrap(),
+        ];
+        let attribution =
+            super::super::stream_token::stream_fold_attribution_commitment(&token_rows).unwrap();
+        let token_authority = super::super::token_store::StreamTokenAuthorityEntry {
+            location: super::super::token_store::STREAM_TOKEN_DATASET_PATH.to_string(),
+            schema_version: super::super::token_store::STREAM_TOKEN_AUTHORITY_SCHEMA_VERSION,
+            schema_hash: super::super::token_store::stream_token_schema_hash(),
+            current_head_witness: CurrentHeadWitness {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                table_version: 1,
+                transaction_uuid: "dddddddd-dddd-4ddd-8ddd-dddddddddddd".to_string(),
+                manifest_e_tag: None,
+            },
+        };
+        let table = make_pin("node:Person", "memory://test-graph/nodes/person", 5, 6);
+        let authority = RecoveryAuthorityToken {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            graph_head: Some("01H000000000000000000000F3".to_string()),
+            schema_identity_domain: "domain-a".to_string(),
+            schema_ir_hash: "schema-hash".to_string(),
+            schema_identity_version: 1,
+        };
+        let token_transaction = transaction(1, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+        if drain_mode {
+            new_stream_drain_fold_sidecar_v14(
+                table,
+                authority,
+                lineage,
+                7,
+                profile,
+                prior_lifecycle,
+                drain_id.to_string(),
+                current_claim,
+                lww_digest,
+                next_lifecycle,
+                None,
+                generation_cut,
+                base_transaction,
+                token_authority,
+                token_transaction,
+                token_rows,
+                attribution,
+            )
+            .unwrap()
+        } else {
+            new_stream_fold_v2_sidecar_v14(
+                table,
+                authority,
+                lineage,
+                7,
+                profile,
+                prior_lifecycle,
+                current_claim,
+                next_lifecycle,
+                None,
+                generation_cut,
+                base_transaction,
+                token_authority,
+                token_transaction,
+                token_rows,
+                attribution,
+            )
+            .unwrap()
+        }
+    }
+
     #[test]
     fn stream_fold_v12_effect_matrix_publishes_only_exact_exact() {
         use StreamFoldParticipantState::{ExactEffect, ExactNoEffect};
@@ -13550,6 +19238,244 @@ mod tests {
         assert_eq!(
             classify_stream_fold_v12_effect_matrix(ExactNoEffect, ExactEffect),
             StreamFoldV12EffectMatrix::Partial
+        );
+    }
+
+    #[test]
+    fn stream_fold_v14_shared_classifier_preserves_base_first_asymmetry() {
+        use StreamFoldParticipantState::{ExactEffect, ExactNoEffect};
+
+        assert_eq!(
+            classify_stream_fold_v14_effect_matrix(ExactNoEffect, ExactNoEffect),
+            StreamFoldV14EffectMatrix::EffectFree
+        );
+        assert_eq!(
+            classify_stream_fold_v14_effect_matrix(ExactEffect, ExactEffect),
+            StreamFoldV14EffectMatrix::Complete
+        );
+        assert_eq!(
+            classify_stream_fold_v14_effect_matrix(ExactEffect, ExactNoEffect),
+            StreamFoldV14EffectMatrix::BaseOnly
+        );
+        assert_eq!(
+            classify_stream_fold_v14_effect_matrix(ExactNoEffect, ExactEffect),
+            StreamFoldV14EffectMatrix::TokenOnly
+        );
+    }
+
+    #[test]
+    fn stream_fold_v14_modes_reject_wrong_claim_tail_and_drain_projection() {
+        let ordinary = stream_fold_sidecar_v14(false);
+        validate_sidecar_shape("<ordinary-fold-v14>", &ordinary).unwrap();
+        let ordinary_protocol = stream_fold_protocol_v14(&ordinary);
+        assert_eq!(
+            ordinary_protocol
+                .prior_lifecycle
+                .current_claim_receipt_id
+                .as_deref(),
+            Some(ordinary_protocol.current_claim_receipt.record_id.as_str())
+        );
+        assert_eq!(
+            ordinary_protocol.planned_next_lifecycle.claim_receipt_chain,
+            ordinary_protocol.prior_lifecycle.claim_receipt_chain
+        );
+        assert_eq!(
+            ordinary_protocol
+                .planned_next_lifecycle
+                .authenticated_wal_tail,
+            ordinary_protocol.prior_lifecycle.authenticated_wal_tail
+        );
+        // An OPEN writer may have acknowledged data after its claim sentinel.
+        // Only a drain fold is pinned to the terminal claim cursor.
+        let mut ordinary_after_writes = ordinary.clone();
+        let protocol = match ordinary_after_writes.protocol_v14.as_deref_mut().unwrap() {
+            RecoveryProtocolV14::StreamFoldV2(protocol) => protocol,
+            _ => unreachable!(),
+        };
+        protocol.generation_cut.replay_after_wal_entry_position = 2;
+        protocol
+            .planned_next_lifecycle
+            .last_fold_summary
+            .as_mut()
+            .unwrap()
+            .exact_generation_cut
+            .replay_after_wal_entry_position = 2;
+        validate_sidecar_shape("<ordinary-fold-after-data-writes>", &ordinary_after_writes)
+            .unwrap();
+
+        let drain = stream_fold_sidecar_v14(true);
+        validate_sidecar_shape("<drain-fold-v14>", &drain).unwrap();
+        let drain_protocol = stream_fold_protocol_v14(&drain);
+        let drain_authority = drain_protocol.drain_authority.as_ref().unwrap();
+        assert_eq!(
+            drain_protocol
+                .current_claim_receipt
+                .lifecycle_operation_id
+                .as_deref(),
+            Some(drain_authority.drain_id.as_str())
+        );
+        assert_eq!(
+            drain_authority.recomputed_lww_projection_digest,
+            drain_protocol
+                .prior_lifecycle
+                .authenticated_wal_tail
+                .lww_projection_digest
+        );
+
+        let mut wrong_projection = drain.clone();
+        let protocol = match wrong_projection.protocol_v14.as_deref_mut().unwrap() {
+            RecoveryProtocolV14::StreamDrainFold(protocol) => protocol,
+            _ => unreachable!(),
+        };
+        protocol
+            .drain_authority
+            .as_mut()
+            .unwrap()
+            .recomputed_lww_projection_digest = format!("sha256:{}", "f".repeat(64));
+        let error =
+            validate_sidecar_shape("<wrong-drain-projection>", &wrong_projection).unwrap_err();
+        assert!(
+            error.to_string().contains("recomputed full-generation LWW"),
+            "{error}"
+        );
+
+        let mut wrong_epoch = drain.clone();
+        let protocol = match wrong_epoch.protocol_v14.as_deref_mut().unwrap() {
+            RecoveryProtocolV14::StreamDrainFold(protocol) => protocol,
+            _ => unreachable!(),
+        };
+        protocol.generation_cut.writer_epoch += 1;
+        let error = validate_sidecar_shape("<wrong-drain-claim-epoch>", &wrong_epoch).unwrap_err();
+        assert!(
+            error.to_string().contains("current claim does not bind"),
+            "{error}"
+        );
+
+        let mut changed_tail = ordinary.clone();
+        let protocol = match changed_tail.protocol_v14.as_deref_mut().unwrap() {
+            RecoveryProtocolV14::StreamFoldV2(protocol) => protocol,
+            _ => unreachable!(),
+        };
+        protocol
+            .planned_next_lifecycle
+            .authenticated_wal_tail
+            .lww_projection_digest = format!("sha256:{}", "e".repeat(64));
+        let error =
+            validate_sidecar_shape("<fold-advances-claim-tail>", &changed_tail).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outside HEAD/revision/fold-summary"),
+            "{error}"
+        );
+
+        let mut wrong_discriminator = ordinary;
+        let protocol = match wrong_discriminator.protocol_v14.take().unwrap().as_ref() {
+            RecoveryProtocolV14::StreamFoldV2(protocol) => protocol.clone(),
+            _ => unreachable!(),
+        };
+        wrong_discriminator.writer_kind = SidecarKind::StreamDrainFold;
+        wrong_discriminator.protocol_v14 =
+            Some(Box::new(RecoveryProtocolV14::StreamDrainFold(protocol)));
+        let error =
+            validate_sidecar_shape("<open-as-drain-fold>", &wrong_discriminator).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("distinct exact OPEN versus DRAINING"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_fold_v14_confirmation_is_exact_for_both_participants() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::local());
+        let mut sidecar = stream_fold_sidecar_v14(false);
+        bind_sidecar_pins_to_root(&mut sidecar, root);
+        write_sidecar(root, storage.as_ref(), &sidecar)
+            .await
+            .unwrap();
+        let protocol = stream_fold_protocol_v14(&sidecar).clone();
+        let achieved_base_head = crate::db::manifest::CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 6,
+            transaction_uuid: protocol.base.planned_transaction.uuid.clone(),
+            manifest_e_tag: Some("base-next-etag".to_string()),
+        };
+        let achieved_token_head = crate::db::manifest::CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 2,
+            transaction_uuid: protocol.token.planned_transaction.uuid.clone(),
+            manifest_e_tag: None,
+        };
+        let next_token_authority = crate::db::manifest::StreamTokenAuthorityEntry {
+            location: protocol.token.prior_authority.location.clone(),
+            schema_version: protocol.token.prior_authority.schema_version,
+            schema_hash: protocol.token.prior_authority.schema_hash.clone(),
+            current_head_witness: achieved_token_head.clone(),
+        };
+        let update = SubTableUpdate {
+            identity: sidecar.tables[0].identity,
+            table_key: sidecar.tables[0].table_key.clone(),
+            table_version: 6,
+            table_branch: None,
+            row_count: 9,
+            version_metadata: test_version_metadata(),
+        };
+        let foreign_token = transaction(1, "ffffffff-ffff-4fff-8fff-ffffffffffff");
+        confirm_stream_fold_sidecar_v14(
+            root,
+            storage.as_ref(),
+            &mut sidecar,
+            protocol.base.planned_transaction.clone(),
+            protocol.merged_generation.clone(),
+            achieved_base_head.clone(),
+            update.clone(),
+            foreign_token,
+            achieved_token_head.clone(),
+            next_token_authority.clone(),
+        )
+        .await
+        .expect_err("foreign token transaction must leave StreamFoldV14 Armed");
+        assert_eq!(
+            stream_fold_protocol_v14(&sidecar).effect_phase,
+            RecoveryEffectPhase::Armed
+        );
+
+        confirm_stream_fold_sidecar_v14(
+            root,
+            storage.as_ref(),
+            &mut sidecar,
+            protocol.base.planned_transaction,
+            protocol.merged_generation,
+            achieved_base_head.clone(),
+            update,
+            protocol.token.planned_transaction,
+            achieved_token_head,
+            next_token_authority.clone(),
+        )
+        .await
+        .unwrap();
+        let confirmed = stream_fold_protocol_v14(&sidecar);
+        assert_eq!(
+            confirmed.effect_phase,
+            RecoveryEffectPhase::EffectsConfirmed
+        );
+        assert_eq!(
+            confirmed.token.next_authority.as_ref(),
+            Some(&next_token_authority)
+        );
+        let next = confirmed.next_lifecycle.as_ref().unwrap();
+        assert_eq!(next.current_head_witness, achieved_base_head);
+        assert_eq!(
+            next.claim_receipt_chain,
+            confirmed.prior_lifecycle.claim_receipt_chain
+        );
+        assert_eq!(
+            next.authenticated_wal_tail,
+            confirmed.prior_lifecycle.authenticated_wal_tail
         );
     }
 
@@ -13578,6 +19504,83 @@ mod tests {
             HashMap::from([(identity, planned)]),
         )
         .unwrap()
+    }
+
+    fn stream_enrollment_sidecar_v10() -> RecoverySidecar {
+        let identity = test_identity("node:Person");
+        let table_key = "node:Person";
+        let table_location =
+            crate::db::manifest::table_path_for_identity(table_key, identity).unwrap();
+        let enrollment_plan = MemWalEnrollmentPlan::new(
+            ShardId::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            ShardId::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+        )
+        .unwrap();
+        let baseline_head = crate::db::manifest::CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 5,
+            transaction_uuid: "33333333-3333-4333-8333-333333333333".to_string(),
+            manifest_e_tag: Some("prior-etag".to_string()),
+        };
+        let authority = RecoveryAuthorityToken {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            graph_head: Some("01H000000000000000000000E0".to_string()),
+            schema_identity_domain: "domain-a".to_string(),
+            schema_ir_hash: "schema-hash".to_string(),
+            schema_identity_version: 1,
+        };
+        let intended_binding = crate::db::manifest::StreamPhysicalBinding {
+            stable_table_id: identity.stable_table_id,
+            table_incarnation_id: identity.table_incarnation_id,
+            table_location: table_location.clone(),
+            table_branch: None,
+            enrollment_id: enrollment_plan.enrollment_id.to_string(),
+            shard_ids: vec![enrollment_plan.shard_id.to_string()],
+            stream_config_version: crate::db::manifest::STREAM_CONFIG_VERSION,
+            stream_config_hash: enrollment_plan.stream_config_hash(),
+        };
+        let enrollment_intent_digest =
+            crate::db::manifest::stream_enrollment_intent_digest_v1(
+                identity,
+                &table_location,
+                &authority.schema_identity_domain,
+                &authority.schema_ir_hash,
+                authority.schema_identity_version,
+                &baseline_head,
+                &intended_binding.stream_config_hash,
+            )
+            .unwrap();
+        let enrollment_receipt = crate::db::manifest::EnrollmentReceipt::new(
+            "44444444-4444-4444-8444-444444444444".to_string(),
+            enrollment_intent_digest,
+            "55555555-5555-4555-8555-555555555555".to_string(),
+            intended_binding.clone(),
+        )
+        .unwrap();
+        let actor_id = Some("act-operator".to_string());
+        let mut sidecar = new_unvalidated_sidecar(
+            STREAM_ENROLLMENT_SIDECAR_SCHEMA_VERSION,
+            SidecarKind::StreamEnrollment,
+            None,
+            actor_id.clone(),
+            vec![make_pin(table_key, &table_location, 5, 6)],
+        );
+        sidecar.protocol_v10 = Some(RecoveryProtocolV10 {
+            authority,
+            lineage: RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000E1".to_string(),
+                branch: None,
+                actor_id,
+                merged_parent_commit_id: None,
+                created_at: 456,
+            },
+            baseline_head,
+            enrollment_plan,
+            intended_binding,
+            enrollment_receipt,
+        });
+        validate_sidecar_shape("<stream-enrollment-v10-fixture>", &sidecar).unwrap();
+        sidecar
     }
 
     fn stream_fold_sidecar() -> RecoverySidecar {
@@ -13634,10 +19637,12 @@ mod tests {
     }
 
     fn stream_fold_sidecar_v12() -> RecoverySidecar {
-        use crate::db::manifest::stream::{LastFoldOutcome, LastFoldSummary, StreamGenerationCut};
+        use crate::db::manifest::stream::{
+            LastFoldOutcome, LastFoldSummary, LegacyStreamLifecycleEntryV2, StreamGenerationCut,
+            StreamLifecycle,
+        };
         use crate::db::manifest::{
-            CurrentHeadWitness, EnrollmentReceipt, STREAM_CONFIG_VERSION, StreamLifecycleEntry,
-            StreamPhysicalBinding,
+            CurrentHeadWitness, EnrollmentReceipt, STREAM_CONFIG_VERSION, StreamPhysicalBinding,
         };
 
         let identity = test_identity("node:Person");
@@ -13668,15 +19673,24 @@ mod tests {
             binding.clone(),
         )
         .unwrap();
-        let prior_lifecycle = StreamLifecycleEntry::new_open_enrollment(
+        let prior_lifecycle = LegacyStreamLifecycleEntryV2 {
             identity,
-            "node:Person".to_string(),
-            binding.clone(),
-            prior_head,
-            BTreeMap::from([(shard_id.to_string(), 1)]),
-            receipt,
-        )
-        .unwrap();
+            diagnostic_table_key: "node:Person".to_string(),
+            lifecycle: StreamLifecycle::Open,
+            binding: binding.clone(),
+            current_head_witness: prior_head,
+            epoch_floor_by_shard: BTreeMap::from([(shard_id.to_string(), 1)]),
+            lifecycle_revision: 1,
+            enrollment_receipt: receipt,
+            management_receipts: Vec::new(),
+            claim_receipts: Vec::new(),
+            current_claim_receipt_id: None,
+            drain: None,
+            strict_block: None,
+            sealed_proof: None,
+            last_fold_summary: None,
+        };
+        prior_lifecycle.validate().unwrap();
         let base_transaction = transaction(5, "55555555-5555-4555-8555-555555555555");
         let generation_cut = RecoveryStreamFoldCut {
             shard_id,
@@ -13767,10 +19781,25 @@ mod tests {
         ];
         let attribution =
             super::super::stream_token::stream_fold_attribution_commitment(&token_rows).unwrap();
-        new_stream_fold_sidecar_v12(
+        let mut sidecar = new_unvalidated_sidecar(
+            STREAM_FOLD_SIDECAR_SCHEMA_VERSION,
+            SidecarKind::StreamFold,
+            None,
             Some(STREAM_FOLD_ACTOR.to_string()),
-            make_pin("node:Person", "memory://test-graph/nodes/person", 5, 6),
-            RecoveryAuthorityToken {
+            vec![make_pin(
+                "node:Person",
+                "memory://test-graph/nodes/person",
+                5,
+                6,
+            )],
+        );
+        planned_next_lifecycle
+            .last_fold_summary
+            .as_mut()
+            .unwrap()
+            .operation_id = sidecar.operation_id.clone();
+        sidecar.protocol_v12 = Some(Box::new(RecoveryProtocolV12 {
+            authority: RecoveryAuthorityToken {
                 branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
                 graph_head: Some("01H000000000000000000000F0".to_string()),
                 schema_identity_domain: "domain-a".to_string(),
@@ -13779,17 +19808,957 @@ mod tests {
             },
             lineage,
             binding,
+            prior_merged_generation: None,
+            generation_cut: generation_cut.clone(),
+            merged_generation: MergedGeneration::new(
+                generation_cut.shard_id,
+                generation_cut.generation,
+            ),
+            effect_phase: RecoveryEffectPhase::Armed,
             prior_lifecycle,
             planned_next_lifecycle,
+            next_lifecycle: None,
+            base: RecoveryStreamFoldBaseEffect {
+                planned_transaction: base_transaction,
+                confirmed_transaction: None,
+                confirmed_merged_generation: None,
+                confirmed_head: None,
+                confirmed_update: None,
+            },
+            token: RecoveryStreamFoldTokenEffect {
+                prior_authority: prior_token_authority,
+                planned_transaction: transaction(1, "77777777-7777-4777-8777-777777777777"),
+                planned_rows: token_rows,
+                attribution_summary: attribution,
+                confirmed_transaction: None,
+                confirmed_head: None,
+                next_authority: None,
+            },
+        }));
+        validate_sidecar_shape("<historical-stream-fold-v12-fixture>", &sidecar).unwrap();
+        sidecar
+    }
+
+    fn stream_lifecycle_receipt_sidecar_v14() -> RecoverySidecar {
+        use crate::db::manifest::stream::{
+            DisableDrainAdoption, DrainDescriptor, DrainGoal, ManagementReceipt, StreamLifecycle,
+            stream_graph_identity_digest,
+        };
+        use crate::db::manifest::stream_profile::{
+            DisablePlan, FoldContinuation, FoldDelegation, ReceiptChainRef, StreamProfileEntry,
+            StreamProfileState,
+        };
+        use crate::db::manifest::{
+            CurrentHeadWitness, EnrollmentReceipt, STREAM_CONFIG_VERSION, StreamPhysicalBinding,
+        };
+
+        let identity = test_identity("node:Person");
+        let shard_id = "22222222-2222-4222-8222-222222222222";
+        let binding = StreamPhysicalBinding {
+            stable_table_id: identity.stable_table_id,
+            table_incarnation_id: identity.table_incarnation_id,
+            table_location: crate::db::manifest::table_path_for_identity("node:Person", identity)
+                .unwrap(),
+            table_branch: None,
+            enrollment_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            shard_ids: vec![shard_id.to_string()],
+            stream_config_version: STREAM_CONFIG_VERSION,
+            stream_config_hash: stream_config_v3_hash(),
+        };
+        let head = CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 5,
+            transaction_uuid: "33333333-3333-4333-8333-333333333333".to_string(),
+            manifest_e_tag: Some("base-etag".to_string()),
+        };
+        let enrollment = EnrollmentReceipt::new(
+            "44444444-4444-4444-8444-444444444444".to_string(),
+            format!("sha256:{}", "1".repeat(64)),
+            "55555555-5555-4555-8555-555555555555".to_string(),
+            binding.clone(),
+        )
+        .unwrap();
+        let mut prior = open_lifecycle_v3(
+            identity,
+            "node:Person",
+            binding.clone(),
+            head.clone(),
+            1,
+            enrollment,
+        );
+        let operation_request_payload =
+            crate::db::manifest::stream::QuiesceRequestPayload {
+                protocol_version: crate::db::manifest::stream::QUIESCE_REQUEST_PROTOCOL_VERSION,
+                graph_identity_digest: stream_graph_identity_digest("domain-a").unwrap(),
+                identity,
+                stream_incarnation_id: prior.enrollment_receipt.stream_incarnation_id.clone(),
+                binding_scope_id: prior.binding_scope_id.clone(),
+                enrollment_id: binding.enrollment_id.clone(),
+                drain_id: "66666666-6666-4666-8666-666666666666".to_string(),
+                expected_lifecycle_revision: 1,
+                goal: DrainGoal::OpenAfterFold,
+                physical_binding_digest:
+                    crate::db::manifest::stream::stream_physical_binding_digest(&binding).unwrap(),
+                expected_current_head_witness: head.clone(),
+                target_epoch_floor_by_shard: BTreeMap::from([(shard_id.to_string(), 1)]),
+                seal_override: None,
+            };
+        let operation_request_digest = operation_request_payload.request_digest().unwrap();
+        prior.lifecycle = StreamLifecycle::Draining;
+        prior.lifecycle_revision = 2;
+        prior.drain = Some(DrainDescriptor {
+            drain_id: "66666666-6666-4666-8666-666666666666".to_string(),
+            operation_expected_revision: 1,
+            operation_request_digest,
+            goal: DrainGoal::OpenAfterFold,
+            initiating_actor: "act-operator".to_string(),
+            initiated_at: 10,
+            expected_binding: binding,
+            expected_current_head_witness: head,
+            operation_request_payload,
+            target_epoch_floor_by_shard: BTreeMap::from([(shard_id.to_string(), 1)]),
+            guarded_operation: None,
+            seal_override: None,
+        });
+        prior.validate().unwrap();
+
+        let delegation = FoldDelegation::issue(
+            "77777777-7777-4777-8777-777777777777",
+            format!("sha256:{}", "3".repeat(64)),
+            "declaration-1",
+            format!("sha256:{}", "4".repeat(64)),
+            2,
+            "act-operator",
+            5,
+        )
+        .unwrap();
+        let continuation = FoldContinuation::derive(&delegation, 3).unwrap();
+        let disable_plan = DisablePlan::new(
+            "disable-operation",
+            format!("sha256:{}", "5".repeat(64)),
+            "declaration-2",
+            format!("sha256:{}", "6".repeat(64)),
+            "act-operator",
+            continuation,
+        )
+        .unwrap();
+        let profile = StreamProfileEntry {
+            profile_revision: 3,
+            profile_receipt_chain: ReceiptChainRef::genesis(),
+            state: StreamProfileState::Disabling { disable_plan },
+        };
+        profile.validate().unwrap();
+
+        let receipt = ManagementReceipt::new(
+            stream_graph_identity_digest("domain-a").unwrap(),
+            identity,
+            prior.enrollment_receipt.stream_incarnation_id.clone(),
+            prior.binding_scope_id.clone(),
+            &prior.management_receipt_chain,
+            "88888888-8888-4888-8888-888888888888",
+            "DISABLE_DRAIN_ADOPTION",
+            2,
+            3,
+            "act-operator",
+            serde_json::json!({
+                "disable_operation_id": "disable-operation",
+                "drain_id": "66666666-6666-4666-8666-666666666666"
+            }),
+            serde_json::json!({"goal": "SEALED", "revision": 3}),
+            11,
+        )
+        .unwrap();
+        let mut next = prior.clone();
+        next.lifecycle_revision = 3;
+        next.management_receipt_chain = receipt.next_chain_ref().unwrap();
+        let next_drain = next.drain.as_mut().unwrap();
+        next_drain.goal = DrainGoal::Sealed;
+        next_drain.seal_override = Some(DisableDrainAdoption {
+            adoption_id: format!("sha256:{}", "7".repeat(64)),
+            disable_operation_id: "disable-operation".to_string(),
+            request_digest: receipt.request_digest.clone(),
+            profile_revision: 3,
+            management_receipt_id: receipt.record_id.clone(),
+            adopted_at: 11,
+        });
+        next.validate().unwrap();
+
+        let prior_token_authority = super::super::token_store::StreamTokenAuthorityEntry {
+            location: super::super::token_store::STREAM_TOKEN_DATASET_PATH.to_string(),
+            schema_version: super::super::token_store::STREAM_TOKEN_AUTHORITY_SCHEMA_VERSION,
+            schema_hash: super::super::token_store::stream_token_schema_hash(),
+            current_head_witness: CurrentHeadWitness {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                table_version: 1,
+                transaction_uuid: "99999999-9999-4999-8999-999999999999".to_string(),
+                manifest_e_tag: None,
+            },
+        };
+        new_stream_lifecycle_receipt_sidecar_v14(
+            "act-operator".to_string(),
+            RecoveryAuthorityToken {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                graph_head: Some("01H000000000000000000000V1".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
+                schema_ir_hash: "schema-hash".to_string(),
+                schema_identity_version: 1,
+            },
+            7,
+            RecoveryStreamLifecycleReceiptKind::DisableDrainAdoption,
+            profile,
+            prior,
             None,
-            generation_cut,
-            base_transaction,
+            next,
             prior_token_authority,
-            transaction(1, "77777777-7777-4777-8777-777777777777"),
-            token_rows,
-            attribution,
+            receipt,
+            transaction(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
         )
         .unwrap()
+    }
+
+    fn stream_quiesce_lifecycle_receipt_sidecar_v14() -> RecoverySidecar {
+        use crate::db::manifest::stream::{
+            ManagementReceipt, stream_graph_identity_digest, stream_quiesce_result_payload,
+        };
+        use crate::db::omnigraph::stream_lifecycle::{EmptyCutEvidence, build_draining_to_sealed};
+
+        let fold_sidecar = stream_fold_sidecar_v14(true);
+        let fold = stream_fold_protocol_v14(&fold_sidecar);
+        let prior = fold.prior_lifecycle.clone();
+        let current_claim_receipt = fold.current_claim_receipt.clone();
+        let request_payload = prior
+            .drain
+            .as_ref()
+            .unwrap()
+            .operation_request_payload
+            .to_value()
+            .unwrap();
+        let next_revision = prior.lifecycle_revision.checked_add(1).unwrap();
+        let receipt = ManagementReceipt::new(
+            stream_graph_identity_digest("domain-a").unwrap(),
+            prior.identity,
+            prior.enrollment_receipt.stream_incarnation_id.clone(),
+            prior.binding_scope_id.clone(),
+            &prior.management_receipt_chain,
+            prior.drain.as_ref().unwrap().drain_id.clone(),
+            "QUIESCE",
+            prior.drain.as_ref().unwrap().operation_expected_revision,
+            next_revision,
+            prior.drain.as_ref().unwrap().initiating_actor.clone(),
+            request_payload,
+            stream_quiesce_result_payload(next_revision).unwrap(),
+            30,
+        )
+        .unwrap();
+        let evidence = EmptyCutEvidence {
+            shard_manifest_version: current_claim_receipt.achieved_shard_manifest_version,
+            writer_epoch: current_claim_receipt.achieved_writer_epoch,
+            replay_cursor: current_claim_receipt.replay_cursor,
+            current_generation: 1,
+            base_merged_generation: 0,
+        };
+        let next =
+            build_draining_to_sealed(&prior, &receipt, &current_claim_receipt, evidence).unwrap();
+        new_stream_lifecycle_receipt_sidecar_v14(
+            prior.drain.as_ref().unwrap().initiating_actor.clone(),
+            fold.authority.clone(),
+            fold.prior_manifest_version,
+            RecoveryStreamLifecycleReceiptKind::QuiesceFinalize,
+            fold.profile.clone(),
+            prior,
+            Some(current_claim_receipt),
+            next,
+            fold.token.prior_authority.clone(),
+            receipt,
+            transaction(
+                fold.token
+                    .prior_authority
+                    .current_head_witness
+                    .table_version,
+                "12121212-1212-4212-8212-121212121212",
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stream_claim_v14_retains_one_attempt_and_recomputes_planner_digests() {
+        let (sidecar, prepared) = stream_claim_sidecar_v14();
+        assert_eq!(sidecar.writer_kind, SidecarKind::StreamClaim);
+        assert!(sidecar.tables.is_empty());
+        assert_eq!(
+            prepared_stream_claim_attempt_v14(&sidecar)
+                .unwrap()
+                .attempt_plan_digest,
+            prepared.attempt_plan_digest
+        );
+        let encoded = serde_json::to_string(&sidecar).unwrap();
+        assert!(encoded.contains("\"prior_attempt_chain\""));
+        assert!(encoded.contains("\"current_attempt\""));
+        assert!(!encoded.contains("\"attempt_effect_chain\":["));
+
+        let mut forged = sidecar.clone();
+        let Some(RecoveryProtocolV14::StreamClaim(protocol)) = forged.protocol_v14.as_deref_mut()
+        else {
+            unreachable!()
+        };
+        protocol.operation.claim_operation_digest = format!("sha256:{}", "f".repeat(64));
+        assert!(
+            validate_sidecar_shape("<forged-stream-claim>", &forged).is_err(),
+            "recovery must recompute the pure claim planner output, not trust a shaped digest"
+        );
+
+        let mut wrong_lifecycle_owner = sidecar;
+        let Some(RecoveryProtocolV14::StreamClaim(protocol)) =
+            wrong_lifecycle_owner.protocol_v14.as_deref_mut()
+        else {
+            unreachable!()
+        };
+        protocol.operation.lifecycle_operation_id =
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string());
+        assert!(
+            validate_sidecar_shape("<wrong-lifecycle-owner>", &wrong_lifecycle_owner).is_err(),
+            "OPEN claims must not acquire a synthetic drain/lifecycle operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_claim_v14_checkpoint_confirmation_is_exact_and_constant_size() {
+        use crate::db::omnigraph::stream_lifecycle::{
+            ClaimAttemptEvidence, build_claim_attempt_effect,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let storage = ObjectStorageAdapter::local();
+        let (mut sidecar, prepared) = stream_claim_sidecar_v14();
+        write_sidecar(root, &storage, &sidecar).await.unwrap();
+        let prior_chain = stream_claim_protocol_v14(&sidecar)
+            .prior_attempt_chain
+            .clone();
+        let effect = build_claim_attempt_effect(
+            &prior_chain,
+            &prepared,
+            ClaimAttemptEvidence::StockManifestOnly {
+                achieved_shard_manifest_version: 2,
+                achieved_writer_epoch: 2,
+            },
+        )
+        .unwrap();
+        let planned = transaction(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        arm_stream_claim_checkpoint_sidecar_v14(
+            root,
+            &storage,
+            &mut sidecar,
+            effect.clone(),
+            planned.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stream_claim_protocol_v14(&sidecar).phase,
+            RecoveryStreamClaimPhaseV14::LedgerArmed
+        );
+
+        let wrong = crate::db::manifest::CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 3,
+            transaction_uuid: planned.uuid.clone(),
+            manifest_e_tag: None,
+        };
+        let prior_authority = stream_claim_protocol_v14(&sidecar)
+            .prior_token_authority
+            .clone();
+        let wrong_authority = super::super::token_store::StreamTokenAuthorityEntry {
+            current_head_witness: wrong.clone(),
+            ..prior_authority.clone()
+        };
+        assert!(
+            confirm_stream_claim_sidecar_v14(
+                root,
+                &storage,
+                &mut sidecar,
+                planned.clone(),
+                wrong,
+                wrong_authority,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            stream_claim_protocol_v14(&sidecar).phase,
+            RecoveryStreamClaimPhaseV14::LedgerArmed
+        );
+
+        let achieved = crate::db::manifest::CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 2,
+            transaction_uuid: planned.uuid.clone(),
+            manifest_e_tag: None,
+        };
+        let next_authority = super::super::token_store::StreamTokenAuthorityEntry {
+            current_head_witness: achieved.clone(),
+            ..prior_authority
+        };
+        confirm_stream_claim_sidecar_v14(
+            root,
+            &storage,
+            &mut sidecar,
+            planned,
+            achieved,
+            next_authority.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stream_claim_protocol_v14(&sidecar).phase,
+            RecoveryStreamClaimPhaseV14::LedgerEffectsConfirmed
+        );
+        let mut checkpoint = sidecar.clone();
+        stream_claim_protocol_v14_mut(&mut checkpoint).phase =
+            RecoveryStreamClaimPhaseV14::CheckpointVisible;
+        validate_sidecar_shape("<checkpoint-visible>", &checkpoint).unwrap();
+        let RecoveryStreamClaimOutcomeV14::CheckpointVisible {
+            prior_attempt_chain,
+            token_authority,
+        } = stream_claim_checkpoint_outcome_v14(&checkpoint).unwrap()
+        else {
+            panic!("expected checkpoint-visible outcome")
+        };
+        assert_eq!(
+            prior_attempt_chain,
+            effect.next_attempt_chain_ref().unwrap()
+        );
+        assert_eq!(token_authority, next_authority);
+        let encoded = serde_json::to_string(&checkpoint).unwrap();
+        assert_eq!(encoded.matches("\"current_attempt\"").count(), 1);
+        assert!(!encoded.contains("\"attempt_effect_chain\":["));
+    }
+
+    #[tokio::test]
+    async fn stream_claim_v14_effect_free_classification_never_mints_ledger_authority() {
+        use crate::db::omnigraph::stream_lifecycle::{
+            ClaimAttemptEvidence, build_claim_attempt_effect,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let storage = ObjectStorageAdapter::local();
+        let (mut sidecar, prepared) = stream_claim_sidecar_v14();
+        write_sidecar(root, &storage, &sidecar).await.unwrap();
+        let effect = build_claim_attempt_effect(
+            &stream_claim_protocol_v14(&sidecar)
+                .prior_attempt_chain
+                .clone(),
+            &prepared,
+            ClaimAttemptEvidence::NoEffect,
+        )
+        .unwrap();
+        classify_effect_free_stream_claim_sidecar_v14(root, &storage, &mut sidecar, effect)
+            .await
+            .unwrap();
+        let protocol = stream_claim_protocol_v14(&sidecar);
+        assert_eq!(
+            protocol.phase,
+            RecoveryStreamClaimPhaseV14::EffectFreeClassified
+        );
+        assert!(protocol.ledger.is_none());
+        assert!(protocol.terminal.is_none());
+        assert!(protocol.classified_attempt.is_some());
+    }
+
+    #[test]
+    fn stream_lifecycle_receipt_v14_binds_zero_pin_admission_and_exact_delta() {
+        let sidecar = stream_lifecycle_receipt_sidecar_v14();
+        assert_eq!(
+            sidecar.schema_version,
+            STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION
+        );
+        assert_eq!(sidecar.writer_kind, SidecarKind::StreamLifecycleReceipt);
+        assert!(sidecar.writer_kind.is_graph_global_barrier());
+        assert!(sidecar.tables.is_empty());
+        let scope = sidecar.stream_admission_scope().unwrap();
+        assert_eq!(scope.identity, test_identity("node:Person"));
+        assert!(scope.table_branch.is_none());
+
+        let mut changed_tail = sidecar.clone();
+        let Some(RecoveryProtocolV14::StreamLifecycleReceipt(protocol)) =
+            changed_tail.protocol_v14.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.next_lifecycle.authenticated_wal_tail.position = 1;
+        assert!(
+            validate_sidecar_shape("<changed-tail>", &changed_tail)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid lifecycle successor")
+        );
+    }
+
+    #[test]
+    fn stream_quiesce_receipt_v14_binds_exact_claim_and_rebuilds_sealed_proof() {
+        let sidecar = stream_quiesce_lifecycle_receipt_sidecar_v14();
+        let encoded = serde_json::to_string(&sidecar).unwrap();
+        assert!(encoded.contains("\"current_claim_receipt\""));
+
+        let mut missing_claim = sidecar.clone();
+        let Some(RecoveryProtocolV14::StreamLifecycleReceipt(protocol)) =
+            missing_claim.protocol_v14.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.current_claim_receipt = None;
+        assert!(
+            validate_sidecar_shape("<quiesce-missing-claim>", &missing_claim)
+                .unwrap_err()
+                .to_string()
+                .contains("exact current ClaimReceipt")
+        );
+
+        let mut forged_proof = sidecar;
+        let Some(RecoveryProtocolV14::StreamLifecycleReceipt(protocol)) =
+            forged_proof.protocol_v14.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol
+            .next_lifecycle
+            .sealed_proof
+            .as_mut()
+            .unwrap()
+            .verified_empty_digest = format!("sha256:{}", "f".repeat(64));
+        assert!(
+            validate_sidecar_shape("<quiesce-forged-proof>", &forged_proof)
+                .unwrap_err()
+                .to_string()
+                .contains("byte-identical")
+        );
+    }
+
+    #[test]
+    fn stream_quiesce_receipt_v14_refuses_cross_graph_request_preimage() {
+        use crate::db::manifest::stream::{
+            ManagementReceipt, stream_graph_identity_digest, stream_quiesce_result_payload,
+        };
+        use crate::db::omnigraph::stream_lifecycle::{EmptyCutEvidence, build_draining_to_sealed};
+
+        let mut sidecar = stream_quiesce_lifecycle_receipt_sidecar_v14();
+        let Some(RecoveryProtocolV14::StreamLifecycleReceipt(protocol)) =
+            sidecar.protocol_v14.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        let drain = protocol.prior_lifecycle.drain.as_mut().unwrap();
+        drain.operation_request_payload.graph_identity_digest =
+            stream_graph_identity_digest("domain-b").unwrap();
+        drain.operation_request_digest = drain.operation_request_payload.request_digest().unwrap();
+        let request_payload = drain.operation_request_payload.to_value().unwrap();
+        let prior = protocol.prior_lifecycle.clone();
+        let prior_drain = prior.drain.as_ref().unwrap();
+        let current_claim = protocol.current_claim_receipt.clone().unwrap();
+        let receipt = ManagementReceipt::new(
+            stream_graph_identity_digest("domain-a").unwrap(),
+            prior.identity,
+            prior.enrollment_receipt.stream_incarnation_id.clone(),
+            prior.binding_scope_id.clone(),
+            &prior.management_receipt_chain,
+            prior_drain.drain_id.clone(),
+            "QUIESCE",
+            prior_drain.operation_expected_revision,
+            protocol.receipt.planned_receipt.to_revision,
+            prior_drain.initiating_actor.clone(),
+            request_payload,
+            stream_quiesce_result_payload(protocol.receipt.planned_receipt.to_revision).unwrap(),
+            protocol.receipt.planned_receipt.recorded_at,
+        )
+        .unwrap();
+        let proof = protocol.next_lifecycle.sealed_proof.as_ref().unwrap();
+        let evidence = EmptyCutEvidence {
+            shard_manifest_version: proof.shard_manifest_version,
+            writer_epoch: proof.writer_epoch,
+            replay_cursor: proof.replay_cursor,
+            current_generation: proof.current_generation,
+            base_merged_generation: proof.base_merged_generation,
+        };
+        protocol.next_lifecycle =
+            build_draining_to_sealed(&prior, &receipt, &current_claim, evidence).unwrap();
+        protocol.receipt.planned_receipt = receipt;
+        assert!(
+            validate_sidecar_shape("<quiesce-cross-graph-request>", &sidecar)
+                .unwrap_err()
+                .to_string()
+                .contains("exact unblocked SEALED drain")
+        );
+    }
+
+    #[test]
+    fn stream_disable_drain_adoption_v14_cannot_carry_claim_proof() {
+        let quiesce = stream_quiesce_lifecycle_receipt_sidecar_v14();
+        let claim = stream_lifecycle_receipt_protocol(&quiesce)
+            .current_claim_receipt
+            .clone()
+            .unwrap();
+        let mut adoption = stream_lifecycle_receipt_sidecar_v14();
+        let Some(RecoveryProtocolV14::StreamLifecycleReceipt(protocol)) =
+            adoption.protocol_v14.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.current_claim_receipt = Some(claim);
+        assert!(
+            validate_sidecar_shape("<adoption-with-claim>", &adoption)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot carry a current ClaimReceipt")
+        );
+
+        let mut wrong_result = stream_lifecycle_receipt_sidecar_v14();
+        let Some(RecoveryProtocolV14::StreamLifecycleReceipt(protocol)) =
+            wrong_result.protocol_v14.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        let prior = &protocol.prior_lifecycle;
+        let original = &protocol.receipt.planned_receipt;
+        let receipt = crate::db::manifest::stream::ManagementReceipt::new(
+            original.graph_identity_digest.clone(),
+            original.identity,
+            original.stream_incarnation_id.clone(),
+            original.binding_scope_id.clone(),
+            &prior.management_receipt_chain,
+            original.operation_id.clone(),
+            original.operation_kind.clone(),
+            original.from_revision,
+            original.to_revision,
+            original.actor_id.clone(),
+            original.request_payload.clone(),
+            serde_json::json!({"goal": "OPEN", "revision": original.to_revision}),
+            original.recorded_at,
+        )
+        .unwrap();
+        protocol.next_lifecycle.management_receipt_chain = receipt.next_chain_ref().unwrap();
+        let adoption = protocol
+            .next_lifecycle
+            .drain
+            .as_mut()
+            .unwrap()
+            .seal_override
+            .as_mut()
+            .unwrap();
+        adoption.management_receipt_id = receipt.record_id.clone();
+        adoption.request_digest = receipt.request_digest.clone();
+        protocol.receipt.planned_receipt = receipt;
+        assert!(
+            validate_sidecar_shape("<adoption-wrong-result>", &wrong_result)
+                .unwrap_err()
+                .to_string()
+                .contains("changes more than")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_quiesce_receipt_v14_exact_opens_selected_claim_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let session = crate::lance_access::control_session();
+        let initial_authority =
+            super::super::token_store::initialize_stream_token_authority(root, &session)
+                .await
+                .unwrap();
+        let mut sidecar = stream_quiesce_lifecycle_receipt_sidecar_v14();
+        {
+            let Some(RecoveryProtocolV14::StreamLifecycleReceipt(protocol)) =
+                sidecar.protocol_v14.as_deref_mut()
+            else {
+                unreachable!();
+            };
+            protocol.receipt.prior_authority = initial_authority.clone();
+            protocol.receipt.planned_transaction = transaction(
+                initial_authority.current_head_witness.table_version,
+                "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            );
+        }
+        validate_sidecar_shape("<quiesce-before-claim-ledger>", &sidecar).unwrap();
+        assert!(
+            validate_stream_lifecycle_receipt_current_claim_ledger_v14(root, &sidecar)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("does not contain the exact current ClaimReceipt")
+        );
+
+        let dataset = super::super::token_store::open_stream_token_authority_at(
+            root,
+            &initial_authority,
+            &session,
+        )
+        .await
+        .unwrap();
+        let claim = stream_lifecycle_receipt_protocol(&sidecar)
+            .current_claim_receipt
+            .clone()
+            .unwrap();
+        let records = [super::super::token_store::LifecycleLedgerRecord::ClaimReceipt(claim)];
+        let staged = super::super::token_store::stage_lifecycle_ledger_records(
+            dataset.clone(),
+            &initial_authority,
+            &records,
+        )
+        .await
+        .unwrap();
+        let store = TableStore::new(root, Arc::clone(&session));
+        let (achieved, _) = store
+            .commit_staged_exact(Arc::new(dataset), staged)
+            .await
+            .unwrap();
+        let selected_authority =
+            super::super::token_store::stream_token_authority_entry_for_dataset(&achieved)
+                .await
+                .unwrap();
+        {
+            let Some(RecoveryProtocolV14::StreamLifecycleReceipt(protocol)) =
+                sidecar.protocol_v14.as_deref_mut()
+            else {
+                unreachable!();
+            };
+            protocol.receipt.prior_authority = selected_authority.clone();
+            protocol.receipt.planned_transaction = transaction(
+                selected_authority.current_head_witness.table_version,
+                "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            );
+        }
+        validate_sidecar_shape("<quiesce-with-claim-ledger>", &sidecar).unwrap();
+        validate_stream_lifecycle_receipt_current_claim_ledger_v14(root, &sidecar)
+            .await
+            .unwrap();
+
+        let Some(RecoveryProtocolV14::StreamLifecycleReceipt(protocol)) =
+            sidecar.protocol_v14.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.current_claim_receipt.as_mut().unwrap().recorded_at += 1;
+        assert!(
+            validate_stream_lifecycle_receipt_current_claim_ledger_v14(root, &sidecar)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not byte-identical")
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_stream_sidecar_process_refusals_are_exact() {
+        let cases = [
+            (
+                stream_enrollment_sidecar_v10(),
+                "historical schema-v10 StreamEnrollment cannot be recovered under lifecycle-v3 because it lacks immutable binding-ledger authority; rebuild or use the matching historical binary",
+            ),
+            (
+                stream_fold_sidecar(),
+                "historical schema-v11 StreamFold cannot be recovered under internal schema v9 because it lacks the token participant and complete state-v2 lifecycle authority",
+            ),
+            (
+                stream_fold_sidecar_v12(),
+                "historical schema-v12 StreamFold cannot be recovered under lifecycle-v3 because its lifecycle-v2 authority cannot be synthesized; rebuild or use the matching historical binary",
+            ),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let db = crate::db::Omnigraph::init(root, "node Person { name: String @key }\n")
+            .await
+            .unwrap();
+        let snapshot = db.snapshot().await;
+        drop(db);
+        let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::local());
+
+        for (sidecar, expected_reason) in cases {
+            let body = serde_json::to_string(&sidecar).unwrap();
+            let parsed = parse_sidecar("<historical-stream-refusal>", &body)
+                .expect("historical refusal fixture must remain shape-valid");
+            let expected_operation_id = parsed.operation_id.clone();
+            let error = process_sidecar(
+                root,
+                &storage,
+                &snapshot,
+                &parsed,
+                RecoveryMode::Full,
+                SchemaStateRecovery::Noop,
+            )
+            .await
+            .expect_err("historical stream protocols must remain explicitly unrecoverable");
+            match error {
+                OmniError::RecoveryRequired {
+                    operation_id,
+                    reason,
+                } => {
+                    assert_eq!(operation_id, expected_operation_id);
+                    assert_eq!(reason, expected_reason);
+                }
+                other => panic!("unexpected historical-stream refusal: {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_v14_decodes_reserved_discriminators_but_processes_them_fail_closed() {
+        let active = stream_lifecycle_receipt_sidecar_v14();
+        let protocol = stream_lifecycle_receipt_protocol(&active);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let db = crate::db::Omnigraph::init(root, "node Person { name: String @key }\n")
+            .await
+            .unwrap();
+        let snapshot = db.snapshot().await;
+        drop(db);
+        let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::local());
+
+        let reserved_kinds = [
+            SidecarKind::StreamResume,
+            SidecarKind::StreamCorrection,
+            SidecarKind::StreamAuthorityRetirement,
+            SidecarKind::StreamTokenLedgerIndexMaintenance,
+            SidecarKind::StreamSealedMaintenance,
+            SidecarKind::StreamRebind,
+        ];
+        for writer_kind in reserved_kinds {
+            let mut reserved = new_unvalidated_sidecar(
+                STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION,
+                writer_kind,
+                None,
+                Some("act-operator".to_string()),
+                Vec::new(),
+            );
+            let scaffold = RecoveryStreamProtocolV14Scaffold {
+                authority: protocol.authority.clone(),
+                admission_scope: protocol.admission_scope.clone(),
+                operation_id: reserved.operation_id.clone(),
+            };
+            let reserved_protocol = match writer_kind {
+                SidecarKind::StreamResume => RecoveryProtocolV14::StreamResume(scaffold),
+                SidecarKind::StreamCorrection => RecoveryProtocolV14::StreamCorrection(scaffold),
+                SidecarKind::StreamAuthorityRetirement => {
+                    RecoveryProtocolV14::StreamAuthorityRetirement(scaffold)
+                }
+                SidecarKind::StreamTokenLedgerIndexMaintenance => {
+                    RecoveryProtocolV14::StreamTokenLedgerIndexMaintenance(scaffold)
+                }
+                SidecarKind::StreamSealedMaintenance => {
+                    RecoveryProtocolV14::StreamSealedMaintenance(scaffold)
+                }
+                SidecarKind::StreamRebind => RecoveryProtocolV14::StreamRebind(scaffold),
+                _ => unreachable!("reserved-kind list must contain only inactive v14 protocols"),
+            };
+            reserved.protocol_v14 = Some(Box::new(reserved_protocol));
+            let body = serde_json::to_string(&reserved).unwrap();
+            let parsed = parse_sidecar("<reserved-v14>", &body).unwrap();
+            assert_eq!(parsed.writer_kind, writer_kind);
+
+            if writer_kind == SidecarKind::StreamResume {
+                let unknown = body.replace("\"StreamResume\"", "\"StreamUnknown\"");
+                assert!(parse_sidecar("<unknown-v14>", &unknown).is_err());
+            }
+
+            let expected_operation_id = parsed.operation_id.clone();
+            let error = process_sidecar(
+                root,
+                &storage,
+                &snapshot,
+                &parsed,
+                RecoveryMode::Full,
+                SchemaStateRecovery::Noop,
+            )
+            .await
+            .expect_err("reserved v14 protocols must process fail-closed");
+            match error {
+                OmniError::RecoveryRequired {
+                    operation_id,
+                    reason,
+                } => {
+                    assert_eq!(operation_id, expected_operation_id);
+                    assert_eq!(
+                        reason,
+                        format!(
+                            "recovery-v14 discriminator {writer_kind:?} is reserved but its exact processor is inactive"
+                        )
+                    );
+                }
+                other => panic!("unexpected reserved-v14 refusal: {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_lifecycle_receipt_v14_confirmation_is_exact_and_rewrite_idempotent() {
+        let mut sidecar = stream_lifecycle_receipt_sidecar_v14();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let storage = ObjectStorageAdapter::local();
+        write_sidecar(root, &storage, &sidecar).await.unwrap();
+        let planned = stream_lifecycle_receipt_protocol(&sidecar)
+            .receipt
+            .planned_transaction
+            .clone();
+        let achieved_head = crate::db::manifest::CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 2,
+            transaction_uuid: planned.uuid.clone(),
+            manifest_e_tag: None,
+        };
+        let prior_authority = stream_lifecycle_receipt_protocol(&sidecar)
+            .receipt
+            .prior_authority
+            .clone();
+        let next_authority = super::super::token_store::StreamTokenAuthorityEntry {
+            current_head_witness: achieved_head.clone(),
+            ..prior_authority
+        };
+        confirm_stream_lifecycle_receipt_sidecar_v14(
+            root,
+            &storage,
+            &mut sidecar,
+            planned,
+            achieved_head,
+            next_authority.clone(),
+        )
+        .await
+        .unwrap();
+        let confirmed = stream_lifecycle_receipt_protocol(&sidecar);
+        assert_eq!(
+            confirmed.effect_phase,
+            RecoveryEffectPhase::EffectsConfirmed
+        );
+        assert_eq!(
+            confirmed.receipt.next_authority.as_ref(),
+            Some(&next_authority)
+        );
+        let retry_transaction = confirmed.receipt.planned_transaction.clone();
+        let retry_head = confirmed.receipt.confirmed_head.clone().unwrap();
+
+        let before = storage
+            .read_text_if_exists(&sidecar_uri(root, &sidecar.operation_id))
+            .await
+            .unwrap()
+            .unwrap();
+        let error = confirm_stream_lifecycle_receipt_sidecar_v14(
+            root,
+            &storage,
+            &mut sidecar,
+            retry_transaction,
+            retry_head,
+            next_authority,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("confirmation differs"));
+        let after = storage
+            .read_text_if_exists(&sidecar_uri(root, &sidecar.operation_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before, after);
     }
 
     #[tokio::test]
@@ -13922,6 +20891,19 @@ mod tests {
         assert!(
             json.get("protocol_v13").is_none(),
             "adding v13 must leave protocol_v12 serialization byte-shape unchanged"
+        );
+        assert!(
+            json.get("protocol_v14").is_none(),
+            "adding v14 must leave protocol_v12 serialization byte-shape unchanged"
+        );
+        assert!(
+            json["protocol_v12"]["prior_lifecycle"]
+                .get("management_receipts")
+                .is_some()
+                && json["protocol_v12"]["prior_lifecycle"]
+                    .get("binding_scope_id")
+                    .is_none(),
+            "historical v12 must retain lifecycle-v2 vectors rather than serialize lifecycle-v3 authority"
         );
         let reparsed = parse_sidecar("<stream-fold-v12>", &body).unwrap();
         assert!(reparsed.protocol_v12.is_some());
@@ -14426,9 +21408,9 @@ mod tests {
             binding.clone(),
         )
         .unwrap();
-        let lifecycle = StreamLifecycleEntry::new_open_enrollment(
+        let lifecycle = open_lifecycle_v3(
             entry.identity,
-            entry.table_key.clone(),
+            &entry.table_key,
             binding,
             CurrentHeadWitness {
                 branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
@@ -14436,10 +21418,9 @@ mod tests {
                 transaction_uuid: ShardId::new_v4().to_string(),
                 manifest_e_tag: None,
             },
-            BTreeMap::from([(plan.shard_id.to_string(), 1)]),
+            1,
             receipt,
-        )
-        .unwrap();
+        );
         manifest
             .commit_changes(&[ManifestChange::SetStreamLifecycle {
                 expected: None,
@@ -15013,9 +21994,9 @@ mod tests {
 
     #[test]
     fn parse_sidecar_refuses_mutation_with_multiple_writer_protocols() {
-        let mut sidecar = occ_sidecar();
-        let protocol_v3 = sidecar.protocol_v3.as_ref().unwrap();
-        sidecar.protocol_v7 = Some(RecoveryProtocolV7 {
+        let mut schema_apply_payload = occ_sidecar();
+        let protocol_v3 = schema_apply_payload.protocol_v3.as_ref().unwrap();
+        schema_apply_payload.protocol_v7 = Some(RecoveryProtocolV7 {
             authority: protocol_v3.authority.clone(),
             lineage: protocol_v3.lineage.clone(),
             rollback_graph_commit_id: "01H000000000000000000000BC".to_string(),
@@ -15032,10 +22013,24 @@ mod tests {
         });
 
         let error = parse_sidecar(
-            "memory://graph/__recovery/multi-protocol.json",
-            &serde_json::to_string(&sidecar).unwrap(),
+            "memory://graph/__recovery/multi-protocol-v7.json",
+            &serde_json::to_string(&schema_apply_payload).unwrap(),
         )
         .expect_err("a v9 Mutation must not dispatch through a foreign payload");
+        assert!(
+            error
+                .to_string()
+                .contains("must carry only the protocol_v3 writer payload"),
+            "unexpected malformed-sidecar error: {error}"
+        );
+
+        let mut stream_fold_payload = occ_sidecar();
+        stream_fold_payload.protocol_v12 = stream_fold_sidecar_v12().protocol_v12;
+        let error = parse_sidecar(
+            "memory://graph/__recovery/multi-protocol-v12.json",
+            &serde_json::to_string(&stream_fold_payload).unwrap(),
+        )
+        .expect_err("a v9 Mutation must not smuggle recovery-v12 attribution");
         assert!(
             error
                 .to_string()

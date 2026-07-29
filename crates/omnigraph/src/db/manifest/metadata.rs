@@ -210,11 +210,7 @@ fn full_manifest_object_store_path(
         return if suffix.is_empty() {
             Ok(dataset_path)
         } else {
-            Ok(format!(
-                "{}/{}",
-                dataset_path.trim_end_matches('/'),
-                suffix
-            ))
+            Ok(format!("{}/{}", dataset_path.trim_end_matches('/'), suffix))
         };
     }
 

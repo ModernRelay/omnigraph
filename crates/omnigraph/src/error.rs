@@ -171,6 +171,31 @@ pub enum OmniError {
     /// protocol text.
     #[error("checked streaming authority does not match current graph authority: {reason}")]
     StreamingAuthorityMismatch { reason: String },
+    /// An externally initiated stream-management request named a lifecycle
+    /// revision which is no longer current. This is an effect-free CAS
+    /// refusal: the caller must reread status and must not retarget the
+    /// original operation ID to the newer revision.
+    #[error(
+        "stream lifecycle changed for table {stable_table_id:016x}:{table_incarnation_id:016x}: expected revision {expected_revision}, current revision {current_revision}"
+    )]
+    StreamLifecycleChanged {
+        stable_table_id: u64,
+        table_incarnation_id: u64,
+        expected_revision: u64,
+        current_revision: u64,
+    },
+    /// The same lifecycle-management occurrence `(stream incarnation,
+    /// operation kind, operation ID)` was retained with a different canonical
+    /// request. The operation ID can never be reinterpreted as a new request.
+    #[error(
+        "stream lifecycle idempotency conflict for table {stable_table_id:016x}:{table_incarnation_id:016x}, operation {operation_kind} '{operation_id}'"
+    )]
+    StreamLifecycleIdempotencyConflict {
+        stable_table_id: u64,
+        table_incarnation_id: u64,
+        operation_kind: String,
+        operation_id: String,
+    },
     /// RETIRED is an irreversible read/export-only disposition. F2 decodes it
     /// fail-closed; the later retirement slice owns the sole transition into
     /// it and no transition out.
@@ -188,6 +213,12 @@ pub enum OmniError {
         rows: u64,
         bytes: u64,
     },
+    /// Strict validation rejected a durable stream generation and retained
+    /// canonical evidence for correction. The token is machine-readable so
+    /// callers never have to recover correction authority by parsing the
+    /// display string.
+    #[error("stream fold is strict-blocked; correction requires block token {block_token}")]
+    StreamDataBlocked { block_token: String },
     /// RFC-026 compare-and-chain request names a stream incarnation which is
     /// no longer current. This is proven before Lance is invoked.
     #[error(
