@@ -2,6 +2,7 @@
 //! models (moved verbatim from lib.rs in the modularization).
 
 use super::*;
+pub(crate) use omnigraph_control_authority::StateLockFile;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -104,11 +105,11 @@ pub struct StateObservations {
 impl StateObservations {
     pub(crate) fn observe_lock_metadata(&mut self, lock: &StateLockFile) {
         self.locked = true;
-        self.lock_id = Some(lock.lock_id.clone());
-        self.lock_operation = Some(lock.operation.clone());
-        self.lock_created_at = Some(lock.created_at.clone());
-        self.lock_pid = Some(lock.pid);
-        self.lock_age_seconds = lock_age_seconds(&lock.created_at);
+        self.lock_id = Some(lock.lock_id().to_string());
+        self.lock_operation = Some(lock.operation().to_string());
+        self.lock_created_at = Some(lock.created_at().to_string());
+        self.lock_pid = Some(lock.pid());
+        self.lock_age_seconds = lock_age_seconds(lock.created_at());
     }
 }
 
@@ -612,16 +613,6 @@ pub(crate) struct StateResource {
     /// pre-streaming ledgers (which must keep parsing unchanged).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) streaming_enabled: Option<bool>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StateLockFile {
-    pub(crate) version: u32,
-    pub(crate) lock_id: String,
-    pub(crate) operation: String,
-    pub(crate) created_at: String,
-    pub(crate) pid: u32,
 }
 
 /// Recovery-intent record for a graph-moving apply operation (RFC-004 §D2).

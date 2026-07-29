@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/omnigraph-compiler",
+    "crates/omnigraph-storage",
+    "crates/omnigraph-control-authority",
     "crates/omnigraph",
     "crates/omnigraph-cli",
     "crates/omnigraph-api-types",

@@ -517,6 +517,13 @@ gateway_surfaces! {
         "write_text", "write_text_if_absent", "rename_text", "delete",
         "write_text_if_match", "delete_prefix",
     ],
+    "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
+        "read_text", "read_text_if_exists", "exists", "list_dir", "read_text_versioned",
+    ],
+    "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::Durable(WriteProtocol::Composed("shared object storage primitive")) => [
+        "write_text", "write_text_if_absent", "rename_text", "delete",
+        "write_text_if_match", "delete_prefix",
+    ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::ReadOrPure => [
         "open_snapshot_at_entry", "open_snapshot_at_table", "open_dataset_head",
         "branch_identifier", "list_branches", "reopen_for_mutation",
@@ -629,10 +636,16 @@ durable_calls! {
     ("instrumentation.rs", ".rename_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".delete(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".delete_prefix(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
-    ("storage.rs", ".delete(", 2, WriteProtocol::Composed("storage adapter primitive")),
-    ("storage.rs", ".put(", 2, WriteProtocol::Composed("object storage put primitive")),
-    ("storage.rs", ".put_opts(", 2, WriteProtocol::Composed("object storage conditional put primitive")),
-    ("storage.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
+    ("storage.rs", ".write_text(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
+    ("storage.rs", ".write_text_if_absent(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
+    ("storage.rs", ".write_text_if_match(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
+    ("storage.rs", ".rename_text(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
+    ("storage.rs", ".delete(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
+    ("storage.rs", ".delete_prefix(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
+    ("omnigraph-storage/lib.rs", ".delete(", 2, WriteProtocol::Composed("storage adapter primitive")),
+    ("omnigraph-storage/lib.rs", ".put(", 2, WriteProtocol::Composed("object storage put primitive")),
+    ("omnigraph-storage/lib.rs", ".put_opts(", 2, WriteProtocol::Composed("object storage conditional put primitive")),
+    ("omnigraph-storage/lib.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
     ("storage_layer.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".force_delete_branch(", 1, WriteProtocol::NativeRefControl),
     ("storage_layer.rs", ".commit_staged_create_exact(", 1, WriteProtocol::Exact("sealed TableStorage create forwarding")),
@@ -865,6 +878,15 @@ const DURABLE_PRIMITIVES: &[&str] = &[
 fn engine_src_root() -> PathBuf {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     PathBuf::from(manifest_dir).join("src")
+}
+
+fn sibling_crate_src(engine_src: &Path, crate_name: &str) -> PathBuf {
+    engine_src
+        .parent()
+        .and_then(Path::parent)
+        .expect("engine crate lives below the workspace crates directory")
+        .join(crate_name)
+        .join("src")
 }
 
 fn is_allow_listed(src: &Path, path: &Path) -> bool {
@@ -1497,9 +1519,11 @@ type RetainAllDeleteCallsite = (
 
 #[rustfmt::skip]
 const RETAIN_ALL_DELETE_CALLS: &[RetainAllDeleteCallsite] = &[
-    ("storage.rs", "ObjectStorageAdapter::delete", "delete", "self.store => &location", 1, RetainAllDeleteScope::GenericGateway),
-    ("storage.rs", "ObjectStorageAdapter::delete_prefix", "delete", "self.store => &location", 1, RetainAllDeleteScope::GenericGateway),
-    ("storage.rs", "ObjectStorageAdapter::delete_prefix", "remove_dir_all", "tokio::fs::remove_dir_all => &path", 1, RetainAllDeleteScope::GenericGateway),
+    ("storage.rs", "ObjectStorageAdapter::delete", "delete", "omnigraph_storage::StorageAdapter::delete => &self.inner, uri", 1, RetainAllDeleteScope::GenericGateway),
+    ("storage.rs", "ObjectStorageAdapter::delete_prefix", "delete_prefix", "omnigraph_storage::StorageAdapter::delete_prefix => &self.inner, prefix_uri", 1, RetainAllDeleteScope::GenericGateway),
+    ("omnigraph-storage/lib.rs", "ObjectStorageAdapter::delete", "delete", "self.store => &location", 1, RetainAllDeleteScope::GenericGateway),
+    ("omnigraph-storage/lib.rs", "ObjectStorageAdapter::delete_prefix", "delete", "self.store => &location", 1, RetainAllDeleteScope::GenericGateway),
+    ("omnigraph-storage/lib.rs", "ObjectStorageAdapter::delete_prefix", "remove_dir_all", "tokio::fs::remove_dir_all => &path", 1, RetainAllDeleteScope::GenericGateway),
     ("instrumentation.rs", "CountingStorageAdapter::delete", "delete", "self.inner => uri", 1, RetainAllDeleteScope::GenericGateway),
     ("instrumentation.rs", "CountingStorageAdapter::delete_prefix", "delete_prefix", "self.inner => prefix_uri", 1, RetainAllDeleteScope::GenericGateway),
     ("db/omnigraph.rs", "best_effort_cleanup_init_artifacts", "delete", "storage => &uri", 1, RetainAllDeleteScope::ExactControlObject),
@@ -1509,8 +1533,8 @@ const RETAIN_ALL_DELETE_CALLS: &[RetainAllDeleteCallsite] = &[
     ("db/manifest/recovery.rs", "delete_sidecar", "delete", "storage => &handle.sidecar_uri", 1, RetainAllDeleteScope::ExactControlObject),
     ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id", "delete", "storage => &sidecar_uri(..)", 1, RetainAllDeleteScope::ExactControlObject),
     ("db/manifest/recovery.rs", "roll_back_schema_apply_v7", "delete_prefix", "storage => &pin.table_path", 2, RetainAllDeleteScope::FirstTouchRollback),
-    ("omnigraph-cluster/store.rs", "StateLockGuard::drop", "remove_file", "std::fs::remove_file => path", 1, RetainAllDeleteScope::ExactControlObject),
-    ("omnigraph-cluster/store.rs", "StateLockGuard::drop", "delete", "adapter => &uri", 2, RetainAllDeleteScope::ExactControlObject),
+    ("omnigraph-control-authority/lib.rs", "StateLockGuard::drop", "remove_file", "std::fs::remove_file => path", 1, RetainAllDeleteScope::ExactControlObject),
+    ("omnigraph-control-authority/lib.rs", "StateLockGuard::drop", "delete", "adapter => &uri", 2, RetainAllDeleteScope::ExactControlObject),
     ("omnigraph-cluster/store.rs", "ClusterStore::force_unlock", "delete", "self.adapter => &lock_uri", 1, RetainAllDeleteScope::ExactControlObject),
     ("omnigraph-cluster/store.rs", "ClusterStore::try_delete_object", "delete", "self.adapter => uri", 1, RetainAllDeleteScope::GenericGateway),
     ("omnigraph-cluster/store.rs", "ClusterStore::delete_object", "try_delete_object", "self => uri", 1, RetainAllDeleteScope::GenericGateway),
@@ -1734,6 +1758,22 @@ fn protocol_scan_files(src: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn durable_protocol_scan_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
+    let mut files = protocol_scan_files(engine_src)
+        .into_iter()
+        .map(|path| (relative_to_src(engine_src, &path), path))
+        .collect::<Vec<_>>();
+    let storage_src = sibling_crate_src(engine_src, "omnigraph-storage");
+    files.extend(walk_rust_files(&storage_src).into_iter().map(|path| {
+        (
+            format!("omnigraph-storage/{}", relative_to_src(&storage_src, &path)),
+            path,
+        )
+    }));
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
 fn retain_all_production_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
     let mut files = protocol_scan_files(engine_src)
         .into_iter()
@@ -1744,11 +1784,7 @@ fn retain_all_production_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
     // root deletion. Scan it as part of the same retain-all boundary, while
     // excluding its out-of-line `#[cfg(test)] mod tests` source (the attribute
     // lives in lib.rs and is not visible when tests.rs is parsed alone).
-    let cluster_src = engine_src
-        .parent()
-        .and_then(Path::parent)
-        .expect("engine crate lives below the workspace crates directory")
-        .join("omnigraph-cluster/src");
+    let cluster_src = sibling_crate_src(engine_src, "omnigraph-cluster");
     for path in walk_rust_files(&cluster_src) {
         if path.file_name().and_then(|name| name.to_str()) == Some("tests.rs") {
             continue;
@@ -1757,6 +1793,15 @@ fn retain_all_production_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
             format!("omnigraph-cluster/{}", relative_to_src(&cluster_src, &path)),
             path,
         ));
+    }
+    for crate_name in ["omnigraph-storage", "omnigraph-control-authority"] {
+        let crate_src = sibling_crate_src(engine_src, crate_name);
+        files.extend(walk_rust_files(&crate_src).into_iter().map(|path| {
+            (
+                format!("{crate_name}/{}", relative_to_src(&crate_src, &path)),
+                path,
+            )
+        }));
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
@@ -1883,10 +1928,20 @@ fn is_gateway_owner(relative: &str, owner: &str) -> bool {
         .any(|surface| surface.file == relative && surface.owner == owner)
 }
 
-fn callable_gateway_surfaces(src: &Path) -> BTreeSet<(String, String, String)> {
+fn callable_gateway_surfaces(engine_src: &Path) -> BTreeSet<(String, String, String)> {
     let mut surfaces = BTreeSet::new();
-    for file in walk_rust_files(src) {
-        let relative = relative_to_src(src, &file);
+    let mut files = walk_rust_files(engine_src)
+        .into_iter()
+        .map(|path| (relative_to_src(engine_src, &path), path))
+        .collect::<Vec<_>>();
+    let storage_src = sibling_crate_src(engine_src, "omnigraph-storage");
+    files.extend(walk_rust_files(&storage_src).into_iter().map(|path| {
+        (
+            format!("omnigraph-storage/{}", relative_to_src(&storage_src, &path)),
+            path,
+        )
+    }));
+    for (relative, file) in files {
         let contents = std::fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
         let ast = parse_rust_source(&contents, &relative);
@@ -2179,8 +2234,7 @@ fn graph_visible_write_chokepoints_are_registered() {
     }
 
     let mut observed = BTreeMap::new();
-    for file in protocol_scan_files(&src) {
-        let relative = relative_to_src(&src, &file);
+    for (relative, file) in durable_protocol_scan_files(&src) {
         let contents = std::fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
         let ast = parse_rust_source(&contents, &relative);

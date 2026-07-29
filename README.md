@@ -243,6 +243,8 @@ Notes:
 ## Workspace Crates
 
 - `crates/omnigraph-compiler`: shared schema/query parser, typechecker, catalog, and IR lowering (zero Lance dependency)
+- `crates/omnigraph-storage`: shared local/S3 control-object storage implementation and concrete backend handle
+- `crates/omnigraph-control-authority`: cycle-free persisted cluster-lock ownership; complete checked apply/runtime/export capabilities land here in a later slice
 - `crates/omnigraph` (package `omnigraph-engine`): storage/runtime, branching, merge, change detection, query execution, and embeddings
 - `crates/omnigraph-policy`: Cedar policy compilation and enforcement
 - `crates/omnigraph-api-types`: shared HTTP wire DTOs used by both the server and the CLI
