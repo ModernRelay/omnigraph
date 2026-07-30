@@ -471,7 +471,8 @@ RFC-026 stream-config v2 plus recovery-v11 for the private B1 row/fold core.
 V9 preserves those worker mechanics and activates stream-config v3, lifecycle
 state v2, trusted hidden attribution, the manifest-selected token participant,
 and recovery-v12's exact base-plus-token fold. V10 adds the required
-disabled-from-genesis profile singleton and reserved dead-letter slot. V11
+disabled-from-genesis profile singleton and the now-frozen explicit-null
+dead-letter compatibility placeholder. V11
 replaces the profile boolean with protocol-v2 checked authority and adds
 recovery-v13 `StreamProfileChange`. The currently served v12 format replaces
 inline lifecycle history with lifecycle-v3 ledger heads and recovery-v14

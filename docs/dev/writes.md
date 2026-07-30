@@ -1346,8 +1346,9 @@ exact-`id` PK metadata. Export deliberately omits v9's trusted hidden stream
 metadata and does not transfer token authority. This remains a private-core
 format, not a public streaming API.
 
-V10 adds the required disabled-from-genesis graph profile singleton and
-reserved-null dead-letter reference. V11 replaces the v10 boolean with checked
+V10 adds the required disabled-from-genesis graph profile singleton and the
+now-frozen explicit-null dead-letter compatibility placeholder. V11 replaces
+the v10 boolean with checked
 profile protocol v2 and adds recovery-v13 `StreamProfileChange`.
 `DISABLING` owns an exact restart/resume plan and drain-only continuation;
 `RETIRED` decodes fail-closed. Current v12 replaces lifecycle state-v2's inline

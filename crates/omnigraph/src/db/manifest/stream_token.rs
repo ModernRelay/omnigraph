@@ -967,23 +967,21 @@ pub(crate) struct StreamFoldAttributionSummary {
     pub(crate) visible_contributor_count: u64,
     pub(crate) visible_write_count: u64,
     pub(crate) winning_attribution_digest: String,
-    /// Reserved v10 slot for the RFC-026 §4.7 P4 dead-letter object reference.
-    /// Physically present as an explicit null until the dead-letter slice
-    /// activates it: this summary is `deny_unknown_fields` and compared for
-    /// exact structural equality between the recovery sidecar and the durable
-    /// lineage row, so the slot must exist at the format bump rather than be
-    /// retrofitted through a serde default. It is deliberately excluded from
-    /// the attribution digest preimage, so a null slot leaves
+    /// Frozen v10 compatibility slot for the then-proposed RFC-026 §4.7 P4
+    /// dead-letter object reference. It is physically present but must remain
+    /// explicit null in this format. The finalized protocol needs additional
+    /// object/version/candidate authority and therefore requires a new
+    /// versioned attribution shape rather than activating this incomplete
+    /// placeholder in place. It is deliberately excluded from the attribution
+    /// digest preimage, so the required null leaves
     /// `stream_fold_attribution_commitment` recomputation stable.
     #[serde(deserialize_with = "deserialize_present_option")]
     pub(crate) dead_letter_object: Option<DeadLetterObjectRef>,
 }
 
-/// Frozen wire shape of a fold's dead-letter object reference (RFC-026 §4.7
-/// P4): the graph-relative reserved-prefix location of the NDJSON object
-/// holding the diverted key-chains, its diverted-row count, and the sha256
-/// digest of its exact bytes. Shape is fixed at the v10 bump; no writer can
-/// produce a populated value until the dead-letter slice activates it.
+/// Historical v10 wire shape of the never-populated dead-letter placeholder.
+/// It remains decodable only so current-format records retain exact structural
+/// meaning; the finalized dead-letter reference is a new-format successor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DeadLetterObjectRef {
@@ -1015,12 +1013,12 @@ impl StreamFoldAttributionSummary {
     pub(crate) fn validate(&self) -> ProtocolResult<()> {
         if let Some(reference) = &self.dead_letter_object {
             // A malformed reference reports its malformation; a well-formed
-            // one is still refused — the slot is reserved until the
-            // dead-letter slice activates it under its own crash matrix.
+            // one is still refused because this frozen v10 placeholder may
+            // never be activated in place.
             reference.validate()?;
             return Err(StreamTokenProtocolError::invalid(
                 "dead_letter_object",
-                "is reserved at v10 and must be null until the dead-letter slice activates it",
+                "is a frozen v10 placeholder and must be null in this format",
             ));
         }
         if self.visible_contributor_count == 0 {
@@ -1131,7 +1129,7 @@ pub(crate) fn stream_fold_attribution_commitment(
         visible_write_count: u64::try_from(winners.len())
             .map_err(|_| StreamTokenProtocolError::invalid("fold_winners", "count exceeds u64"))?,
         winning_attribution_digest: format!("sha256:{:x}", hasher.finalize()),
-        // Reserved at v10; the digest preimage above deliberately excludes it.
+        // Frozen explicit-null v10 slot; the digest preimage excludes it.
         dead_letter_object: None,
     })
 }
@@ -2013,7 +2011,7 @@ mod tests {
         };
         summary.validate().unwrap();
         let encoded = serde_json::to_string(&summary).unwrap();
-        // The reserved v10 dead-letter slot is physically present as an
+        // The frozen v10 compatibility slot is physically present as an
         // explicit null on the wire.
         assert!(
             encoded.contains("\"dead_letter_object\":null"),
@@ -2061,8 +2059,8 @@ mod tests {
                 winning_attribution_digest: format!("sha256:{}", "AB".repeat(32)),
                 ..summary.clone()
             },
-            // A populated slot — even a well-formed one — is refused while the
-            // slot is reserved.
+            // A populated slot — even a well-formed one — is refused because
+            // the v10 placeholder is permanently null in this format.
             StreamFoldAttributionSummary {
                 dead_letter_object: Some(DeadLetterObjectRef {
                     location: "__dead_letter/01ARZ.ndjson".to_string(),

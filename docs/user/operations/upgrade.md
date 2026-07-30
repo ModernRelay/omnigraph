@@ -174,10 +174,20 @@ or in-place migration window.
 Internal schema v10 adds one piece of durable graph-wide state: the required
 `stream_profile` singleton in `__manifest` — the RFC-026 §4.7 enablement
 authority for the experimental, cluster-only streaming profile. Every fresh v10
-graph carries it from genesis with streaming disabled. The same bump reserves a
-dead-letter slot inside the stream-fold attribution record, but that nullable
-field is not a dead-letter protocol; terminal dead-letter/replay authority still
-requires its own later strict format/recovery strand.
+graph carries it from genesis with streaming disabled. The same bump added an
+explicit-null dead-letter compatibility placeholder inside the stream-fold
+attribution record. That v10 field is now frozen null: it is not a dead-letter
+protocol and does not pre-register a Replay origin,
+chunk chain, checkpoint ledger, or history-paging contract. The selected later
+F5 strand instead uses one measured, bounded deterministic NDJSON object per
+fold and one current `DEAD_LETTERED` token per losing key. A corrected successor
+is a fresh ordinary `Admission` naming that terminal token as predecessor.
+Dead-letter inspection/payload export, block correction, authority repair, and
+authority retirement remain cluster/offline-only for the experimental profile.
+Ordinary graph export remains blocked while current terminal sequencing
+authority would be lost; the same-format binary's explicit irreversible
+retirement records provenance and freezes the source before row-only export to
+a fresh graph. None of that later F5 behavior is active in v10.
 
 A v9 graph must use the standard rebuild recipe above: quiesce writers, export
 with the latest 0.9.x binary, initialize a **different** root with the v10

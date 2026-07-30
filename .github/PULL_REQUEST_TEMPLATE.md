@@ -24,6 +24,13 @@
 - [ ] Public docs updated if user-facing surface changed (or N/A)
 - [ ] Reviewed against [docs/dev/invariants.md](../blob/main/docs/dev/invariants.md) — no Hard Invariant weakened, no deny-list item hit (or justified)
 
+## Local verification
+
+<!-- List the exact commands run and their results. Use "not run" with a reason
+instead of implying that post-merge CI has already provided evidence. -->
+
+- `command` — result
+
 ## Notes for reviewers
 
 <!-- Anything that helps review: tradeoffs, follow-ups, areas of risk. -->

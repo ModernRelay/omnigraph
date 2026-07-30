@@ -133,8 +133,9 @@ converge the physical state.
    manifest-selected graph-global token authority, and the private
    recovery-v12 B2 compare-and-chain/fold core; v10 added the required
    graph-global `stream_profile` enablement singleton (§4.7 P1 — present from
-   genesis, disabled, single-CAS flips with strict revision advance) and
-   reserved the fold-attribution dead-letter slot; v11 replaced that boolean
+   genesis, disabled, single-CAS flips with strict revision advance) and added
+   the now-frozen explicit-null fold-attribution dead-letter compatibility
+   placeholder; v11 replaced that boolean
    with protocol-v2
    `DISABLED | ENABLED | DISABLING | RETIRED` state, bounded receipt-chain and
    fold-delegation/continuation authority, makes profile mutation
@@ -339,6 +340,20 @@ them explicit.
   flat; aggregate authority lookup is reported honestly and may grow. The
   evidence is advisory; it does not create a quota, latency SLO, or
   history-flat claim.
+
+  The manifest-selected `_stream_tokens.lance` dataset has a separate,
+  explicit EXP performance gap. Exact receipt/token probes remain logically
+  correct through Lance's uncovered-fragment fallback, and cluster-only
+  terminal inspection/export may stream the selected current-token version,
+  but their physical work can grow with uncovered fragments and retained
+  history. The ordinary graph `optimize` path does not maintain this dataset.
+  Before public activation, status must expose uncovered count/oldest age and
+  a lookup-cost warning; local plus RustFS/S3 instruments must measure exact
+  lookup and terminal-scan reads/bytes/p95 at increasing ledger depths; and a
+  recorded threshold must schedule an authority-safe reconciler. Until that
+  threshold is crossed, the reconciler is deliberately deferred rather than a
+  correctness prerequisite. This is an instrumented exception to invariant
+  15, not a claim of history-flat control-plane cost.
 
   RC.1's missing durable materialization-attempt receipt and reserve-first
   complete-output envelope are consequently not blockers for unbounded

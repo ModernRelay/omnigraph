@@ -72,8 +72,9 @@ use crate::error::{OmniError, Result};
 ///   config-v3/state-v2/recovery-v12 authority. V8 graphs cross this immutable
 ///   format boundary by export/init/load rebuild.
 /// - v10 — RFC-026 §4.7 P1 adds the required graph-global `stream_profile`
-///   enablement singleton (present from genesis, disabled) and reserves the
-///   fold-attribution dead-letter slot. V9 graphs cross this immutable format
+///   enablement singleton (present from genesis, disabled) and adds the
+///   now-frozen explicit-null fold-attribution dead-letter placeholder. V9
+///   graphs cross this immutable format
 ///   boundary by export/init/load rebuild: v9 decoders silently skip unknown
 ///   row kinds, so only the stamp can make an older binary refuse a
 ///   streaming-capable graph instead of writing blind to the flag.
