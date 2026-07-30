@@ -1155,6 +1155,22 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
    required/default, type/coercion, enum/range/check, vector-dimension, and
    schema validation. Compute the exact post-tombstone/hidden-metadata
    dense-slice charge before recovery or Lance.
+
+   **Implemented sub-slice:** the feature-gated engine seam accepts one bounded
+   JSON object, performs authorization before parsing, requires the exact
+   `$stream` shape and an explicit canonical `id`, rejects duplicate,
+   unknown, and reserved fields, and uses fresh accepted schema authority to
+   convert node/edge scalar, list, enum, and caller-supplied vector values into
+   the existing B2 row path. The existing root-wide B2 preprocessing permit now
+   spans parsing and normalization; raw bytes, pre-DOM structural slots, and
+   projected aggregate Arrow allocation are bounded before their respective
+   allocation boundaries.
+   Invalid shape, type, vector, range, check, or key input is effect-free and
+   refused before the write-recovery barrier.
+   Blob-bearing tables fail before any MemWAL put because Lance's LSM fold
+   scanner cannot yet materialize their logical Blob values. Incremental NDJSON,
+   multi-row/reorder handling, transport admission, lazy enrollment, and the
+   public surface remain pending; this does not complete F4.
 3. **Lazy enrollment with a prepare handshake** (§4.7 P2) — every table is
    stream-eligible only while the profile is exactly `ENABLED`, but the wire
    invariant above still requires the engine-minted stream incarnation before

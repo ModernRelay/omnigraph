@@ -280,10 +280,25 @@ them explicit.
   post-watcher check closes only the clean-ack stale-epoch outcome for the
   private OmniGraph adapter. It does not retract durable WAL bytes, protect raw
   Lance writers, make fence-sentinel deletion safe, provide cross-process
-  ownership, or enable reclamation/public B2. The private seam consumes
-  already-normalized physical rows and vectors;
-  it performs no external embedding call or unspecified fold-derived-field
-  materialization. It is not a product surface and performs no GC or correction.
+  ownership, or enable reclamation/public B2. The low-level private B1/B2 seam
+  consumes already-normalized physical rows and vectors; it performs no
+  external embedding call or unspecified fold-derived-field materialization.
+  A feature-gated caller-shaped seam now accepts exactly one bounded JSON
+  object after policy and checked-runtime authorization, validates its
+  `$stream` envelope, and strictly normalizes and value-checks one node or edge
+  row against a fresh operation-local accepted catalog before entering the
+  write-recovery barrier. Before parsing it owns the existing root-wide B2
+  preprocessing envelope; a 32-MiB raw bound, 131,072-slot conservative
+  pre-DOM structural bound, and aggregate projected-Arrow preflight prevent
+  small JSON tokens or schema dimensions from amplifying past that ownership.
+  The same permit transfers into B2. The seam then reacquires and
+  revalidates profile/runtime authority before delegating to the existing
+  low-level seam. It is not an incremental NDJSON,
+  transport, lazy-enrollment, or product surface. Blob-bearing tables are
+  refused before any MemWAL put: Lance's LSM fold scanner returns Blob
+  descriptors rather than foldable logical Blob values, so exact-generation
+  Blob materialization across warm and cold recovery remains a separate
+  prerequisite. The private path performs no GC or correction.
   The closure defect found by Gate R0 is repaired at the fold boundary:
   admission, replay, and the scanner all charge
   `ArrayData::get_slice_memory_size` logical bytes against the same 32-MiB
@@ -297,8 +312,9 @@ them explicit.
   Current schema v9/config-v3/state-v2 retains those worker mechanics and adds
   the private compare-and-chain data plane. Canonical payload/token digests and
   trusted hidden metadata bind each admitted key occurrence. B2 preprocessing
-  is root-bounded before allocation: each 128-MiB envelope covers the original
-  32-MiB row, a possible 32-MiB materialized replacement, and 64 MiB of
+  is root-bounded before allocation: each 128-MiB envelope covers either the
+  caller-shaped raw/structural/normalized row corridor above, or the normalized
+  32-MiB row plus a possible 32-MiB materialized replacement and 64 MiB of
   canonical bytes. Its inflight slot transfers into the queued corridor and
   its scratch charge remains until hashing completes; pressure is an
   effect-free typed refusal. The private profile admits exactly two envelopes

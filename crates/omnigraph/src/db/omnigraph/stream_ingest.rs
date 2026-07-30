@@ -60,13 +60,14 @@ use crate::error::{OmniError, Result};
 use crate::storage_layer::{SnapshotHandle, StagedHandle};
 use crate::table_store::mem_wal::{
     B1_MAX_GENERATION_ARROW_BYTES, B1_MAX_GENERATION_ROWS, B2_MAX_TOKEN_PROJECTION_ARROW_BYTES,
-    CallerOrdinalRange, CheckedExclusiveStreamAuthority, CheckedStreamAuthority,
-    ClaimedMemWalWorker, ConfirmedStreamTokenOverlay, ConfirmedStreamTokenOverlayRow,
-    CurrentGenerationProjectionSource, DurableBatchAck, IdleAuthorityCheck, IdleAuthorityFailure,
-    MemWalWorkerError, OpenedMemWalWorker, PassiveB1PhysicalState, PassiveQuiesceDisposition,
-    PreparedPut, PreparedPutFailure, QueuedBatchPermit, QuiesceCut, SealedGenerationCut,
-    StreamWorkerKey, WorkerOpenFailure, b1_input_accounting, b1_logical_batch_bytes,
-    capture_current_head_witness, reconstruct_b1_writer_config, scan_flushed_generation_projection,
+    B2PreprocessingPermit, CallerOrdinalRange, CheckedExclusiveStreamAuthority,
+    CheckedStreamAuthority, ClaimedMemWalWorker, ConfirmedStreamTokenOverlay,
+    ConfirmedStreamTokenOverlayRow, CurrentGenerationProjectionSource, DurableBatchAck,
+    IdleAuthorityCheck, IdleAuthorityFailure, MemWalWorkerError, OpenedMemWalWorker,
+    PassiveB1PhysicalState, PassiveQuiesceDisposition, PreparedPut, PreparedPutFailure,
+    QueuedBatchPermit, QuiesceCut, SealedGenerationCut, StreamWorkerKey, WorkerOpenFailure,
+    b1_input_accounting, b1_logical_batch_bytes, capture_current_head_witness,
+    reconstruct_b1_writer_config, scan_flushed_generation_projection,
     validate_b1_lifecycle_physical_state, validate_stream_config_v3_binding,
 };
 use crate::validate::{ChangeSet, CommittedState, TableChange};
@@ -84,6 +85,15 @@ use super::stream_lifecycle::{
 use super::{Omnigraph, WriteTxn};
 
 const B1_MAX_FOLD_ATTEMPTS: usize = 2;
+/// The raw body can contain far more DOM nodes than Arrow values (for example,
+/// `[0,0,...]`). Reserve 64 MiB of the 128-MiB B2 envelope for parsed structure
+/// and conservatively charge 512 bytes per structural slot before serde can
+/// allocate that DOM. Raw/string bytes occupy at most the separate 32-MiB
+/// input bound; normalized Arrow occupies the remaining 32 MiB.
+const STREAM_JSON_DOM_STRUCTURE_BYTES: u64 = 64 * 1024 * 1024;
+const STREAM_JSON_BYTES_PER_STRUCTURAL_SLOT: u64 = 512;
+const STREAM_JSON_MAX_STRUCTURAL_SLOTS: u64 =
+    STREAM_JSON_DOM_STRUCTURE_BYTES / STREAM_JSON_BYTES_PER_STRUCTURAL_SLOT;
 
 /// Private B2 result for one caller occurrence. Public response shaping stays
 /// deliberately inactive; this value exists so crash/race tests can prove the
@@ -122,6 +132,89 @@ struct AttributedFoldPlan {
     summary: StreamFoldAttributionSummary,
 }
 
+struct StreamJsonRowWire {
+    envelope: StreamWriteEnvelope,
+    body: BTreeMap<String, serde_json::Value>,
+}
+
+impl<'de> serde::Deserialize<'de> for StreamJsonRowWire {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StreamJsonRowWire;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("one stream JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<StreamJsonRowWire, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut envelope = None;
+                let mut body = BTreeMap::new();
+                while let Some(field) = map.next_key::<String>()? {
+                    if field == "$stream" {
+                        if envelope.is_some() {
+                            return Err(serde::de::Error::duplicate_field("$stream"));
+                        }
+                        envelope = Some(map.next_value::<StreamWriteEnvelope>()?);
+                    } else {
+                        if body.contains_key(&field) {
+                            return Err(serde::de::Error::custom(format!(
+                                "duplicate stream input field '{field}'"
+                            )));
+                        }
+                        body.insert(field, map.next_value::<serde_json::Value>()?);
+                    }
+                }
+                let envelope =
+                    envelope.ok_or_else(|| serde::de::Error::missing_field("$stream"))?;
+                Ok(StreamJsonRowWire { envelope, body })
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+fn validate_stream_json_structure_bound(raw_json: &[u8]) -> Result<()> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut slots = 1_u64;
+    for &byte in raw_json {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            continue;
+        }
+        if matches!(byte, b'{' | b'}' | b'[' | b']' | b',' | b':') {
+            slots = slots.checked_add(1).unwrap_or(u64::MAX);
+            if slots > STREAM_JSON_MAX_STRUCTURAL_SLOTS {
+                return Err(OmniError::resource_limit(
+                    "stream_json_structural_slots",
+                    STREAM_JSON_MAX_STRUCTURAL_SLOTS,
+                    slots,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 enum FoldLifecycleMode {
     Open,
@@ -152,14 +245,15 @@ impl Omnigraph {
         // Refuse an oversized caller buffer synchronously before recovery IO,
         // authority capture, detached ownership, or a cold epoch claim.
         validate_stream_input_bounds(table_key, &batch)?;
+        let provisional = self
+            .capture_stream_authority(table_key, "stream put")
+            .await?;
+        Self::ensure_stream_table_admission_supported(&provisional.txn.catalog, table_key)?;
         let batch = self
             .storage()
             .prepare_keyed_write_batch(table_key, batch)
             .await?;
         validate_stream_input_bounds(table_key, &batch)?;
-        let provisional = self
-            .capture_stream_authority(table_key, "stream put")
-            .await?;
         self.validate_stream_logical_admission_batch(&provisional, &batch)?;
 
         let ids = batch
@@ -348,21 +442,23 @@ impl Omnigraph {
         .await
     }
 
-    /// Admit one authenticated, fully normalized logical row through the
+    /// Parse and admit one authenticated caller-shaped JSON row through the
     /// checked serving-runtime boundary.
     ///
     /// This is the first intentionally narrow functional ingress seam: the
-    /// table must already be enrolled and `OPEN`, and normalization remains a
-    /// caller responsibility. Transport, lazy enrollment, and public response
-    /// shaping remain inactive. Before production transport activation, the
-    /// owned profile guard must transfer into the detached put tail so caller
-    /// cancellation cannot release it before watcher/fence settlement.
+    /// table must already be enrolled and `OPEN`. It accepts one bounded JSON
+    /// object, validates the exact `$stream` envelope, strictly normalizes the
+    /// logical row to dense Arrow, and delegates to the existing B2 core.
+    /// Incremental NDJSON, transport admission, lazy enrollment, and public
+    /// response shaping remain inactive. Before production transport
+    /// activation, the owned profile guard must transfer into the detached put
+    /// tail so caller cancellation cannot release it before watcher/fence
+    /// settlement.
     pub(crate) async fn stream_ingest_one_as(
         self: &Arc<Self>,
         table_key: &str,
-        batch: RecordBatch,
+        raw_json: &[u8],
         caller_ordinal: u64,
-        envelope: StreamWriteEnvelope,
         actor_id: &str,
     ) -> Result<StreamTokenAdmissionAck> {
         self.enforce(
@@ -373,12 +469,40 @@ impl Omnigraph {
         let contributor_id = TrustedContributorId::new(actor_id.to_string())
             .map_err(|error| OmniError::manifest(error.to_string()))?;
 
-        // Recovery may need the profile gate exclusively, so complete the
-        // normal write-entry barrier before joining that gate in shared mode.
+        // Authenticate the exact serving runtime before spending work on an
+        // untrusted body. Recovery may need this gate exclusively, so this
+        // preliminary lease ends after effect-free parsing and validation.
+        let preflight_guard = self.write_queue().acquire_stream_profile_shared().await;
+        self.ensure_streaming_ingest_runtime_authorized().await?;
+        let raw_bytes = u64::try_from(raw_json.len()).unwrap_or(u64::MAX);
+        if raw_bytes > B1_MAX_GENERATION_ARROW_BYTES {
+            return Err(OmniError::resource_limit(
+                "stream raw JSON bytes",
+                B1_MAX_GENERATION_ARROW_BYTES,
+                raw_bytes,
+            ));
+        }
+        let preprocessing = self.stream_workers.reserve_b2_preprocessing()?;
+        validate_stream_json_structure_bound(raw_json)?;
+        let wire = serde_json::from_slice::<StreamJsonRowWire>(raw_json)
+            .map_err(|error| OmniError::manifest(format!("invalid stream JSON: {error}")))?;
+        wire.envelope
+            .validate()
+            .map_err(|error| OmniError::manifest(error.to_string()))?;
+        let normalization_txn = self.open_write_txn(None).await?;
+        Self::ensure_stream_table_admission_supported(&normalization_txn.catalog, table_key)?;
+        let catalog = super::public_catalog_view(&normalization_txn.catalog)?;
+        let row = serde_json::Value::Object(wire.body.into_iter().collect());
+        let batch = crate::loader::normalize_stream_json_row(&catalog, table_key, row)?;
+        validate_stream_input_bounds(table_key, &batch)?;
+        validate_stream_value_constraints(table_key, &batch, &catalog)?;
+        drop(preflight_guard);
+
         self.heal_pending_recovery_sidecars_for_write(&[None])
             .await?;
 
-        // The profile gate is outermost and is acquired exactly once. Calling
+        // Reacquire and revalidate after recovery: profile authority may have
+        // moved while the preliminary lease was absent. Calling
         // `stream_put_phase_b2_one` here would attempt a nested read lock and
         // can deadlock behind a queued profile writer because Tokio's RwLock is
         // fair/write-preferring.
@@ -388,8 +512,9 @@ impl Omnigraph {
             table_key,
             batch,
             caller_ordinal,
-            envelope,
+            wire.envelope,
             contributor_id,
+            Some(preprocessing),
             &profile_guard,
         )
         .await
@@ -414,6 +539,7 @@ impl Omnigraph {
             caller_ordinal,
             envelope,
             contributor_id,
+            None,
             &profile_guard,
         )
         .await
@@ -427,6 +553,7 @@ impl Omnigraph {
         caller_ordinal: u64,
         envelope: StreamWriteEnvelope,
         contributor_id: TrustedContributorId,
+        preprocessing: Option<B2PreprocessingPermit>,
         _profile_guard: &tokio::sync::OwnedRwLockReadGuard<()>,
     ) -> Result<StreamTokenAdmissionAck> {
         if batch.num_rows() != 1 {
@@ -436,10 +563,20 @@ impl Omnigraph {
             )));
         }
         validate_stream_input_bounds(table_key, &batch)?;
-        let mut preprocessing = self.stream_workers.reserve_b2_preprocessing()?;
-        // Blob bytes participate in the payload digest. Resolve them before
-        // recovery/authority and never hash an external descriptor which may
-        // change after acknowledgement.
+        envelope
+            .validate()
+            .map_err(|error| OmniError::manifest(error.to_string()))?;
+        let provisional = self
+            .capture_stream_authority(table_key, "stream token admission")
+            .await?;
+        Self::ensure_stream_table_admission_supported(&provisional.txn.catalog, table_key)?;
+        let mut preprocessing = match preprocessing {
+            Some(preprocessing) => preprocessing,
+            None => self.stream_workers.reserve_b2_preprocessing()?,
+        };
+        // Normalize the keyed-write representation after the read-only
+        // provisional capture and remeasure it before any put. Blob tables are
+        // refused above until their generation-fold materialization path exists.
         let batch = self
             .storage()
             .prepare_keyed_write_batch(table_key, batch)
@@ -459,13 +596,7 @@ impl Omnigraph {
         }
         let logical_id = id_array.value(0).to_string();
         let canonical_payload = super::canonical_stream_payload_v1(&batch, 0)?;
-        envelope
-            .validate()
-            .map_err(|error| OmniError::manifest(error.to_string()))?;
 
-        let provisional = self
-            .capture_stream_authority(table_key, "stream token admission")
-            .await?;
         self.validate_stream_logical_admission_batch(&provisional, &batch)?;
         let key = provisional.worker_key;
         let admission_key = provisional.admission_key.clone();
@@ -3812,23 +3943,7 @@ impl Omnigraph {
         self.storage()
             .validate_keyed_write_batch(&capture.entry.table_key, batch)?;
 
-        let mut changeset = ChangeSet::new();
-        changeset.insert(
-            capture.entry.table_key.clone(),
-            TableChange {
-                added: vec![batch.clone()],
-                changed: Vec::new(),
-                deleted_ids: Vec::new(),
-            },
-        );
-        if let Some(violation) =
-            crate::validate::evaluate_value_constraints(&changeset, &capture.txn.catalog)
-                .into_iter()
-                .next()
-        {
-            return Err(violation.into_omni_error());
-        }
-        Ok(())
+        validate_stream_value_constraints(&capture.entry.table_key, batch, &capture.txn.catalog)
     }
 
     fn validate_stream_logical_admission_batch(
@@ -3863,23 +3978,7 @@ impl Omnigraph {
         self.storage()
             .validate_keyed_write_batch(&capture.entry.table_key, batch)?;
 
-        let mut changeset = ChangeSet::new();
-        changeset.insert(
-            capture.entry.table_key.clone(),
-            TableChange {
-                added: vec![batch.clone()],
-                changed: Vec::new(),
-                deleted_ids: Vec::new(),
-            },
-        );
-        if let Some(violation) =
-            crate::validate::evaluate_value_constraints(&changeset, &capture.txn.catalog)
-                .into_iter()
-                .next()
-        {
-            return Err(violation.into_omni_error());
-        }
-        Ok(())
+        validate_stream_value_constraints(&capture.entry.table_key, batch, &capture.txn.catalog)
     }
 
     async fn ensure_no_relevant_stream_sidecar(
@@ -3952,6 +4051,36 @@ impl Omnigraph {
                     sidecar.writer_kind, capture.entry.identity
                 ),
             ));
+        }
+        Ok(())
+    }
+
+    fn ensure_stream_table_admission_supported(
+        catalog: &omnigraph_compiler::catalog::Catalog,
+        table_key: &str,
+    ) -> Result<()> {
+        let blob_properties = if let Some(type_name) = table_key.strip_prefix("node:") {
+            &catalog
+                .node_types
+                .get(type_name)
+                .ok_or_else(|| OmniError::manifest(format!("unknown node type '{type_name}'")))?
+                .blob_properties
+        } else if let Some(type_name) = table_key.strip_prefix("edge:") {
+            &catalog
+                .edge_types
+                .get(type_name)
+                .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{type_name}'")))?
+                .blob_properties
+        } else {
+            return Err(OmniError::manifest(format!(
+                "invalid stream table key '{table_key}'"
+            )));
+        };
+        if !blob_properties.is_empty() {
+            return Err(OmniError::manifest(format!(
+                "stream admission for Blob-bearing table '{table_key}' is not active: \
+                 Lance MemWAL fold cannot materialize Blob values"
+            )));
         }
         Ok(())
     }
@@ -4049,33 +4178,15 @@ impl Omnigraph {
     /// the boolean pins new durability versus an exact durable retry.
     #[cfg(feature = "failpoints")]
     #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
     pub async fn failpoint_stream_ingest_one_as_for_test(
         self: &Arc<Self>,
         table_key: &str,
-        batch: RecordBatch,
+        raw_json: &[u8],
         caller_ordinal: u64,
-        stream_incarnation_id: &str,
-        write_id: &str,
-        predecessor_token: Option<&str>,
         actor_id: &str,
     ) -> Result<(String, bool)> {
-        let predecessor_token = predecessor_token
-            .map(str::parse::<StreamToken>)
-            .transpose()
-            .map_err(|error| OmniError::manifest(error.to_string()))?;
         let ack = self
-            .stream_ingest_one_as(
-                table_key,
-                batch,
-                caller_ordinal,
-                StreamWriteEnvelope {
-                    stream_incarnation_id: stream_incarnation_id.to_string(),
-                    write_id: write_id.to_string(),
-                    predecessor_token,
-                },
-                actor_id,
-            )
+            .stream_ingest_one_as(table_key, raw_json, caller_ordinal, actor_id)
             .await?;
         Ok((ack.stream_token.to_string(), ack.already_durable))
     }
@@ -4538,6 +4649,29 @@ fn stream_data_block_error(block_token: &str) -> OmniError {
     OmniError::StreamDataBlocked {
         block_token: block_token.to_string(),
     }
+}
+
+fn validate_stream_value_constraints(
+    table_key: &str,
+    batch: &RecordBatch,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+) -> Result<()> {
+    let mut changeset = ChangeSet::new();
+    changeset.insert(
+        table_key.to_string(),
+        TableChange {
+            added: vec![batch.clone()],
+            changed: Vec::new(),
+            deleted_ids: Vec::new(),
+        },
+    );
+    if let Some(violation) = crate::validate::evaluate_value_constraints(&changeset, catalog)
+        .into_iter()
+        .next()
+    {
+        return Err(violation.into_omni_error());
+    }
+    Ok(())
 }
 
 fn validate_stream_input_bounds(table_key: &str, batch: &RecordBatch) -> Result<()> {
@@ -5095,5 +5229,29 @@ mod tests {
             error.to_string(),
             "stream fold is strict-blocked; correction requires block token block-token"
         );
+    }
+
+    #[test]
+    fn json_structure_bound_counts_tokens_but_not_string_contents() {
+        let commas = ",".repeat(STREAM_JSON_MAX_STRUCTURAL_SLOTS as usize);
+        let quoted = format!(r#"{{"value":"{commas}"}}"#);
+        validate_stream_json_structure_bound(quoted.as_bytes())
+            .expect("structural bytes inside one JSON string do not allocate DOM nodes");
+
+        let amplified = format!(
+            "[{}0]",
+            "0,".repeat(STREAM_JSON_MAX_STRUCTURAL_SLOTS as usize)
+        );
+        let error = validate_stream_json_structure_bound(amplified.as_bytes())
+            .expect_err("many tiny values must fail before serde allocates their DOM nodes");
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: STREAM_JSON_MAX_STRUCTURAL_SLOTS,
+                actual,
+            } if resource == "stream_json_structural_slots"
+                && actual == STREAM_JSON_MAX_STRUCTURAL_SLOTS + 1
+        ));
     }
 }

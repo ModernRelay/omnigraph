@@ -15,7 +15,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray};
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
+    StringArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use fail::FailScenario;
@@ -44,6 +47,7 @@ use helpers::memwal::{CurrentMemWalInventory, MemWalObjectKind};
 use helpers::stream_authority::enable_stream_profile;
 
 const STREAM_SCHEMA: &str = "node Person { score: I32 }\n";
+const NULLABLE_STREAM_SCHEMA: &str = "node Person { score: I32? }\n";
 const TWO_TABLE_STREAM_SCHEMA: &str = r#"
 node Person { score: I32 }
 node Company { score: I32 }
@@ -57,6 +61,28 @@ node Person {
 const MIN_CARD_STREAM_SCHEMA: &str = r#"
 node Person { name: String @key }
 edge Knows: Person -> Person @card(2..)
+"#;
+const EDGE_STREAM_SCHEMA: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person
+"#;
+const TYPED_STREAM_SCHEMA: &str = r#"
+node Person {
+    slug: String @key
+    title: String
+    score: I32
+    state: enum(open, closed)
+    tags: [String]
+    embedding: Vector(2)? @embed("title", model="test-model")
+    @range(score, 0..10)
+    @check(title, "^[A-Z].*")
+}
+"#;
+const BLOB_STREAM_SCHEMA: &str = r#"
+node Person {
+    score: I32
+    content: Blob?
+}
 "#;
 const RANGE_STREAM_SCHEMA: &str = r#"
 node Person {
@@ -714,14 +740,20 @@ async fn authorized_ingest_score(
     predecessor_token: Option<&str>,
     actor_id: &str,
 ) -> Result<(String, bool), OmniError> {
-    let batch = physical_batch(db, &[(logical_id.to_string(), score)]).await;
+    let raw_json = serde_json::to_vec(&serde_json::json!({
+        "$stream": {
+            "stream_incarnation_id": stream_incarnation_id,
+            "write_id": write_id,
+            "predecessor_token": predecessor_token,
+        },
+        "id": logical_id,
+        "score": score,
+    }))
+    .unwrap();
     db.failpoint_stream_ingest_one_as_for_test(
         TABLE,
-        batch,
+        &raw_json,
         caller_ordinal,
-        stream_incarnation_id,
-        write_id,
-        predecessor_token,
         actor_id,
     )
     .await
@@ -1413,17 +1445,22 @@ async fn empty_quiesce_is_idempotent_and_refuses_rebound_or_stale_requests() {
     assert_eq!(stream_lane(&db).await, terminal);
     assert_no_recovery_sidecars(&dir);
 
-    let _must_not_invoke_put =
-        ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
-    let batch = physical_batch(&db, &[("after-seal".to_string(), 9)]).await;
+    let _must_not_invoke_put = ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+    let raw_json = serde_json::to_vec(&serde_json::json!({
+        "$stream": {
+            "stream_incarnation_id": incarnation,
+            "write_id": "50505050-5050-4050-8050-505050505050",
+            "predecessor_token": null,
+        },
+        "id": "after-seal",
+        "score": 9,
+    }))
+    .unwrap();
     let sealed = db
         .failpoint_stream_ingest_one_as_for_test(
             TABLE,
-            batch,
+            &raw_json,
             1,
-            &incarnation,
-            "50505050-5050-4050-8050-505050505050",
-            None,
             "agent:after-seal",
         )
         .await
@@ -3330,10 +3367,6 @@ rules:
 
     let _scenario = FailScenario::setup();
     let (dir, db) = init_enrolled().await;
-    let incarnation = db
-        .failpoint_stream_incarnation_for_test(TABLE)
-        .await
-        .unwrap();
     let policy_path = dir.path().join("stream-policy.yaml");
     std::fs::write(&policy_path, STREAM_POLICY).unwrap();
     let policy = PolicyEngine::load_graph(&policy_path, dir.path().to_str().unwrap()).unwrap();
@@ -3349,25 +3382,16 @@ rules:
         .version();
 
     {
-        // Both refusals must happen before row-shape work or any Lance put.
+        // Both refusals must happen before recovery, JSON parsing, or a Lance put.
+        let _must_not_enter_recovery =
+            ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
         let _must_not_invoke_put =
             ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
-        let malformed = physical_batch(
-            &db,
-            &[
-                ("denied-a".to_string(), 1),
-                ("denied-b".to_string(), 2),
-            ],
-        )
-        .await;
         let denied = db
             .failpoint_stream_ingest_one_as_for_test(
                 TABLE,
-                malformed.clone(),
+                b"{",
                 1,
-                &incarnation,
-                "10101010-1010-4010-8010-101010101010",
-                None,
                 "act-denied",
             )
             .await
@@ -3377,11 +3401,8 @@ rules:
         let no_runtime = db
             .failpoint_stream_ingest_one_as_for_test(
                 TABLE,
-                malformed,
+                b"{",
                 2,
-                &incarnation,
-                "20202020-2020-4020-8020-202020202020",
-                None,
                 "act-allowed",
             )
             .await
@@ -3401,6 +3422,814 @@ rules:
             .version(),
         manifest_before_refusals,
         "authorization/runtime refusals must be graph-effect-free"
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn authorized_json_ingest_rejects_invalid_shape_and_reserved_fields_effect_free() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(NULLABLE_STREAM_SCHEMA).await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    let envelope = serde_json::json!({
+        "stream_incarnation_id": incarnation,
+        "write_id": "30303030-3030-4030-8030-303030303030",
+        "predecessor_token": null,
+    });
+    let envelope_json = serde_json::to_string(&envelope).unwrap();
+    let valid_row = || {
+        serde_json::json!({
+            "$stream": envelope.clone(),
+            "id": "strict-row",
+            "score": 3,
+        })
+    };
+    let cases = vec![
+        ("malformed JSON", b"{".to_vec(), "invalid stream JSON"),
+        ("non-object JSON", b"[]".to_vec(), "invalid stream JSON"),
+        (
+            "missing envelope",
+            serde_json::to_vec(&serde_json::json!({"id": "strict-row", "score": 3})).unwrap(),
+            "invalid stream JSON",
+        ),
+        (
+            "non-object envelope",
+            serde_json::to_vec(&serde_json::json!({
+                "$stream": [],
+                "id": "strict-row",
+                "score": 3,
+            }))
+            .unwrap(),
+            "invalid stream JSON",
+        ),
+        (
+            "missing predecessor",
+            serde_json::to_vec(&serde_json::json!({
+                "$stream": {
+                    "stream_incarnation_id": incarnation,
+                    "write_id": "30303030-3030-4030-8030-303030303030",
+                },
+                "id": "strict-row",
+                "score": 3,
+            }))
+            .unwrap(),
+            "invalid stream JSON",
+        ),
+        (
+            "duplicate envelope field",
+            format!(
+                r#"{{"$stream":{{"stream_incarnation_id":"{incarnation}","write_id":"30303030-3030-4030-8030-303030303030","write_id":"31313131-3131-4131-8131-313131313131","predecessor_token":null}},"id":"strict-row","score":3}}"#
+            )
+            .into_bytes(),
+            "invalid stream JSON",
+        ),
+        (
+            "duplicate envelope",
+            format!(
+                r#"{{"$stream":{envelope_json},"$stream":{envelope_json},"id":"strict-row","score":3}}"#
+            )
+            .into_bytes(),
+            "invalid stream JSON",
+        ),
+        (
+            "duplicate row field",
+            format!(
+                r#"{{"$stream":{envelope_json},"id":"strict-row","id":"forged","score":3}}"#
+            )
+            .into_bytes(),
+            "invalid stream JSON",
+        ),
+        (
+            "body-supplied contributor",
+            serde_json::to_vec(&serde_json::json!({
+                "$stream": {
+                    "stream_incarnation_id": incarnation,
+                    "write_id": "30303030-3030-4030-8030-303030303030",
+                    "predecessor_token": null,
+                    "contributor_id": "forged",
+                },
+                "id": "strict-row",
+                "score": 3,
+            }))
+            .unwrap(),
+            "invalid stream JSON",
+        ),
+        (
+            "body-supplied origin",
+            serde_json::to_vec(&serde_json::json!({
+                "$stream": {
+                    "stream_incarnation_id": incarnation,
+                    "write_id": "30303030-3030-4030-8030-303030303030",
+                    "predecessor_token": null,
+                    "origin": {"kind": "admission"},
+                },
+                "id": "strict-row",
+                "score": 3,
+            }))
+            .unwrap(),
+            "invalid stream JSON",
+        ),
+        (
+            "nil stream incarnation",
+            serde_json::to_vec(&serde_json::json!({
+                "$stream": {
+                    "stream_incarnation_id": "00000000-0000-0000-0000-000000000000",
+                    "write_id": "30303030-3030-4030-8030-303030303030",
+                    "predecessor_token": null,
+                },
+                "id": "strict-row",
+                "score": 3,
+            }))
+            .unwrap(),
+            "must be non-nil",
+        ),
+        (
+            "noncanonical write id",
+            serde_json::to_vec(&serde_json::json!({
+                "$stream": {
+                    "stream_incarnation_id": incarnation,
+                    "write_id": "30303030-3030-4030-8030-30303030303A",
+                    "predecessor_token": null,
+                },
+                "id": "strict-row",
+                "score": 3,
+            }))
+            .unwrap(),
+            "canonical lowercase",
+        ),
+        (
+            "malformed predecessor token",
+            serde_json::to_vec(&serde_json::json!({
+                "$stream": {
+                    "stream_incarnation_id": incarnation,
+                    "write_id": "30303030-3030-4030-8030-303030303030",
+                    "predecessor_token": "sha256:bad",
+                },
+                "id": "strict-row",
+                "score": 3,
+            }))
+            .unwrap(),
+            "invalid stream JSON",
+        ),
+        (
+            "missing id",
+            serde_json::to_vec(&serde_json::json!({
+                "$stream": envelope.clone(),
+                "score": 3,
+            }))
+            .unwrap(),
+            "requires explicit field 'id'",
+        ),
+        (
+            "null id",
+            serde_json::to_vec(&serde_json::json!({
+                "$stream": envelope.clone(),
+                "id": null,
+                "score": 3,
+            }))
+            .unwrap(),
+            "requires non-null string field 'id'",
+        ),
+        (
+            "non-string id",
+            serde_json::to_vec(&serde_json::json!({
+                "$stream": envelope.clone(),
+                "id": 7,
+                "score": 3,
+            }))
+            .unwrap(),
+            "field 'id' must be a string",
+        ),
+        (
+            "unknown field",
+            serde_json::to_vec(&{
+                let mut row = valid_row();
+                row.as_object_mut()
+                    .unwrap()
+                    .insert("typo".to_string(), serde_json::json!(true));
+                row
+            })
+            .unwrap(),
+            "unknown stream input field 'typo'",
+        ),
+        (
+            "Lance tombstone",
+            serde_json::to_vec(&{
+                let mut row = valid_row();
+                row.as_object_mut()
+                    .unwrap()
+                    .insert("_tombstone".to_string(), serde_json::json!(false));
+                row
+            })
+            .unwrap(),
+            "reserved physical state",
+        ),
+        (
+            "trusted stream metadata",
+            serde_json::to_vec(&{
+                let mut row = valid_row();
+                row.as_object_mut().unwrap().insert(
+                    "__omnigraph_stream_v1$".to_string(),
+                    serde_json::json!("forged"),
+                );
+                row
+            })
+            .unwrap(),
+            "reserved physical state",
+        ),
+        (
+            "case-insensitive trusted stream metadata",
+            serde_json::to_vec(&{
+                let mut row = valid_row();
+                row.as_object_mut().unwrap().insert(
+                    "__OMNIGRAPH_STREAM_V1$".to_string(),
+                    serde_json::json!("forged"),
+                );
+                row
+            })
+            .unwrap(),
+            "reserved physical state",
+        ),
+        (
+            "Lance virtual column",
+            serde_json::to_vec(&{
+                let mut row = valid_row();
+                row.as_object_mut()
+                    .unwrap()
+                    .insert("_rowid".to_string(), serde_json::json!(1));
+                row
+            })
+            .unwrap(),
+            "reserved physical state",
+        ),
+        (
+            "wrong nullable scalar type",
+            serde_json::to_vec(&serde_json::json!({
+                "$stream": envelope.clone(),
+                "id": "strict-row",
+                "score": "not-an-int",
+            }))
+            .unwrap(),
+            "expects Int32",
+        ),
+    ];
+
+    let manifest_before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    let inventory_before = mem_wal_inventory(db.uri()).await;
+    let _must_not_enter_recovery =
+        ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
+    let _must_not_invoke_put = ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+    for (ordinal, (case, raw_json, expected)) in cases.into_iter().enumerate() {
+        let error = db
+            .failpoint_stream_ingest_one_as_for_test(
+                TABLE,
+                &raw_json,
+                ordinal as u64,
+                "agent:strict",
+            )
+            .await
+            .expect_err(case);
+        assert!(error.to_string().contains(expected), "{case}: {error:?}");
+    }
+
+    let many_values = format!("{}0", "0,".repeat(140_000));
+    let structurally_amplified = format!(
+        r#"{{"$stream":{envelope_json},"id":"strict-row","score":[{many_values}]}}"#
+    );
+    let error = db
+        .failpoint_stream_ingest_one_as_for_test(
+            TABLE,
+            structurally_amplified.as_bytes(),
+            98,
+            "agent:strict",
+        )
+        .await
+        .expect_err("a small raw body may not amplify into an unbounded JSON DOM");
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: 131_072,
+                actual: 131_073,
+            } if resource == "stream_json_structural_slots"
+        ),
+        "{error:?}"
+    );
+
+    let oversized = vec![b' '; (32 * 1024 * 1024) + 1];
+    let error = db
+        .failpoint_stream_ingest_one_as_for_test(
+            TABLE,
+            &oversized,
+            99,
+            "agent:strict",
+        )
+        .await
+        .expect_err("one raw JSON line above 32 MiB must fail before parsing");
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: 33_554_432,
+                actual: 33_554_433,
+            } if resource == "stream raw JSON bytes"
+        ),
+        "{error:?}"
+    );
+
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_before,
+        "invalid stream JSON must not move graph authority"
+    );
+    let inventory_after = mem_wal_inventory(db.uri()).await;
+    assert_eq!(
+        inventory_after.objects, inventory_before.objects,
+        "invalid stream JSON must not move MemWAL object paths, classes, or sizes"
+    );
+    assert_eq!(
+        inventory_after.generation_roots, inventory_before.generation_roots,
+        "invalid stream JSON must not create a generation"
+    );
+    assert_eq!(
+        inventory_after.referenced_generation_roots,
+        inventory_before.referenced_generation_roots,
+        "invalid stream JSON must not move generation authority"
+    );
+    assert!(visible_rows(&db).await.is_empty());
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn authorized_json_ingest_normalizes_and_folds_one_edge() {
+    let _scenario = FailScenario::setup();
+    let cluster = tempfile::tempdir().unwrap();
+    let graph = cluster.path().join("graphs/knowledge.omni");
+    let db = Arc::new(
+        Omnigraph::init(graph.to_str().unwrap(), EDGE_STREAM_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    load_jsonl(
+        &db,
+        r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .expect("seed valid endpoints before enrolling the edge table");
+    db.failpoint_enroll_stream_table_for_test(MIN_CARD_EDGE_TABLE)
+        .await
+        .unwrap();
+    let cluster_uri = format!("file://{}", cluster.path().display());
+    enable_stream_profile(&db, &cluster_uri).await;
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let dir = EnrolledGraphDir {
+        _cluster: cluster,
+        graph,
+    };
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(MIN_CARD_EDGE_TABLE)
+        .await
+        .unwrap();
+    {
+        let _must_not_enter_recovery =
+            ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
+        let invalid = [
+            (
+                "missing src",
+                serde_json::json!({
+                    "$stream": {
+                        "stream_incarnation_id": incarnation,
+                        "write_id": "41414141-4141-4141-8141-414141414141",
+                        "predecessor_token": null,
+                    },
+                    "id": "edge-missing-src",
+                    "dst": "Bob",
+                }),
+                "requires explicit field 'src'",
+            ),
+            (
+                "non-string dst",
+                serde_json::json!({
+                    "$stream": {
+                        "stream_incarnation_id": incarnation,
+                        "write_id": "42424242-4242-4242-8242-424242424242",
+                        "predecessor_token": null,
+                    },
+                    "id": "edge-bad-dst",
+                    "src": "Alice",
+                    "dst": 7,
+                }),
+                "field 'dst' must be a string",
+            ),
+        ];
+        for (case, row, expected) in invalid {
+            let error = db
+                .failpoint_stream_ingest_one_as_for_test(
+                    MIN_CARD_EDGE_TABLE,
+                    &serde_json::to_vec(&row).unwrap(),
+                    0,
+                    "agent:edge",
+                )
+                .await
+                .expect_err(case);
+            assert!(error.to_string().contains(expected), "{case}: {error:?}");
+        }
+    }
+    let raw_json = serde_json::to_vec(&serde_json::json!({
+        "$stream": {
+            "stream_incarnation_id": incarnation,
+            "write_id": "40404040-4040-4040-8040-404040404040",
+            "predecessor_token": null,
+        },
+        "id": "edge-1",
+        "src": "Alice",
+        "dst": "Bob",
+    }))
+    .unwrap();
+    let (_, already_durable) = db
+        .failpoint_stream_ingest_one_as_for_test(
+            MIN_CARD_EDGE_TABLE,
+            &raw_json,
+            0,
+            "agent:edge",
+        )
+        .await
+        .expect("the strict normalizer must admit the accepted edge shape");
+    assert!(!already_durable);
+    assert!(
+        helpers::read_table(&db, MIN_CARD_EDGE_TABLE)
+            .await
+            .is_empty(),
+        "durable MemWAL acknowledgement must not bypass fold visibility"
+    );
+
+    db.failpoint_stream_b1_for_test(MIN_CARD_EDGE_TABLE, None, 0)
+        .await
+        .expect("the normalized edge must fold through the existing B2 path");
+    let batches = helpers::read_table(&db, MIN_CARD_EDGE_TABLE).await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let batch = &batches[0];
+    let string_value = |column: &str| {
+        batch
+            .column_by_name(column)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string()
+    };
+    assert_eq!(string_value("id"), "edge-1");
+    assert_eq!(string_value("src"), "Alice");
+    assert_eq!(string_value("dst"), "Bob");
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn authorized_json_ingest_normalizes_typed_values_and_rejects_value_errors() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(TYPED_STREAM_SCHEMA).await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    let valid = serde_json::json!({
+        "$stream": {
+            "stream_incarnation_id": incarnation,
+            "write_id": "50505050-5050-4050-8050-505050505050",
+            "predecessor_token": null,
+        },
+        "id": "doc-1",
+        "slug": "doc-1",
+        "title": "Accepted",
+        "score": 7,
+        "state": "open",
+        "tags": ["stream", "strict"],
+        "embedding": [0.25, 0.75],
+    });
+    db.failpoint_stream_ingest_one_as_for_test(
+        TABLE,
+        &serde_json::to_vec(&valid).unwrap(),
+        0,
+        "agent:typed",
+    )
+    .await
+    .expect("vectors, lists, and enums must normalize through the one-row seam");
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the normalized typed row must fold through the existing core");
+    let batches = helpers::read_table(&db, TABLE).await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let batch = &batches[0];
+    let score = batch
+        .column_by_name("score")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(score.value(0), 7);
+    let state = batch
+        .column_by_name("state")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(state.value(0), "open");
+    let tags = batch
+        .column_by_name("tags")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap()
+        .value(0);
+    let tags = tags.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(tags.value(0), "stream");
+    assert_eq!(tags.value(1), "strict");
+    let embedding = batch
+        .column_by_name("embedding")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap()
+        .value(0);
+    let embedding = embedding.as_any().downcast_ref::<Float32Array>().unwrap();
+    assert_eq!([embedding.value(0), embedding.value(1)], [0.25, 0.75]);
+
+    let invalid_row = |write_id: &str, id: &str, field: &str, value: serde_json::Value| {
+        let mut row = valid.clone();
+        let object = row.as_object_mut().unwrap();
+        object.insert("id".to_string(), serde_json::json!(id));
+        object.insert("slug".to_string(), serde_json::json!(id));
+        object.insert(field.to_string(), value);
+        object
+            .get_mut("$stream")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("write_id".to_string(), serde_json::json!(write_id));
+        row
+    };
+    let mut missing_embedding = invalid_row(
+        "51515151-5151-4151-8151-515151515151",
+        "doc-missing-vector",
+        "score",
+        serde_json::json!(5),
+    );
+    missing_embedding
+        .as_object_mut()
+        .unwrap()
+        .remove("embedding");
+    let mut mismatched_key = invalid_row(
+        "53535353-5353-4353-8353-535353535353",
+        "doc-key",
+        "score",
+        serde_json::json!(5),
+    );
+    mismatched_key
+        .as_object_mut()
+        .unwrap()
+        .insert("slug".to_string(), serde_json::json!("different-key"));
+    let invalid = vec![
+        (
+            "caller-supplied embed vector",
+            missing_embedding,
+            "requires caller-supplied @embed vector",
+        ),
+        (
+            "vector dimension",
+            invalid_row(
+                "52525252-5252-4252-8252-525252525252",
+                "doc-vector",
+                "embedding",
+                serde_json::json!([0.5]),
+            ),
+            "expects 2 dimensions",
+        ),
+        (
+            "canonical key",
+            mismatched_key,
+            "does not match its canonical @key id",
+        ),
+        (
+            "enum",
+            invalid_row(
+                "54545454-5454-4454-8454-545454545454",
+                "doc-enum",
+                "state",
+                serde_json::json!("unknown"),
+            ),
+            "invalid enum value",
+        ),
+        (
+            "range",
+            invalid_row(
+                "55555555-5555-4555-8555-555555555555",
+                "doc-range",
+                "score",
+                serde_json::json!(11),
+            ),
+            "@range violation",
+        ),
+        (
+            "check",
+            invalid_row(
+                "56565656-5656-4656-8656-565656565656",
+                "doc-check",
+                "title",
+                serde_json::json!("lowercase"),
+            ),
+            "@check violation",
+        ),
+    ];
+    let manifest_before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    let inventory_before = mem_wal_inventory(db.uri()).await;
+    let _must_not_enter_recovery =
+        ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
+    let _must_not_invoke_put = ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+    for (ordinal, (case, row, expected)) in invalid.into_iter().enumerate() {
+        let error = db
+            .failpoint_stream_ingest_one_as_for_test(
+                TABLE,
+                &serde_json::to_vec(&row).unwrap(),
+                ordinal as u64 + 1,
+                "agent:typed",
+            )
+            .await
+            .expect_err(case);
+        assert!(error.to_string().contains(expected), "{case}: {error:?}");
+    }
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_before,
+        "normalization/value failures must not move graph authority"
+    );
+    let inventory_after = mem_wal_inventory(db.uri()).await;
+    assert_eq!(
+        inventory_after.objects, inventory_before.objects,
+        "normalization/value failures must not move MemWAL inventory"
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn blob_bearing_table_is_rejected_before_any_stream_put() {
+    let _scenario = FailScenario::setup();
+    let cluster = tempfile::tempdir().unwrap();
+    let graph = cluster.path().join("graphs/knowledge.omni");
+    let schema_owner = Omnigraph::init(graph.to_str().unwrap(), STREAM_SCHEMA)
+        .await
+        .unwrap();
+    let stale_handle = Arc::new(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+    schema_owner
+        .apply_schema(BLOB_STREAM_SCHEMA)
+        .await
+        .expect("the schema owner must add the nullable Blob property");
+    load_jsonl(
+        &schema_owner,
+        r#"{"type":"Person","data":{"score":0,"content":null}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .expect("an ordinary keyed write must leave an enrollable post-apply head");
+    schema_owner
+        .failpoint_enroll_stream_table_for_test(TABLE)
+        .await
+        .unwrap();
+    let cluster_uri = format!("file://{}", cluster.path().display());
+    enable_stream_profile(&schema_owner, &cluster_uri).await;
+    let db =
+        helpers::stream_authority::bind_checked_stream_runtime(stale_handle, &cluster_uri).await;
+    assert!(
+        db.catalog()
+            .node_types
+            .get("Person")
+            .unwrap()
+            .blob_properties
+            .is_empty(),
+        "the exercising handle must retain its pre-apply public catalog"
+    );
+    let dir = EnrolledGraphDir {
+        _cluster: cluster,
+        graph,
+    };
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    let manifest_before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    let inventory_before = mem_wal_inventory(db.uri()).await;
+    let _must_not_enter_recovery =
+        ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
+    let _must_not_invoke_put = ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+
+    let raw = serde_json::json!({
+        "$stream": {
+            "stream_incarnation_id": incarnation,
+            "write_id": "57575757-5757-4757-8757-575757575757",
+            "predecessor_token": null,
+        },
+        "id": "asset-json",
+        "score": 1,
+        "content": null,
+    });
+    let error = db
+        .failpoint_stream_ingest_one_as_for_test(
+            TABLE,
+            &serde_json::to_vec(&raw).unwrap(),
+            0,
+            "agent:blob",
+        )
+        .await
+        .expect_err("the JSON seam must reject the whole Blob-bearing table");
+    assert!(
+        error.to_string().contains("Blob-bearing table")
+            && error
+                .to_string()
+                .contains("fold cannot materialize Blob values"),
+        "{error:?}"
+    );
+
+    let mut content = lance::blob::BlobArrayBuilder::new(1);
+    content.push_null().unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("score", DataType::Int32, false),
+            lance::blob::blob_field("content", true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["asset-physical"])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            content.finish().unwrap(),
+        ],
+    )
+    .unwrap();
+    let error = db
+        .failpoint_stream_b1_for_test(TABLE, Some(batch.clone()), 1)
+        .await
+        .expect_err("the legacy lower B1 seam must enforce the same table-level refusal");
+    assert!(
+        error.to_string().contains("Blob-bearing table"),
+        "{error:?}"
+    );
+    let error = db
+        .failpoint_stream_b2_for_test(
+            TABLE,
+            batch,
+            2,
+            &incarnation,
+            "58585858-5858-4858-8858-585858585858",
+            None,
+            "agent:blob",
+        )
+        .await
+        .expect_err("the lower B2 seam must enforce the same table-level refusal");
+    assert!(
+        error.to_string().contains("Blob-bearing table"),
+        "{error:?}"
+    );
+
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_before,
+        "Blob refusal must not move graph authority"
+    );
+    let inventory_after = mem_wal_inventory(db.uri()).await;
+    assert_eq!(
+        inventory_after.objects, inventory_before.objects,
+        "Blob refusal must not move MemWAL inventory"
     );
     assert_no_recovery_sidecars(&dir);
 }

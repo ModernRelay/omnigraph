@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
     builder::{
         ArrayBuilder, BooleanBuilder, Date32Builder, Date64Builder, FixedSizeListBuilder,
         Float32Builder, Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
@@ -15,7 +15,8 @@ use arrow_array::{
 use arrow_schema::DataType;
 use base64::Engine;
 use lance::blob::BlobArrayBuilder;
-use omnigraph_compiler::catalog::NodeType;
+use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
+use omnigraph_compiler::types::PropType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -874,8 +875,13 @@ fn build_node_batch(
             let col = build_blob_column(field.name(), field.is_nullable(), rows)?;
             property_columns.push(col);
         } else {
-            let col =
-                build_column_from_json(field.name(), field.data_type(), field.is_nullable(), rows)?;
+            let col = build_column_from_json(
+                field.name(),
+                field.data_type(),
+                field.is_nullable(),
+                rows,
+                JsonConversionMode::LoaderCompat,
+            )?;
             property_columns.push(col);
         }
     }
@@ -1039,12 +1045,316 @@ fn build_edge_batch(
                 field.data_type(),
                 field.is_nullable(),
                 &data_values,
+                JsonConversionMode::LoaderCompat,
             )?;
             columns.push(col);
         }
     }
 
     RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+/// Normalize one caller-shaped stream row into the exact logical Arrow schema
+/// consumed by the private B2 admission core.
+///
+/// Unlike the bulk loader, this path is intentionally strict: every row owns
+/// its sequencing identity, so it may not mint an id, ignore an unknown field,
+/// or turn a malformed nullable value into null. The caller removes and
+/// validates the `$stream` envelope and supplies the hidden-column-free public
+/// catalog before entering this helper.
+pub(crate) fn normalize_stream_json_row(
+    catalog: &Catalog,
+    table_key: &str,
+    row: JsonValue,
+) -> Result<RecordBatch> {
+    let batch = if let Some(type_name) = table_key.strip_prefix("node:") {
+        let node_type = catalog
+            .node_types
+            .get(type_name)
+            .ok_or_else(|| OmniError::manifest(format!("unknown node type '{type_name}'")))?;
+        normalize_stream_node_row(node_type, row)
+    } else if let Some(type_name) = table_key.strip_prefix("edge:") {
+        let edge_type = catalog
+            .edge_types
+            .get(type_name)
+            .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{type_name}'")))?;
+        normalize_stream_edge_row(edge_type, row)
+    } else {
+        Err(OmniError::manifest(format!(
+            "invalid stream table key '{table_key}'"
+        )))
+    }?;
+
+    Ok(batch)
+}
+
+fn normalize_stream_node_row(node_type: &NodeType, row: JsonValue) -> Result<RecordBatch> {
+    let object = row
+        .as_object()
+        .ok_or_else(|| OmniError::manifest("stream input must be one JSON object"))?;
+    validate_stream_input_fields(
+        &format!("node:{}", node_type.name),
+        object,
+        &node_type.properties,
+        &[],
+    )?;
+    validate_explicit_stream_id(&node_type.name, object)?;
+    let mut embed_properties = node_type.embed_sources.keys().collect::<Vec<_>>();
+    embed_properties.sort();
+    for property in embed_properties {
+        if object.get(property).is_none_or(JsonValue::is_null) {
+            return Err(OmniError::manifest(format!(
+                "stream row for {} requires caller-supplied @embed vector '{}'",
+                node_type.name, property
+            )));
+        }
+    }
+
+    let schema = Arc::clone(&node_type.arrow_schema);
+    preflight_stream_row_arrow_bytes(&schema, object)?;
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    let id = object
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .expect("validated stream id");
+    columns.push(Arc::new(StringArray::from(vec![id])) as ArrayRef);
+    for field in schema.fields().iter().skip(1) {
+        let column = build_column_from_json(
+            field.name(),
+            field.data_type(),
+            field.is_nullable(),
+            std::slice::from_ref(&row),
+            JsonConversionMode::Strict,
+        )?;
+        columns.push(column);
+    }
+    let batch = RecordBatch::try_new(schema, columns)
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+
+    if let Some(key_properties) = &node_type.key {
+        let key_columns = key_properties
+            .iter()
+            .map(|property| {
+                batch.column_by_name(property).cloned().ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "@key property '{property}' is missing from node {} stream schema",
+                        node_type.name
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let canonical = canonical_node_id(&key_columns, 0)?.ok_or_else(|| {
+            OmniError::manifest(format!(
+                "node {} is missing a non-null @key value",
+                node_type.name
+            ))
+        })?;
+        if id != canonical {
+            return Err(OmniError::manifest(format!(
+                "node {} explicit id '{}' does not match its canonical @key id '{}'",
+                node_type.name, id, canonical
+            )));
+        }
+    }
+    Ok(batch)
+}
+
+fn normalize_stream_edge_row(edge_type: &EdgeType, row: JsonValue) -> Result<RecordBatch> {
+    let object = row
+        .as_object()
+        .ok_or_else(|| OmniError::manifest("stream input must be one JSON object"))?;
+    validate_stream_input_fields(
+        &format!("edge:{}", edge_type.name),
+        object,
+        &edge_type.properties,
+        &["src", "dst"],
+    )?;
+    validate_explicit_stream_id(&edge_type.name, object)?;
+    let src = validate_required_stream_string(&edge_type.name, "src", object)?;
+    let dst = validate_required_stream_string(&edge_type.name, "dst", object)?;
+
+    let schema = Arc::clone(&edge_type.arrow_schema);
+    preflight_stream_row_arrow_bytes(&schema, object)?;
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    let id = object
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .expect("validated stream id");
+    columns.push(Arc::new(StringArray::from(vec![id])) as ArrayRef);
+    columns.push(Arc::new(StringArray::from(vec![src])) as ArrayRef);
+    columns.push(Arc::new(StringArray::from(vec![dst])) as ArrayRef);
+    for field in schema.fields().iter().skip(3) {
+        let column = build_column_from_json(
+            field.name(),
+            field.data_type(),
+            field.is_nullable(),
+            std::slice::from_ref(&row),
+            JsonConversionMode::Strict,
+        )?;
+        columns.push(column);
+    }
+    RecordBatch::try_new(schema, columns).map_err(|error| OmniError::Lance(error.to_string()))
+}
+
+fn validate_stream_input_fields(
+    table_key: &str,
+    object: &serde_json::Map<String, JsonValue>,
+    properties: &HashMap<String, PropType>,
+    structural_fields: &[&str],
+) -> Result<()> {
+    for field in object.keys() {
+        if is_reserved_stream_physical_field(field) {
+            return Err(OmniError::manifest(format!(
+                "stream input field '{field}' is reserved physical state"
+            )));
+        }
+        if field == "id"
+            || structural_fields.contains(&field.as_str())
+            || properties.contains_key(field)
+        {
+            continue;
+        }
+        return Err(OmniError::manifest(format!(
+            "unknown stream input field '{field}' for '{table_key}'"
+        )));
+    }
+    Ok(())
+}
+
+fn is_reserved_stream_physical_field(field: &str) -> bool {
+    matches!(
+        field,
+        "_tombstone"
+            | "_rowid"
+            | "_rowaddr"
+            | "_rowoffset"
+            | "_row_created_at_version"
+            | "_row_last_updated_at_version"
+    ) || field.eq_ignore_ascii_case(crate::db::STREAM_METADATA_COLUMN)
+}
+
+fn validate_explicit_stream_id(
+    type_name: &str,
+    object: &serde_json::Map<String, JsonValue>,
+) -> Result<()> {
+    validate_required_stream_string(type_name, "id", object).map(|_| ())
+}
+
+fn validate_required_stream_string<'a>(
+    type_name: &str,
+    field: &str,
+    object: &'a serde_json::Map<String, JsonValue>,
+) -> Result<&'a str> {
+    match object.get(field) {
+        Some(JsonValue::String(value)) => Ok(value),
+        Some(JsonValue::Null) => Err(OmniError::manifest(format!(
+            "stream row for {type_name} requires non-null string field '{field}'"
+        ))),
+        Some(value) => Err(OmniError::manifest(format!(
+            "stream row for {type_name} field '{field}' must be a string, got {value}"
+        ))),
+        None => Err(OmniError::manifest(format!(
+            "stream row for {type_name} requires explicit field '{field}'"
+        ))),
+    }
+}
+
+fn preflight_stream_row_arrow_bytes(
+    schema: &arrow_schema::Schema,
+    object: &serde_json::Map<String, JsonValue>,
+) -> Result<()> {
+    preflight_stream_row_arrow_bytes_with_limit(schema, object, KEYED_WRITE_MAX_BYTES)
+}
+
+fn preflight_stream_row_arrow_bytes_with_limit(
+    schema: &arrow_schema::Schema,
+    object: &serde_json::Map<String, JsonValue>,
+    limit: u64,
+) -> Result<()> {
+    let mut projected = 0_u64;
+    for field in schema.fields() {
+        let value = object.get(field.name()).unwrap_or(&JsonValue::Null);
+        projected = projected
+            .checked_add(projected_stream_column_bytes(field.data_type(), value)?)
+            .unwrap_or(u64::MAX);
+        if projected > limit {
+            return Err(OmniError::resource_limit(
+                "stream_input_arrow_bytes",
+                limit,
+                projected,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn projected_stream_column_bytes(data_type: &DataType, value: &JsonValue) -> Result<u64> {
+    const ARRAY_BUFFER_OVERHEAD: u64 = 16;
+    let bytes = match data_type {
+        DataType::Utf8 => ARRAY_BUFFER_OVERHEAD.saturating_add(
+            value
+                .as_str()
+                .and_then(|value| u64::try_from(value.len()).ok())
+                .unwrap_or_default(),
+        ),
+        DataType::Int32 | DataType::Float32 | DataType::Date32 => ARRAY_BUFFER_OVERHEAD + 4,
+        DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Date64 => {
+            ARRAY_BUFFER_OVERHEAD + 8
+        }
+        DataType::UInt32 => ARRAY_BUFFER_OVERHEAD + 4,
+        DataType::Boolean => ARRAY_BUFFER_OVERHEAD + 1,
+        DataType::List(child) => {
+            let mut bytes = ARRAY_BUFFER_OVERHEAD;
+            if let Some(items) = value.as_array() {
+                for item in items {
+                    bytes = bytes
+                        .checked_add(projected_stream_list_item_bytes(child.data_type(), item)?)
+                        .unwrap_or(u64::MAX);
+                }
+            }
+            bytes
+        }
+        DataType::FixedSizeList(child, dimension) => {
+            let dimension = u64::try_from(*dimension).map_err(|_| {
+                OmniError::manifest_internal(format!(
+                    "stream vector has invalid dimension {dimension}"
+                ))
+            })?;
+            let child_width = projected_stream_fixed_width(child.data_type())?;
+            ARRAY_BUFFER_OVERHEAD
+                .checked_add(dimension.checked_mul(child_width + 1).unwrap_or(u64::MAX))
+                .unwrap_or(u64::MAX)
+        }
+        other => {
+            return Err(OmniError::manifest(format!(
+                "stream input has unsupported Arrow type {other:?}"
+            )));
+        }
+    };
+    Ok(bytes)
+}
+
+fn projected_stream_list_item_bytes(data_type: &DataType, value: &JsonValue) -> Result<u64> {
+    match data_type {
+        DataType::Utf8 => Ok(8_u64.saturating_add(
+            value
+                .as_str()
+                .and_then(|value| u64::try_from(value.len()).ok())
+                .unwrap_or_default(),
+        )),
+        other => projected_stream_fixed_width(other).map(|width| width + 1),
+    }
+}
+
+fn projected_stream_fixed_width(data_type: &DataType) -> Result<u64> {
+    match data_type {
+        DataType::Boolean => Ok(1),
+        DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => Ok(4),
+        DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Date64 => Ok(8),
+        other => Err(OmniError::manifest(format!(
+            "stream input has unsupported nested Arrow type {other:?}"
+        ))),
+    }
 }
 
 /// Refuse an oversized aggregate base64 payload before any blob bytes are
@@ -1153,11 +1463,18 @@ fn build_blob_column(name: &str, nullable: bool, rows: &[JsonValue]) -> Result<A
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonConversionMode {
+    LoaderCompat,
+    Strict,
+}
+
 fn build_column_from_json(
     name: &str,
     data_type: &DataType,
     nullable: bool,
     rows: &[JsonValue],
+    mode: JsonConversionMode,
 ) -> Result<ArrayRef> {
     let array: ArrayRef = match data_type {
         DataType::Utf8 => {
@@ -1328,15 +1645,76 @@ fn build_column_from_json(
         DataType::FixedSizeList(child_field, dim) => {
             // Vector type: parse JSON array of floats into FixedSizeList<Float32>
             let dim = *dim;
+            let dim_usize = usize::try_from(dim).map_err(|_| {
+                OmniError::manifest_internal(format!(
+                    "vector property '{name}' has invalid dimension {dim}"
+                ))
+            })?;
+            if mode == JsonConversionMode::Strict {
+                // Strict stream normalization must reject malformed input and
+                // prove the builder's lower-bound allocation before creating
+                // it. A legal compiler dimension can still approach i32::MAX;
+                // even one nullable null would otherwise reserve or append
+                // billions of child slots before the post-build batch bound.
+                for row in rows {
+                    let value = row.get(name).unwrap_or(&JsonValue::Null);
+                    match value {
+                        JsonValue::Array(items) => {
+                            if items.len() != dim_usize {
+                                return Err(OmniError::manifest(format!(
+                                    "vector property '{}' expects {} dimensions, got {}",
+                                    name,
+                                    dim,
+                                    items.len()
+                                )));
+                            }
+                            for item in items {
+                                let Some(value) = item.as_f64() else {
+                                    return Err(OmniError::manifest(format!(
+                                        "vector property '{}' elements must be numeric, got {}",
+                                        name, item
+                                    )));
+                                };
+                                checked_json_f32(value, "vector element")?;
+                            }
+                        }
+                        JsonValue::Null if nullable => {}
+                        JsonValue::Null => {
+                            return Err(OmniError::manifest(format!(
+                                "non-nullable vector property '{}' has null values",
+                                name
+                            )));
+                        }
+                        other => {
+                            return Err(OmniError::manifest(format!(
+                                "vector property '{}' expects a JSON array, got {}",
+                                name, other
+                            )));
+                        }
+                    }
+                }
+                let allocation_bytes = u64::try_from(rows.len())
+                    .ok()
+                    .and_then(|rows| rows.checked_mul(u64::try_from(dim_usize).ok()?))
+                    .and_then(|values| values.checked_mul(4))
+                    .unwrap_or(u64::MAX);
+                if allocation_bytes > KEYED_WRITE_MAX_BYTES {
+                    return Err(OmniError::resource_limit(
+                        "stream_input_arrow_bytes",
+                        KEYED_WRITE_MAX_BYTES,
+                        allocation_bytes,
+                    ));
+                }
+            }
             let mut builder = FixedSizeListBuilder::with_capacity(
-                Float32Builder::with_capacity(rows.len() * dim as usize),
+                Float32Builder::with_capacity(rows.len() * dim_usize),
                 dim,
                 rows.len(),
             )
             .with_field(child_field.clone());
             for row in rows {
                 if let Some(arr) = row.get(name).and_then(|v| v.as_array()) {
-                    if arr.len() != dim as usize {
+                    if arr.len() != dim_usize {
                         return Err(OmniError::manifest(format!(
                             "vector property '{}' expects {} dimensions, got {}",
                             name,
@@ -1362,7 +1740,7 @@ fn build_column_from_json(
                     }
                     builder.append(true);
                 } else if nullable {
-                    for _ in 0..dim as usize {
+                    for _ in 0..dim_usize {
                         builder.values().append_null();
                     }
                     builder.append(false);
@@ -1375,12 +1753,42 @@ fn build_column_from_json(
             }
             Arc::new(builder.finish())
         }
+        _ if mode == JsonConversionMode::Strict => {
+            return Err(OmniError::manifest(format!(
+                "stream property '{name}' has unsupported Arrow type {data_type:?}"
+            )));
+        }
         _ => {
             // Unsupported type: fill with nulls
             let values: Vec<Option<&str>> = vec![None; rows.len()];
             Arc::new(StringArray::from(values))
         }
     };
+
+    if mode == JsonConversionMode::Strict {
+        for (row_index, row) in rows.iter().enumerate() {
+            let input = row.get(name).unwrap_or(&JsonValue::Null);
+            if !input.is_null() && array.is_null(row_index) {
+                return Err(OmniError::manifest(format!(
+                    "stream property '{name}' expects {data_type:?}, got {input}"
+                )));
+            }
+        }
+        if matches!(data_type, DataType::List(_)) {
+            let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "strict list conversion for '{name}' produced a non-list array"
+                ))
+            })?;
+            for row_index in 0..list.len() {
+                if !list.is_null(row_index) && list.value(row_index).null_count() != 0 {
+                    return Err(OmniError::manifest(format!(
+                        "stream list property '{name}' contains a null or invalid item"
+                    )));
+                }
+            }
+        }
+    }
 
     if !nullable && array.null_count() > 0 {
         return Err(OmniError::manifest(format!(
@@ -2130,6 +2538,122 @@ edge WorksAt: Person -> Company
 {"edge": "Knows", "from": "Alice", "to": "Bob"}
 {"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 "#;
+
+    #[test]
+    fn strict_json_conversion_rejects_nullable_wrong_types_and_list_items() {
+        let wrong_scalar = vec![serde_json::json!({"score": "not-an-int"})];
+        let compatible = build_column_from_json(
+            "score",
+            &DataType::Int32,
+            true,
+            &wrong_scalar,
+            JsonConversionMode::LoaderCompat,
+        )
+        .unwrap();
+        assert!(
+            compatible.is_null(0),
+            "bulk-load compatibility keeps its historical nullable coercion"
+        );
+        let strict = build_column_from_json(
+            "score",
+            &DataType::Int32,
+            true,
+            &wrong_scalar,
+            JsonConversionMode::Strict,
+        )
+        .expect_err("stream normalization must not turn a wrong type into null");
+        assert!(strict.to_string().contains("expects Int32"), "{strict:?}");
+
+        let list_type = DataType::List(Arc::new(arrow_schema::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )));
+        let wrong_list = vec![serde_json::json!({"tags": ["valid", 7]})];
+        build_column_from_json(
+            "tags",
+            &list_type,
+            false,
+            &wrong_list,
+            JsonConversionMode::LoaderCompat,
+        )
+        .expect("bulk-load compatibility retains nullable list-item coercion");
+        let strict = build_column_from_json(
+            "tags",
+            &list_type,
+            false,
+            &wrong_list,
+            JsonConversionMode::Strict,
+        )
+        .expect_err("stream normalization must reject a wrong list item");
+        assert!(
+            strict.to_string().contains("null or invalid item"),
+            "{strict:?}"
+        );
+
+        let missing_nullable = vec![serde_json::json!({})];
+        let strict = build_column_from_json(
+            "score",
+            &DataType::Int32,
+            true,
+            &missing_nullable,
+            JsonConversionMode::Strict,
+        )
+        .expect("a missing nullable stream property remains null");
+        assert!(strict.is_null(0));
+
+        let pathological_vector = DataType::FixedSizeList(
+            Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+            i32::MAX,
+        );
+        let strict = build_column_from_json(
+            "embedding",
+            &pathological_vector,
+            true,
+            &missing_nullable,
+            JsonConversionMode::Strict,
+        )
+        .expect_err("stream normalization must bound vector allocation before building");
+        assert!(
+            matches!(
+                strict,
+                OmniError::ResourceLimitExceeded {
+                    ref resource,
+                    limit: KEYED_WRITE_MAX_BYTES,
+                    actual: 8_589_934_588,
+                } if resource == "stream_input_arrow_bytes"
+            ),
+            "{strict:?}"
+        );
+
+        let list_schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", DataType::Utf8, false),
+            arrow_schema::Field::new(
+                "tags",
+                DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    false,
+                ))),
+                false,
+            ),
+        ]);
+        let list_row = serde_json::json!({"id": "row", "tags": ["one", "two"]});
+        let error = preflight_stream_row_arrow_bytes_with_limit(
+            &list_schema,
+            list_row.as_object().unwrap(),
+            32,
+        )
+        .expect_err("aggregate list buffers must be bounded before builders allocate");
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: 32,
+                actual: 57,
+            } if resource == "stream_input_arrow_bytes"
+        ));
+    }
 
     #[tokio::test]
     async fn test_load_creates_data() {
