@@ -317,6 +317,33 @@ impl Omnigraph {
         }
     }
 
+    /// Final graph-profile preflight for the hidden stream-ingest seam.
+    ///
+    /// Unlike ordinary content writes, ingestion is meaningful only while the
+    /// profile is `ENABLED`, and it always requires the checked serving
+    /// runtime that is bound to this exact cluster declaration and profile
+    /// revision. The caller holds the root-shared profile gate through the
+    /// complete admission result.
+    pub(crate) async fn ensure_streaming_ingest_runtime_authorized(&self) -> Result<()> {
+        let profile = self.current_canonical_stream_profile().await?;
+        match profile.mode() {
+            StreamProfileMode::Enabled => {
+                let Some(runtime) = self.stream_runtime_authority.as_ref() else {
+                    return Err(OmniError::StreamingRequiresClusterRuntime {
+                        mode: profile.mode().as_str().to_string(),
+                    });
+                };
+                validate_runtime_profile_binding(&profile, &runtime.guard)
+            }
+            mode @ (StreamProfileMode::Disabled | StreamProfileMode::Disabling) => {
+                Err(OmniError::StreamingRequiresClusterRuntime {
+                    mode: mode.as_str().to_string(),
+                })
+            }
+            StreamProfileMode::Retired => Err(OmniError::StreamAuthorityRetired),
+        }
+    }
+
     /// BranchMerge has no token-aware sequencing transition in this profile.
     ///
     /// The profile gate still protects it from a concurrent transition, but a
