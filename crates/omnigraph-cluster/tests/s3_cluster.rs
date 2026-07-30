@@ -17,9 +17,8 @@ use std::env;
 use std::fs;
 
 use omnigraph_cluster::{
-    ApplyOptions, apply_config_dir, apply_config_dir_with_options, import_config_dir,
-    read_serving_snapshot, read_serving_snapshot_from_storage, status_config_dir,
-    validate_config_dir,
+    ApplyOptions, apply_config_dir_with_options, import_config_dir, read_serving_snapshot,
+    read_serving_snapshot_from_storage, status_config_dir, validate_config_dir,
 };
 use ulid::Ulid;
 
@@ -28,13 +27,13 @@ const SCHEMA_V2: &str = "node Person {\n  name: String @key\n  title: String?\n}
 const FIND_PERSON_GQ: &str = "query find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n";
 const POLICY_YAML: &str = r#"
 version: 1
-actors:
-  - id: act-admin
-    roles: [admin]
+groups:
+  admins: [act-admin]
 rules:
-  - effect: permit
-    actions: [read, change, schema_apply, branch_create, branch_delete, branch_merge]
-    roles: [admin]
+  - id: admins-full-access
+    allow:
+      actors: { group: admins }
+      actions: [read, change, schema_apply, branch_create, branch_delete, branch_merge, stream_manage]
 "#;
 
 /// Unique per-run storage root under the test bucket, or None to skip.
@@ -43,7 +42,7 @@ fn s3_storage_root(suite: &str) -> Option<String> {
     Some(format!("s3://{bucket}/cluster-e2e/{suite}-{}", Ulid::new()))
 }
 
-fn write_cluster_fixture(dir: &std::path::Path, storage_root: &str, schema: &str) {
+fn write_cluster_fixture(dir: &std::path::Path, storage_root: &str, schema: &str, streaming: bool) {
     fs::write(dir.join("people.pg"), schema).unwrap();
     fs::create_dir_all(dir.join("queries")).unwrap();
     fs::write(dir.join("queries/people.gq"), FIND_PERSON_GQ).unwrap();
@@ -56,7 +55,7 @@ storage: {storage_root}
 graphs:
   knowledge:
     schema: people.pg
-    streaming: true
+    streaming: {streaming}
     queries: queries/
 policies:
   intel:
@@ -68,6 +67,13 @@ policies:
     .unwrap();
 }
 
+fn e2e_apply_options() -> ApplyOptions {
+    ApplyOptions {
+        actor: Some("act-admin".to_string()),
+        confirm_stream_offline: true,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_cluster_full_lifecycle_import_apply_serve_evolve_delete() {
     let Some(root) = s3_storage_root("lifecycle") else {
@@ -75,7 +81,7 @@ async fn s3_cluster_full_lifecycle_import_apply_serve_evolve_delete() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    write_cluster_fixture(dir.path(), &root, SCHEMA_V1);
+    write_cluster_fixture(dir.path(), &root, SCHEMA_V1, true);
 
     // validate is config-only and must pass before any bucket I/O.
     let validate = validate_config_dir(dir.path());
@@ -96,14 +102,7 @@ async fn s3_cluster_full_lifecycle_import_apply_serve_evolve_delete() {
         status.state_observations
     );
 
-    let apply = apply_config_dir_with_options(
-        dir.path(),
-        ApplyOptions {
-            actor: Some("e2e-operator".to_string()),
-            confirm_stream_offline: true,
-        },
-    )
-    .await;
+    let apply = apply_config_dir_with_options(dir.path(), e2e_apply_options()).await;
     assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
 
     // Nothing stored locally: the config dir holds only declared sources.
@@ -136,9 +135,15 @@ async fn s3_cluster_full_lifecycle_import_apply_serve_evolve_delete() {
     assert_eq!(via_uri.policies.len(), 1);
 
     // Schema evolution converges on the bucket.
-    write_cluster_fixture(dir.path(), &root, SCHEMA_V2);
-    let evolve = apply_config_dir(dir.path()).await;
+    write_cluster_fixture(dir.path(), &root, SCHEMA_V2, true);
+    let evolve = apply_config_dir_with_options(dir.path(), e2e_apply_options()).await;
     assert!(evolve.ok && evolve.converged, "{:?}", evolve.diagnostics);
+
+    // The graph cannot be deleted while its streaming profile is active.
+    // Disable it explicitly under the same checked offline authority first.
+    write_cluster_fixture(dir.path(), &root, SCHEMA_V2, false);
+    let disable = apply_config_dir_with_options(dir.path(), e2e_apply_options()).await;
+    assert!(disable.ok && disable.converged, "{:?}", disable.diagnostics);
 
     // Approved delete: drop the graph from the config; the plan demands an
     // approval, the approved apply prefix-deletes the bucket root.
@@ -153,14 +158,10 @@ async fn s3_cluster_full_lifecycle_import_apply_serve_evolve_delete() {
         .approvals_required
         .first()
         .expect("graph delete requires approval");
-    let approve = omnigraph_cluster::approve_config_dir(
-        dir.path(),
-        &approval.resource,
-        "e2e-operator",
-    )
-    .await;
+    let approve =
+        omnigraph_cluster::approve_config_dir(dir.path(), &approval.resource, "act-admin").await;
     assert!(approve.ok, "{:?}", approve.diagnostics);
-    let delete = apply_config_dir(dir.path()).await;
+    let delete = apply_config_dir_with_options(dir.path(), e2e_apply_options()).await;
     assert!(delete.ok && delete.converged, "{:?}", delete.diagnostics);
 
     let after = read_serving_snapshot_from_storage(&root).await;

@@ -17,27 +17,23 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 
 ## CI control-plane tests
 
-`scripts/ci/test-firehose-ci.sh` owns the firehose classifier, dependency-key,
-smoke-command, archive round-trip, and workflow trust guards. Extend that
-script when changing `.github/workflows/ci.yml` or `scripts/ci/firehose-*.sh`;
-do not create a second CI-policy harness. Its fixture keeps path classification
-honest: documentation below `docs/` may no-op, while source and text fixtures
-under `crates/` must schedule the tier, and only dependency inputs may move the
-source key.
+The workflow has one conservative text-only classifier: only known top-level
+documentation files and documentation formats below `docs/` may skip the
+post-merge heavy jobs. A Markdown/text fixture under `crates/` is source, not
+documentation. There is no dedicated firehose artifact, dependency-key, or
+compile harness.
 
-Run:
+When changing `.github/workflows/ci.yml`, validate its syntax and the remaining
+shell owners:
 
 ```bash
-bash scripts/ci/test-firehose-ci.sh
-shellcheck scripts/ci/*.sh
+shellcheck scripts/*.sh
 actionlint .github/workflows/ci.yml
 ```
 
-The shell harness cannot prove hosted-runner latency, GitHub attestation
-identity, or artifact retention behavior. Those are measured workflow
-acceptance evidence, with the activation threshold documented in
-[ci.md](ci.md); a local green result must not be used to add the shadow
-contexts to branch protection.
+Also inspect the `Classify Changes` case table whenever a new fixture format or
+source subtree is added. Hosted-runner latency is measured workflow evidence;
+it is not inferred from a local syntax check. See [ci.md](ci.md).
 
 ## Engine integration tests (`crates/omnigraph/tests/`)
 
@@ -511,6 +507,16 @@ scope. The lifecycle
 matrix includes `quiesce -> create named branch -> resume`: bounded resume must
 recheck branch topology under the closed gates and remain `SEALED`, while a
 compatible main-only resume advances the epoch and opens.
+
+F5 extends those owners; it does not create a separate replay suite. The
+existing fold/recovery/failpoint/export/cluster/CLI seams must cover one
+bounded deterministic dead-letter object, current `DEAD_LETTERED` authority,
+an all-diverted fold, ambiguous conditional PUT recovery, exact retry while
+current, predecessor fencing, ordinary correction, bounded selected-version
+list/export, export blocking, and same-format retirement. One-under/exact/one-
+over byte and RSS cells set the object limit before activation. No cell may
+assume a chunk chain, replay mutation, public history pagination, maintained
+dead-letter inventory, or ordinary `optimize` coverage of `_stream_tokens`.
 
 ### RFC-026 Phase B2b coverage ownership (specified, inactive)
 

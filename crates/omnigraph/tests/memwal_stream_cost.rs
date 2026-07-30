@@ -456,8 +456,13 @@ struct WidestRetainedGrowthSample {
     recovery_sidecars_after_fold: Vec<String>,
 }
 
-async fn initialize_history(uri: &str, depth: u64, compact_before_enrollment: bool) {
-    let db = Omnigraph::init(uri, STREAM_SCHEMA).await.unwrap();
+async fn initialize_history(
+    cluster_uri: &str,
+    depth: u64,
+    compact_before_enrollment: bool,
+) -> String {
+    let uri = helpers::stream_authority::graph_uri(cluster_uri);
+    let db = Omnigraph::init(&uri, STREAM_SCHEMA).await.unwrap();
     for tick in 0..depth {
         db.mutate(
             "main",
@@ -476,13 +481,18 @@ async fn initialize_history(uri: &str, depth: u64, compact_before_enrollment: bo
     db.failpoint_enroll_stream_table_for_test(TABLE)
         .await
         .unwrap();
+    helpers::stream_authority::enable_stream_profile(&db, cluster_uri).await;
+    uri
 }
 
-async fn init_enrolled(uri: &str, schema: &str) {
-    let db = Omnigraph::init(uri, schema).await.unwrap();
+async fn init_enrolled(cluster_uri: &str, schema: &str) -> String {
+    let uri = helpers::stream_authority::graph_uri(cluster_uri);
+    let db = Omnigraph::init(&uri, schema).await.unwrap();
     db.failpoint_enroll_stream_table_for_test(TABLE)
         .await
         .unwrap();
+    helpers::stream_authority::enable_stream_profile(&db, cluster_uri).await;
+    uri
 }
 
 async fn table_schema(db: &Omnigraph) -> Arc<Schema> {
@@ -530,17 +540,17 @@ async fn payload_batch(db: &Omnigraph, rows: usize, payload_bytes: usize) -> Rec
 }
 
 async fn history_sample_at_uri(
-    uri: &str,
+    cluster_uri: &str,
     depth: u64,
     compact_before_enrollment: bool,
 ) -> HistorySample {
-    initialize_history(uri, depth, compact_before_enrollment).await;
+    let uri = initialize_history(cluster_uri, depth, compact_before_enrollment).await;
 
     let table_tracker = IOTracker::default();
     let manifest_tracker = IOTracker::default();
     with_raw_io_trackers(&table_tracker, &manifest_tracker, async {
-        let (adapter, adapter_counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
-        let db = Arc::new(Omnigraph::open_with_storage(uri, adapter).await.unwrap());
+        let (adapter, adapter_counts) = CountingStorageAdapter::new(storage_for_uri(&uri).unwrap());
+        let db = Arc::new(Omnigraph::open_with_storage(&uri, adapter).await.unwrap());
         let schema = table_schema(&db).await;
         let first = score_batch(Arc::clone(&schema), &format!("d{depth}-warmup"), 1);
         let measured = score_batch(schema, &format!("d{depth}-measured"), 1);
@@ -676,15 +686,14 @@ async fn warm_already_claimed_ack_is_measured_on_configured_rustfs() {
 
 async fn cold_replay_sample(retained_batches: u64) -> ColdReplaySample {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    init_enrolled(uri, STREAM_SCHEMA).await;
+    let uri = init_enrolled(dir.path().to_str().unwrap(), STREAM_SCHEMA).await;
 
     let table_tracker = IOTracker::default();
     let manifest_tracker = IOTracker::default();
     with_raw_io_trackers(&table_tracker, &manifest_tracker, async {
-        let (adapter, _) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+        let (adapter, _) = CountingStorageAdapter::new(storage_for_uri(&uri).unwrap());
         let mut db = Arc::new(
-            Omnigraph::open_with_storage(uri, Arc::clone(&adapter))
+            Omnigraph::open_with_storage(&uri, Arc::clone(&adapter))
                 .await
                 .unwrap(),
         );
@@ -696,6 +705,9 @@ async fn cold_replay_sample(retained_batches: u64) -> ColdReplaySample {
                 1,
             );
             if ordinal + 1 == retained_batches {
+                let retired = helpers::failpoint::Rendezvous::park_first(
+                    names::STREAM_B1_AFTER_RETIREMENT_RELEASE,
+                );
                 let error = {
                     let _after_durable =
                         ScopedFailPoint::new(names::STREAM_B1_AFTER_WATCHER_SUCCESS, "return");
@@ -704,6 +716,8 @@ async fn cold_replay_sample(retained_batches: u64) -> ColdReplaySample {
                         .expect_err("the final durable entry retires the warm writer")
                 };
                 assert!(matches!(error, OmniError::AckUnknown { .. }), "{error:?}");
+                retired.wait_until_reached().await;
+                retired.release();
             } else {
                 db.failpoint_stream_b1_for_test(TABLE, Some(batch), ordinal)
                     .await
@@ -711,34 +725,37 @@ async fn cold_replay_sample(retained_batches: u64) -> ColdReplaySample {
             }
         }
 
-        // Reopen the graph, then reset: the measured interval starts at the
-        // stream's cold claim/replay, not at generic graph open.
+        // Recovery-v14 can resolve durable claim/lifecycle authority while the
+        // graph reopens. Reset before that reopen so the cold interval owns
+        // every read needed to reach the claimed pre-seal worker.
         drop(db);
-        db = Arc::new(Omnigraph::open_with_storage(uri, adapter).await.unwrap());
         let _ = table_tracker.incremental_stats();
         let _ = manifest_tracker.incremental_stats();
 
         let started = Instant::now();
-        let error = {
-            let _before_seal = ScopedFailPoint::new(names::STREAM_B1_BEFORE_FORCE_SEAL, "return");
-            db.failpoint_stream_b1_for_test(TABLE, None, 0)
-                .await
-                .expect_err("stop after cold claim/replay and before generation output")
-        };
-        assert!(
-            error
-                .to_string()
-                .contains(names::STREAM_B1_BEFORE_FORCE_SEAL),
-            "{error:?}"
-        );
-        let elapsed_us = started.elapsed().as_micros();
-        let table = PathIo::from_stats(&table_tracker.incremental_stats());
+        db = Arc::new(Omnigraph::open_with_storage(&uri, adapter).await.unwrap());
+        let before_seal = Arc::new(helpers::failpoint::Rendezvous::park_first(
+            names::STREAM_B1_BEFORE_FORCE_SEAL,
+        ));
+        let controller_rendezvous = Arc::clone(&before_seal);
+        let controller_tracker = table_tracker.clone();
+        let controller = tokio::spawn(async move {
+            controller_rendezvous.wait_until_reached().await;
+            let elapsed_us = started.elapsed().as_micros();
+            let table = PathIo::from_stats(&controller_tracker.incremental_stats());
+            controller_rendezvous.release();
+            (elapsed_us, table)
+        });
 
-        // Complete the same durable tail so each fixture leaves no live worker.
+        // Continue the same claimed worker into its fold so the replay term
+        // excludes both generation output and a second operational claim.
         let _ = manifest_tracker.incremental_stats();
         db.failpoint_stream_b1_for_test(TABLE, None, 0)
             .await
-            .unwrap();
+            .expect("cold replay fixture must close its claimed generation");
+        let (elapsed_us, table) = controller
+            .await
+            .expect("cold replay controller task must remain joinable");
         ColdReplaySample {
             retained_batches,
             elapsed_us,
@@ -748,7 +765,7 @@ async fn cold_replay_sample(retained_batches: u64) -> ColdReplaySample {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn cold_claim_replay_is_reported_separately_by_retained_wal_depth() {
     let _scenario = FailScenario::setup();
@@ -783,12 +800,11 @@ async fn cold_claim_replay_is_reported_separately_by_retained_wal_depth() {
 
 async fn fold_rows_sample(rows: usize) -> FoldRowsSample {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    init_enrolled(uri, STREAM_SCHEMA).await;
+    let uri = init_enrolled(dir.path().to_str().unwrap(), STREAM_SCHEMA).await;
     let table_tracker = IOTracker::default();
     let manifest_tracker = IOTracker::default();
     with_raw_io_trackers(&table_tracker, &manifest_tracker, async {
-        let db = Arc::new(Omnigraph::open(uri).await.unwrap());
+        let db = Arc::new(Omnigraph::open(&uri).await.unwrap());
         let schema = table_schema(&db).await;
         let batch = score_batch(schema, &format!("fold-{rows}"), rows);
         db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
@@ -973,7 +989,7 @@ fn current_process_peak_rss_bytes() -> Option<u64> {
 }
 
 async fn retained_history_scaling_samples_at(
-    uri: &str,
+    cluster_uri: &str,
     depths: &[u64],
 ) -> Vec<RetentionDepthSample> {
     assert!(!depths.is_empty());
@@ -985,14 +1001,14 @@ async fn retained_history_scaling_samples_at(
         "retained-history sweep depths must be positive and strictly increasing"
     );
 
-    init_enrolled(uri, STREAM_SCHEMA).await;
+    let uri = init_enrolled(cluster_uri, STREAM_SCHEMA).await;
     let table_tracker = IOTracker::default();
     let manifest_tracker = IOTracker::default();
 
     with_raw_io_trackers(&table_tracker, &manifest_tracker, async {
-        let (adapter, adapter_counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+        let (adapter, adapter_counts) = CountingStorageAdapter::new(storage_for_uri(&uri).unwrap());
         let mut db = Arc::new(
-            Omnigraph::open_with_storage(uri, Arc::clone(&adapter))
+            Omnigraph::open_with_storage(&uri, Arc::clone(&adapter))
                 .await
                 .unwrap(),
         );
@@ -1020,16 +1036,13 @@ async fn retained_history_scaling_samples_at(
                 visible_rows += 1;
             }
 
-            let before = current_mem_wal_inventory(uri).await;
+            let before = current_mem_wal_inventory(&uri).await;
             assert_eq!(
                 before.generation_roots.len(),
                 usize::try_from(depth).unwrap(),
                 "fixture must reach the requested retained-generation depth exactly"
             );
             let retained_roots = before.generation_roots.clone();
-            let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-            let manifest_version_before = before_snapshot.version();
-            let table_version_before = before_snapshot.entry(TABLE).unwrap().table_version;
 
             // Establish one resident writer, then measure only the second put.
             // This keeps warm acknowledgement separate from cold claim/replay.
@@ -1038,6 +1051,9 @@ async fn retained_history_scaling_samples_at(
                 .await
                 .unwrap();
             ordinal += 1;
+            let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+            let manifest_version_before = before_snapshot.version();
+            let table_version_before = before_snapshot.entry(TABLE).unwrap().table_version;
             let adapter_before =
                 reset_retention_term_trackers(&table_tracker, &manifest_tracker, &adapter_counts);
             let started = Instant::now();
@@ -1058,7 +1074,7 @@ async fn retained_history_scaling_samples_at(
                 adapter_before,
                 &retained_roots,
             );
-            let after_ack = current_mem_wal_inventory(uri).await;
+            let after_ack = current_mem_wal_inventory(&uri).await;
             let after_ack_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
             let manifest_version_after_ack = after_ack_snapshot.version();
             let table_version_after_ack = after_ack_snapshot.entry(TABLE).unwrap().table_version;
@@ -1091,53 +1107,68 @@ async fn retained_history_scaling_samples_at(
             let adapter_before =
                 reset_retention_term_trackers(&table_tracker, &manifest_tracker, &adapter_counts);
             let started = Instant::now();
-            let replay_before_abort =
-                helpers::failpoint::Rendezvous::park_first(names::STREAM_B1_BEFORE_ABORT);
-            let replay_retired = helpers::failpoint::Rendezvous::park_first(
-                names::STREAM_B1_AFTER_RETIREMENT_RELEASE,
-            );
             db = Arc::new(
-                Omnigraph::open_with_storage(uri, Arc::clone(&adapter))
+                Omnigraph::open_with_storage(&uri, Arc::clone(&adapter))
                     .await
                     .unwrap(),
             );
-            let error = {
-                let _before_seal =
-                    ScopedFailPoint::new(names::STREAM_B1_BEFORE_FORCE_SEAL, "return");
-                db.failpoint_stream_b1_for_test(TABLE, None, 0)
+            let before_seal = Arc::new(helpers::failpoint::Rendezvous::park_first(
+                names::STREAM_B1_BEFORE_FORCE_SEAL,
+            ));
+            let controller_rendezvous = Arc::clone(&before_seal);
+            let controller_table = table_tracker.clone();
+            let controller_manifest = manifest_tracker.clone();
+            let controller_counts = Arc::clone(&adapter_counts);
+            let controller_roots = retained_roots.clone();
+            let controller_db = Arc::clone(&db);
+            let controller_uri = uri.clone();
+            let controller = tokio::spawn(async move {
+                controller_rendezvous.wait_until_reached().await;
+                let cold_reopen_replay = retention_term_sample(
+                    started,
+                    &controller_table,
+                    &controller_manifest,
+                    &controller_counts,
+                    adapter_before,
+                    &controller_roots,
+                );
+                let after_replay = current_mem_wal_inventory(&controller_uri).await;
+                let after_replay_snapshot = controller_db
+                    .snapshot_of(ReadTarget::branch("main"))
                     .await
-                    .expect_err("cold replay measurement must stop before generation output")
-            };
-            assert!(
-                error
-                    .to_string()
-                    .contains(names::STREAM_B1_BEFORE_FORCE_SEAL),
-                "{error:?}"
-            );
-            replay_before_abort.wait_until_reached().await;
-            let cold_reopen_replay = retention_term_sample(
-                started,
-                &table_tracker,
-                &manifest_tracker,
-                &adapter_counts,
-                adapter_before,
-                &retained_roots,
-            );
-            replay_before_abort.release();
-            replay_retired.wait_until_reached().await;
-            replay_retired.release();
-            let after_replay = current_mem_wal_inventory(uri).await;
-            let after_replay_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-            let manifest_version_after_replay = after_replay_snapshot.version();
-            let table_version_after_replay =
-                after_replay_snapshot.entry(TABLE).unwrap().table_version;
-
-            let adapter_before =
-                reset_retention_term_trackers(&table_tracker, &manifest_tracker, &adapter_counts);
-            let started = Instant::now();
+                    .unwrap();
+                let manifest_version_after_replay = after_replay_snapshot.version();
+                let table_version_after_replay =
+                    after_replay_snapshot.entry(TABLE).unwrap().table_version;
+                let fold_adapter_before = reset_retention_term_trackers(
+                    &controller_table,
+                    &controller_manifest,
+                    &controller_counts,
+                );
+                let fold_started = Instant::now();
+                controller_rendezvous.release();
+                (
+                    cold_reopen_replay,
+                    after_replay,
+                    manifest_version_after_replay,
+                    table_version_after_replay,
+                    fold_adapter_before,
+                    fold_started,
+                )
+            });
             db.failpoint_stream_b1_for_test(TABLE, None, 0)
                 .await
                 .expect("the replayed generation must fold and publish");
+            let (
+                cold_reopen_replay,
+                after_replay,
+                manifest_version_after_replay,
+                table_version_after_replay,
+                adapter_before,
+                started,
+            ) = controller
+                .await
+                .expect("retained-history controller task must remain joinable");
             let fold = retention_term_sample(
                 started,
                 &table_tracker,
@@ -1161,9 +1192,9 @@ async fn retained_history_scaling_samples_at(
             );
             let manifest_version_after_fold = after_fold_snapshot.version();
             let table_version_after_fold = after_fold_snapshot.entry(TABLE).unwrap().table_version;
-            let after_fold = current_mem_wal_inventory(uri).await;
+            let after_fold = current_mem_wal_inventory(&uri).await;
             assert!(
-                current_recovery_sidecars(uri).await.is_empty(),
+                current_recovery_sidecars(&uri).await.is_empty(),
                 "successful retained-history fold must retire its recovery sidecar"
             );
 
@@ -1294,13 +1325,14 @@ fn assert_retained_history_scaling_sample(sample: &RetentionDepthSample) {
         "acknowledgement must remain graph-invisible"
     );
     assert_eq!(
-        sample.manifest_version_after_replay, sample.manifest_version_before,
-        "cold replay must remain graph-invisible"
+        sample.manifest_version_after_replay,
+        sample.manifest_version_before + 1,
+        "the cold claim must publish exactly one operational ClaimReceipt"
     );
     assert_eq!(
         sample.manifest_version_after_fold,
-        sample.manifest_version_before + 1,
-        "one fold must have exactly one graph visibility point"
+        sample.manifest_version_before + 2,
+        "the same claimed worker must add exactly one fold visibility point"
     );
     assert_eq!(
         sample.table_version_after_ack, sample.table_version_before,
@@ -1440,18 +1472,17 @@ async fn b2a_retained_history_decision_scale_sweeps_to_128_generations_on_config
         .expect("configured S3/RustFS benchmark fixture cleanup must succeed");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn gate_r0_retain_all_current_object_growth_is_swept_explicitly() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    init_enrolled(uri, STREAM_SCHEMA).await;
+    let uri = init_enrolled(dir.path().to_str().unwrap(), STREAM_SCHEMA).await;
     let table_tracker = IOTracker::default();
     let manifest_tracker = IOTracker::default();
 
     let samples = with_raw_io_trackers(&table_tracker, &manifest_tracker, async {
-        let db = Arc::new(Omnigraph::open(uri).await.unwrap());
+        let db = Arc::new(Omnigraph::open(&uri).await.unwrap());
         let schema = table_schema(&db).await;
         let mut completed = 0u64;
         let mut ordinal = 0u64;
@@ -1475,11 +1506,14 @@ async fn gate_r0_retain_all_current_object_growth_is_swept_explicitly() {
             }
 
             let serialized_manifest_bytes = max_shard_manifest_bytes(dir.path());
-            let inventory = current_mem_wal_inventory(uri).await;
+            let inventory = current_mem_wal_inventory(&uri).await;
             let pending = score_batch(
                 Arc::clone(&schema),
                 &format!("metadata-measured-{checkpoint}"),
                 1,
+            );
+            let retired = helpers::failpoint::Rendezvous::park_first(
+                names::STREAM_B1_AFTER_RETIREMENT_RELEASE,
             );
             let error = {
                 let _after_durable =
@@ -1490,35 +1524,40 @@ async fn gate_r0_retain_all_current_object_growth_is_swept_explicitly() {
             };
             assert!(matches!(error, OmniError::AckUnknown { .. }), "{error:?}");
             ordinal += 1;
+            retired.wait_until_reached().await;
+            retired.release();
             let _ = table_tracker.incremental_stats();
             let _ = manifest_tracker.incremental_stats();
 
             let started = Instant::now();
-            let error = {
-                let _before_seal =
-                    ScopedFailPoint::new(names::STREAM_B1_BEFORE_FORCE_SEAL, "return");
-                db.failpoint_stream_b1_for_test(TABLE, None, 0)
-                    .await
-                    .expect_err("measure retained metadata before generation output")
-            };
-            assert!(
-                error
-                    .to_string()
-                    .contains(names::STREAM_B1_BEFORE_FORCE_SEAL),
-                "{error:?}"
-            );
+            let before_seal = Arc::new(helpers::failpoint::Rendezvous::park_first(
+                names::STREAM_B1_BEFORE_FORCE_SEAL,
+            ));
+            let controller_rendezvous = Arc::clone(&before_seal);
+            let controller_table = table_tracker.clone();
+            let controller_manifest = manifest_tracker.clone();
+            let controller = tokio::spawn(async move {
+                controller_rendezvous.wait_until_reached().await;
+                let elapsed_us = started.elapsed().as_micros();
+                let table = PathIo::from_stats(&controller_table.incremental_stats());
+                let _ = controller_manifest.incremental_stats();
+                controller_rendezvous.release();
+                (elapsed_us, table)
+            });
+            db.failpoint_stream_b1_for_test(TABLE, None, 0)
+                .await
+                .expect("retained-metadata fixture must close its claimed generation");
+            let (cold_elapsed_us, table) = controller
+                .await
+                .expect("retained-metadata controller task must remain joinable");
             samples.push(RetainedMetadataSample {
                 merged_generations: checkpoint,
                 serialized_manifest_bytes,
-                cold_elapsed_us: started.elapsed().as_micros(),
-                table: PathIo::from_stats(&table_tracker.incremental_stats()),
+                cold_elapsed_us,
+                table,
                 inventory,
             });
 
-            let _ = manifest_tracker.incremental_stats();
-            db.failpoint_stream_b1_for_test(TABLE, None, 0)
-                .await
-                .unwrap();
             completed += 1;
         }
         samples
@@ -1935,9 +1974,8 @@ fn gate_r0_source_audit_revision_tripwire_matches_surveyed_lance() {
 async fn gate_r0_referenced_cut_retry_reuses_the_same_generation_root_local() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    init_enrolled(uri, STREAM_SCHEMA).await;
-    let db = Arc::new(Omnigraph::open(uri).await.unwrap());
+    let uri = init_enrolled(dir.path().to_str().unwrap(), STREAM_SCHEMA).await;
+    let db = Arc::new(Omnigraph::open(&uri).await.unwrap());
     let batch = score_batch(table_schema(&db).await, "r0-retry", 1);
     db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
         .await
@@ -1956,7 +1994,7 @@ async fn gate_r0_referenced_cut_retry_reuses_the_same_generation_root_local() {
             .contains(names::STREAM_FOLD_POST_DRAIN_PRE_SIDECAR),
         "{error:?}"
     );
-    let after_failed_fold = current_mem_wal_inventory(uri).await;
+    let after_failed_fold = current_mem_wal_inventory(&uri).await;
     assert_eq!(after_failed_fold.generation_roots.len(), 1);
     assert_eq!(
         after_failed_fold.generation_roots,
@@ -1970,7 +2008,7 @@ async fn gate_r0_referenced_cut_retry_reuses_the_same_generation_root_local() {
     db.failpoint_stream_b1_for_test(TABLE, None, 0)
         .await
         .unwrap();
-    let after_retry = current_mem_wal_inventory(uri).await;
+    let after_retry = current_mem_wal_inventory(&uri).await;
     assert_eq!(
         after_retry.generation_roots, after_failed_fold.generation_roots,
         "a retry after the referenced cut must fold-only, not materialize another random root"
@@ -2019,13 +2057,26 @@ async fn widest_high_entropy_payload_batch(db: &Omnigraph, payload_bytes: usize)
     batch
 }
 
-async fn widest_retained_growth_at_uri(uri: &str) -> WidestRetainedGrowthSample {
-    init_enrolled(uri, PAYLOAD_SCHEMA).await;
-    let before = current_mem_wal_inventory(uri).await;
+async fn widest_retained_growth_at_uri(cluster_uri: &str) -> WidestRetainedGrowthSample {
+    let uri = init_enrolled(cluster_uri, PAYLOAD_SCHEMA).await;
     let table_tracker = IOTracker::default();
     let manifest_tracker = IOTracker::default();
     with_raw_io_trackers(&table_tracker, &manifest_tracker, async {
-        let db = Arc::new(Omnigraph::open(uri).await.unwrap());
+        let db = Arc::new(Omnigraph::open(&uri).await.unwrap());
+        let claim_setup = payload_batch(&db, 1, 1).await;
+        let claim_error = {
+            let _before_put = ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+            db.failpoint_stream_b1_for_test(TABLE, Some(claim_setup), 0)
+                .await
+                .expect_err("fixture setup must stop after the cold claim and before WAL input")
+        };
+        assert!(
+            claim_error
+                .to_string()
+                .contains(names::STREAM_B1_BEFORE_PUT_INVOKE),
+            "{claim_error:?}"
+        );
+        let before = current_mem_wal_inventory(&uri).await;
         let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
         let manifest_version_before = before_snapshot.version();
         let table_version_before = before_snapshot.entry(TABLE).unwrap().table_version;
@@ -2061,7 +2112,7 @@ async fn widest_retained_growth_at_uri(uri: &str) -> WidestRetainedGrowthSample 
             rejected_manifest_io.total_writes, 0,
             "over-cap admission must not arm or publish recovery: {rejected_manifest_io:#?}"
         );
-        let after_rejection = current_mem_wal_inventory(uri).await;
+        let after_rejection = current_mem_wal_inventory(&uri).await;
         assert_eq!(after_rejection.objects, before.objects);
         assert_eq!(after_rejection.generation_roots, before.generation_roots);
         assert_eq!(
@@ -2075,7 +2126,7 @@ async fn widest_retained_growth_at_uri(uri: &str) -> WidestRetainedGrowthSample 
             table_version_before
         );
         assert!(
-            current_recovery_sidecars(uri).await.is_empty(),
+            current_recovery_sidecars(&uri).await.is_empty(),
             "over-cap admission must not leave a recovery sidecar"
         );
         let _ = table_tracker.incremental_stats();
@@ -2087,7 +2138,7 @@ async fn widest_retained_growth_at_uri(uri: &str) -> WidestRetainedGrowthSample 
             .unwrap();
         let table_ack = PathIo::from_stats(&table_tracker.incremental_stats());
         let _ = manifest_tracker.incremental_stats();
-        let after_ack = current_mem_wal_inventory(uri).await;
+        let after_ack = current_mem_wal_inventory(&uri).await;
         let after_ack_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
         let manifest_version_after_ack = after_ack_snapshot.version();
         let table_version_after_ack = after_ack_snapshot.entry(TABLE).unwrap().table_version;
@@ -2096,7 +2147,7 @@ async fn widest_retained_growth_at_uri(uri: &str) -> WidestRetainedGrowthSample 
             .await
             .expect("every admitted near-cap generation must close");
         let table_fold = PathIo::from_stats(&table_tracker.incremental_stats());
-        let after_fold = current_mem_wal_inventory(uri).await;
+        let after_fold = current_mem_wal_inventory(&uri).await;
         let after_fold_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
         let manifest_version_after_fold = after_fold_snapshot.version();
         let table_version_after_fold = after_fold_snapshot.entry(TABLE).unwrap().table_version;
@@ -2145,7 +2196,7 @@ async fn widest_retained_growth_at_uri(uri: &str) -> WidestRetainedGrowthSample 
             table_version_after_fold,
             visible_rows,
             sampled_payloads,
-            recovery_sidecars_after_fold: current_recovery_sidecars(uri).await,
+            recovery_sidecars_after_fold: current_recovery_sidecars(&uri).await,
         }
     })
     .await
@@ -2411,9 +2462,8 @@ fn widest_legal_generation_cost_child() {
         .unwrap()
         .block_on(async move {
             let dir = tempfile::tempdir().unwrap();
-            let uri = dir.path().to_str().unwrap();
-            init_enrolled(uri, PAYLOAD_SCHEMA).await;
-            let db = Arc::new(Omnigraph::open(uri).await.unwrap());
+            let uri = init_enrolled(dir.path().to_str().unwrap(), PAYLOAD_SCHEMA).await;
+            let db = Arc::new(Omnigraph::open(&uri).await.unwrap());
             let (batch, fold) = match mode.as_str() {
                 "baseline" => (payload_batch(&db, 1, 1).await, false),
                 "widest" => (

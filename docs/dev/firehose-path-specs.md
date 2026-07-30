@@ -66,9 +66,10 @@ The format corollary is equally strict: **a format that can create terminal
 authority ordinary export cannot represent must ship its own safe exit before
 that authority becomes reachable.** A later strict-strand binary cannot rescue
 an older root it refuses to open. V11 reserves a fail-closed `RETIRED` profile
-shape, while recovery-v14 reserves the lifecycle retirement discriminator
-without activating it. F3 must activate an irreversible retirement/export path
-before `WITHDRAWN` becomes reachable; F5 must extend that path before
+shape, while recovery-v14 contains one frozen fail-closed retirement scaffold.
+F3 may activate that scaffold only if its exact payload is sufficient;
+otherwise it takes a new strand. An irreversible retirement/export path must
+exist before `WITHDRAWN` becomes reachable, and F5 must extend that path before
 `DEAD_LETTERED` becomes reachable.
 
 ---
@@ -100,10 +101,10 @@ Recovery-v14 activates `StreamEnrollmentV2`, `StreamClaim`, `StreamFoldV2`,
 families fail closed. Historical recovery-v10 enrollment and recovery-v12
 lifecycle-v2 folds are not reinterpreted.
 
-The historical v10 bump also reserved the *shape* of the fold-attribution
-dead-letter object reference
-(`StreamFoldAttributionSummary::dead_letter_object`, explicit null today).
-That reservation is not a dead-letter protocol: the validator still rejects a
+The historical v10 bump also added an explicit-null fold-attribution
+dead-letter compatibility placeholder
+(`StreamFoldAttributionSummary::dead_letter_object`). That incomplete shape is
+now frozen null and is not a dead-letter protocol: the validator rejects a
 populated reference, token authority has no terminal dead-letter disposition,
 and current fold recovery cannot represent an all-diverted cut. F5 therefore
 starts with a full format/recovery audit and assumes a new strand.
@@ -158,9 +159,9 @@ abort-drain, correction/retirement, or `SEALED` maintenance/rebind integration.
 | ~~F1~~ | Cedar split + read-only status | — | shipped |
 | ~~F2 profile authority~~ | Capability-bound cluster control/runtime delegation, profile protocol v2, resumable `DISABLING`, exact profile receipt recovery | internal v11 + recovery v13 `StreamProfileChange` only; historical ordinary fold remained recovery v12 | shipped |
 | ~~F2 lifecycle tranche~~ | Claim receipts + hidden drain `OPEN→DRAINING→SEALED`, empty and non-empty, with restart continuation | internal v12 + lifecycle v3 + recovery v14 | implemented; public control activation remains closed |
-| **F3** | Resume / abort-drain + safe `SEALED` maintenance bridge + activate `WITHDRAWN` retirement before correction can create it | activate the registered fail-closed v14 families in the existing v12 strand | after F2 lifecycle |
+| **F3** | Resume / abort-drain + safe `SEALED` maintenance bridge + activate `WITHDRAWN` retirement before correction can create it | audit the frozen v14 scaffold; use it only if exact, otherwise take an honest new pre-release strand | after F2 lifecycle |
 | **F4** | Hidden ingest vertical slice + lazy enrollment | audit | after F3 |
-| **F5** | Fold driver + terminal dead-letter authority + extend retirement for `DEAD_LETTERED` | a new strand after lifecycle activation | after F4 |
+| **F5** | Fold driver + minimal `DEAD_LETTERED` authority, one object, ordinary-ingest correction, and retirement | a new strand after lifecycle activation | after F4 |
 | **F6** | Guardrails + acceptance evidence | — | after F5 |
 | **F7** | Served SDK / HTTP / remote CLI / OpenAPI activation | — | only after F6 passes |
 
@@ -168,15 +169,17 @@ These are dependency milestones, not mandates for giant PRs. Keep each PR
 reviewable behind the hidden seam: the next lifecycle tranche may land receipts,
 then non-empty/empty drain; F3 may land resume/abort, data/authority correction,
 then each content-preserving maintenance owner and rebind; F5 may land the
-serial driver, terminal authority/object recovery, then operations/replay.
+serial driver, then terminal authority/object recovery and cluster-only
+inspection/correction.
 Every sub-PR preserves the refusal for behavior it has not integrated.
 
-The plan contains **three** strict export/init/load rebuilds before F7: the
-v10→v11/v13 profile-authority tranche, the implemented v11→v12/v14 lifecycle
-tranche, and F5's complete dead-letter/replay tranche. F4's enrollment
-receipt/payload co-landed in v12/v14, so it does not require a fourth strand.
-Any additional strand requires an RFC/spec amendment and explicit approval;
-it is not an automatic fallback.
+Two strict export/init/load rebuilds are already implemented:
+v10→v11/v13 profile authority and v11→v12/v14 lifecycle. Each future persisted
+grammar takes another strand when its final shape differs from a dormant
+scaffold. Dormant discriminator names never authorize reinterpretation of
+their frozen payload. The exact pre-release strand count is recorded as shapes
+settle and freezes at the 0.10.0 release gate; an honest extra strand is cheaper
+than pre-registering a guessed on-disk contract.
 
 The lifecycle tranche plus F3 are the operator lifecycle and maintenance
 bridge. They ship **no row-admission or acknowledgement capability**; the
@@ -334,9 +337,9 @@ writer a sidecar-covered witness/rebind transition.
    recovery barrier while the old profile revision/delegation is still
    authoritative and settles or refuses **every** graph-content or authority
    sidecar: Mutation/Load, SchemaApply, BranchMerge, Optimize/EnsureIndices,
-   repair/cleanup, enrollment, fold, replay, lifecycle, token-ledger
-   maintenance, authority retirement (the lifecycle strand or the
-   version-appropriate F5 V2),
+   repair/cleanup, enrollment, writer claim/cold-WAL reconstruction, fold,
+   lifecycle, token-ledger maintenance, authority retirement (the lifecycle
+   strand or F5's version-appropriate terminal-authority strand),
    and rebind. It then releases those gates,
    reacquires from the root in canonical order, and recaptures/revalidates the
    exact cleared authority. Ambiguous old recovery returns `RecoveryRequired`
@@ -470,11 +473,10 @@ writer a sidecar-covered witness/rebind transition.
    `_stream_tokens.lance` dataset gains tagged immutable
    `ProfileManagementReceipt` rows. V12/recovery-v14 extends this mechanism
    with `EnrollmentReceiptV2`, `BindingReceipt`,
-   `ManagementReceipt`, `ClaimAttemptEffect`, and terminal `ClaimReceipt`; F5
-   later adds fold-bound `DeadLetterRecord` and replay-checkpoint rows. A row has a
+   `ManagementReceipt`, `ClaimAttemptEffect`, and terminal `ClaimReceipt`. A row has a
    deterministic identity derived from graph, stable table/incarnation and
-   binding scope where applicable, receipt tag, operation ID, and attempt or
-   checkpoint ordinal. Retain-all preserves every row, but the hot profile—and,
+   binding scope where applicable, receipt tag, operation ID, and attempt
+   ordinal. Retain-all preserves every row, but the hot profile—and,
    lifecycle rows—retain only bounded current
    receipt IDs, counts, domain-separated chain digests, and tail commitments.
    They never contain a history `Vec`. V11 gives current-token and
@@ -489,9 +491,11 @@ writer a sidecar-covered witness/rebind transition.
    `_stream_tokens.lance` transaction owned by recovery-v13
    `StreamProfileChange`. Active v12 lifecycle-ledger appends use their
    separately selected recovery-v14 owners.
-   Later-format tags, including F5 `DeadLetterRecord` and replay-checkpoint
-   rows, use their strand's matching recovery envelope and do not reinterpret
-   v13. The sole graph-manifest CAS advances the selected token-dataset pointer
+   Any later-format receipt tag uses its strand's matching recovery envelope
+   and does not reinterpret v13/v14. F5's dead-letter authority lives in the
+   one current per-key token row and one recovery-owned object; it does not add
+   a receipt-history or replay-checkpoint family. The sole graph-manifest CAS
+   advances the selected token-dataset pointer
    together with the corresponding hot pointer/count/chain commitment,
    lifecycle or profile revision, and any base/token effects. A ledger
    transaction without that CAS is inert recovery residue; the CAS cannot name
@@ -500,27 +504,21 @@ writer a sidecar-covered witness/rebind transition.
    `record_lookup_key` plus a common chain envelope containing its scope/tag,
    contiguous ordinal, predecessor record ID, prior chain digest, and resulting
    chain digest. Receipt-first retry performs one exact scalar-index lookup.
-   History pagination is newest-first chain walking: it starts at the bounded
-   hot `ReceiptChainRef` (or an opaque next-record cursor) and performs at most
-   the requested exact predecessor probes plus one. It never asks Lance to
-   order a range—Lance 9 scalar-index hits are row IDs, and `order_by` before
-   `limit` would sort the whole matching scope. The cursor binds the selected
-   token version, scope/head commitment, and exact profile/lifecycle revision,
-   and continuation rechecks that they are still current. Movement returns a
-   typed stale cursor rather than opening a client-named raw historical token
-   version, so a page cannot mix chains. Both paths materialize at most the
-   requested rows plus one and issue no application-level fold over retained
-   history; neither broadens a current-token lookup into a ledger query.
+   Exact receipt lookup remains internal idempotency/recovery authority. The
+   experimental product exposes no receipt-history pagination or audit-history
+   cursor. Retained chain rows are not a public management-history product.
 
    A scalar index alone is **not** a no-scan proof: Lance scans fragments
    appended after that index's coverage until `optimize_indices` folds them in.
-   V12 reserves `StreamTokenLedgerIndexMaintenance` but keeps it fail-closed;
-   the hidden lifecycle tranche does not claim a coverage reconciler. Logical
-   operations remain correct through Lance's uncovered-fragment fallback.
-   F3 must implement the manifest-derived reconciler, and F6 must measure and
-   publish its trigger target, prove old indexed history is not rescanned, and
-   show that the uncovered tail and lookup I/O stay within the accepted
-   steady-state envelope before activation.
+   V12 reserves `StreamTokenLedgerIndexMaintenance` but keeps its frozen
+   scaffold fail-closed; a different final payload requires a new strand.
+   Logical operations remain correct through Lance's uncovered-fragment
+   fallback. The reconciler is not an F3 correctness prerequisite for EXP.
+   Status must expose uncovered count/oldest age and a lookup-cost warning; F6
+   measures exact lookup plus cluster-only current-terminal scans at increasing
+   history depth locally and on RustFS/S3, records an activation threshold,
+   and schedules an authority-safe reconciler only when that threshold is
+   crossed. Ordinary graph `optimize` does not maintain this dataset.
 
    `ManagementReceipt` now carries bounded canonical request **and result**
    payloads with digest recomputation in validation. A quiesce request is one
@@ -716,48 +714,19 @@ writer a sidecar-covered witness/rebind transition.
 
 Extend existing owners; do not open a new silo.
 
-- **F2 first creates stable shadow `Firehose PR smoke` and
-  `Firehose dependency rebuild` jobs** in `.github/workflows/ci.yml`. They
-  always report; their classifier runs the bounded suite for engine, cluster,
-  server, policy, API-types, CLI, Cargo/build inputs, tests, workflow, or
-  branch-protection changes and quickly no-ops only for proven docs-only
-  changes. Only after the exact artifact path satisfies the latency evidence
-  below and provides the durable write-once key→digest binding does the F2 CI
-  tranche add both verbatim contexts to branch protection. Job existence alone
-  is not evidence for activation. The tier starts with manifest
-  lifecycle/recovery, claim,
-  token-ledger index reconciliation, empty/non-empty drain, failpoint, and
-  `forbidden_apis` owners, then F3–F5 extend the same required tier in the PR
-  that adds each behavior. For an
-  ordinary source PR, its critical path and job timeout are both at most 15
-  minutes. It may not depend on a
-  best-effort GitHub cache hit: before the check becomes required, F2 proves an
-  empty-runner p95 within budget by either isolating a cold-buildable protocol
-  harness or using an immutable, attested dependency image keyed by Rust,
-  target, every Cargo manifest/configuration and `Cargo.lock`, features/profile/
-  flags, build scripts, exact base image/system packages, workflow/action
-  digests, and `protoc` inputs. Durable keyed artifacts are published only by a
-  separately privileged protected `push` to `refs/heads/main`, with a write-once
-  key→digest binding and provenance for the repository, exact publisher
-  workflow, main ref, and source digest. A PR is read-only with respect to that
-  durable namespace. On a changed or unavailable trusted key,
-  `Firehose PR smoke` succeeds only as an explicit delegation to the separately
-  required dependency-rebuild context; it does not claim that smoke ran. A
-  separate required
-  `Firehose dependency rebuild` check **always starts and reports** on every PR:
-  with an unchanged key it verifies the exact attested image/artifact metadata
-  and quickly no-ops successfully; with a changed or unavailable trusted key it
-  is the sole explicit exception and cold-builds plus runs the smoke tier inside
-  the same PR workflow under one aggregate hard 60-minute timeout. Jobs may
-  share only an artifact scoped to that exact workflow-run ID; a PR artifact is
-  never promoted for another run. The post-merge main run publishes the durable
-  keyed artifact for later PRs. Neither
-  required check may disappear behind a workflow/path filter. Once activated,
-  branch protection requires both contexts. The two gates
-  never run duplicate cold compiles or fall back to an unbounded hour-long job.
-  If the aggregate cold build plus smoke cannot meet its bound, the
-  isolated harness is mandatory. Near-cap, RustFS/S3 fault, endurance, and
-  performance matrices remain scheduled/opt-in.
+- **CI follows the sustainable repository policy.** Pull requests run the
+  ordinary conservative classifier, documentation/link checks, entrypoint
+  check, and AWS-feature test. Authors run the affected lifecycle/recovery,
+  claim, drain, failpoint, and `forbidden_apis` owners locally and record the
+  exact commands in the PR. The full feature-superset workspace,
+  immediate-predecessor format fence, and RustFS graphs run post-merge, on
+  tags, or by manual dispatch. A red post-merge `main` is stop-the-line until
+  fixed or reverted. There is no custom attested/keyed dependency artifact or
+  required firehose rebuild context. A dedicated PR protocol check may return
+  only after an isolated harness demonstrates measured empty-runner and warm
+  p95 within its proposed budget; an opportunistic cache is not correctness
+  evidence. Near-cap, RustFS/S3 fault, endurance, and performance matrices
+  remain post-merge, scheduled, or explicitly opt-in according to their cost.
 - Capability tests prove only cluster-state-locked offline reconciliation
   after the explicit writer-process handoff can flip the profile; an ambient
   `Omnigraph`, embedded SDK, and direct `--store` caller cannot. The durable
@@ -1060,7 +1029,7 @@ writer.
    Once selected, Mutation/Load/delete and `_as`, SchemaApply, BranchMerge,
    branch create/delete and every profile transition/refinement,
    Optimize/EnsureIndices/Repair/Cleanup, and every other graph, schema,
-   branch-ref, profile, lifecycle, recovery, maintenance, replay, fold,
+   branch-ref, profile, lifecycle, recovery, maintenance, writer-claim/fold,
    correction, enrollment, rebind, and content writer refuses before body
    admission or effect with
    `StreamAuthorityRetired { retirement_id, export_cut_digest }`; reads and
@@ -1412,218 +1381,90 @@ Cadence is the visibility gap. Expect ~seconds under load; the contract says
 "typically seconds, unbounded tail" and there is **no producer-facing flush**
 in this profile (§4.7 P5).
 
-### 6.2 Terminal dead-letter authority (§4.7 P4)
+### 6.2 Minimal terminal dead-letter authority (§4.7 P4)
 
-Two failure classes, treated differently — collapsing them is how systems rot:
+Fold-time outcomes remain split by semantics:
 
 | Class | Examples | Disposition |
 |---|---|---|
-| **Data conflict** | uniqueness, RI, cardinality, keyed row validation | Deterministically divert one terminal **LWW candidate per losing key**, apply every independent key, keep the stream flowing |
-| **Structural violation** | schema mismatch, witness violation, token-chain corruption | **Whole fold refuses, fails closed** — these mean bug or tampering, not bad data |
+| **Structural** | corrupt/missing authenticated cut, schema or token-authority contradiction, malformed validation evidence, dead-letter object above the selected envelope | Install a durable strict `DataBlock`; publish no partial fold |
+| **Data conflict** | uniqueness, RI, cardinality, keyed row validation | Divert one terminal LWW candidate per losing key, apply independent winners, and keep the lane progressing |
 
-Diversion is **per key, not per row**. The LSM projection deliberately
-collapses `P → X → Y` to terminal winner `Y`; it does not promise to preserve
-superseded payload `X`. The immutable artifact therefore contains exactly one
-terminal LWW candidate for each losing logical key, whose token is the current
-`DEAD_LETTERED` authority. Earlier occurrences are represented only by the
-authenticated WAL-segment and token-chain commitments. They are neither
-payload-export entries nor replay selections.
+Only the final LWW candidate for each losing key becomes a payload entry.
+Superseded same-key occurrences remain authenticated by the WAL/token chain but
+are not separately exported or replayed.
 
-The reserved v10 object-reference slot is only one field. F5 must amend the
-RFC and format contract, then implement all of the following in one strand:
+1. **One current terminal token per losing key.** The F5 format adds
+   `DEAD_LETTERED` to the current-token disposition and a versioned terminal
+   evidence shape containing the exact occurrence, predecessor, contributor
+   and payload identity, reason code, object descriptor, and candidate ordinal.
+   The visible base may remain absent or at its previous `PRESENT` token; it
+   never pretends to match the terminal token. The manifest-selected token
+   version remains the sole post-fold sequencing authority.
 
-1. **Per-key terminal sequencing.** Add a durable `DEAD_LETTERED` token
-   disposition (or an equivalently indexed current-authority state) distinct
-   from `PRESENT` and correction-owned `WITHDRAWN`. It carries the exact fold
-   operation and dead-letter object/replay-candidate reference. Base/token validation
-   permits no matching current base row for this disposition. An exact retry
-   returns terminal `dead_lettered`; a corrected successor must name that
-   current token as predecessor and use a fresh `write_id`. Leaving authority
-   at the old predecessor, pretending the row is `PRESENT`, or scanning object
-   history on every admission is forbidden.
-   The same F5 format strand adds the engine-only `Replay { replay_id,
-   dead_letter_object_digest, candidate_entry_ordinal }` origin to hidden base
-   metadata, token rows, fold attribution, and response DTO validation. V11/v13
-   reject that tag; request bodies can never supply it. `durable`,
-   `already_durable`, `withdrawn`, and `dead_lettered` return the exact
-   persisted origin appropriate to their variant.
-2. **Mixed and all-diverted folds.** The token participant advances every
-   accepted key to either `PRESENT` or `DEAD_LETTERED`; the base participant
-   still publishes exact merged-generation progress when visible-row count is
-   zero. Recovery and attribution must allow zero visible winners with nonzero
-   diverted rows. The current non-empty token plan, nonzero visible summary,
-   and token-only/base-missing refusal cannot be reused unchanged.
-   Because a legal cut may contain 8,192 token rows and the fold also appends
-   one `DeadLetterRecord`, the F5 sidecar owns a deterministic token-dataset
-   transaction chain of at most two links rather than silently creating an
-   8,193-row transaction or lowering the admitted generation cap. It packs the
-   record into the first transaction only when the exact row/byte limits permit;
-   otherwise the one-row record is the final pre-minted link. No intermediate
-   token version is manifest authority.
-3. **Complete deterministic conflicts.** Replace the current first-error
-   validator seam with a bounded structured result that identifies every
-   keyed violation. Build stable conflict components and process them in
-   canonical `(constraint identity, table identity, logical id, stream token)`
-   order; for uniqueness/cardinality, the canonical admissible prefix wins and
-   the remainder diverts. Remove losers, revalidate to a fixed point, and treat
-   any unkeyed or contradictory result as structural. Persist the reason code
-   and digest for the one final candidate of every diverted key.
-4. **Recovery-bound, bounded object publication.** Sort at most 8,192 bounded
-   canonical terminal-candidate descriptors—row ordinals plus fixed-width
-   identities/digests, not copied keys or encoded NDJSON—and retain references
-   to the already-owned dense generation/conflict plan. Publication uses
-   immutable 1-MiB chunks, at most 256 chunks and 256 MiB of encoded payload,
-   plus one canonical final manifest of at most 64 KiB. This is a fixed format
-   bound, not a configurable provider multipart assumption.
+2. **One bounded object per fold.** The driver deterministically orders the
+   terminal candidates and canonically encodes one NDJSON object under the
+   reserved graph-relative prefix. Before implementation, F5 pins one encoded-
+   byte and peak-RSS envelope with a measurement cell. Exceeding it installs
+   `DataBlock` before any object or Lance effect. There is no chunked fallback,
+   chunk manifest, multipart protocol, or object-sized uncharged buffer.
 
-   A deterministic first pass reserves the finite root-wide exclusive-fold
-   scratch envelope and streams canonical NDJSON into hash/byte-count and
-   1-MiB chunk-boundary sinks. It retains only bounded chunk
-   `{ordinal, length, digest}` descriptors and the count plus chain/root digest
-   of the ordered terminal-candidate identities; it writes no object and holds
-   no encoded payload buffer. If payload would require more than 256 chunks,
-   exceed 256 MiB, or produce a final manifest over 64 KiB, no object or Lance
-   effect is allowed. The fold instead publishes a whole-cut tagged
-   `DataBlock(reason = DEAD_LETTER_EXPANSION)` on the same
-   `DRAINING` row—creating `goal = OPEN_AFTER_FOLD` when the ordinary fold had
-   no existing drain—so exact correction/withdrawal can resolve it. Retry
-   remains on that block; it does not repeatedly encode an impossible object.
+3. **Recovery owns the object before PUT.** The F5 sidecar binds the
+   authenticated generation cut, canonical candidate descriptors, versioned
+   object path/digest/length/row count, exact optional base transaction, exact
+   token transaction, and final manifest outcome before conditional create.
+   `PutMode::Create` is accepted on `AlreadyExists` only after exact
+   length/digest verification. A lost result remains recovery-owned. An object
+   not selected by the terminal manifest CAS is inert retain-all residue and is
+   never discovered through prefix listing.
 
-   Otherwise the fold sidecar arms the exact immutable cut, logical manifest
-   path, complete payload digest/length/candidate count and identity-chain
-   commitment, ordered fixed chunk paths/descriptors, and exact final manifest
-   bytes/digest. The manifest bound is validated before arming. The second pass
-   re-encodes the immutable cut and conditionally creates each chunk with
-   `PutMode::Create`; `AlreadyExists` is success only after exact length/digest
-   verification. After all chunks verify, it conditionally creates the final
-   manifest the same way, then stream-reads manifest and chunks through the
-   charged scratch envelope and verifies the complete artifact **before either
-   Lance participant effect**. This deliberately avoids unsupported
-   conditional streaming multipart semantics in `object_store`.
+4. **All-diverted folds are first-class.** A fold with no visible winner may
+   still select the new token version, merged-generation progress, versioned
+   fold attribution, and object reference in one manifest CAS. F5 uses a new
+   attribution/recovery shape: the historical v10 nullable
+   `dead_letter_object` placeholder remains explicit null under v12 and is
+   never activated in place.
 
-   Recovery resumes the exact first missing chunk or verifies an already
-   present one from the armed descriptors; it never overwrites a mismatch and
-   never retries an ambiguous write outside recovery. The same two-pass encoder
-   makes recovery deterministic without an object-sized `Vec`. Chunk,
-   descriptor, encoder, and verification memory remain charged through final
-   verification. The 32-MiB logical Arrow cap and 384-MiB RSS remeasurement
-   tripwire are not misrepresented as JSON expansion bounds. Pre-effect
-   chunks/manifests are inert retained B2a residue, and payload export/replay
-   resolves only the logical manifest named by manifest-selected attribution.
-   The fold sidecar's pre-minted token-dataset transaction chain also appends
-   one immutable
-   `DeadLetterRecord` containing the final-manifest reference/digest,
-   candidate count/identity commitment, fold operation, and attribution
-   digest. The sole manifest CAS advances a bounded graph-global
-   dead-letter-chain head/count/digest together with the token/base pointers
-   and graph-commit attribution. A record is authoritative only through that
-   selected chain; an object or unselected ledger version alone is inert.
-5. **Authoritative operations.** List historical graph-visible dead-letter
-   artifacts newest-first by walking the selected `DeadLetterRecord`
-   predecessor chain with the same exact-probe/page bounds as the F2 receipt
-   ledger—never by raw prefix listing, graph-commit-history folding, or a
-   Lance ordered range. A listed candidate may since have a successor; replay
-   still revalidates its exact current `DEAD_LETTERED` token under gates.
-   Payload export re-verifies each object digest and requires the existing
-   `export` Cedar action; listing only bounded non-payload metadata follows
-   status authorization.
-6. **Retry-safe replay.** Replay requires caller-minted `replay_id`, exact
-   selected object/entry-set digest, expected lifecycle revision, and both
-   `stream_manage` and `stream_ingest`. The normalized selection contains at
-   most one terminal candidate per logical key; selecting a duplicate key or a
-   candidate whose terminal token is no longer current is an effect-free typed
-   refusal. F5's new format strand adds
-   recovery-owned `StreamDeadLetterReplay` arming/checkpoint/finalization; no
-   raw `_stream_tokens` HEAD is authority. Replay progress is an immutable
-   tagged checkpoint row in the F2 receipt ledger. Each exact pre-minted
-   checkpoint-only ledger transaction advances the manifest-selected token-
-   dataset pointer through one graph-manifest CAS but does **not** insert,
-   replace, or withdraw a current-token row. The original
-   `DEAD_LETTERED` token remains current until the admitted replay occurrence
-   is folded through the ordinary token protocol. Each bounded page has unique
-   keys. Before arming the page or revalidating its terminal tokens,
-   replay passes the graph-global sidecar barrier, then acquires in order:
-   graph-profile shared; sorted relevant stream-admission leases
-   **exclusively**; schema; main-branch; the root stream-token gate; sorted
-   graph-table gates; and every selected same-key queue in canonical key order.
-   Under that frozen cut and F4's preprocessing budget, it computes exact
-   normalized row/byte charges and chooses the canonical non-empty prefix that
-   fits the resident generation's exact remaining capacity. If no next row
-   fits remaining capacity but it fits an empty generation, replay creates no
-   replay sidecar and retains the graph-profile shared guard plus the relevant
-   exclusive stream-admission leases. It releases only the inner
-   schema/main/token/table/key gates, invokes the ordinary fold core with the
-   already checked exclusive authority, reruns the graph-global barrier, then
-   reacquires the inner gates in canonical order and recaptures authority,
-   capacity, reservation, and prefix before reopening admission. Continuous
-   producer ingress therefore cannot starve replay between the fold and its
-   replan.
+5. **Retry and correction use ordinary occurrence semantics.** While a
+   `DEAD_LETTERED` token remains current, an exact retry returns the same
+   terminal result without writing another object or moving authority. A
+   correction is a fresh ordinary Admission with a new `write_id`, corrected
+   payload, and predecessor equal to that terminal token. A successful fold
+   makes its `PRESENT` token current. After that successor, retrying the old
+   occurrence receives the normal current-authority conflict. There is no
+   `Replay` origin, `StreamDeadLetterReplay` recovery family, replay
+   checkpoint, or mutating replay endpoint.
 
-   A candidate that cannot fit an empty legal generation is not a repeatedly
-   returned page-level refusal. Replay appends a terminal per-entry
-   `replay_candidate_too_large` checkpoint through the ledger-only transaction
-   and manifest CAS, with no WAL put or current-token change, and proceeds to
-   the next candidate. The `DEAD_LETTERED` token remains current so an ordinary
-   corrected successor is still possible; same-ID retry returns the exact
-   checkpoint result.
+6. **Current-token inspection, not a second inventory.** Cluster-only
+   dead-letter list/export pins the manifest-selected token version, streams
+   its one current row per graph key in bounded batches, filters
+   `DEAD_LETTERED`, and groups object references/candidate ordinals for
+   digest-verified payload output. It does not list object prefixes, walk graph
+   history, or maintain a `DeadLetterRecord` chain. Physical scan work may
+   grow with uncovered fragments/history; §3.3 and F6 own that explicit,
+   instrumented EXP gap rather than adding hot disposition counters now.
 
-   `Armed` binds exact page membership, charges, resident-generation/capacity
-   witness, and the reservation that prevents another put from consuming it.
-   It retains that bounded
-   ownership, including the root token gate, through receipt publication, all
-   watcher/fence outcomes, and the checkpoint manifest CAS. Resubmission takes
-   injected complete checked replay authority and may not reacquire those gates
-   or queues. `StreamDeadLetterReplay` is graph-global relevant to every
-   manifest/main-authority publisher just like a fold sidecar. It derives a
-   stable UUIDv5 `write_id` from `(stream incarnation, replay_id, object digest,
-   candidate entry ordinal, terminal token)`, records that replay origin on
-   the row, and uses the ordinary ingest core with that candidate's terminal
-   token as predecessor. After the page's ordinary ingest outcomes are
-   exact/idempotently classifiable, a sidecar-owned checkpoint-ledger
-   transaction and manifest CAS publish the bounded receipt checkpoint and
-   terminal per-entry results without changing current-token authority.
-   `stream_fold_required` is never a terminal replay disposition: seeing it
-   after the bound reservation is an authority/protocol contradiction that
-   remains recovery-owned and fails closed.
-   Crash recovery classifies token transaction and manifest-pointer outcomes;
-   the graph-global binding recovery barrier must settle an armed replay page
-   before any manifest publisher, ordinary admission, or selected same-key
-   queue reopens. An acknowledged
-   page with an unpublished checkpoint can therefore replay the same write IDs
-   and derive `already_durable` before any corrected successor advances, then
-   publish progress once. The terminal update uses the same protocol. Same-ID
-   retry resumes the persisted page;
-   already completed entries reuse the same identity and resolve through
-   current token authority. Same ID with another selection conflicts. A lost
-   response can neither mint a second successor nor restart from entry zero.
-   Retain-all deletes no referenced or orphan dead-letter object; future
-   reclamation needs its own authority protocol.
-7. **Extend same-format retirement.** Before F5 may make `DEAD_LETTERED`
-   reachable, its graph/recovery strand adds format-specific
-   `StreamAuthorityRetirementV2` recovery and receipt tags. They bind the exact
-   manifest-selected pre-retirement token witness, stream current-token
-   dispositions/counts in bounded batches, and never materialize, sort, or hash
-   a token-row vector. They bind the bounded manifest dead-letter chain
-   head/count/digest without enumerating ledger records or canonical objects.
-   The V2 receipt adds
-   `dead_lettered_token_count`, requires at least one current
-   `WITHDRAWN | DEAD_LETTERED` token, retains every canonical object unchanged,
-   and does not reinterpret v11/v13. A successful replay or
-   corrected successor can make a dead-lettered key `PRESENT`; authority
-   retirement remains the logical-graph-preserving, authority-discarding exit
-   when an operator intentionally accepts loss of sequencing continuity for a
-   fresh-root rebuild.
+7. **Retirement remains the same-format exit.** Before
+   `DEAD_LETTERED` becomes reachable, F5 extends cluster-only irreversible
+   authority retirement to `WITHDRAWN | DEAD_LETTERED`. Planning pins the
+   exact sealed root cut and selected token witness, streams current terminal
+   rows in bounded batches, and records scan-derived disposition counts and an
+   immutable plan digest. Confirmation is actor-bound, recovery-owned, and
+   publishes `RETIRED` plus its receipt in one manifest CAS. It deletes no
+   object and never relabels terminal authority as `PRESENT`.
 
-The V2/dead-letter authority-retirement portions of §7.2 are **F5 merge gates
-before `DEAD_LETTERED` becomes reachable**. F5 co-lands the upgrade, cluster,
-CLI, error, and release-note changes for that disposition and
-`StreamAuthorityRetirementV2`. F6 reruns and integrates those cells; it does
-not defer them.
+8. **Operational surface stays narrow.** The primary workflows remain ingest,
+   status, fold, quiesce, and resume. Automatic bodyless prepare is a protocol
+   handshake. Dead-letter inspection/payload export, block correction,
+   authority repair, and retirement remain cluster/offline operations for EXP;
+   they do not receive served HTTP/OpenAPI parity. Every reachable
+   `DataBlock`, `AuthorityBlock`, `WITHDRAWN`, or `DEAD_LETTERED` state
+   nevertheless has one supported operator exit before public ingest activates.
 
-Diversion is loud in the fold result, status, attribution, audit, and metrics.
-No object reference is enough by itself to claim a key is terminal.
-
----
+F5 does not extend attribution merely because the object exists. It reuses the
+trusted contributor/payload identity already required for sequencing and adds
+only the object integrity fields needed by recovery and export. Additional
+per-record principals, provenance chains, and public history are out of scope.
 
 ## 7. F6 — guardrails and acceptance evidence
 
@@ -1651,32 +1492,34 @@ No object reference is enough by itself to claim a key is terminal.
   Any other mode/state refuses before headers or effect. A plain fold is
   insufficient, and a separate authorized dead-letter payload export is an
   inspection artifact—not an import/rebuild proof. In case (a), any terminal
-  entry returns typed `StreamExportBlocked`. Replay applies to
-  `DEAD_LETTERED`; a fresh accepted successor may replace either terminal
-  state, but no absence-preserving successor clears `WITHDRAWN`. Authority
+  entry returns typed `StreamExportBlocked`. A fresh ordinary successor naming
+  the current terminal token may replace either terminal state; no
+  absence-preserving successor clears `WITHDRAWN`. Authority
   retirement resets sequencing only by rebuilding into a fresh graph identity;
   any later enrollment creates a fresh stream incarnation, and the source
   never resumes. Lossless terminal-authority transfer still needs a future
   stream-aware export/import format. Export never silently omits an
   acknowledged WAL/dead-letter cut.
 - **Status**: expose driver health, last success/error, pending trigger/backoff,
-  token-ledger index coverage/uncovered-tail age and reconciliation error,
+  token-ledger index coverage/uncovered-tail age and lookup-cost warning,
   lifecycle revision, exact generation/merge cut, advisory backlog,
-  `StrictBlock`, relevant recovery, last fold, visible/diverted counts, and
-  authoritative paginated historical dead-letter-artifact references.
-  Advisory current-state summaries remain labeled non-authoritative; replay
-  always revalidates the selected candidate's current token.
+  `StrictBlock`, relevant recovery, last fold, visible/diverted counts, and a
+  bounded current-terminal indicator/sample derived from the selected token
+  version. A reconciliation error appears only after measured evidence has
+  scheduled a reconciler. Advisory current-state summaries remain labeled
+  non-authoritative; cluster-only list/export revalidates each current terminal
+  row.
 - **Shutdown**: the F5 supervisor protocol is wired into multi-graph server
   shutdown and tested under graceful and forced termination.
 
 ### 7.2 Correctness evidence
 
 - Failpoints through the hidden candidate-runtime path at acknowledgement, claim,
-  lifecycle, maintenance, both fold participants, both dead-letter encoder
-  passes, conditional object creation, streaming verification, confirmation,
+  lifecycle, maintenance, both fold participants, canonical dead-letter
+  encoding, conditional object creation, exact verification, confirmation,
   and manifest publication. Include sidecar-before-object, ambiguous/stalled
   upload, object-before-Lance, base-only, base+token-before-CAS, orphan
-  inertness, all-diverted, exact retry, and replay; a structural assertion
+  inertness, all-diverted, exact retry, and an ordinary corrected successor; a structural assertion
   proves no object-write path is reachable before the sidecar is durable.
 - `forbidden_apis` registration for every new writer; no raw Lance/MemWAL,
   token-HEAD, dead-letter-listing, or generic `allow_sealed` bypass.
@@ -1684,7 +1527,8 @@ No object reference is enough by itself to claim a key is terminal.
   strand, including populated dead-letter authority.
 - One hidden candidate-runtime cluster test:
   ordered NDJSON acknowledgement → automatic node/edge fold → visible or
-  dead-lettered terminal state → list/export/replay → restart and forced
+  dead-lettered terminal state → cluster-only list/export → ordinary corrected
+  successor → restart and forced
   shutdown → offline disable to terminal `DISABLED` → offline
   maintenance/rebind → enable → restart → resume. The test uses
   sequential OS processes and proves the server has joined every writer owner
@@ -1709,15 +1553,13 @@ No object reference is enough by itself to claim a key is terminal.
   before the first disable profile CAS, then reacquires from the root.
   Schema/rebind refuses before terminal `DISABLED` and reruns the recovery
   barrier under that exact disabled revision before its own CAS.
-- A long-history token-ledger cell keeps exact receipt lookup and bounded
-  pagination correct across covered history plus a measured uncovered tail,
-  crashes before and after `optimize_indices` and the pointer CAS, and proves
-  reconciliation never changes current-token rows or receipt commitments.
-  The negative control grows uncovered fragments and must expose the degraded
-  physical scan/status honestly; the reconciled path must show old history is
-  index-addressed rather than decoded or scanned by application code. A plan
-  assertion forbids `SortExec`/ordered range pagination and pins at most
-  page-size-plus-one exact predecessor probes.
+- A long-history token-ledger instrument measures exact receipt/token lookup
+  and bounded current-terminal scanning across covered history plus increasing
+  uncovered tails, locally and on RustFS/S3. It records rows/bytes/object reads
+  and p95, exposes degraded physical work in status, and pins the threshold
+  that schedules an authority-safe reconciler. No reconciler is required for
+  logical EXP activation, and ordinary graph `optimize` is not credited with
+  token-ledger convergence.
 - A sustained mixed-backlog cell continuously makes node work ready while an
   edge is already in the frozen scheduling round and proves that the edge gets
   its bounded turn with a fresh post-node snapshot.
@@ -1759,7 +1601,7 @@ No object reference is enough by itself to claim a key is terminal.
   Mutation/Load/delete and `_as`, SchemaApply, BranchMerge, branch
   create/delete, every profile transition/refinement,
   Optimize/EnsureIndices/Repair/Cleanup,
-  prepare/admission, quiesce/resume, correction, replay/fold,
+  prepare/admission, quiesce/resume, correction/fold,
   enrollment/rebind, and every new recovery arm; only exact finalization of the
   already-armed retirement sidecar is allowed. Read/query/status and repeated
   export of the recorded cut remain available.
@@ -1777,34 +1619,24 @@ No object reference is enough by itself to claim a key is terminal.
   read/query/status/export-only server mode and can mint only
   `CheckedClusterServedExportAuthority`; no fold delegation, supervisor,
   admission, mutation, or other runtime authority exists.
-- F5 repeats the matrix with `WITHDRAWN | DEAD_LETTERED`, pins the bounded
-  manifest dead-letter chain commitment and immutable token witness, proves
-  retirement does not require replay and never deletes canonical dead-letter
+- F5 repeats the matrix with `WITHDRAWN | DEAD_LETTERED`, pins the immutable
+  token witness plus scan-derived disposition counts, proves retirement
+  requires no payload mutation and never deletes canonical dead-letter
   objects, and activates `DEAD_LETTERED` only after its format-specific
   retirement tag/recovery path is green. The same-format source binary
   performs retirement/export before the refusing successor format is used.
-- A replay page parks a concurrent corrected successor behind canonical
-  same-key ownership through its checkpoint CAS. Crash immediately after the
-  replay acknowledgement but before that CAS, then restart: binding recovery
-  proves `already_durable`, publishes the checkpoint once, releases ownership,
-  and only then may the successor advance. An unrelated-table fold racing the
-  same graph-global token pointer waits behind replay's root token gate and
-  then replans from the published pointer; neither side can bury the other's
-  token effect. A partially full generation admits only the exact fitting
-  canonical replay prefix. Under sustained producer ingress, a no-fit/empty-fit
-  page retains outer admission across its injected-authority fold and replan.
-  An empty-generation-oversize candidate publishes one durable terminal
-  checkpoint without changing its `DEAD_LETTERED` token, survives a lost
-  response, and lets the operation continue to the next candidate.
-- Dead-letter publication tests hit 255/256/257 chunks, the 256-MiB payload
-  edge, and the 64-KiB manifest edge; over-limit expansion installs the exact
-  structural block before any object/Lance effect. Crash/retry at every chunk
-  and final-manifest create verifies `PutMode::Create`, byte-identical
-  `AlreadyExists`, mismatch corruption, inert partial residue, and second-pass
-  recovery without conditional multipart or an object-sized buffer. The exact
-  8,192-key all-diverted case forces the two-link token/record transaction
-  boundary and crashes before, between, and after those links, proving no
-  intermediate token version becomes manifest authority.
+- Exact retry after restart returns the same terminal result while the
+  `DEAD_LETTERED` token is current; a corrected ordinary successor must name
+  that token, and an older predecessor cannot resurrect or bypass the key.
+  Race the successor with another table's fold and prove the graph-global token
+  pointer serializes both effects without a special replay queue.
+- Dead-letter publication tests pin the measured single-object byte/RSS cap.
+  One-below/exact/one-over expansion proves over-limit `DataBlock` occurs
+  before object/Lance effect. Crash before/after sidecar, conditional PUT,
+  exact existing-object verification, optional base effect, token effect, and
+  manifest CAS. Digest/length mismatch fails closed; unselected objects remain
+  inert. Mixed and 8,192-key all-diverted folds prove no intermediate token
+  version becomes graph authority.
 
 ### 7.3 Resource and performance evidence
 
@@ -1818,41 +1650,25 @@ closing evidence commit records numeric pass/fail thresholds from the measured
 baseline; until then the diagram makes no trip-count or latency claim.
 The fold matrix includes a near-cap generation whose strings maximize JSON
 escaping and repeated field-name/null expansion, plus a store stalled during
-upload and verification. It proves the two-pass dead-letter encoder retains
-only the bounded descriptor set and configured chunk reservation, never an
-object-sized buffer, and stays within the selected exclusive-fold RSS limit.
+upload and verification. It measures canonical encoded bytes and peak RSS,
+pins the single-object envelope, and proves admission above that envelope
+blocks before durable effect.
 
 Keep CI sustainable:
 
-- for an ordinary source PR, the required `Firehose PR smoke` tier created in
-  F2 has a **hard ≤15-minute critical-path budget** and no smoke job timeout
-  above 15 minutes; it uses
-  event-driven rendezvous rather than sleeps and gives every stalled owner a
-  fail-fast diagnostic timeout. Its classifier includes `omnigraph-engine`,
-  `omnigraph-cluster`, `omnigraph-server`, `omnigraph-policy`,
-  `omnigraph-api-types`, CLI, Cargo/build inputs, tests, CI, and branch
-  protection. Empty-runner and warm p95 for an unchanged image key must both
-  fit before the check becomes required; the immutable dependency-image or
-  isolated-harness strategy from F2 is correctness infrastructure, while an
-  opportunistic GitHub cache is only an optimization;
-- the required `Firehose dependency rebuild` check always starts and reports.
-  With an unchanged immutable image key it verifies the exact attested
-  main-published artifact/image metadata and quickly no-ops successfully. A
-  changed or missing trusted key takes the one explicit exception: the PR
-  cold-builds and runs smoke within one aggregate **hard ≤60-minute timeout**,
-  sharing only a current-run artifact and publishing nothing durable. The
-  `Firehose PR smoke` context explicitly delegates to this required rebuild
-  context and does not claim that smoke ran itself. The protected post-merge
-  main run may publish the write-once key→digest artifact.
-  It never duplicates the cold build in multiple jobs. Workflow/path filters
-  may not omit either required check, so branch protection never waits for a
-  check that was not created;
-- high-entropy near-cap, RustFS/S3 fault, endurance, and full performance
-  matrices run scheduled or explicitly opt-in, have a **hard ≤60-minute
-  timeout**, and publish artifacts; and
-- no required PR job may normalize the prior hour-plus feedback loop. If a
-  deterministic correctness cell cannot fit the PR tier, split the fixture or
-  optimize the harness rather than silently dropping the gate.
+- pull requests run the ordinary conservative classifier, documentation/link
+  checks, entrypoint check, and AWS-feature test;
+- authors run the affected focused owners locally and record exact commands
+  and results in the PR;
+- the full feature-superset workspace, immediate-predecessor format fence, and
+  RustFS graphs run post-merge, on tags, or by manual dispatch;
+- a red post-merge `main` is stop-the-line until fixed or reverted;
+- high-entropy near-cap, endurance, and full performance matrices remain
+  scheduled or explicitly opt-in with bounded timeouts; and
+- no custom attested dependency archive, keyed rebuild/publisher, or shadow
+  reporter is part of the design. A dedicated required protocol check returns
+  only after an isolated harness demonstrates measured empty-runner and warm
+  p95 within its proposed budget.
 
 **Stopping after F6 is safe:** all behavior remains behind the internal
 activation seam. F7 is forbidden until every required F6 cell is green.
@@ -1877,15 +1693,21 @@ time F7 executes, F2 will already have landed the profile adapter and
 | fold | explicit operator fold + internal driver fold | `POST .../streams/{type_name}/fold` | `stream fold` |
 | quiesce | capability-bound quiesce | `POST .../streams/{type_name}/quiesce` | `stream quiesce` |
 | resume / abort | capability-bound resume | `POST .../streams/{type_name}/resume` | `stream resume [--abort-drain]` |
-| block / correction | block view + data correction | `GET .../blocks/{block_token}`, `POST .../correct` | `stream block show`, `stream correct` |
-| authority repair | exact DRAINING repair plan | `POST .../blocks/{block_token}/repair-authority` | `stream block repair-authority` |
-| rebuild proof | post-`SEALED` preflight | `POST .../rebuild-preflight` | `stream rebuild-preflight` |
 | graph export / rebuild artifact | runtime-pinned exact sealed cut | existing `POST /graphs/{graph_id}/export` with stream-aware guards | existing `export --server`; direct `--store` refuses an enrolled graph |
-| dead letter | newest-first historical artifact list / payload export / current-token-validated replay | `GET .../dead-letters`, `GET .../dead-letters/{dead_letter_id}`, `POST .../{dead_letter_id}/replay` | `stream dead-letter list|export|replay` |
 | same-binding maintenance | lifecycle-aware Optimize / EnsureIndices | `POST /graphs/{graph_id}/maintenance/optimize`, `POST /graphs/{graph_id}/maintenance/ensure-indices` | `optimize --server`, `maintenance ensure-indices --server` |
-| offline blocked-disable repair | no serving runtime; cluster-state-locked sole-writer adapter | none | `cluster stream block show|correct|repair-authority --confirm-stream-offline` |
-| offline authority retirement | no serving runtime; cluster-state-locked stopped-writer adapter | none | `cluster stream retire-for-rebuild plan|confirm --confirm-stream-offline` |
 | cluster schema / rebind | no serving runtime; exact terminal `DISABLED` revision + `CheckedClusterMaintenanceAuthority` | none | disable to `DISABLED`, then `cluster apply --confirm-stream-offline`; later enable/restart/resume |
+
+The table contains the five primary stream workflows plus existing export and
+maintenance integration. Bodyless prepare is an automatic ingest handshake,
+not a sixth workflow. Reachable terminal states retain narrow cluster/offline
+exits without served HTTP/OpenAPI parity:
+
+| Cluster/offline support | Command shape |
+|---|---|
+| current dead-letter inspection and payload export | `cluster stream dead-letter list|export --confirm-stream-offline` |
+| block inspection and data correction | `cluster stream block show|correct --confirm-stream-offline` |
+| exact authority repair | `cluster stream block repair-authority --confirm-stream-offline` |
+| authority retirement / rebuild exit | `cluster stream retire-for-rebuild plan|confirm --confirm-stream-offline` |
 
 All request/response types live in `omnigraph-api-types`; pagination, canonical
 token/digest parsing, and tagged per-line dispositions are shared rather than
@@ -1900,11 +1722,11 @@ and the canonical sorted compare set of
 `{table_identity, lifecycle_revision}`. Its recovery/management receipt retains
 that request digest and terminal graph-manifest result, so a lost-response
 retry cannot discover a newer table set or retarget a later revision.
-Prepare and ingest use `stream_ingest`; lifecycle, fold, block, correction,
-rebuild, and authority repair use `stream_manage`; dead-letter replay requires both
-`stream_manage` and `stream_ingest`. Read-only status and non-payload
-dead-letter listing use operational-metadata authorization. Any endpoint or CLI
-command that returns full row payloads requires the existing `export` action.
+Prepare and ingest use `stream_ingest`; lifecycle and fold use
+`stream_manage`. Cluster-only block correction, authority repair, and
+retirement require their exact offline checked authority plus
+`stream_manage`. Read-only status uses operational-metadata authorization.
+Dead-letter payload export additionally requires the existing `export` action.
 
 The existing graph export route/remote command becomes stream-aware in this
 same slice through a two-stage checked engine seam. Before constructing the
@@ -1982,10 +1804,11 @@ activation PR updates:
 
 - `docs/user/cli/reference.md`, `docs/user/operations/server.md`,
   `docs/user/operations/policy.md`, and `docs/user/operations/errors.md` for
-  prepare/ingest, status, lifecycle, block/correction, dead-letter, maintenance,
-  safe-export endpoints/commands, authorization, tagged results, and the
+  served prepare/ingest, status, lifecycle, maintenance, safe export,
+  authorization, tagged results, and the
   stream/export-specific extension of the served-only versus embedded/direct
-  refusal boundary;
+  refusal boundary; cluster docs/CLI reference separately own the offline
+  block/correction, authority-repair, retirement, and dead-letter-export exits;
 - `docs/user/operations/maintenance.md` for exact
   `quiesce → served Optimize/EnsureIndices → resume`, and
   `docs/user/clusters/index.md` plus `docs/user/operations/upgrade.md` for
@@ -1998,8 +1821,9 @@ activation PR updates:
   guide; and
 - `docs/user/reference/constants.md` for every activated, measured F6/F7
   row/byte/count/time default: ingress line/run/root ownership, preprocessing,
-  fold/dead-letter scratch chunks, driver cadence/backoff, status/dead-letter
-  pagination, export slot/queue/deadline, and shutdown bounds.
+  fold/dead-letter single-object byte/RSS envelope, driver cadence/backoff,
+  bounded current-terminal scan pages, export slot/queue/deadline, and shutdown
+  bounds.
 
 User-doc examples and error tables are tested or link-checked in the same PR;
 no active operational default remains discoverable only in an RFC or source
@@ -2022,10 +1846,12 @@ or irreversible retirement/export understood by that same binary. A successor
 strand is not an exit because strict refusal prevents it from opening the old
 root. V11 owns `WITHDRAWN` retirement; F5 extends it for `DEAD_LETTERED`.
 
-**Strand budget.** The selected path expects two rebuilds before F7: F2 and F5.
-The separately approved F2/F3 and F4 contingencies make four the stated
-ceiling. A failure to co-land those shapes stops for amendment and approval; it
-does not silently consume another graph/recovery version.
+**Strand budget.** V11 and v12 are implemented. Each unsettled future payload
+is either exactly the frozen scaffold already registered or takes a new honest
+pre-release strand. There is no guessed numeric ceiling: every added strand is
+recorded with predecessor refusal/rebuild evidence, and the complete count
+freezes at the 0.10.0 release gate. No discriminator acquires a different
+payload meaning in place merely to save a rebuild.
 
 **What the experimental designation does and does not buy.** It licenses
 trimming: explicit enrollment, per-token producer barriers, fresh reads, and
@@ -2070,21 +1896,20 @@ lands a production writer or claims an SLO before F6.
 | Decision | Selected shape |
 |---|---|
 | Effectful claims | Every effect is classified into one immutable attempt-ledger row before another Lance call; the terminal `ClaimReceipt` commits the chain and there is no arbitrary attempt cap or receipt-free `SEALED` route |
-| Receipt history | Tagged immutable rows live in manifest-selected `_stream_tokens.lance`; hot profile/lifecycle rows retain bounded current pointers/count/chain commitments; newest-first pagination follows exact indexed predecessor IDs instead of sorting a Lance range, and recovery-covered derived index reconciliation keeps old history index-addressed while the correct uncovered-tail fallback remains explicit and observable |
+| Receipt authority | Tagged immutable rows live in manifest-selected `_stream_tokens.lance`; hot profile/lifecycle rows retain bounded current pointers/count/chain commitments. Exact lookup remains recovery/idempotency authority, but EXP exposes no public receipt-history pagination. Uncovered-fragment fallback is correct and observable; a measured threshold, not F3, schedules reconciliation |
 | Quiesce ownership | One exclusive admission lease; folds consume injected checked authority |
 | Empty lane | Dedicated fence/tail/empty-proof path with an incremental authenticated WAL-segment cursor/chain; never scan from genesis or invent/seal an empty generation |
-| Lifecycle format | Internal v12/lifecycle-v3 + recovery-v14 activates hidden enrollment, claim, ordinary/drain fold, and terminal lifecycle receipt with fixed-size ledger-chain/current authority. F3's remaining registered lifecycle exits stay fail-closed; F5 still requires the later dead-letter/replay strand. The plan therefore has three rebuilds before F7; any additional split requires explicit amendment. |
+| Lifecycle format | Internal v12/lifecycle-v3 + recovery-v14 activates hidden enrollment, claim, ordinary/drain fold, and terminal lifecycle receipt with fixed-size ledger-chain/current authority. Dormant v14 scaffold meanings are immutable: F3 uses them only if exact, otherwise takes a new pre-release strand. F5 requires a new terminal-authority/object strand. The release gate records the final strand count |
 | Maintenance | Explicit lifecycle-aware integration per writer; no generic `SEALED` bypass |
 | Public ordering | Hidden F4/F5 → evidence F6 → atomic served/remote activation F7 |
-| Dead letter | One terminal LWW candidate per losing key; two-pass conditional-create 1-MiB chunks (max 256/256 MiB) plus ≤64-KiB manifest, with pre-effect structural block on expansion |
+| Dead letter | One terminal LWW candidate per losing key; one deterministic, conditionally created NDJSON object under a measured byte/RSS cap; one current `DEAD_LETTERED` token per losing key; ordinary-ingest correction; pre-effect `DataBlock` on expansion |
 | Process topology | One externally enforced writer process; profile apply requires stop → cluster-state-locked offline owner → restart; schema/rebind additionally requires terminal `DISABLED` before its checked offline authority, with no claim that process-local locks detect foreign processes |
 | Capability placement | `omnigraph-storage` plus `omnigraph-control-authority` resolve the engine/storage/cluster-lock dependency without a cycle; opaque stopped/offline and runtime guards preserve one storage path and expose no forgeable mint |
 | Public topology | Under `ENABLED`, Mutation/Load/delete require the exact checked served runtime; under `DISABLING`, they are closed. BranchMerge is closed under both modes even with that runtime. Ambient SDK/direct CLI and Cedar-only lanes refuse before effect |
 | Control authority | Profile flip requires validated offline cluster-apply capability; `DISABLING` closes admission durably and retains one fixed-principal fold continuation until the sole apply owner seals all lanes |
-| Required CI latency | Smoke and dependency checks always report; ordinary smoke ≤15 minutes, unchanged main-published dependency key verifies/no-ops, and a changed/missing key cold-builds plus smokes in the PR within one aggregate ≤60-minute bound without durable publication |
+| CI policy | Conservative lightweight PR checks plus author-recorded local evidence; full workspace, format fence, and RustFS post-merge/manual; red `main` is stop-the-line. No custom attested/keyed dependency pipeline; a dedicated required protocol harness returns only from measured latency evidence |
 | Driver identity | Timer/cap folds bind the durable delegation and deterministic cut authority, with no append-only management receipt |
 | Fold ordering | One serial root cut; finite ready-identity rounds prioritize nodes then serve every captured edge with fresh validation |
-| Replay | One final candidate per key; ledger-only checkpoints never mutate current tokens, no-fit retains outer admission across fold/replan, and oversize candidates get terminal per-entry checkpoints |
 | Export | Normal export requires fresh exact `SEALED` proof, token/base parity, and no current terminal token; same-format irreversible retirement may instead freeze the entire source at an exact cut and permit row-only export with a provenance receipt into a fresh graph identity whose later enrollment mints a fresh stream incarnation; payload export alone is not rebuild |
 | Structural block | Fix + same-drain retry, exact data correction, or recovery-bound authority correction; ordinary rebuild preflight is post-`SEALED` |
 

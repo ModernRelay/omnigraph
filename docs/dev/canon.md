@@ -781,9 +781,12 @@ RFC-026 §4.7 P1's enablement authority: one required graph-global
 `stream_profile` singleton (present from genesis with streaming disabled at
 `profile_revision` 1), flipped only through the shared publisher's exact-entry
 CAS with a strict revision advance, and obeyed by every process that opens the
-graph. The same bump reserves the fold-attribution dead-letter slot as an
-explicit null, because that summary is `deny_unknown_fields` and compared for
-exact structural equality between the recovery sidecar and the lineage row.
+graph. The same bump added a fold-attribution dead-letter compatibility
+placeholder as an explicit null, because that summary is `deny_unknown_fields`
+and compared for exact structural equality between the recovery sidecar and
+the lineage row. That frozen null is not a dead-letter, replay, chunk, or
+history protocol. F5 owns its settled terminal-authority/object grammar in a
+later strict strand rather than activating the placeholder in place.
 The bump exists because v9 decoders silently skip unknown row kinds — only the
 stamp turns "older binary meets streaming-capable graph" into a refusal
 instead of a writer blind to the freeze. V9 crosses by export/init/load
@@ -1130,12 +1133,17 @@ shape)**;
 public MemWAL row admission and later lifecycle/read phases **(RFC-026, draft;
 private v9 compare-and-chain/token-fold core, unbounded retain-all, bounded
 v11/profile-v2 checked authority, and hidden v12/lifecycle-v3 quiescence
-implemented; managed reclamation is optional later work; F3 can activate the
-already-registered recovery-v14 same-format resume/correction/retirement and
-maintenance exits before public enrollment, quiesce, exclusive-cut physical
-status, row admission, and transport-parity evidence; F5 dead-letter
-disposition remains the next planned strict format strand; the Cedar
-vocabulary and embedded manifest-only status are active)**;
+implemented; managed reclamation is optional later work; F3 audits the frozen
+recovery-v14 resume/correction/retirement/maintenance scaffolds and activates
+them only if their exact payloads suffice, otherwise taking a new strand,
+before public enrollment, quiesce, exclusive-cut physical
+status, row admission, and transport-parity evidence; F5's next strict strand
+adds one measured, bounded deterministic NDJSON object per fold, current
+`DEAD_LETTERED` authority per losing key, correction through a fresh ordinary
+`Admission`, and same-format retirement; dead-letter inspection/export plus block correction,
+authority repair, and retirement remain cluster/offline-only, with no replay
+mutation or public history surface; the Cedar vocabulary and embedded
+manifest-only status are active)**;
 lineage-based merge deltas
 **(RFC-027, research-blocked)**; background reconciler; planner
 statistics/cost model; policy pushdown; ingest-time embeddings; per-query
@@ -1153,7 +1161,7 @@ resource budgets.
 | **R4: Manifest authority access grows with commit count.** Current-state resolution folds history; a selective index does not by itself bound the complete physical read. | Medium | `optimize` compacts internal tables (keeps periodically-optimized shipped paths flat where separately cost-gated). RFC-024 Gate A rejected durable heads because representative RustFS latest-manifest reads/bytes grow despite flat exact-BTREE row/range work. RFC-025 Gate 0 independently rejected checkpoint-registry activation: at local 10→1,000 on RC.1, uncompacted reconciled work and the eight-fragment tail stay flat, but compacted list/cleanup scan bytes grow 17,012→38,000 cold and 12,336→15,064 warm; exact-show bytes and operation counts also grow. Both RFCs are research-blocked; v8 retains the journal fold and internal-table *cleanup* remains deferred behind the resurrection watermark. |
 | **R5: Schema identity corruption or alias/identity drift.** Internal schema v5 introduced stable IDs/incarnation as durable authority; v6, v7, and v8 preserve them. | Medium | Open/init validate the SchemaIR domain and exact bidirectional IR↔manifest identity/path/alias contract; every active recovery envelope carries the identity pair; zero, duplicate, missing, or mismatched identity fails closed. |
 | **R6: Merge cost at divergence** — full-width classification and history-growing manifest folds. | Medium | Coherent coordinator scans plus retained probe handles reduced the pre-slice measured depth-5/depth-80 baseline from 59/651 manifest reads to 40/410 and cap the common fast-forward route at three internal opens and three scans, but the uncompacted-history slope remains. `merge_cost.rs` keeps both facts visible; O(delta) merge is blocked on a real deletion-delta source **(RFC-027)**; fragment adoption is **(draft RFC-0001)**. |
-| **R7: No public streaming row path** — production writes are still capped by the `graph_head` CAS rate; high-frequency small writes remain wasteful outside the private evidence seam. | Medium | MemWAL is the strategic substrate. The bounded worker provides watcher-plus-post-fence acknowledgement and conservative replay; its legal high-entropy near-cap shape closes under logical dense-slice accounting, with physical RSS guarded only as a remeasurement tripwire. Private B2a selects unbounded retain-all with no canonical MemWAL deletion or storage quota. Schema v9 adds compare-and-chain tokens and graph-global token authority; v11 adds checked profile authority and exact recovery-v13 profile receipts. Current v12/lifecycle-v3 and recovery-v14 cover immutable enrollment/binding receipts, recovery-covered writer claims, exact ordinary/drain folds, and restartable hidden empty/non-empty quiescence. Public row activation remains closed on supported enrollment/quiesce, correction/retirement, physical status, and CLI/HTTP/OpenAPI parity. Managed reclamation and a whole-root history budget are optional later work; a public exact enrollment receipt plus reversible admission seal gates broader overlapping-process topology. |
+| **R7: No public streaming row path** — production writes are still capped by the `graph_head` CAS rate; high-frequency small writes remain wasteful outside the private evidence seam. | Medium | MemWAL is the strategic substrate. The bounded worker provides watcher-plus-post-fence acknowledgement and conservative replay; its legal high-entropy near-cap shape closes under logical dense-slice accounting, with physical RSS guarded only as a remeasurement tripwire. Private B2a selects unbounded retain-all with no canonical MemWAL deletion or storage quota. Schema v9 adds compare-and-chain tokens and graph-global token authority; v11 adds checked profile authority and exact recovery-v13 profile receipts. Current v12/lifecycle-v3 and recovery-v14 cover immutable enrollment/binding receipts, recovery-covered writer claims, exact ordinary/drain folds, and restartable hidden empty/non-empty quiescence. Public row activation remains closed on supported enrollment/quiesce, physical status, primary ingest/status/fold/quiesce/resume transport parity, and supported cluster/offline block-correction, authority-repair, and retirement exits. Emergency exits deliberately do not require broad HTTP/OpenAPI parity. Managed reclamation and a whole-root history budget are optional later work; a public exact enrollment receipt plus reversible admission seal gates broader overlapping-process topology. |
 | **R8: Some operations lack enforced memory/time budgets.** | Medium | Known gap, narrowed and accepted for RFC-023. Its direct-substrate instrument rejected the first whole-delta fenced adopt (~447 MB peak at 100K × 256 versus ~74 MB Append), and the first corrected production 10K series failed at 30.0× / 108,625,920 bytes overhead; both negative results remain evidence. Mutation/Load now refuses a keyed table above 8,192 rows / 32 MiB before arm, while BranchMerge uses a recovery-enrolled chain with the same per-chunk bounds and a 1,024-transaction ceiling. The inductive certificate route removes the general diff, temporary delta, target preflight, and target join without weakening that chain. Final five-pair production medians passed at 31/8 ms (3.875×) for 10K and 136/35 ms (~3.886×) for 100K; maximum signed paired RSS overheads were 24,297,472 and 32,604,160 bytes. Inclusive row/transaction ceilings, byte refusal (including materialized blobs), operation-wide validation retention, exact source/target incarnation revalidation, second-generation certificate composition, and both between-chunk recovery directions are pinned; other operations still need explicit bounds. |
 | **R9: Local-FS conditional-write emulation** (`write_text_if_match` check-then-act gap). | Low | All current callers sit behind the cluster lock protocol; S3 uses true conditional puts; close before admitting any lock-free caller. |
 | **R10: Doc/spec drift as the system grows** — this document included. | Low | Maintenance contract (same-PR doc updates, `check-agents-md.sh` link CI, "don't lie" stale markers); this canon defers to area docs by construction. |
@@ -1191,8 +1199,13 @@ Live design questions, each owned by an RFC or a known gap — not a wishlist:
    recovery-v13 `StreamProfileChange`. V12 adds lifecycle-v3/recovery-v14:
    hidden enrollment, claim, ordinary/drain fold, and terminal quiescence are
    implemented, while registered resume/correction/retirement/maintenance/
-   rebind families remain fail-closed. F3 may activate those same-format exits;
-   F5's dead-letter/replay vocabulary is the next planned strict strand.
+   rebind families remain fail-closed. F3 may activate a v14 scaffold only
+   when its exact frozen payload suffices; otherwise it takes a new strand.
+   F5's next planned strict strand adds only the settled terminal shape: one
+   bounded deterministic object per fold, current `DEAD_LETTERED` token
+   authority, correction through a fresh ordinary `Admission`, and same-format retirement. It
+   adds no Replay origin, replay checkpoint family, chunk chain, or public
+   history walk.
    RFC-024's heads, RFC-025's retention, and later RFC-026 phases remain
    independently reviewable. Any later format activation requires its own
    export/init/load rebuild unless capabilities deliberately co-release after

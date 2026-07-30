@@ -37,15 +37,10 @@ use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
 use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_control_authority::{
-    AuthorityOperationClass, OfflineAuthorityRequest, RuntimeBindingRequest, StateLockAcquire,
-    acquire_state_lock, mint_runtime_guard, validate_offline_guard, validate_runtime_binding,
-};
-use omnigraph_storage::storage_handle_for_uri;
 use serial_test::serial;
-use sha2::{Digest, Sha256};
 
 use helpers::memwal::{CurrentMemWalInventory, MemWalObjectKind};
+use helpers::stream_authority::enable_stream_profile;
 
 const STREAM_SCHEMA: &str = "node Person { score: I32 }\n";
 const TWO_TABLE_STREAM_SCHEMA: &str = r#"
@@ -85,10 +80,6 @@ query insert_company($score: I32) {
 const PROVIDER_FAILURE_MESSAGE: &str = "injected RFC-026 provider exhaustion";
 const PROVIDER_PUT_TIMEOUT: Duration = Duration::from_secs(45);
 const PROVIDER_FOLD_TIMEOUT: Duration = Duration::from_secs(90);
-const STREAM_DECLARATION_REVISION: &str = "memwal-stream-test-declaration-v1";
-const STREAM_DECLARATION_DIGEST: &str =
-    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderFailureTarget {
     PartialGeneration,
@@ -516,124 +507,6 @@ impl EnrolledGraphDir {
     }
 }
 
-async fn write_cluster_state(cluster_uri: &str) -> String {
-    let value = serde_json::json!({
-        "version": 1,
-        "state_revision": 1,
-        "applied_revision": {
-            "config_digest": "memwal-stream-test-config",
-            "resources": {}
-        }
-    });
-    let text = serde_json::to_string_pretty(&value).unwrap();
-    let storage = storage_handle_for_uri(cluster_uri).unwrap();
-    storage
-        .adapter()
-        .write_text(&format!("{cluster_uri}/__cluster/state.json"), &text)
-        .await
-        .unwrap();
-    format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
-}
-
-async fn enable_stream_profile(db: &Omnigraph, cluster_uri: &str) {
-    let cluster_uri = cluster_uri.trim_end_matches('/');
-    let state_cas = write_cluster_state(cluster_uri).await;
-    let storage = storage_handle_for_uri(cluster_uri).unwrap();
-    let lock_uri = format!("{cluster_uri}/__cluster/lock.json");
-    let lock = match acquire_state_lock(&storage, &lock_uri, "apply")
-        .await
-        .unwrap()
-    {
-        StateLockAcquire::Acquired(lock) => lock,
-        StateLockAcquire::Held => panic!("fresh MemWAL test apply lock is already held"),
-    };
-    let guard = validate_offline_guard(
-        &lock,
-        OfflineAuthorityRequest {
-            graph_id: "knowledge",
-            graph_store_uri: db.uri(),
-            expected_state_cas: &state_cas,
-            state_revision: 1,
-            declaration_revision: STREAM_DECLARATION_REVISION,
-            declaration_digest: STREAM_DECLARATION_DIGEST,
-            expected_profile_revision: 1,
-            operation_id: "memwal-stream-test-enable",
-            operation: AuthorityOperationClass::StreamProfileEnable,
-            actor: "operator:memwal-test",
-            confirm_stream_offline: true,
-        },
-    )
-    .await
-    .unwrap();
-    let authority = db.check_cluster_apply_authority(guard).await.unwrap();
-    let result = db.set_streaming_profile_checked(authority).await.unwrap();
-    assert!(result.streaming_enabled);
-}
-
-async fn bind_checked_stream_runtime(
-    db: Arc<Omnigraph>,
-    cluster_uri: &str,
-) -> Arc<Omnigraph> {
-    let status = db.stream_status().await.unwrap();
-    assert_eq!(status.profile_mode, "ENABLED");
-    let value = serde_json::json!({
-        "version": 1,
-        "state_revision": 1,
-        "applied_revision": {
-            "config_digest": "memwal-stream-test-config",
-            "resources": {
-                "graph.knowledge": {
-                    "digest": "memwal-stream-test-graph"
-                },
-                "streaming.knowledge": {
-                    "digest": STREAM_DECLARATION_DIGEST,
-                    "declaration_revision": STREAM_DECLARATION_REVISION,
-                    "streaming_enabled": true,
-                    "profile_mode": "ENABLED",
-                    "profile_revision": status.profile_revision
-                }
-            }
-        }
-    });
-    let text = serde_json::to_string_pretty(&value).unwrap();
-    let cluster_uri = cluster_uri.trim_end_matches('/');
-    let storage = storage_handle_for_uri(cluster_uri).unwrap();
-    storage
-        .adapter()
-        .write_text(&format!("{cluster_uri}/__cluster/state.json"), &text)
-        .await
-        .unwrap();
-    let state_cas = format!("sha256:{:x}", Sha256::digest(text.as_bytes()));
-    let binding = validate_runtime_binding(
-        &storage,
-        cluster_uri,
-        RuntimeBindingRequest {
-            graph_id: "knowledge",
-            graph_store_uri: db.uri(),
-            expected_state_cas: &state_cas,
-            state_revision: 1,
-            declaration_revision: STREAM_DECLARATION_REVISION,
-            declaration_digest: STREAM_DECLARATION_DIGEST,
-            profile_mode: "ENABLED",
-            profile_revision: status.profile_revision,
-        },
-    )
-    .await
-    .unwrap();
-    let guard = mint_runtime_guard(
-        binding,
-        "memwal-stream-test-runtime",
-        "omnigraph:test",
-    )
-    .await
-    .unwrap();
-    let db = match Arc::try_unwrap(db) {
-        Ok(db) => db,
-        Err(_) => panic!("runtime fixture must own the sole engine handle"),
-    };
-    Arc::new(db.with_checked_cluster_stream_runtime(guard).await.unwrap())
-}
-
 async fn init_enrolled() -> (EnrolledGraphDir, Arc<Omnigraph>) {
     init_enrolled_with_schema(STREAM_SCHEMA).await
 }
@@ -646,12 +519,10 @@ async fn init_enrolled_disabled() -> (EnrolledGraphDir, Arc<Omnigraph>) {
     init_enrolled_with_profile(STREAM_SCHEMA, false).await
 }
 
-async fn init_enrolled_served_with_schema(
-    schema: &str,
-) -> (EnrolledGraphDir, Arc<Omnigraph>) {
+async fn init_enrolled_served_with_schema(schema: &str) -> (EnrolledGraphDir, Arc<Omnigraph>) {
     let (dir, db) = init_enrolled_with_schema(schema).await;
     let cluster_uri = dir.cluster_uri();
-    let db = bind_checked_stream_runtime(db, &cluster_uri).await;
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
     (dir, db)
 }
 

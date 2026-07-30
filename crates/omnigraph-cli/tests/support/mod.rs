@@ -578,7 +578,19 @@ query find_person($name: String) {
 "#,
     )
     .unwrap();
-    fs::write(root.join("base.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(
+        root.join("base.policy.yaml"),
+        r#"version: 1
+groups:
+  stream_operators: [act-cluster-test, act-operator, andrew]
+rules:
+  - id: stream-operators-manage
+    allow:
+      actors: { group: stream_operators }
+      actions: [stream_manage]
+"#,
+    )
+    .unwrap();
     fs::write(
         root.join("cluster.yaml"),
         r#"
@@ -602,6 +614,17 @@ policies:
 "#,
     )
     .unwrap();
+}
+
+pub fn remove_streaming_from_cluster_fixture(root: &std::path::Path) {
+    let config_path = root.join("cluster.yaml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    let config_without_streaming = config.replace("    streaming: true\n", "");
+    assert_ne!(
+        config, config_without_streaming,
+        "cluster fixture no longer contains the expected streaming declaration"
+    );
+    fs::write(config_path, config_without_streaming).unwrap();
 }
 
 pub fn init_cluster_derived_graph(root: &std::path::Path) {
@@ -639,9 +662,7 @@ pub fn write_cluster_applyable_state(root: &std::path::Path) -> serde_json::Valu
     // declared flag over a fabricated ledger would (correctly) fail. Real
     // graphs get the fixture's `streaming: true` through the apply-create
     // e2es instead.
-    let config_path = root.join("cluster.yaml");
-    let config = fs::read_to_string(&config_path).unwrap();
-    fs::write(&config_path, config.replace("    streaming: true\n", "")).unwrap();
+    remove_streaming_from_cluster_fixture(root);
     let validate = parse_stdout_json(&output_success(
         cli()
             .arg("cluster")
@@ -677,14 +698,20 @@ pub fn write_cluster_applyable_state(root: &std::path::Path) -> serde_json::Valu
 }
 
 pub fn cluster_json(root: &std::path::Path, command: &str) -> serde_json::Value {
-    parse_stdout_json(&output_success(
-        cli()
-            .arg("cluster")
-            .arg(command)
-            .arg("--config")
-            .arg(root)
-            .arg("--json"),
-    ))
+    let mut invocation = cli();
+    if command == "apply" {
+        invocation.arg("--as").arg("act-cluster-test");
+    }
+    invocation
+        .arg("cluster")
+        .arg(command)
+        .arg("--config")
+        .arg(root);
+    if command == "apply" {
+        invocation.arg("--confirm-stream-offline");
+    }
+    invocation.arg("--json");
+    parse_stdout_json(&output_success(&mut invocation))
 }
 
 pub fn write_multi_graph_cluster_fixture(root: &std::path::Path) {

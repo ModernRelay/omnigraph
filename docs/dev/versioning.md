@@ -76,11 +76,13 @@ Internal schema v10 was the first 0.10.0-dev streaming-profile format. It
 preserved the complete v9 contract and added RFC-026 §4.7 P1's enablement
 authority: one required graph-global `stream_profile` singleton row, present
 from genesis (disabled, revision 1), flipped through the shared publisher's
-exact-entry CAS with a strict revision advance. The same bump reserved the
-fold-attribution dead-letter slot (`dead_letter_object`, explicit null) because
-that summary is `deny_unknown_fields` and structurally equality-compared
-between the recovery sidecar and the lineage row — it cannot be retrofitted
-through a serde default. The bump was forced by decode semantics, not row
+exact-entry CAS with a strict revision advance. The same bump added an
+explicit-null fold-attribution dead-letter compatibility placeholder
+(`dead_letter_object`). That incomplete v10 shape is now frozen null; the
+finalized protocol uses a new versioned attribution shape rather than
+activating it in place. The placeholder exists because the summary is
+`deny_unknown_fields` and structurally equality-compared between the recovery
+sidecar and the lineage row. The bump was forced by decode semantics, not row
 volume: v9 decoders silently skip unknown row kinds, so only the stamp can make
 a v9 binary refuse a streaming-capable graph instead of writing blind to the
 freeze. A v9 graph crosses by export/init/load rebuild. The genuine v9↔v10
@@ -119,6 +121,13 @@ are recovery-covered before Lance is invoked. Ordinary and drain folds bind
 the selected current claim and exact authenticated full-generation projection.
 The restartable private quiesce path handles never-written and non-empty lanes
 through `OPEN → DRAINING → SEALED`.
+
+Those dormant v14 discriminators have an immutable scaffold payload meaning.
+They may activate under v14 only if that exact grammar is sufficient. A final
+operation that needs another payload shape uses a new sidecar schema/internal
+stamp and pins predecessor-binary refusal; a dormant name is never a license
+to reinterpret persisted bytes. Before release, an honest additional strand
+is preferred to guessing a future on-disk shape.
 
 Recovery-v13 remains exactly the v11 profile-change protocol. Historical
 recovery-v10 enrollment and recovery-v12 lifecycle-v2 folds retain their old

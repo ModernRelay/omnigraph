@@ -8,7 +8,7 @@ This page explains what the policy says and how to change it.
 
 | Setting | Value | Why |
 |---|---|---|
-| **Required status checks (strict)** | `Classify Changes`, `Check AGENTS.md Links`, `Test omnigraph-server --features aws` | Every PR must pass the AWS-feature build/test and AGENTS.md link integrity. **`Test Workspace` is deliberately NOT required** — it runs only on push to `main` (post-merge), tags, and manual `workflow_dispatch`, to keep PR turnaround fast (it was the ~15min+ slow gate). It is therefore *not* listed here: a required check that never reports on PRs (the `test` job is `if: github.event_name != 'pull_request'`) would leave every PR permanently pending — the job-never-reports trap. The new `Firehose PR smoke` and `Firehose dependency rebuild` jobs do report on every PR, but remain shadow checks until their exact attested-artifact path satisfies the activation evidence below. The trade-off (a regression lands on `main` and is caught by the post-merge run, so `main` can briefly go red) and its mitigations are documented in [ci.md](ci.md). Each required context must equal a job `name:` that actually reports on PRs **verbatim** — a context naming a job that never reports leaves every PR permanently pending and forces admin overrides. `strict: true` requires the branch to be up-to-date with `main` before merge. |
+| **Required status checks (strict)** | `Classify Changes`, `Check AGENTS.md Links`, `Test omnigraph-server --features aws` | Every PR must pass the AWS-feature build/test and AGENTS.md link integrity. **`Test Workspace` is deliberately not required**: it runs only after merge to `main`, on tags, or by manual dispatch. A required check that never reports on PRs would leave every PR pending. The trade-off is explicit: a regression may make `main` briefly red, at which point unrelated merges stop until it is fixed or reverted. See [ci.md](ci.md). Each required context must exactly match a job name that reports on PRs. `strict: true` requires the branch to be up to date with `main`. |
 | **Required approving reviews** | `0` | No human-review gate. With a 2-person team where both maintainers own everything, requiring an approval meant every PR needed the *other* person (or an admin/bypass override) — friction with no real review value. CI checks are the gate; maintainers merge their own PRs once checks pass. Raise this to `1` if an outside-contributor flow ever needs a review gate. |
 | **Require code-owner reviews** | `false` | CODEOWNERS was removed entirely (see the git history of `.github/`); there is no code-owner review requirement. |
 | **Require linear history** | `true` | No merge commits — squash or rebase only. Matches recent practice. |
@@ -43,35 +43,6 @@ DRY_RUN=1 ./scripts/apply-branch-protection.sh
 3. After the PR merges, an admin runs `./scripts/apply-branch-protection.sh` to push the new policy to GitHub.
 
 The script is **not run automatically** by CI. Branch-protection changes are admin actions that should be applied deliberately — a CI-driven automatic apply would mean any merged PR could rewrite protection rules, which defeats the purpose. The script's existence makes the apply reproducible; the admin's manual invocation is the audit point.
-
-## Firehose activation gate
-
-Do not add the two shadow firehose contexts to
-`.github/branch-protection.json` merely because the jobs exist. First satisfy
-the evidence gate in [ci.md](ci.md): exercise the exact protected-main
-publish, attestation, lookup, empty-runner restore, warm smoke, and cold
-exception; collect at least 20 unchanged-key artifact-hit samples; and keep p95
-end-to-end completion through `Firehose PR smoke` and the dependent evidence
-reporter at or below 15 minutes. Close the retention-scoped write-once gap with
-a non-expiring immutable key→digest binding before activation. Changed or
-unavailable keys must complete the single cold compile plus smoke within the
-separate 60-minute ceiling. A failure requires a smaller isolated harness, not
-larger timeouts.
-
-Once that evidence is recorded in the closing CI PR:
-
-1. Add `Firehose PR smoke` and `Firehose dependency rebuild` verbatim to
-   `required_status_checks.contexts`.
-2. Run `DRY_RUN=1 ./scripts/apply-branch-protection.sh` and inspect the
-   rendered payload.
-3. Merge the declaration, then have an administrator run
-   `./scripts/apply-branch-protection.sh`.
-4. Read the live protection API and confirm both contexts are present before
-   treating the F2 required-CI prerequisite as closed.
-
-This staging is deliberate: current Rust-cache timing is useful sizing
-evidence, but it is not proof of the immutable-artifact path and therefore
-cannot justify activating a required context.
 
 ## How to read the current GitHub state
 

@@ -723,11 +723,17 @@ fn cluster_apply_uses_operator_actor_from_omnigraph_home() {
             .arg("apply")
             .arg("--config")
             .arg(temp.path())
+            .arg("--confirm-stream-offline")
             .arg("--json")
             .output()
             .unwrap();
-        let json: serde_json::Value =
-            serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        assert!(
+            output.status.success(),
+            "cluster apply failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json = parse_stdout_json(&output);
         json["actor"].clone()
     };
 
@@ -752,17 +758,20 @@ fn cluster_approve_uses_operator_actor_fallback() {
     )
     .unwrap();
     // Converge, then remove the graph so a gated delete is pending.
-    for command in ["import", "apply"] {
-        let output = cli()
+    for subcommand in ["import", "apply"] {
+        let mut command = cli();
+        command
             .current_dir(temp.path())
             .env("OMNIGRAPH_HOME", operator_home.path())
             .arg("cluster")
-            .arg(command)
+            .arg(subcommand)
             .arg("--config")
-            .arg(temp.path())
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "cluster {command} failed");
+            .arg(temp.path());
+        if subcommand == "apply" {
+            command.arg("--confirm-stream-offline");
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "cluster {subcommand} failed");
     }
     fs::write(temp.path().join("cluster.yaml"), "version: 1\ngraphs: {}\n").unwrap();
 
@@ -812,6 +821,7 @@ fn cluster_commands_ignore_legacy_omnigraph_yaml() {
     // `operator.actor`, then to none (no loud failure on absence).
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
+    remove_streaming_from_cluster_fixture(temp.path());
     fs::write(temp.path().join("omnigraph.yaml"), "{{{{ not yaml").unwrap();
 
     for command in ["validate", "plan", "status"] {

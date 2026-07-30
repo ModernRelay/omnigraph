@@ -1288,9 +1288,14 @@ The review does not require all RFCs to land together. A safe order is:
    `RETIRED`, exact `ProfileManagementReceipt`, and unchanged recovery-v12
    historical fold meaning. Preserve the implemented v12/lifecycle-v3/
    recovery-v14 hidden enrollment, claim, ordinary/drain fold, and terminal
-   receipt path. Activate the registered same-format resume/correction/
-   retirement/maintenance/rebind exits before exposing production lifecycle
-   control, then prove SDK/CLI/HTTP/OpenAPI parity before exposing B2. Keep B2b
+   receipt path. Audit the frozen resume/correction/retirement/maintenance/
+   rebind scaffolds and activate one under v14 only when its exact payload is
+   sufficient; any different final grammar takes a new strand. Before exposing
+   production lifecycle control, add the simplified F5 terminal path: one
+   bounded recovery-owned object, current `DEAD_LETTERED` authority, ordinary
+   correction, and same-format retirement, with emergency repair surfaces
+   cluster/offline-only. Then prove primary SDK/CLI/HTTP/OpenAPI parity before
+   exposing B2. Keep B2b
    Lance-owned managed reclamation as an optional future route with its own
    evidence and format amendment. Retain the public exact enrollment receipt
    and cross-process admission seal as the gate for broader topology;

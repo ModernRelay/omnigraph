@@ -429,9 +429,10 @@ pub(crate) const STREAM_FOLD_SIDECAR_SCHEMA_VERSION: u32 = 12;
 /// Exact profile-management receipt/profile publication generation.
 pub(crate) const STREAM_PROFILE_CHANGE_SIDECAR_SCHEMA_VERSION: u32 = 13;
 
-/// Closed lifecycle-v3 recovery generation. Only `StreamLifecycleReceipt` is
-/// executable in the first slice; every other decoded discriminator remains
-/// fail-closed until its exact classifier is implemented.
+/// Closed lifecycle-v3 recovery generation. Only the active payload grammars
+/// below may execute. Dormant discriminators retain their frozen scaffold
+/// meaning; a finalized operation that needs another payload uses a new
+/// sidecar schema version rather than reinterpreting v14.
 pub(crate) const STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION: u32 = 14;
 
 /// Schema v11 is the first sidecar allowed to describe data-bearing MemWAL
@@ -1337,9 +1338,10 @@ pub(crate) struct RecoveryStreamAdmissionScope {
     pub binding_scope_id: String,
 }
 
-/// Typed bounded placeholder for a recovery-v14 family whose exact effect
-/// classifier is deliberately inactive in this slice. Decoding the closed
-/// discriminator is safe; processing it always fails closed.
+/// Frozen bounded payload for a recovery-v14 discriminator whose classifier is
+/// inactive. Decoding is safe and processing fails closed. A final operation
+/// may activate this discriminator under v14 only if this exact payload is
+/// sufficient; any different grammar requires a new sidecar schema version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecoveryStreamProtocolV14Scaffold {
@@ -1616,11 +1618,10 @@ pub(crate) struct RecoveryStreamClaimV14 {
     pub terminal: Option<RecoveryStreamClaimTerminalV14>,
 }
 
-/// Recovery-v14 is a closed discriminator. The vocabulary is fixed before
-/// public lifecycle activation so an unknown future meaning is rejected by
-/// serde rather than guessed. Enrollment-v2, claim, ordinary/drain fold, and
-/// lifecycle-receipt processors are active; the remaining scaffold variants
-/// stay bounded and fail closed.
+/// Recovery-v14 is a closed discriminator with immutable payload meanings.
+/// Enrollment-v2, claim, ordinary/drain fold, and lifecycle-receipt processors
+/// are active. The remaining exact scaffold variants stay bounded and fail
+/// closed; they are not reservations for a different future payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", deny_unknown_fields)]
 pub(crate) enum RecoveryProtocolV14 {
