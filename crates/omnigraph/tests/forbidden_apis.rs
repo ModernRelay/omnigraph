@@ -244,6 +244,7 @@ write_surfaces! {
     "db/omnigraph/stream_ingest.rs" => WriteProtocol::TestOnly => [
         "failpoint_stream_b1_for_test",
         "failpoint_stream_b2_for_test",
+        "failpoint_stream_ingest_one_as_for_test",
         "failpoint_stream_quiesce_for_test",
     ],
     "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],

@@ -348,11 +348,57 @@ impl Omnigraph {
         .await
     }
 
+    /// Admit one authenticated, fully normalized logical row through the
+    /// checked serving-runtime boundary.
+    ///
+    /// This is the first intentionally narrow functional ingress seam: the
+    /// table must already be enrolled and `OPEN`, and normalization remains a
+    /// caller responsibility. Transport, lazy enrollment, and public response
+    /// shaping remain inactive. Before production transport activation, the
+    /// owned profile guard must transfer into the detached put tail so caller
+    /// cancellation cannot release it before watcher/fence settlement.
+    pub(crate) async fn stream_ingest_one_as(
+        self: &Arc<Self>,
+        table_key: &str,
+        batch: RecordBatch,
+        caller_ordinal: u64,
+        envelope: StreamWriteEnvelope,
+        actor_id: &str,
+    ) -> Result<StreamTokenAdmissionAck> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::StreamIngest,
+            &omnigraph_policy::ResourceScope::Graph,
+            Some(actor_id),
+        )?;
+        let contributor_id = TrustedContributorId::new(actor_id.to_string())
+            .map_err(|error| OmniError::manifest(error.to_string()))?;
+
+        // Recovery may need the profile gate exclusively, so complete the
+        // normal write-entry barrier before joining that gate in shared mode.
+        self.heal_pending_recovery_sidecars_for_write(&[None])
+            .await?;
+
+        // The profile gate is outermost and is acquired exactly once. Calling
+        // `stream_put_phase_b2_one` here would attempt a nested read lock and
+        // can deadlock behind a queued profile writer because Tokio's RwLock is
+        // fair/write-preferring.
+        let profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+        self.ensure_streaming_ingest_runtime_authorized().await?;
+        self.stream_put_phase_b2_one_under_profile_guard(
+            table_key,
+            batch,
+            caller_ordinal,
+            envelope,
+            contributor_id,
+            &profile_guard,
+        )
+        .await
+    }
+
     /// Admit one fully normalized logical row through RFC-026's private B2
-    /// compare-and-chain boundary.  The caller supplies only its idempotency
-    /// envelope; contributor identity is already resolved by the trusted
-    /// engine boundary.  This remains crate-private and is exposed to tests
-    /// only through the feature-gated seam below.
+    /// compare-and-chain boundary. The caller supplies an already-trusted
+    /// contributor identity. This low-level protocol seam remains crate-private
+    /// for the existing recovery and sequencing tests.
     pub(crate) async fn stream_put_phase_b2_one(
         self: &Arc<Self>,
         table_key: &str,
@@ -361,7 +407,28 @@ impl Omnigraph {
         envelope: StreamWriteEnvelope,
         contributor_id: TrustedContributorId,
     ) -> Result<StreamTokenAdmissionAck> {
-        let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+        let profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+        self.stream_put_phase_b2_one_under_profile_guard(
+            table_key,
+            batch,
+            caller_ordinal,
+            envelope,
+            contributor_id,
+            &profile_guard,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_put_phase_b2_one_under_profile_guard(
+        self: &Arc<Self>,
+        table_key: &str,
+        batch: RecordBatch,
+        caller_ordinal: u64,
+        envelope: StreamWriteEnvelope,
+        contributor_id: TrustedContributorId,
+        _profile_guard: &tokio::sync::OwnedRwLockReadGuard<()>,
+    ) -> Result<StreamTokenAdmissionAck> {
         if batch.num_rows() != 1 {
             return Err(OmniError::manifest(format!(
                 "private B2 admission requires exactly one row, got {}",
@@ -3975,6 +4042,42 @@ impl Omnigraph {
             )
             .await?;
         Ok(ack.stream_token.to_string())
+    }
+
+    /// Feature-gated proof seam for the authenticated one-row ingress
+    /// boundary. Wire strings keep private protocol types out of the SDK while
+    /// the boolean pins new durability versus an exact durable retry.
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn failpoint_stream_ingest_one_as_for_test(
+        self: &Arc<Self>,
+        table_key: &str,
+        batch: RecordBatch,
+        caller_ordinal: u64,
+        stream_incarnation_id: &str,
+        write_id: &str,
+        predecessor_token: Option<&str>,
+        actor_id: &str,
+    ) -> Result<(String, bool)> {
+        let predecessor_token = predecessor_token
+            .map(str::parse::<StreamToken>)
+            .transpose()
+            .map_err(|error| OmniError::manifest(error.to_string()))?;
+        let ack = self
+            .stream_ingest_one_as(
+                table_key,
+                batch,
+                caller_ordinal,
+                StreamWriteEnvelope {
+                    stream_incarnation_id: stream_incarnation_id.to_string(),
+                    write_id: write_id.to_string(),
+                    predecessor_token,
+                },
+                actor_id,
+            )
+            .await?;
+        Ok((ack.stream_token.to_string(), ack.already_durable))
     }
 
     /// Return the exact logical stream incarnation for private protocol tests.

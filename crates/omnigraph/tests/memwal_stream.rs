@@ -37,6 +37,7 @@ use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
 use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph_policy::{PolicyChecker, PolicyEngine};
 use serial_test::serial;
 
 use helpers::memwal::{CurrentMemWalInventory, MemWalObjectKind};
@@ -700,6 +701,32 @@ async fn b2_put_score(
     .await
 }
 
+/// Exercise the hidden authenticated one-row ingress boundary while retaining
+/// the same private wire-envelope shape used by the lower B2 tests.
+#[allow(clippy::too_many_arguments)]
+async fn authorized_ingest_score(
+    db: &Arc<Omnigraph>,
+    stream_incarnation_id: &str,
+    logical_id: &str,
+    score: i32,
+    caller_ordinal: u64,
+    write_id: &str,
+    predecessor_token: Option<&str>,
+    actor_id: &str,
+) -> Result<(String, bool), OmniError> {
+    let batch = physical_batch(db, &[(logical_id.to_string(), score)]).await;
+    db.failpoint_stream_ingest_one_as_for_test(
+        TABLE,
+        batch,
+        caller_ordinal,
+        stream_incarnation_id,
+        write_id,
+        predecessor_token,
+        actor_id,
+    )
+    .await
+}
+
 async fn physical_payload_batch(db: &Omnigraph, id: &str, payload_bytes: usize) -> RecordBatch {
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let table = snapshot.open(TABLE).await.unwrap();
@@ -1324,7 +1351,11 @@ async fn quiesce_reuses_a_published_drain_fold_after_receipt_arm_reopen() {
 #[serial]
 async fn empty_quiesce_is_idempotent_and_refuses_rebound_or_stale_requests() {
     let _scenario = FailScenario::setup();
-    let (dir, db) = init_enrolled().await;
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
     let expected_revision = stream_lane(&db).await.lifecycle_revision;
     let drain_id = "92929292-9292-4292-8292-929292929292";
     let actor = "operator:empty-quiesce-test";
@@ -1380,6 +1411,37 @@ async fn empty_quiesce_is_idempotent_and_refuses_rebound_or_stale_requests() {
         "{stale:?}"
     );
     assert_eq!(stream_lane(&db).await, terminal);
+    assert_no_recovery_sidecars(&dir);
+
+    let _must_not_invoke_put =
+        ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+    let batch = physical_batch(&db, &[("after-seal".to_string(), 9)]).await;
+    let sealed = db
+        .failpoint_stream_ingest_one_as_for_test(
+            TABLE,
+            batch,
+            1,
+            &incarnation,
+            "50505050-5050-4050-8050-505050505050",
+            None,
+            "agent:after-seal",
+        )
+        .await
+        .expect_err("ordinary admission must not cross a SEALED lifecycle");
+    let OmniError::Manifest(manifest_error) = sealed else {
+        panic!("expected typed stream lifecycle conflict, got {sealed:?}");
+    };
+    assert!(
+        matches!(
+            manifest_error.details,
+            Some(omnigraph::error::ManifestConflictDetails::StreamLifecycleConflict {
+                ref lifecycle,
+                ..
+            }) if lifecycle == "SEALED"
+        ),
+        "{manifest_error:?}"
+    );
+    assert!(visible_rows(&db).await.is_empty());
     assert_no_recovery_sidecars(&dir);
 }
 
@@ -3103,15 +3165,15 @@ async fn strict_fold_validation_failure_keeps_manifest_old_and_stream_fold_only(
 
 #[tokio::test]
 #[serial]
-async fn b2_happy_fold_exact_retry_and_typed_conflicts_are_effect_free() {
+async fn authorized_ingest_happy_fold_retry_and_conflicts_are_effect_free() {
     let _scenario = FailScenario::setup();
-    let (_dir, db) = init_enrolled().await;
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
     let incarnation = db
         .failpoint_stream_incarnation_for_test(TABLE)
         .await
         .unwrap();
     let first_write = "11111111-1111-4111-8111-111111111111";
-    let token = b2_put_score(
+    let (token, already_durable) = authorized_ingest_score(
         &db,
         &incarnation,
         "same-key",
@@ -3122,11 +3184,12 @@ async fn b2_happy_fold_exact_retry_and_typed_conflicts_are_effect_free() {
         "agent:a",
     )
     .await
-    .expect("one B2 occurrence must cross the complete durability boundary");
+    .expect("one authorized occurrence must cross the complete durability boundary");
+    assert!(!already_durable);
     assert!(visible_rows(&db).await.is_empty());
     db.failpoint_stream_b1_for_test(TABLE, None, 0)
         .await
-        .expect("the attributed occurrence must fold through recovery-v12");
+        .expect("the attributed occurrence must fold through recovery-v14");
     assert_eq!(visible_rows(&db).await, vec![("same-key".to_string(), 1)]);
     let manifest_after_fold = db
         .snapshot_of(ReadTarget::branch("main"))
@@ -3139,7 +3202,7 @@ async fn b2_happy_fold_exact_retry_and_typed_conflicts_are_effect_free() {
     // failure instead of letting an accidental second WAL put pass unnoticed.
     let _must_not_invoke_put = ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
 
-    let retry = b2_put_score(
+    let (retry, retry_was_durable) = authorized_ingest_score(
         &db,
         &incarnation,
         "same-key",
@@ -3152,8 +3215,26 @@ async fn b2_happy_fold_exact_retry_and_typed_conflicts_are_effect_free() {
     .await
     .expect("an exact durable retry must be idempotent without a second put");
     assert_eq!(retry, token);
+    assert!(retry_was_durable);
 
-    let binding_error = b2_put_score(
+    let actor_rebind = authorized_ingest_score(
+        &db,
+        &incarnation,
+        "same-key",
+        1,
+        7,
+        first_write,
+        None,
+        "agent:b",
+    )
+    .await
+    .expect_err("the authenticated actor is part of idempotency identity");
+    assert!(
+        matches!(actor_rebind, OmniError::StreamIdempotencyConflict { .. }),
+        "{actor_rebind:?}"
+    );
+
+    let binding_error = authorized_ingest_score(
         &db,
         "22222222-2222-4222-8222-222222222222",
         "binding-conflict",
@@ -3173,7 +3254,7 @@ async fn b2_happy_fold_exact_retry_and_typed_conflicts_are_effect_free() {
         other => panic!("expected StreamBindingChanged, got {other:?}"),
     }
 
-    let sequence_error = b2_put_score(
+    let sequence_error = authorized_ingest_score(
         &db,
         &incarnation,
         "same-key",
@@ -3197,7 +3278,7 @@ async fn b2_happy_fold_exact_retry_and_typed_conflicts_are_effect_free() {
         other => panic!("expected StreamSequenceConflict, got {other:?}"),
     }
 
-    let idempotency_error = b2_put_score(
+    let idempotency_error = authorized_ingest_score(
         &db,
         &incarnation,
         "same-key",
@@ -3230,6 +3311,98 @@ async fn b2_happy_fold_exact_retry_and_typed_conflicts_are_effect_free() {
         manifest_after_fold,
         "exact retries and typed conflicts must be graph-effect-free"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn authorized_ingest_checks_policy_then_runtime_before_input() {
+    const STREAM_POLICY: &str = r#"
+version: 1
+groups:
+  ingesters: [act-allowed]
+  observers: [act-denied]
+rules:
+  - id: stream-ingesters
+    allow:
+      actors: { group: ingesters }
+      actions: [stream_ingest]
+"#;
+
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled().await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    let policy_path = dir.path().join("stream-policy.yaml");
+    std::fs::write(&policy_path, STREAM_POLICY).unwrap();
+    let policy = PolicyEngine::load_graph(&policy_path, dir.path().to_str().unwrap()).unwrap();
+    let db = match Arc::try_unwrap(db) {
+        Ok(db) => db,
+        Err(_) => panic!("policy fixture must own the sole engine handle"),
+    };
+    let db = Arc::new(db.with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>));
+    let manifest_before_refusals = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+
+    {
+        // Both refusals must happen before row-shape work or any Lance put.
+        let _must_not_invoke_put =
+            ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+        let malformed = physical_batch(
+            &db,
+            &[
+                ("denied-a".to_string(), 1),
+                ("denied-b".to_string(), 2),
+            ],
+        )
+        .await;
+        let denied = db
+            .failpoint_stream_ingest_one_as_for_test(
+                TABLE,
+                malformed.clone(),
+                1,
+                &incarnation,
+                "10101010-1010-4010-8010-101010101010",
+                None,
+                "act-denied",
+            )
+            .await
+            .expect_err("Cedar must reject an actor without stream_ingest");
+        assert!(matches!(denied, OmniError::Policy(_)), "{denied:?}");
+
+        let no_runtime = db
+            .failpoint_stream_ingest_one_as_for_test(
+                TABLE,
+                malformed,
+                2,
+                &incarnation,
+                "20202020-2020-4020-8020-202020202020",
+                None,
+                "act-allowed",
+            )
+            .await
+            .expect_err("an enabled ambient handle is not a serving runtime");
+        assert!(
+            matches!(
+                no_runtime,
+                OmniError::StreamingRequiresClusterRuntime { ref mode } if mode == "ENABLED"
+            ),
+            "{no_runtime:?}"
+        );
+    }
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_before_refusals,
+        "authorization/runtime refusals must be graph-effect-free"
+    );
+    assert_no_recovery_sidecars(&dir);
 }
 
 #[tokio::test]
