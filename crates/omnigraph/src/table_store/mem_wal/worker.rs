@@ -4341,7 +4341,7 @@ impl MemWalWorkerRegistry {
                 let opening = Arc::new(tokio::sync::Notify::new());
                 *slot_state = RegistrySlotState::Opening(Arc::clone(&opening));
                 drop(slot_state);
-                let mut open_task = tokio::spawn(opener());
+                let mut open_task = crate::instrumentation::spawn_with_query_io_probes(opener());
                 let opened = match tokio::time::timeout_at(deadline, &mut open_task).await {
                     Ok(Ok(result)) => result,
                     Ok(Err(error)) => {
