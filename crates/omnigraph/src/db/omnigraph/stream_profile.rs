@@ -344,6 +344,16 @@ impl Omnigraph {
         }
     }
 
+    /// Final checked-runtime preflight for the private same-binding SEALED
+    /// maintenance bridge. It intentionally has the same profile requirement
+    /// as ingestion (exact ENABLED delegation), while operation-specific
+    /// lifecycle checks remain in the maintenance adapter.
+    pub(crate) async fn ensure_streaming_sealed_maintenance_runtime_authorized(
+        &self,
+    ) -> Result<()> {
+        self.ensure_streaming_ingest_runtime_authorized().await
+    }
+
     /// BranchMerge has no token-aware sequencing transition in this profile.
     ///
     /// The profile gate still protects it from a concurrent transition, but a

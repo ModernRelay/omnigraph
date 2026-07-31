@@ -2,12 +2,14 @@
 
 **Type:** implementation plan for in-flight work
 **Status:** slices F0–F1, F2 profile authority, the hidden F2 lifecycle tranche,
-and private F3a resume/abort-drain are implemented. The current development
-strand selects internal schema v13, lifecycle protocol v3, recovery-v14 exact
-enrollment/claim/fold/drain/terminal-receipt owners, and recovery-v15 exact
-`SEALED → OPEN` resume plus guarded `DRAINING → OPEN` abort. Public ingress and
-operator lifecycle verbs, correction/retirement, physical rebind, and
-maintenance integration remain inactive.
+private F3a resume/abort-drain, and the narrow F3b EnsureIndices bridge are
+implemented. The current development strand selects internal schema v14,
+lifecycle protocol v3, recovery-v14 exact
+enrollment/claim/fold/drain/terminal-receipt owners, recovery-v15 exact
+`SEALED → OPEN` resume plus guarded `DRAINING → OPEN` abort, and recovery-v16
+same-binding `SEALED` EnsureIndices. Public ingress and operator lifecycle
+verbs, correction/retirement, Optimize integration, physical rebind, and every
+maintenance transport surface remain inactive.
 **Design authority:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) — this
 file never overrides it. Where they disagree, the RFC wins and this file is
 wrong. §4.7 records the selected experimental profile; §4.3/§4.6 record the
@@ -91,15 +93,19 @@ exist before `WITHDRAWN` becomes reachable, and F5 must extend that path before
 | Lifecycle-v3 fixed-size binding/management/claim chains + authenticated WAL-tail authority | manifest stream/token store | F2 lifecycle |
 | Recovery-v14 exact enrollment, claim, ordinary/drain fold, and lifecycle receipt | manifest recovery | F2 lifecycle |
 | Hidden empty/non-empty quiesce, including claim-before-seal and seal-before-fold restart | engine/worker private seams | F2 lifecycle |
+| Recovery-v15 private `SEALED → OPEN` resume and guarded `DRAINING → OPEN` abort | manifest recovery/engine private seams | F3a |
+| Checked-runtime, main-only `SEALED` EnsureIndices with recovery-v16 proof refresh | table maintenance/manifest recovery private seams | F3b EnsureIndices |
 
-Internal schema is **v12**, profile protocol is **v2**, and lifecycle protocol
+Internal schema is **v14**, profile protocol is **v2**, and lifecycle protocol
 is **v3**. Recovery-v13 remains exactly `StreamProfileChange`: it owns the exact
 `ProfileManagementReceipt` token-ledger transaction, and only its achieved token
 witness plus fixed next profile may reach the terminal manifest CAS.
 Recovery-v14 activates `StreamEnrollmentV2`, `StreamClaim`, `StreamFoldV2`,
-`StreamDrainFold`, and `StreamLifecycleReceipt`; its remaining registered
-families fail closed. Historical recovery-v10 enrollment and recovery-v12
-lifecycle-v2 folds are not reinterpreted.
+`StreamDrainFold`, and `StreamLifecycleReceipt`; recovery-v15 owns private
+resume/abort-drain, and recovery-v16 layers exact `SEALED` lifecycle authority
+over the existing EnsureIndices effect grammar. Recovery-v14's remaining
+registered families still fail closed. Historical recovery-v10 enrollment and
+recovery-v12 lifecycle-v2 folds are not reinterpreted.
 
 The historical v10 bump also added an explicit-null fold-attribution
 dead-letter compatibility placeholder
@@ -141,13 +147,16 @@ writer, one externally enforced live writer process, upsert-only.**
 
 ### 1.3 The honest summary
 
-The private put/fold/claim/quiesce seam is closed and tested; the public
+The private put/fold/claim/quiesce/resume seam is closed and tested; the public
 protocol is not. Profile mutation requires an opaque checked stopped/offline or
 served-runtime owner, and `DISABLING` persists an exact continuation plan. The
 hidden lifecycle core can now drain a non-`SEALED` lane to `SEALED`, but no
 cluster/CLI/HTTP/SDK management path invokes it yet. There is still no
-caller-facing ingest, serial fold scheduler, dead-letter authority, resume or
-abort-drain, correction/retirement, or `SEALED` maintenance/rebind integration.
+caller-facing ingest, serial fold scheduler, dead-letter authority,
+correction/retirement, Optimize bridge, physical rebind, or public lifecycle
+and maintenance integration. A doc-hidden checked-runtime seam can run
+EnsureIndices on productive enrolled tables only while they are exactly
+`SEALED`; ambient EnsureIndices remains fenced.
 
 ---
 
@@ -159,7 +168,9 @@ abort-drain, correction/retirement, or `SEALED` maintenance/rebind integration.
 | ~~F1~~ | Cedar split + read-only status | — | shipped |
 | ~~F2 profile authority~~ | Capability-bound cluster control/runtime delegation, profile protocol v2, resumable `DISABLING`, exact profile receipt recovery | internal v11 + recovery v13 `StreamProfileChange` only; historical ordinary fold remained recovery v12 | shipped |
 | ~~F2 lifecycle tranche~~ | Claim receipts + hidden drain `OPEN→DRAINING→SEALED`, empty and non-empty, with restart continuation | internal v12 + lifecycle v3 + recovery v14 | implemented; public control activation remains closed |
-| **F3** | Resume / abort-drain + safe `SEALED` maintenance bridge + activate `WITHDRAWN` retirement before correction can create it | audit the frozen v14 scaffold; use it only if exact, otherwise take an honest new pre-release strand | after F2 lifecycle |
+| ~~F3a~~ | Private resume / guarded abort-drain | internal v13 + recovery v15 | implemented; public control activation remains closed |
+| ~~F3b EnsureIndices~~ | Checked-runtime, main-only, same-binding `SEALED` EnsureIndices | internal v14 + recovery v16 | implemented; no public maintenance surface |
+| **F3 remainder** | Optimize bridge, physical rebind, and `WITHDRAWN` retirement before correction can create it | finalized shapes only; frozen v14 scaffolds are never reinterpreted | after F3b EnsureIndices |
 | **F4** | Hidden ingest vertical slice + lazy enrollment | audit | after F3 |
 | **F5** | Fold driver + minimal `DEAD_LETTERED` authority, one object, ordinary-ingest correction, and retirement | a new strand after lifecycle activation | after F4 |
 | **F6** | Guardrails + acceptance evidence | — | after F5 |
@@ -173,8 +184,10 @@ serial driver, then terminal authority/object recovery and cluster-only
 inspection/correction.
 Every sub-PR preserves the refusal for behavior it has not integrated.
 
-Two strict export/init/load rebuilds are already implemented:
-v10→v11/v13 profile authority and v11→v12/v14 lifecycle. Each future persisted
+Four strict export/init/load rebuilds are already implemented across these
+control/lifecycle slices: v10→v11/recovery-v13 profile authority,
+v11→v12/recovery-v14 lifecycle, v12→v13/recovery-v15 resume, and
+v13→v14/recovery-v16 SEALED EnsureIndices. Each future persisted
 grammar takes another strand when its final shape differs from a dormant
 scaffold. Dormant discriminator names never authorize reinterpretation of
 their frozen payload. The exact pre-release strand count is recorded as shapes
@@ -700,15 +713,17 @@ writer a sidecar-covered witness/rebind transition.
   activates claim, `StreamEnrollmentV2`, ordinary fold-v2, drain-fold, and
   `StreamLifecycleReceipt`. Its three-field resume scaffold, correction, retirement,
   token-ledger-index maintenance, sealed maintenance, and rebind are registered
-  but fail closed under v14. Current v13/recovery-v15 activates the complete
+  but fail closed under v14. V13/recovery-v15 activates the complete
   crate-private resume/guarded drain-abort owner without reinterpreting that
-  scaffold. Historical recovery-v10 enrollment and recovery-v12
+  scaffold. Current v14/recovery-v16 activates only the distinct checked
+  `SEALED` EnsureIndices shape; the older maintenance scaffold remains frozen,
+  and Optimize/rebind remain inactive. Historical recovery-v10 enrollment and recovery-v12
   lifecycle-v2 base-plus-token fold retain their exact meanings and are refused
   under lifecycle-v3. A later F3 slice must activate retirement before correction
   can create `WITHDRAWN`; F5 must extend that exit before `DEAD_LETTERED`.
 - **Each lifecycle strand requires genuine binary evidence.** The historical
-  v11↔v12 and current v12↔v13
-  old-binary/new-format refusal and export/init/load rebuild test uses the
+  v11↔v12 and v12↔v13 seams plus the current v13↔v14 seam use a genuine
+  old-binary/new-format refusal and export/init/load rebuild test with the
   immutable final predecessor binary, not a stamp rewrite. The fixture is clean,
   disabled, and unenrolled because ordinary export does not transfer stream
   authority.
@@ -821,23 +836,26 @@ Extend existing owners; do not open a new silo.
 
 `SEALED → OPEN` (resume) and `DRAINING → OPEN` (abort-drain), both
 revision-fenced and caller-identified by `resume_id`; plus the missing bridge
-that lets an operator run maintenance without moving a streamed table's HEAD
-behind lifecycle authority. All lifecycle and maintenance entry points remain
-crate-private, doc-hidden physical seams. F7 gives lifecycle plus same-binding
-Optimize/EnsureIndices a server-owned runtime wrapper, and gives
+that lets maintenance move a streamed table's HEAD without bypassing lifecycle
+authority. All lifecycle and maintenance entry points remain crate-private,
+doc-hidden physical seams. The narrow EnsureIndices bridge already requires
+the retained checked serving-runtime authority; F7 exposes it through the
+served policy/API layer. Optimize still needs its own lifecycle-aware recovery
+integration. F7 gives
 cluster-declared schema/rebind work, only after the graph reaches terminal
 profile `DISABLED`, a separate offline
 `CheckedClusterMaintenanceAuthority`; neither becomes an ambient engine
 writer.
 
-**Implemented F3a:** current internal schema v13 and recovery-v15 now cover the
+**Implemented F3a:** internal schema v13 and recovery-v15 cover the
 crate-private `SEALED → OPEN` resume and guarded `DRAINING → OPEN` abort,
 including receipt-first idempotency, the recovery-owned physical claim,
 terminal claim/management receipts, and bounded current-binding ancestry
-validation. Public lifecycle surfaces remain absent. **F3b remains:** the
-same-binding `SEALED` maintenance bridge and fresh physical rebind are separate
-effect shapes and must not be smuggled through resume; items 5 onward below
-remain the next slice.
+validation. Public lifecycle surfaces remain absent. **F3b status:** the first
+same-binding maintenance shape is now implemented for EnsureIndices only.
+Optimize and fresh physical rebind remain separate effect shapes and must not
+be smuggled through either resume or recovery-v16; items 6 onward remain future
+work.
 
 ### 4.2 What must be built
 
@@ -865,7 +883,7 @@ remain the next slice.
    requires: no guarded operation began, binding and the complete current row
    still match, every background seal/abort owner settled, and **no unmerged
    or strict-blocked cut remains**.
-5. **The `SEALED` maintenance bridge (F3b; not yet active).** Keep
+5. **The `SEALED` maintenance bridge (F3b; EnsureIndices slice active).** Keep
    `ensure_stream_effects_allowed` closed by default. Integrate each sanctioned
    writer explicitly:
    - a same-binding HEAD mover extends its existing recovery sidecar with the
@@ -885,8 +903,26 @@ remain the next slice.
    - native branch-ref controls remain the existing exception, but any named
      graph branch keeps resume safely `SEALED`.
 
-   The served same-binding matrix covers only content-preserving Optimize and
-   EnsureIndices. Cluster-declared schema operations—even when they preserve
+   Internal schema v14 and recovery-v16 implement the exact-transaction case
+   for EnsureIndices. Its doc-hidden entry point requires `stream_manage`, an
+   actor, the retained exact `CheckedClusterStreamRuntimeAuthority`, canonical
+   main, and exact `SEALED` state for every enrolled productive table. It takes
+   sorted exclusive admission for every productive table, layers complete
+   prior/next lifecycle rows over the existing recovery-v8 CreateIndex plan,
+   re-proves the selected ClaimReceipt from the captured token authority, and
+   publishes every index pointer, `CurrentHeadWitness`, proof digest, and
+   lifecycle revision in one graph-manifest CAS. The operation creates no
+   token-ledger row, does not advance token authority or a management-receipt
+   chain, and accepts no caller operation ID. Existing recovery ownership plus
+   EnsureIndices' convergent planning supplies retry idempotency: a residual
+   sidecar settles before replanning, and a true no-work invocation records no
+   sidecar, lineage, or lifecycle successor. Ambient/direct EnsureIndices keeps
+   the generic lifecycle refusal.
+
+   The eventual served same-binding matrix covers only content-preserving
+   Optimize and EnsureIndices. Optimize remains inactive until its distinct
+   non-caller-minted maintenance effect is integrated. Cluster-declared schema
+   operations—even when they preserve
    physical row bytes, hidden stream metadata, token semantics, table identity,
    and binding—require the terminal-`DISABLED` offline authority; a
    rematerializing schema operation additionally uses the rebind shape above.
@@ -903,9 +939,10 @@ remain the next slice.
    retention/adoption/rebind proof is implemented; the same-binding bridge
    does not authorize content writes, deletion, or adoption. No generic
    `allow_sealed=true` bypass is permitted. Automatic operation-scoped drain
-   remains Phase D; this slice enables explicit
-   `quiesce → served same-binding maintenance → resume` and the separate
-   disabled offline schema/rebind workflow.
+   remains Phase D. This slice proves the private
+   `quiesce → checked-runtime EnsureIndices → resume` composition; the served
+   surface, Optimize, and the disabled offline schema/rebind workflow remain
+   later slices.
 6. **A representable, non-circular structural-block exit.** Internal v11 makes
    `StrictBlock` a tagged authority:
 
@@ -1088,7 +1125,9 @@ remain the next slice.
   `DisableDrainAdoption` is the sole no-reopen route from an existing
   `OPEN_AFTER_FOLD` drain to the disable plan's `SEALED` target.
 - **`SEALED` is authority, not permission by itself.** A maintenance writer
-  proceeds only through its audited lifecycle-aware recovery shape.
+  proceeds only through its explicit lifecycle-aware recovery shape. The
+  capability-only EnsureIndices bridge records graph lineage and the ordinary
+  recovery audit; it does not invent a token-ledger management receipt.
 
 ### 4.4 Evidence
 
@@ -1105,12 +1144,17 @@ main-only resume advances the epoch and opens.*
 `db/omnigraph.rs::native_branch_controls_refuse_open_stream_and_allow_sealed`
 is the half-built stand-in to extend.
 
-Add one table-driven maintenance matrix covering every writer above: an
-authorized `SEALED` same-binding effect advances the table pointer, both
-witness copies, recomputed empty digest, and lifecycle revision atomically; a
-rematerializing effect remains `SEALED` until its dedicated rebind; destructive
-cleanup/adoption, BranchMerge, Mutation/Load, and every unintegrated writer
-refuse; a crash at each physical/manifest boundary recovers exactly. Include
+The first EnsureIndices evidence pins a productive authorized `SEALED` effect,
+its atomic pointer/witness/proof/revision refresh, true no-work, ambient
+refusal, `quiesce → EnsureIndices → resume`, and cold roll-forward of an exact
+confirmed v16 sidecar. Recovery-v8's existing matrix continues to own the
+underlying CreateIndex physical boundaries and compensation classifier. When
+that classifier restores a table, v16 recovery derives an exact new `SEALED`
+successor for the Restore HEAD; it never republishes the stale pre-effect HEAD
+as current authority. F3b-specific mixed ordinary/enrolled pins,
+OPEN/DRAINING, named-branch, stale-proof, mismatched-runtime, and remaining
+crash-boundary cells are still evidence requirements, not claims of this
+slice. The later matrix must also cover Optimize and rebind, including
 `quiesce → optimize → resume`,
 `disable to terminal DISABLED → schema change → rebind (still SEALED) →
 enable → server restart → explicit resume`, old-binding receipt retention plus
@@ -1126,7 +1170,9 @@ effect. Include an existing blocked `OPEN_AFTER_FOLD` drain, lost adoption
 response, correction that preserves the override, and final `SEALED`.
 
 The production ownership matrix is part of the proof: same-binding
-Optimize/EnsureIndices run in the serving process under its runtime capability.
+EnsureIndices already requires the serving process's retained runtime
+capability, while Optimize still lacks its lifecycle-aware adapter. F7 exposes
+both only after the latter exists.
 Cluster-declared schema/rebind does **not** rely on an operator-timed
 quiesce/shutdown gap. The operator stops the server and runs the ordinary
 offline disable apply to terminal `DISABLED`; its durable plan captures and
@@ -1211,8 +1257,9 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
 
    This is not a public transport or product surface: SDK, HTTP, CLI, API DTO,
    and OpenAPI ingress remain absent. F3a now supplies the separate private
-   resume/abort owner and bounded current-binding ancestry validation; physical
-   rebind and its maintenance authority remain F3b work. Consequently this
+   resume/abort owner and bounded current-binding ancestry validation. The
+   checked-runtime EnsureIndices bridge is active, while Optimize and physical
+   rebind remain F3 work. Consequently this
    hidden tranche still does not make the formal F4 product milestone complete.
 3. **Lazy enrollment with a prepare handshake** (§4.7 P2) — every table is
    stream-eligible only while the profile is exactly `ENABLED`, but the wire
@@ -1800,12 +1847,14 @@ its operation ID and expected `lifecycle_revision`, with receipt-first replay;
 profile apply instead binds the expected profile revision.
 Root-wide authority retirement binds `(graph identity, AUTHORITY_RETIREMENT,
 retirement_id)`, the expected profile revision, and exact plan digest.
-Graph-wide Optimize/EnsureIndices is the multi-table exception: its request
-binds the caller operation ID, exact graph head and accepted-catalog digest,
-and the canonical sorted compare set of
-`{table_identity, lifecycle_revision}`. Its recovery/management receipt retains
-that request digest and terminal graph-manifest result, so a lost-response
-retry cannot discover a newer table set or retarget a later revision.
+Graph-wide Optimize/EnsureIndices is the multi-table exception to the
+single-lane occurrence grammar. These naturally convergent maintenance calls
+carry no caller operation ID and create no lifecycle management receipt. Their
+checked served entry point authorizes one fresh plan; exact recovery settles
+any armed plan before a retry replans against current graph/catalog/lifecycle
+authority. A no-work retry is therefore a true no-op rather than a replayed
+terminal receipt. EnsureIndices already implements that engine boundary;
+Optimize must match it before F7 exposes either route.
 Prepare and ingest use `stream_ingest`; lifecycle and fold use
 `stream_manage`. Cluster-only block correction, authority repair, and
 retirement require their exact offline checked authority plus
@@ -1856,12 +1905,13 @@ gate. The artifact may initialize only a fresh target through the normal
 cluster workflow; it is never loaded back over the enrolled source.
 
 The operator workflow is intentionally split by owner. A same-binding
-Optimize/EnsureIndices request stays in the serving process, requires every
-affected lane already be exactly `SEALED`, and otherwise returns a typed
-quiesce-required refusal. After the operator explicitly quiesces them, the
-runtime executes the lifecycle-aware writer while holding the required sorted
-exclusive leases. A cluster schema/configuration, path, native-ref, or rebind
-change uses `graceful server shutdown → offline disable to terminal DISABLED →
+EnsureIndices request stays in the serving process, requires every affected
+lane already be exactly `SEALED`, and otherwise returns a typed lifecycle
+refusal. After the operator explicitly quiesces them, the runtime executes the
+lifecycle-aware writer while holding the required sorted exclusive leases.
+Optimize joins this workflow only after its separate recovery integration. A
+cluster schema/configuration, path, native-ref, or rebind change uses
+`graceful server shutdown → offline disable to terminal DISABLED →
 cluster apply --confirm-stream-offline → separate enable apply → server
 restart → explicit resume`. Disable, not an operator-timed quiesce, closes the
 last-ingress race and drains every operation that won before shutdown. The

@@ -1968,10 +1968,7 @@ fn stream_lifecycle_for_person(
             protocol_version: stream::QUIESCE_REQUEST_PROTOCOL_VERSION,
             graph_identity_digest: format!("sha256:{}", "b".repeat(64)),
             identity: entry.identity,
-            stream_incarnation_id: entry
-                .enrollment_receipt
-                .stream_incarnation_id
-                .clone(),
+            stream_incarnation_id: entry.enrollment_receipt.stream_incarnation_id.clone(),
             binding_scope_id: entry.binding_scope_id.clone(),
             enrollment_id: binding.enrollment_id.clone(),
             drain_id: drain_id.clone(),
@@ -2456,7 +2453,7 @@ async fn test_init_stamps_internal_schema_version() {
     ManifestCoordinator::init(uri, &catalog).await.unwrap();
 
     let ds = open_manifest_dataset(uri, None).await.unwrap();
-    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 13);
+    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 14);
     assert_eq!(
         super::migrations::read_stamp(&ds),
         super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,

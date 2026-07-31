@@ -419,7 +419,12 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// one restartable physical claim, the exact terminal ClaimReceipt plus
 /// ManagementReceipt transaction, and the sole SEALED/DRAINING → OPEN
 /// manifest publication.
-pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 15;
+///
+/// v15 → v16: RFC-026 F3b same-binding SEALED EnsureIndices. V16 wraps the
+/// frozen recovery-v8 exact CreateIndex plan with the complete prior SEALED
+/// authority and exact terminal lifecycle successors. V9 and v14 wire
+/// meanings remain unchanged.
+pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 16;
 
 /// The only recovery generation emitted by the manifest-v5 write paths.
 pub(crate) const IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION: u32 = 9;
@@ -444,6 +449,12 @@ pub(crate) const STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION: u32 = 14;
 
 /// Exact resume/abort-drain claim and terminal lifecycle generation.
 pub(crate) const STREAM_RESUME_SIDECAR_SCHEMA_VERSION: u32 = 15;
+
+/// Exact same-binding SEALED maintenance generation. This capability contract
+/// covers only the existing EnsureIndices physical plan and deliberately has
+/// no caller operation-id or new receipt family. F7 transport reuses this
+/// recovery contract under checked serving-runtime authority.
+pub(crate) const STREAM_SEALED_MAINTENANCE_SIDECAR_SCHEMA_VERSION: u32 = 16;
 
 /// Schema v11 is the first sidecar allowed to describe data-bearing MemWAL
 /// state, which is bound to stream-config v2 rather than Phase A's config-v1.
@@ -1791,6 +1802,36 @@ impl RecoveryProtocolV15 {
     }
 }
 
+/// Lifecycle authority added around the already-exact recovery-v8
+/// EnsureIndices effect plan.  `protocol_v8` on the same sidecar remains the
+/// sole owner of table transactions, lineage, and compensation.  Keeping this
+/// overlay small lets both paths share one physical classifier without
+/// reinterpreting recovery-v8 or the frozen v14 scaffold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamSealedMaintenanceV16 {
+    pub profile: super::StreamProfileEntry,
+    pub token_authority: super::StreamTokenAuthorityEntry,
+    pub prior_lifecycles: Vec<super::StreamLifecycleEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_lifecycles: Option<Vec<super::StreamLifecycleEntry>>,
+    /// Exact SEALED successors for enrolled tables whose owned index effect
+    /// was compensated by a Lance Restore. Restore appends a new physical HEAD,
+    /// so rollback must publish the refreshed proof with that pointer rather
+    /// than leave lifecycle authority at the pre-effect witness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_lifecycles: Option<Vec<super::StreamLifecycleEntry>>,
+}
+
+/// V16 is intentionally a one-operation envelope. Optimize has no stable
+/// caller-minted Lance transaction today and must not be smuggled through the
+/// exact CreateIndex classifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", deny_unknown_fields)]
+pub(crate) enum RecoveryProtocolV16 {
+    StreamSealedEnsureIndices(RecoveryStreamSealedMaintenanceV16),
+}
+
 /// Schema-v6 EnsureIndices rollback identity retained for compatibility.
 /// Recovery must still be able to prove that a previously published
 /// compensation was a rollback rather than infer the outcome from aligned
@@ -1884,6 +1925,10 @@ pub(crate) struct RecoverySidecar {
     /// Exact RFC-026 resume/abort-drain payload (schema v15 only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v15: Option<Box<RecoveryProtocolV15>>,
+    /// Exact RFC-026 same-binding SEALED EnsureIndices overlay (schema v16
+    /// only). The exact physical CreateIndex plan remains in `protocol_v8`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_v16: Option<Box<RecoveryProtocolV16>>,
     /// EnsureIndices-only fixed rollback identity. It does not make the
     /// physical index effects exact; it only makes compensation retry-safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2381,6 +2426,14 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             STREAM_RESUME_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
         )));
     }
+    if sidecar.protocol_v16.is_some()
+        && sidecar.schema_version != STREAM_SEALED_MAINTENANCE_SIDECAR_SCHEMA_VERSION
+    {
+        return Err(malformed(format!(
+            "protocol_v16 requires schema-v{}, found schema-v{}",
+            STREAM_SEALED_MAINTENANCE_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
+        )));
+    }
 
     if sidecar.schema_version < EXACT_EFFECT_IDENTITY_SCHEMA_VERSION {
         if sidecar.protocol_v3.is_some()
@@ -2393,6 +2446,7 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             || sidecar.protocol_v13.is_some()
             || sidecar.protocol_v14.is_some()
             || sidecar.protocol_v15.is_some()
+            || sidecar.protocol_v16.is_some()
         {
             return Err(malformed(
                 "an exact-effect protocol is present on a pre-v3 sidecar".to_string(),
@@ -2423,6 +2477,10 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
 
     if sidecar.schema_version == STREAM_RESUME_SIDECAR_SCHEMA_VERSION {
         return validate_stream_protocol_v15_shape(sidecar_uri, sidecar);
+    }
+
+    if sidecar.schema_version == STREAM_SEALED_MAINTENANCE_SIDECAR_SCHEMA_VERSION {
+        return validate_stream_protocol_v16_shape(sidecar_uri, sidecar);
     }
 
     if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
@@ -6070,6 +6128,244 @@ fn validate_stream_protocol_v15_shape(sidecar_uri: &str, sidecar: &RecoverySidec
             validate_stream_resume_v15_shape(&malformed, sidecar, protocol)
         }
     }
+}
+
+fn validate_stream_protocol_v16_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+    if sidecar.branch.is_some()
+        || sidecar.writer_kind != SidecarKind::StreamSealedMaintenance
+        || sidecar.protocol_v3.is_some()
+        || sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v10.is_some()
+        || sidecar.protocol_v11.is_some()
+        || sidecar.protocol_v12.is_some()
+        || sidecar.protocol_v13.is_some()
+        || sidecar.protocol_v14.is_some()
+        || sidecar.protocol_v15.is_some()
+        || sidecar.ensure_indices_rollback_v6.is_some()
+        || sidecar.merge_source_commit_id.is_some()
+        || !sidecar.additional_registrations.is_empty()
+        || !sidecar.tombstones.is_empty()
+        || sidecar.schema_apply_manifest_published
+        || sidecar.schema_apply_target_schema_ir_hash.is_some()
+    {
+        return Err(malformed(
+            "schema-v16 SEALED EnsureIndices must target canonical main and carry only protocol_v8 plus protocol_v16 authority"
+                .to_string(),
+        ));
+    }
+    let overlay = sidecar
+        .protocol_v16
+        .as_deref()
+        .ok_or_else(|| malformed("missing required protocol_v16 payload".to_string()))?;
+    let RecoveryProtocolV16::StreamSealedEnsureIndices(overlay) = overlay;
+
+    // Reuse the complete, frozen v8 physical grammar by validating a projected
+    // v9 sidecar. V16 adds authority around that grammar; it does not widen it.
+    let mut projected = sidecar.clone();
+    projected.schema_version = IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION;
+    projected.writer_kind = SidecarKind::EnsureIndices;
+    projected.protocol_v16 = None;
+    validate_ensure_indices_v8_shape(sidecar_uri, &projected)?;
+    let physical = sidecar
+        .protocol_v8
+        .as_ref()
+        .expect("projected v8 shape requires protocol_v8");
+    if physical.authority.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
+        || physical.lineage.branch.is_some()
+        || sidecar.actor_id.is_none()
+        || physical.lineage.actor_id != sidecar.actor_id
+        || sidecar.tables.iter().any(|pin| pin.table_branch.is_some())
+        || physical
+            .effects
+            .iter()
+            .any(RecoveryEnsureIndicesEffect::is_first_touch)
+    {
+        return Err(malformed(
+            "schema-v16 SEALED EnsureIndices requires authenticated canonical-main authority and existing main refs"
+                .to_string(),
+        ));
+    }
+    overlay
+        .profile
+        .validate()
+        .map_err(|error| malformed(error.to_string()))?;
+    if !overlay.profile.streaming_enabled() {
+        return Err(malformed(
+            "schema-v16 SEALED EnsureIndices requires an ENABLED stream profile".to_string(),
+        ));
+    }
+    overlay
+        .token_authority
+        .validate()
+        .map_err(|error| malformed(error.to_string()))?;
+
+    let pin_ids = sidecar
+        .tables
+        .iter()
+        .map(|pin| pin.identity)
+        .collect::<HashSet<_>>();
+    let prior_ids = overlay
+        .prior_lifecycles
+        .iter()
+        .map(|entry| entry.identity)
+        .collect::<Vec<_>>();
+    if prior_ids.is_empty()
+        || prior_ids.windows(2).any(|pair| pair[0] >= pair[1])
+        || prior_ids.iter().any(|identity| !pin_ids.contains(identity))
+    {
+        return Err(malformed(
+            "schema-v16 prior SEALED lifecycle rows must be a non-empty strictly sorted subset of productive table pins"
+                .to_string(),
+        ));
+    }
+    for prior in &overlay.prior_lifecycles {
+        prior
+            .validate()
+            .map_err(|error| malformed(error.to_string()))?;
+        let pin = sidecar
+            .tables
+            .iter()
+            .find(|pin| pin.identity == prior.identity)
+            .expect("prior lifecycle subset checked above");
+        if prior.lifecycle != super::StreamLifecycle::Sealed
+            || prior.current_head_witness.table_version != pin.expected_version
+        {
+            return Err(malformed(
+                "schema-v16 prior lifecycle must be SEALED at the exact table pin".to_string(),
+            ));
+        }
+    }
+
+    match (physical.effect_phase, overlay.next_lifecycles.as_ref()) {
+        (RecoveryEffectPhase::Armed, None) => {}
+        (RecoveryEffectPhase::EffectsConfirmed, Some(next))
+            if next.len() == overlay.prior_lifecycles.len() =>
+        {
+            for (prior, next) in overlay.prior_lifecycles.iter().zip(next) {
+                next.validate_successor_of(prior)
+                    .map_err(|error| malformed(error.to_string()))?;
+                let confirmed = physical
+                    .intended_delta
+                    .table_updates
+                    .iter()
+                    .find(|slot| slot.identity == prior.identity)
+                    .and_then(|slot| slot.confirmed.as_ref())
+                    .ok_or_else(|| {
+                        malformed(
+                            "confirmed SEALED lifecycle has no confirmed table output".to_string(),
+                        )
+                    })?;
+                let effect = physical
+                    .effects
+                    .iter()
+                    .find(|effect| effect.identity == prior.identity)
+                    .expect("validated v8 effects match table pins");
+                let mut normalized = next.clone();
+                normalized.lifecycle_revision = prior.lifecycle_revision;
+                normalized.current_head_witness = prior.current_head_witness.clone();
+                let normalized_proof = normalized.sealed_proof.as_mut().ok_or_else(|| {
+                    malformed("confirmed SEALED lifecycle lost its empty proof".to_string())
+                })?;
+                let prior_proof = prior.sealed_proof.as_ref().expect("validated SEALED proof");
+                normalized_proof.base_current_head_witness =
+                    prior_proof.base_current_head_witness.clone();
+                normalized_proof.verified_empty_digest = prior_proof.verified_empty_digest.clone();
+                if next.lifecycle != super::StreamLifecycle::Sealed
+                    || next.current_head_witness.table_version != confirmed.table_version
+                    || next.current_head_witness.branch_identifier
+                        != lance::dataset::refs::BranchIdentifier::main()
+                    || next.current_head_witness.transaction_uuid != effect.planned_transaction.uuid
+                    || normalized != *prior
+                {
+                    return Err(malformed(
+                        "schema-v16 successor changes authority outside revision, exact confirmed base HEAD, and recomputed empty proof"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(malformed(
+                "schema-v16 lifecycle confirmation must be absent while Armed and complete when EffectsConfirmed"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let rollback_ids = physical
+        .rollback_audit_outcomes
+        .as_ref()
+        .map(|outcomes| {
+            overlay
+                .prior_lifecycles
+                .iter()
+                .filter(|prior| {
+                    let pin = sidecar
+                        .tables
+                        .iter()
+                        .find(|pin| pin.identity == prior.identity)
+                        .expect("prior lifecycle subset checked above");
+                    outcomes
+                        .iter()
+                        .any(|outcome| outcome.table_key == pin.table_key)
+                })
+                .map(|prior| prior.identity)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(rollback) = overlay.rollback_lifecycles.as_ref() {
+        let rollback_successor_ids = rollback
+            .iter()
+            .map(|entry| entry.identity)
+            .collect::<Vec<_>>();
+        if physical.rollback_audit_outcomes.is_none() || rollback_successor_ids != rollback_ids {
+            return Err(malformed(
+                "schema-v16 rollback lifecycle successors must exactly cover enrolled compensated table effects"
+                    .to_string(),
+            ));
+        }
+        for next in rollback {
+            let prior = overlay
+                .prior_lifecycles
+                .iter()
+                .find(|prior| prior.identity == next.identity)
+                .expect("rollback successor identities checked above");
+            next.validate_successor_of(prior)
+                .map_err(|error| malformed(error.to_string()))?;
+            let mut normalized = next.clone();
+            normalized.lifecycle_revision = prior.lifecycle_revision;
+            normalized.current_head_witness = prior.current_head_witness.clone();
+            let normalized_proof = normalized.sealed_proof.as_mut().ok_or_else(|| {
+                malformed("rollback SEALED lifecycle lost its empty proof".to_string())
+            })?;
+            let prior_proof = prior.sealed_proof.as_ref().expect("validated SEALED proof");
+            normalized_proof.base_current_head_witness =
+                prior_proof.base_current_head_witness.clone();
+            normalized_proof.verified_empty_digest = prior_proof.verified_empty_digest.clone();
+            if next.lifecycle != super::StreamLifecycle::Sealed
+                || next.current_head_witness.branch_identifier
+                    != lance::dataset::refs::BranchIdentifier::main()
+                || next.current_head_witness.table_version
+                    <= prior.current_head_witness.table_version
+                || next.current_head_witness.transaction_uuid
+                    == prior.current_head_witness.transaction_uuid
+                || normalized != *prior
+            {
+                return Err(malformed(
+                    "schema-v16 rollback successor changes authority outside revision, restored base HEAD, and recomputed empty proof"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_stream_fold_attribution_summary<F>(
@@ -13272,6 +13568,9 @@ async fn process_sidecar(
     if sidecar.schema_version == STREAM_RESUME_SIDECAR_SCHEMA_VERSION {
         return process_stream_resume_sidecar_v15(root_uri, storage, snapshot, sidecar).await;
     }
+    if sidecar.schema_version == STREAM_SEALED_MAINTENANCE_SIDECAR_SCHEMA_VERSION {
+        return process_ensure_indices_sidecar_v8(root_uri, storage, snapshot, sidecar, mode).await;
+    }
     if sidecar.schema_version == STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION {
         return match sidecar
             .protocol_v14
@@ -14086,6 +14385,198 @@ impl BranchMergeMultiCommitProof {
     }
 }
 
+fn stream_sealed_maintenance_v16(
+    sidecar: &RecoverySidecar,
+) -> Option<&RecoveryStreamSealedMaintenanceV16> {
+    match sidecar.protocol_v16.as_deref() {
+        Some(RecoveryProtocolV16::StreamSealedEnsureIndices(protocol)) => Some(protocol),
+        None => None,
+    }
+}
+
+fn validate_stream_sealed_maintenance_prior_v16(
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    let Some(overlay) = stream_sealed_maintenance_v16(sidecar) else {
+        return Ok(());
+    };
+    if snapshot.stream_profile() != &overlay.profile
+        || snapshot.stream_token_authority() != &overlay.token_authority
+    {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "SEALED EnsureIndices profile or selected token authority changed before publication",
+        ));
+    }
+    for pin in &sidecar.tables {
+        let recorded = overlay
+            .prior_lifecycles
+            .iter()
+            .find(|entry| entry.identity == pin.identity);
+        if snapshot.stream_lifecycle(pin.identity) != recorded {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                format!(
+                    "SEALED EnsureIndices lifecycle authority changed for table '{}'",
+                    pin.table_key
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn rebuild_stream_sealed_maintenance_successors_v16(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+    priors: &[super::StreamLifecycleEntry],
+) -> Result<Vec<super::StreamLifecycleEntry>> {
+    let overlay = stream_sealed_maintenance_v16(sidecar).ok_or_else(|| {
+        OmniError::manifest_internal(
+            "SEALED EnsureIndices successor rebuild requires protocol_v16 authority",
+        )
+    })?;
+    let token_dataset = super::token_store::open_stream_token_authority_at(
+        root_uri,
+        &overlay.token_authority,
+        &crate::lance_access::control_session(),
+    )
+    .await?;
+    let mut rebuilt = Vec::with_capacity(priors.len());
+    for prior in priors {
+        let pin = sidecar
+            .tables
+            .iter()
+            .find(|pin| pin.identity == prior.identity)
+            .expect("validated v16 lifecycle rows are a subset of table pins");
+        let table_dataset = crate::instrumentation::open_dataset(
+            &pin.table_path,
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::table_wrapper(),
+        )
+        .await?;
+        let observed_head = capture_current_head_witness(&table_dataset)
+            .await
+            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+        let record_id = prior.current_claim_receipt_id.as_deref().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "SEALED EnsureIndices prior lifecycle has no selected ClaimReceipt",
+            )
+        })?;
+        let record = super::token_store::lookup_lifecycle_ledger_record_by_id(
+            &token_dataset,
+            &overlay.token_authority,
+            super::stream::CLAIM_RECEIPT_TAG,
+            record_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            OmniError::manifest_internal(
+                "SEALED EnsureIndices selected ClaimReceipt is absent from token authority",
+            )
+        })?;
+        let super::token_store::LifecycleLedgerRecord::ClaimReceipt(receipt) = record else {
+            return Err(OmniError::manifest_internal(
+                "SEALED EnsureIndices selected ClaimReceipt ID decoded another ledger family",
+            ));
+        };
+        rebuilt.push(crate::db::build_sealed_maintenance_successor(
+            prior,
+            &receipt,
+            observed_head,
+        )?);
+    }
+    Ok(rebuilt)
+}
+
+async fn validate_stream_sealed_maintenance_terminal_v16(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    let Some(overlay) = stream_sealed_maintenance_v16(sidecar) else {
+        return Ok(());
+    };
+    let next = overlay.next_lifecycles.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "confirmed SEALED EnsureIndices sidecar has no lifecycle successors",
+        )
+    })?;
+    let rebuilt = rebuild_stream_sealed_maintenance_successors_v16(
+        root_uri,
+        sidecar,
+        &overlay.prior_lifecycles,
+    )
+    .await?;
+    if &rebuilt != next {
+        return Err(OmniError::manifest_internal(
+            "SEALED EnsureIndices lifecycle successors differ from their exact physical/receipt rebuild",
+        ));
+    }
+    Ok(())
+}
+
+/// Bind the exact post-Restore SEALED successors before the rollback manifest
+/// CAS. A retry after any subset of Restore commits deterministically rebuilds
+/// the same rows from the selected ClaimReceipts and current physical HEADs.
+async fn bind_stream_sealed_maintenance_rollback_v16(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+) -> Result<RecoverySidecar> {
+    let Some(overlay) = stream_sealed_maintenance_v16(sidecar) else {
+        return Ok(sidecar.clone());
+    };
+    let rollback_priors = overlay
+        .prior_lifecycles
+        .iter()
+        .filter(|prior| {
+            let state = sidecar
+                .tables
+                .iter()
+                .position(|pin| pin.identity == prior.identity)
+                .and_then(|index| states.get(index))
+                .expect("validated prior lifecycle has one classified table pin");
+            matches!(
+                state.effect_ownership,
+                EffectOwnership::OwnAtHead | EffectOwnership::OwnCompensatedAtHead
+            ) && table_requires_rollback_effect(state)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let rebuilt =
+        rebuild_stream_sealed_maintenance_successors_v16(root_uri, sidecar, &rollback_priors)
+            .await?;
+    if let Some(recorded) = overlay.rollback_lifecycles.as_ref() {
+        if recorded != &rebuilt {
+            return Err(OmniError::manifest_internal(
+                "SEALED EnsureIndices rollback successors differ from their exact physical/receipt rebuild",
+            ));
+        }
+        return Ok(sidecar.clone());
+    }
+
+    let mut prepared = sidecar.clone();
+    let Some(RecoveryProtocolV16::StreamSealedEnsureIndices(overlay)) =
+        prepared.protocol_v16.as_deref_mut()
+    else {
+        unreachable!("caller checked protocol_v16 SEALED EnsureIndices authority");
+    };
+    overlay.rollback_lifecycles = Some(rebuilt);
+    let uri = sidecar_uri(root_uri, &prepared.operation_id);
+    validate_sidecar_shape(&uri, &prepared)?;
+    let json = serde_json::to_string_pretty(&prepared).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize SEALED EnsureIndices rollback successors for sidecar '{}': {error}",
+            prepared.operation_id
+        ))
+    })?;
+    storage.write_text(&uri, &json).await?;
+    Ok(prepared)
+}
+
 /// Prove ownership of a BranchMerge multi-commit effect from Lance's durable
 /// transaction history. Numeric version movement is only a scan bound: each
 /// logical data commit must match its pre-minted identity at its exact output
@@ -14218,6 +14709,7 @@ async fn process_ensure_indices_sidecar_v8(
     if let Some(outcome) = detect_visible_v8_outcome(root_uri, sidecar).await? {
         return finalize_visible_v8_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
     }
+    validate_stream_sealed_maintenance_prior_v16(snapshot, sidecar)?;
     let protocol = sidecar
         .protocol_v8
         .as_ref()
@@ -14467,6 +14959,8 @@ async fn process_ensure_indices_sidecar_v8(
         return Ok(true);
     }
 
+    validate_stream_sealed_maintenance_terminal_v16(root_uri, sidecar).await?;
+
     roll_forward_ensure_indices_v8(root_uri, storage, sidecar, mode).await
 }
 
@@ -14495,7 +14989,8 @@ async fn roll_back_ensure_indices_v8(
     // Persist the original observations before deleting a first-touch ref or
     // restoring an existing one. Re-entry after either physical action reuses
     // this exact operator-facing outcome set.
-    let prepared = prepare_fixed_rollback_audit_plan(root_uri, storage, sidecar, states).await?;
+    let mut prepared =
+        prepare_fixed_rollback_audit_plan(root_uri, storage, sidecar, states).await?;
     let protocol = prepared
         .protocol_v8
         .as_ref()
@@ -14671,6 +15166,30 @@ async fn roll_back_ensure_indices_v8(
     }
 
     let rollback_outcomes = protocol.rollback_audit_outcomes.clone().unwrap_or_default();
+    prepared =
+        bind_stream_sealed_maintenance_rollback_v16(root_uri, storage, &prepared, states).await?;
+    if let Some(overlay) = stream_sealed_maintenance_v16(&prepared) {
+        let rollback = overlay.rollback_lifecycles.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "SEALED EnsureIndices rollback has no exact lifecycle successors",
+            )
+        })?;
+        for next in rollback {
+            let prior = overlay
+                .prior_lifecycles
+                .iter()
+                .find(|prior| prior.identity == next.identity)
+                .expect("validated rollback successor has one prior lifecycle");
+            changes.push(ManifestChange::SetStreamLifecycle {
+                expected: Some(prior.clone()),
+                next: next.clone(),
+            });
+        }
+        changes.push(ManifestChange::SetStreamProfile {
+            expected: overlay.profile.clone(),
+            next: overlay.profile.clone(),
+        });
+    }
     let (_manifest_version, graph_commit_id) = publish_recovery_commit(
         root_uri,
         &prepared,
@@ -14734,6 +15253,30 @@ async fn roll_forward_ensure_indices_v8(
             table_key: slot.table_key.clone(),
             from_version: slot.expected_version,
             to_version: confirmed.table_version,
+        });
+    }
+    if let Some(overlay) = stream_sealed_maintenance_v16(sidecar) {
+        let next = overlay.next_lifecycles.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "confirmed SEALED EnsureIndices recovery has no lifecycle successors",
+            )
+        })?;
+        updates.extend(
+            overlay
+                .prior_lifecycles
+                .iter()
+                .cloned()
+                .zip(next.iter().cloned())
+                .map(|(expected, next)| ManifestChange::SetStreamLifecycle {
+                    expected: Some(expected),
+                    next,
+                }),
+        );
+        // Exact read assertion: this maintenance plan is valid only for the
+        // ENABLED profile it captured, but it does not mutate profile state.
+        updates.push(ManifestChange::SetStreamProfile {
+            expected: overlay.profile.clone(),
+            next: overlay.profile.clone(),
         });
     }
     crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
@@ -16812,9 +17355,48 @@ async fn detect_visible_v8_outcome(
     let original_commit = commits
         .iter()
         .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id);
-    let rollback_visible = commits
+    let rollback_commit = commits
         .iter()
-        .any(|commit| commit.graph_commit_id == protocol.rollback_graph_commit_id);
+        .find(|commit| commit.graph_commit_id == protocol.rollback_graph_commit_id);
+    let rollback_visible = if let Some(commit) = rollback_commit {
+        if let Some(overlay) = stream_sealed_maintenance_v16(sidecar) {
+            let rollback = overlay.rollback_lifecycles.as_ref().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "SEALED EnsureIndices sidecar '{}' has visible rollback commit '{}' but no exact rollback lifecycle successors",
+                    sidecar.operation_id, protocol.rollback_graph_commit_id
+                ))
+            })?;
+            let committed_snapshot = ManifestCoordinator::snapshot_at(
+                root_uri,
+                sidecar.branch.as_deref(),
+                commit.manifest_version,
+            )
+            .await?;
+            let stream_authority_matches = committed_snapshot.stream_profile() == &overlay.profile
+                && committed_snapshot.stream_token_authority() == &overlay.token_authority
+                && sidecar.tables.iter().all(|pin| {
+                    let expected = rollback
+                        .iter()
+                        .find(|entry| entry.identity == pin.identity)
+                        .or_else(|| {
+                            overlay
+                                .prior_lifecycles
+                                .iter()
+                                .find(|entry| entry.identity == pin.identity)
+                        });
+                    committed_snapshot.stream_lifecycle(pin.identity) == expected
+                });
+            if !stream_authority_matches {
+                return Err(OmniError::manifest_internal(format!(
+                    "SEALED EnsureIndices sidecar '{}' found rollback commit '{}' but its exact lifecycle authority differs",
+                    sidecar.operation_id, protocol.rollback_graph_commit_id
+                )));
+            }
+        }
+        true
+    } else {
+        false
+    };
     let original_visible = if let Some(commit) = original_commit {
         let expected_branch = protocol
             .lineage
@@ -16854,7 +17436,18 @@ async fn detect_visible_v8_outcome(
                     && entry.version_metadata == confirmed.version_metadata
             })
         });
-        if !delta_matches {
+        let stream_authority_matches =
+            stream_sealed_maintenance_v16(sidecar).is_none_or(|overlay| {
+                overlay.next_lifecycles.as_ref().is_some_and(|next| {
+                    committed_snapshot.stream_profile() == &overlay.profile
+                        && committed_snapshot.stream_token_authority() == &overlay.token_authority
+                        && sidecar.tables.iter().all(|pin| {
+                            let expected = next.iter().find(|entry| entry.identity == pin.identity);
+                            committed_snapshot.stream_lifecycle(pin.identity) == expected
+                        })
+                })
+            });
+        if !delta_matches || !stream_authority_matches {
             return Err(OmniError::manifest_internal(format!(
                 "EnsureIndices recovery sidecar '{}' found original commit id '{}' but its exact manifest delta differs",
                 sidecar.operation_id, protocol.lineage.graph_commit_id
@@ -17817,6 +18410,7 @@ fn new_unvalidated_sidecar(
 
         protocol_v14: None,
         protocol_v15: None,
+        protocol_v16: None,
         ensure_indices_rollback_v6: None,
     }
 }
@@ -19645,9 +20239,49 @@ pub(crate) fn new_ensure_indices_sidecar_v9(
 
         protocol_v14: None,
         protocol_v15: None,
+        protocol_v16: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-ensure-indices-v9-sidecar>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Arm the checked-runtime, canonical-main SEALED EnsureIndices bridge. The
+/// physical plan is exactly recovery-v8; v16 adds only the manifest authority
+/// that must move with those table pointers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new_stream_sealed_ensure_indices_sidecar_v16(
+    actor_id: String,
+    tables: Vec<SidecarTablePin>,
+    authority: RecoveryAuthorityToken,
+    lineage: RecoveryLineageIntent,
+    planned_transactions: HashMap<TableIdentity, StagedTransactionIdentity>,
+    profile: super::StreamProfileEntry,
+    token_authority: super::StreamTokenAuthorityEntry,
+    mut prior_lifecycles: Vec<super::StreamLifecycleEntry>,
+) -> Result<RecoverySidecar> {
+    prior_lifecycles.sort_by_key(|entry| entry.identity);
+    let mut sidecar = new_ensure_indices_sidecar_v9(
+        None,
+        Some(actor_id),
+        tables,
+        authority,
+        lineage,
+        planned_transactions,
+        HashMap::new(),
+    )?;
+    sidecar.schema_version = STREAM_SEALED_MAINTENANCE_SIDECAR_SCHEMA_VERSION;
+    sidecar.writer_kind = SidecarKind::StreamSealedMaintenance;
+    sidecar.protocol_v16 = Some(Box::new(RecoveryProtocolV16::StreamSealedEnsureIndices(
+        RecoveryStreamSealedMaintenanceV16 {
+            profile,
+            token_authority,
+            prior_lifecycles,
+            next_lifecycles: None,
+            rollback_lifecycles: None,
+        },
+    )));
+    validate_sidecar_shape("<new-stream-sealed-ensure-indices-v16-sidecar>", &sidecar)?;
     Ok(sidecar)
 }
 
@@ -19661,6 +20295,49 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v9(
     updates: &[SubTableUpdate],
     committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
     confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
+) -> Result<()> {
+    confirm_ensure_indices_sidecar(
+        root_uri,
+        storage,
+        sidecar,
+        updates,
+        committed_transactions,
+        confirmed_ref_identifiers,
+        None,
+    )
+    .await
+}
+
+/// Confirm every exact CreateIndex output together with the complete SEALED
+/// lifecycle successors that the terminal graph CAS may select.
+pub(crate) async fn confirm_stream_sealed_ensure_indices_sidecar_v16(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    updates: &[SubTableUpdate],
+    committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
+    next_lifecycles: Vec<super::StreamLifecycleEntry>,
+) -> Result<()> {
+    confirm_ensure_indices_sidecar(
+        root_uri,
+        storage,
+        sidecar,
+        updates,
+        committed_transactions,
+        &HashMap::new(),
+        Some(next_lifecycles),
+    )
+    .await
+}
+
+async fn confirm_ensure_indices_sidecar(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    updates: &[SubTableUpdate],
+    committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
+    confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
+    next_lifecycles: Option<Vec<super::StreamLifecycleEntry>>,
 ) -> Result<()> {
     crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
@@ -19796,6 +20473,20 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v9(
         pin.confirmed_version = Some(update.table_version);
     }
     confirmed_protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+    if let Some(next_lifecycles) = next_lifecycles {
+        let Some(RecoveryProtocolV16::StreamSealedEnsureIndices(overlay)) =
+            confirmed.protocol_v16.as_deref_mut()
+        else {
+            return Err(OmniError::manifest_internal(
+                "SEALED EnsureIndices confirmation requires protocol_v16 authority",
+            ));
+        };
+        overlay.next_lifecycles = Some(next_lifecycles);
+    } else if confirmed.protocol_v16.is_some() {
+        return Err(OmniError::manifest_internal(
+            "protocol_v16 SEALED EnsureIndices confirmation requires lifecycle successors",
+        ));
+    }
     validate_sidecar_shape(&uri, &confirmed)?;
     let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
         OmniError::manifest_internal(format!(
@@ -19906,6 +20597,7 @@ pub(crate) fn new_occ_sidecar_v9(
 
         protocol_v14: None,
         protocol_v15: None,
+        protocol_v16: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-occ-sidecar>", &sidecar)?;
@@ -20097,6 +20789,7 @@ pub(crate) fn new_schema_apply_sidecar_v9(
 
         protocol_v14: None,
         protocol_v15: None,
+        protocol_v16: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-schema-apply-v9-sidecar>", &sidecar)?;
@@ -20269,6 +20962,7 @@ pub(crate) fn new_branch_merge_sidecar_v9(
 
         protocol_v14: None,
         protocol_v15: None,
+        protocol_v16: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-branch-merge-sidecar>", &sidecar)?;
@@ -20514,6 +21208,7 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::manifest::CurrentHeadWitness;
     use crate::storage::ObjectStorageAdapter;
     use crate::storage_layer::IndexBuildSpec;
     use crate::table_store::TableStore;
@@ -24112,6 +24807,259 @@ mod tests {
         )
         .expect_err("schema-v2 must not opt into schema-v6 rollback semantics");
         assert!(error.to_string().contains("requires schema-v6"));
+    }
+
+    fn stream_sealed_ensure_indices_sidecar_v16_fixture()
+    -> (RecoverySidecar, super::super::stream::ClaimReceipt) {
+        let quiesce = stream_quiesce_lifecycle_receipt_sidecar_v14();
+        let terminal = stream_lifecycle_receipt_protocol(&quiesce);
+        let prior = terminal.next_lifecycle.clone();
+        let current_claim_receipt = terminal.current_claim_receipt.clone().unwrap();
+        let expected_version = prior.current_head_witness.table_version;
+        let identity = prior.identity;
+        let pin = SidecarTablePin {
+            identity,
+            table_key: prior.diagnostic_table_key.clone(),
+            table_path: format!("memory://test-graph/{}", prior.binding.table_location),
+            expected_version,
+            post_commit_pin: expected_version + 1,
+            confirmed_version: None,
+            table_branch: None,
+        };
+        let sidecar = new_stream_sealed_ensure_indices_sidecar_v16(
+            "act-maintenance".to_string(),
+            vec![pin],
+            RecoveryAuthorityToken {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                graph_head: Some("01H000000000000000000000E0".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
+                schema_ir_hash: "schema-hash".to_string(),
+                schema_identity_version: 1,
+            },
+            RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000E1".to_string(),
+                branch: None,
+                actor_id: Some("act-maintenance".to_string()),
+                merged_parent_commit_id: None,
+                created_at: 812,
+            },
+            HashMap::from([(
+                identity,
+                transaction(expected_version, "34343434-3434-4434-8434-343434343434"),
+            )]),
+            terminal.profile.clone(),
+            terminal.receipt.prior_authority.clone(),
+            vec![prior],
+        )
+        .unwrap();
+        (sidecar, current_claim_receipt)
+    }
+
+    fn confirm_stream_sealed_ensure_indices_shape_v16(
+        sidecar: &mut RecoverySidecar,
+        current_claim_receipt: &super::super::stream::ClaimReceipt,
+        next_head: CurrentHeadWitness,
+    ) -> super::super::stream::StreamLifecycleEntry {
+        let overlay = stream_sealed_maintenance_v16(sidecar).unwrap();
+        let prior = overlay.prior_lifecycles[0].clone();
+        let next =
+            crate::db::build_sealed_maintenance_successor(&prior, current_claim_receipt, next_head)
+                .unwrap();
+        let identity = prior.identity;
+        let protocol = sidecar.protocol_v8.as_mut().unwrap();
+        let effect = protocol
+            .effects
+            .iter_mut()
+            .find(|effect| effect.identity == identity)
+            .unwrap();
+        effect.confirmed_transaction = Some(effect.planned_transaction.clone());
+        let slot = protocol
+            .intended_delta
+            .table_updates
+            .iter_mut()
+            .find(|slot| slot.identity == identity)
+            .unwrap();
+        slot.confirmed = Some(RecoveryConfirmedTableUpdate {
+            table_version: next.current_head_witness.table_version,
+            table_branch: None,
+            row_count: 1,
+            version_metadata: test_version_metadata(),
+        });
+        protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+        sidecar
+            .tables
+            .iter_mut()
+            .find(|pin| pin.identity == identity)
+            .unwrap()
+            .confirmed_version = Some(next.current_head_witness.table_version);
+        let Some(RecoveryProtocolV16::StreamSealedEnsureIndices(overlay)) =
+            sidecar.protocol_v16.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        overlay.next_lifecycles = Some(vec![next.clone()]);
+        validate_sidecar_shape("<confirmed-stream-sealed-indices-v16>", sidecar).unwrap();
+        next
+    }
+
+    #[test]
+    fn stream_sealed_ensure_indices_v16_pins_schema_phase_and_exact_head_grammar() {
+        let (armed, current_claim_receipt) = stream_sealed_ensure_indices_sidecar_v16_fixture();
+        assert_eq!(
+            armed.schema_version,
+            STREAM_SEALED_MAINTENANCE_SIDECAR_SCHEMA_VERSION
+        );
+        let encoded = serde_json::to_string(&armed).unwrap();
+        parse_sidecar("<stream-sealed-indices-v16>", &encoded).unwrap();
+
+        let mut wrong_schema = armed.clone();
+        wrong_schema.schema_version = IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION;
+        assert!(
+            validate_sidecar_shape("<v16-overlay-on-v9>", &wrong_schema)
+                .unwrap_err()
+                .to_string()
+                .contains("protocol_v16 requires schema-v16")
+        );
+
+        let mut empty_prior = armed.clone();
+        let Some(RecoveryProtocolV16::StreamSealedEnsureIndices(overlay)) =
+            empty_prior.protocol_v16.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        overlay.prior_lifecycles.clear();
+        assert!(
+            validate_sidecar_shape("<v16-empty-prior>", &empty_prior)
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty strictly sorted subset")
+        );
+
+        let mut premature = armed.clone();
+        let Some(RecoveryProtocolV16::StreamSealedEnsureIndices(overlay)) =
+            premature.protocol_v16.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        overlay.next_lifecycles = Some(Vec::new());
+        assert!(
+            validate_sidecar_shape("<v16-premature-terminal>", &premature)
+                .unwrap_err()
+                .to_string()
+                .contains("absent while Armed")
+        );
+
+        let planned = armed.protocol_v8.as_ref().unwrap().effects[0]
+            .planned_transaction
+            .clone();
+        let mut confirmed = armed;
+        confirm_stream_sealed_ensure_indices_shape_v16(
+            &mut confirmed,
+            &current_claim_receipt,
+            CurrentHeadWitness {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                table_version: planned.read_version + 1,
+                transaction_uuid: planned.uuid,
+                manifest_e_tag: Some("maintenance-etag".to_string()),
+            },
+        );
+
+        let mut missing_terminal = confirmed.clone();
+        let Some(RecoveryProtocolV16::StreamSealedEnsureIndices(overlay)) =
+            missing_terminal.protocol_v16.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        overlay.next_lifecycles = None;
+        assert!(
+            validate_sidecar_shape("<v16-missing-terminal>", &missing_terminal)
+                .unwrap_err()
+                .to_string()
+                .contains("complete when EffectsConfirmed")
+        );
+
+        let mut foreign_uuid = confirmed;
+        let Some(RecoveryProtocolV16::StreamSealedEnsureIndices(overlay)) =
+            foreign_uuid.protocol_v16.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        let next = &mut overlay.next_lifecycles.as_mut().unwrap()[0];
+        next.current_head_witness.transaction_uuid =
+            "56565656-5656-4656-8656-565656565656".to_string();
+        let proof = next.sealed_proof.as_mut().unwrap();
+        proof.base_current_head_witness = next.current_head_witness.clone();
+        proof.verified_empty_digest = format!("sha256:{}", "f".repeat(64));
+        next.validate().unwrap();
+        assert!(
+            validate_sidecar_shape("<v16-foreign-terminal-uuid>", &foreign_uuid)
+                .unwrap_err()
+                .to_string()
+                .contains("exact confirmed base HEAD")
+        );
+    }
+
+    #[test]
+    fn stream_sealed_ensure_indices_v16_represents_confirmed_authority_rollback() {
+        let (mut sidecar, current_claim_receipt) =
+            stream_sealed_ensure_indices_sidecar_v16_fixture();
+        let planned = sidecar.protocol_v8.as_ref().unwrap().effects[0]
+            .planned_transaction
+            .clone();
+        confirm_stream_sealed_ensure_indices_shape_v16(
+            &mut sidecar,
+            &current_claim_receipt,
+            CurrentHeadWitness {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                table_version: planned.read_version + 1,
+                transaction_uuid: planned.uuid,
+                manifest_e_tag: None,
+            },
+        );
+        let prior = stream_sealed_maintenance_v16(&sidecar)
+            .unwrap()
+            .prior_lifecycles[0]
+            .clone();
+        sidecar
+            .protocol_v8
+            .as_mut()
+            .unwrap()
+            .rollback_audit_outcomes = Some(vec![TableOutcome {
+            table_key: sidecar.tables[0].table_key.clone(),
+            from_version: sidecar.tables[0].post_commit_pin,
+            to_version: sidecar.tables[0].expected_version,
+        }]);
+        let rollback = crate::db::build_sealed_maintenance_successor(
+            &prior,
+            &current_claim_receipt,
+            CurrentHeadWitness {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                table_version: sidecar.tables[0].post_commit_pin + 1,
+                transaction_uuid: "78787878-7878-4878-8878-787878787878".to_string(),
+                manifest_e_tag: prior.current_head_witness.manifest_e_tag.clone(),
+            },
+        )
+        .unwrap();
+        let Some(RecoveryProtocolV16::StreamSealedEnsureIndices(overlay)) =
+            sidecar.protocol_v16.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        overlay.rollback_lifecycles = Some(vec![rollback]);
+        validate_sidecar_shape("<v16-confirmed-authority-rollback>", &sidecar).unwrap();
+
+        let Some(RecoveryProtocolV16::StreamSealedEnsureIndices(overlay)) =
+            sidecar.protocol_v16.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        overlay.rollback_lifecycles = Some(Vec::new());
+        assert!(
+            validate_sidecar_shape("<v16-incomplete-authority-rollback>", &sidecar)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly cover enrolled compensated")
+        );
     }
 
     #[test]

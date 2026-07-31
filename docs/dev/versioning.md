@@ -126,9 +126,7 @@ historical. It did not encode the complete prior lifecycle/profile/topology,
 the physical claim attempt, or the two terminal receipt families required to
 recover resume safely, so v13 does not reinterpret it.
 
-Internal schema **v13 is the currently served format** (unreleased, current
-0.10.0-dev source builds; a later private control-plane strand may supersede it
-before release). It preserves lifecycle-v3
+Internal schema v13 was an unreleased 0.10.0-dev format. It preserves lifecycle-v3
 and raises the recovery-sidecar ceiling to v15. Recovery-v15 has one active
 hidden discriminator, `StreamResume`, which owns the complete revision-fenced
 `SEALED → OPEN` resume or guarded `DRAINING → OPEN` abort: exact request and
@@ -136,21 +134,34 @@ actor, prior authority, a restartable physical higher-epoch claim, terminal
 `ClaimReceipt` plus `ManagementReceipt`, and the sole final `OPEN` publication.
 Receipt lookup precedes revision refusal for idempotent retry. The v14
 resume/correction/retirement/ledger-maintenance/sealed-maintenance/rebind
-scaffolds retain their old bytes and continue to fail closed. Physical rebind
-and the `SEALED` maintenance bridge need distinct finalized recovery shapes and
-remain inactive.
+scaffolds retain their old bytes and continue to fail closed.
+
+Internal schema **v14 is the currently served format** (unreleased, current
+0.10.0-dev source builds; a later private control-plane strand may supersede it
+before release). It raises the sidecar ceiling to recovery-v16 for one active
+hidden discriminator, `StreamSealedEnsureIndices`. V16 reuses the frozen
+recovery-v8 exact CreateIndex plan and layers the enabled profile, selected
+token-authority witness, and complete sorted prior/next `SEALED` lifecycle rows
+around it. The table pointer, both HEAD witnesses, recomputed empty proof, and
+lifecycle revision publish atomically. This capability-only operation writes
+no token row, advances no receipt chain, and accepts no caller operation ID;
+recovery settlement followed by convergent EnsureIndices replanning supplies
+retry idempotency. Ambient EnsureIndices remains refused for enrolled tables;
+Optimize, physical rebind, and public maintenance surfaces remain inactive.
+Recovery-v14's sealed-maintenance
+scaffold keeps its original bytes and is not reinterpreted.
 
 Recovery-v13 remains exactly the v11 profile-change protocol. Historical
 recovery-v10 enrollment and recovery-v12 lifecycle-v2 folds retain their old
 wire meanings and are refused under lifecycle-v3 rather than synthesized.
 There is still no public firehose ingress, public production enrollment,
-quiesce, resume/abort, correction/retirement, maintenance bridge, rebind, or
-streaming transport surface. The v15 path remains crate-private and
+quiesce, resume/abort, correction/retirement, Optimize/rebind, or streaming or
+maintenance transport surface. The v15 and v16 paths remain crate-private and
 feature-gated.
 
-A v12 graph crosses by export/init/load rebuild into a different root. Because
-`MIN_SUPPORTED == CURRENT == 13`, v13 refuses v12 and a v12 binary refuses
-v13. The genuine v11↔v12 fence remains historical evidence.
+A v13 graph crosses by export/init/load rebuild into a different root. Because
+`MIN_SUPPORTED == CURRENT == 14`, v14 refuses v13 and a v13 binary refuses
+v14. The genuine v12↔v13 fence remains historical evidence.
 
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,
