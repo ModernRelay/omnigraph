@@ -770,13 +770,36 @@ async fn authorized_ingest_score(
         "score": score,
     }))
     .unwrap();
-    db.failpoint_stream_ingest_one_as_for_test(
-        TABLE,
-        &raw_json,
-        caller_ordinal,
-        actor_id,
-    )
+    db.failpoint_stream_ingest_one_as_for_test(TABLE, &raw_json, caller_ordinal, actor_id)
     .await
+}
+
+fn ndjson_score_line(
+    stream_incarnation_id: &str,
+    logical_id: &str,
+    score: i32,
+    write_id: &str,
+    predecessor_token: Option<&str>,
+) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "$stream": {
+            "stream_incarnation_id": stream_incarnation_id,
+            "write_id": write_id,
+            "predecessor_token": predecessor_token,
+        },
+        "id": logical_id,
+        "score": score,
+    }))
+    .unwrap();
+    line.push(b'\n');
+    line
+}
+
+fn parse_ndjson_outcomes(outcomes: Vec<String>) -> Vec<serde_json::Value> {
+    outcomes
+        .into_iter()
+        .map(|outcome| serde_json::from_str(&outcome).expect("outcome must be valid JSON"))
+        .collect()
 }
 
 async fn prepare_stream_ingest(
@@ -3773,6 +3796,443 @@ rules:
         "authorization/runtime refusals must be graph-effect-free"
     );
     assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn ndjson_fragmented_distinct_rows_share_one_physical_attempt_and_fold_in_order() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+
+    let body = [
+        ndjson_score_line(
+            &incarnation,
+            "ndjson-a",
+            11,
+            "60606060-6060-4060-8060-606060606061",
+            None,
+        ),
+        ndjson_score_line(
+            &incarnation,
+            "ndjson-b",
+            12,
+            "60606060-6060-4060-8060-606060606062",
+            None,
+        ),
+        ndjson_score_line(
+            &incarnation,
+            "ndjson-c",
+            13,
+            "60606060-6060-4060-8060-606060606063",
+            None,
+        ),
+    ]
+    .concat();
+    let first_cut = 17;
+    let second_cut = body.len() - 9;
+    let outcomes = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_ndjson_as_for_test(
+            TABLE,
+            vec![
+                body[..first_cut].to_vec(),
+                body[first_cut..second_cut].to_vec(),
+                body[second_cut..].to_vec(),
+            ],
+            "agent:ndjson-batch",
+        )
+        .await
+        .expect("fragmented NDJSON must admit one distinct-key physical run"),
+    );
+
+    assert_eq!(outcomes.len(), 3);
+    for (ordinal, outcome) in outcomes.iter().enumerate() {
+        assert_eq!(outcome["ordinal"], ordinal as u64);
+        assert_eq!(outcome["status"], "durable");
+        assert!(outcome["stream_token"].as_str().is_some());
+        assert_eq!(
+            outcome["unconfirmed_candidate_token"],
+            serde_json::Value::Null
+        );
+        assert_eq!(outcome["origin"]["kind"], "admission");
+        assert_eq!(
+            outcome["origin"]["admission_attempt_id"],
+            outcome["admission_attempt_id"]
+        );
+        assert!(outcome["enrollment_id"].as_str().is_some());
+        assert!(outcome["shard_id"].as_str().is_some());
+        assert!(
+            outcome["writer_epoch"]
+                .as_u64()
+                .is_some_and(|epoch| epoch > 0)
+        );
+        assert_eq!(outcome["terminal_correction"], serde_json::Value::Null);
+    }
+    let attempts = outcomes
+        .iter()
+        .map(|outcome| {
+            outcome["admission_attempt_id"]
+                .as_str()
+                .expect("durable result carries its physical attempt id")
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "all three rows must share one physical Lance invocation"
+    );
+    assert!(
+        visible_rows(&db).await.is_empty(),
+        "stream durability remains invisible until fold publication"
+    );
+
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the multi-row physical run must fold through the existing path");
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![
+            ("ndjson-a".to_string(), 11),
+            ("ndjson-b".to_string(), 12),
+            ("ndjson-c".to_string(), 13),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn ndjson_cold_replay_refusal_reports_the_achieved_claim_epoch() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let replay = physical_batch(&db, &[("cold-replay-source".to_string(), 17)]).await;
+    let retired =
+        helpers::failpoint::Rendezvous::park_first(names::STREAM_B1_AFTER_RETIREMENT_RELEASE);
+
+    let error = {
+        let _after_invoke =
+            ScopedFailPoint::new(names::STREAM_B1_AFTER_PUT_INVOKE_BEFORE_WATCHER, "return");
+        db.failpoint_stream_b1_for_test(TABLE, Some(replay), 0)
+            .await
+            .expect_err("the seed invocation must become acknowledgement-ambiguous")
+    };
+    assert!(matches!(error, OmniError::AckUnknown { .. }), "{error:?}");
+    retired.wait_until_reached().await;
+    retired.release();
+
+    let epoch_before_replay_claim = epoch_floor(&stream_lane(&db).await);
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    let outcomes = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_ndjson_as_for_test(
+            TABLE,
+            vec![ndjson_score_line(
+                &incarnation,
+                "must-wait-for-replay-fold",
+                18,
+                "67676767-6767-4767-8767-676767676761",
+                None,
+            )],
+            "agent:ndjson-cold-replay",
+        )
+        .await
+        .expect("cold replay refusal is an ordered per-line result"),
+    );
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["status"], "stream_fold_required");
+    let reported_epoch = outcomes[0]["writer_epoch"]
+        .as_u64()
+        .expect("a post-claim refusal must carry current writer authority");
+    let achieved_epoch = epoch_floor(&stream_lane(&db).await);
+    assert!(
+        achieved_epoch > epoch_before_replay_claim,
+        "cold replay classification must first publish a successor writer claim"
+    );
+    assert_eq!(
+        reported_epoch, achieved_epoch,
+        "the refusal must not report the pre-claim writer epoch"
+    );
+    assert!(outcomes[0]["enrollment_id"].as_str().is_some());
+    assert!(outcomes[0]["shard_id"].as_str().is_some());
+    assert!(visible_rows(&db).await.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn ndjson_invalid_lines_and_token_boundaries_preserve_caller_order() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    let actor = "agent:ndjson-boundaries";
+    let existing_write = "61616161-6161-4161-8161-616161616161";
+    let (existing_token, already_durable) = authorized_ingest_score(
+        &db,
+        &incarnation,
+        "ndjson-existing",
+        21,
+        90,
+        existing_write,
+        None,
+        actor,
+    )
+    .await
+    .expect("seed one current token");
+    assert!(!already_durable);
+
+    let body = [
+        ndjson_score_line(
+            &incarnation,
+            "ndjson-before-invalid",
+            22,
+            "62626262-6262-4262-8262-626262626261",
+            None,
+        ),
+        b"{\n".to_vec(),
+        ndjson_score_line(
+            &incarnation,
+            "ndjson-after-invalid",
+            23,
+            "62626262-6262-4262-8262-626262626262",
+            None,
+        ),
+        ndjson_score_line(&incarnation, "ndjson-existing", 21, existing_write, None),
+        ndjson_score_line(
+            &incarnation,
+            "ndjson-existing",
+            24,
+            "62626262-6262-4262-8262-626262626264",
+            None,
+        ),
+        ndjson_score_line(&incarnation, "ndjson-existing", 99, existing_write, None),
+    ]
+    .concat();
+    let outcomes = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_ndjson_as_for_test(TABLE, vec![body], actor)
+            .await
+            .expect("line-local failures and token boundaries are request outcomes"),
+    );
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome["status"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "durable",
+            "invalid",
+            "durable",
+            "already_durable",
+            "stream_sequence_conflict",
+            "stream_idempotency_conflict",
+        ]
+    );
+    for (ordinal, outcome) in outcomes.iter().enumerate() {
+        assert_eq!(outcome["ordinal"], ordinal as u64);
+    }
+    assert_eq!(outcomes[3]["stream_token"], existing_token);
+    assert_eq!(outcomes[3]["origin"]["kind"], "admission");
+    assert_eq!(outcomes[4]["current_token"], existing_token);
+    assert_eq!(outcomes[5]["current_token"], existing_token);
+    for outcome in &outcomes[3..] {
+        assert!(outcome["enrollment_id"].as_str().is_some());
+        assert!(outcome["shard_id"].as_str().is_some());
+        assert!(
+            outcome["writer_epoch"]
+                .as_u64()
+                .is_some_and(|epoch| epoch > 0)
+        );
+    }
+    assert_ne!(
+        outcomes[0]["admission_attempt_id"], outcomes[2]["admission_attempt_id"],
+        "an invalid line must close the preceding physical run"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn ndjson_ack_unknown_stops_admission_but_local_invalidity_still_wins() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    let body = [
+        ndjson_score_line(
+            &incarnation,
+            "ndjson-ambiguous",
+            31,
+            "63636363-6363-4363-8363-636363636361",
+            None,
+        ),
+        b"{\n".to_vec(),
+        ndjson_score_line(
+            &incarnation,
+            "ndjson-uninvoked-tail",
+            32,
+            "63636363-6363-4363-8363-636363636362",
+            None,
+        ),
+    ]
+    .concat();
+
+    let outcomes = {
+        let _after_durable = ScopedFailPoint::new(names::STREAM_B1_AFTER_WATCHER_SUCCESS, "return");
+        parse_ndjson_outcomes(
+            db.failpoint_stream_ingest_ndjson_as_for_test(
+                TABLE,
+                vec![body],
+                "agent:ndjson-ambiguous",
+            )
+            .await
+            .expect("AckUnknown is an ordered per-line result, not a request error"),
+        )
+    };
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome["status"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["ack_unknown", "invalid", "stream_retry_required"]
+    );
+    assert!(
+        outcomes[0]["unconfirmed_candidate_token"]
+            .as_str()
+            .is_some()
+    );
+    assert_eq!(outcomes[0]["stream_token"], serde_json::Value::Null);
+    assert_eq!(outcomes[1]["blocking_ordinal"], serde_json::Value::Null);
+    assert_eq!(outcomes[2]["blocking_ordinal"], 0);
+    assert_eq!(outcomes[2]["blocking_status"], "ack_unknown");
+    assert_eq!(
+        outcomes[2]["blocking_admission_attempt_id"],
+        outcomes[0]["admission_attempt_id"]
+    );
+    assert!(outcomes[0]["enrollment_id"].as_str().is_some());
+    assert!(outcomes[0]["shard_id"].as_str().is_some());
+    assert!(
+        outcomes[0]["writer_epoch"]
+            .as_u64()
+            .is_some_and(|epoch| epoch > 0)
+    );
+    assert_eq!(
+        outcomes[2]["blocking_enrollment_id"],
+        outcomes[0]["enrollment_id"]
+    );
+    assert_eq!(outcomes[2]["blocking_shard_id"], outcomes[0]["shard_id"]);
+    assert_eq!(
+        outcomes[2]["blocking_writer_epoch"],
+        outcomes[0]["writer_epoch"]
+    );
+    assert_eq!(
+        outcomes[2]["stream_token"],
+        serde_json::Value::Null,
+        "an uninvoked tail must not inherit a confirmed token"
+    );
+    assert_eq!(
+        outcomes[2]["unconfirmed_candidate_token"],
+        serde_json::Value::Null,
+        "an uninvoked tail must not inherit another occurrence's candidate"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn ndjson_disconnect_before_body_poll_never_invokes_a_physical_put() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    let before_put = helpers::failpoint::Rendezvous::park_first(names::STREAM_B1_BEFORE_PUT_INVOKE);
+
+    db.failpoint_stream_ingest_ndjson_cancel_for_test(
+        TABLE,
+        vec![ndjson_score_line(
+            &incarnation,
+            "ndjson-cancelled",
+            41,
+            "64646464-6464-4464-8464-646464646461",
+            None,
+        )],
+        "agent:ndjson-cancelled",
+    )
+    .await
+    .expect("closing the result consumer must join the request task");
+
+    assert!(
+        !before_put.reached(),
+        "disconnect must win before the request task polls or invokes the body"
+    );
+    before_put.release();
+    assert!(visible_rows(&db).await.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn ndjson_intrinsic_token_oversize_outranks_ack_unknown_blocker() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    // The normalized/stored row remains below the 32-MiB generation bound,
+    // while the exact authority projection repeats this key in its canonical
+    // recovery payload and therefore cannot fit an empty legal token plan.
+    let oversized_id = "x".repeat(17 * 1024 * 1024);
+    let body = [
+        ndjson_score_line(
+            &incarnation,
+            "ndjson-ambiguous-before-oversize",
+            51,
+            "65656565-6565-4565-8565-656565656561",
+            None,
+        ),
+        ndjson_score_line(
+            &incarnation,
+            &oversized_id,
+            52,
+            "65656565-6565-4565-8565-656565656562",
+            None,
+        ),
+    ]
+    .concat();
+
+    let outcomes = {
+        let _after_durable = ScopedFailPoint::new(names::STREAM_B1_AFTER_WATCHER_SUCCESS, "return");
+        parse_ndjson_outcomes(
+            db.failpoint_stream_ingest_ndjson_as_for_test(
+                TABLE,
+                vec![body],
+                "agent:ndjson-oversize",
+            )
+            .await
+            .expect("intrinsic oversize is a line result after AckUnknown"),
+        )
+    };
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome["status"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["ack_unknown", "stream_input_too_large"]
+    );
+    assert_eq!(outcomes[1]["blocking_ordinal"], serde_json::Value::Null);
+    assert!(
+        outcomes[1]["actual"].as_u64().unwrap() > outcomes[1]["limit"].as_u64().unwrap(),
+        "the terminal result must report the exact violated empty-plan bound"
+    );
 }
 
 #[tokio::test]

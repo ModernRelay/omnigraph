@@ -352,11 +352,32 @@ pub(crate) type ConfirmedStreamTokenOverlay = BTreeMap<String, ConfirmedStreamTo
 /// admission lease after completing the caller's fresh authority check.
 pub(crate) struct CheckedStreamAuthority {
     _guard: OwnedRwLockReadGuard<()>,
+    _profile_guard: Option<OwnedRwLockReadGuard<()>>,
 }
 
 impl CheckedStreamAuthority {
     pub(crate) fn from_shared_admission(guard: OwnedRwLockReadGuard<()>) -> Self {
-        Self { _guard: guard }
+        Self {
+            _guard: guard,
+            _profile_guard: None,
+        }
+    }
+
+    /// Carry graph-profile authority into the detached append tail together
+    /// with the table admission lease.
+    ///
+    /// Production stream admission acquires profile-shared before the table
+    /// lease. Keeping both guards in this opaque token prevents a cancelled
+    /// request from releasing profile authority while Lance's put watcher or
+    /// same-writer fence check is still settling.
+    pub(crate) fn from_shared_admission_with_profile(
+        guard: OwnedRwLockReadGuard<()>,
+        profile_guard: OwnedRwLockReadGuard<()>,
+    ) -> Self {
+        Self {
+            _guard: guard,
+            _profile_guard: Some(profile_guard),
+        }
     }
 }
 
@@ -1757,6 +1778,7 @@ impl MemWalWorker {
             table_incarnation_id: self.key.identity.table_incarnation_id,
             enrollment_id: self.key.enrollment_id.to_string(),
             shard_id: self.key.shard_id.to_string(),
+            writer_epoch: self.writer.epoch(),
             caller_ordinal_start: ordinals.start,
             caller_ordinal_end: ordinals.end,
             admission_attempt_id: None,

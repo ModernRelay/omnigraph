@@ -265,6 +265,7 @@ pub enum OmniError {
         table_incarnation_id: u64,
         enrollment_id: String,
         shard_id: String,
+        writer_epoch: u64,
         caller_ordinal_start: u64,
         caller_ordinal_end: u64,
         /// B2-only server-minted physical invocation identity. B1's private

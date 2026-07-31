@@ -250,6 +250,10 @@ write_surfaces! {
         "failpoint_stream_ingest_one_as_for_test",
         "failpoint_stream_quiesce_for_test",
     ],
+    "db/omnigraph/stream_ndjson.rs" => WriteProtocol::TestOnly => [
+        "failpoint_stream_ingest_ndjson_as_for_test",
+        "failpoint_stream_ingest_ndjson_cancel_for_test",
+    ],
     "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],
     "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],
     "db/omnigraph/stream_profile.rs" => WriteProtocol::Composed("control-plane-required refusal") => ["set_streaming_enabled_as"],
