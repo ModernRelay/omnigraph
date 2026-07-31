@@ -31,6 +31,8 @@ pub(crate) const CLAIM_RECEIPT_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const QUIESCE_REQUEST_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const STREAM_RESUME_REQUEST_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const STREAM_RESUME_OPERATION_KIND: &str = "RESUME";
+pub(crate) const STREAM_REBIND_REQUEST_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const STREAM_REBIND_OPERATION_KIND: &str = "REBIND";
 pub(crate) const STREAM_DATA_BLOCK_VALIDATION_CONTRACT_VERSION: u32 = 1;
 
 pub(crate) const ENROLLMENT_RECEIPT_V2_TAG: &str = "STREAM_ENROLLMENT_RECEIPT_V2";
@@ -68,8 +70,11 @@ const CLAIM_RECEIPT_LOOKUP_DOMAIN: &[u8] = b"omnigraph.stream-claim-receipt-look
 const CLAIM_RECEIPT_RECORD_DOMAIN: &[u8] = b"omnigraph.stream-claim-receipt-record.v1\0";
 const RECEIPT_CHAIN_STEP_DOMAIN: &[u8] = b"omnigraph.stream-receipt-chain-step.v1\0";
 const BINDING_RECEIPT_DIGEST_DOMAIN: &[u8] = b"omnigraph.stream-binding-receipt-result.v1\0";
+const RETAINED_SHARD_SET_DIGEST_DOMAIN: &[u8] =
+    b"omnigraph.stream-retained-shard-set.v1\0";
 const STRICT_DATA_BLOCK_TOKEN_DOMAIN: &[u8] = b"omnigraph.stream-data-block-token.v1\0";
 const MAX_RECEIPT_JSON_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_SELECTED_BINDING_CHAIN_RECORDS: u64 = 1_024;
 const STRICT_DATA_BLOCK_MAX_KEYS: u64 = 8_192;
 const STRICT_DATA_BLOCK_MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -100,7 +105,7 @@ impl StreamPhysicalBinding {
         TableIdentity::new(self.stable_table_id, self.table_incarnation_id)
     }
 
-    fn validate(&self, expected_identity: TableIdentity) -> Result<()> {
+    pub(crate) fn validate(&self, expected_identity: TableIdentity) -> Result<()> {
         let embedded_identity = self.identity()?;
         if embedded_identity != expected_identity {
             return Err(OmniError::manifest_internal(format!(
@@ -186,7 +191,7 @@ pub(crate) struct CurrentHeadWitness {
 }
 
 impl CurrentHeadWitness {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.branch_identifier != BranchIdentifier::main() {
             return Err(OmniError::manifest_internal(
                 "internal schema v9 stream HEAD witness must name the main branch",
@@ -366,9 +371,24 @@ pub(crate) struct BindingReceipt {
     pub(crate) enrollment_id: String,
     pub(crate) physical_binding: StreamPhysicalBinding,
     pub(crate) shard_ids: Vec<String>,
+    /// Fixed-size commitment to every retained physical shard prefix after a
+    /// rebind. The historical initial binding (ordinal 2) omits both fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retained_shard_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retained_shard_set_digest: Option<String>,
     pub(crate) operation_id: String,
     pub(crate) receipt_digest: String,
     pub(crate) recorded_at: i64,
+}
+
+/// Fixed-size physical-prefix authority carried by the selected binding
+/// receipt. This lets hot capture authenticate retained history without
+/// walking the immutable receipt chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetainedShardInventoryCommitment {
+    pub(crate) retained_shard_count: u64,
+    pub(crate) retained_shard_set_digest: String,
 }
 
 /// Terminal receipt for a successful externally initiated lifecycle request.
@@ -727,6 +747,28 @@ pub(crate) struct StreamResumeRequestPayload {
     pub(crate) public_named_branches: Vec<String>,
 }
 
+/// Immutable canonical preimage of one offline physical-rebind occurrence.
+///
+/// Fresh physical identities are recovery-owned plan data, not caller input.
+/// This request instead fixes the old logical lane, its compare revision, the
+/// exact disabled-profile cut, and the empty public-branch topology under
+/// which recovery may install that plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StreamRebindRequestPayload {
+    pub(crate) protocol_version: u32,
+    pub(crate) graph_identity_digest: String,
+    pub(crate) identity: TableIdentity,
+    pub(crate) stream_incarnation_id: String,
+    pub(crate) binding_scope_id: String,
+    pub(crate) enrollment_id: String,
+    pub(crate) rebind_id: String,
+    pub(crate) expected_lifecycle_revision: u64,
+    pub(crate) expected_profile_revision: u64,
+    pub(crate) actor_id: String,
+    pub(crate) public_named_branches: Vec<String>,
+}
+
 /// Durable restart plan for a revision-fenced drain.  Config-v3 requires the
 /// Phase-D `guarded_operation` slot to be explicit JSON null.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -761,11 +803,7 @@ pub(crate) struct StrictBlock {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "SCREAMING_SNAKE_CASE",
-    deny_unknown_fields
-)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub(crate) enum StrictBlockEvidence {
     DataBlock {
         enrollment_id: String,
@@ -1808,6 +1846,59 @@ impl BindingReceipt {
         operation_id: impl Into<String>,
         recorded_at: i64,
     ) -> Result<Self> {
+        Self::new_with_inventory(
+            graph_identity_digest,
+            identity,
+            prior_chain,
+            binding_scope_id,
+            stream_incarnation_id,
+            physical_binding,
+            None,
+            operation_id,
+            recorded_at,
+        )
+    }
+
+    /// Construct a post-rebind receipt that binds the complete terminal shard
+    /// namespace. The caller supplies authority-derived shards, never ambient
+    /// object-store discovery.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_retained_shards(
+        graph_identity_digest: impl Into<String>,
+        identity: TableIdentity,
+        prior_chain: &ReceiptChainRef,
+        binding_scope_id: impl Into<String>,
+        stream_incarnation_id: impl Into<String>,
+        physical_binding: StreamPhysicalBinding,
+        retained_shards: &[ShardId],
+        operation_id: impl Into<String>,
+        recorded_at: i64,
+    ) -> Result<Self> {
+        Self::new_with_inventory(
+            graph_identity_digest,
+            identity,
+            prior_chain,
+            binding_scope_id,
+            stream_incarnation_id,
+            physical_binding,
+            Some(retained_shard_inventory_commitment(retained_shards)?),
+            operation_id,
+            recorded_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_inventory(
+        graph_identity_digest: impl Into<String>,
+        identity: TableIdentity,
+        prior_chain: &ReceiptChainRef,
+        binding_scope_id: impl Into<String>,
+        stream_incarnation_id: impl Into<String>,
+        physical_binding: StreamPhysicalBinding,
+        retained_inventory: Option<RetainedShardInventoryCommitment>,
+        operation_id: impl Into<String>,
+        recorded_at: i64,
+    ) -> Result<Self> {
         prior_chain.validate_with_domain(BINDING_RECEIPT_CHAIN_GENESIS_DOMAIN)?;
         let graph_identity_digest = graph_identity_digest.into();
         let binding_scope_id = binding_scope_id.into();
@@ -1833,6 +1924,11 @@ impl BindingReceipt {
             enrollment_id: physical_binding.enrollment_id.clone(),
             shard_ids: physical_binding.shard_ids.clone(),
             physical_binding,
+            retained_shard_count: retained_inventory
+                .as_ref()
+                .map(|inventory| inventory.retained_shard_count),
+            retained_shard_set_digest: retained_inventory
+                .map(|inventory| inventory.retained_shard_set_digest),
             operation_id,
             receipt_digest: String::new(),
             recorded_at,
@@ -1906,6 +2002,7 @@ impl BindingReceipt {
                 "stream binding receipt differs from its physical binding or timestamp",
             ));
         }
+        self.validate_retained_shard_inventory_context()?;
         validate_digest("binding receipt receipt_digest", &self.receipt_digest)?;
         if self.receipt_digest != self.compute_receipt_digest()? {
             return Err(OmniError::manifest_internal(
@@ -1940,22 +2037,73 @@ impl BindingReceipt {
         )
     }
 
+    pub(crate) fn retained_shard_inventory_commitment(
+        &self,
+    ) -> Result<Option<RetainedShardInventoryCommitment>> {
+        self.validate_retained_shard_inventory_context()?;
+        Ok(self
+            .retained_shard_count
+            .zip(self.retained_shard_set_digest.clone())
+            .map(
+                |(retained_shard_count, retained_shard_set_digest)| {
+                    RetainedShardInventoryCommitment {
+                        retained_shard_count,
+                        retained_shard_set_digest,
+                    }
+                },
+            ))
+    }
+
+    fn validate_retained_shard_inventory_context(&self) -> Result<()> {
+        match (
+            self.chain_ordinal,
+            self.retained_shard_count,
+            self.retained_shard_set_digest.as_deref(),
+        ) {
+            (2, None, None) => Ok(()),
+            (ordinal, Some(count), Some(digest)) if ordinal > 2 => {
+                let expected = self.chain_ordinal.checked_sub(1).ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "stream binding receipt retained-shard count underflow",
+                    )
+                })?;
+                if count != expected {
+                    return Err(OmniError::manifest_internal(format!(
+                        "stream binding receipt retained-shard count {count} differs from chain-derived count {expected}"
+                    )));
+                }
+                validate_digest("binding receipt retained_shard_set_digest", digest)
+            }
+            _ => Err(OmniError::manifest_internal(
+                "stream binding receipt must be ordinal 2 without a retained-shard commitment or ordinal >2 with a complete commitment",
+            )),
+        }
+    }
+
     fn compute_receipt_digest(&self) -> Result<String> {
         let binding =
             bounded_json_bytes("binding receipt physical binding", &self.physical_binding)?;
-        Ok(hash_fields(
-            BINDING_RECEIPT_DIGEST_DOMAIN,
-            &[
-                self.graph_identity_digest.as_bytes(),
-                &self.identity.stable_table_id.to_be_bytes(),
-                &self.identity.table_incarnation_id.to_be_bytes(),
-                self.binding_scope_id.as_bytes(),
-                self.stream_incarnation_id.as_bytes(),
-                self.enrollment_id.as_bytes(),
-                &binding,
-                self.operation_id.as_bytes(),
-            ],
-        ))
+        let base_fields = [
+            self.graph_identity_digest.as_bytes(),
+            &self.identity.stable_table_id.to_be_bytes(),
+            &self.identity.table_incarnation_id.to_be_bytes(),
+            self.binding_scope_id.as_bytes(),
+            self.stream_incarnation_id.as_bytes(),
+            self.enrollment_id.as_bytes(),
+            &binding,
+            self.operation_id.as_bytes(),
+        ];
+        let (Some(count), Some(digest)) = (
+            self.retained_shard_count,
+            self.retained_shard_set_digest.as_deref(),
+        ) else {
+            return Ok(hash_fields(BINDING_RECEIPT_DIGEST_DOMAIN, &base_fields));
+        };
+        let count_bytes = count.to_be_bytes();
+        let mut fields = base_fields.to_vec();
+        fields.push(&count_bytes);
+        fields.push(digest.as_bytes());
+        Ok(hash_fields(BINDING_RECEIPT_DIGEST_DOMAIN, &fields))
     }
 
     fn compute_record_id(&self) -> String {
@@ -2222,6 +2370,31 @@ pub(crate) fn stream_resume_result_payload(
     Ok(serde_json::json!({
         "lifecycle": "OPEN",
         "revision": open_lifecycle_revision,
+    }))
+}
+
+/// Canonical terminal result of replacing one sealed lane's physical
+/// enrollment while preserving its logical stream incarnation.
+pub(crate) fn stream_rebind_result_payload(
+    sealed_lifecycle_revision: u64,
+    binding_scope_id: &str,
+    binding: &StreamPhysicalBinding,
+    current_head: &CurrentHeadWitness,
+) -> Result<serde_json::Value> {
+    if sealed_lifecycle_revision == 0 {
+        return Err(OmniError::manifest_internal(
+            "terminal stream rebind result requires a positive lifecycle revision",
+        ));
+    }
+    validate_uuid("rebind result binding_scope_id", binding_scope_id)?;
+    binding.validate(binding.identity()?)?;
+    current_head.validate()?;
+    Ok(serde_json::json!({
+        "lifecycle": "SEALED",
+        "revision": sealed_lifecycle_revision,
+        "binding_scope_id": binding_scope_id,
+        "binding": binding,
+        "current_head": current_head,
     }))
 }
 
@@ -2828,9 +3001,7 @@ impl ClaimReceipt {
     /// complete current-generation projection.
     pub(crate) fn proves_empty_current_generation(&self) -> bool {
         self.authenticated_tail_segment_entry_count == 1
-            && self
-                .authenticated_tail_prior_position
-                .checked_add(1)
+            && self.authenticated_tail_prior_position.checked_add(1)
                 == Some(self.authenticated_tail_position)
             && self.authenticated_tail_segment_lww_projection_digest
                 == self.authenticated_tail_lww_projection_digest
@@ -2856,7 +3027,6 @@ impl DisableDrainAdoption {
         }
         Ok(())
     }
-
 }
 
 impl QuiesceRequestPayload {
@@ -2879,15 +3049,9 @@ impl QuiesceRequestPayload {
                 "stream quiesce request has an unsupported protocol version",
             ));
         }
-        validate_digest(
-            "quiesce graph_identity_digest",
-            &self.graph_identity_digest,
-        )?;
+        validate_digest("quiesce graph_identity_digest", &self.graph_identity_digest)?;
         self.identity.validate()?;
-        validate_uuid(
-            "quiesce stream_incarnation_id",
-            &self.stream_incarnation_id,
-        )?;
+        validate_uuid("quiesce stream_incarnation_id", &self.stream_incarnation_id)?;
         validate_uuid("quiesce binding_scope_id", &self.binding_scope_id)?;
         validate_uuid("quiesce enrollment_id", &self.enrollment_id)?;
         validate_uuid("quiesce drain_id", &self.drain_id)?;
@@ -2925,8 +3089,7 @@ impl QuiesceRequestPayload {
         )?;
         let expected_binding_digest = stream_physical_binding_digest(&drain.expected_binding)?;
         if self.identity != entry.identity
-            || self.stream_incarnation_id
-                != entry.enrollment_receipt.stream_incarnation_id
+            || self.stream_incarnation_id != entry.enrollment_receipt.stream_incarnation_id
             || self.binding_scope_id != entry.binding_scope_id
             || self.enrollment_id != drain.expected_binding.enrollment_id
             || self.drain_id != drain.drain_id
@@ -3007,6 +3170,75 @@ impl StreamResumeRequestPayload {
         // Enforce the same bounded canonical JSON envelope as the immutable
         // management receipt which eventually embeds this request.
         bounded_json_bytes("resume request payload", self)?;
+        Ok(())
+    }
+}
+
+impl StreamRebindRequestPayload {
+    pub(crate) fn to_value(&self) -> Result<serde_json::Value> {
+        self.validate_shape()?;
+        serde_json::to_value(self).map_err(|error| {
+            OmniError::manifest_internal(format!(
+                "failed to encode canonical stream rebind request: {error}"
+            ))
+        })
+    }
+
+    pub(crate) fn request_digest(&self) -> Result<String> {
+        ManagementReceipt::request_digest_for(&self.to_value()?)
+    }
+
+    pub(crate) fn validate_for_lifecycle(
+        &self,
+        lifecycle: &StreamLifecycleEntry,
+        expected_profile_revision: u64,
+    ) -> Result<()> {
+        self.validate_shape()?;
+        lifecycle.validate()?;
+        if lifecycle.lifecycle != StreamLifecycle::Sealed
+            || self.identity != lifecycle.identity
+            || self.stream_incarnation_id != lifecycle.enrollment_receipt.stream_incarnation_id
+            || self.binding_scope_id != lifecycle.binding_scope_id
+            || self.enrollment_id != lifecycle.binding.enrollment_id
+            || self.expected_lifecycle_revision != lifecycle.lifecycle_revision
+            || self.expected_profile_revision != expected_profile_revision
+        {
+            return Err(OmniError::manifest_internal(
+                "stream rebind request differs from the exact SEALED lane or disabled-profile revision",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_shape(&self) -> Result<()> {
+        if self.protocol_version != STREAM_REBIND_REQUEST_PROTOCOL_VERSION {
+            return Err(OmniError::manifest_internal(
+                "stream rebind request has an unsupported protocol version",
+            ));
+        }
+        validate_digest("rebind graph_identity_digest", &self.graph_identity_digest)?;
+        self.identity.validate()?;
+        validate_uuid("rebind stream_incarnation_id", &self.stream_incarnation_id)?;
+        validate_uuid("rebind binding_scope_id", &self.binding_scope_id)?;
+        validate_uuid("rebind enrollment_id", &self.enrollment_id)?;
+        let rebind_id = validate_uuid("rebind rebind_id", &self.rebind_id)?;
+        if rebind_id.get_version_num() != 4 {
+            return Err(OmniError::manifest_internal(
+                "stream rebind rebind_id must be a UUID v4 value",
+            ));
+        }
+        if self.expected_lifecycle_revision == 0 || self.expected_profile_revision == 0 {
+            return Err(OmniError::manifest_internal(
+                "stream rebind request requires positive lifecycle and profile revisions",
+            ));
+        }
+        validate_canonical_text("rebind actor_id", &self.actor_id)?;
+        if !self.public_named_branches.is_empty() {
+            return Err(OmniError::manifest_internal(
+                "stream rebind request requires the exact empty public named-branch topology",
+            ));
+        }
+        bounded_json_bytes("rebind request payload", self)?;
         Ok(())
     }
 }
@@ -3157,9 +3389,7 @@ impl StrictBlock {
 
     fn validate(&self, entry: &StreamLifecycleEntry) -> Result<()> {
         validate_digest("strict block_token", &self.block_token)?;
-        if self.correction_revision == 0
-            || self.correction_revision != entry.lifecycle_revision
-        {
+        if self.correction_revision == 0 || self.correction_revision != entry.lifecycle_revision {
             return Err(OmniError::manifest_internal(
                 "stream strict block must bind the exact current correction revision",
             ));
@@ -3208,8 +3438,7 @@ impl StrictBlock {
                     || *shard_manifest_version == 0
                     || *writer_epoch == 0
                     || *replay_cursor == 0
-                    || *validation_contract_version
-                        != STREAM_DATA_BLOCK_VALIDATION_CONTRACT_VERSION
+                    || *validation_contract_version != STREAM_DATA_BLOCK_VALIDATION_CONTRACT_VERSION
                     || *offending_key_count == 0
                     || *offending_key_count > STRICT_DATA_BLOCK_MAX_KEYS
                 {
@@ -3523,9 +3752,7 @@ impl StreamLifecycleEntry {
         if published_prefix != 0
             && published_prefix == replay_cursor
             && published_prefix == receipt.replay_cursor
-            && published_prefix
-                .checked_add(1)
-                == Some(receipt.sentinel_position)
+            && published_prefix.checked_add(1) == Some(receipt.sentinel_position)
         {
             return Some(StreamEmptyCutDisposition::PublishedFoldPrefix);
         }
@@ -3697,6 +3924,86 @@ impl StreamLifecycleEntry {
         ) {
             return Err(OmniError::manifest_internal(
                 "stream lifecycle successor skips a required drain/resume boundary",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Structural fence for the one operation that is allowed to replace a
+    /// physical stream binding. Ordinary lifecycle successors deliberately
+    /// continue to use [`Self::validate_successor_of`] and therefore cannot
+    /// opt into this transition by changing a flag.
+    pub(crate) fn validate_rebind_successor_of(&self, prior: &Self) -> Result<()> {
+        prior.validate()?;
+        self.validate()?;
+        let expected_revision = prior
+            .lifecycle_revision
+            .checked_add(1)
+            .ok_or_else(|| OmniError::manifest_internal("stream lifecycle revision overflow"))?;
+        let expected_head_version = prior
+            .current_head_witness
+            .table_version
+            .checked_add(2)
+            .ok_or_else(|| OmniError::manifest_internal("stream rebind table version overflow"))?;
+        let expected_binding_receipt_count = prior
+            .binding_receipt_chain
+            .record_count
+            .checked_add(1)
+            .ok_or_else(|| OmniError::manifest_internal("stream binding receipt chain overflow"))?;
+        let expected_management_receipt_count = prior
+            .management_receipt_chain
+            .record_count
+            .checked_add(1)
+            .ok_or_else(|| {
+                OmniError::manifest_internal("stream management receipt chain overflow")
+            })?;
+        let expected_claim_receipt_count = prior
+            .claim_receipt_chain
+            .record_count
+            .checked_add(1)
+            .ok_or_else(|| OmniError::manifest_internal("stream claim receipt chain overflow"))?;
+        let proof = self.sealed_proof.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal("stream rebind successor lost its SEALED proof")
+        })?;
+        if prior.lifecycle != StreamLifecycle::Sealed
+            || self.lifecycle != StreamLifecycle::Sealed
+            || self.lifecycle_revision != expected_revision
+            || self.identity != prior.identity
+            || self.diagnostic_table_key != prior.diagnostic_table_key
+            || self.enrollment_receipt != prior.enrollment_receipt
+            || self.binding.table_location != prior.binding.table_location
+            || self.binding.table_branch != prior.binding.table_branch
+            || self.binding.stream_config_version != prior.binding.stream_config_version
+            || self.binding.stream_config_hash != prior.binding.stream_config_hash
+            || self.binding == prior.binding
+            || self.binding_scope_id == prior.binding_scope_id
+            || self.binding.enrollment_id == prior.binding.enrollment_id
+            || self
+                .binding
+                .shard_ids
+                .iter()
+                .any(|shard| prior.binding.shard_ids.contains(shard))
+            || self.current_head_witness.table_version != expected_head_version
+            || self.current_head_witness.transaction_uuid
+                == prior.current_head_witness.transaction_uuid
+            || self.binding_receipt_chain.record_count != expected_binding_receipt_count
+            || self.current_binding_receipt_id == prior.current_binding_receipt_id
+            || self.binding_receipt_chain.head_record_id.as_deref()
+                != Some(self.current_binding_receipt_id.as_str())
+            || self.management_receipt_chain.record_count != expected_management_receipt_count
+            || self.management_receipt_chain.head_record_id
+                == prior.management_receipt_chain.head_record_id
+            || self.claim_receipt_chain.record_count != expected_claim_receipt_count
+            || self.current_claim_receipt_id == prior.current_claim_receipt_id
+            || self.authenticated_wal_tail.position != 1
+            || self.authenticated_wal_tail.segment_count != 1
+            || proof.replay_cursor != 0
+            || proof.current_generation != 1
+            || proof.base_merged_generation != 0
+            || self.last_fold_summary.is_some()
+        {
+            return Err(OmniError::manifest_internal(
+                "stream rebind successor must replace only the physical binding, advance its receipt chain once, reset binding-scoped fold state, and remain SEALED",
             ));
         }
         Ok(())
@@ -3910,12 +4217,66 @@ fn hash_fields(domain: &[u8], fields: &[&[u8]]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+/// Commit to one canonical, non-empty set of UUID-v4 shard prefixes. Sorting
+/// and duplicate rejection make the digest independent of caller order while
+/// preserving exact set cardinality.
+pub(crate) fn retained_shard_inventory_commitment(
+    shards: &[ShardId],
+) -> Result<RetainedShardInventoryCommitment> {
+    if shards.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "stream retained-shard inventory must be non-empty",
+        ));
+    }
+    let mut canonical = shards.to_vec();
+    canonical.sort_unstable();
+    if canonical.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(OmniError::manifest_internal(
+            "stream retained-shard inventory must be duplicate-free",
+        ));
+    }
+    if canonical
+        .iter()
+        .any(|shard| shard.is_nil() || shard.get_version_num() != 4)
+    {
+        return Err(OmniError::manifest_internal(
+            "stream retained-shard inventory must contain only UUID-v4 identities",
+        ));
+    }
+    let retained_shard_count = u64::try_from(canonical.len()).map_err(|_| {
+        OmniError::manifest_internal("stream retained-shard inventory count overflow")
+    })?;
+    let fields = canonical
+        .iter()
+        .map(|shard| shard.as_bytes().as_slice())
+        .collect::<Vec<_>>();
+    Ok(RetainedShardInventoryCommitment {
+        retained_shard_count,
+        retained_shard_set_digest: hash_fields(RETAINED_SHARD_SET_DIGEST_DOMAIN, &fields),
+    })
+}
+
 fn digest_domain(domain: &[u8]) -> String {
     hash_fields(domain, &[])
 }
 
 pub(crate) fn binding_receipt_chain_genesis() -> ReceiptChainRef {
     ReceiptChainRef::genesis_with_domain(BINDING_RECEIPT_CHAIN_GENESIS_DOMAIN)
+}
+
+/// Minimal non-empty enrollment-chain stand-in for in-source fixtures that do
+/// not persist a token ledger. Production initial bindings always use the
+/// actual `EnrollmentReceiptV2::next_chain_ref()`.
+#[cfg(test)]
+pub(crate) fn test_initial_binding_prior_chain() -> ReceiptChainRef {
+    ReceiptChainRef {
+        head_record_id: Some(hash_fields(
+            b"omnigraph.test-stream-enrollment-record.v1\0",
+            &[],
+        )),
+        record_count: 1,
+        chain_digest: hash_fields(b"omnigraph.test-stream-enrollment-chain.v1\0", &[]),
+    }
 }
 
 pub(crate) fn management_receipt_chain_genesis() -> ReceiptChainRef {
@@ -4179,11 +4540,7 @@ fn canonical_json_digest(domain: &[u8], field: &str, value: &serde_json::Value) 
 /// Encode the receipt JSON contract independently of `serde_json::Map`'s
 /// backing container: object keys sort by their UTF-8 bytes, arrays retain
 /// order, and scalar spellings remain serde_json's stable JSON spellings.
-fn write_canonical_json(
-    field: &str,
-    value: &serde_json::Value,
-    bytes: &mut Vec<u8>,
-) -> Result<()> {
+fn write_canonical_json(field: &str, value: &serde_json::Value, bytes: &mut Vec<u8>) -> Result<()> {
     match value {
         serde_json::Value::Null => bytes.extend_from_slice(b"null"),
         serde_json::Value::Bool(value) => {
@@ -4191,16 +4548,12 @@ fn write_canonical_json(
         }
         serde_json::Value::Number(value) => {
             serde_json::to_writer(&mut *bytes, value).map_err(|error| {
-                OmniError::manifest_internal(format!(
-                    "failed to encode stream {field}: {error}"
-                ))
+                OmniError::manifest_internal(format!("failed to encode stream {field}: {error}"))
             })?;
         }
         serde_json::Value::String(value) => {
             serde_json::to_writer(&mut *bytes, value).map_err(|error| {
-                OmniError::manifest_internal(format!(
-                    "failed to encode stream {field}: {error}"
-                ))
+                OmniError::manifest_internal(format!("failed to encode stream {field}: {error}"))
             })?;
         }
         serde_json::Value::Array(values) => {
@@ -4785,6 +5138,119 @@ mod tests {
         let mut sealed_without_proof = entry();
         sealed_without_proof.lifecycle = StreamLifecycle::Sealed;
         assert!(sealed_without_proof.validate().is_err());
+    }
+
+    #[test]
+    fn binding_receipt_inventory_is_canonical_contextual_and_freezes_ordinal_two() {
+        let base = entry();
+        let graph_digest = format!("sha256:{}", "1".repeat(64));
+        let enrollment = EnrollmentReceiptV2::new(
+            graph_digest.clone(),
+            base.identity,
+            &binding_receipt_chain_genesis(),
+            "77777777-7777-4777-8777-777777777777",
+            format!("sha256:{}", "2".repeat(64)),
+            "act-operator",
+            base.enrollment_receipt.stream_incarnation_id.clone(),
+            base.binding_scope_id.clone(),
+            base.binding.clone(),
+            1,
+        )
+        .unwrap();
+        let initial = BindingReceipt::new(
+            graph_digest.clone(),
+            base.identity,
+            &enrollment.next_chain_ref().unwrap(),
+            base.binding_scope_id.clone(),
+            base.enrollment_receipt.stream_incarnation_id.clone(),
+            base.binding.clone(),
+            "77777777-7777-4777-8777-777777777777",
+            2,
+        )
+        .unwrap();
+        assert_eq!(initial.chain_ordinal, 2);
+        assert_eq!(
+            initial.receipt_digest,
+            "sha256:a80a59b7fad93181bf8bed278be32200da4978ef6a03ad6093e82a77e0cf0924"
+        );
+        assert_eq!(initial.retained_shard_inventory_commitment().unwrap(), None);
+        let initial_json = serde_json::to_value(&initial).unwrap();
+        assert!(initial_json.get("retained_shard_count").is_none());
+        assert!(initial_json.get("retained_shard_set_digest").is_none());
+        assert_eq!(
+            serde_json::from_value::<BindingReceipt>(initial_json).unwrap(),
+            initial
+        );
+        assert!(
+            BindingReceipt::new(
+                graph_digest.clone(),
+                base.identity,
+                &binding_receipt_chain_genesis(),
+                base.binding_scope_id.clone(),
+                base.enrollment_receipt.stream_incarnation_id.clone(),
+                base.binding.clone(),
+                "77777777-7777-4777-8777-777777777777",
+                2,
+            )
+            .is_err(),
+            "a BindingReceipt cannot occupy the enrollment receipt's ordinal 1"
+        );
+
+        let old_shard = ShardId::parse_str(&base.binding.shard_ids[0]).unwrap();
+        let new_shard =
+            ShardId::parse_str("88888888-8888-4888-8888-888888888888").unwrap();
+        let forward = retained_shard_inventory_commitment(&[old_shard, new_shard]).unwrap();
+        let reverse = retained_shard_inventory_commitment(&[new_shard, old_shard]).unwrap();
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.retained_shard_count, 2);
+        assert!(retained_shard_inventory_commitment(&[old_shard, old_shard]).is_err());
+        assert!(retained_shard_inventory_commitment(&[ShardId::nil()]).is_err());
+
+        let rebound_binding = StreamPhysicalBinding {
+            enrollment_id: "99999999-9999-4999-8999-999999999999".to_string(),
+            shard_ids: vec![new_shard.to_string()],
+            ..base.binding.clone()
+        };
+        assert!(
+            BindingReceipt::new(
+                graph_digest.clone(),
+                base.identity,
+                &initial.next_chain_ref().unwrap(),
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                base.enrollment_receipt.stream_incarnation_id.clone(),
+                rebound_binding.clone(),
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                3,
+            )
+            .is_err(),
+            "an ordinal >2 receipt cannot omit its retained-shard commitment"
+        );
+        let rebound = BindingReceipt::new_with_retained_shards(
+            graph_digest,
+            base.identity,
+            &initial.next_chain_ref().unwrap(),
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            base.enrollment_receipt.stream_incarnation_id.clone(),
+            rebound_binding,
+            &[new_shard, old_shard],
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            rebound.retained_shard_inventory_commitment().unwrap(),
+            Some(forward)
+        );
+        let rebound_json = serde_json::to_value(&rebound).unwrap();
+        assert_eq!(rebound_json["retained_shard_count"], 2);
+        assert!(rebound_json["retained_shard_set_digest"].is_string());
+
+        let mut partial = rebound.clone();
+        partial.retained_shard_set_digest = None;
+        assert!(partial.validate().is_err());
+        let mut wrong_count = rebound;
+        wrong_count.retained_shard_count = Some(3);
+        assert!(wrong_count.validate().is_err());
     }
 
     #[test]

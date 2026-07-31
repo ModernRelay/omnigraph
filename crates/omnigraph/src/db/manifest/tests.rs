@@ -1940,7 +1940,7 @@ fn stream_lifecycle_for_person(
     let binding_receipt = stream::BindingReceipt::new(
         stream::stream_graph_identity_digest("manifest-test-domain").unwrap(),
         person_entry.identity,
-        &stream::binding_receipt_chain_genesis(),
+        &stream::test_initial_binding_prior_chain(),
         binding_scope_id,
         enrollment_receipt.stream_incarnation_id.clone(),
         binding.clone(),
@@ -2453,7 +2453,7 @@ async fn test_init_stamps_internal_schema_version() {
     ManifestCoordinator::init(uri, &catalog).await.unwrap();
 
     let ds = open_manifest_dataset(uri, None).await.unwrap();
-    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 15);
+    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 16);
     assert_eq!(
         super::migrations::read_stamp(&ds),
         super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,

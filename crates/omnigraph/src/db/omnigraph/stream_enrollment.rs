@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::manifest::stream::{
     BINDING_RECEIPT_TAG, BindingReceipt, CLAIM_RECEIPT_TAG, CurrentHeadWitness,
-    EnrollmentReceiptV2, binding_receipt_chain_genesis, stream_graph_identity_digest,
+    EnrollmentReceiptV2, MAX_SELECTED_BINDING_CHAIN_RECORDS,
+    RetainedShardInventoryCommitment, binding_receipt_chain_genesis, stream_graph_identity_digest,
     stream_physical_binding_digest,
 };
 use crate::db::manifest::stream_profile::ReceiptChainRef;
@@ -34,17 +35,14 @@ use crate::storage_layer::{SnapshotHandle, StagedHandle};
 use crate::table_store::mem_wal::{
     MemWalEnrollmentPlan, capture_pre_enrollment_head, initialize_index_from_exact_no_effect,
     provision_shard_from_exact_index_only, stream_config_v3_hash,
-    validate_b1_lifecycle_physical_state, validate_phase_a_stream_absent,
+    validate_b1_lifecycle_physical_state_with_binding_inventory, validate_phase_a_stream_absent,
 };
 
 use super::Omnigraph;
 
-/// Prepare is a cold, bodyless authority check, but it must still have a
-/// history-independent ceiling. Rebind appends one immutable binding receipt;
-/// exceeding this bound requires an explicit future chain-checkpoint format
-/// rather than an unbounded scan on every prepare retry.
-const MAX_SELECTED_BINDING_CHAIN_RECORDS: u64 = 1_024;
-
+/// Offline rebind is the sole full binding-history traversal and therefore
+/// still needs a fixed ceiling. Hot capture, cold open, and prepare authenticate
+/// only the selected receipt's fixed-size retained-prefix commitment.
 /// Ephemeral, non-wire compare token for one absent eligible stream lane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,7 +129,7 @@ impl Omnigraph {
                             entry.identity
                         )));
                     }
-                    if let Err(error) = validate_selected_lifecycle_ledger_authority(
+                    let retained_inventory = match validate_selected_lifecycle_ledger_authority(
                         &token_dataset,
                         snapshot.stream_token_authority(),
                         &graph_identity_digest,
@@ -139,20 +137,27 @@ impl Omnigraph {
                     )
                     .await
                     {
-                        return Err(OmniError::manifest_internal(format!(
-                            "internal-v12 stream ledger consistency failed for '{}' ({}): {error}",
-                            entry.table_key, entry.identity
-                        )));
-                    }
+                        Ok(inventory) => inventory,
+                        Err(error) => {
+                            return Err(OmniError::manifest_internal(format!(
+                                "internal-v12 stream ledger consistency failed for '{}' ({}): {error}",
+                                entry.table_key, entry.identity
+                            )));
+                        }
+                    };
                     // A Dataset pinned at the manifest-selected version cannot
                     // observe a later attached HEAD. Lifecycle authority owns
                     // the current physical ref, so latest must still equal the
                     // durable exact witness before the format is accepted.
                     let head = self.storage().open_dataset_head(&full_path, None).await?;
-                    validate_b1_lifecycle_physical_state(head.dataset(), lifecycle)
-                        .await
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
+                    validate_b1_lifecycle_physical_state_with_binding_inventory(
+                        head.dataset(),
+                        lifecycle,
+                        retained_inventory.as_ref(),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
                 }
                 None => {
                     match validate_phase_a_stream_absent(table.dataset()).await {
@@ -320,23 +325,13 @@ impl Omnigraph {
                 entry.identity
             )));
         }
-        validate_selected_lifecycle_ledger_authority(
+        let retained_inventory = validate_selected_lifecycle_ledger_authority(
             &token_dataset,
             txn.base.stream_token_authority(),
             &graph_identity_digest,
             &lifecycle,
         )
         .await?;
-        let full_path = format!(
-            "{}/{}",
-            self.root_uri().trim_end_matches('/'),
-            entry.table_path.trim_start_matches('/')
-        );
-        let head = self.storage().open_dataset_head(&full_path, None).await?;
-        validate_b1_lifecycle_physical_state(head.dataset(), &lifecycle)
-            .await
-            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-
         let winner_request_id = &lifecycle.enrollment_receipt.enrollment_request_id;
         let winner_receipt = match exact_receipt {
             Some(receipt) => receipt,
@@ -360,13 +355,19 @@ impl Omnigraph {
             &graph_identity_digest,
             &lifecycle,
         )?;
-        validate_selected_binding_chain_authority(
-            &token_dataset,
-            txn.base.stream_token_authority(),
-            &winner_receipt,
+        let full_path = format!(
+            "{}/{}",
+            self.root_uri().trim_end_matches('/'),
+            entry.table_path.trim_start_matches('/')
+        );
+        let head = self.storage().open_dataset_head(&full_path, None).await?;
+        validate_b1_lifecycle_physical_state_with_binding_inventory(
+            head.dataset(),
             &lifecycle,
+            retained_inventory.as_ref(),
         )
-        .await?;
+        .await
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
         if winner_receipt.enrollment_request_id == enrollment_request_id.to_string() {
             if winner_receipt.actor_id != actor_id {
                 return Err(OmniError::manifest_conflict(format!(
@@ -881,12 +882,12 @@ fn validate_enrollment_receipt_against_lifecycle(
     Ok(())
 }
 
-async fn validate_selected_binding_chain_authority(
+pub(super) async fn load_selected_binding_chain_records(
     token_dataset: &Dataset,
     token_authority: &StreamTokenAuthorityEntry,
     enrollment: &EnrollmentReceiptV2,
     lifecycle: &StreamLifecycleEntry,
-) -> Result<()> {
+) -> Result<Vec<BindingReceipt>> {
     enrollment.validate()?;
     lifecycle.validate()?;
     if enrollment.chain_ordinal != 1
@@ -945,7 +946,8 @@ async fn validate_selected_binding_chain_authority(
             chain_digest: binding.prior_chain_digest,
         };
     }
-    validate_selected_binding_chain_records(enrollment, lifecycle, &newest_to_oldest)
+    validate_selected_binding_chain_records(enrollment, lifecycle, &newest_to_oldest)?;
+    Ok(newest_to_oldest)
 }
 
 /// Validate a fully bounded newest-to-oldest binding path. The selected head
@@ -1032,7 +1034,7 @@ pub(super) async fn validate_selected_lifecycle_ledger_authority(
     token_authority: &StreamTokenAuthorityEntry,
     graph_identity_digest: &str,
     lifecycle: &StreamLifecycleEntry,
-) -> Result<()> {
+) -> Result<Option<RetainedShardInventoryCommitment>> {
     let binding = lookup_lifecycle_ledger_record_by_id(
         token_dataset,
         token_authority,
@@ -1051,24 +1053,14 @@ pub(super) async fn validate_selected_lifecycle_ledger_authority(
             "stream lifecycle binding head decoded as another ledger family",
         ));
     };
-    if binding.graph_identity_digest != graph_identity_digest
-        || binding.identity != lifecycle.identity
-        || binding.binding_scope_id != lifecycle.binding_scope_id
-        || binding.stream_incarnation_id != lifecycle.enrollment_receipt.stream_incarnation_id
-        || binding.enrollment_id != lifecycle.binding.enrollment_id
-        || binding.physical_binding != lifecycle.binding
-        || binding.shard_ids != lifecycle.binding.shard_ids
-        || binding.record_id != lifecycle.current_binding_receipt_id
-        || binding.next_chain_ref()? != lifecycle.binding_receipt_chain
-    {
-        return Err(OmniError::manifest_internal(format!(
-            "stream lifecycle {} is not authenticated by its selected binding receipt",
-            lifecycle.identity
-        )));
-    }
+    let retained_inventory = validate_selected_binding_receipt(
+        &binding,
+        graph_identity_digest,
+        lifecycle,
+    )?;
 
     let Some(current_claim_receipt_id) = lifecycle.current_claim_receipt_id.as_deref() else {
-        return Ok(());
+        return Ok(retained_inventory);
     };
     let claim = lookup_lifecycle_ledger_record_by_id(
         token_dataset,
@@ -1112,7 +1104,30 @@ pub(super) async fn validate_selected_lifecycle_ledger_authority(
             lifecycle.identity
         )));
     }
-    Ok(())
+    Ok(retained_inventory)
+}
+
+fn validate_selected_binding_receipt(
+    binding: &BindingReceipt,
+    graph_identity_digest: &str,
+    lifecycle: &StreamLifecycleEntry,
+) -> Result<Option<RetainedShardInventoryCommitment>> {
+    if binding.graph_identity_digest != graph_identity_digest
+        || binding.identity != lifecycle.identity
+        || binding.binding_scope_id != lifecycle.binding_scope_id
+        || binding.stream_incarnation_id != lifecycle.enrollment_receipt.stream_incarnation_id
+        || binding.enrollment_id != lifecycle.binding.enrollment_id
+        || binding.physical_binding != lifecycle.binding
+        || binding.shard_ids != lifecycle.binding.shard_ids
+        || binding.record_id != lifecycle.current_binding_receipt_id
+        || binding.next_chain_ref()? != lifecycle.binding_receipt_chain
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "stream lifecycle {} is not authenticated by its selected binding receipt",
+            lifecycle.identity
+        )));
+    }
+    binding.retained_shard_inventory_commitment()
 }
 
 fn mint_distinct_stream_uuid(excluded: &[ShardId]) -> ShardId {
@@ -1193,13 +1208,19 @@ mod tests {
             shard_ids: vec![rebound_shard.to_string()],
             ..initial_binding.clone()
         };
-        let rebound_receipt = BindingReceipt::new(
+        let mut retained_shards = vec![
+            ShardId::parse_str(&initial_binding.shard_ids[0]).unwrap(),
+            ShardId::parse_str(rebound_shard).unwrap(),
+        ];
+        retained_shards.sort_unstable();
+        let rebound_receipt = BindingReceipt::new_with_retained_shards(
             graph_identity_digest,
             identity,
             &initial_receipt.next_chain_ref().unwrap(),
             rebound_scope,
             stream_incarnation_id,
             rebound_binding.clone(),
+            &retained_shards,
             "99999999-9999-4999-8999-999999999999",
             3,
         )
@@ -1268,5 +1289,19 @@ mod tests {
         over_bound.binding_receipt_chain.record_count =
             MAX_SELECTED_BINDING_CHAIN_RECORDS.saturating_add(1);
         assert!(validate_selected_binding_chain_records(&enrollment, &over_bound, &[]).is_err());
+    }
+
+    #[test]
+    fn selected_binding_head_authenticates_rebind_inventory_without_chain_walk() {
+        let (_, _, rebound, lifecycle) = binding_chain_fixture();
+        let inventory =
+            validate_selected_binding_receipt(&rebound, &digest('b'), &lifecycle)
+                .unwrap()
+                .expect("rebound binding carries fixed-size inventory");
+        assert_eq!(inventory.retained_shard_count, 2);
+
+        let mut wrong = rebound;
+        wrong.retained_shard_count = Some(3);
+        assert!(validate_selected_binding_receipt(&wrong, &digest('b'), &lifecycle).is_err());
     }
 }

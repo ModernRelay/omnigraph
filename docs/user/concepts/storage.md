@@ -47,7 +47,7 @@ The on-disk shape of `__manifest` is reconciled with the binary via a single ver
 - The stamp is read with no object-store writes, so the check is safe under a read-only open. Operators can see a graph's stamp with `omnigraph snapshot` and the binary's served version with `omnigraph version` (the `internal-schema` line).
 
 The stamp values below are historical; this binary serves only the current one
-(`v15`). An earlier-stamped graph is rebuilt via export/import, not migrated in
+(`v16`). An earlier-stamped graph is rebuilt via export/import, not migrated in
 place.
 
 | Stamp | Shape |
@@ -66,7 +66,8 @@ place.
 | v12 | Replaces lifecycle state-v2's inline receipt vectors with lifecycle-v3 fixed-size ledger-chain/current pointers and an authenticated WAL-tail commitment. Recovery-v14 activates exact hidden `StreamEnrollmentV2`, `StreamClaim`, `StreamFoldV2`, `StreamDrainFold`, and `StreamLifecycleReceipt` owners. The private path can recovery-cover cold epoch claims and quiesce never-written or non-empty lanes through `OPEN → DRAINING → SEALED`, including restart after a claim or an already-flushed cut. Historical recovery-v10 enrollment and recovery-v12 lifecycle-v2 fold payloads retain their old meaning and are refused under this format. Its three-field v14 resume scaffold remains frozen and is not reinterpreted. |
 | v13 | Preserves lifecycle-v3 and raises the sidecar ceiling to recovery-v15. The hidden `StreamResume` owner recovery-covers revision-fenced `SEALED → OPEN` resume and guarded `DRAINING → OPEN` abort, including the higher-epoch claim and terminal claim/management receipts. |
 | v14 | Raises the sidecar ceiling to recovery-v16 for the private, checked-runtime, canonical-main `SEALED` EnsureIndices bridge. V16 reuses the exact recovery-v8 CreateIndex plan and atomically refreshes each affected lifecycle HEAD witness, verified-empty proof, and revision without a token effect, management receipt, or caller operation ID. Ambient EnsureIndices remains refused for enrolled tables. |
-| v15 | Raises the sidecar ceiling to recovery-v17 for the distinct private, checked-runtime, canonical-main `SEALED` Optimize bridge. V17 binds Optimize's complete confirmed output set and exact achieved table HEADs, then atomically refreshes productive pointers and lifecycle proofs without a token effect, management receipt, or caller operation ID. Ambient Optimize remains refused for enrolled tables; physical rebind, public row ingress, and CLI/HTTP/OpenAPI maintenance/lifecycle verbs remain inactive. **The only version this binary serves.** |
+| v15 | Raises the sidecar ceiling to recovery-v17 for the distinct private, checked-runtime, canonical-main `SEALED` Optimize bridge. V17 binds Optimize's complete confirmed output set and exact achieved table HEADs, then atomically refreshes productive pointers and lifecycle proofs without a token effect, management receipt, or caller operation ID. Ambient Optimize remains refused for enrolled tables. |
+| v16 | Raises the sidecar ceiling to recovery-v18 for private physical rebind. V18 binds the complete prior `SEALED` authority, exact fresh enrollment and empty shard, immutable binding and fence-only claim receipts, and the next `SEALED` proof. Rebind does not open admission; a separate resume claims within the new scope. Public row ingress and CLI/HTTP/OpenAPI lifecycle/rebind verbs remain inactive. **The only version this binary serves.** |
 
 ## On-disk layout
 

@@ -64,15 +64,16 @@ are implemented and evidence-green at a deliberately narrow boundary:
 - replayed or flushed-but-unmerged state routes to fold only;
 - one strict fold stages exact base-table and `_stream_tokens.lance`
   participants and publishes both through `__manifest`; and
-- current internal schema v15 preserves the v9 row/token contract and v12's
+- current internal schema v16 preserves the v9 row/token contract and v12's
   lifecycle-v3 fixed-size ledger heads and recovery-v14 hidden
   enrollment, writer-claim, ordinary/drain-fold, and terminal management
   authority. Recovery-v15 adds private revision-fenced resume and guarded
   drain-abort. Recovery-v16 adds checked-runtime, canonical-main `SEALED`
   EnsureIndices with atomic pointer/proof refresh, no token receipt or caller
   operation ID, and effect-free no-work retry. Recovery-v17 adds the distinct
-  checked-runtime `SEALED` Optimize path with exact achieved-HEAD recovery;
-  physical rebind remains inactive. V11's checked profile-v2 and recovery-v13
+  checked-runtime `SEALED` Optimize path with exact achieved-HEAD recovery.
+  Recovery-v18 adds the private physical-rebind owner for an exact `SEALED`
+  lane; public/production rebind remains inactive. V11's checked profile-v2 and recovery-v13
   `StreamProfileChange` remain intact. Historical v8/config-v2/recovery-v11
   and v9 lifecycle-v2/recovery-v12 state cross that boundary only through
   export/init/load.
@@ -83,8 +84,9 @@ engine seam. Checked profile control exists, including restart-stable
 ingest method, HTTP route, CLI ingest command, OpenAPI surface, or enrolled-lane
 operator workflow. The hidden core implements recovery-covered empty/non-empty
 `OPEN → DRAINING → SEALED` plus crate-private `SEALED → OPEN` resume and
-guarded `DRAINING → OPEN` abort. Physical rebind, the maintenance bridge, and
-production control/transport activation remain fail-closed. An acknowledgement
+guarded `DRAINING → OPEN` abort, checked `SEALED` maintenance, and checked
+offline physical rebind. Public/production rebind and control/transport
+activation remain fail-closed. An acknowledgement
 means that the submitted batch is durable and
 replayable; it does not mean that the graph already exposes the rows.
 
@@ -113,7 +115,7 @@ RFC-026 Phase B2 specifies the remaining public contract:
   retained-storage admission promise.
 
 The private storage/correctness subset is implemented through current schema
-v15: v9 supplied stream-config v3, lifecycle state v2, canonical
+v16: v9 supplied stream-config v3, lifecycle state v2, canonical
 compare-and-chain tokens, trusted hidden row attribution, manifest-selected
 token authority, and recovery-v12's exact base-plus-token publication; v12
 adds lifecycle-v3 and recovery-v14 hidden enrollment, claims, ordinary/drain
@@ -121,11 +123,11 @@ folds, and restartable empty/non-empty quiescence; v13/recovery-v15 adds private
 resume and guarded drain-abort; v14/recovery-v16 adds checked-runtime,
 canonical-main `SEALED` EnsureIndices with atomic lifecycle-proof refresh and
 no token receipt or caller operation ID; v15/recovery-v17 adds the distinct
-checked-runtime `SEALED` Optimize path with exact achieved-HEAD recovery.
-Supported production
-enrollment/quiesce/resume/abort, correction/retirement, exclusive-cut physical
-status, physical rebind, SDK/HTTP/CLI/OpenAPI, and every other product surface
-remain inactive.
+checked-runtime `SEALED` Optimize path with exact achieved-HEAD recovery; and
+v16/recovery-v18 adds checked offline physical rebind into a fresh empty
+`SEALED` scope. Supported production enrollment/quiesce/resume/abort,
+correction/retirement, exclusive-cut physical status, physical rebind,
+SDK/HTTP/CLI/OpenAPI, and every other product surface remain inactive.
 
 ## The missing Lance capabilities
 

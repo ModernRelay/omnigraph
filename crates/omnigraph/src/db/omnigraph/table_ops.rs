@@ -4,7 +4,9 @@ use super::*;
 enum EnsureIndicesMode<'a> {
     Ambient,
     #[cfg_attr(not(feature = "failpoints"), allow(dead_code))]
-    SealedMaintenance { actor_id: &'a str },
+    SealedMaintenance {
+        actor_id: &'a str,
+    },
 }
 
 impl<'a> EnsureIndicesMode<'a> {

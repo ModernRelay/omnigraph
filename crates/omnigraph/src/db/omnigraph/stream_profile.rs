@@ -47,6 +47,43 @@ pub struct CheckedClusterApplyAuthority<'lock> {
     guard: ValidatedOfflineGuard<'lock>,
 }
 
+/// Engine-checked stopped-writer authority for stream-aware offline
+/// maintenance on one exact `DISABLED` profile revision.
+///
+/// This capability is distinct from profile reconciliation: it cannot carry a
+/// profile target, and profile enable/disable guards cannot be consumed as
+/// maintenance authority. The lower guard retains the actual cluster apply
+/// lock and process-local runtime exclusion for this value's lifetime.
+#[doc(hidden)]
+pub struct CheckedClusterMaintenanceAuthority<'lock> {
+    guard: ValidatedOfflineGuard<'lock>,
+}
+
+impl CheckedClusterMaintenanceAuthority<'_> {
+    pub(crate) fn operation_id(&self) -> &str {
+        self.guard.operation_id()
+    }
+
+    pub(crate) fn actor(&self) -> &str {
+        self.guard.actor()
+    }
+
+    pub(crate) fn expected_profile_revision(&self) -> u64 {
+        self.guard.expected_profile_revision()
+    }
+
+    pub(crate) fn graph_store_uri(&self) -> &str {
+        self.guard.graph_store_uri()
+    }
+
+    /// Revalidate the exact terminal profile after an operation has acquired
+    /// its final root/gate set. The initial factory check is not a substitute
+    /// for this pre-effect recapture.
+    pub(crate) fn validate_profile(&self, profile: &StreamProfileEntry) -> Result<()> {
+        validate_offline_maintenance_profile_binding(profile, &self.guard)
+    }
+}
+
 /// Engine-checked authority held by the sole served writer runtime.
 ///
 /// This value owns the lower process registration for the complete
@@ -228,6 +265,30 @@ fn validate_runtime_profile_binding(
     Ok(())
 }
 
+fn validate_offline_maintenance_profile_binding(
+    profile: &StreamProfileEntry,
+    guard: &ValidatedOfflineGuard<'_>,
+) -> Result<()> {
+    if profile.mode() != StreamProfileMode::Disabled {
+        return Err(OmniError::StreamingAuthorityMismatch {
+            reason: format!(
+                "offline stream maintenance requires exact DISABLED profile mode; graph is {}",
+                profile.mode().as_str()
+            ),
+        });
+    }
+    if profile.profile_revision != guard.expected_profile_revision() {
+        return Err(OmniError::StreamingAuthorityMismatch {
+            reason: format!(
+                "offline stream maintenance expected profile revision {} but graph is at {}",
+                guard.expected_profile_revision(),
+                profile.profile_revision
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl Omnigraph {
     /// Consume a lower stopped-writer guard into the only engine capability
     /// that can change the graph-global stream profile.
@@ -260,6 +321,45 @@ impl Omnigraph {
             Some(guard.actor()),
         )?;
         Ok(CheckedClusterApplyAuthority { guard })
+    }
+
+    /// Consume a lower stopped-writer guard into the only engine capability
+    /// that can run stream-aware offline maintenance.
+    ///
+    /// Operation adapters must retain this value through their effects and
+    /// call [`CheckedClusterMaintenanceAuthority::validate_profile`] after
+    /// acquiring their final gates. This factory check proves that the
+    /// capability was initially minted for this store, actor, operation class,
+    /// and exact terminal profile revision.
+    #[doc(hidden)]
+    pub async fn check_cluster_maintenance_authority<'lock>(
+        &self,
+        guard: ValidatedOfflineGuard<'lock>,
+    ) -> Result<CheckedClusterMaintenanceAuthority<'lock>> {
+        if guard.graph_store_uri() != self.uri() {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: format!(
+                    "validated maintenance store '{}' does not match opened graph '{}'",
+                    guard.graph_store_uri(),
+                    self.uri()
+                ),
+            });
+        }
+        if guard.operation() != AuthorityOperationClass::StreamMaintenance {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: "offline authority is not a stream-maintenance operation".to_string(),
+            });
+        }
+        self.enforce(
+            omnigraph_policy::PolicyAction::StreamManage,
+            &omnigraph_policy::ResourceScope::Graph,
+            Some(guard.actor()),
+        )?;
+
+        let _profile_gate = self.write_queue().acquire_stream_profile_shared().await;
+        let profile = self.current_canonical_stream_profile().await?;
+        validate_offline_maintenance_profile_binding(&profile, &guard)?;
+        Ok(CheckedClusterMaintenanceAuthority { guard })
     }
 
     /// Attach the one checked serving-runtime authority to this engine handle.
@@ -1043,6 +1143,146 @@ node Person {
         db.set_streaming_profile_checked(authority).await
     }
 
+    async fn check_maintenance_authority(
+        db: &Omnigraph,
+        cluster: &tempfile::TempDir,
+        state_cas: &str,
+        graph_store_uri: &str,
+        expected_profile_revision: u64,
+        operation_id: &str,
+        actor: &str,
+    ) -> Result<()> {
+        let cluster_uri = format!("file://{}", cluster.path().display());
+        let storage = storage_handle_for_uri(&cluster_uri).unwrap();
+        let lock_uri = format!("{cluster_uri}/__cluster/lock.json");
+        let lock = match acquire_state_lock(&storage, &lock_uri, "apply")
+            .await
+            .unwrap()
+        {
+            StateLockAcquire::Acquired(lock) => lock,
+            StateLockAcquire::Held => panic!("fresh test apply lock is already held"),
+        };
+        let declaration_digest = format!("sha256:{}", "d".repeat(64));
+        let guard = validate_offline_guard(
+            &lock,
+            OfflineAuthorityRequest {
+                graph_id: "knowledge",
+                graph_store_uri,
+                expected_state_cas: state_cas,
+                state_revision: 1,
+                declaration_revision: "stream-maintenance-declaration-v1",
+                declaration_digest: &declaration_digest,
+                expected_profile_revision,
+                operation_id,
+                operation: AuthorityOperationClass::StreamMaintenance,
+                actor,
+                confirm_stream_offline: true,
+            },
+        )
+        .await
+        .unwrap();
+        let authority = db.check_cluster_maintenance_authority(guard).await?;
+        assert_eq!(authority.operation_id(), operation_id);
+        assert_eq!(authority.actor(), actor);
+        assert_eq!(
+            authority.expected_profile_revision(),
+            expected_profile_revision
+        );
+        assert_eq!(authority.graph_store_uri(), graph_store_uri);
+        let profile = db.current_canonical_stream_profile().await?;
+        authority.validate_profile(&profile)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checked_maintenance_authority_requires_exact_disabled_profile_revision() {
+        let cluster = tempfile::tempdir().unwrap();
+        let state_cas = write_cluster_state(&cluster);
+        let graph = cluster.path().join("graphs/knowledge.omni");
+        let db = Omnigraph::init(graph.to_str().unwrap(), TEST_SCHEMA)
+            .await
+            .unwrap();
+
+        let other_graph = cluster.path().join("graphs/other.omni");
+        let other_db = Omnigraph::init(other_graph.to_str().unwrap(), TEST_SCHEMA)
+            .await
+            .unwrap();
+        let wrong_store = check_maintenance_authority(
+            &other_db,
+            &cluster,
+            &state_cas,
+            db.uri(),
+            1,
+            "maintenance-wrong-store",
+            "operator:alice",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            wrong_store,
+            OmniError::StreamingAuthorityMismatch { ref reason }
+                if reason.contains("does not match opened graph")
+        ));
+        check_maintenance_authority(
+            &db,
+            &cluster,
+            &state_cas,
+            db.uri(),
+            1,
+            "maintenance-at-disabled-r1",
+            "operator:alice",
+        )
+        .await
+        .unwrap();
+
+        let stale_revision = check_maintenance_authority(
+            &db,
+            &cluster,
+            &state_cas,
+            db.uri(),
+            2,
+            "maintenance-at-stale-revision",
+            "operator:alice",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            stale_revision,
+            OmniError::StreamingAuthorityMismatch { ref reason }
+                if reason.contains("expected profile revision 2 but graph is at 1")
+        ));
+
+        apply_profile(
+            &db,
+            &cluster,
+            &state_cas,
+            1,
+            "enable-before-maintenance",
+            AuthorityOperationClass::StreamProfileEnable,
+            "stream-declaration-enabled-v1",
+            &format!("sha256:{}", "a".repeat(64)),
+            "operator:alice",
+        )
+        .await
+        .unwrap();
+        let enabled = check_maintenance_authority(
+            &db,
+            &cluster,
+            &state_cas,
+            db.uri(),
+            2,
+            "maintenance-at-enabled-r2",
+            "operator:alice",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            enabled,
+            OmniError::StreamingAuthorityMismatch { ref reason }
+                if reason.contains("requires exact DISABLED profile mode; graph is ENABLED")
+        ));
+    }
+
     #[tokio::test]
     async fn checked_profile_enable_disable_and_receipt_first_replay() {
         let cluster = tempfile::tempdir().unwrap();
@@ -1180,6 +1420,19 @@ rules:
         let policy = PolicyEngine::load_graph(&policy_path, graph.to_str().unwrap()).unwrap();
         let db = db.with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>);
 
+        let denied_maintenance = check_maintenance_authority(
+            &db,
+            &cluster,
+            &state_cas,
+            db.uri(),
+            1,
+            "denied-maintenance-operation",
+            "operator:denied",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(denied_maintenance, OmniError::Policy(_)));
+
         let denied = apply_profile(
             &db,
             &cluster,
@@ -1269,7 +1522,7 @@ rules:
             crate::db::manifest::stream::stream_graph_identity_digest("stream-profile-test-domain")
                 .unwrap(),
             table.identity,
-            &crate::db::manifest::stream::binding_receipt_chain_genesis(),
+            &crate::db::manifest::stream::test_initial_binding_prior_chain(),
             binding_scope_id,
             enrollment_receipt.stream_incarnation_id.clone(),
             binding.clone(),

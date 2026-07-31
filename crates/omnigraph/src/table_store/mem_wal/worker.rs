@@ -37,7 +37,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, watch};
 
-use crate::db::manifest::stream::{ClaimReceipt, stream_physical_binding_digest};
+use crate::db::manifest::stream::{
+    ClaimReceipt, RetainedShardInventoryCommitment, retained_shard_inventory_commitment,
+    stream_physical_binding_digest,
+};
 use crate::db::manifest::stream_token::{
     STREAM_PAYLOAD_DIGEST_VERSION, STREAM_PAYLOAD_ENCODING_VERSION,
     STREAM_TOKEN_DERIVATION_VERSION, STREAM_TOKEN_WIRE_VERSION, StreamTokenAuthorityRow,
@@ -49,7 +52,7 @@ use crate::db::manifest::{
 };
 use crate::error::{OmniError, Result as OmniResult};
 
-use super::UNSHARDED_SPEC_ID;
+use super::{MAX_RETAINED_REBIND_SHARDS, UNSHARDED_SPEC_ID};
 
 /// Own a token and an already-invoked operation until that operation settles,
 /// then transfer the token to its continuation.  Deadlines may drop a waiter
@@ -729,6 +732,66 @@ pub(crate) async fn validate_b1_lifecycle_physical_state(
     dataset: &Dataset,
     lifecycle: &StreamLifecycleEntry,
 ) -> Result<PassiveB1PhysicalState, MemWalWorkerError> {
+    validate_b1_lifecycle_physical_state_impl(
+        dataset,
+        lifecycle,
+        None,
+        PassiveBindingInventoryValidation::CompleteRetainedPrefixes,
+    )
+    .await
+}
+
+/// Passive validation using the fixed-size retained-prefix commitment from the
+/// manifest-selected binding receipt. Only the lifecycle's current shard is
+/// opened or interpreted; older prefixes remain inert retained history.
+pub(crate) async fn validate_b1_lifecycle_physical_state_with_binding_inventory(
+    dataset: &Dataset,
+    lifecycle: &StreamLifecycleEntry,
+    retained_inventory: Option<&RetainedShardInventoryCommitment>,
+) -> Result<PassiveB1PhysicalState, MemWalWorkerError> {
+    validate_b1_lifecycle_physical_state_impl(
+        dataset,
+        lifecycle,
+        retained_inventory,
+        PassiveBindingInventoryValidation::CompleteRetainedPrefixes,
+    )
+    .await
+}
+
+/// Hot-path passive validation for the selected current binding only.
+///
+/// The caller must first authenticate `retained_inventory` from the
+/// manifest-selected `BindingReceipt`. Historical shard prefixes are inert and
+/// do not participate in writer admission, so ordinary capture must not relist
+/// them on every request. Cold open, rebind, and recovery continue to use
+/// [`validate_b1_lifecycle_physical_state_with_binding_inventory`] to compare
+/// the complete physical prefix set with that fixed-size commitment.
+pub(crate) async fn validate_b1_lifecycle_current_binding_physical_state(
+    dataset: &Dataset,
+    lifecycle: &StreamLifecycleEntry,
+    retained_inventory: Option<&RetainedShardInventoryCommitment>,
+) -> Result<PassiveB1PhysicalState, MemWalWorkerError> {
+    validate_b1_lifecycle_physical_state_impl(
+        dataset,
+        lifecycle,
+        retained_inventory,
+        PassiveBindingInventoryValidation::CurrentBindingOnly,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum PassiveBindingInventoryValidation {
+    CurrentBindingOnly,
+    CompleteRetainedPrefixes,
+}
+
+async fn validate_b1_lifecycle_physical_state_impl(
+    dataset: &Dataset,
+    lifecycle: &StreamLifecycleEntry,
+    retained_inventory: Option<&RetainedShardInventoryCommitment>,
+    inventory_validation: PassiveBindingInventoryValidation,
+) -> Result<PassiveB1PhysicalState, MemWalWorkerError> {
     lifecycle
         .validate()
         .map_err(|error| MemWalWorkerError::config(error.to_string()))?;
@@ -754,56 +817,71 @@ pub(crate) async fn validate_b1_lifecycle_physical_state(
         .map_err(|error| MemWalWorkerError::lance("passive config read", error))?
         .ok_or_else(|| MemWalWorkerError::state("lifecycle-bound table has no MemWAL index"))?;
     let (_, shard_id) = validate_stream_config_v3_binding(&details, &lifecycle.binding)?;
-    let shard_ids = dataset
-        .list_mem_wal_latest_shard_ids()
-        .await
-        .map_err(|error| MemWalWorkerError::lance("passive shard listing", error))?;
-    if shard_ids != vec![shard_id] {
-        return Err(MemWalWorkerError::state(format!(
-            "physical shard namespace differs from exact binding: expected [{shard_id}], observed {shard_ids:?}"
-        )));
-    }
+    require_selected_passive_shard_commitment(
+        lifecycle.binding_receipt_chain.record_count,
+        retained_inventory,
+    )?;
     let object_store = dataset
         .object_store(None)
         .await
         .map_err(|error| MemWalWorkerError::lance("passive shard store open", error))?;
-    let mem_wal_root = dataset.branch_location().path.join("_mem_wal");
-    let top_level = object_store
-        .inner
-        .list_with_delimiter(Some(&mem_wal_root))
-        .await
-        .map_err(|error| MemWalWorkerError::lance("passive MemWAL root listing", error))?;
-    if !top_level.objects.is_empty() {
-        return Err(MemWalWorkerError::state(format!(
-            "MemWAL root contains loose objects: {:?}",
-            top_level
-                .objects
-                .iter()
-                .map(|object| object.location.as_ref())
-                .collect::<Vec<_>>()
-        )));
-    }
-    let mut top_level_shards = top_level
-        .common_prefixes
-        .iter()
-        .map(|prefix| {
-            let name = prefix.filename().ok_or_else(|| {
-                MemWalWorkerError::state(format!(
-                    "MemWAL root contains an unnamed prefix {prefix:?}"
-                ))
-            })?;
-            ShardId::parse_str(name).map_err(|error| {
-                MemWalWorkerError::state(format!(
-                    "MemWAL root contains malformed shard prefix {name:?}: {error}"
-                ))
+    if matches!(
+        inventory_validation,
+        PassiveBindingInventoryValidation::CompleteRetainedPrefixes
+    ) {
+        let mut shard_ids = dataset
+            .list_mem_wal_latest_shard_ids()
+            .await
+            .map_err(|error| MemWalWorkerError::lance("passive shard listing", error))?;
+        shard_ids.sort_unstable();
+        require_committed_passive_shard_inventory(
+            lifecycle.binding_receipt_chain.record_count,
+            shard_id,
+            retained_inventory,
+            &shard_ids,
+            "physical shard namespace",
+        )?;
+
+        let mem_wal_root = dataset.branch_location().path.join("_mem_wal");
+        let top_level = object_store
+            .inner
+            .list_with_delimiter(Some(&mem_wal_root))
+            .await
+            .map_err(|error| MemWalWorkerError::lance("passive MemWAL root listing", error))?;
+        if !top_level.objects.is_empty() {
+            return Err(MemWalWorkerError::state(format!(
+                "MemWAL root contains loose objects: {:?}",
+                top_level
+                    .objects
+                    .iter()
+                    .map(|object| object.location.as_ref())
+                    .collect::<Vec<_>>()
+            )));
+        }
+        let mut top_level_shards = top_level
+            .common_prefixes
+            .iter()
+            .map(|prefix| {
+                let name = prefix.filename().ok_or_else(|| {
+                    MemWalWorkerError::state(format!(
+                        "MemWAL root contains an unnamed prefix {prefix:?}"
+                    ))
+                })?;
+                ShardId::parse_str(name).map_err(|error| {
+                    MemWalWorkerError::state(format!(
+                        "MemWAL root contains malformed shard prefix {name:?}: {error}"
+                    ))
+                })
             })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    top_level_shards.sort();
-    if top_level_shards != vec![shard_id] {
-        return Err(MemWalWorkerError::state(format!(
-            "MemWAL root prefixes differ from exact binding: expected [{shard_id}], observed {top_level_shards:?}"
-        )));
+            .collect::<Result<Vec<_>, _>>()?;
+        top_level_shards.sort();
+        require_committed_passive_shard_inventory(
+            lifecycle.binding_receipt_chain.record_count,
+            shard_id,
+            retained_inventory,
+            &top_level_shards,
+            "MemWAL root prefixes",
+        )?;
     }
     let manifest = ShardManifestStore::new(
         object_store,
@@ -857,6 +935,90 @@ pub(crate) async fn validate_b1_lifecycle_physical_state(
         }
         _ => unreachable!("exact_unmerged_generations bounded the result"),
     }
+}
+
+fn require_selected_passive_shard_commitment(
+    binding_receipt_record_count: u64,
+    retained_inventory: Option<&RetainedShardInventoryCommitment>,
+) -> Result<(), MemWalWorkerError> {
+    let Some(commitment) = retained_inventory else {
+        if binding_receipt_record_count != 2 {
+            return Err(MemWalWorkerError::state(
+                "strict initial-binding validation cannot accept a rebound lifecycle without a retained-shard commitment",
+            ));
+        }
+        return Ok(());
+    };
+    if binding_receipt_record_count <= 2 {
+        return Err(MemWalWorkerError::state(
+            "initial binding cannot carry a retained-shard commitment",
+        ));
+    }
+    let chain_derived_count = binding_receipt_record_count.checked_sub(1).ok_or_else(|| {
+        MemWalWorkerError::state("binding receipt retained-shard count underflow")
+    })?;
+    if commitment.retained_shard_count != chain_derived_count
+        || commitment.retained_shard_count == 0
+        || commitment.retained_shard_count > MAX_RETAINED_REBIND_SHARDS as u64
+    {
+        return Err(MemWalWorkerError::state(format!(
+            "selected retained-shard count {}, chain-derived count {chain_derived_count}, and maximum {MAX_RETAINED_REBIND_SHARDS} disagree",
+            commitment.retained_shard_count,
+        )));
+    }
+    Ok(())
+}
+
+fn require_committed_passive_shard_inventory(
+    binding_receipt_record_count: u64,
+    current_shard: ShardId,
+    retained_inventory: Option<&RetainedShardInventoryCommitment>,
+    observed: &[ShardId],
+    source: &'static str,
+) -> Result<(), MemWalWorkerError> {
+    require_selected_passive_shard_commitment(binding_receipt_record_count, retained_inventory)?;
+    let Some(commitment) = retained_inventory else {
+        if observed != [current_shard] {
+            return Err(MemWalWorkerError::state(format!(
+                "{source} differs from the exact initial singleton binding: expected [{current_shard}], observed {observed:?}"
+            )));
+        }
+        return Ok(());
+    };
+    if observed.is_empty() || observed.len() > MAX_RETAINED_REBIND_SHARDS {
+        return Err(MemWalWorkerError::state(format!(
+            "{source} must contain 1..={MAX_RETAINED_REBIND_SHARDS} shard prefixes"
+        )));
+    }
+    if observed.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(MemWalWorkerError::state(format!(
+            "{source} is not strictly sorted and duplicate-free"
+        )));
+    }
+    if observed.binary_search(&current_shard).is_err() {
+        return Err(MemWalWorkerError::state(format!(
+            "{source} omits current shard {current_shard}"
+        )));
+    }
+    let chain_derived_count = binding_receipt_record_count - 1;
+    let observed_count = u64::try_from(observed.len())
+        .map_err(|_| MemWalWorkerError::state("observed shard-prefix count overflow"))?;
+    if commitment.retained_shard_count != chain_derived_count
+        || observed_count != commitment.retained_shard_count
+    {
+        return Err(MemWalWorkerError::state(format!(
+            "{source} count {observed_count}, committed count {}, and chain-derived count {chain_derived_count} disagree",
+            commitment.retained_shard_count,
+        )));
+    }
+    let observed_commitment = retained_shard_inventory_commitment(observed)
+        .map_err(|error| MemWalWorkerError::state(error.to_string()))?;
+    if &observed_commitment != commitment {
+        return Err(MemWalWorkerError::state(format!(
+            "{source} differs from its selected binding-receipt commitment"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -4137,9 +4299,7 @@ impl MemWalWorkerRegistry {
                 .await
         })
         .await
-        .map_err(|error| {
-            MemWalWorkerError::state(format!("resume writer task failed: {error}"))
-        })?
+        .map_err(|error| MemWalWorkerError::state(format!("resume writer task failed: {error}")))?
     }
 
     async fn install_resumed_writer_background(
@@ -4220,9 +4380,8 @@ impl MemWalWorkerRegistry {
             Err(failure) => {
                 let (error, claimed) = failure.into_parts();
                 if let Some(claimed) = claimed {
-                    let worker = Arc::new(MemWalWorker::retiring_from_claimed(
-                        key, table_key, claimed,
-                    ));
+                    let worker =
+                        Arc::new(MemWalWorker::retiring_from_claimed(key, table_key, claimed));
                     let install = self.install_conservative_retiring_usage(&worker);
                     *slot_state = RegistrySlotState::Active(Arc::clone(&worker));
                     opening.notify_waiters();
@@ -4262,6 +4421,7 @@ impl MemWalWorkerRegistry {
         authority: CheckedExclusiveStreamAuthority,
         dataset: Dataset,
         draining: StreamLifecycleEntry,
+        retained_inventory: Option<RetainedShardInventoryCommitment>,
         current_claim: ClaimReceipt,
     ) -> Result<PassiveQuiesceDisposition, MemWalWorkerError> {
         let inflight = self.reserve_inflight_core()?;
@@ -4273,6 +4433,7 @@ impl MemWalWorkerRegistry {
                     authority,
                     dataset,
                     draining,
+                    retained_inventory,
                     current_claim,
                     inflight,
                 )
@@ -4290,6 +4451,7 @@ impl MemWalWorkerRegistry {
         authority: CheckedExclusiveStreamAuthority,
         dataset: Dataset,
         draining: StreamLifecycleEntry,
+        retained_inventory: Option<RetainedShardInventoryCommitment>,
         current_claim: ClaimReceipt,
         inflight: InFlightPermit,
     ) -> Result<PassiveQuiesceDisposition, MemWalWorkerError> {
@@ -4298,7 +4460,12 @@ impl MemWalWorkerRegistry {
         let authority = self
             .retire_current_owner_for_quiesce(&slot, key, authority)
             .await?;
-        let physical = validate_b1_lifecycle_physical_state(&dataset, &draining).await?;
+        let physical = validate_b1_lifecycle_physical_state_with_binding_inventory(
+            &dataset,
+            &draining,
+            retained_inventory.as_ref(),
+        )
+        .await?;
         self.passive_disposition_from_physical(
             key,
             authority,
@@ -4347,17 +4514,11 @@ impl MemWalWorkerRegistry {
                 replay_after_wal_entry_position,
                 writer_epoch,
             } => {
-                validate_passive_claim_epoch(
-                    current_claim,
-                    shard_manifest_version,
-                    writer_epoch,
-                )?;
+                validate_passive_claim_epoch(current_claim, shard_manifest_version, writer_epoch)?;
                 drop(inflight);
                 let base_merged_generation =
                     current_generation.checked_sub(1).ok_or_else(|| {
-                        MemWalWorkerError::state(
-                            "passive empty successor has generation zero",
-                        )
+                        MemWalWorkerError::state("passive empty successor has generation zero")
                     })?;
                 if draining
                     .selected_claim_empty_cut_disposition(
@@ -5017,8 +5178,7 @@ fn validate_passive_claim_epoch(
     {
         return Err(MemWalWorkerError::state(format!(
             "passive quiesce physical cut (manifest={shard_manifest_version}, epoch={writer_epoch}) differs from current claim (manifest={}, epoch={})",
-            current_claim.achieved_shard_manifest_version,
-            current_claim.achieved_writer_epoch,
+            current_claim.achieved_shard_manifest_version, current_claim.achieved_writer_epoch,
         )));
     }
     Ok(())
@@ -5309,8 +5469,7 @@ mod tests {
             AuthenticatedWalTail, BindingReceipt, ClaimProfile, ClaimReceiptPreimage,
             ClaimTerminalClassification, CurrentHeadWitness, DrainDescriptor, DrainGoal,
             EnrollmentReceipt, QUIESCE_REQUEST_PROTOCOL_VERSION, QuiesceRequestPayload,
-            authenticated_wal_tail_chain_digest, binding_receipt_chain_genesis,
-            stream_graph_identity_digest,
+            authenticated_wal_tail_chain_digest, stream_graph_identity_digest,
         };
         use lance::dataset::refs::BranchIdentifier;
 
@@ -5345,7 +5504,7 @@ mod tests {
         let binding_receipt = BindingReceipt::new(
             graph_identity_digest.clone(),
             key.identity,
-            &binding_receipt_chain_genesis(),
+            &crate::db::manifest::stream::test_initial_binding_prior_chain(),
             &binding_scope_id,
             &stream_incarnation_id,
             binding.clone(),
@@ -5534,6 +5693,117 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn passive_binding_inventory_accepts_only_selected_exact_commitment() {
+        let historical = ShardId::new_v4();
+        let current = ShardId::new_v4();
+        let mut authenticated = vec![historical, current];
+        authenticated.sort_unstable();
+        let commitment = retained_shard_inventory_commitment(&authenticated).unwrap();
+
+        require_committed_passive_shard_inventory(
+            2,
+            current,
+            None,
+            &[current],
+            "initial inventory",
+        )
+        .unwrap();
+        require_committed_passive_shard_inventory(
+            3,
+            current,
+            Some(&commitment),
+            &authenticated,
+            "rebound inventory",
+        )
+        .unwrap();
+
+        let mut reversed = authenticated.clone();
+        reversed.reverse();
+        assert!(
+            require_committed_passive_shard_inventory(
+                3,
+                current,
+                Some(&commitment),
+                &reversed,
+                "reversed inventory",
+            )
+            .is_err()
+        );
+        let mut with_foreign = authenticated.clone();
+        with_foreign.push(ShardId::new_v4());
+        with_foreign.sort_unstable();
+        assert!(
+            require_committed_passive_shard_inventory(
+                3,
+                current,
+                Some(&commitment),
+                &with_foreign,
+                "foreign inventory",
+            )
+            .is_err()
+        );
+        assert!(
+            require_committed_passive_shard_inventory(
+                3,
+                current,
+                Some(&commitment),
+                &authenticated[..1],
+                "missing inventory",
+            )
+            .is_err()
+        );
+        let mut wrong_digest = commitment.clone();
+        wrong_digest.retained_shard_set_digest = format!("sha256:{}", "0".repeat(64));
+        assert!(
+            require_committed_passive_shard_inventory(
+                3,
+                current,
+                Some(&wrong_digest),
+                &authenticated,
+                "wrong digest",
+            )
+            .is_err()
+        );
+        assert!(
+            require_committed_passive_shard_inventory(
+                2,
+                current,
+                Some(&commitment),
+                &[current],
+                "initial with commitment",
+            )
+            .is_err()
+        );
+        assert!(
+            require_committed_passive_shard_inventory(
+                3,
+                current,
+                None,
+                &authenticated,
+                "rebind without commitment",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn passive_current_binding_uses_only_fixed_size_selected_commitment() {
+        let historical = ShardId::new_v4();
+        let current = ShardId::new_v4();
+        let commitment = retained_shard_inventory_commitment(&[historical, current]).unwrap();
+
+        require_selected_passive_shard_commitment(2, None).unwrap();
+        require_selected_passive_shard_commitment(3, Some(&commitment)).unwrap();
+
+        assert!(require_selected_passive_shard_commitment(3, None).is_err());
+        assert!(require_selected_passive_shard_commitment(2, Some(&commitment)).is_err());
+
+        let mut wrong_count = commitment;
+        wrong_count.retained_shard_count += 1;
+        assert!(require_selected_passive_shard_commitment(3, Some(&wrong_count)).is_err());
     }
 
     fn batch(rows: usize) -> RecordBatch {
@@ -6729,21 +6999,15 @@ mod tests {
         future_target.validate().unwrap();
         assert!(validate_passive_drain_claim(key, &future_target, &claim).is_err());
         assert!(validate_passive_claim_epoch(&claim, 13, 7).is_err());
-        assert!(
-            validate_passive_unflushed_claim_physical_cut(&claim, 13, 6, 1).is_err()
-        );
+        assert!(validate_passive_unflushed_claim_physical_cut(&claim, 13, 6, 1).is_err());
         validate_passive_unflushed_claim_physical_cut(&claim, 14, 6, 2).unwrap();
         validate_passive_flushed_claim_physical_cut(&claim, 14, 6, 2).unwrap();
 
         let (_, stock_empty) = passive_test_drain_and_claim(key, 15, 7, 1, true);
         validate_passive_unflushed_claim_physical_cut(&stock_empty, 15, 7, 0).unwrap();
-        assert!(
-            validate_passive_unflushed_claim_physical_cut(&stock_empty, 15, 7, 1).is_err()
-        );
+        assert!(validate_passive_unflushed_claim_physical_cut(&stock_empty, 15, 7, 1).is_err());
         validate_passive_flushed_claim_physical_cut(&stock_empty, 16, 7, 1).unwrap();
-        assert!(
-            validate_passive_flushed_claim_physical_cut(&stock_empty, 16, 7, 0).is_err()
-        );
+        assert!(validate_passive_flushed_claim_physical_cut(&stock_empty, 16, 7, 0).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

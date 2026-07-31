@@ -2,14 +2,14 @@
 
 **Type:** implementation plan for in-flight work
 **Status:** slices F0–F1, F2 profile authority, the hidden F2 lifecycle tranche,
-private F3a resume/abort-drain, F3b EnsureIndices, and F3c Optimize are
-implemented. The current development strand selects internal schema v15,
+private F3a resume/abort-drain, F3b EnsureIndices, F3c Optimize, and F3d
+physical rebind are implemented. The current development strand selects internal schema v16,
 lifecycle protocol v3, recovery-v14 exact
 enrollment/claim/fold/drain/terminal-receipt owners, recovery-v15 exact
 `SEALED → OPEN` resume plus guarded `DRAINING → OPEN` abort, and recovery-v16
 same-binding `SEALED` EnsureIndices plus recovery-v17 same-binding `SEALED`
-Optimize. Public ingress and operator lifecycle verbs, correction/retirement,
-physical rebind, and every
+Optimize, and recovery-v18 private exact-`SEALED` physical rebind. Public
+ingress and operator lifecycle/rebind verbs, correction/retirement, and every
 maintenance transport surface remain inactive.
 **Design authority:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) — this
 file never overrides it. Where they disagree, the RFC wins and this file is
@@ -158,9 +158,10 @@ hidden lifecycle core can now drain a non-`SEALED` lane to `SEALED`, but no
 cluster/CLI/HTTP/SDK management path invokes it yet. There is still no
 caller-facing ingest, serial fold scheduler, dead-letter authority,
 correction/retirement, physical rebind, or public lifecycle and maintenance
-integration. Doc-hidden checked-runtime seams can run EnsureIndices and
-Optimize on productive enrolled tables only while they are exactly `SEALED`;
-their ambient forms remain fenced.
+integration. The doc-hidden offline seam can perform an exact physical rebind
+while the profile is terminal `DISABLED`; doc-hidden checked-runtime seams can
+run EnsureIndices and Optimize on productive enrolled tables only while they
+are exactly `SEALED`. Their ambient forms remain fenced.
 
 ---
 
@@ -175,7 +176,8 @@ their ambient forms remain fenced.
 | ~~F3a~~ | Private resume / guarded abort-drain | internal v13 + recovery v15 | implemented; public control activation remains closed |
 | ~~F3b EnsureIndices~~ | Checked-runtime, main-only, same-binding `SEALED` EnsureIndices | internal v14 + recovery v16 | implemented; no public maintenance surface |
 | ~~F3c Optimize~~ | Checked-runtime, main-only, same-binding `SEALED` Optimize | internal v15 + recovery v17 | implemented; no public maintenance surface |
-| **F3 remainder** | Physical rebind and `WITHDRAWN` retirement before correction can create it | finalized shapes only; frozen v14 scaffolds are never reinterpreted | after F3c Optimize |
+| ~~F3d physical rebind~~ | Offline, terminal-`DISABLED`, exact fresh-scope `SEALED` physical rebind | internal v16 + recovery v18 | implemented; no public rebind surface |
+| **F3 remainder** | Activate authority correction plus terminal `WITHDRAWN` retirement before correction can create it | finalized retirement/correction shape only; frozen v14 scaffolds are never reinterpreted | after F3d physical rebind |
 | **F4** | Hidden ingest vertical slice + lazy enrollment | audit | after F3 |
 | **F5** | Fold driver + minimal `DEAD_LETTERED` authority, one object, ordinary-ingest correction, and retirement | a new strand after lifecycle activation | after F4 |
 | **F6** | Guardrails + acceptance evidence | — | after F5 |
@@ -189,11 +191,12 @@ serial driver, then terminal authority/object recovery and cluster-only
 inspection/correction.
 Every sub-PR preserves the refusal for behavior it has not integrated.
 
-Five strict export/init/load rebuilds are already implemented across these
+Six strict export/init/load rebuilds are already implemented across these
 control/lifecycle slices: v10→v11/recovery-v13 profile authority,
 v11→v12/recovery-v14 lifecycle, v12→v13/recovery-v15 resume, and
-v13→v14/recovery-v16 SEALED EnsureIndices, and
-v14→v15/recovery-v17 SEALED Optimize. Each future persisted
+v13→v14/recovery-v16 SEALED EnsureIndices,
+v14→v15/recovery-v17 SEALED Optimize, and v15→v16/recovery-v18 physical
+rebind. Each future persisted
 grammar takes another strand when its final shape differs from a dormant
 scaffold. Dormant discriminator names never authorize reinterpretation of
 their frozen payload. The exact pre-release strand count is recorded as shapes
@@ -209,8 +212,9 @@ not enough: current
 optimize, index work, repair, cleanup, mutation/load, recovery, and schema
 apply even at `SEALED`, because they can move the table witness, alter
 token/binding authority, adopt drift, or destroy recovery evidence without a
-lifecycle-aware proof. F3 must integrate the exact
-witness/rebind transition before this plan may claim maintenance is available.
+lifecycle-aware proof. F3d now supplies the exact witness/rebind transition;
+the remaining F3 gate is correction plus terminal `WITHDRAWN` retirement before
+the plan may activate correction.
 See §10 for the ordering rationale.
 
 ---
@@ -722,14 +726,15 @@ writer a sidecar-covered witness/rebind transition.
   but fail closed under v14. V13/recovery-v15 activates the complete
   crate-private resume/guarded drain-abort owner without reinterpreting that
   scaffold. V14/recovery-v16 activates the distinct checked `SEALED`
-  EnsureIndices shape; current v15/recovery-v17 activates checked `SEALED`
-  Optimize without reinterpreting the older maintenance scaffold. Physical
-  rebind remains inactive. Historical recovery-v10 enrollment and recovery-v12
+  EnsureIndices shape; v15/recovery-v17 activates checked `SEALED` Optimize
+  without reinterpreting the older maintenance scaffold. Current
+  v16/recovery-v18 activates the complete private physical-rebind owner without
+  reinterpreting the three-field v14 rebind scaffold. Historical recovery-v10 enrollment and recovery-v12
   lifecycle-v2 base-plus-token fold retain their exact meanings and are refused
   under lifecycle-v3. A later F3 slice must activate retirement before correction
   can create `WITHDRAWN`; F5 must extend that exit before `DEAD_LETTERED`.
 - **Each lifecycle strand requires genuine binary evidence.** The historical
-  v11↔v12, v12↔v13, and v13↔v14 seams plus the current v14↔v15 seam use a genuine
+  v11↔v12, v12↔v13, v13↔v14, and v14↔v15 seams plus the current v15↔v16 seam use a genuine
   old-binary/new-format refusal and export/init/load rebuild test with the
   immutable final predecessor binary, not a stamp rewrite. The fixture is clean,
   disabled, and unenrolled because ordinary export does not transfer stream
@@ -859,9 +864,10 @@ including receipt-first idempotency, the recovery-owned physical claim,
 terminal claim/management receipts, and bounded current-binding ancestry
 validation. Public lifecycle surfaces remain absent. **F3b/F3c status:** the
 same-binding maintenance shapes are implemented separately for EnsureIndices
-and Optimize. Fresh physical rebind remains a separate effect shape and must
-not be smuggled through resume, recovery-v16, or recovery-v17; items 6 onward
-remain future work.
+and Optimize. **F3d status:** recovery-v18 separately implements fresh physical
+rebind for an exact `SEALED` lane; it was not smuggled through resume,
+recovery-v16, recovery-v17, or the frozen v14 scaffold. Public/production
+rebind and items 6 onward remain future work.
 
 ### 4.2 What must be built
 
@@ -933,6 +939,20 @@ remain future work.
    lifecycle HEAD witnesses, proofs, and revisions in the manifest CAS. A
    true no-work retry remains effect-free, and ambient/direct Optimize keeps
    the generic lifecycle refusal.
+
+   Internal schema v16 and recovery-v18 implement the separate physical-rebind
+   case. The private terminal-`DISABLED`, checked stopped/offline maintenance,
+   canonical-main owner consumes the complete prior `SEALED` authority,
+   creates a fresh enrollment and empty shard namespace, appends immutable
+   binding and fence-only claim receipts, and publishes the fresh binding with
+   one exact next `SEALED` proof. It
+   retains prior binding/claim history, admits no writer or put, and requires a
+   separate recovery-v15 resume to open the fresh scope. The v14 three-field
+   scaffold keeps its old bytes and remains refused. Hot open/admission proves
+   current authority with O(1) selected `BindingReceipt` + `ClaimReceipt`
+   point lookups and one fixed-size cumulative shard-set commitment; only the
+   terminal-`DISABLED` offline rebind owner walks the bounded binding history
+   to prove fresh identifier disjointness.
 
    The hidden served same-binding matrix now covers only content-preserving
    Optimize and EnsureIndices. Cluster-declared schema
@@ -1273,8 +1293,9 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
    This is not a public transport or product surface: SDK, HTTP, CLI, API DTO,
    and OpenAPI ingress remain absent. F3a now supplies the separate private
    resume/abort owner and bounded current-binding ancestry validation. The
-   checked-runtime EnsureIndices and Optimize bridges are active, while
-   physical rebind remains F3 work. Consequently this
+   checked-runtime EnsureIndices and Optimize bridges and private recovery-v18
+   physical-rebind owner are active, while public/production rebind remains
+   absent. Consequently this
    hidden tranche still does not make the formal F4 product milestone complete.
 3. **Lazy enrollment with a prepare handshake** (§4.7 P2) — every table is
    stream-eligible only while the profile is exactly `ENABLED`, but the wire
@@ -1354,9 +1375,9 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
    witness is ephemeral, no manifest/recovery grammar changed, and the only
    externally reachable adapter remains the feature-gated test seam. This
    slice originally failed closed unless the current binding was still the
-   initial binding. F3a replaces that shortcut with bounded current-binding
-   chain validation; no code may mint a new physical binding until F3b's rebind
-   effect and receipt shape become active.
+   initial binding. F3a replaced that shortcut with bounded current-binding
+   chain validation, and F3d now owns the only private physical-binding mint
+   through recovery-v18's exact rebind effect and receipt shape.
 
    This activates the actor-bound `EnrollmentReceiptV2` and
    `StreamEnrollmentV2` selected by the implemented hidden

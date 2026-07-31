@@ -68,6 +68,10 @@ use super::{
     TableRegistration, TableRename, TableTombstone, TableVersionExpectation,
 };
 
+#[path = "recovery/stream_rebind_v18.rs"]
+mod stream_rebind_v18;
+pub(crate) use stream_rebind_v18::*;
+
 /// System actor identifier for recovery-owned lineage: legacy recovery,
 /// exact-protocol rollback, schema-v6 EnsureIndices rollback, and orphan
 /// discard. A v3/v4 roll-forward
@@ -449,7 +453,12 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// boundary, then binds the complete achieved table updates and composite HEAD
 /// witnesses before roll-forward is allowed. V16 remains the exact
 /// caller-minted CreateIndex grammar and is not reinterpreted.
-pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 17;
+///
+/// v17 → v18: RFC-026 F3d physical rebind. V18 owns the complete old SEALED
+/// authority, exact retained-object inventory, fresh MemWAL replacement and
+/// initial fence, terminal ledger transaction, and sole fresh SEALED publish.
+/// The frozen v14 scaffold and v17 Optimize envelope keep their old meanings.
+pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 18;
 
 /// The only recovery generation emitted by the manifest-v5 write paths.
 pub(crate) const IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION: u32 = 9;
@@ -485,6 +494,9 @@ pub(crate) const STREAM_SEALED_MAINTENANCE_SIDECAR_SCHEMA_VERSION: u32 = 16;
 /// effects are Lance-owned multi-commit maintenance operations rather than one
 /// caller-minted transaction per table.
 pub(crate) const STREAM_SEALED_OPTIMIZE_SIDECAR_SCHEMA_VERSION: u32 = 17;
+
+/// Exact offline SEALED physical-rebind generation.
+pub(crate) const STREAM_REBIND_SIDECAR_SCHEMA_VERSION: u32 = 18;
 
 /// Schema v11 is the first sidecar allowed to describe data-bearing MemWAL
 /// state, which is bound to stream-config v2 rather than Phase A's config-v1.
@@ -2012,6 +2024,9 @@ pub(crate) struct RecoverySidecar {
     /// multi-commit transaction sequence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v17: Option<Box<RecoveryProtocolV17>>,
+    /// Exact RFC-026 offline physical-rebind envelope (schema v18 only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_v18: Option<Box<RecoveryProtocolV18>>,
     /// EnsureIndices-only fixed rollback identity. It does not make the
     /// physical index effects exact; it only makes compensation retry-safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2029,6 +2044,11 @@ impl RecoverySidecar {
                 self.protocol_v15
                     .as_deref()
                     .map(RecoveryProtocolV15::admission_scope)
+            })
+            .or_else(|| {
+                self.protocol_v18
+                    .as_deref()
+                    .map(RecoveryProtocolV18::admission_scope)
             })
     }
 }
@@ -2525,6 +2545,14 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             STREAM_SEALED_OPTIMIZE_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
         )));
     }
+    if sidecar.protocol_v18.is_some()
+        && sidecar.schema_version != STREAM_REBIND_SIDECAR_SCHEMA_VERSION
+    {
+        return Err(malformed(format!(
+            "protocol_v18 requires schema-v{}, found schema-v{}",
+            STREAM_REBIND_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
+        )));
+    }
 
     if sidecar.schema_version < EXACT_EFFECT_IDENTITY_SCHEMA_VERSION {
         if sidecar.protocol_v3.is_some()
@@ -2539,6 +2567,7 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             || sidecar.protocol_v15.is_some()
             || sidecar.protocol_v16.is_some()
             || sidecar.protocol_v17.is_some()
+            || sidecar.protocol_v18.is_some()
         {
             return Err(malformed(
                 "an exact-effect protocol is present on a pre-v3 sidecar".to_string(),
@@ -2577,6 +2606,10 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
 
     if sidecar.schema_version == STREAM_SEALED_OPTIMIZE_SIDECAR_SCHEMA_VERSION {
         return validate_stream_protocol_v17_shape(sidecar_uri, sidecar);
+    }
+
+    if sidecar.schema_version == STREAM_REBIND_SIDECAR_SCHEMA_VERSION {
+        return validate_stream_protocol_v18_shape(sidecar_uri, sidecar);
     }
 
     if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
@@ -5111,7 +5144,9 @@ where
     let expected_summary_operation_id = protocol
         .drain_authority
         .as_ref()
-        .map_or(sidecar.operation_id.as_str(), |drain| drain.drain_id.as_str());
+        .map_or(sidecar.operation_id.as_str(), |drain| {
+            drain.drain_id.as_str()
+        });
     if summary.operation_id != expected_summary_operation_id
         || summary.graph_commit_id.as_deref() != Some(protocol.lineage.graph_commit_id.as_str())
         || summary.exact_generation_cut != stream_fold_v14_generation_cut(&protocol.generation_cut)
@@ -5252,8 +5287,7 @@ fn validate_stream_fold_resume_management_receipt_v14(
     let next_chain = receipt.next_chain_ref()?;
     if receipt.graph_identity_digest != expected_graph_digest
         || receipt.identity != lifecycle.identity
-        || receipt.stream_incarnation_id
-            != lifecycle.enrollment_receipt.stream_incarnation_id
+        || receipt.stream_incarnation_id != lifecycle.enrollment_receipt.stream_incarnation_id
         || receipt.binding_scope_id != lifecycle.binding_scope_id
         || receipt.operation_kind != STREAM_RESUME_OPERATION_KIND
         || receipt.operation_id != resume_id
@@ -5266,8 +5300,7 @@ fn validate_stream_fold_resume_management_receipt_v14(
         || receipt.result_payload != expected_result
         || request.graph_identity_digest != expected_graph_digest
         || request.identity != lifecycle.identity
-        || request.stream_incarnation_id
-            != lifecycle.enrollment_receipt.stream_incarnation_id
+        || request.stream_incarnation_id != lifecycle.enrollment_receipt.stream_incarnation_id
         || request.binding_scope_id != lifecycle.binding_scope_id
         || request.enrollment_id != lifecycle.binding.enrollment_id
         || request.resume_id != resume_id
@@ -5836,10 +5869,9 @@ where
     let lifecycle = &protocol.prior_lifecycle;
     let Some(receipt) = protocol.prior_claim_receipt.as_ref() else {
         let genesis_chain = super::stream::claim_receipt_chain_genesis();
-        let genesis_tail = super::stream::AuthenticatedWalTail::genesis(
-            &lifecycle.binding_scope_id,
-        )
-        .map_err(|error| malformed(format!("invalid genesis WAL tail: {error}")))?;
+        let genesis_tail =
+            super::stream::AuthenticatedWalTail::genesis(&lifecycle.binding_scope_id)
+                .map_err(|error| malformed(format!("invalid genesis WAL tail: {error}")))?;
         if protocol.request.mode != super::stream::StreamResumeMode::AbortDrain
             || lifecycle.current_claim_receipt_id.is_some()
             || lifecycle.claim_receipt_chain != genesis_chain
@@ -5852,11 +5884,9 @@ where
         }
         return Ok(());
     };
-    receipt.validate().map_err(|error| {
-        malformed(format!(
-            "invalid selected pre-resume ClaimReceipt: {error}"
-        ))
-    })?;
+    receipt
+        .validate()
+        .map_err(|error| malformed(format!("invalid selected pre-resume ClaimReceipt: {error}")))?;
     let expected_graph_digest =
         super::stream::stream_graph_identity_digest(&protocol.authority.schema_identity_domain)
             .map_err(|error| malformed(format!("invalid graph identity digest: {error}")))?;
@@ -6040,7 +6070,12 @@ where
                 .to_string(),
         ));
     }
-    validate_canonical_uuid_text(malformed, "StreamResume resume_id", &request.resume_id, true)?;
+    validate_canonical_uuid_text(
+        malformed,
+        "StreamResume resume_id",
+        &request.resume_id,
+        true,
+    )?;
     if request.actor_id.is_empty() || request.actor_id.trim() != request.actor_id {
         return Err(malformed(
             "StreamResume actor must be non-empty canonical text".to_string(),
@@ -6072,8 +6107,7 @@ where
         || plan.expected_base_head != protocol.prior_lifecycle.current_head_witness
         || protocol.prior_lifecycle.binding.shard_ids.as_slice() != [plan.shard_id.as_str()]
         || plan.minimum_next_epoch_floor <= current_epoch
-        || protocol.operation.lifecycle_operation_id.as_deref()
-            != Some(request.resume_id.as_str())
+        || protocol.operation.lifecycle_operation_id.as_deref() != Some(request.resume_id.as_str())
         || protocol.operation.shard_id != plan.shard_id
     {
         return Err(malformed(
@@ -6106,7 +6140,9 @@ where
         let management = &terminal.management_receipt;
         management
             .validate(terminal.next_lifecycle.lifecycle_revision)
-            .map_err(|error| malformed(format!("invalid StreamResume management receipt: {error}")))?;
+            .map_err(|error| {
+                malformed(format!("invalid StreamResume management receipt: {error}"))
+            })?;
         if management.operation_id != request.resume_id
             || management.operation_kind != STREAM_RESUME_OPERATION_KIND
             || management.request_payload != request_payload
@@ -7830,15 +7866,15 @@ pub(crate) async fn restore_table_to_version(
 /// as `Omnigraph::refresh` documents.
 ///
 /// Concurrency: unlike the open-time sweep, this runs while other writers may
-/// be in flight. Physical writers hold root-scoped stream admission → schema →
-/// branch → sorted-table gates across their sidecar/effect lifetime. Healing
-/// takes the ordered superset, so it blocks until the sidecar writer either
+/// be in flight. Physical writers hold root-scoped stream profile → admission
+/// → schema → branch → sorted-table gates across their sidecar/effect lifetime.
+/// Healing takes the ordered superset, so it blocks until the sidecar writer either
 /// finished (sidecar deleted; the under-gate reread skips it) or died
 /// (the freshly parsed sidecar is genuinely orphaned and safe to process). Without this, the
 /// heal could observe a live writer's sidecar in its commit→publish
 /// window, roll it forward, and fail that writer's own publish CAS.
-/// Lock order is stream admission → schema → branch → sorted tables →
-/// coordinator, matching the RFC-022 writer and Full-recovery paths.
+/// Lock order is stream profile → admission → schema → branch → sorted tables
+/// → coordinator, matching the RFC-022 writer and Full-recovery paths.
 ///
 /// The schema-staging reconcile runs lazily, per SchemaApply sidecar,
 /// AFTER that sidecar's queue guards are held and its existence is
@@ -7872,34 +7908,30 @@ pub(crate) struct HealPendingOutcome {
     pub(crate) unresolved: Vec<UnresolvedRecoveryIntent>,
 }
 
-pub(crate) async fn heal_pending_sidecars_roll_forward(
-    root_uri: &str,
+#[derive(Debug)]
+struct HealOneSidecarOutcome {
+    processed_any: bool,
+    unresolved: Option<UnresolvedRecoveryIntent>,
+}
+
+/// Own one discovered sidecar from gate acquisition through its under-gate
+/// reread and terminal classification. Ownership is deliberate: recovery-v18
+/// can run this future from a fresh task without letting cancellation release
+/// the guards while its irreversible continuation is still running.
+fn heal_one_sidecar_roll_forward(
+    root_uri: String,
     storage: std::sync::Arc<dyn StorageAdapter>,
-    coordinator: &tokio::sync::RwLock<GraphCoordinator>,
-    write_queue: &crate::db::write_queue::WriteQueueManager,
-) -> Result<HealPendingOutcome> {
-    let sidecars = list_sidecars(root_uri, storage.as_ref()).await?;
-    if sidecars.is_empty() {
-        return Ok(HealPendingOutcome {
-            processed_any: false,
-            unresolved: Vec::new(),
-        });
-    }
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_POST_LIST_PRE_GATES)?;
-    let mut processed_any = false;
-    let mut unresolved = Vec::new();
-    for sidecar in sidecars {
-        // Serialize against a possibly-live writer (see fn docs). Guards are
-        // scoped per sidecar and follow the one total order shared by writers,
-        // Full recovery, and live healing. Admission is outermost: an ordinary
-        // sidecar takes shared admission (the same class as its original base
-        // effect), while enrollment closes admission exclusively. Taking
-        // schema + branch even for an empty/legacy sidecar also serializes its
-        // audit/delete lifecycle.
+    write_queue: std::sync::Arc<crate::db::write_queue::WriteQueueManager>,
+    sidecar: RecoverySidecar,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<HealOneSidecarOutcome>> + Send + 'static>,
+> {
+    Box::pin(async move {
         let mut _shared_profile_guard = None;
         let mut _exclusive_profile_guard = None;
         if sidecar.writer_kind == SidecarKind::StreamProfileChange {
-            _exclusive_profile_guard = Some(write_queue.acquire_stream_profile_exclusive().await);
+            _exclusive_profile_guard =
+                Some(write_queue.acquire_stream_profile_exclusive().await);
         } else {
             _shared_profile_guard = Some(write_queue.acquire_stream_profile_shared().await);
         }
@@ -7943,45 +7975,27 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
             .collect();
         let is_schema_apply = matches!(sidecar.writer_kind, SidecarKind::SchemaApply);
         let _table_guards = write_queue.acquire_many(&queue_keys).await;
-        // Re-read after the wait: the writer we blocked on may have completed
-        // Phase C and deleted the sidecar, or may have durably confirmed Phase B
-        // before releasing its gates.  Processing the pre-wait body would turn a
-        // fully confirmed effect set back into an apparent partial one.
+
         let Some(sidecar) =
-            reread_sidecar_under_gates(root_uri, storage.as_ref(), &sidecar).await?
+            reread_sidecar_under_gates(&root_uri, storage.as_ref(), &sidecar).await?
         else {
-            continue;
+            return Ok(HealOneSidecarOutcome {
+                processed_any: false,
+                unresolved: None,
+            });
         };
-        // Recovery sidecar `branch: None` is canonical main authority, not
-        // "the branch this handle happens to be bound to". A long-lived
-        // handle may have called `sync_branch` since it opened, so its
-        // handle-local coordinator cannot classify main-only recovery. Open
-        // and refresh main explicitly under the sidecar gates. Reuse that one
-        // coherent capture for schema staging, branch-existence authority, and
-        // canonical-main sidecar classification.
-        // Keep the cold coordinator-open future and retained coordinator off
-        // the already-deep live-writer stack. Mutation/Load enters this healer
-        // through several async adapter layers, and the recovery dispatcher is
-        // boxed below for the same reason.
         let mut main_coord = Box::new(
             Box::pin(GraphCoordinator::open(
-                root_uri,
+                &root_uri,
                 std::sync::Arc::clone(&storage),
             ))
             .await?,
         );
         Box::pin(main_coord.refresh()).await?;
 
-        // Schema-staging reconcile, per SchemaApply sidecar, UNDER the
-        // sidecar's guards: a sidecar still on disk after the queue wait
-        // belongs to a dead writer, so promoting its staging files can no
-        // longer race the live apply's own renames or steal its commit.
-        // It also re-runs per sidecar, so a multi-sidecar pass never
-        // classifies against a reconcile result an earlier roll-forward
-        // staled. Non-SchemaApply sidecars never consult the value.
         let schema_state_recovery = if is_schema_apply {
             crate::db::schema_state::recover_schema_state_files(
-                root_uri,
+                &root_uri,
                 std::sync::Arc::clone(&storage),
                 &main_coord.snapshot(),
             )
@@ -7989,63 +8003,112 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
         } else {
             SchemaStateRecovery::Noop
         };
-        // Fresh per-branch snapshot — same rationale as
-        // `recover_manifest_drift`: classify against the branch the
-        // sidecar's writer targeted, refreshed after any prior
-        // sidecar's roll-forward.
         let branch_snapshot = match sidecar.branch.as_deref() {
-            Some(b) => {
-                // Orphan check against the manifest's branch list (the
-                // authority) BEFORE opening: a deferred sidecar whose
-                // branch was deleted would otherwise wedge every write
-                // on the dead-branch open.
+            Some(branch) => {
                 let branch_exists = main_coord
                     .all_branches()
                     .await?
                     .iter()
-                    .any(|name| name == b);
+                    .any(|name| name == branch);
                 if !branch_exists {
-                    discard_orphaned_branch_sidecar(root_uri, storage.as_ref(), &sidecar).await?;
-                    processed_any = true;
-                    continue;
+                    discard_orphaned_branch_sidecar(&root_uri, storage.as_ref(), &sidecar).await?;
+                    return Ok(HealOneSidecarOutcome {
+                        processed_any: true,
+                        unresolved: None,
+                    });
                 }
-                let mut branch_coord =
-                    GraphCoordinator::open_branch(root_uri, b, std::sync::Arc::clone(&storage))
-                        .await?;
+                let mut branch_coord = GraphCoordinator::open_branch(
+                    &root_uri,
+                    branch,
+                    std::sync::Arc::clone(&storage),
+                )
+                .await?;
                 branch_coord.refresh().await?;
                 branch_coord.snapshot()
             }
             None => main_coord.snapshot(),
         };
-        // Keep the writer-specific recovery dispatcher off this already-deep
-        // heal future. Recovery-v11 adds another exact classifier, and embedding
-        // the complete dispatcher state here can exceed Tokio's ordinary worker
-        // stack even when the active sidecar is an older protocol.
-        if Box::pin(process_sidecar(
-            root_uri,
+        if process_sidecar(
+            &root_uri,
             &storage,
             &branch_snapshot,
             &sidecar,
             RecoveryMode::RollForwardOnly,
             schema_state_recovery,
-        ))
+        )
         .await?
         {
-            processed_any = true;
-        } else {
-            let mut table_keys = sidecar
-                .tables
-                .iter()
-                .map(|pin| pin.table_key.clone())
-                .collect::<Vec<_>>();
-            table_keys.sort();
-            table_keys.dedup();
-            unresolved.push(UnresolvedRecoveryIntent {
+            return Ok(HealOneSidecarOutcome {
+                processed_any: true,
+                unresolved: None,
+            });
+        }
+
+        let mut table_keys = sidecar
+            .tables
+            .iter()
+            .map(|pin| pin.table_key.clone())
+            .collect::<Vec<_>>();
+        table_keys.sort();
+        table_keys.dedup();
+        Ok(HealOneSidecarOutcome {
+            processed_any: false,
+            unresolved: Some(UnresolvedRecoveryIntent {
                 operation_id: sidecar.operation_id.clone(),
                 branch: sidecar.branch.clone().filter(|branch| branch != "main"),
                 writer_kind: sidecar.writer_kind,
                 table_keys,
-            });
+            }),
+        })
+    })
+}
+
+pub(crate) async fn heal_pending_sidecars_roll_forward(
+    root_uri: &str,
+    storage: std::sync::Arc<dyn StorageAdapter>,
+    coordinator: &tokio::sync::RwLock<GraphCoordinator>,
+    write_queue: std::sync::Arc<crate::db::write_queue::WriteQueueManager>,
+) -> Result<HealPendingOutcome> {
+    let sidecars = list_sidecars(root_uri, storage.as_ref()).await?;
+    if sidecars.is_empty() {
+        return Ok(HealPendingOutcome {
+            processed_any: false,
+            unresolved: Vec::new(),
+        });
+    }
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_POST_LIST_PRE_GATES)?;
+    let mut processed_any = false;
+    let mut unresolved = Vec::new();
+    for sidecar in sidecars {
+        let outcome = if sidecar.schema_version == STREAM_REBIND_SIDECAR_SCHEMA_VERSION {
+            // The v18 continuation reaches deep Lance coordinator planning.
+            // Its fresh task owns the complete gate envelope, under-gate
+            // reread, classification, and effects, so parent cancellation can
+            // never release recovery ownership while the child keeps running.
+            let root_uri = root_uri.to_string();
+            let storage = std::sync::Arc::clone(&storage);
+            let write_queue = std::sync::Arc::clone(&write_queue);
+            crate::instrumentation::spawn_with_query_io_probes(
+                heal_one_sidecar_roll_forward(root_uri, storage, write_queue, sidecar),
+            )
+            .await
+            .map_err(|error| {
+                OmniError::Lance(format!(
+                    "stream rebind recovery owner task failed before returning its exact outcome: {error}"
+                ))
+            })??
+        } else {
+            heal_one_sidecar_roll_forward(
+                root_uri.to_string(),
+                std::sync::Arc::clone(&storage),
+                std::sync::Arc::clone(&write_queue),
+                sidecar,
+            )
+            .await?
+        };
+        processed_any |= outcome.processed_any;
+        if let Some(intent) = outcome.unresolved {
+            unresolved.push(intent);
         }
     }
     // Re-read coordinator state so the caller's handle observes the
@@ -8169,8 +8232,9 @@ pub(crate) fn schema_apply_serial_queue_key() -> crate::db::write_queue::TableQu
 /// Concurrency: a newly-opening handle is not yet published, but another handle
 /// for the same root may already be serving writes. Every handle obtains the
 /// root-scoped [`WriteQueueManager`](crate::db::write_queue::WriteQueueManager).
-/// The caller holds its schema gate across schema-file recovery and this whole
-/// pass; Full recovery adds branch → sorted table gates per sidecar and
+/// The mutable-open caller holds root profile-exclusive → prelisted stream
+/// admission → schema gates across schema-file recovery and this whole pass;
+/// Full recovery adds branch → sorted table gates per sidecar and
 /// re-reads/re-parses the sidecar after waiting. A live writer either finishes
 /// and deletes its sidecar (recovery skips it), durably confirms a newer body
 /// (recovery classifies that body), or releases the gates with a genuinely pending
@@ -8255,14 +8319,14 @@ pub(crate) async fn recover_manifest_drift(
         // `process_sidecar` is a large closed dispatcher. Box its state at the
         // full-sweep boundary so adding an unreachable protocol branch cannot
         // inflate every older recovery call beyond Tokio's default stack.
-        Box::pin(process_sidecar(
+        process_sidecar(
             root_uri,
             &storage,
             &branch_snapshot,
             &sidecar,
             mode,
             schema_state_recovery,
-        ))
+        )
         .await?;
     }
     // Final refresh so the caller sees the post-sweep state.
@@ -12850,10 +12914,7 @@ fn stream_resume_protocol_v15_mut(sidecar: &mut RecoverySidecar) -> &mut Recover
     protocol
 }
 
-fn stream_resume_error_v15(
-    sidecar: &RecoverySidecar,
-    reason: impl std::fmt::Display,
-) -> OmniError {
+fn stream_resume_error_v15(sidecar: &RecoverySidecar, reason: impl std::fmt::Display) -> OmniError {
     OmniError::recovery_required(
         sidecar.operation_id.clone(),
         format!("StreamResume recovery cannot prove an exact outcome: {reason}"),
@@ -12890,9 +12951,11 @@ fn stream_resume_ledger_records_v15(
         records.push(super::token_store::LifecycleLedgerRecord::ClaimReceipt(
             terminal.claim_receipt.clone(),
         ));
-        records.push(super::token_store::LifecycleLedgerRecord::ManagementReceipt(
-            terminal.management_receipt.clone(),
-        ));
+        records.push(
+            super::token_store::LifecycleLedgerRecord::ManagementReceipt(
+                terminal.management_receipt.clone(),
+            ),
+        );
     }
     records
 }
@@ -12996,8 +13059,7 @@ async fn observe_stream_resume_ledger_v15(
         observed_management.as_ref(),
     ) {
         (Some(terminal), Some(claim), Some(management))
-            if claim == &terminal.claim_receipt
-                && management == &terminal.management_receipt => {}
+            if claim == &terminal.claim_receipt && management == &terminal.management_receipt => {}
         (None, None, None) => {}
         _ => {
             return Err(stream_resume_error_v15(
@@ -13042,10 +13104,7 @@ fn stream_resume_manifest_is_checkpoint_v15(
             == Some(&protocol.prior_lifecycle)
 }
 
-fn stream_resume_manifest_is_terminal_v15(
-    snapshot: &Snapshot,
-    sidecar: &RecoverySidecar,
-) -> bool {
+fn stream_resume_manifest_is_terminal_v15(snapshot: &Snapshot, sidecar: &RecoverySidecar) -> bool {
     let protocol = stream_resume_protocol_v15(sidecar);
     let (Some(ledger), Some(terminal)) = (protocol.ledger.as_ref(), protocol.terminal.as_ref())
     else {
@@ -13289,9 +13348,7 @@ async fn mark_stream_resume_checkpoint_visible_v15(
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
 ) -> Result<RecoverySidecar> {
-    if stream_resume_protocol_v15(sidecar).phase
-        == RecoveryStreamClaimPhaseV14::CheckpointVisible
-    {
+    if stream_resume_protocol_v15(sidecar).phase == RecoveryStreamClaimPhaseV14::CheckpointVisible {
         return Ok(sidecar.clone());
     }
     let mut checkpoint = sidecar.clone();
@@ -13315,7 +13372,9 @@ fn stream_resume_terminal_outcome_v15(
         .ledger
         .as_ref()
         .and_then(|ledger| ledger.next_authority.clone())
-        .ok_or_else(|| stream_resume_error_v15(sidecar, "terminal outcome has no token authority"))?;
+        .ok_or_else(|| {
+            stream_resume_error_v15(sidecar, "terminal outcome has no token authority")
+        })?;
     Ok(RecoveryStreamResumeOutcomeV15::TerminalVisible {
         lifecycle: terminal.next_lifecycle.clone(),
         token_authority,
@@ -13511,12 +13570,9 @@ async fn process_stream_resume_sidecar_v15_typed(
     if observed.state == StreamClaimLedgerObservationState::ExactNoEffect {
         match stream_resume_protocol_v15(sidecar).phase {
             RecoveryStreamClaimPhaseV14::LedgerArmed => {
-                confirmed = restage_missing_stream_resume_ledger_v15(
-                    root_uri,
-                    storage.as_ref(),
-                    sidecar,
-                )
-                .await?;
+                confirmed =
+                    restage_missing_stream_resume_ledger_v15(root_uri, storage.as_ref(), sidecar)
+                        .await?;
             }
             RecoveryStreamClaimPhaseV14::LedgerEffectsConfirmed
             | RecoveryStreamClaimPhaseV14::CheckpointVisible => {
@@ -13530,8 +13586,7 @@ async fn process_stream_resume_sidecar_v15_typed(
                 unreachable!("handled before resume-ledger observation")
             }
         }
-    } else if stream_resume_protocol_v15(sidecar).phase
-        == RecoveryStreamClaimPhaseV14::LedgerArmed
+    } else if stream_resume_protocol_v15(sidecar).phase == RecoveryStreamClaimPhaseV14::LedgerArmed
     {
         confirm_stream_resume_sidecar_v15(
             root_uri,
@@ -13569,13 +13624,8 @@ async fn process_stream_resume_sidecar_v15_typed(
                 "terminal manifest CAS did not select the exact resume token pointer and OPEN lifecycle",
             ));
         }
-        finalize_visible_stream_resume_v15(
-            root_uri,
-            storage.as_ref(),
-            &confirmed,
-            cleanup_policy,
-        )
-        .await
+        finalize_visible_stream_resume_v15(root_uri, storage.as_ref(), &confirmed, cleanup_policy)
+            .await
     } else {
         if !stream_resume_manifest_is_checkpoint_v15(&fresh, &confirmed) {
             return Err(stream_resume_error_v15(
@@ -13627,7 +13677,25 @@ pub(crate) async fn complete_stream_resume_sidecar_v15(
     .await
 }
 
-async fn process_sidecar(
+fn process_sidecar<'a>(
+    root_uri: &'a str,
+    storage: &'a std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &'a Snapshot,
+    sidecar: &'a RecoverySidecar,
+    mode: RecoveryMode,
+    schema_state_recovery: SchemaStateRecovery,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + 'a>> {
+    Box::pin(process_sidecar_inner(
+        root_uri,
+        storage,
+        snapshot,
+        sidecar,
+        mode,
+        schema_state_recovery,
+    ))
+}
+
+async fn process_sidecar_inner(
     root_uri: &str,
     storage: &std::sync::Arc<dyn StorageAdapter>,
     snapshot: &Snapshot,
@@ -13672,6 +13740,9 @@ async fn process_sidecar(
             root_uri, storage, snapshot, sidecar, mode,
         )
         .await;
+    }
+    if sidecar.schema_version == STREAM_REBIND_SIDECAR_SCHEMA_VERSION {
+        return process_stream_rebind_sidecar_v18(root_uri, storage, snapshot, sidecar).await;
     }
     if sidecar.schema_version == STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION {
         return match sidecar
@@ -18531,6 +18602,7 @@ fn new_unvalidated_sidecar(
         protocol_v15: None,
         protocol_v16: None,
         protocol_v17: None,
+        protocol_v18: None,
         ensure_indices_rollback_v6: None,
     }
 }
@@ -18659,9 +18731,10 @@ fn new_stream_fold_sidecar_v14_inner(
                 "StreamFoldV14 construction requires a complete planned fold summary",
             )
         })?;
-    summary.operation_id = drain_authority
-        .as_ref()
-        .map_or_else(|| sidecar.operation_id.clone(), |drain| drain.drain_id.clone());
+    summary.operation_id = drain_authority.as_ref().map_or_else(
+        || sidecar.operation_id.clone(),
+        |drain| drain.drain_id.clone(),
+    );
     let protocol = RecoveryStreamFoldV14 {
         authority,
         lineage,
@@ -19301,9 +19374,7 @@ pub(crate) fn new_stream_resume_sidecar_v15(
             prior_claim_receipt,
             request,
             open_plan,
-            operation: RecoveryStreamClaimOperationV14::from_prepared(
-                &current_attempt.operation,
-            ),
+            operation: RecoveryStreamClaimOperationV14::from_prepared(&current_attempt.operation),
             prior_attempt_chain,
             current_attempt: RecoveryStreamClaimAttemptV14::from_prepared(current_attempt),
             phase: RecoveryStreamClaimPhaseV14::AttemptArmed,
@@ -20361,6 +20432,7 @@ pub(crate) fn new_ensure_indices_sidecar_v9(
         protocol_v15: None,
         protocol_v16: None,
         protocol_v17: None,
+        protocol_v18: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-ensure-indices-v9-sidecar>", &sidecar)?;
@@ -20720,6 +20792,7 @@ pub(crate) fn new_occ_sidecar_v9(
         protocol_v15: None,
         protocol_v16: None,
         protocol_v17: None,
+        protocol_v18: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-occ-sidecar>", &sidecar)?;
@@ -20913,6 +20986,7 @@ pub(crate) fn new_schema_apply_sidecar_v9(
         protocol_v15: None,
         protocol_v16: None,
         protocol_v17: None,
+        protocol_v18: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-schema-apply-v9-sidecar>", &sidecar)?;
@@ -21087,6 +21161,7 @@ pub(crate) fn new_branch_merge_sidecar_v9(
         protocol_v15: None,
         protocol_v16: None,
         protocol_v17: None,
+        protocol_v18: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-branch-merge-sidecar>", &sidecar)?;
@@ -21380,8 +21455,7 @@ fn validate_stream_protocol_v17_shape(sidecar_uri: &str, sidecar: &RecoverySidec
         .ok_or_else(|| malformed("missing required protocol_v17 payload".to_string()))?;
     let RecoveryProtocolV17::StreamSealedOptimize(protocol) = protocol;
     validate_authority_identity(&malformed, &protocol.authority)?;
-    if protocol.authority.branch_identifier
-        != lance::dataset::refs::BranchIdentifier::main()
+    if protocol.authority.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
         || protocol.lineage.branch.is_some()
         || protocol.lineage.merged_parent_commit_id.is_some()
         || protocol.lineage.actor_id != sidecar.actor_id
@@ -21484,7 +21558,10 @@ fn validate_stream_protocol_v17_shape(sidecar_uri: &str, sidecar: &RecoverySidec
             if outputs.len() == sidecar.tables.len()
                 && next.len() == protocol.prior_lifecycles.len() =>
         {
-            let output_ids = outputs.iter().map(|output| output.identity).collect::<Vec<_>>();
+            let output_ids = outputs
+                .iter()
+                .map(|output| output.identity)
+                .collect::<Vec<_>>();
             if output_ids.windows(2).any(|pair| pair[0] >= pair[1])
                 || output_ids.iter().copied().collect::<HashSet<_>>() != pin_ids
             {
@@ -21511,9 +21588,11 @@ fn validate_stream_protocol_v17_shape(sidecar_uri: &str, sidecar: &RecoverySidec
                     || output.achieved_head.branch_identifier
                         != lance::dataset::refs::BranchIdentifier::main()
                     || output.achieved_head.table_version != output.update.table_version
-                    || output.achieved_head.manifest_e_tag.as_ref().is_some_and(|e_tag| {
-                        e_tag.is_empty() || e_tag.trim() != e_tag
-                    })
+                    || output
+                        .achieved_head
+                        .manifest_e_tag
+                        .as_ref()
+                        .is_some_and(|e_tag| e_tag.is_empty() || e_tag.trim() != e_tag)
                 {
                     return Err(malformed(
                         "schema-v17 confirmed Optimize output differs from its main-table pin or exact achieved HEAD"
@@ -21537,8 +21616,7 @@ fn validate_stream_protocol_v17_shape(sidecar_uri: &str, sidecar: &RecoverySidec
                 let prior_proof = prior.sealed_proof.as_ref().expect("validated SEALED proof");
                 normalized_proof.base_current_head_witness =
                     prior_proof.base_current_head_witness.clone();
-                normalized_proof.verified_empty_digest =
-                    prior_proof.verified_empty_digest.clone();
+                normalized_proof.verified_empty_digest = prior_proof.verified_empty_digest.clone();
                 if next.lifecycle != super::StreamLifecycle::Sealed
                     || next.current_head_witness != output.achieved_head
                     || normalized != *prior
@@ -21610,8 +21688,7 @@ fn validate_stream_protocol_v17_shape(sidecar_uri: &str, sidecar: &RecoverySidec
                 let prior_proof = prior.sealed_proof.as_ref().expect("validated SEALED proof");
                 normalized_proof.base_current_head_witness =
                     prior_proof.base_current_head_witness.clone();
-                normalized_proof.verified_empty_digest =
-                    prior_proof.verified_empty_digest.clone();
+                normalized_proof.verified_empty_digest = prior_proof.verified_empty_digest.clone();
                 if next.lifecycle != super::StreamLifecycle::Sealed
                     || next.current_head_witness.branch_identifier
                         != lance::dataset::refs::BranchIdentifier::main()
@@ -21756,8 +21833,7 @@ async fn validate_stream_sealed_optimize_rollback_plan_v17(
                 crate::instrumentation::table_wrapper(),
             )
             .await?;
-            stream_optimize_compensating_restore_source_v17(&dataset, state.manifest_pinned)
-                .await?
+            stream_optimize_compensating_restore_source_v17(&dataset, state.manifest_pinned).await?
                 == Some(outcome.from_version)
         } else {
             state.lance_head == outcome.from_version
@@ -22033,7 +22109,11 @@ async fn classify_stream_sealed_optimize_tables_v17(
             let output = protocol
                 .confirmed_outputs
                 .as_ref()
-                .and_then(|outputs| outputs.iter().find(|output| output.identity == pin.identity))
+                .and_then(|outputs| {
+                    outputs
+                        .iter()
+                        .find(|output| output.identity == pin.identity)
+                })
                 .expect("validated EffectsConfirmed output set");
             if observed == output.achieved_head {
                 (
@@ -22081,8 +22161,7 @@ async fn validate_visible_stream_sealed_optimize_rollback_v17(
         let (dataset, observed_update, observed_head) =
             observe_stream_sealed_optimize_output_v17(root_uri, pin).await?;
         let restore_source =
-            stream_optimize_compensating_restore_source_v17(&dataset, pin.expected_version)
-                .await?;
+            stream_optimize_compensating_restore_source_v17(&dataset, pin.expected_version).await?;
         let entry = snapshot_entry_by_identity(committed, pin.identity);
         let exact_entry = entry.is_some_and(|entry| {
             entry.table_key == pin.table_key
@@ -22183,8 +22262,8 @@ async fn detect_visible_stream_sealed_optimize_outcome_v17(
             )));
         }
         validate_stream_sealed_optimize_terminal_v17(root_uri, sidecar).await?;
-        let committed = ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version)
-            .await?;
+        let committed =
+            ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version).await?;
         let outputs = protocol.confirmed_outputs.as_ref().ok_or_else(|| {
             OmniError::manifest_internal(
                 "visible SEALED Optimize original has no confirmed output set",
@@ -22239,10 +22318,9 @@ async fn detect_visible_stream_sealed_optimize_outcome_v17(
                 sidecar.operation_id, protocol.rollback_graph_commit_id
             )));
         }
-        let committed = ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version)
-            .await?;
-        validate_visible_stream_sealed_optimize_rollback_v17(root_uri, &committed, sidecar)
-            .await?;
+        let committed =
+            ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version).await?;
+        validate_visible_stream_sealed_optimize_rollback_v17(root_uri, &committed, sidecar).await?;
         let rollback_lifecycles = protocol
             .rollback_lifecycles
             .as_ref()
@@ -22371,8 +22449,14 @@ async fn roll_forward_stream_sealed_optimize_v17(
     sidecar: &RecoverySidecar,
 ) -> Result<bool> {
     let protocol = stream_sealed_optimize_v17(sidecar).expect("validated protocol_v17");
-    let outputs = protocol.confirmed_outputs.as_ref().expect("confirmed outputs");
-    let next_lifecycles = protocol.next_lifecycles.as_ref().expect("confirmed successors");
+    let outputs = protocol
+        .confirmed_outputs
+        .as_ref()
+        .expect("confirmed outputs");
+    let next_lifecycles = protocol
+        .next_lifecycles
+        .as_ref()
+        .expect("confirmed successors");
     let mut changes = Vec::with_capacity(outputs.len() + next_lifecycles.len() + 1);
     let mut expected = ExpectedTableVersions::with_capacity(outputs.len());
     let mut outcomes = Vec::with_capacity(outputs.len());
@@ -22458,10 +22542,8 @@ async fn roll_back_stream_sealed_optimize_v17(
             )?;
         }
     }
-    prepared = bind_stream_sealed_optimize_rollback_lifecycles_v17(
-        root_uri, storage, &prepared,
-    )
-    .await?;
+    prepared =
+        bind_stream_sealed_optimize_rollback_lifecycles_v17(root_uri, storage, &prepared).await?;
     let protocol = stream_sealed_optimize_v17(&prepared).expect("prepared protocol_v17");
     let rollback_lifecycles = protocol
         .rollback_lifecycles
@@ -22595,8 +22677,7 @@ async fn process_stream_sealed_optimize_sidecar_v17(
     if matches!(mode, RecoveryMode::RollForwardOnly) {
         warn!(
             operation_id = sidecar.operation_id.as_str(),
-            authority_changed,
-            "recovery: deferring rollback-eligible SEALED Optimize sidecar"
+            authority_changed, "recovery: deferring rollback-eligible SEALED Optimize sidecar"
         );
         return Ok(false);
     }
@@ -22840,14 +22921,14 @@ mod tests {
         enrollment_receipt: super::super::stream::EnrollmentReceipt,
     ) -> super::super::stream::StreamLifecycleEntry {
         use super::super::stream::{
-            BindingReceipt, binding_receipt_chain_genesis, stream_graph_identity_digest,
+            BindingReceipt, stream_graph_identity_digest, test_initial_binding_prior_chain,
         };
 
         let binding_scope_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
         let binding_receipt = BindingReceipt::new(
             stream_graph_identity_digest("domain-a").unwrap(),
             identity,
-            &binding_receipt_chain_genesis(),
+            &test_initial_binding_prior_chain(),
             binding_scope_id,
             enrollment_receipt.stream_incarnation_id.clone(),
             binding.clone(),
@@ -23647,17 +23728,16 @@ mod tests {
             stream_config_version: crate::db::manifest::STREAM_CONFIG_VERSION,
             stream_config_hash: enrollment_plan.stream_config_hash(),
         };
-        let enrollment_intent_digest =
-            crate::db::manifest::stream_enrollment_intent_digest_v1(
-                identity,
-                &table_location,
-                &authority.schema_identity_domain,
-                &authority.schema_ir_hash,
-                authority.schema_identity_version,
-                &baseline_head,
-                &intended_binding.stream_config_hash,
-            )
-            .unwrap();
+        let enrollment_intent_digest = crate::db::manifest::stream_enrollment_intent_digest_v1(
+            identity,
+            &table_location,
+            &authority.schema_identity_domain,
+            &authority.schema_ir_hash,
+            authority.schema_identity_version,
+            &baseline_head,
+            &intended_binding.stream_config_hash,
+        )
+        .unwrap();
         let enrollment_receipt = crate::db::manifest::EnrollmentReceipt::new(
             "44444444-4444-4444-8444-444444444444".to_string(),
             enrollment_intent_digest,
@@ -24198,8 +24278,8 @@ mod tests {
             claim_attempt_chain_genesis, stream_graph_identity_digest,
         };
         use crate::db::omnigraph::stream_lifecycle::{
-            ClaimAttemptRequest, ClaimOperationRequest, StreamResumeRequest,
-            prepare_claim_attempt, prepare_resume_claim_operation, prepare_stream_resume_open,
+            ClaimAttemptRequest, ClaimOperationRequest, StreamResumeRequest, prepare_claim_attempt,
+            prepare_resume_claim_operation, prepare_stream_resume_open,
         };
 
         // Reuse the existing quiesce fixture so the SEALED authority and its
@@ -24288,8 +24368,8 @@ mod tests {
             claim_attempt_chain_genesis, stream_graph_identity_digest,
         };
         use crate::db::omnigraph::stream_lifecycle::{
-            ClaimAttemptRequest, ClaimOperationRequest, StreamResumeRequest,
-            prepare_claim_attempt, prepare_resume_claim_operation, prepare_stream_resume_open,
+            ClaimAttemptRequest, ClaimOperationRequest, StreamResumeRequest, prepare_claim_attempt,
+            prepare_resume_claim_operation, prepare_stream_resume_open,
         };
 
         let drain_sidecar = stream_lifecycle_receipt_sidecar_v14();
@@ -24424,9 +24504,11 @@ mod tests {
     #[test]
     fn stream_abort_v15_allows_only_exact_genesis_without_a_prior_claim() {
         let sidecar = stream_abort_sidecar_v15_from_genesis_drain();
-        assert!(stream_resume_protocol_v15(&sidecar)
-            .prior_claim_receipt
-            .is_none());
+        assert!(
+            stream_resume_protocol_v15(&sidecar)
+                .prior_claim_receipt
+                .is_none()
+        );
         prepared_stream_resume_attempt_v15(&sidecar).unwrap();
 
         let mut forged_tail = sidecar;
@@ -24568,7 +24650,10 @@ mod tests {
             built.receipt.predecessor_record_id,
             prior.claim_receipt_chain.head_record_id
         );
-        assert_eq!(built.next_claim_chain, built.receipt.next_chain_ref().unwrap());
+        assert_eq!(
+            built.next_claim_chain,
+            built.receipt.next_chain_ref().unwrap()
+        );
         assert_eq!(
             built.next_authenticated_tail.binding_scope_id,
             prior.binding_scope_id
@@ -24589,13 +24674,9 @@ mod tests {
             built.next_authenticated_tail.lww_projection_digest,
             built.receipt.authenticated_tail_lww_projection_digest
         );
-        let next_lifecycle = build_resume_adoption_row(
-            &prior,
-            &built,
-            &management,
-            StreamResumeMode::ResumeSealed,
-        )
-        .unwrap();
+        let next_lifecycle =
+            build_resume_adoption_row(&prior, &built, &management, StreamResumeMode::ResumeSealed)
+                .unwrap();
 
         // A v15 terminal resume deliberately leaves an OPEN row whose current
         // claim owns the resume occurrence. The frozen v14 ordinary-fold wire
@@ -24662,11 +24743,7 @@ mod tests {
             &misbound_resume_provenance,
         )
         .unwrap();
-        let fold = match misbound_resume_provenance
-            .protocol_v14
-            .as_deref()
-            .unwrap()
-        {
+        let fold = match misbound_resume_provenance.protocol_v14.as_deref().unwrap() {
             RecoveryProtocolV14::StreamFoldV2(protocol) => protocol,
             _ => unreachable!(),
         };
@@ -29217,8 +29294,7 @@ query delete_person($name: String) {
 
     #[test]
     fn stream_sealed_optimize_v17_rejects_malformed_output_key_head_and_lifecycle() {
-        let (mut confirmed, current_claim_receipt) =
-            stream_sealed_optimize_sidecar_v17_fixture();
+        let (mut confirmed, current_claim_receipt) = stream_sealed_optimize_sidecar_v17_fixture();
         let expected_version = confirmed.tables[0].expected_version;
         confirm_stream_sealed_optimize_shape_v17(
             &mut confirmed,
@@ -29256,8 +29332,7 @@ query delete_person($name: String) {
         else {
             unreachable!();
         };
-        protocol.confirmed_outputs.as_mut().unwrap()[0].table_key =
-            "node:Company".to_string();
+        protocol.confirmed_outputs.as_mut().unwrap()[0].table_key = "node:Company".to_string();
         assert!(
             validate_sidecar_shape("<v17-wrong-output-key>", &wrong_key)
                 .unwrap_err()
@@ -29383,8 +29458,7 @@ query delete_person($name: String) {
 
     #[test]
     fn stream_sealed_optimize_v17_rollback_rows_cover_only_enrolled_moved_tables() {
-        let (mut sidecar, current_claim_receipt) =
-            stream_sealed_optimize_sidecar_v17_fixture();
+        let (mut sidecar, current_claim_receipt) = stream_sealed_optimize_sidecar_v17_fixture();
         sidecar
             .tables
             .push(make_pin("node:Company", "ignored", 4, 5));
@@ -29403,7 +29477,10 @@ query delete_person($name: String) {
         protocol.rollback_lifecycles = Some(Vec::new());
         validate_sidecar_shape("<v17-only-ordinary-table-restored>", &sidecar).unwrap();
 
-        let prior = stream_sealed_optimize_v17(&sidecar).unwrap().prior_lifecycles[0].clone();
+        let prior = stream_sealed_optimize_v17(&sidecar)
+            .unwrap()
+            .prior_lifecycles[0]
+            .clone();
         let restored = crate::db::build_sealed_maintenance_successor(
             &prior,
             &current_claim_receipt,
@@ -29420,11 +29497,15 @@ query delete_person($name: String) {
         else {
             unreachable!();
         };
-        protocol.rollback_audit_outcomes.as_mut().unwrap().push(TableOutcome {
-            table_key: prior.diagnostic_table_key.clone(),
-            from_version: prior.current_head_witness.table_version + 1,
-            to_version: prior.current_head_witness.table_version,
-        });
+        protocol
+            .rollback_audit_outcomes
+            .as_mut()
+            .unwrap()
+            .push(TableOutcome {
+                table_key: prior.diagnostic_table_key.clone(),
+                from_version: prior.current_head_witness.table_version + 1,
+                to_version: prior.current_head_witness.table_version,
+            });
         assert!(
             validate_sidecar_shape("<v17-missing-enrolled-rollback-row>", &sidecar)
                 .unwrap_err()
@@ -29441,4 +29522,326 @@ query delete_person($name: String) {
         validate_sidecar_shape("<v17-enrolled-and-ordinary-tables-restored>", &sidecar).unwrap();
     }
 
+    fn stream_rebind_sidecar_v18_fixture() -> RecoverySidecar {
+        use crate::db::manifest::stream::{
+            BindingReceipt, STREAM_REBIND_REQUEST_PROTOCOL_VERSION, StreamRebindRequestPayload,
+            stream_graph_identity_digest, test_initial_binding_prior_chain,
+        };
+        use crate::table_store::mem_wal::{MemWalEnrollmentPlan, MemWalRebindPlan};
+
+        let quiesce = stream_quiesce_lifecycle_receipt_sidecar_v14();
+        let terminal = stream_lifecycle_receipt_protocol(&quiesce);
+        let prior = terminal.next_lifecycle.clone();
+        let prior_claim_receipt = terminal.current_claim_receipt.clone().unwrap();
+        let graph_identity_digest = stream_graph_identity_digest("domain-a").unwrap();
+        let prior_binding_receipt = BindingReceipt::new(
+            graph_identity_digest.clone(),
+            prior.identity,
+            &test_initial_binding_prior_chain(),
+            prior.binding_scope_id.clone(),
+            prior.enrollment_receipt.stream_incarnation_id.clone(),
+            prior.binding.clone(),
+            "INITIAL_ENROLLMENT",
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            prior_binding_receipt.record_id,
+            prior.current_binding_receipt_id
+        );
+
+        let rebind_id = "abababab-abab-4bab-8bab-abababababab";
+        let fresh_scope_id = "acacacac-acac-4cac-8cac-acacacacacac";
+        let fresh_enrollment_id =
+            ShardId::parse_str("adadadad-adad-4dad-8dad-adadadadadad").unwrap();
+        let fresh_shard_id = ShardId::parse_str("aeaeaeae-aeae-4eae-8eae-aeaeaeaeaeae").unwrap();
+        let next_enrollment =
+            MemWalEnrollmentPlan::new(fresh_enrollment_id, fresh_shard_id).unwrap();
+        let prior_shard_id = ShardId::parse_str(&prior.binding.shard_ids[0]).unwrap();
+        let rebind_plan =
+            MemWalRebindPlan::new(prior.binding.clone(), vec![prior_shard_id], next_enrollment)
+                .unwrap();
+        let intended_binding = super::super::stream::StreamPhysicalBinding {
+            enrollment_id: fresh_enrollment_id.to_string(),
+            shard_ids: vec![fresh_shard_id.to_string()],
+            ..prior.binding.clone()
+        };
+        let expected_terminal_shards = rebind_plan.expected_terminal_shards();
+        let planned_binding_receipt = BindingReceipt::new_with_retained_shards(
+            graph_identity_digest.clone(),
+            prior.identity,
+            &prior.binding_receipt_chain,
+            fresh_scope_id,
+            prior.enrollment_receipt.stream_incarnation_id.clone(),
+            intended_binding.clone(),
+            &expected_terminal_shards,
+            rebind_id,
+            50,
+        )
+        .unwrap();
+        let mut profile = terminal.profile.clone();
+        profile.state = super::super::StreamProfileState::Disabled;
+        profile.validate().unwrap();
+        let request = StreamRebindRequestPayload {
+            protocol_version: STREAM_REBIND_REQUEST_PROTOCOL_VERSION,
+            graph_identity_digest,
+            identity: prior.identity,
+            stream_incarnation_id: prior.enrollment_receipt.stream_incarnation_id.clone(),
+            binding_scope_id: prior.binding_scope_id.clone(),
+            enrollment_id: prior.binding.enrollment_id.clone(),
+            rebind_id: rebind_id.to_string(),
+            expected_lifecycle_revision: prior.lifecycle_revision,
+            expected_profile_revision: profile.profile_revision,
+            actor_id: "act-operator".to_string(),
+            public_named_branches: Vec::new(),
+        };
+        let expected_version = prior.current_head_witness.table_version;
+        let table = SidecarTablePin {
+            identity: prior.identity,
+            table_key: prior.diagnostic_table_key.clone(),
+            table_path: prior.binding.table_location.clone(),
+            expected_version,
+            post_commit_pin: expected_version + 2,
+            confirmed_version: None,
+            table_branch: None,
+        };
+        new_stream_rebind_sidecar_v18(
+            "act-operator".to_string(),
+            table,
+            terminal.authority.clone(),
+            RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000R8".to_string(),
+                branch: None,
+                actor_id: Some("act-operator".to_string()),
+                merged_parent_commit_id: None,
+                created_at: 51,
+            },
+            terminal.prior_manifest_version,
+            profile,
+            prior,
+            prior_binding_receipt,
+            prior_claim_receipt,
+            terminal.receipt.prior_authority.clone(),
+            request,
+            rebind_plan,
+            intended_binding,
+            planned_binding_receipt,
+            1,
+            "afafafaf-afaf-4faf-8faf-afafafafafaf".to_string(),
+            50,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stream_rebind_v18_pins_physical_armed_grammar_and_exclusive_strand() {
+        use crate::db::manifest::stream::{BindingReceipt, MAX_SELECTED_BINDING_CHAIN_RECORDS};
+        use crate::table_store::mem_wal::{MemWalEnrollmentPlan, MemWalRebindPlan};
+
+        let armed = stream_rebind_sidecar_v18_fixture();
+        assert_eq!(armed.schema_version, STREAM_REBIND_SIDECAR_SCHEMA_VERSION);
+        assert_eq!(armed.writer_kind, SidecarKind::StreamRebind);
+        let RecoveryProtocolV18::StreamRebind(protocol) = armed.protocol_v18.as_deref().unwrap();
+        assert_eq!(protocol.phase, RecoveryStreamRebindPhaseV18::PhysicalArmed);
+        assert!(protocol.physical.is_none());
+        assert!(protocol.terminal.is_none());
+        assert!(protocol.ledger.is_none());
+
+        let encoded = serde_json::to_string(&armed).unwrap();
+        let parsed = parse_sidecar("<stream-rebind-v18-physical-armed>", &encoded).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), encoded);
+
+        let mut wrong_schema = armed.clone();
+        wrong_schema.schema_version = STREAM_SEALED_OPTIMIZE_SIDECAR_SCHEMA_VERSION;
+        assert!(
+            validate_sidecar_shape("<v18-overlay-on-v17>", &wrong_schema)
+                .unwrap_err()
+                .to_string()
+                .contains("protocol_v18 requires schema-v18")
+        );
+
+        let mut wrong_writer = armed.clone();
+        wrong_writer.writer_kind = SidecarKind::StreamSealedMaintenance;
+        assert!(
+            validate_sidecar_shape("<v18-wrong-writer>", &wrong_writer)
+                .unwrap_err()
+                .to_string()
+                .contains("schema-v18 StreamRebind must target canonical main")
+        );
+
+        let mut wrong_binding_ordinal = armed.clone();
+        let Some(RecoveryProtocolV18::StreamRebind(protocol)) =
+            wrong_binding_ordinal.protocol_v18.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        let original_planned_receipt = protocol.planned_binding_receipt.clone();
+        let mut forged_prior_chain = protocol.prior_lifecycle.binding_receipt_chain.clone();
+        forged_prior_chain.record_count += 1;
+        let mut forged_terminal_shards = protocol.rebind_plan.expected_terminal_shards();
+        forged_terminal_shards.push(
+            ShardId::parse_str("b0b0b0b0-b0b0-40b0-80b0-b0b0b0b0b0b0").unwrap(),
+        );
+        forged_terminal_shards.sort_unstable();
+        protocol.planned_binding_receipt = BindingReceipt::new_with_retained_shards(
+            original_planned_receipt.graph_identity_digest,
+            original_planned_receipt.identity,
+            &forged_prior_chain,
+            original_planned_receipt.binding_scope_id,
+            original_planned_receipt.stream_incarnation_id,
+            original_planned_receipt.physical_binding,
+            &forged_terminal_shards,
+            original_planned_receipt.operation_id,
+            original_planned_receipt.recorded_at,
+        )
+        .unwrap();
+        assert_eq!(protocol.planned_binding_receipt.chain_ordinal, 4);
+        assert!(
+            validate_sidecar_shape("<v18-wrong-binding-ordinal>", &wrong_binding_ordinal)
+                .unwrap_err()
+                .to_string()
+                .contains("not the exact next bounded binding-chain ordinal"),
+            "v18 must reject a self-consistent planned receipt that skips the exact next binding-chain ordinal"
+        );
+
+        let mut over_bound_binding_ordinal = armed.clone();
+        let Some(RecoveryProtocolV18::StreamRebind(protocol)) =
+            over_bound_binding_ordinal.protocol_v18.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.prior_lifecycle.binding_receipt_chain.record_count =
+            MAX_SELECTED_BINDING_CHAIN_RECORDS;
+        let prior_chain = protocol.prior_lifecycle.binding_receipt_chain.clone();
+        let original_planned_receipt = protocol.planned_binding_receipt.clone();
+        let mut maximum_inventory = (0..MAX_SELECTED_BINDING_CHAIN_RECORDS)
+            .map(|_| ShardId::new_v4())
+            .collect::<Vec<_>>();
+        maximum_inventory.sort_unstable();
+        protocol.planned_binding_receipt = BindingReceipt::new_with_retained_shards(
+            original_planned_receipt.graph_identity_digest,
+            original_planned_receipt.identity,
+            &prior_chain,
+            original_planned_receipt.binding_scope_id,
+            original_planned_receipt.stream_incarnation_id,
+            original_planned_receipt.physical_binding,
+            &maximum_inventory,
+            original_planned_receipt.operation_id,
+            original_planned_receipt.recorded_at,
+        )
+        .unwrap();
+        assert_eq!(
+            protocol.planned_binding_receipt.chain_ordinal,
+            MAX_SELECTED_BINDING_CHAIN_RECORDS + 1
+        );
+        assert!(
+            validate_sidecar_shape(
+                "<v18-over-bound-binding-ordinal>",
+                &over_bound_binding_ordinal,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not the exact next bounded binding-chain ordinal"),
+            "v18 must reject an exact next planned receipt beyond the fixed traversal bound"
+        );
+
+        let RecoveryProtocolV18::StreamRebind(protocol) =
+            armed.protocol_v18.as_deref().unwrap();
+        let prior_rebound_receipt = protocol.planned_binding_receipt.clone();
+        let prior_rebound_binding = prior_rebound_receipt.physical_binding.clone();
+        let prior_rebound_shard =
+            ShardId::parse_str(&prior_rebound_binding.shard_ids[0]).unwrap();
+        let foreign_retained_shard =
+            ShardId::parse_str("b1b1b1b1-b1b1-41b1-81b1-b1b1b1b1b1b1").unwrap();
+        let mut forged_retained_shards = vec![prior_rebound_shard, foreign_retained_shard];
+        forged_retained_shards.sort_unstable();
+        let next_enrollment = MemWalEnrollmentPlan::new(
+            ShardId::parse_str("b2b2b2b2-b2b2-42b2-82b2-b2b2b2b2b2b2").unwrap(),
+            ShardId::parse_str("b3b3b3b3-b3b3-43b3-83b3-b3b3b3b3b3b3").unwrap(),
+        )
+        .unwrap();
+        let forged_plan = MemWalRebindPlan::new(
+            prior_rebound_binding.clone(),
+            forged_retained_shards,
+            next_enrollment.clone(),
+        )
+        .unwrap();
+        let mut next_binding = prior_rebound_binding.clone();
+        next_binding.enrollment_id = next_enrollment.enrollment_id.to_string();
+        next_binding.shard_ids = vec![next_enrollment.shard_id.to_string()];
+        let planned_terminal_shards = forged_plan.expected_terminal_shards();
+        let next_receipt = BindingReceipt::new_with_retained_shards(
+            prior_rebound_receipt.graph_identity_digest.clone(),
+            prior_rebound_receipt.identity,
+            &prior_rebound_receipt.next_chain_ref().unwrap(),
+            "b4b4b4b4-b4b4-44b4-84b4-b4b4b4b4b4b4",
+            prior_rebound_receipt.stream_incarnation_id.clone(),
+            next_binding,
+            &planned_terminal_shards,
+            "b5b5b5b5-b5b5-45b5-85b5-b5b5b5b5b5b5",
+            60,
+        )
+        .unwrap();
+        assert!(
+            validate_rebind_inventory_authority(
+                &prior_rebound_receipt,
+                &prior_rebound_binding,
+                &forged_plan,
+                &next_receipt,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains(
+                "retained-shard plan does not match the selected prior binding receipt"
+            ),
+            "v18 must reject a self-consistent terminal inventory whose retained prefix differs from selected prior receipt authority"
+        );
+
+        let mut extra_protocol = armed;
+        extra_protocol.protocol_v14 = stream_lifecycle_receipt_sidecar_v14().protocol_v14;
+        assert!(
+            validate_sidecar_shape("<v18-extra-v14-protocol>", &extra_protocol)
+                .unwrap_err()
+                .to_string()
+                .contains("protocol_v14 requires schema-v14")
+        );
+    }
+
+    #[tokio::test]
+    async fn process_sidecar_routes_schema_v18_to_rebind_not_frozen_v14() {
+        let sidecar = stream_rebind_sidecar_v18_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let db = crate::db::Omnigraph::init(root, "node Person { name: String @key }\n")
+            .await
+            .unwrap();
+        let snapshot = db.snapshot().await;
+        drop(db);
+        let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::local());
+
+        let error = process_sidecar(
+            root,
+            &storage,
+            &snapshot,
+            &sidecar,
+            RecoveryMode::Full,
+            SchemaStateRecovery::Noop,
+        )
+        .await
+        .expect_err("the unrelated graph cannot satisfy the exact v18 prior manifest");
+        match error {
+            OmniError::RecoveryRequired {
+                operation_id,
+                reason,
+            } => {
+                assert_eq!(operation_id, sidecar.operation_id);
+                assert_eq!(
+                    reason,
+                    "StreamRebind recovery cannot prove an exact outcome: manifest profile, table, lifecycle, token pointer, or version differs from every exact rebind outcome"
+                );
+                assert!(!reason.contains("recovery-v14 discriminator"));
+            }
+            other => panic!("schema-v18 did not route to StreamRebind recovery: {other}"),
+        }
+    }
 }

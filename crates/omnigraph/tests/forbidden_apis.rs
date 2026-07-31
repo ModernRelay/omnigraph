@@ -209,12 +209,17 @@ const STREAM_LIFECYCLE_V14: WriteProtocol =
     WriteProtocol::Exact("private firehose lifecycle recovery v14");
 const STREAM_LIFECYCLE_V14_V15: WriteProtocol =
     WriteProtocol::Composed("private firehose lifecycle recovery v14 + resume recovery v15");
+const STREAM_REBIND_V18: WriteProtocol =
+    WriteProtocol::Exact("private physical rebind recovery v18");
+const STREAM_ENROLLMENT_V14_REBIND_V18: WriteProtocol =
+    WriteProtocol::Composed("StreamEnrollmentV2 recovery v14 + physical rebind recovery v18");
+const STREAM_LIFECYCLE_V14_V15_V18: WriteProtocol =
+    WriteProtocol::Composed("private firehose lifecycle recovery v14 + resume v15 + rebind v18");
 /// RFC-026 checked profile authority: ENABLED/DISABLED terminal transitions
 /// pair one immutable token-ledger receipt with one profile/lineage publish
 /// under recovery-v13. Disable additionally persists the admission-cutoff
 /// `DISABLING` continuation before its terminal receipt.
-const STREAM_PROFILE_V13: WriteProtocol =
-    WriteProtocol::Exact("StreamProfileChange recovery v13");
+const STREAM_PROFILE_V13: WriteProtocol = WriteProtocol::Exact("StreamProfileChange recovery v13");
 
 #[derive(Debug, Clone, Copy)]
 struct WriteSurface {
@@ -257,6 +262,9 @@ write_surfaces! {
         "failpoint_stream_quiesce_for_test",
         "failpoint_stream_resume_for_test",
     ],
+    "db/omnigraph/stream_rebind.rs" => WriteProtocol::TestOnly => [
+        "failpoint_stream_rebind_checked_for_test",
+    ],
     "db/omnigraph/stream_ndjson.rs" => WriteProtocol::TestOnly => [
         "failpoint_stream_ingest_ndjson_as_for_test",
         "failpoint_stream_ingest_ndjson_cancel_for_test",
@@ -276,9 +284,22 @@ write_surfaces! {
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
-    ("db/omnigraph/stream_profile.rs", "check_cluster_apply_authority"),
-    ("db/omnigraph/stream_profile.rs", "with_checked_cluster_stream_runtime"),
-    ("db/omnigraph/stream_ingest.rs", "failpoint_stream_incarnation_for_test"),
+    (
+        "db/omnigraph/stream_profile.rs",
+        "check_cluster_apply_authority",
+    ),
+    (
+        "db/omnigraph/stream_profile.rs",
+        "check_cluster_maintenance_authority",
+    ),
+    (
+        "db/omnigraph/stream_profile.rs",
+        "with_checked_cluster_stream_runtime",
+    ),
+    (
+        "db/omnigraph/stream_ingest.rs",
+        "failpoint_stream_incarnation_for_test",
+    ),
     ("db/omnigraph.rs", "plan_schema"),
     ("db/omnigraph.rs", "plan_schema_with_options"),
     ("db/omnigraph.rs", "preview_schema_apply_with_options"),
@@ -699,12 +720,15 @@ durable_calls! {
     ("db/omnigraph/stream_enrollment.rs", "write_sidecar(", 1, STREAM_ENROLLMENT_V14),
     ("db/omnigraph/stream_ingest.rs", "write_sidecar(", 4, STREAM_LIFECYCLE_V14_V15),
     ("db/omnigraph/stream_profile.rs", "write_sidecar(", 1, STREAM_PROFILE_V13),
+    ("db/omnigraph/stream_rebind.rs", "write_sidecar(", 1, STREAM_REBIND_V18),
+    ("db/manifest/recovery/stream_rebind_v18.rs", "write_sidecar(", 1, STREAM_REBIND_V18),
     ("db/manifest/token_store.rs", "Dataset::write(", 1, WriteProtocol::Bootstrap),
     ("db/manifest/token_store.rs", "MergeInsertBuilder::try_new(", 3, WriteProtocol::Composed("stream token + lifecycle-ledger staging")),
     ("db/manifest/token_store.rs", ".execute_uncommitted(", 3, WriteProtocol::Composed("stream token + lifecycle-ledger staging")),
     ("db/manifest/token_store.rs", "stage_lifecycle_ledger_records(", 5, WriteProtocol::Composed("typed lifecycle-ledger staging wrappers")),
     ("db/omnigraph/stream_enrollment.rs", "stage_lifecycle_ledger_records(", 1, STREAM_ENROLLMENT_V14),
     ("db/omnigraph/stream_ingest.rs", "stage_lifecycle_ledger_records(", 2, STREAM_LIFECYCLE_V14_V15),
+    ("db/manifest/recovery/stream_rebind_v18.rs", "stage_lifecycle_ledger_records(", 2, STREAM_REBIND_V18),
     ("db/omnigraph/stream_ingest.rs", "stage_management_receipt(", 1, STREAM_LIFECYCLE_V14),
     ("db/manifest/recovery.rs", "stage_lifecycle_ledger_records(", 3, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/stream_ingest.rs", "stage_stream_token_upsert(", 1, STREAM_LIFECYCLE_V14),
@@ -721,6 +745,7 @@ durable_calls! {
     ("db/omnigraph/stream_profile.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/stream_profile.rs", "SnapshotHandle::new(", 1, STREAM_PROFILE_V13),
     ("db/manifest/recovery.rs", ".commit_staged_exact(", 5, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery/stream_rebind_v18.rs", ".commit_staged_exact(", 1, STREAM_REBIND_V18),
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("adapter-owned first-touch data ref")),
     ("exec/staging.rs", "confirm_occ_sidecar_v9(", 1, WriteProtocol::Exact("Mutation/Load v9")),
@@ -750,6 +775,7 @@ durable_calls! {
     ("db/omnigraph/schema_apply.rs", "delete_sidecar(", 1, SCHEMA_V9),
     ("db/omnigraph/table_ops.rs", "delete_sidecar(", 1, INDICES_V9),
     ("db/omnigraph/optimize.rs", "delete_sidecar(", 1, OPTIMIZE_V9),
+    ("db/manifest/recovery/stream_rebind_v18.rs", "delete_sidecar(", 1, STREAM_REBIND_V18),
     ("exec/mutation.rs", "commit_updates_on_branch_with_expected(", 1, MUTATION_V9),
     ("loader/mod.rs", "commit_updates_on_branch_with_expected(", 1, LOAD_V9),
     ("exec/merge.rs", "commit_updates_on_branch_with_expected(", 1, MERGE_V9),
@@ -801,13 +827,16 @@ durable_calls! {
     ("db/omnigraph/optimize.rs", ".force_delete_branch(", 1, WriteProtocol::PhysicalOnly),
     ("db/manifest/recovery.rs", ".force_delete_branch(", 2, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".publish_with_precondition(", 7, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery/stream_rebind_v18.rs", ".publish_with_precondition(", 1, STREAM_REBIND_V18),
     ("db/manifest/recovery.rs", ".publish(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".restore(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".append(RecoveryAuditRecord", 16, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery/stream_rebind_v18.rs", ".append(RecoveryAuditRecord", 1, STREAM_REBIND_V18),
     ("db/manifest/recovery.rs", "publish_recovery_commit(", 13, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "restore_table_to_version(", 4, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "record_audit(", 13, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 37, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery/stream_rebind_v18.rs", "delete_sidecar_by_operation_id(", 1, STREAM_REBIND_V18),
     ("db/manifest/recovery.rs", "delete_sidecar(", 4, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", ".raw_dataset_append(", 1, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", "Dataset::write(", 1, WriteProtocol::RecoveryExecutor),
@@ -825,11 +854,12 @@ durable_calls! {
     ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
     ("db/omnigraph/stream_enrollment.rs", ".dataset()", 7, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/stream_enrollment.rs", ".into_dataset()", 1, STREAM_ENROLLMENT_V14),
-    ("db/omnigraph/stream_ingest.rs", ".dataset()", 38, STREAM_LIFECYCLE_V14_V15),
+    ("db/omnigraph/stream_ingest.rs", ".dataset()", 39, STREAM_LIFECYCLE_V14_V15_V18),
+    ("db/omnigraph/stream_rebind.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/stream_ingest.rs", ".mem_wal_writer(", 2, STREAM_LIFECYCLE_V14_V15),
     ("db/omnigraph/stream_ingest.rs", ".put(", 1, STREAM_LIFECYCLE_V14),
-    ("table_store/mem_wal.rs", ".initialize_mem_wal()", 1, STREAM_ENROLLMENT_V14),
-    ("table_store/mem_wal.rs", ".mem_wal_writer(", 1, STREAM_ENROLLMENT_V14),
+    ("table_store/mem_wal.rs", ".initialize_mem_wal()", 2, STREAM_ENROLLMENT_V14_REBIND_V18),
+    ("table_store/mem_wal.rs", ".mem_wal_writer(", 2, STREAM_ENROLLMENT_V14_REBIND_V18),
     ("table_store/mem_wal/worker.rs", ".put_no_wait(", 1, STREAM_LIFECYCLE_V14),
     ("table_store/mem_wal/worker.rs", ".abort()", 2, STREAM_LIFECYCLE_V14),
     ("table_store/mem_wal/worker.rs", ".force_seal_active()", 1, STREAM_LIFECYCLE_V14),
@@ -1518,14 +1548,55 @@ fn call_inventory(ast: &syn::File) -> CallInventory {
 }
 
 /// Raw MemWAL storage is retained indefinitely in RFC-026's selected B2a
-/// profile.  These are the only production functions allowed to spell the
-/// physical `_mem_wal` directory: both perform bounded, read-only validation.
+/// profile. These are the only production functions allowed to spell the
+/// physical `_mem_wal` directory. Most perform bounded read-only inventory;
+/// recovery-v18 additionally replaces only the Lance system-index pointer and
+/// provisions a fresh empty shard while retaining every old canonical object.
 /// A new owner is therefore an architectural change, not an incidental helper.
 const RAW_MEM_WAL_PATH_OWNERS: &[(&str, &str, usize)] = &[
+    (
+        "table_store/mem_wal.rs",
+        "drop_current_index_from_exact_rebind_no_effect",
+        1,
+    ),
+    ("table_store/mem_wal.rs", "mem_wal_top_level_shards", 2),
     ("table_store/mem_wal.rs", "raw_mem_wal_inventory", 2),
+    ("table_store/mem_wal.rs", "raw_mem_wal_shard_inventory", 2),
     (
         "table_store/mem_wal/worker.rs",
-        "validate_b1_lifecycle_physical_state",
+        "validate_b1_lifecycle_physical_state_impl",
+        1,
+    ),
+];
+
+/// Recovery-v18 may remove and replace only Lance's current MemWAL system
+/// index. The retained shard/object roots are never deleted. The lexical
+/// scanner intentionally treats `drop` next to `MemWal` as suspicious, so
+/// these exact state references disposition that one pointer transition
+/// without permitting another reclamation-shaped symbol.
+const RETAIN_ALL_REBIND_INDEX_TRANSITION_SYMBOLS: &[(&str, &str, &str, usize)] = &[
+    (
+        "db/manifest/recovery/stream_rebind_v18.rs",
+        "converge_physical",
+        "path `MemWalRebindState::ExactIndexDropped`",
+        1,
+    ),
+    (
+        "table_store/mem_wal.rs",
+        "classify_rebind",
+        "path `MemWalRebindState::ExactIndexDropped`",
+        1,
+    ),
+    (
+        "table_store/mem_wal.rs",
+        "drop_current_index_from_exact_rebind_no_effect",
+        "path `MemWalRebindState::ExactIndexDropped`",
+        1,
+    ),
+    (
+        "table_store/mem_wal.rs",
+        "initialize_fresh_index_from_exact_rebind_drop",
+        "path `MemWalRebindState::ExactIndexDropped`",
         1,
     ),
 ];
@@ -1558,11 +1629,7 @@ const RETAIN_ALL_CHECKED_MAINTENANCE_HEAD_READS: &[(&str, &str, usize)] = &[
         "apply_optimize_table_effects",
         1,
     ),
-    (
-        "db/omnigraph/table_ops.rs",
-        "ensure_indices_for_branch",
-        2,
-    ),
+    ("db/omnigraph/table_ops.rs", "ensure_indices_for_branch", 2),
 ];
 
 const RETAIN_ALL_OMNIGRAPH_METHODS: &[&str] = &[
@@ -2413,13 +2480,10 @@ fn retain_all_mem_wal_has_no_production_reclamation_or_adoption_route() {
         RETAIN_ALL_DELETE_CALLS.len(),
         "retain-all delete callsite keys must be unique"
     );
-    let expected_checked_maintenance_head_reads =
-        RETAIN_ALL_CHECKED_MAINTENANCE_HEAD_READS
-            .iter()
-            .map(|(file, function, count)| {
-                (((*file).to_string(), (*function).to_string()), *count)
-            })
-            .collect::<BTreeMap<_, _>>();
+    let expected_checked_maintenance_head_reads = RETAIN_ALL_CHECKED_MAINTENANCE_HEAD_READS
+        .iter()
+        .map(|(file, function, count)| (((*file).to_string(), (*function).to_string()), *count))
+        .collect::<BTreeMap<_, _>>();
     assert_eq!(
         expected_checked_maintenance_head_reads.len(),
         RETAIN_ALL_CHECKED_MAINTENANCE_HEAD_READS.len(),
@@ -2510,15 +2574,13 @@ fn retain_all_mem_wal_has_no_production_reclamation_or_adoption_route() {
             }
             for (function, usage) in &inventory.mem_wal_uses {
                 let key = (relative.clone(), function.clone());
-                if usage == "mem_wal"
-                    && expected_checked_maintenance_head_reads.contains_key(&key)
+                if usage == "mem_wal" && expected_checked_maintenance_head_reads.contains_key(&key)
                 {
                     *observed_checked_maintenance_mem_wal_segments
                         .entry(key)
                         .or_default() += 1;
                 } else {
-                    maintenance_mem_wal_uses
-                        .push(format!("{relative}::{function}: {usage}"));
+                    maintenance_mem_wal_uses.push(format!("{relative}::{function}: {usage}"));
                 }
             }
         }
@@ -2539,19 +2601,27 @@ fn retain_all_mem_wal_has_no_production_reclamation_or_adoption_route() {
         observed_raw_owners, expected_raw_owners,
         "raw `_mem_wal` path access must remain confined to the exact bounded read-only inventory and passive lifecycle validators"
     );
-    assert!(
-        reclamation_symbols.is_empty(),
-        "retain-all forbids any production MemWAL reclamation/adoption/reclassification route:\n  {}",
-        reclamation_symbols.join("\n  ")
+    let observed_reclamation_symbols =
+        reclamation_symbols
+            .into_iter()
+            .fold(BTreeMap::<_, usize>::new(), |mut counts, symbol| {
+                *counts.entry(symbol).or_default() += 1;
+                counts
+            });
+    let expected_reclamation_symbols = RETAIN_ALL_REBIND_INDEX_TRANSITION_SYMBOLS
+        .iter()
+        .map(|(file, function, symbol, count)| (format!("{file}::{function}: {symbol}"), *count))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        observed_reclamation_symbols, expected_reclamation_symbols,
+        "retain-all permits only the exact recovery-v18 MemWAL system-index pointer transition; any other reclamation/adoption/reclassification symbol is forbidden"
     );
     assert_eq!(
-        observed_checked_maintenance_head_reads,
-        expected_checked_maintenance_head_reads,
+        observed_checked_maintenance_head_reads, expected_checked_maintenance_head_reads,
         "checked maintenance may call only the exact registered composite-HEAD witness sites"
     );
     assert_eq!(
-        observed_checked_maintenance_mem_wal_segments,
-        expected_checked_maintenance_head_reads,
+        observed_checked_maintenance_mem_wal_segments, expected_checked_maintenance_head_reads,
         "each checked-maintenance composite-HEAD read must own exactly one registered `mem_wal` path segment"
     );
     assert!(
@@ -3140,6 +3210,79 @@ fn method_call_count(block: &syn::Block, method_name: &str) -> usize {
     };
     counter.visit_block(block);
     counter.count
+}
+
+fn function_call_count(block: &syn::Block, function_name: &str) -> usize {
+    struct Counter<'a> {
+        function_name: &'a str,
+        count: usize,
+    }
+
+    impl<'ast> Visit<'ast> for Counter<'_> {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if matches!(
+                node.func.as_ref(),
+                Expr::Path(path)
+                    if path.path.segments.last().is_some_and(|segment| {
+                        segment.ident == self.function_name
+                    })
+            ) {
+                self.count += 1;
+            }
+            visit::visit_expr_call(self, node);
+        }
+    }
+
+    let mut counter = Counter {
+        function_name,
+        count: 0,
+    };
+    counter.visit_block(block);
+    counter.count
+}
+
+#[test]
+fn ordinary_stream_authority_capture_never_relists_retained_binding_history() {
+    let relative = "db/omnigraph/stream_ingest.rs";
+    let file = engine_src_root().join(relative);
+    let contents = std::fs::read_to_string(&file)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+    let ast = parse_rust_source(&contents, relative);
+    let function = ast
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Impl(implementation) if is_omnigraph_type(&implementation.self_ty) => {
+                implementation.items.iter().find_map(|item| match item {
+                    syn::ImplItem::Fn(function)
+                        if function.sig.ident == "capture_stream_authority_for_lifecycle" =>
+                    {
+                        Some(function)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .next()
+        .expect("missing Omnigraph::capture_stream_authority_for_lifecycle");
+
+    assert_eq!(
+        function_call_count(
+            &function.block,
+            "validate_b1_lifecycle_current_binding_physical_state"
+        ),
+        1,
+        "ordinary stream authority capture must validate the selected current binding exactly once"
+    );
+    assert_eq!(
+        function_call_count(
+            &function.block,
+            "validate_b1_lifecycle_physical_state_with_binding_inventory"
+        ),
+        0,
+        "ordinary stream authority capture must not enumerate retained physical history"
+    );
 }
 
 #[test]

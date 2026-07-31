@@ -1,10 +1,12 @@
 //! Narrow RFC-026 adapters for bounded MemWAL enrollment and the private
 //! B1/common-B2 core.
 //!
-//! The parent module captures the exact main-branch witness, initializes the
-//! singleton unsharded MemWAL index, provisions one pre-minted empty shard, and
-//! classifies those enrollment effects after a lost result. The private
-//! [`worker`] submodule owns B1's one-generation admission, watcher,
+//! The parent module captures exact main-branch witnesses, initializes the
+//! singleton unsharded MemWAL index, provisions pre-minted empty shards, and
+//! classifies enrollment or sealed-rebind effects after a lost result. Rebind
+//! replaces only index authority, retains every authenticated old shard prefix,
+//! and obtains one fresh fence-only claim without a put. The private [`worker`]
+//! submodule owns B1's one-generation admission, watcher,
 //! post-durability successor-epoch check, replay, seal/drain, and quiesced
 //! retirement mechanics. Current schema v9 adds common-B2 token/attribution;
 //! graph authority, recovery-v12 base-plus-token fold ownership, and the sole
@@ -24,8 +26,9 @@ use std::fmt::Display;
 
 use futures::{TryStream, TryStreamExt};
 use lance::Dataset;
-use lance::dataset::mem_wal::{DatasetMemWalExt, ShardManifestStore, ShardWriterConfig};
+use lance::dataset::mem_wal::{DatasetMemWalExt, ShardManifestStore, ShardWriterConfig, WalTailer};
 use lance::dataset::transaction::Operation;
+use lance::index::DatasetIndexExt;
 use lance_index::mem_wal::{
     MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardId, ShardManifest, ShardStatus,
 };
@@ -33,7 +36,7 @@ use object_store::{ObjectMeta, path::Path};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::db::manifest::CurrentHeadWitness;
+use crate::db::manifest::{CurrentHeadWitness, STREAM_CONFIG_VERSION, StreamPhysicalBinding};
 
 const UNSHARDED_SPEC_ID: u32 = 1;
 const SHARD_MANIFEST_SCAN_BATCH_SIZE: usize = 2;
@@ -42,6 +45,13 @@ const SHARD_MANIFEST_SCAN_BATCH_SIZE: usize = 2;
 /// placing a hard ceiling on evidence collection.  More state is ambiguous, not
 /// permission to keep scanning an unbounded prefix.
 const MAX_MEM_WAL_INVENTORY_OBJECTS: usize = 8;
+/// Binding ancestry is fixed-size ledger state. Rebind may retain every prior
+/// shard prefix, but it must never turn a root listing into an unbounded scan.
+const MAX_RETAINED_REBIND_SHARDS: usize = 1_024;
+/// Only the fresh shard is inspected recursively. This bound permits several
+/// manifest-only claim attempts plus Lance's manifest hint and the one
+/// required fence sentinel, while still making provider residue loud.
+const MAX_REBIND_FRESH_SHARD_OBJECTS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum MemWalEnrollmentError {
@@ -172,6 +182,172 @@ pub(crate) enum MemWalEnrollmentState {
     ExactIndexAndExpectedEmptyShard {
         receipt: MemWalEnrollmentReceipt,
         shard_manifest: ShardManifest,
+    },
+}
+
+/// Exact physical intent for replacing one sealed lane's MemWAL binding.
+///
+/// `retained_shard_ids` is not ambient object-store discovery: the caller must
+/// derive the canonical set from the authenticated binding-receipt ancestry
+/// selected by durable token authority. The adapter compares that complete set
+/// with the root prefixes and never adopts an unmentioned shard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MemWalRebindPlan {
+    pub(crate) prior_binding: StreamPhysicalBinding,
+    pub(crate) retained_shard_ids: Vec<ShardId>,
+    pub(crate) next_enrollment: MemWalEnrollmentPlan,
+}
+
+impl MemWalRebindPlan {
+    pub(crate) fn new(
+        prior_binding: StreamPhysicalBinding,
+        retained_shard_ids: Vec<ShardId>,
+        next_enrollment: MemWalEnrollmentPlan,
+    ) -> Result<Self, MemWalEnrollmentError> {
+        let plan = Self {
+            prior_binding,
+            retained_shard_ids,
+            next_enrollment,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// Re-run constructor invariants after deserializing recovery authority.
+    pub(crate) fn validate(&self) -> Result<(), MemWalEnrollmentError> {
+        self.next_enrollment.validate()?;
+        if self.prior_binding.table_branch.is_some()
+            || self.prior_binding.shard_ids.len() != 1
+            || self.prior_binding.stream_config_version != STREAM_CONFIG_VERSION
+            || self.prior_binding.stream_config_hash != stream_config_v3_hash()
+        {
+            return Err(MemWalEnrollmentError::InvalidPlan {
+                reason: "prior binding is not the exact main-only config-v3 singleton".to_string(),
+            });
+        }
+        self.prior_binding
+            .identity()
+            .map_err(|error| MemWalEnrollmentError::InvalidPlan {
+                reason: format!("prior binding identity is invalid: {error}"),
+            })?;
+        let prior_enrollment =
+            ShardId::parse_str(&self.prior_binding.enrollment_id).map_err(|error| {
+                MemWalEnrollmentError::InvalidPlan {
+                    reason: format!("prior enrollment_id is invalid: {error}"),
+                }
+            })?;
+        let prior_shard =
+            ShardId::parse_str(&self.prior_binding.shard_ids[0]).map_err(|error| {
+                MemWalEnrollmentError::InvalidPlan {
+                    reason: format!("prior shard_id is invalid: {error}"),
+                }
+            })?;
+        if prior_enrollment.is_nil()
+            || prior_shard.is_nil()
+            || prior_enrollment.get_version_num() != 4
+            || prior_shard.get_version_num() != 4
+            || prior_enrollment == prior_shard
+        {
+            return Err(MemWalEnrollmentError::InvalidPlan {
+                reason: "prior enrollment_id and shard_id must be distinct UUID v4 values"
+                    .to_string(),
+            });
+        }
+        if self.retained_shard_ids.is_empty()
+            || self.retained_shard_ids.len() > MAX_RETAINED_REBIND_SHARDS
+        {
+            return Err(MemWalEnrollmentError::InvalidPlan {
+                reason: format!(
+                    "retained shard ancestry must contain 1..={MAX_RETAINED_REBIND_SHARDS} identities"
+                ),
+            });
+        }
+        let mut canonical = self.retained_shard_ids.clone();
+        canonical.sort_unstable();
+        canonical.dedup();
+        if canonical != self.retained_shard_ids {
+            return Err(MemWalEnrollmentError::InvalidPlan {
+                reason: "retained shard ancestry must be sorted and unique".to_string(),
+            });
+        }
+        if canonical
+            .iter()
+            .any(|shard| shard.is_nil() || shard.get_version_num() != 4)
+        {
+            return Err(MemWalEnrollmentError::InvalidPlan {
+                reason: "retained shard ancestry must contain only UUID v4 identities".to_string(),
+            });
+        }
+        if !canonical.contains(&prior_shard) {
+            return Err(MemWalEnrollmentError::InvalidPlan {
+                reason: "retained shard ancestry omits the selected prior shard".to_string(),
+            });
+        }
+        if canonical.contains(&self.next_enrollment.shard_id)
+            || canonical.contains(&self.next_enrollment.enrollment_id)
+            || prior_enrollment == self.next_enrollment.enrollment_id
+            || prior_shard == self.next_enrollment.enrollment_id
+            || prior_enrollment == self.next_enrollment.shard_id
+        {
+            return Err(MemWalEnrollmentError::InvalidPlan {
+                reason: "fresh enrollment and shard identities overlap retained authority"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn prior_shard_id(&self) -> ShardId {
+        ShardId::parse_str(&self.prior_binding.shard_ids[0]).expect("validated rebind prior shard")
+    }
+
+    pub(crate) fn expected_terminal_shards(&self) -> Vec<ShardId> {
+        let mut expected = self.retained_shard_ids.clone();
+        expected.push(self.next_enrollment.shard_id);
+        expected.sort_unstable();
+        expected
+    }
+}
+
+/// Exact fence-only facts produced by the fresh binding's initial claim.
+/// Protocol digests stay in lifecycle/recovery code because they additionally
+/// bind graph identity, stream incarnation, and the new binding scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MemWalRebindFenceEvidence {
+    pub(crate) shard_manifest: ShardManifest,
+    pub(crate) sentinel_position: u64,
+    pub(crate) sentinel_writer_epoch: u64,
+    pub(crate) base_merged_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MemWalRebindState {
+    ExactNoEffect,
+    ExactIndexDropped {
+        dropped_head: CurrentHeadWitness,
+    },
+    ExactFreshIndexOnly {
+        dropped_head: CurrentHeadWitness,
+        receipt: MemWalEnrollmentReceipt,
+    },
+    /// Epoch 1 provisions the fresh namespace but has no predecessor and thus
+    /// no fence sentinel. Rebind cannot publish from this intermediate state.
+    ExactFreshIndexAndProvisionedShard {
+        dropped_head: CurrentHeadWitness,
+        receipt: MemWalEnrollmentReceipt,
+        shard_manifest: ShardManifest,
+    },
+    /// A claim advanced the manifest but did not durably expose its sentinel.
+    /// A retry may claim the next epoch; no data or lifecycle authority exists.
+    ExactFreshIndexAndClaimManifestOnly {
+        dropped_head: CurrentHeadWitness,
+        receipt: MemWalEnrollmentReceipt,
+        shard_manifest: ShardManifest,
+    },
+    ExactFreshIndexAndFenceOnlyClaim {
+        dropped_head: CurrentHeadWitness,
+        receipt: MemWalEnrollmentReceipt,
+        evidence: MemWalRebindFenceEvidence,
     },
 }
 
@@ -404,6 +580,305 @@ pub(crate) async fn provision_shard_from_exact_index_only(
     }
 }
 
+/// Classify the complete same-table rebind effect chain from the exact prior
+/// base HEAD. The only attached table effects admitted are:
+///
+/// `N --drop old MemWAL index--> N+1 --initialize fresh index--> N+2`.
+///
+/// Shard objects do not advance the table version. Historical prefixes are
+/// compared with authenticated ancestry but never recursively scanned; only
+/// the fresh shard is inspected under a hard bound.
+pub(crate) async fn classify_rebind(
+    anchor: &Dataset,
+    before: &CurrentHeadWitness,
+    plan: &MemWalRebindPlan,
+) -> Result<MemWalRebindState, MemWalEnrollmentError> {
+    plan.validate()?;
+    require_bounded_profile_table(anchor)?;
+    let predecessor = anchor
+        .checkout_version(before.table_version)
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind predecessor open", error))?;
+    let observed_before = capture_current_head_witness(&predecessor).await?;
+    if observed_before != *before {
+        return Err(MemWalEnrollmentError::authority(format!(
+            "rebind predecessor differs from captured authority: expected={before:?}, actual={observed_before:?}"
+        )));
+    }
+    let prior_details = predecessor
+        .mem_wal_index_details()
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind prior index read", error))?
+        .ok_or_else(|| MemWalEnrollmentError::physical("rebind predecessor has no MemWAL index"))?;
+    let (_, prior_shard) = validate_stream_config_v3_binding(&prior_details, &plan.prior_binding)
+        .map_err(|error| MemWalEnrollmentError::physical(error.to_string()))?;
+    if prior_shard != plan.prior_shard_id() {
+        return Err(MemWalEnrollmentError::physical(
+            "rebind predecessor config and intended prior shard disagree",
+        ));
+    }
+    let prior_indices = predecessor
+        .load_indices_by_name(MEM_WAL_INDEX_NAME)
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind prior metadata read", error))?;
+    let [prior_index] = prior_indices.as_slice() else {
+        return Err(MemWalEnrollmentError::physical(format!(
+            "rebind predecessor must contain exactly one MemWAL index metadata row, got {}",
+            prior_indices.len()
+        )));
+    };
+
+    let top_level_shards = mem_wal_top_level_shards(anchor).await?;
+    let has_drop = predecessor
+        .has_successor_version()
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind drop successor probe", error))?;
+    if !has_drop {
+        require_exact_rebind_shards(
+            &top_level_shards,
+            &plan.retained_shard_ids,
+            "rebind no-effect state",
+        )?;
+        return Ok(MemWalRebindState::ExactNoEffect);
+    }
+
+    let drop_version = checked_attached_successor(before.table_version, "rebind index drop")?;
+    let dropped = predecessor
+        .checkout_version(drop_version)
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind dropped-index open", error))?;
+    let dropped_head = classify_exact_rebind_drop(&dropped, before, prior_index).await?;
+    let has_fresh_index = dropped
+        .has_successor_version()
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind fresh-index probe", error))?;
+    if !has_fresh_index {
+        require_exact_rebind_shards(
+            &top_level_shards,
+            &plan.retained_shard_ids,
+            "rebind dropped-index state",
+        )?;
+        return Ok(MemWalRebindState::ExactIndexDropped { dropped_head });
+    }
+
+    let fresh_index_version = checked_attached_successor(drop_version, "rebind fresh index")?;
+    let buried_version = checked_attached_successor(fresh_index_version, "rebind buried effect")?;
+    let fresh = dropped
+        .checkout_version(fresh_index_version)
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind fresh-index open", error))?;
+    if fresh
+        .has_successor_version()
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind buried successor probe", error))?
+    {
+        return Err(MemWalEnrollmentError::authority(format!(
+            "rebind table effects are buried by attached version {buried_version}"
+        )));
+    }
+    let receipt =
+        classify_exact_index_successor(&fresh, &dropped_head, &plan.next_enrollment).await?;
+    if receipt.mem_wal_index_uuid == prior_index.uuid {
+        return Err(MemWalEnrollmentError::physical(
+            "fresh MemWAL index reused the retired index UUID",
+        ));
+    }
+
+    if top_level_shards == plan.retained_shard_ids {
+        return Ok(MemWalRebindState::ExactFreshIndexOnly {
+            dropped_head,
+            receipt,
+        });
+    }
+    let terminal_shards = plan.expected_terminal_shards();
+    require_exact_rebind_shards(
+        &top_level_shards,
+        &terminal_shards,
+        "rebind fresh-shard state",
+    )?;
+    let fresh_objects = raw_mem_wal_shard_inventory(anchor, plan.next_enrollment.shard_id).await?;
+    match classify_rebind_fresh_shard(&fresh, plan.next_enrollment.shard_id, &fresh_objects).await?
+    {
+        RebindFreshShardState::Provisioned(shard_manifest) => {
+            Ok(MemWalRebindState::ExactFreshIndexAndProvisionedShard {
+                dropped_head,
+                receipt,
+                shard_manifest,
+            })
+        }
+        RebindFreshShardState::ClaimManifestOnly(shard_manifest) => {
+            Ok(MemWalRebindState::ExactFreshIndexAndClaimManifestOnly {
+                dropped_head,
+                receipt,
+                shard_manifest,
+            })
+        }
+        RebindFreshShardState::FenceOnlyClaim(evidence) => {
+            Ok(MemWalRebindState::ExactFreshIndexAndFenceOnlyClaim {
+                dropped_head,
+                receipt,
+                evidence,
+            })
+        }
+    }
+}
+
+/// Retire only the selected singleton MemWAL index. Lance's index-drop commit
+/// does not delete any `_mem_wal` objects; the post-effect classifier proves
+/// the complete historical prefix set is unchanged.
+pub(crate) async fn drop_current_index_from_exact_rebind_no_effect(
+    dataset: &mut Dataset,
+    before: &CurrentHeadWitness,
+    plan: &MemWalRebindPlan,
+) -> Result<CurrentHeadWitness, MemWalEnrollmentError> {
+    match classify_rebind(dataset, before, plan).await? {
+        MemWalRebindState::ExactNoEffect => {}
+        state => {
+            return Err(MemWalEnrollmentError::physical(format!(
+                "rebind index drop requires exact no-effect state, got {state:?}"
+            )));
+        }
+    }
+    if dataset.version().version != before.table_version {
+        *dataset = dataset
+            .checkout_version(before.table_version)
+            .await
+            .map_err(|error| MemWalEnrollmentError::lance("rebind drop exact reopen", error))?;
+    }
+    dataset
+        .drop_index(MEM_WAL_INDEX_NAME)
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind index drop", error))?;
+    match classify_rebind(dataset, before, plan).await? {
+        MemWalRebindState::ExactIndexDropped { dropped_head } => Ok(dropped_head),
+        state => Err(MemWalEnrollmentError::physical(format!(
+            "rebind drop did not produce exact dropped-index state: {state:?}"
+        ))),
+    }
+}
+
+/// Initialize the fresh config-v3 singleton only after the old index's exact
+/// drop is visible at N+1.
+pub(crate) async fn initialize_fresh_index_from_exact_rebind_drop(
+    dataset: &mut Dataset,
+    before: &CurrentHeadWitness,
+    plan: &MemWalRebindPlan,
+) -> Result<MemWalEnrollmentReceipt, MemWalEnrollmentError> {
+    let dropped_head = match classify_rebind(dataset, before, plan).await? {
+        MemWalRebindState::ExactIndexDropped { dropped_head } => dropped_head,
+        state => {
+            return Err(MemWalEnrollmentError::physical(format!(
+                "fresh rebind initialization requires exact dropped-index state, got {state:?}"
+            )));
+        }
+    };
+    if dataset.version().version != dropped_head.table_version {
+        *dataset = dataset
+            .checkout_version(dropped_head.table_version)
+            .await
+            .map_err(|error| {
+                MemWalEnrollmentError::lance("rebind initializer exact reopen", error)
+            })?;
+    }
+    let mut builder = dataset.initialize_mem_wal().unsharded();
+    for (key, value) in plan.next_enrollment.expected_writer_defaults() {
+        builder = builder.add_writer_config_default(key, value);
+    }
+    builder
+        .execute()
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind index initialization", error))?;
+    match classify_rebind(dataset, before, plan).await? {
+        MemWalRebindState::ExactFreshIndexOnly { receipt, .. } => Ok(receipt),
+        state => Err(MemWalEnrollmentError::physical(format!(
+            "rebind initializer did not produce exact fresh-index state: {state:?}"
+        ))),
+    }
+}
+
+/// Provision the fresh shard, then obtain its first durable fence-only claim.
+///
+/// Lance's epoch-1 open creates only a manifest because there is no predecessor
+/// to fence. A second no-put open claims epoch 2 (or the next epoch after a
+/// manifest-only lost attempt) and durably writes the required empty sentinel.
+/// Recovery-v18 arms the complete forward-only plan before entering this
+/// adapter. Reclassification before every open prevents data-bearing or foreign
+/// state from being adopted.
+pub(crate) async fn provision_rebind_shard_from_exact_index_only(
+    anchor: &Dataset,
+    before: &CurrentHeadWitness,
+    plan: &MemWalRebindPlan,
+) -> Result<(MemWalEnrollmentReceipt, MemWalRebindFenceEvidence), MemWalEnrollmentError> {
+    for _ in 0..3 {
+        let state = classify_rebind(anchor, before, plan).await?;
+        let (receipt, prior_epoch) = match state {
+            MemWalRebindState::ExactFreshIndexOnly { receipt, .. } => (receipt, 0),
+            MemWalRebindState::ExactFreshIndexAndProvisionedShard {
+                receipt,
+                shard_manifest,
+                ..
+            }
+            | MemWalRebindState::ExactFreshIndexAndClaimManifestOnly {
+                receipt,
+                shard_manifest,
+                ..
+            } => (receipt, shard_manifest.writer_epoch),
+            MemWalRebindState::ExactFreshIndexAndFenceOnlyClaim {
+                receipt, evidence, ..
+            } => return Ok((receipt, evidence)),
+            state => {
+                return Err(MemWalEnrollmentError::physical(format!(
+                    "rebind shard provisioning requires fresh-index or incomplete-claim state, got {state:?}"
+                )));
+            }
+        };
+        let fresh = anchor
+            .checkout_version(receipt.head.table_version)
+            .await
+            .map_err(|error| MemWalEnrollmentError::lance("rebind fresh-index reopen", error))?;
+        let details = fresh
+            .mem_wal_index_details()
+            .await
+            .map_err(|error| MemWalEnrollmentError::lance("rebind writer defaults read", error))?
+            .ok_or_else(|| MemWalEnrollmentError::physical("fresh rebind index disappeared"))?;
+        let config = plan.next_enrollment.reconstruct_writer_config(&details)?;
+        let writer = fresh
+            .mem_wal_writer(plan.next_enrollment.shard_id, config)
+            .await
+            .map_err(|error| {
+                MemWalEnrollmentError::lance("rebind fence-only shard claim", error)
+            })?;
+        let expected_epoch = prior_epoch
+            .checked_add(1)
+            .ok_or_else(|| MemWalEnrollmentError::physical("rebind writer epoch overflow"))?;
+        if writer.shard_id() != plan.next_enrollment.shard_id || writer.epoch() != expected_epoch {
+            let observed_shard = writer.shard_id();
+            let observed_epoch = writer.epoch();
+            let _ = writer.close().await;
+            return Err(MemWalEnrollmentError::physical(format!(
+                "rebind claim returned shard {observed_shard} epoch {observed_epoch}, expected {} epoch {expected_epoch}",
+                plan.next_enrollment.shard_id
+            )));
+        }
+        writer
+            .check_fenced()
+            .await
+            .map_err(|error| MemWalEnrollmentError::lance("rebind fence check", error))?;
+        writer
+            .close()
+            .await
+            .map_err(|error| MemWalEnrollmentError::lance("rebind shard close", error))?;
+    }
+    match classify_rebind(anchor, before, plan).await? {
+        MemWalRebindState::ExactFreshIndexAndFenceOnlyClaim {
+            receipt, evidence, ..
+        } => Ok((receipt, evidence)),
+        state => Err(MemWalEnrollmentError::physical(format!(
+            "rebind claim did not converge to exact fence-only state: {state:?}"
+        ))),
+    }
+}
+
 /// Fail closed when a table with no lifecycle authority already carries the
 /// singleton MemWAL system index. A covered enrollment gap is resolved (or
 /// refused in read-only mode) before this check; an uncovered index is partial
@@ -608,6 +1083,360 @@ async fn classify_exact_index_successor(
     })
 }
 
+fn checked_attached_successor(
+    version: u64,
+    operation: &'static str,
+) -> Result<u64, MemWalEnrollmentError> {
+    let successor = version
+        .checked_add(1)
+        .ok_or_else(|| MemWalEnrollmentError::authority(format!("{operation} version overflow")))?;
+    if lance_table::format::is_detached_version(successor) {
+        return Err(MemWalEnrollmentError::authority(format!(
+            "{operation} crosses the detached-version boundary"
+        )));
+    }
+    Ok(successor)
+}
+
+async fn classify_exact_rebind_drop(
+    dropped: &Dataset,
+    before: &CurrentHeadWitness,
+    prior_index: &lance_table::format::IndexMetadata,
+) -> Result<CurrentHeadWitness, MemWalEnrollmentError> {
+    let expected_version = checked_attached_successor(before.table_version, "rebind index drop")?;
+    if dropped.version().version != expected_version {
+        return Err(MemWalEnrollmentError::authority(format!(
+            "rebind drop is not exact N+1: expected {expected_version}, got {}",
+            dropped.version().version
+        )));
+    }
+    let head = capture_current_head_witness(dropped).await?;
+    validate_rebind_successor_head(before, &head, "index drop")?;
+    let transaction = dropped
+        .read_transaction()
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind drop transaction read", error))?
+        .ok_or_else(|| MemWalEnrollmentError::physical("rebind drop has no transaction"))?;
+    if transaction.read_version != before.table_version
+        || transaction.uuid.is_empty()
+        || transaction.uuid == before.transaction_uuid
+        || transaction.uuid != head.transaction_uuid
+        || transaction.tag.is_some()
+        || transaction.transaction_properties.is_some()
+    {
+        return Err(MemWalEnrollmentError::physical(format!(
+            "rebind drop transaction has a foreign shape: {transaction:?}"
+        )));
+    }
+    let (new_indices, removed_indices) = match &transaction.operation {
+        Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } => (new_indices, removed_indices),
+        operation => {
+            return Err(MemWalEnrollmentError::physical(format!(
+                "rebind drop operation is not CreateIndex: {operation:?}"
+            )));
+        }
+    };
+    if !new_indices.is_empty()
+        || removed_indices.len() != 1
+        || removed_indices.first() != Some(prior_index)
+    {
+        return Err(MemWalEnrollmentError::physical(format!(
+            "rebind drop must remove exactly the selected MemWAL metadata row: new={new_indices:?}, removed={removed_indices:?}"
+        )));
+    }
+    if dropped
+        .mem_wal_index_details()
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind dropped details read", error))?
+        .is_some()
+        || !dropped
+            .load_indices_by_name(MEM_WAL_INDEX_NAME)
+            .await
+            .map_err(|error| MemWalEnrollmentError::lance("rebind dropped metadata read", error))?
+            .is_empty()
+    {
+        return Err(MemWalEnrollmentError::physical(
+            "rebind drop successor still contains MemWAL index authority",
+        ));
+    }
+    Ok(head)
+}
+
+fn validate_rebind_successor_head(
+    before: &CurrentHeadWitness,
+    after: &CurrentHeadWitness,
+    operation: &'static str,
+) -> Result<(), MemWalEnrollmentError> {
+    if after.branch_identifier != before.branch_identifier {
+        return Err(MemWalEnrollmentError::authority(format!(
+            "branch/ref incarnation changed during rebind {operation}"
+        )));
+    }
+    if before.manifest_e_tag.is_some() && after.manifest_e_tag.is_none() {
+        return Err(MemWalEnrollmentError::authority(format!(
+            "rebind {operation} successor lost the manifest e_tag"
+        )));
+    }
+    if before.manifest_e_tag.is_some() && after.manifest_e_tag == before.manifest_e_tag {
+        return Err(MemWalEnrollmentError::authority(format!(
+            "rebind {operation} successor reused its predecessor manifest e_tag"
+        )));
+    }
+    Ok(())
+}
+
+fn require_exact_rebind_shards(
+    actual: &[ShardId],
+    expected: &[ShardId],
+    state: &'static str,
+) -> Result<(), MemWalEnrollmentError> {
+    if actual != expected {
+        return Err(MemWalEnrollmentError::physical(format!(
+            "{state} has foreign or missing MemWAL prefixes: expected={expected:?}, actual={actual:?}"
+        )));
+    }
+    Ok(())
+}
+
+async fn mem_wal_top_level_shards(
+    dataset: &Dataset,
+) -> Result<Vec<ShardId>, MemWalEnrollmentError> {
+    let object_store = dataset
+        .object_store(None)
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind root store open", error))?;
+    let root = dataset.branch_location().path.join("_mem_wal");
+    let listed = object_store
+        .inner
+        .list_with_delimiter(Some(&root))
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind root listing", error))?;
+    if !listed.objects.is_empty() {
+        return Err(MemWalEnrollmentError::physical(format!(
+            "rebind MemWAL root contains loose objects: {:?}",
+            listed
+                .objects
+                .iter()
+                .map(|object| object.location.as_ref())
+                .collect::<Vec<_>>()
+        )));
+    }
+    if listed.common_prefixes.len() > MAX_RETAINED_REBIND_SHARDS.saturating_add(1) {
+        return Err(MemWalEnrollmentError::InventoryLimitExceeded {
+            scope: format!("{}/_mem_wal shard prefixes", dataset.branch_location().uri),
+            limit: MAX_RETAINED_REBIND_SHARDS.saturating_add(1),
+        });
+    }
+    let mut shards = Vec::with_capacity(listed.common_prefixes.len());
+    for prefix in listed.common_prefixes {
+        let relative = relative_object_path(&root, &prefix)?;
+        if relative.is_empty() || relative.contains('/') {
+            return Err(MemWalEnrollmentError::physical(format!(
+                "rebind MemWAL root contains malformed nested prefix {prefix:?}"
+            )));
+        }
+        let shard = ShardId::parse_str(&relative).map_err(|error| {
+            MemWalEnrollmentError::physical(format!(
+                "rebind MemWAL root contains malformed shard prefix {relative:?}: {error}"
+            ))
+        })?;
+        shards.push(shard);
+    }
+    shards.sort_unstable();
+    if shards.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(MemWalEnrollmentError::physical(
+            "rebind MemWAL root returned duplicate shard prefixes",
+        ));
+    }
+    Ok(shards)
+}
+
+async fn raw_mem_wal_shard_inventory(
+    dataset: &Dataset,
+    shard_id: ShardId,
+) -> Result<Vec<String>, MemWalEnrollmentError> {
+    let object_store = dataset
+        .object_store(None)
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind shard store open", error))?;
+    let root = dataset
+        .branch_location()
+        .path
+        .join("_mem_wal")
+        .join(shard_id.to_string());
+    let objects = strict_collect_bounded(
+        object_store.inner.list(Some(&root)),
+        MAX_REBIND_FRESH_SHARD_OBJECTS,
+        format!("{}/_mem_wal/{shard_id}", dataset.branch_location().uri),
+    )
+    .await?;
+    let mut relative = objects
+        .into_iter()
+        .map(|object| relative_object_path(&root, &object.location))
+        .collect::<Result<Vec<_>, _>>()?;
+    relative.sort();
+    Ok(relative)
+}
+
+enum RebindFreshShardState {
+    Provisioned(ShardManifest),
+    ClaimManifestOnly(ShardManifest),
+    FenceOnlyClaim(MemWalRebindFenceEvidence),
+}
+
+async fn classify_rebind_fresh_shard(
+    dataset: &Dataset,
+    shard_id: ShardId,
+    objects: &[String],
+) -> Result<RebindFreshShardState, MemWalEnrollmentError> {
+    let expected_sentinel = format!(
+        "wal/{}",
+        lance::dataset::mem_wal::util::wal_entry_filename(1)
+    );
+    let mut manifest_versions = Vec::new();
+    let mut saw_hint = false;
+    let mut wal_objects = Vec::new();
+    let mut unexpected = Vec::new();
+    for object in objects {
+        match documented_manifest_version(object) {
+            Some(Some(version)) => manifest_versions.push(version),
+            Some(None) => {
+                if saw_hint {
+                    return Err(MemWalEnrollmentError::physical(
+                        "fresh rebind shard contains duplicate manifest hints",
+                    ));
+                }
+                saw_hint = true;
+            }
+            None if object.starts_with("wal/") => wal_objects.push(object.clone()),
+            None if documented_manifest_staging(object) => {}
+            None => unexpected.push(object.clone()),
+        }
+    }
+    manifest_versions.sort_unstable();
+    wal_objects.sort();
+    unexpected.sort();
+    if manifest_versions.is_empty() || !unexpected.is_empty() {
+        return Err(MemWalEnrollmentError::physical(format!(
+            "fresh rebind shard has incomplete manifests or unexpected objects: manifests={manifest_versions:?}, unexpected={unexpected:?}"
+        )));
+    }
+    let latest_version = *manifest_versions
+        .last()
+        .expect("non-empty manifest versions checked above");
+    let expected_versions = (1..=latest_version).collect::<Vec<_>>();
+    if manifest_versions != expected_versions {
+        return Err(MemWalEnrollmentError::physical(format!(
+            "fresh rebind shard manifest history has gaps: expected={expected_versions:?}, actual={manifest_versions:?}"
+        )));
+    }
+
+    let object_store = dataset
+        .object_store(None)
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind manifest store open", error))?;
+    let store = ShardManifestStore::new(
+        object_store.clone(),
+        &dataset.branch_location().path,
+        shard_id,
+        SHARD_MANIFEST_SCAN_BATCH_SIZE,
+    );
+    let mut previous_epoch = 0;
+    let mut latest_manifest = None;
+    for version in expected_versions {
+        let manifest = store
+            .read_version(version)
+            .await
+            .map_err(|error| MemWalEnrollmentError::lance("rebind shard manifest read", error))?;
+        validate_empty_rebind_shard_manifest(&manifest, shard_id, version, previous_epoch)?;
+        previous_epoch = manifest.writer_epoch;
+        latest_manifest = Some(manifest);
+    }
+    let latest_manifest = latest_manifest.expect("non-empty exact history checked above");
+
+    if wal_objects.is_empty() {
+        if latest_manifest.wal_entry_position_last_seen != 0 {
+            return Err(MemWalEnrollmentError::physical(
+                "fresh rebind shard records a WAL cursor without a WAL object",
+            ));
+        }
+        return Ok(if latest_manifest.writer_epoch == 1 {
+            RebindFreshShardState::Provisioned(latest_manifest)
+        } else {
+            RebindFreshShardState::ClaimManifestOnly(latest_manifest)
+        });
+    }
+    if wal_objects != [expected_sentinel] || latest_manifest.writer_epoch < 2 {
+        return Err(MemWalEnrollmentError::physical(format!(
+            "fresh rebind shard WAL is not exactly one initial fence sentinel: {wal_objects:?}"
+        )));
+    }
+    let tailer = WalTailer::new(
+        object_store,
+        dataset.branch_location().path.clone(),
+        shard_id,
+    );
+    let sentinel = tailer
+        .read_entry(1)
+        .await
+        .map_err(|error| MemWalEnrollmentError::lance("rebind sentinel read", error))?
+        .ok_or_else(|| MemWalEnrollmentError::physical("listed rebind sentinel disappeared"))?;
+    if sentinel.shard_id != shard_id
+        || sentinel.entry_position != 1
+        || sentinel.writer_epoch != latest_manifest.writer_epoch
+        || !sentinel.batches.is_empty()
+    {
+        return Err(MemWalEnrollmentError::physical(format!(
+            "fresh rebind WAL endpoint is not an empty current-epoch sentinel: shard={}, position={}, epoch={}, batches={}",
+            sentinel.shard_id,
+            sentinel.entry_position,
+            sentinel.writer_epoch,
+            sentinel.batches.len()
+        )));
+    }
+    Ok(RebindFreshShardState::FenceOnlyClaim(
+        MemWalRebindFenceEvidence {
+            shard_manifest: latest_manifest,
+            sentinel_position: sentinel.entry_position,
+            sentinel_writer_epoch: sentinel.writer_epoch,
+            base_merged_generation: 0,
+        },
+    ))
+}
+
+fn validate_empty_rebind_shard_manifest(
+    manifest: &ShardManifest,
+    shard_id: ShardId,
+    expected_version: u64,
+    previous_epoch: u64,
+) -> Result<(), MemWalEnrollmentError> {
+    let epoch_is_exact = if expected_version == 1 {
+        manifest.writer_epoch == 1
+    } else {
+        manifest.writer_epoch == previous_epoch
+            || manifest.writer_epoch == previous_epoch.saturating_add(1)
+    };
+    if manifest.shard_id != shard_id
+        || manifest.version != expected_version
+        || manifest.shard_spec_id != UNSHARDED_SPEC_ID
+        || !manifest.shard_field_values.is_empty()
+        || !epoch_is_exact
+        || manifest.replay_after_wal_entry_position != 0
+        || manifest.wal_entry_position_last_seen > 1
+        || manifest.current_generation != 1
+        || !manifest.flushed_generations.is_empty()
+        || manifest.status != ShardStatus::Active
+    {
+        return Err(MemWalEnrollmentError::physical(format!(
+            "fresh rebind shard manifest is not an empty claim-only successor: {manifest:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_fresh_unsharded_details(
     details: &MemWalIndexDetails,
     plan: &MemWalEnrollmentPlan,
@@ -755,6 +1584,25 @@ fn documented_manifest_version(relative: &str) -> Option<Option<u64>> {
     Some(Some(reversed.reverse_bits()))
 }
 
+/// Lance may leave a losing atomic-CAS shard-manifest staging object. It never
+/// became authority, so exact physical classifiers ignore only this canonical
+/// `manifest/<positive-version>.binpb.tmp.<uuid>` shape and fail closed on
+/// every other unrecognized object.
+fn documented_manifest_staging(relative: &str) -> bool {
+    let Some(filename) = relative.strip_prefix("manifest/") else {
+        return false;
+    };
+    let Some((manifest_name, temporary_id)) = filename.split_once(".tmp.") else {
+        return false;
+    };
+    let canonical_manifest = format!("manifest/{manifest_name}");
+    if !matches!(documented_manifest_version(&canonical_manifest), Some(Some(1..))) {
+        return false;
+    }
+    ShardId::parse_str(temporary_id)
+        .is_ok_and(|parsed| parsed.as_hyphenated().to_string() == temporary_id)
+}
+
 async fn exact_empty_shard_manifest(
     dataset: &Dataset,
     shard_id: ShardId,
@@ -766,6 +1614,7 @@ async fn exact_empty_shard_manifest(
         match documented_manifest_version(object) {
             Some(Some(version)) => manifest_versions.push(version),
             Some(None) => {}
+            None if documented_manifest_staging(object) => {}
             None => unexpected_objects.push(object.clone()),
         }
     }
@@ -868,6 +1717,32 @@ mod tests {
         MemWalEnrollmentPlan::new(ShardId::new_v4(), ShardId::new_v4()).unwrap()
     }
 
+    fn binding_for(plan: &MemWalEnrollmentPlan) -> StreamPhysicalBinding {
+        StreamPhysicalBinding {
+            stable_table_id: 7,
+            table_incarnation_id: 9,
+            table_location: "nodes/person-7-9.lance".to_string(),
+            table_branch: None,
+            enrollment_id: plan.enrollment_id.to_string(),
+            shard_ids: vec![plan.shard_id.to_string()],
+            stream_config_version: STREAM_CONFIG_VERSION,
+            stream_config_hash: plan.stream_config_hash(),
+        }
+    }
+
+    async fn enrolled_dataset(uri: &str) -> (Dataset, MemWalEnrollmentPlan) {
+        let mut dataset = fresh_dataset(uri).await;
+        let before = capture_pre_enrollment_head(&dataset).await.unwrap();
+        let plan = plan();
+        initialize_index_from_exact_no_effect(&mut dataset, &before, &plan)
+            .await
+            .unwrap();
+        provision_shard_from_exact_index_only(&dataset, &before, &plan)
+            .await
+            .unwrap();
+        (dataset, plan)
+    }
+
     #[tokio::test]
     async fn adapter_classifies_and_executes_only_the_two_enrollment_effects() {
         let dir = tempfile::tempdir().unwrap();
@@ -918,6 +1793,290 @@ mod tests {
             shard_manifest.writer_epoch, 1,
             "refused re-provisioning must not claim the shard a second time"
         );
+    }
+
+    #[tokio::test]
+    async fn rebind_drops_and_recreates_only_index_authority_and_retains_old_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("physical-rebind.lance");
+        let uri = uri.to_str().unwrap();
+        let (mut dataset, old_plan) = enrolled_dataset(uri).await;
+        let before = capture_current_head_witness(&dataset).await.unwrap();
+        let old_store = ShardManifestStore::new(
+            dataset.object_store(None).await.unwrap(),
+            &dataset.branch_location().path,
+            old_plan.shard_id,
+            SHARD_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        let old_manifest = old_store.read_version(1).await.unwrap();
+        let next_plan = plan();
+        let rebind = MemWalRebindPlan::new(
+            binding_for(&old_plan),
+            vec![old_plan.shard_id],
+            next_plan.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            classify_rebind(&dataset, &before, &rebind).await.unwrap(),
+            MemWalRebindState::ExactNoEffect
+        );
+        let dropped =
+            drop_current_index_from_exact_rebind_no_effect(&mut dataset, &before, &rebind)
+                .await
+                .unwrap();
+        assert_eq!(dropped.table_version, before.table_version + 1);
+        assert!(matches!(
+            classify_rebind(&dataset, &before, &rebind).await.unwrap(),
+            MemWalRebindState::ExactIndexDropped { .. }
+        ));
+
+        let receipt = initialize_fresh_index_from_exact_rebind_drop(&mut dataset, &before, &rebind)
+            .await
+            .unwrap();
+        assert_eq!(receipt.head.table_version, before.table_version + 2);
+        assert!(matches!(
+            classify_rebind(&dataset, &before, &rebind).await.unwrap(),
+            MemWalRebindState::ExactFreshIndexOnly { .. }
+        ));
+
+        let (terminal_receipt, evidence) =
+            provision_rebind_shard_from_exact_index_only(&dataset, &before, &rebind)
+                .await
+                .unwrap();
+        assert_eq!(terminal_receipt, receipt);
+        assert_eq!(evidence.sentinel_position, 1);
+        assert_eq!(evidence.sentinel_writer_epoch, 2);
+        assert_eq!(evidence.shard_manifest.writer_epoch, 2);
+        assert_eq!(evidence.shard_manifest.replay_after_wal_entry_position, 0);
+        assert_eq!(evidence.shard_manifest.current_generation, 1);
+        assert_eq!(evidence.base_merged_generation, 0);
+        assert!(matches!(
+            classify_rebind(&dataset, &before, &rebind).await.unwrap(),
+            MemWalRebindState::ExactFreshIndexAndFenceOnlyClaim { .. }
+        ));
+
+        assert_eq!(old_store.read_version(1).await.unwrap(), old_manifest);
+        let mut expected_shards = vec![old_plan.shard_id, next_plan.shard_id];
+        expected_shards.sort_unstable();
+        assert_eq!(
+            mem_wal_top_level_shards(&dataset).await.unwrap(),
+            expected_shards
+        );
+
+        let (_, retried) = provision_rebind_shard_from_exact_index_only(&dataset, &before, &rebind)
+            .await
+            .unwrap();
+        assert_eq!(retried.sentinel_position, 1);
+        assert_eq!(retried.sentinel_writer_epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn rebind_claim_converges_forward_after_manifest_only_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("physical-rebind-manifest-only.lance");
+        let uri = uri.to_str().unwrap();
+        let (mut dataset, old_plan) = enrolled_dataset(uri).await;
+        let before = capture_current_head_witness(&dataset).await.unwrap();
+        let rebind =
+            MemWalRebindPlan::new(binding_for(&old_plan), vec![old_plan.shard_id], plan()).unwrap();
+        drop_current_index_from_exact_rebind_no_effect(&mut dataset, &before, &rebind)
+            .await
+            .unwrap();
+        initialize_fresh_index_from_exact_rebind_drop(&mut dataset, &before, &rebind)
+            .await
+            .unwrap();
+
+        let store = ShardManifestStore::new(
+            dataset.object_store(None).await.unwrap(),
+            &dataset.branch_location().path,
+            rebind.next_enrollment.shard_id,
+            SHARD_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        // forbidden-api-allow: test-only crash-window construction between
+        // Lance's epoch manifest and its automatic fence sentinel.
+        assert_eq!(store.claim_epoch(UNSHARDED_SPEC_ID).await.unwrap().0, 1);
+        assert_eq!(store.claim_epoch(UNSHARDED_SPEC_ID).await.unwrap().0, 2);
+        assert!(matches!(
+            classify_rebind(&dataset, &before, &rebind)
+                .await
+                .unwrap(),
+            MemWalRebindState::ExactFreshIndexAndClaimManifestOnly {
+                shard_manifest,
+                ..
+            } if shard_manifest.writer_epoch == 2
+        ));
+
+        let (_, evidence) =
+            provision_rebind_shard_from_exact_index_only(&dataset, &before, &rebind)
+                .await
+                .unwrap();
+        assert_eq!(evidence.sentinel_position, 1);
+        assert_eq!(evidence.sentinel_writer_epoch, 3);
+        assert_eq!(evidence.shard_manifest.writer_epoch, 3);
+    }
+
+    #[test]
+    fn rebind_classifier_accepts_only_canonical_lance_manifest_staging() {
+        let bits = format!("{:064b}", 1_u64.reverse_bits());
+        let temporary_id = "01234567-89ab-cdef-0123-456789abcdef";
+        assert!(documented_manifest_staging(&format!(
+            "manifest/{bits}.binpb.tmp.{temporary_id}"
+        )));
+        for malformed in [
+            format!("manifest/{bits}.binpb"),
+            format!("manifest/{bits}.binpb.tmp.NOT-A-UUID"),
+            format!(
+                "manifest/{bits}.binpb.tmp.{}",
+                temporary_id.to_ascii_uppercase()
+            ),
+            format!("manifest/{}.binpb.tmp.{temporary_id}", "0".repeat(64)),
+            format!("wal/{bits}.arrow.tmp.{temporary_id}"),
+        ] {
+            assert!(
+                !documented_manifest_staging(&malformed),
+                "malformed staging path must fail closed: {malformed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rebind_classifier_rejects_foreign_drop_burial_and_shard_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let foreign_uri = dir.path().join("rebind-foreign-drop.lance");
+        let foreign_uri = foreign_uri.to_str().unwrap();
+        let (mut foreign, old_plan) = enrolled_dataset(foreign_uri).await;
+        let before = capture_current_head_witness(&foreign).await.unwrap();
+        let rebind =
+            MemWalRebindPlan::new(binding_for(&old_plan), vec![old_plan.shard_id], plan()).unwrap();
+        let transaction = Transaction::new(
+            foreign.version().version,
+            Operation::UpdateConfig {
+                config_updates: Some(UpdateMap {
+                    update_entries: vec![
+                        (
+                            "omnigraph.test.foreign-rebind".to_string(),
+                            Some("true".to_string()),
+                        )
+                            .into(),
+                    ],
+                    replace: false,
+                }),
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+        // forbidden-api-allow: test-only foreign N+1 classifier evidence
+        foreign = CommitBuilder::new(Arc::new(foreign))
+            .execute(transaction)
+            .await
+            .unwrap();
+        let error = classify_rebind(&foreign, &before, &rebind)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MemWalEnrollmentError::PhysicalConflict { .. }
+        ));
+
+        let buried_uri = dir.path().join("rebind-buried.lance");
+        let buried_uri = buried_uri.to_str().unwrap();
+        let (mut buried, old_plan) = enrolled_dataset(buried_uri).await;
+        let before = capture_current_head_witness(&buried).await.unwrap();
+        let rebind =
+            MemWalRebindPlan::new(binding_for(&old_plan), vec![old_plan.shard_id], plan()).unwrap();
+        drop_current_index_from_exact_rebind_no_effect(&mut buried, &before, &rebind)
+            .await
+            .unwrap();
+        initialize_fresh_index_from_exact_rebind_drop(&mut buried, &before, &rebind)
+            .await
+            .unwrap();
+        let transaction = Transaction::new(
+            buried.version().version,
+            Operation::UpdateConfig {
+                config_updates: Some(UpdateMap {
+                    update_entries: vec![
+                        (
+                            "omnigraph.test.buried-rebind".to_string(),
+                            Some("true".to_string()),
+                        )
+                            .into(),
+                    ],
+                    replace: false,
+                }),
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+        // forbidden-api-allow: test-only buried N+3 classifier evidence
+        buried = CommitBuilder::new(Arc::new(buried))
+            .execute(transaction)
+            .await
+            .unwrap();
+        let error = classify_rebind(&buried, &before, &rebind)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MemWalEnrollmentError::AuthorityChanged { .. }
+        ));
+        assert!(error.to_string().contains("buried"));
+
+        let prefix_uri = dir.path().join("rebind-foreign-prefix.lance");
+        let prefix_uri = prefix_uri.to_str().unwrap();
+        let (mut prefix, old_plan) = enrolled_dataset(prefix_uri).await;
+        let before = capture_current_head_witness(&prefix).await.unwrap();
+        let rebind =
+            MemWalRebindPlan::new(binding_for(&old_plan), vec![old_plan.shard_id], plan()).unwrap();
+        drop_current_index_from_exact_rebind_no_effect(&mut prefix, &before, &rebind)
+            .await
+            .unwrap();
+        initialize_fresh_index_from_exact_rebind_drop(&mut prefix, &before, &rebind)
+            .await
+            .unwrap();
+        let details = prefix.mem_wal_index_details().await.unwrap().unwrap();
+        let foreign_shard = ShardId::new_v4();
+        let config = reconstruct_b1_writer_config(
+            &details,
+            rebind.next_enrollment.enrollment_id,
+            foreign_shard,
+        )
+        .unwrap();
+        let writer = prefix.mem_wal_writer(foreign_shard, config).await.unwrap();
+        writer.close().await.unwrap();
+        let error = classify_rebind(&prefix, &before, &rebind)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MemWalEnrollmentError::PhysicalConflict { .. }
+        ));
+        assert!(error.to_string().contains("foreign or missing"));
+    }
+
+    #[test]
+    fn rebind_plan_requires_canonical_authenticated_shard_ancestry() {
+        let old = plan();
+        let next = plan();
+        let another = ShardId::new_v4();
+        let mut retained = vec![old.shard_id, another];
+        retained.sort_unstable();
+        assert!(MemWalRebindPlan::new(binding_for(&old), retained.clone(), next.clone()).is_ok());
+
+        retained.reverse();
+        assert!(matches!(
+            MemWalRebindPlan::new(binding_for(&old), retained, next.clone()).unwrap_err(),
+            MemWalEnrollmentError::InvalidPlan { .. }
+        ));
+        assert!(matches!(
+            MemWalRebindPlan::new(binding_for(&old), vec![old.shard_id], old).unwrap_err(),
+            MemWalEnrollmentError::InvalidPlan { .. }
+        ));
     }
 
     #[tokio::test]

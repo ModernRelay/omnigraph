@@ -43,6 +43,7 @@ mod stream_ingest;
 pub(crate) mod stream_lifecycle;
 mod stream_ndjson;
 mod stream_profile;
+mod stream_rebind;
 mod stream_request;
 mod stream_status;
 mod table_ops;
@@ -54,7 +55,8 @@ pub use repair::{
 pub use schema_apply::SchemaApplyOptions;
 #[doc(hidden)]
 pub use stream_profile::{
-    CheckedClusterApplyAuthority, CheckedClusterStreamRuntimeAuthority, StreamingProfileResult,
+    CheckedClusterApplyAuthority, CheckedClusterMaintenanceAuthority,
+    CheckedClusterStreamRuntimeAuthority, StreamingProfileResult,
 };
 pub use stream_status::{StreamStatus, StreamTableStatus};
 pub use table_ops::PendingIndex;
@@ -659,19 +661,31 @@ impl Omnigraph {
         let mut coordinator =
             GraphCoordinator::open_with_session(&root, Arc::clone(&storage), &control_session)
                 .await?;
-        // Full recovery may Restore or publish any table named by a pending
-        // sidecar. Close those admission domains before taking the schema gate,
-        // preserving the global admission -> schema -> branch -> table order
-        // even when another handle is still finishing the writer that created
-        // the sidecar. This is deliberately exclusive and cold-path only.
+        // Full recovery may change graph-global stream-profile authority or
+        // Restore/publish any table named by a pending sidecar. Every mutable
+        // cold open therefore owns the profile gate exclusively before sidecar
+        // discovery, then preserves the global profile -> admission -> schema
+        // -> branch -> table order through the full sweep. This waits out live
+        // shared-profile writers before classifying their sidecars and avoids a
+        // stale pre-list/guard-upgrade race. ReadOnly keeps its non-mutating
+        // behavior and takes no recovery profile guard.
         // The recovery sweep re-lists under the schema gate; a sidecar created
         // after this pre-list is either still protected by the writer's schema
         // gate (so this open waits) or belongs to a writer that has already
         // released every effect guard.
+        let _recovery_profile_guard = if matches!(mode, OpenMode::ReadWrite) {
+            Some(write_queue.acquire_stream_profile_exclusive().await)
+        } else {
+            None
+        };
+        let recovery_sidecars = if matches!(mode, OpenMode::ReadWrite) {
+            crate::db::manifest::list_sidecars(&root, storage.as_ref()).await?
+        } else {
+            Vec::new()
+        };
         let recovery_admission_keys = if matches!(mode, OpenMode::ReadWrite) {
-            crate::db::manifest::list_sidecars(&root, storage.as_ref())
-                .await?
-                .into_iter()
+            recovery_sidecars
+                .iter()
                 .flat_map(|sidecar| {
                     if let Some(scope) = sidecar.stream_admission_scope() {
                         vec![
@@ -683,7 +697,7 @@ impl Omnigraph {
                     } else {
                         sidecar
                             .tables
-                            .into_iter()
+                            .iter()
                             .map(|pin| {
                                 crate::db::write_queue::StreamAdmissionKey::for_resolved_ref(
                                     pin.identity,
@@ -1912,7 +1926,7 @@ impl Omnigraph {
             &self.root_uri,
             Arc::clone(&self.storage),
             &self.coordinator,
-            &self.write_queue,
+            Arc::clone(&self.write_queue),
         )
         .await?;
         self.reload_schema_if_source_changed().await?;
@@ -2154,7 +2168,7 @@ impl Omnigraph {
             &self.root_uri,
             Arc::clone(&self.storage),
             &self.coordinator,
-            &self.write_queue,
+            Arc::clone(&self.write_queue),
         )
         .await?;
         if outcome.processed_any {

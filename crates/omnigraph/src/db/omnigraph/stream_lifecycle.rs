@@ -21,16 +21,17 @@ use sha2::{Digest, Sha256};
 
 use crate::db::manifest::TableIdentity;
 use crate::db::manifest::stream::{
-    AuthenticatedWalTail, ClaimAttemptClassification, ClaimAttemptEffect,
+    AuthenticatedWalTail, BindingReceipt, ClaimAttemptClassification, ClaimAttemptEffect,
     ClaimAttemptEffectPreimage, ClaimProfile, ClaimReceipt, ClaimReceiptPreimage,
     ClaimTerminalClassification, CurrentHeadWitness, DisableDrainAdoption, DrainDescriptor,
     DrainGoal, LastFoldOutcome, LastFoldSummary, ManagementReceipt,
     QUIESCE_REQUEST_PROTOCOL_VERSION, QuiesceRequestPayload,
-    STREAM_DATA_BLOCK_VALIDATION_CONTRACT_VERSION, STREAM_RESUME_OPERATION_KIND,
-    STREAM_RESUME_REQUEST_PROTOCOL_VERSION, SealedProof, StreamGenerationCut, StreamLifecycle,
-    StreamLifecycleEntry, StreamResumeMode, StreamResumeRequestPayload, StrictBlock,
-    authenticated_wal_tail_chain_digest, stream_physical_binding_digest,
-    stream_quiesce_result_payload, stream_resume_result_payload,
+    STREAM_DATA_BLOCK_VALIDATION_CONTRACT_VERSION, STREAM_REBIND_OPERATION_KIND,
+    STREAM_RESUME_OPERATION_KIND, STREAM_RESUME_REQUEST_PROTOCOL_VERSION, SealedProof,
+    StreamGenerationCut, StreamLifecycle, StreamLifecycleEntry, StreamRebindRequestPayload,
+    StreamResumeMode, StreamResumeRequestPayload, StrictBlock, authenticated_wal_tail_chain_digest,
+    stream_physical_binding_digest, stream_quiesce_result_payload, stream_rebind_result_payload,
+    stream_resume_result_payload,
 };
 use crate::db::manifest::stream_profile::ReceiptChainRef;
 use crate::db::manifest::stream_token::{
@@ -1240,6 +1241,169 @@ pub(crate) fn prepare_resume_claim_operation(
         ));
     }
     prepare_claim_operation_for_eligible_lifecycle(prior, request)
+}
+
+fn validate_rebind_claim_authority_shape(
+    prior: &StreamLifecycleEntry,
+    authority: &StreamLifecycleEntry,
+) -> Result<()> {
+    prior.validate()?;
+    authority.validate()?;
+    let expected_head_version = prior
+        .current_head_witness
+        .table_version
+        .checked_add(2)
+        .ok_or_else(|| OmniError::manifest_internal("stream rebind table version overflow"))?;
+    let expected_binding_receipt_count = prior
+        .binding_receipt_chain
+        .record_count
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("stream binding receipt chain overflow"))?;
+    let [fresh_shard_id] = authority.binding.shard_ids.as_slice() else {
+        return Err(OmniError::manifest_internal(
+            "stream rebind claim authority requires one fresh shard",
+        ));
+    };
+    if prior.lifecycle != StreamLifecycle::Sealed
+        || authority.lifecycle != StreamLifecycle::Open
+        || authority.lifecycle_revision != prior.lifecycle_revision
+        || authority.identity != prior.identity
+        || authority.diagnostic_table_key != prior.diagnostic_table_key
+        || authority.enrollment_receipt != prior.enrollment_receipt
+        || authority.binding.table_location != prior.binding.table_location
+        || authority.binding.table_branch != prior.binding.table_branch
+        || authority.binding.stream_config_version != prior.binding.stream_config_version
+        || authority.binding.stream_config_hash != prior.binding.stream_config_hash
+        || authority.binding == prior.binding
+        || authority.binding_scope_id == prior.binding_scope_id
+        || authority.binding.enrollment_id == prior.binding.enrollment_id
+        || authority
+            .binding
+            .shard_ids
+            .iter()
+            .any(|shard| prior.binding.shard_ids.contains(shard))
+        || authority.current_head_witness.table_version != expected_head_version
+        || authority.current_head_witness.transaction_uuid
+            == prior.current_head_witness.transaction_uuid
+        || authority.binding_receipt_chain.record_count != expected_binding_receipt_count
+        || authority.current_binding_receipt_id == prior.current_binding_receipt_id
+        || authority.binding_receipt_chain.head_record_id.as_deref()
+            != Some(authority.current_binding_receipt_id.as_str())
+        || authority.management_receipt_chain != prior.management_receipt_chain
+        || authority.claim_receipt_chain != prior.claim_receipt_chain
+        || authority.current_claim_receipt_id != prior.current_claim_receipt_id
+        || authority.authenticated_wal_tail.position != 0
+        || authority.authenticated_wal_tail.segment_count != 0
+        || authority.epoch_floor_by_shard != BTreeMap::from([(fresh_shard_id.clone(), 1)])
+        || authority.last_fold_summary.is_some()
+    {
+        return Err(OmniError::manifest_internal(
+            "stream rebind claim authority does not replace only the exact SEALED physical scope",
+        ));
+    }
+    Ok(())
+}
+
+/// Build the sidecar-only authority used to authenticate the first fence in a
+/// freshly installed rebind scope.
+///
+/// This value is deliberately `OPEN` only so the existing claim digest and
+/// WAL-authentication machinery can consume a structurally valid lifecycle.
+/// It is never manifest-publishable: recovery-v18 accepts only the terminal
+/// `SEALED` successor built from the resulting claim and exact empty proof.
+pub(crate) fn build_rebind_claim_authority(
+    prior: &StreamLifecycleEntry,
+    binding_receipt: &BindingReceipt,
+    current_head_witness: CurrentHeadWitness,
+    initial_writer_epoch: u64,
+) -> Result<StreamLifecycleEntry> {
+    prior.validate()?;
+    binding_receipt.validate()?;
+    current_head_witness.validate()?;
+    let expected_binding_receipt_count = prior
+        .binding_receipt_chain
+        .record_count
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("stream binding receipt chain overflow"))?;
+    if prior.lifecycle != StreamLifecycle::Sealed
+        || binding_receipt.identity != prior.identity
+        || binding_receipt.stream_incarnation_id != prior.enrollment_receipt.stream_incarnation_id
+        || binding_receipt.prior_chain_digest != prior.binding_receipt_chain.chain_digest
+        || binding_receipt.predecessor_record_id != prior.binding_receipt_chain.head_record_id
+        || binding_receipt.chain_ordinal != expected_binding_receipt_count
+        || binding_receipt.physical_binding.table_location != prior.binding.table_location
+        || binding_receipt.physical_binding.table_branch != prior.binding.table_branch
+        || binding_receipt.physical_binding.stream_config_version
+            != prior.binding.stream_config_version
+        || binding_receipt.physical_binding.stream_config_hash != prior.binding.stream_config_hash
+        || binding_receipt.physical_binding.enrollment_id == prior.binding.enrollment_id
+        || binding_receipt.binding_scope_id == prior.binding_scope_id
+        || binding_receipt
+            .physical_binding
+            .shard_ids
+            .iter()
+            .any(|shard| prior.binding.shard_ids.contains(shard))
+        || initial_writer_epoch != 1
+    {
+        return Err(OmniError::manifest_internal(
+            "stream rebind claim authority does not replace the exact SEALED physical scope",
+        ));
+    }
+    let [shard_id] = binding_receipt.physical_binding.shard_ids.as_slice() else {
+        return Err(OmniError::manifest_internal(
+            "stream rebind claim authority requires one fresh shard",
+        ));
+    };
+    let next_binding_chain = binding_receipt.next_chain_ref()?;
+    let mut authority = prior.clone();
+    authority.lifecycle = StreamLifecycle::Open;
+    authority.binding = binding_receipt.physical_binding.clone();
+    authority.binding_scope_id = binding_receipt.binding_scope_id.clone();
+    authority.current_head_witness = current_head_witness;
+    authority.epoch_floor_by_shard = BTreeMap::from([(shard_id.clone(), initial_writer_epoch)]);
+    authority.current_binding_receipt_id = binding_receipt.record_id.clone();
+    authority.binding_receipt_chain = next_binding_chain;
+    authority.authenticated_wal_tail =
+        AuthenticatedWalTail::genesis(binding_receipt.binding_scope_id.clone())?;
+    authority.drain = None;
+    authority.strict_block = None;
+    authority.sealed_proof = None;
+    authority.last_fold_summary = None;
+    validate_rebind_claim_authority_shape(prior, &authority)?;
+    Ok(authority)
+}
+
+/// Prepare the recovery-v18 initial fence claim. Ordinary callers cannot use
+/// this path to claim a sealed lane: the fresh binding authority must be the
+/// exact sidecar-derived replacement of `prior`, and the physical prestate is
+/// fixed to Lance's empty epoch-1 shard.
+pub(crate) fn prepare_rebind_claim_operation(
+    prior: &StreamLifecycleEntry,
+    claim_authority: &StreamLifecycleEntry,
+    request: ClaimOperationRequest,
+) -> Result<PreparedClaimOperation> {
+    validate_rebind_claim_authority_shape(prior, claim_authority)?;
+    let rebind_id = request.lifecycle_operation_id.as_deref().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "a stream rebind claim must bind the exact rebind occurrence ID",
+        )
+    })?;
+    if prior.lifecycle != StreamLifecycle::Sealed
+        || claim_authority.lifecycle != StreamLifecycle::Open
+        || request.claim_kind != STREAM_REBIND_OPERATION_KIND
+        || request.claim_id != rebind_id
+        || request.initial_shard_manifest_version != 1
+        || request.initial_writer_epoch != 1
+        || request.initial_replay_cursor != 0
+        || request.initial_current_generation != 1
+        || request.initial_base_merged_generation != 0
+    {
+        return Err(OmniError::manifest_internal(
+            "stream rebind claim does not bind the exact fresh epoch-1 physical authority",
+        ));
+    }
+    validate_uuid_v4("rebind claim lifecycle_operation_id", rebind_id)?;
+    prepare_claim_operation_for_eligible_lifecycle(claim_authority, request)
 }
 
 fn prepare_claim_operation_for_eligible_lifecycle(
@@ -2906,6 +3070,197 @@ pub(crate) fn build_resume_adoption_row(
     Ok(next)
 }
 
+/// Build the sole terminal recovery-v18 rebind outcome.
+///
+/// The sidecar-only `claim_authority` names the freshly initialized table
+/// metadata and epoch-1 shard. `built` authenticates the one epoch-2 empty
+/// sentinel. This builder then advances all three immutable ledger chains and
+/// derives a fresh `SEALED` proof without ever publishing the provisional
+/// `OPEN` value.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_rebind_adoption_row(
+    prior: &StreamLifecycleEntry,
+    claim_authority: &StreamLifecycleEntry,
+    binding_receipt: &BindingReceipt,
+    built: &BuiltTerminalClaim,
+    management_receipt: &ManagementReceipt,
+    expected_profile_revision: u64,
+    evidence: EmptyCutEvidence,
+) -> Result<StreamLifecycleEntry> {
+    validate_rebind_claim_authority_shape(prior, claim_authority)?;
+    binding_receipt.validate()?;
+    built.receipt.validate()?;
+    let next_lifecycle_revision = next_revision(prior.lifecycle_revision)?;
+    management_receipt.validate(next_lifecycle_revision)?;
+    let expected_claim_receipt_count = prior
+        .claim_receipt_chain
+        .record_count
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("stream claim receipt chain overflow"))?;
+    let expected_management_receipt_count = prior
+        .management_receipt_chain
+        .record_count
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("stream management receipt chain overflow"))?;
+    if prior.lifecycle != StreamLifecycle::Sealed
+        || claim_authority.lifecycle != StreamLifecycle::Open
+        || binding_receipt.identity != prior.identity
+        || binding_receipt.physical_binding != claim_authority.binding
+        || binding_receipt.binding_scope_id != claim_authority.binding_scope_id
+        || binding_receipt.record_id != claim_authority.current_binding_receipt_id
+        || binding_receipt.next_chain_ref()? != claim_authority.binding_receipt_chain
+    {
+        return Err(OmniError::manifest_internal(
+            "terminal stream rebind lost its exact prior or fresh binding authority",
+        ));
+    }
+
+    let request: StreamRebindRequestPayload =
+        serde_json::from_value(management_receipt.request_payload.clone()).map_err(|error| {
+            OmniError::manifest_internal(format!(
+                "terminal stream rebind receipt has a non-canonical request payload: {error}"
+            ))
+        })?;
+    request.validate_for_lifecycle(prior, expected_profile_revision)?;
+    let expected_request_payload = request.to_value()?;
+    let expected_request_digest = request.request_digest()?;
+    let expected_result_payload = stream_rebind_result_payload(
+        next_lifecycle_revision,
+        &claim_authority.binding_scope_id,
+        &claim_authority.binding,
+        &claim_authority.current_head_witness,
+    )?;
+    let expected_result_digest = ManagementReceipt::result_digest_for(&expected_result_payload)?;
+
+    let [shard_id] = claim_authority.binding.shard_ids.as_slice() else {
+        return Err(OmniError::manifest_internal(
+            "terminal stream rebind requires one fresh shard",
+        ));
+    };
+    let physical_binding_digest = stream_physical_binding_digest(&claim_authority.binding)?;
+    let expected_empty_projection_digest = lww_projection_digest_for_authority(
+        prior.identity,
+        &claim_authority.binding_scope_id,
+        &claim_authority.binding.enrollment_id,
+        shard_id,
+        &prior.enrollment_receipt.stream_incarnation_id,
+        &claim_authority.binding.stream_config_hash,
+        &physical_binding_digest,
+        &BTreeMap::new(),
+    )?;
+    if binding_receipt.graph_identity_digest != request.graph_identity_digest
+        || binding_receipt.operation_id != request.rebind_id
+        || built.receipt.graph_identity_digest != request.graph_identity_digest
+        || built.receipt.identity != prior.identity
+        || built.receipt.lifecycle_operation_id.as_deref() != Some(request.rebind_id.as_str())
+        || built.receipt.claim_kind != STREAM_REBIND_OPERATION_KIND
+        || built.receipt.claim_id != request.rebind_id
+        || built.receipt.binding_scope_id != claim_authority.binding_scope_id
+        || built.receipt.enrollment_id != claim_authority.binding.enrollment_id
+        || built.receipt.shard_id != *shard_id
+        || built.receipt.stream_incarnation_id != prior.enrollment_receipt.stream_incarnation_id
+        || built.receipt.stream_configuration_digest != claim_authority.binding.stream_config_hash
+        || built.receipt.physical_binding_digest != physical_binding_digest
+        || built.receipt.prior_chain_digest != prior.claim_receipt_chain.chain_digest
+        || built.receipt.predecessor_record_id != prior.claim_receipt_chain.head_record_id
+        || built.next_claim_chain != built.receipt.next_chain_ref()?
+        || built.next_claim_chain.record_count != expected_claim_receipt_count
+        || built.next_authenticated_tail.binding_scope_id != claim_authority.binding_scope_id
+        || built.receipt.authenticated_tail_prior_position != 0
+        || built.receipt.authenticated_tail_prior_chain_digest
+            != claim_authority.authenticated_wal_tail.chain_digest
+        || built.receipt.authenticated_tail_segment_count != 1
+        || built.receipt.authenticated_tail_segment_entry_count != 1
+        || built.receipt.authenticated_tail_published_prefix_position != 0
+        || built
+            .receipt
+            .authenticated_tail_segment_lww_projection_digest
+            != expected_empty_projection_digest
+        || built.receipt.authenticated_tail_lww_projection_digest
+            != expected_empty_projection_digest
+        || built.next_authenticated_tail.position != built.receipt.authenticated_tail_position
+        || built.next_authenticated_tail.segment_count
+            != built.receipt.authenticated_tail_segment_count
+        || built.next_authenticated_tail.chain_digest
+            != built.receipt.authenticated_tail_chain_digest
+        || built.next_authenticated_tail.lww_projection_digest
+            != built.receipt.authenticated_tail_lww_projection_digest
+        || !built.receipt.proves_empty_current_generation()
+        || evidence.shard_manifest_version != built.receipt.achieved_shard_manifest_version
+        || evidence.writer_epoch != built.receipt.achieved_writer_epoch
+        || evidence.replay_cursor != built.receipt.replay_cursor
+        || evidence.replay_cursor != 0
+        || evidence.current_generation != 1
+        || evidence.base_merged_generation != 0
+    {
+        return Err(OmniError::manifest_internal(
+            "terminal stream rebind claim does not prove the exact fresh empty scope",
+        ));
+    }
+
+    let next_management_chain = management_receipt.next_chain_ref()?;
+    if management_receipt.graph_identity_digest != request.graph_identity_digest
+        || management_receipt.identity != prior.identity
+        || management_receipt.stream_incarnation_id
+            != prior.enrollment_receipt.stream_incarnation_id
+        || management_receipt.binding_scope_id != claim_authority.binding_scope_id
+        || management_receipt.operation_kind != STREAM_REBIND_OPERATION_KIND
+        || management_receipt.operation_id != request.rebind_id
+        || management_receipt.request_payload != expected_request_payload
+        || management_receipt.request_digest != expected_request_digest
+        || management_receipt.from_revision != prior.lifecycle_revision
+        || management_receipt.to_revision != next_lifecycle_revision
+        || management_receipt.actor_id != request.actor_id
+        || management_receipt.result_payload != expected_result_payload
+        || management_receipt.result_digest != expected_result_digest
+        || management_receipt.prior_chain_digest != prior.management_receipt_chain.chain_digest
+        || management_receipt.predecessor_record_id != prior.management_receipt_chain.head_record_id
+        || next_management_chain.record_count != expected_management_receipt_count
+        || next_management_chain.head_record_id.as_deref()
+            != Some(management_receipt.record_id.as_str())
+    {
+        return Err(OmniError::manifest_internal(
+            "terminal stream rebind management receipt does not extend the exact request authority",
+        ));
+    }
+
+    let mut next = claim_authority.clone();
+    next.lifecycle = StreamLifecycle::Sealed;
+    next.lifecycle_revision = next_lifecycle_revision;
+    next.management_receipt_chain = next_management_chain;
+    next.claim_receipt_chain = built.next_claim_chain.clone();
+    next.current_claim_receipt_id = Some(built.receipt.record_id.clone());
+    next.authenticated_wal_tail = built.next_authenticated_tail.clone();
+    next.epoch_floor_by_shard =
+        BTreeMap::from([(shard_id.clone(), built.receipt.achieved_writer_epoch)]);
+    next.drain = None;
+    next.strict_block = None;
+    next.last_fold_summary = None;
+    next.sealed_proof = None;
+    let verified_empty_digest =
+        verified_empty_digest_from_validated_authority(&next, &built.receipt, evidence)?;
+    next.sealed_proof = Some(SealedProof {
+        drain_id: request.rebind_id,
+        binding_scope_id: next.binding_scope_id.clone(),
+        shard_manifest_version: evidence.shard_manifest_version,
+        writer_epoch: evidence.writer_epoch,
+        replay_cursor: evidence.replay_cursor,
+        current_generation: evidence.current_generation,
+        base_merged_generation: evidence.base_merged_generation,
+        base_current_head_witness: next.current_head_witness.clone(),
+        current_claim_receipt_id: built.receipt.record_id.clone(),
+        claim_receipt_chain: next.claim_receipt_chain.clone(),
+        authenticated_tail_position: next.authenticated_wal_tail.position,
+        authenticated_tail_segment_count: next.authenticated_wal_tail.segment_count,
+        authenticated_tail_chain_digest: next.authenticated_wal_tail.chain_digest.clone(),
+        current_sentinel_position: built.receipt.sentinel_position,
+        current_sentinel_digest: built.receipt.sentinel_digest.clone(),
+        verified_empty_digest,
+    });
+    next.validate_rebind_successor_of(prior)?;
+    Ok(next)
+}
+
 pub(crate) fn stream_verified_empty_digest(
     draining: &StreamLifecycleEntry,
     current_claim_receipt: &ClaimReceipt,
@@ -3664,8 +4019,8 @@ mod tests {
     use lance::dataset::refs::BranchIdentifier;
 
     use crate::db::manifest::stream::{
-        claim_attempt_chain_genesis, claim_receipt_chain_genesis, management_receipt_chain_genesis,
-        test_sealed_lifecycle_from,
+        STREAM_REBIND_REQUEST_PROTOCOL_VERSION, claim_attempt_chain_genesis,
+        claim_receipt_chain_genesis, management_receipt_chain_genesis, test_sealed_lifecycle_from,
     };
     use crate::db::manifest::stream_token::{
         StreamRowOrigin, StreamTokenInput, TrustedContributorId,
@@ -3680,6 +4035,12 @@ mod tests {
     const INCARNATION_ID: &str = "44444444-4444-4444-8444-444444444444";
     const WRITE_ID: &str = "55555555-5555-4555-8555-555555555555";
     const ATTEMPT_ID: &str = "66666666-6666-4666-8666-666666666666";
+    const REBIND_SCOPE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const REBIND_ENROLLMENT_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const REBIND_SHARD_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const REBIND_ID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const REBIND_HEAD_TRANSACTION_ID: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const REBIND_PROFILE_REVISION: u64 = 7;
 
     fn digest(byte: char) -> String {
         format!("sha256:{}", byte.to_string().repeat(64))
@@ -3805,7 +4166,7 @@ mod tests {
             current_binding_receipt_id: binding_receipt_id.clone(),
             binding_receipt_chain: ReceiptChainRef {
                 head_record_id: Some(binding_receipt_id),
-                record_count: 1,
+                record_count: 2,
                 chain_digest: digest('3'),
             },
             management_receipt_chain: management_receipt_chain_genesis(),
@@ -4033,6 +4394,316 @@ mod tests {
             .unwrap();
         sealed.validate().unwrap();
         (sealed, current_claim_receipt)
+    }
+
+    struct RebindFixture {
+        prior: StreamLifecycleEntry,
+        claim_authority: StreamLifecycleEntry,
+        binding_receipt: BindingReceipt,
+        built: BuiltTerminalClaim,
+        management_receipt: ManagementReceipt,
+        evidence: EmptyCutEvidence,
+    }
+
+    fn rebind_fixture(binding_operation_id: &str) -> RebindFixture {
+        let prior = test_sealed_lifecycle_from(&open_lifecycle()).unwrap();
+        let fresh_binding = StreamPhysicalBinding {
+            enrollment_id: REBIND_ENROLLMENT_ID.to_string(),
+            shard_ids: vec![REBIND_SHARD_ID.to_string()],
+            ..prior.binding.clone()
+        };
+        let mut retained_shards = vec![
+            ShardId::parse_str(SHARD_ID).unwrap(),
+            ShardId::parse_str(REBIND_SHARD_ID).unwrap(),
+        ];
+        retained_shards.sort_unstable();
+        let binding_receipt = BindingReceipt::new_with_retained_shards(
+            digest('d'),
+            prior.identity,
+            &prior.binding_receipt_chain,
+            REBIND_SCOPE_ID,
+            prior.enrollment_receipt.stream_incarnation_id.clone(),
+            fresh_binding,
+            &retained_shards,
+            binding_operation_id,
+            11,
+        )
+        .unwrap();
+        let fresh_head = CurrentHeadWitness {
+            branch_identifier: BranchIdentifier::main(),
+            table_version: prior.current_head_witness.table_version + 2,
+            transaction_uuid: REBIND_HEAD_TRANSACTION_ID.to_string(),
+            manifest_e_tag: Some("fresh-index-etag".to_string()),
+        };
+        let claim_authority =
+            build_rebind_claim_authority(&prior, &binding_receipt, fresh_head, 1).unwrap();
+        let operation = prepare_rebind_claim_operation(
+            &prior,
+            &claim_authority,
+            ClaimOperationRequest {
+                graph_identity_digest: digest('d'),
+                claim_id: REBIND_ID.to_string(),
+                lifecycle_operation_id: Some(REBIND_ID.to_string()),
+                recovery_operation_id: "stream-rebind-recovery".to_string(),
+                claim_kind: STREAM_REBIND_OPERATION_KIND.to_string(),
+                profile: ClaimProfile::RetainAll,
+                shard_id: REBIND_SHARD_ID.to_string(),
+                initial_shard_manifest_version: 1,
+                initial_writer_epoch: 1,
+                initial_replay_cursor: 0,
+                initial_current_generation: 1,
+                initial_base_merged_generation: 0,
+                claim_contract_version: 1,
+            },
+        )
+        .unwrap();
+        let attempt = prepare_claim_attempt(
+            &operation,
+            ClaimAttemptRequest {
+                attempt_id: ATTEMPT_ID.to_string(),
+                pre_shard_manifest_version: 1,
+                pre_writer_epoch: 1,
+                pre_replay_cursor: 0,
+                planned_sentinel_position: 1,
+                planned_writer_epoch: 2,
+                storage_envelope_digest: None,
+            },
+        )
+        .unwrap();
+        let effect = build_claim_attempt_effect(
+            &claim_attempt_chain_genesis(),
+            &attempt,
+            ClaimAttemptEvidence::StockManifestPlusSentinel {
+                achieved_shard_manifest_version: 2,
+                achieved_writer_epoch: 2,
+            },
+        )
+        .unwrap();
+        let attempt_chain = effect.next_attempt_chain_ref().unwrap();
+        let physical_binding_digest =
+            stream_physical_binding_digest(&claim_authority.binding).unwrap();
+        let empty_projection_digest = lww_projection_digest_for_authority(
+            prior.identity,
+            REBIND_SCOPE_ID,
+            REBIND_ENROLLMENT_ID,
+            REBIND_SHARD_ID,
+            &prior.enrollment_receipt.stream_incarnation_id,
+            &claim_authority.binding.stream_config_hash,
+            &physical_binding_digest,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let empty_fence_state_digest = stream_empty_fence_state_digest(
+            REBIND_SCOPE_ID,
+            REBIND_ENROLLMENT_ID,
+            REBIND_SHARD_ID,
+            &prior.enrollment_receipt.stream_incarnation_id,
+            &claim_authority.binding.stream_config_hash,
+            &physical_binding_digest,
+            1,
+            2,
+            &attempt.planned_sentinel_digest,
+        )
+        .unwrap();
+        let segment = AuthenticatedClaimWalSegment {
+            identity: prior.identity,
+            binding_scope_id: REBIND_SCOPE_ID.to_string(),
+            enrollment_id: REBIND_ENROLLMENT_ID.to_string(),
+            shard_id: REBIND_SHARD_ID.to_string(),
+            stream_incarnation_id: prior.enrollment_receipt.stream_incarnation_id.clone(),
+            prior_writer_epoch: 1,
+            achieved_writer_epoch: 2,
+            prior_position: 0,
+            position: 1,
+            published_prefix_position: 0,
+            entry_count: 1,
+            row_count: 0,
+            arrow_bytes: 0,
+            sentinel_digest: attempt.planned_sentinel_digest.clone(),
+            segment_digest: digest('4'),
+            empty_fence_state_digest,
+            suffix_lww_projection_digest: empty_projection_digest.clone(),
+        };
+        let built = build_terminal_claim(
+            &prior.claim_receipt_chain,
+            &attempt,
+            &effect,
+            &attempt_chain,
+            &segment,
+            &empty_projection_digest,
+            0,
+            12,
+        )
+        .unwrap();
+        let evidence = EmptyCutEvidence {
+            shard_manifest_version: 2,
+            writer_epoch: 2,
+            replay_cursor: 0,
+            current_generation: 1,
+            base_merged_generation: 0,
+        };
+        let request = StreamRebindRequestPayload {
+            protocol_version: STREAM_REBIND_REQUEST_PROTOCOL_VERSION,
+            graph_identity_digest: digest('d'),
+            identity: prior.identity,
+            stream_incarnation_id: prior.enrollment_receipt.stream_incarnation_id.clone(),
+            binding_scope_id: prior.binding_scope_id.clone(),
+            enrollment_id: prior.binding.enrollment_id.clone(),
+            rebind_id: REBIND_ID.to_string(),
+            expected_lifecycle_revision: prior.lifecycle_revision,
+            expected_profile_revision: REBIND_PROFILE_REVISION,
+            actor_id: "act-operator".to_string(),
+            public_named_branches: Vec::new(),
+        };
+        let management_receipt = ManagementReceipt::new(
+            digest('d'),
+            prior.identity,
+            prior.enrollment_receipt.stream_incarnation_id.clone(),
+            REBIND_SCOPE_ID,
+            &prior.management_receipt_chain,
+            REBIND_ID,
+            STREAM_REBIND_OPERATION_KIND,
+            prior.lifecycle_revision,
+            prior.lifecycle_revision + 1,
+            "act-operator",
+            request.to_value().unwrap(),
+            stream_rebind_result_payload(
+                prior.lifecycle_revision + 1,
+                REBIND_SCOPE_ID,
+                &claim_authority.binding,
+                &claim_authority.current_head_witness,
+            )
+            .unwrap(),
+            13,
+        )
+        .unwrap();
+        RebindFixture {
+            prior,
+            claim_authority,
+            binding_receipt,
+            built,
+            management_receipt,
+            evidence,
+        }
+    }
+
+    #[test]
+    fn rebind_builds_only_the_exact_fresh_scope_sealed_successor() {
+        let fixture = rebind_fixture(REBIND_ID);
+        let next = build_rebind_adoption_row(
+            &fixture.prior,
+            &fixture.claim_authority,
+            &fixture.binding_receipt,
+            &fixture.built,
+            &fixture.management_receipt,
+            REBIND_PROFILE_REVISION,
+            fixture.evidence,
+        )
+        .unwrap();
+
+        assert_eq!(next.lifecycle, StreamLifecycle::Sealed);
+        assert_eq!(
+            next.lifecycle_revision,
+            fixture.prior.lifecycle_revision + 1
+        );
+        assert_eq!(next.identity, fixture.prior.identity);
+        assert_eq!(
+            next.diagnostic_table_key,
+            fixture.prior.diagnostic_table_key
+        );
+        assert_eq!(next.enrollment_receipt, fixture.prior.enrollment_receipt);
+        assert_eq!(next.binding, fixture.claim_authority.binding);
+        assert_eq!(next.binding_scope_id, REBIND_SCOPE_ID);
+        assert_eq!(
+            next.current_head_witness,
+            fixture.claim_authority.current_head_witness
+        );
+        assert_eq!(
+            next.binding_receipt_chain,
+            fixture.binding_receipt.next_chain_ref().unwrap()
+        );
+        assert_eq!(next.claim_receipt_chain, fixture.built.next_claim_chain);
+        assert_eq!(
+            next.management_receipt_chain,
+            fixture.management_receipt.next_chain_ref().unwrap()
+        );
+        assert_eq!(
+            next.authenticated_wal_tail,
+            fixture.built.next_authenticated_tail
+        );
+        assert_eq!(
+            next.epoch_floor_by_shard,
+            BTreeMap::from([(REBIND_SHARD_ID.to_string(), 2)])
+        );
+        assert!(next.last_fold_summary.is_none());
+        assert!(next.validate_successor_of(&fixture.prior).is_err());
+        next.validate_rebind_successor_of(&fixture.prior).unwrap();
+        assert_eq!(
+            build_rebind_adoption_row(
+                &fixture.prior,
+                &fixture.claim_authority,
+                &fixture.binding_receipt,
+                &fixture.built,
+                &fixture.management_receipt,
+                REBIND_PROFILE_REVISION,
+                fixture.evidence,
+            )
+            .unwrap(),
+            next,
+            "recovery must rebuild one byte-identical fresh-scope SEALED row"
+        );
+    }
+
+    #[test]
+    fn rebind_successor_rejects_unbound_receipt_tail_or_physical_cut() {
+        let wrong_operation = rebind_fixture("ffffffff-ffff-4fff-8fff-ffffffffffff");
+        let error = build_rebind_adoption_row(
+            &wrong_operation.prior,
+            &wrong_operation.claim_authority,
+            &wrong_operation.binding_receipt,
+            &wrong_operation.built,
+            &wrong_operation.management_receipt,
+            REBIND_PROFILE_REVISION,
+            wrong_operation.evidence,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("fresh empty scope"));
+
+        let fixture = rebind_fixture(REBIND_ID);
+        let mut mismatched_tail = fixture.built.clone();
+        mismatched_tail.next_authenticated_tail.position = 2;
+        let error = build_rebind_adoption_row(
+            &fixture.prior,
+            &fixture.claim_authority,
+            &fixture.binding_receipt,
+            &mismatched_tail,
+            &fixture.management_receipt,
+            REBIND_PROFILE_REVISION,
+            fixture.evidence,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("fresh empty scope"));
+
+        let mut skipped_head = fixture.claim_authority.current_head_witness.clone();
+        skipped_head.table_version -= 1;
+        assert!(
+            build_rebind_claim_authority(
+                &fixture.prior,
+                &fixture.binding_receipt,
+                skipped_head,
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            build_rebind_claim_authority(
+                &fixture.prior,
+                &fixture.binding_receipt,
+                fixture.claim_authority.current_head_witness,
+                2,
+            )
+            .is_err()
+        );
     }
 
     #[test]
