@@ -26,17 +26,17 @@ use crate::db::manifest::stream::{
 };
 use crate::db::manifest::stream_token::{
     AdmissionClassification, AdmissionRequest, PayloadDigest, PayloadDigestInput,
-    StreamFoldAttributionSummary, StreamRowOrigin, StreamToken, StreamTokenAuthorityRow,
-    StreamWriteEnvelope, TrustedContributorId, TrustedStreamRowMetadata,
-    build_trusted_stream_metadata_array, classify_admission, decode_trusted_stream_metadata,
-    stream_fold_attribution_commitment, validate_authority_base_pair,
+    StreamFoldAttributionSummary, StreamRowOrigin, StreamTerminalCorrection, StreamToken,
+    StreamTokenAuthorityRow, StreamTokenDisposition, StreamWriteEnvelope, TrustedContributorId,
+    TrustedStreamRowMetadata, build_trusted_stream_metadata_array, classify_admission,
+    decode_trusted_stream_metadata, stream_fold_attribution_commitment,
+    validate_authority_base_pair,
 };
 use crate::db::manifest::token_store::{
     LifecycleLedgerRecord, add_stream_lookup_retained_bytes, lookup_lifecycle_ledger_record_by_id,
-    lookup_management_receipt, lookup_stream_token_row, open_stream_token_authority_head,
-    stage_lifecycle_ledger_records, stage_management_receipt, stage_stream_token_upsert,
-    stream_token_authority_entry_for_dataset, stream_token_rows_for_keys,
-    validate_stream_token_plan_bounds,
+    lookup_management_receipt, open_stream_token_authority_head, stage_lifecycle_ledger_records,
+    stage_management_receipt, stage_stream_token_upsert, stream_token_authority_entry_for_dataset,
+    stream_token_rows_for_keys, validate_stream_token_plan_bounds,
 };
 use crate::db::manifest::{
     CurrentHeadWitness, ExpectedTableVersions, ManifestChange, RecoveryAuthorityToken,
@@ -85,6 +85,10 @@ use super::stream_lifecycle::{
 use super::{Omnigraph, WriteTxn};
 
 const B1_MAX_FOLD_ATTEMPTS: usize = 2;
+/// One B2 classification/projection call is deliberately small because exact
+/// token-prefix selection may need to validate every shorter prefix when
+/// existing winner replacement makes the fit predicate non-monotonic.
+pub(super) const STREAM_B2_CLASSIFICATION_WINDOW_ROWS: usize = 256;
 /// The raw body can contain far more DOM nodes than Arrow values (for example,
 /// `[0,0,...]`). Reserve 64 MiB of the 128-MiB B2 envelope for parsed structure
 /// and conservatively charge 512 bytes per structural slot before serde can
@@ -102,7 +106,103 @@ const STREAM_JSON_MAX_STRUCTURAL_SLOTS: u64 =
 pub(crate) struct StreamTokenAdmissionAck {
     pub(crate) stream_token: StreamToken,
     pub(crate) origin: StreamRowOrigin,
+    pub(crate) disposition: StreamTokenDisposition,
+    pub(crate) terminal_correction: Option<StreamTerminalCorrection>,
     pub(crate) already_durable: bool,
+}
+
+/// Freshly revalidated physical authority associated with a B2 disposition.
+///
+/// This is current binding evidence, not immutable token provenance. In
+/// particular, an `already_durable` token may have originated under an older
+/// enrollment while this proof names the writer currently serving the lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StreamB2BindingProof {
+    pub(super) enrollment_id: String,
+    pub(super) shard_id: String,
+    pub(super) writer_epoch: u64,
+}
+
+/// One strictly normalized caller row plus its validated compare-and-chain
+/// envelope. The hidden request driver uses this type so framing does not
+/// duplicate B2's JSON grammar or Arrow normalization boundary.
+pub(super) struct NormalizedStreamJsonRow {
+    pub(super) envelope: StreamWriteEnvelope,
+    pub(super) batch: RecordBatch,
+    pub(super) logical_id: String,
+}
+
+/// Effect-free disposition for the first row at a physical-run boundary.
+///
+/// A disposition after one or more `New` rows is deliberately left
+/// unconsumed: the new prefix is submitted first and the caller classifies the
+/// boundary again under the next queue position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum StreamB2BoundaryDisposition {
+    AlreadyDurable(StreamTokenAdmissionAck),
+    BindingChanged {
+        stable_table_id: u64,
+        table_incarnation_id: u64,
+        current_stream_incarnation_id: String,
+    },
+    SequenceConflict {
+        stable_table_id: u64,
+        table_incarnation_id: u64,
+        logical_id: String,
+        current_token: Option<String>,
+    },
+    IdempotencyConflict {
+        stable_table_id: u64,
+        table_incarnation_id: u64,
+        logical_id: String,
+        current_token: String,
+    },
+}
+
+/// Per-occurrence correlation retained when one multi-row physical append is
+/// ambiguous. Candidate tokens are explicitly unconfirmed and cannot be used
+/// as predecessor authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StreamB2AmbiguousRow {
+    pub(super) caller_ordinal: u64,
+    pub(super) admission_attempt_id: String,
+    pub(super) logical_write_id: String,
+    pub(super) unconfirmed_candidate_token: StreamToken,
+}
+
+/// Rich private ambiguity result for one physical append. `OmniError` retains
+/// its historical singleton fields; hidden multi-row transport maps this
+/// structure into one ordered result per caller occurrence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StreamB2AckUnknown {
+    pub(super) stable_table_id: u64,
+    pub(super) table_incarnation_id: u64,
+    pub(super) binding: StreamB2BindingProof,
+    pub(super) caller_ordinals: CallerOrdinalRange,
+    pub(super) rows: Vec<StreamB2AmbiguousRow>,
+    pub(super) reason: String,
+}
+
+/// Result of classifying and, when possible, admitting one distinct-key
+/// physical prefix.
+#[derive(Debug)]
+pub(super) enum StreamB2PrefixOutcome {
+    Admitted {
+        caller_ordinals: CallerOrdinalRange,
+        binding: StreamB2BindingProof,
+        acknowledgements: Vec<StreamTokenAdmissionAck>,
+    },
+    Boundary {
+        caller_ordinal: u64,
+        binding: StreamB2BindingProof,
+        disposition: StreamB2BoundaryDisposition,
+    },
+    AckUnknown(StreamB2AckUnknown),
+    Refused {
+        caller_ordinal: u64,
+        binding: StreamB2BindingProof,
+        error: OmniError,
+    },
 }
 
 /// One coherent main-branch stream authority capture.
@@ -213,6 +313,47 @@ fn validate_stream_json_structure_bound(raw_json: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(super) fn normalize_stream_json_row_with_catalog(
+    table_key: &str,
+    raw_json: &[u8],
+    catalog: &omnigraph_compiler::catalog::Catalog,
+) -> Result<NormalizedStreamJsonRow> {
+    let raw_bytes = u64::try_from(raw_json.len()).unwrap_or(u64::MAX);
+    if raw_bytes > B1_MAX_GENERATION_ARROW_BYTES {
+        return Err(OmniError::resource_limit(
+            "stream raw JSON bytes",
+            B1_MAX_GENERATION_ARROW_BYTES,
+            raw_bytes,
+        ));
+    }
+    validate_stream_json_structure_bound(raw_json)?;
+    let wire = serde_json::from_slice::<StreamJsonRowWire>(raw_json)
+        .map_err(|error| OmniError::manifest(format!("invalid stream JSON: {error}")))?;
+    wire.envelope
+        .validate()
+        .map_err(|error| OmniError::manifest(error.to_string()))?;
+    let row = serde_json::Value::Object(wire.body.into_iter().collect());
+    let batch = crate::loader::normalize_stream_json_row(catalog, table_key, row)?;
+    validate_stream_input_bounds(table_key, &batch)?;
+    validate_stream_value_constraints(table_key, &batch, catalog)?;
+    let ids = batch
+        .column_by_name("id")
+        .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| {
+            OmniError::manifest_internal("normalized stream JSON row has no exact Utf8 id column")
+        })?;
+    if batch.num_rows() != 1 || ids.is_null(0) {
+        return Err(OmniError::manifest_internal(
+            "stream JSON normalization did not produce one non-null logical id",
+        ));
+    }
+    Ok(NormalizedStreamJsonRow {
+        envelope: wire.envelope,
+        logical_id: ids.value(0).to_string(),
+        batch,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -474,28 +615,11 @@ impl Omnigraph {
         // preliminary lease ends after effect-free parsing and validation.
         let preflight_guard = self.write_queue().acquire_stream_profile_shared().await;
         self.ensure_streaming_ingest_runtime_authorized().await?;
-        let raw_bytes = u64::try_from(raw_json.len()).unwrap_or(u64::MAX);
-        if raw_bytes > B1_MAX_GENERATION_ARROW_BYTES {
-            return Err(OmniError::resource_limit(
-                "stream raw JSON bytes",
-                B1_MAX_GENERATION_ARROW_BYTES,
-                raw_bytes,
-            ));
-        }
         let preprocessing = self.stream_workers.reserve_b2_preprocessing()?;
-        validate_stream_json_structure_bound(raw_json)?;
-        let wire = serde_json::from_slice::<StreamJsonRowWire>(raw_json)
-            .map_err(|error| OmniError::manifest(format!("invalid stream JSON: {error}")))?;
-        wire.envelope
-            .validate()
-            .map_err(|error| OmniError::manifest(error.to_string()))?;
         let normalization_txn = self.open_write_txn(None).await?;
         Self::ensure_stream_table_admission_supported(&normalization_txn.catalog, table_key)?;
         let catalog = super::public_catalog_view(&normalization_txn.catalog)?;
-        let row = serde_json::Value::Object(wire.body.into_iter().collect());
-        let batch = crate::loader::normalize_stream_json_row(&catalog, table_key, row)?;
-        validate_stream_input_bounds(table_key, &batch)?;
-        validate_stream_value_constraints(table_key, &batch, &catalog)?;
+        let normalized = normalize_stream_json_row_with_catalog(table_key, raw_json, &catalog)?;
         drop(preflight_guard);
 
         self.heal_pending_recovery_sidecars_for_write(&[None])
@@ -510,12 +634,12 @@ impl Omnigraph {
         self.ensure_streaming_ingest_runtime_authorized().await?;
         self.stream_put_phase_b2_one_under_profile_guard(
             table_key,
-            batch,
+            normalized.batch,
             caller_ordinal,
-            wire.envelope,
+            normalized.envelope,
             contributor_id,
             Some(preprocessing),
-            &profile_guard,
+            profile_guard,
         )
         .await
     }
@@ -540,7 +664,7 @@ impl Omnigraph {
             envelope,
             contributor_id,
             None,
-            &profile_guard,
+            profile_guard,
         )
         .await
     }
@@ -554,18 +678,130 @@ impl Omnigraph {
         envelope: StreamWriteEnvelope,
         contributor_id: TrustedContributorId,
         preprocessing: Option<B2PreprocessingPermit>,
-        _profile_guard: &tokio::sync::OwnedRwLockReadGuard<()>,
+        profile_guard: tokio::sync::OwnedRwLockReadGuard<()>,
     ) -> Result<StreamTokenAdmissionAck> {
-        if batch.num_rows() != 1 {
+        let caller_ordinals =
+            CallerOrdinalRange::new(caller_ordinal, caller_ordinal).map_err(worker_error)?;
+        match self
+            .stream_put_phase_b2_distinct_prefix_under_profile_guard(
+                table_key,
+                batch,
+                caller_ordinals,
+                vec![envelope],
+                contributor_id,
+                preprocessing,
+                profile_guard,
+            )
+            .await?
+        {
+            StreamB2PrefixOutcome::Admitted {
+                mut acknowledgements,
+                ..
+            } if acknowledgements.len() == 1 => Ok(acknowledgements.remove(0)),
+            StreamB2PrefixOutcome::Boundary { disposition, .. } => match disposition {
+                StreamB2BoundaryDisposition::AlreadyDurable(ack) => Ok(ack),
+                StreamB2BoundaryDisposition::BindingChanged {
+                    stable_table_id,
+                    table_incarnation_id,
+                    current_stream_incarnation_id,
+                } => Err(OmniError::StreamBindingChanged {
+                    stable_table_id,
+                    table_incarnation_id,
+                    current_stream_incarnation_id,
+                }),
+                StreamB2BoundaryDisposition::SequenceConflict {
+                    stable_table_id,
+                    table_incarnation_id,
+                    logical_id,
+                    current_token,
+                } => Err(OmniError::StreamSequenceConflict {
+                    stable_table_id,
+                    table_incarnation_id,
+                    logical_id,
+                    current_token,
+                }),
+                StreamB2BoundaryDisposition::IdempotencyConflict {
+                    stable_table_id,
+                    table_incarnation_id,
+                    logical_id,
+                    current_token,
+                } => Err(OmniError::StreamIdempotencyConflict {
+                    stable_table_id,
+                    table_incarnation_id,
+                    logical_id,
+                    current_token,
+                }),
+            },
+            StreamB2PrefixOutcome::AckUnknown(unknown) if unknown.rows.len() == 1 => {
+                let row = &unknown.rows[0];
+                Err(OmniError::AckUnknown {
+                    stable_table_id: unknown.stable_table_id,
+                    table_incarnation_id: unknown.table_incarnation_id,
+                    enrollment_id: unknown.binding.enrollment_id,
+                    shard_id: unknown.binding.shard_id,
+                    writer_epoch: unknown.binding.writer_epoch,
+                    caller_ordinal_start: unknown.caller_ordinals.start,
+                    caller_ordinal_end: unknown.caller_ordinals.end,
+                    admission_attempt_id: Some(row.admission_attempt_id.clone()),
+                    logical_write_ids: vec![row.logical_write_id.clone()],
+                    unconfirmed_candidate_token: Some(row.unconfirmed_candidate_token.to_string()),
+                    reason: unknown.reason,
+                })
+            }
+            StreamB2PrefixOutcome::Refused { error, .. } => Err(error),
+            _ => Err(OmniError::manifest_internal(
+                "singleton B2 wrapper received a non-singleton prefix result",
+            )),
+        }
+    }
+
+    /// Classify and admit the longest leading all-`New` distinct-key prefix.
+    ///
+    /// The first row is charged before shared admission and the table input
+    /// queue. Durable authority is then batch-read under that stable queue
+    /// position. A token disposition at row zero is returned effect-free; one
+    /// after a fresh prefix is not consumed. All admitted rows share one Lance
+    /// put, watcher, and post-durability fence.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn stream_put_phase_b2_distinct_prefix_under_profile_guard(
+        self: &Arc<Self>,
+        table_key: &str,
+        batch: RecordBatch,
+        caller_ordinals: CallerOrdinalRange,
+        envelopes: Vec<StreamWriteEnvelope>,
+        contributor_id: TrustedContributorId,
+        preprocessing: Option<B2PreprocessingPermit>,
+        profile_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    ) -> Result<StreamB2PrefixOutcome> {
+        let ordinal_len = caller_ordinals
+            .end
+            .checked_sub(caller_ordinals.start)
+            .and_then(|distance| distance.checked_add(1))
+            .ok_or_else(|| OmniError::manifest_internal("stream caller ordinal range overflow"))?;
+        if batch.num_rows() == 0
+            || u64::try_from(batch.num_rows()).unwrap_or(u64::MAX) != ordinal_len
+            || envelopes.len() != batch.num_rows()
+        {
             return Err(OmniError::manifest(format!(
-                "private B2 admission requires exactly one row, got {}",
-                batch.num_rows()
+                "B2 prefix rows, envelopes, and ordinals must align: rows={}, envelopes={}, ordinals={ordinal_len}",
+                batch.num_rows(),
+                envelopes.len()
             )));
         }
+        if batch.num_rows() > STREAM_B2_CLASSIFICATION_WINDOW_ROWS {
+            return Err(OmniError::resource_limit(
+                "stream_b2_classification_rows",
+                u64::try_from(STREAM_B2_CLASSIFICATION_WINDOW_ROWS).unwrap_or(u64::MAX),
+                u64::try_from(batch.num_rows()).unwrap_or(u64::MAX),
+            ));
+        }
         validate_stream_input_bounds(table_key, &batch)?;
-        envelope
-            .validate()
-            .map_err(|error| OmniError::manifest(error.to_string()))?;
+        for envelope in &envelopes {
+            envelope
+                .validate()
+                .map_err(|error| OmniError::manifest(error.to_string()))?;
+        }
+
         let provisional = self
             .capture_stream_authority(table_key, "stream token admission")
             .await?;
@@ -574,16 +810,14 @@ impl Omnigraph {
             Some(preprocessing) => preprocessing,
             None => self.stream_workers.reserve_b2_preprocessing()?,
         };
-        // Normalize the keyed-write representation after the read-only
-        // provisional capture and remeasure it before any put. Blob tables are
-        // refused above until their generation-fold materialization path exists.
         let batch = self
             .storage()
             .prepare_keyed_write_batch(table_key, batch)
             .await?;
         validate_stream_input_bounds(table_key, &batch)?;
+        self.validate_stream_logical_admission_batch(&provisional, &batch)?;
 
-        let id_array = batch
+        let ids = batch
             .column_by_name("id")
             .and_then(|array| array.as_any().downcast_ref::<StringArray>())
             .ok_or_else(|| {
@@ -591,13 +825,28 @@ impl Omnigraph {
                     "validated stream admission batch has no exact Utf8 id column",
                 )
             })?;
-        if id_array.is_null(0) {
-            return Err(OmniError::manifest("stream row id must be non-null"));
+        let mut ordered_ids = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            if ids.is_null(row) {
+                return Err(OmniError::manifest("stream row id must be non-null"));
+            }
+            ordered_ids.push(ids.value(row).to_string());
         }
-        let logical_id = id_array.value(0).to_string();
-        let canonical_payload = super::canonical_stream_payload_v1(&batch, 0)?;
+        {
+            // The ordered vector is the sole owner for this phase. Duplicate
+            // detection borrows those strings instead of retaining a second
+            // attacker-sized copy of every logical id.
+            let mut distinct_ids = std::collections::BTreeSet::new();
+            for logical_id in &ordered_ids {
+                if distinct_ids.insert(logical_id.as_str()) {
+                    continue;
+                }
+                return Err(OmniError::manifest(format!(
+                    "B2 physical prefix repeats logical id '{logical_id}'"
+                )));
+            }
+        }
 
-        self.validate_stream_logical_admission_batch(&provisional, &batch)?;
         let key = provisional.worker_key;
         let admission_key = provisional.admission_key.clone();
         crate::failpoints::maybe_fail(
@@ -605,246 +854,509 @@ impl Omnigraph {
         )?;
         let authority_db = Arc::clone(self);
         let authority_key = admission_key.clone();
+        let first_row = batch.slice(0, 1);
         let (mut queued, put_authority) = self
             .stream_workers
             .reserve_b2_put_input(
                 key,
                 table_key,
-                &batch,
+                &first_row,
                 &mut preprocessing,
                 move || async move {
                     let shared = authority_db
                         .write_queue()
                         .acquire_stream_shared(&authority_key)
                         .await;
-                    CheckedStreamAuthority::from_shared_admission(shared)
+                    CheckedStreamAuthority::from_shared_admission_with_profile(
+                        shared,
+                        profile_guard,
+                    )
                 },
             )
             .await?;
+        drop(first_row);
 
         let prepared = self
             .capture_stream_authority(table_key, "stream token final admission")
             .await?;
-        self.ensure_no_relevant_stream_sidecar_except_exact_claim(
-            &prepared,
-            "stream token admission",
-        )
-        .await?;
-        ensure_same_binding(key, &prepared, "stream token final admission authority")?;
-        self.validate_stream_logical_admission_batch(&prepared, &batch)?;
-        let payload_digest = PayloadDigest::derive(&PayloadDigestInput {
-            identity: prepared.entry.identity,
-            accepted_schema_hash: &prepared.txn.authority.schema_ir_hash,
-            canonical_payload: &canonical_payload,
-        })
-        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-        drop(canonical_payload);
-        drop(preprocessing);
-        let request = AdmissionRequest {
-            identity: prepared.entry.identity,
-            logical_id: logical_id.clone(),
-            envelope,
-            contributor_id,
-            payload_digest,
+        let classified_binding = StreamB2BindingProof {
+            enrollment_id: prepared.enrollment_id.to_string(),
+            shard_id: prepared.shard_id.to_string(),
+            writer_epoch: prepared.epoch_floor,
         };
-        request
-            .validate()
-            .map_err(|error| OmniError::manifest(error.to_string()))?;
-
-        // Owning the same-key queue makes this overlay snapshot stable until
-        // the permit transfers into the worker. The shared admission lease
-        // simultaneously excludes a fold/token-table publication.
-        let overlay_current = self
-            .stream_workers
-            .confirmed_token_for_key(&queued, table_key, &logical_id)
-            .await?;
-
-        let (durable_authority, durable_metadata) = if overlay_current.is_none() {
-            let token_dataset = prepared.txn.base.open_stream_token_authority().await?;
-            let authority = lookup_stream_token_row(
-                &token_dataset,
-                prepared.txn.base.stream_token_authority(),
-                prepared.entry.identity,
-                &logical_id,
+        let mut worker_put_attempted = false;
+        let outcome: Result<StreamB2PrefixOutcome> = async {
+            self.ensure_no_relevant_stream_sidecar_except_exact_claim(
+                &prepared,
+                "stream token admission",
             )
             .await?;
-            // A missing token row plus a non-null base copy is corruption, so
-            // the base probe is unconditional whenever no confirmed overlay
-            // owns the key.
-            let metadata = lookup_base_stream_metadata(
-                prepared.head.dataset(),
-                prepared.entry.identity,
-                &logical_id,
-            )
-            .await?;
-            (authority, metadata)
-        } else {
-            (None, None)
-        };
-        let current_authority = overlay_current
-            .as_ref()
-            .map(|row| &row.authority)
-            .or(durable_authority.as_ref());
-        let current_metadata = overlay_current
-            .as_ref()
-            .map(|row| &row.metadata)
-            .or(durable_metadata.as_ref());
-        let stream_incarnation_id = prepared
-            .lifecycle
-            .enrollment_receipt
-            .stream_incarnation_id
-            .as_str();
-        let classification = classify_admission(
-            stream_incarnation_id,
-            &request,
-            current_authority,
-            current_metadata,
-        )
-        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+            ensure_same_binding(key, &prepared, "stream token final admission authority")?;
+            drop(provisional);
+            self.validate_stream_logical_admission_batch(&prepared, &batch)?;
 
-        let candidate = match classification {
-            AdmissionClassification::AlreadyDurable { authority, .. } => {
-                return Ok(StreamTokenAdmissionAck {
-                    stream_token: authority.current_token,
-                    origin: authority.origin,
-                    already_durable: true,
-                });
+            let mut overlay_current = BTreeMap::new();
+            let mut durable_keys = std::collections::BTreeSet::new();
+            for logical_id in &ordered_ids {
+                if let Some(current) = self
+                    .stream_workers
+                    .confirmed_token_for_key(&queued, table_key, logical_id)
+                    .await?
+                {
+                    overlay_current.insert(logical_id.clone(), current);
+                } else {
+                    durable_keys.insert(logical_id.clone());
+                }
             }
-            AdmissionClassification::BindingChanged {
-                current_stream_incarnation_id,
-            } => {
-                return Err(OmniError::StreamBindingChanged {
-                    stable_table_id: request.identity.stable_table_id,
-                    table_incarnation_id: request.identity.table_incarnation_id,
-                    current_stream_incarnation_id,
-                });
-            }
-            AdmissionClassification::SequenceConflict { current_token } => {
-                return Err(OmniError::StreamSequenceConflict {
-                    stable_table_id: request.identity.stable_table_id,
-                    table_incarnation_id: request.identity.table_incarnation_id,
-                    logical_id,
-                    current_token: current_token.map(|token| token.to_string()),
-                });
-            }
-            AdmissionClassification::IdempotencyConflict { current_token } => {
-                return Err(OmniError::StreamIdempotencyConflict {
-                    stable_table_id: request.identity.stable_table_id,
-                    table_incarnation_id: request.identity.table_incarnation_id,
-                    logical_id,
-                    current_token: current_token.to_string(),
-                });
-            }
-            AdmissionClassification::New { candidate_token } => candidate_token,
-        };
-
-        let (fold_base_token, chain_depth) = match overlay_current.as_ref() {
-            Some(current) => (
-                current.metadata.fold_base_token,
-                current.metadata.chain_depth.checked_add(1).ok_or_else(|| {
-                    OmniError::resource_limit(
-                        format!("stream chain depth for {table_key}/{logical_id}"),
-                        u32::MAX as u64,
-                        u32::MAX as u64 + 1,
+            let (durable_current, durable_metadata) = if durable_keys.is_empty() {
+                (BTreeMap::new(), BTreeMap::new())
+            } else {
+                let token_dataset = prepared.txn.base.open_stream_token_authority().await?;
+                let authority = stream_token_rows_for_keys(
+                    &token_dataset,
+                    prepared.txn.base.stream_token_authority(),
+                    prepared.entry.identity,
+                    &durable_keys,
+                )
+                .await?;
+                let metadata = lookup_base_stream_metadata_for_keys(
+                    prepared.head.dataset(),
+                    prepared.entry.identity,
+                    &durable_keys,
+                )
+                .await?;
+                for logical_id in &durable_keys {
+                    validate_authority_base_pair(
+                        prepared.entry.identity,
+                        logical_id,
+                        authority.get(logical_id),
+                        metadata.get(logical_id),
                     )
-                })?,
-            ),
-            None => (request.envelope.predecessor_token, 1),
-        };
-        let metadata = TrustedStreamRowMetadata::new_admission(
-            &request,
-            candidate,
-            fold_base_token,
-            chain_depth,
-            ShardId::new_v4().to_string(),
-            caller_ordinal,
-        )
-        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-        let authority =
-            crate::db::manifest::stream_token::StreamTokenAuthorityRow::from_present_metadata(
-                request.identity,
-                logical_id.clone(),
-                prepared.binding.enrollment_id.clone(),
-                &metadata,
-            )
-            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-        // A row which cannot fit an otherwise-empty token/recovery projection
-        // is terminal for this occurrence; asking the caller to fold would
-        // create an endless retry loop.
-        validate_stream_token_plan_bounds(std::slice::from_ref(&authority))?;
-        let origin = metadata.origin.clone();
-        let admission_attempt_id = match &origin {
-            StreamRowOrigin::Admission {
-                admission_attempt_id,
-                ..
-            } => admission_attempt_id.clone(),
-            StreamRowOrigin::Correction { .. } => {
+                    .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+                }
+                (authority, metadata)
+            };
+
+            struct NewRow {
+                metadata: TrustedStreamRowMetadata,
+                authority: StreamTokenAuthorityRow,
+                ack: StreamTokenAdmissionAck,
+                ambiguous: StreamB2AmbiguousRow,
+            }
+
+            let mut new_rows = Vec::new();
+            // One physical invocation owns one attempt id even when it carries
+            // several logical occurrences. This is the shared ambiguity and audit
+            // identity surfaced for every row if watcher/fence proof is lost.
+            let admission_attempt_id = ShardId::new_v4().to_string();
+            let stream_incarnation_id = prepared
+                .lifecycle
+                .enrollment_receipt
+                .stream_incarnation_id
+                .as_str();
+            for (row, (logical_id, envelope)) in ordered_ids
+                .into_iter()
+                .zip(envelopes.into_iter())
+                .enumerate()
+            {
+                let canonical_payload = super::canonical_stream_payload_v1(&batch, row)?;
+                let payload_digest = PayloadDigest::derive(&PayloadDigestInput {
+                    identity: prepared.entry.identity,
+                    accepted_schema_hash: &prepared.txn.authority.schema_ir_hash,
+                    canonical_payload: &canonical_payload,
+                })
+                .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+                let request = AdmissionRequest {
+                    identity: prepared.entry.identity,
+                    logical_id,
+                    envelope,
+                    contributor_id: contributor_id.clone(),
+                    payload_digest,
+                };
+                request
+                    .validate()
+                    .map_err(|error| OmniError::manifest(error.to_string()))?;
+                let logical_id = &request.logical_id;
+                let overlay = overlay_current.get(logical_id);
+                let current_authority = overlay
+                    .map(|current| &current.authority)
+                    .or_else(|| durable_current.get(logical_id));
+                let current_metadata = overlay
+                    .map(|current| &current.metadata)
+                    .or_else(|| durable_metadata.get(logical_id));
+                let classification = classify_admission(
+                    stream_incarnation_id,
+                    &request,
+                    current_authority,
+                    current_metadata,
+                )
+                .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+                let candidate = match classification {
+                    AdmissionClassification::New { candidate_token } => candidate_token,
+                    AdmissionClassification::AlreadyDurable { authority, .. } => {
+                        if new_rows.is_empty() {
+                            return Ok(StreamB2PrefixOutcome::Boundary {
+                                caller_ordinal: caller_ordinals.start,
+                                binding: classified_binding.clone(),
+                                disposition: StreamB2BoundaryDisposition::AlreadyDurable(
+                                    StreamTokenAdmissionAck {
+                                        stream_token: authority.current_token,
+                                        origin: authority.origin,
+                                        disposition: authority.disposition,
+                                        terminal_correction: authority.terminal_correction,
+                                        already_durable: true,
+                                    },
+                                ),
+                            });
+                        }
+                        break;
+                    }
+                    AdmissionClassification::BindingChanged {
+                        current_stream_incarnation_id,
+                    } => {
+                        if new_rows.is_empty() {
+                            return Ok(StreamB2PrefixOutcome::Boundary {
+                                caller_ordinal: caller_ordinals.start,
+                                binding: classified_binding.clone(),
+                                disposition: StreamB2BoundaryDisposition::BindingChanged {
+                                    stable_table_id: request.identity.stable_table_id,
+                                    table_incarnation_id: request.identity.table_incarnation_id,
+                                    current_stream_incarnation_id,
+                                },
+                            });
+                        }
+                        break;
+                    }
+                    AdmissionClassification::SequenceConflict { current_token } => {
+                        if new_rows.is_empty() {
+                            return Ok(StreamB2PrefixOutcome::Boundary {
+                                caller_ordinal: caller_ordinals.start,
+                                binding: classified_binding.clone(),
+                                disposition: StreamB2BoundaryDisposition::SequenceConflict {
+                                    stable_table_id: request.identity.stable_table_id,
+                                    table_incarnation_id: request.identity.table_incarnation_id,
+                                    logical_id: request.logical_id,
+                                    current_token: current_token.map(|token| token.to_string()),
+                                },
+                            });
+                        }
+                        break;
+                    }
+                    AdmissionClassification::IdempotencyConflict { current_token } => {
+                        if new_rows.is_empty() {
+                            return Ok(StreamB2PrefixOutcome::Boundary {
+                                caller_ordinal: caller_ordinals.start,
+                                binding: classified_binding.clone(),
+                                disposition: StreamB2BoundaryDisposition::IdempotencyConflict {
+                                    stable_table_id: request.identity.stable_table_id,
+                                    table_incarnation_id: request.identity.table_incarnation_id,
+                                    logical_id: request.logical_id,
+                                    current_token: current_token.to_string(),
+                                },
+                            });
+                        }
+                        break;
+                    }
+                };
+                let caller_ordinal = caller_ordinals
+                    .start
+                    .checked_add(u64::try_from(row).unwrap_or(u64::MAX))
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal("stream caller ordinal overflow")
+                    })?;
+                let (fold_base_token, chain_depth) = match overlay {
+                    Some(current) => (
+                        current.metadata.fold_base_token,
+                        current.metadata.chain_depth.checked_add(1).ok_or_else(|| {
+                            OmniError::resource_limit(
+                                format!("stream chain depth for {table_key}/{logical_id}"),
+                                u32::MAX as u64,
+                                u32::MAX as u64 + 1,
+                            )
+                        })?,
+                    ),
+                    None => (request.envelope.predecessor_token, 1),
+                };
+                let metadata = TrustedStreamRowMetadata::new_admission(
+                    &request,
+                    candidate,
+                    fold_base_token,
+                    chain_depth,
+                    admission_attempt_id.clone(),
+                    caller_ordinal,
+                )
+                .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+                let logical_write_id = request.envelope.write_id;
+                let authority = StreamTokenAuthorityRow::from_present_metadata(
+                    request.identity,
+                    request.logical_id,
+                    prepared.binding.enrollment_id.clone(),
+                    &metadata,
+                )
+                .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+                validate_stream_token_plan_bounds(std::slice::from_ref(&authority))?;
+                let origin = metadata.origin.clone();
+                let admission_attempt_id = match &origin {
+                    StreamRowOrigin::Admission {
+                        admission_attempt_id,
+                        ..
+                    } => admission_attempt_id.clone(),
+                    StreamRowOrigin::Correction { .. } => {
+                        return Err(OmniError::manifest_internal(
+                            "stream admission minted a correction origin",
+                        ));
+                    }
+                };
+                new_rows.push(NewRow {
+                    metadata,
+                    authority,
+                    ack: StreamTokenAdmissionAck {
+                        stream_token: candidate,
+                        origin,
+                        disposition: StreamTokenDisposition::Present,
+                        terminal_correction: None,
+                        already_durable: false,
+                    },
+                    ambiguous: StreamB2AmbiguousRow {
+                        caller_ordinal,
+                        admission_attempt_id,
+                        logical_write_id,
+                        unconfirmed_candidate_token: candidate,
+                    },
+                });
+            }
+            drop(contributor_id);
+            drop(overlay_current);
+            drop(durable_current);
+            drop(durable_metadata);
+            drop(durable_keys);
+
+            if new_rows.is_empty() {
                 return Err(OmniError::manifest_internal(
-                    "stream admission minted a correction origin",
+                    "B2 classification produced neither a boundary nor a new prefix",
                 ));
             }
-        };
-        let logical_write_id = request.envelope.write_id.clone();
-        let batch = append_trusted_stream_metadata(batch, vec![Some(metadata.clone())])?;
-        self.validate_stream_admission_batch(&prepared, &batch)?;
-        queued.reprice_for_exact_batch(table_key, &batch)?;
-        let mut confirmed_token_updates = ConfirmedStreamTokenOverlay::new();
-        confirmed_token_updates.insert(
-            logical_id,
-            ConfirmedStreamTokenOverlayRow {
-                authority,
-                metadata,
-            },
-        );
-        let projected_token_rows = self
-            .stream_workers
-            .projected_token_authority_rows(&queued, table_key, &confirmed_token_updates)
-            .await?;
-        validate_generation_token_plan(table_key, &projected_token_rows)?;
 
-        if let Err(error) = self
-            .finish_reserved_stream_put(
-                table_key.to_string(),
-                batch,
-                CallerOrdinalRange::new(caller_ordinal, caller_ordinal).map_err(worker_error)?,
-                key,
-                admission_key,
-                queued,
-                put_authority,
-                confirmed_token_updates,
-            )
-            .await
-        {
-            return Err(match error {
-                OmniError::AckUnknown {
-                    stable_table_id,
-                    table_incarnation_id,
-                    enrollment_id,
-                    shard_id,
-                    caller_ordinal_start,
-                    caller_ordinal_end,
-                    reason,
-                    ..
-                } => OmniError::AckUnknown {
-                    stable_table_id,
-                    table_incarnation_id,
-                    enrollment_id,
-                    shard_id,
-                    caller_ordinal_start,
-                    caller_ordinal_end,
-                    admission_attempt_id: Some(admission_attempt_id),
-                    logical_write_ids: vec![logical_write_id],
-                    unconfirmed_candidate_token: Some(candidate.to_string()),
-                    reason,
+            // Find the longest exact prefix whose complete current-generation
+            // token projection fits. Adding a distinct-key update can replace a
+            // larger existing winner, so fit is not monotonic: prefix N may fail
+            // while N + 1 fits. Start with the common full-prefix case and scan
+            // downward only after a capacity failure. The method boundary caps
+            // this exact scan at STREAM_B2_CLASSIFICATION_WINDOW_ROWS.
+            let stream_workers = &self.stream_workers;
+            let queued_for_projection = &queued;
+            let token_prefix = longest_fitting_token_prefix(new_rows.len(), |prefix| {
+                let updates = new_rows[..prefix]
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.authority.logical_id.clone(),
+                            ConfirmedStreamTokenOverlayRow {
+                                authority: row.authority.clone(),
+                                metadata: row.metadata.clone(),
+                            },
+                        )
+                    })
+                    .collect::<ConfirmedStreamTokenOverlay>();
+                async move {
+                    let projected = stream_workers
+                        .projected_token_authority_rows(queued_for_projection, table_key, &updates)
+                        .await?;
+                    match validate_generation_token_plan(table_key, &projected) {
+                        Ok(()) => Ok(None),
+                        Err(error @ OmniError::FoldRequired { .. }) => Ok(Some(error)),
+                        Err(error) => Err(error),
+                    }
+                }
+            })
+            .await?;
+            new_rows.truncate(token_prefix);
+
+            let attributed = append_trusted_stream_metadata(
+                batch.slice(0, token_prefix),
+                new_rows
+                    .iter()
+                    .map(|row| Some(row.metadata.clone()))
+                    .collect(),
+            )?;
+            // `attributed` still shares the selected source columns. The final
+            // dense rebuild below is the only batch allowed to cross into worker
+            // ownership, so the larger caller batch can leave this phase now.
+            drop(batch);
+            // A single attributed row which cannot fit an empty generation is an
+            // intrinsic input limit, not a fold boundary (folding cannot help).
+            validate_stream_stored_bounds(table_key, &attributed.slice(0, 1))?;
+            let mut low = 1_usize;
+            let mut high = attributed.num_rows();
+            let mut physical_prefix = 0_usize;
+            let mut physical_capacity_error = None;
+            while low <= high {
+                let mid = low + (high - low) / 2;
+                let prefix = attributed.slice(0, mid);
+                match queued.reprice_for_exact_batch(table_key, &prefix) {
+                    Ok(()) => {
+                        physical_prefix = mid;
+                        low = mid.saturating_add(1);
+                    }
+                    Err(error @ OmniError::FoldRequired { .. })
+                    | Err(error @ OmniError::ResourceLimitExceeded { .. }) => {
+                        physical_capacity_error = Some(error);
+                        high = mid.saturating_sub(1);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if physical_prefix == 0 {
+                return Err(physical_capacity_error.unwrap_or_else(|| {
+                    OmniError::manifest_internal(
+                        "B2 physical prefix search found no admissible row",
+                    )
+                }));
+            }
+            new_rows.truncate(physical_prefix);
+            let selected = attributed.slice(0, physical_prefix);
+            let row_count = u32::try_from(selected.num_rows())
+                .map_err(|_| OmniError::manifest_internal("B2 selected prefix exceeds u32 rows"))?;
+            let indices = UInt32Array::from_iter_values(0..row_count);
+            let columns = selected
+                .columns()
+                .iter()
+                .map(|column| {
+                    take(column.as_ref(), &indices, None)
+                        .map_err(|error| OmniError::Lance(error.to_string()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let batch = RecordBatch::try_new(selected.schema(), columns)
+                .map_err(|error| OmniError::Lance(error.to_string()))?;
+            drop(selected);
+            drop(attributed);
+            queued.reprice_for_exact_batch(table_key, &batch)?;
+            self.validate_stream_admission_batch(&prepared, &batch)?;
+            // The first-row queue charge becomes the complete selected physical
+            // charge here. Until this point the B2 preprocessing envelope keeps
+            // the prepared multi-row tail bounded even though only row zero was
+            // eligible for worker-capacity arbitration.
+            let token_updates = new_rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.authority.logical_id.clone(),
+                        ConfirmedStreamTokenOverlayRow {
+                            authority: row.authority.clone(),
+                            metadata: row.metadata.clone(),
+                        },
+                    )
+                })
+                .collect::<ConfirmedStreamTokenOverlay>();
+            // A physical-capacity split can shorten the token-validated prefix.
+            // Replacements in the warm overlay are not size-monotonic (for example,
+            // a successor contributor can be shorter), so a smaller prefix is not
+            // automatically covered by the larger prefix's proof. Revalidate the
+            // exact update set that will cross the acknowledgement boundary.
+            let projected = self
+                .stream_workers
+                .projected_token_authority_rows(&queued, table_key, &token_updates)
+                .await?;
+            validate_generation_token_plan(table_key, &projected)?;
+            drop(projected);
+            drop(prepared);
+            drop(preprocessing);
+
+            let end = caller_ordinals
+                .start
+                .checked_add(u64::try_from(physical_prefix - 1).unwrap_or(u64::MAX))
+                .ok_or_else(|| OmniError::manifest_internal("B2 admitted ordinal overflow"))?;
+            let admitted_ordinals =
+                CallerOrdinalRange::new(caller_ordinals.start, end).map_err(worker_error)?;
+            worker_put_attempted = true;
+            let durable = match self
+                .finish_reserved_stream_put(
+                    table_key.to_string(),
+                    batch,
+                    admitted_ordinals,
+                    key,
+                    admission_key,
+                    queued,
+                    put_authority,
+                    token_updates,
+                )
+                .await
+            {
+                Ok(durable) => durable,
+                Err(error) => {
+                    return match error {
+                        OmniError::AckUnknown {
+                            stable_table_id,
+                            table_incarnation_id,
+                            enrollment_id,
+                            shard_id,
+                            writer_epoch,
+                            caller_ordinal_start,
+                            caller_ordinal_end,
+                            reason,
+                            ..
+                        } => Ok(StreamB2PrefixOutcome::AckUnknown(StreamB2AckUnknown {
+                            stable_table_id,
+                            table_incarnation_id,
+                            binding: StreamB2BindingProof {
+                                enrollment_id,
+                                shard_id,
+                                writer_epoch,
+                            },
+                            caller_ordinals: CallerOrdinalRange::new(
+                                caller_ordinal_start,
+                                caller_ordinal_end,
+                            )
+                            .map_err(worker_error)?,
+                            rows: new_rows.into_iter().map(|row| row.ambiguous).collect(),
+                            reason,
+                        })),
+                        other => Err(other),
+                    };
+                }
+            };
+            Ok(StreamB2PrefixOutcome::Admitted {
+                caller_ordinals: admitted_ordinals,
+                binding: StreamB2BindingProof {
+                    enrollment_id: durable.enrollment_id.to_string(),
+                    shard_id: durable.shard_id.to_string(),
+                    writer_epoch: durable.writer_epoch,
                 },
-                other => other,
-            });
+                acknowledgements: new_rows.into_iter().map(|row| row.ack).collect(),
+            })
         }
-        Ok(StreamTokenAdmissionAck {
-            stream_token: candidate,
-            origin,
-            already_durable: false,
-        })
+        .await;
+        match outcome {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                let binding = if worker_put_attempted {
+                    // A cold prepare can durably advance the shard epoch and
+                    // then refuse effect-free (most notably when replay makes
+                    // the opened worker fold-only). The worker task has
+                    // settled before returning this non-AckUnknown error, so
+                    // recapture the achieved/current authority instead of
+                    // reporting the pre-claim epoch. If authority moved again,
+                    // fail closed rather than pairing the refusal with a
+                    // binding from another lane.
+                    let achieved = self
+                        .capture_stream_authority(table_key, "stream put refusal binding")
+                        .await?;
+                    ensure_same_binding(key, &achieved, "stream put refusal binding")?;
+                    StreamB2BindingProof {
+                        enrollment_id: achieved.enrollment_id.to_string(),
+                        shard_id: achieved.shard_id.to_string(),
+                        writer_epoch: achieved.epoch_floor,
+                    }
+                } else {
+                    classified_binding
+                };
+                Ok(StreamB2PrefixOutcome::Refused {
+                    caller_ordinal: caller_ordinals.start,
+                    binding,
+                    error,
+                })
+            }
+        }
     }
 
     /// Finish one already-queued stream append.  B1 supplies an empty token
@@ -3737,7 +4249,7 @@ impl Omnigraph {
         .await
     }
 
-    async fn capture_stream_authority(
+    pub(super) async fn capture_stream_authority(
         &self,
         table_key: &str,
         operation: &str,
@@ -4742,6 +5254,39 @@ fn validate_generation_token_plan(table_key: &str, rows: &[StreamTokenAuthorityR
     }
 }
 
+async fn longest_fitting_token_prefix<F, Fut>(
+    candidate_rows: usize,
+    mut validate: F,
+) -> Result<usize>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<OmniError>>>,
+{
+    if candidate_rows == 0 || candidate_rows > STREAM_B2_CLASSIFICATION_WINDOW_ROWS {
+        return Err(OmniError::manifest_internal(format!(
+            "B2 exact token-prefix scan requires 1..={STREAM_B2_CLASSIFICATION_WINDOW_ROWS} candidates, got {candidate_rows}"
+        )));
+    }
+
+    let mut capacity_error = None;
+    for prefix in (1..=candidate_rows).rev() {
+        match validate(prefix).await? {
+            None => return Ok(prefix),
+            Some(error @ OmniError::FoldRequired { .. }) => {
+                capacity_error = Some(error);
+            }
+            Some(error) => {
+                return Err(OmniError::manifest_internal(format!(
+                    "B2 token-prefix validator returned a non-capacity outcome: {error}"
+                )));
+            }
+        }
+    }
+    Err(capacity_error.unwrap_or_else(|| {
+        OmniError::manifest_internal("B2 exact token-prefix scan found no admissible row")
+    }))
+}
+
 fn append_trusted_stream_metadata(
     batch: RecordBatch,
     metadata: Vec<Option<TrustedStreamRowMetadata>>,
@@ -5253,5 +5798,49 @@ mod tests {
             } if resource == "stream_json_structural_slots"
                 && actual == STREAM_JSON_MAX_STRUCTURAL_SLOTS + 1
         ));
+    }
+
+    #[tokio::test]
+    async fn exact_token_prefix_scan_handles_a_fail_then_fit_replacement() {
+        let current = BTreeMap::from([("a", 1_u64), ("b", 100_u64)]);
+        let updates = [("a", 60_u64), ("b", 1_u64)];
+        let projected_bytes = |prefix: usize| {
+            let mut projected = current.clone();
+            projected.extend(updates[..prefix].iter().copied());
+            projected.into_values().sum::<u64>()
+        };
+
+        assert_eq!(
+            projected_bytes(1),
+            160,
+            "the first successor must exceed the synthetic projection limit"
+        );
+        assert_eq!(
+            projected_bytes(2),
+            61,
+            "the second successor replaces the much larger current winner"
+        );
+
+        let selected = longest_fitting_token_prefix(updates.len(), |prefix| {
+            let bytes = projected_bytes(prefix);
+            async move {
+                if bytes > 110 {
+                    Ok(Some(OmniError::FoldRequired {
+                        table_key: "node:Person".to_string(),
+                        rows: u64::try_from(prefix).unwrap(),
+                        bytes,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+        })
+        .await
+        .expect("the full non-monotonic prefix fits");
+
+        assert_eq!(
+            selected, 2,
+            "exact descending selection must not reject after prefix one fails"
+        );
     }
 }

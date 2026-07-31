@@ -1156,21 +1156,45 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
    schema validation. Compute the exact post-tombstone/hidden-metadata
    dense-slice charge before recovery or Lance.
 
-   **Implemented sub-slice:** the feature-gated engine seam accepts one bounded
-   JSON object, performs authorization before parsing, requires the exact
-   `$stream` shape and an explicit canonical `id`, rejects duplicate,
-   unknown, and reserved fields, and uses fresh accepted schema authority to
-   convert node/edge scalar, list, enum, and caller-supplied vector values into
-   the existing B2 row path. The existing root-wide B2 preprocessing permit now
-   spans parsing and normalization; raw bytes, pre-DOM structural slots, and
-   projected aggregate Arrow allocation are bounded before their respective
-   allocation boundaries.
-   Invalid shape, type, vector, range, check, or key input is effect-free and
-   refused before the write-recovery barrier.
-   Blob-bearing tables fail before any MemWAL put because Lance's LSM fold
-   scanner cannot yet materialize their logical Blob values. Incremental NDJSON,
-   multi-row/reorder handling, transport admission, and the public surface
-   remain pending; this does not complete F4.
+   **Implemented hidden sub-slice:** the crate-private, feature-gated request
+   seam performs policy and checked-runtime authorization, then acquires
+   separate root-wide and per-actor transport admission before polling body
+   chunks. It rejects a transport chunk over 32 MiB before framing, then lazily
+   emits at most one completed line at a time instead of expanding one chunk
+   into a queue. It incrementally frames bounded NDJSON without collecting the
+   request, drops an over-limit line while counting through its delimiter, and
+   resumes at the next caller ordinal. Each retained line requires the exact
+   `$stream` shape and an explicit canonical `id`, rejects duplicate, unknown,
+   and reserved fields, and uses fresh accepted schema authority to convert
+   node/edge scalar, list, enum, and caller-supplied vector values into dense
+   B2 input. Raw bytes, pre-DOM structural slots, projected aggregate Arrow
+   allocation, normalized runs, and ordered results are bounded before their
+   respective allocation or ownership boundaries.
+
+   The seam forms contiguous multi-row physical prefixes containing distinct
+   keys and closes a prefix at invalid input, a repeated key, a current-token
+   disposition, or the row/byte ceiling. Authority classification is windowed
+   at 256 rows. Exact token-prefix selection checks the full window first and
+   then scans downward when necessary: adding a distinct-key successor may
+   replace a larger current winner, so token projection size is not monotonic
+   and cannot be binary-searched. One watcher/fence outcome covers each invoked
+   prefix, while a bounded reorder owner maps tagged per-line outcomes back
+   into caller order. A physical-admission blocker supplies
+   `blocking_ordinal` to later uninvoked lines, but adapter-local `invalid` and
+   `stream_input_too_large` results still take precedence. Intrinsic sizing for
+   that stopped tail temporarily owns the same root B2 preprocessing permit as
+   ordinary admission; waiting for it races output cancellation and cannot
+   escape the two-envelope root budget. After invocation, ownership transfers
+   to the root task: disconnect stops further body polling and admission but
+   cannot cancel or erase the bounded invoked tail.
+   Blob-bearing tables still fail before any MemWAL put because Lance's LSM
+   fold scanner cannot yet materialize their logical Blob values.
+
+   This is not a public transport or product surface: SDK, HTTP, CLI, API DTO,
+   and OpenAPI ingress remain absent. The seam exposes no F3 resume or rebind
+   path and continues to accept only the initial binding; full binding-chain
+   ancestry remains F3 work. Consequently this hidden tranche does not make the
+   formal F4 milestone complete until F3 lands.
 3. **Lazy enrollment with a prepare handshake** (§4.7 P2) — every table is
    stream-eligible only while the profile is exactly `ENABLED`, but the wire
    invariant above still requires the engine-minted stream incarnation before
@@ -1278,9 +1302,12 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
    tagged union with `dead_lettered` rather than returning an ad hoc error.
 5. **Bounded transport ownership.** Parse incrementally; never collect the
    request. One request may retain at most one submitted run and one
-   accumulating run, each within 8,192 rows / 32 MiB. A raw line over the
-   selected 32-MiB line ceiling is terminal before materialization. The result
-   channel and reorder buffer hold at most one run (8,192 statuses); when the
+   accumulating run, each within 8,192 rows / 32 MiB. A transport chunk over
+   32 MiB is refused before framing, and a raw line over the selected 32-MiB
+   line ceiling is terminal before materialization. Completed lines are
+   yielded lazily from each accepted chunk, never collected into a parallel
+   frame queue. The result channel and reorder buffer hold at most one run
+   (8,192 statuses); when the
    output consumer stalls, parsing and new admission backpressure rather than
    accumulating. A separate root-wide slot/byte budget charges every live raw
    accumulator, normalized run, result queue, and reorder owner, so many slow
