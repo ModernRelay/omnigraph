@@ -21,8 +21,9 @@ use lance_index::mem_wal::{MemWalIndexDetails, MergedGeneration, ShardId, ShardS
 
 use crate::db::manifest::stream::{
     CLAIM_RECEIPT_TAG, ClaimProfile, DrainGoal, LastFoldOutcome, LastFoldSummary,
-    ManagementReceipt, StreamGenerationCut, stream_graph_identity_digest,
-    stream_quiesce_result_payload,
+    ManagementReceipt, STREAM_RESUME_OPERATION_KIND, StreamGenerationCut, StreamResumeMode,
+    StreamResumeRequestPayload, stream_graph_identity_digest, stream_quiesce_result_payload,
+    stream_resume_result_payload,
 };
 use crate::db::manifest::stream_token::{
     AdmissionClassification, AdmissionRequest, PayloadDigest, PayloadDigestInput,
@@ -40,20 +41,26 @@ use crate::db::manifest::token_store::{
 };
 use crate::db::manifest::{
     CurrentHeadWitness, ExpectedTableVersions, ManifestChange, RecoveryAuthorityToken,
-    RecoveryLineageIntent, RecoveryProtocolV14, RecoveryStreamClaimContinuationV14,
-    RecoveryStreamClaimOutcomeV14, RecoveryStreamFoldCut, RecoveryStreamLifecycleReceiptKind,
-    SidecarTablePin, StreamLifecycle, StreamLifecycleEntry, StreamPhysicalBinding, TableIdentity,
+    RecoveryLineageIntent, RecoveryProtocolV14, RecoveryProtocolV15,
+    RecoveryStreamClaimContinuationV14, RecoveryStreamClaimOutcomeV14, RecoveryStreamFoldCut,
+    RecoveryStreamLifecycleReceiptKind, RecoveryStreamOpenPlanV15,
+    RecoveryStreamResumeOutcomeV15, RecoveryStreamResumeRequestV15, SidecarTablePin,
+    StreamLifecycle, StreamLifecycleEntry, StreamPhysicalBinding, TableIdentity,
     TableVersionExpectation, arm_stream_claim_checkpoint_sidecar_v14,
     arm_stream_claim_terminal_sidecar_v14, classify_effect_free_stream_claim_sidecar_v14,
+    arm_stream_resume_checkpoint_sidecar_v15, arm_stream_resume_terminal_sidecar_v15,
+    classify_effect_free_stream_resume_sidecar_v15,
     complete_stream_claim_sidecar_v14, complete_stream_fold_sidecar_v14,
     complete_stream_lifecycle_receipt_sidecar_v14, confirm_stream_claim_sidecar_v14,
+    complete_stream_resume_sidecar_v15, confirm_stream_resume_sidecar_v15,
     confirm_stream_fold_sidecar_v14, confirm_stream_lifecycle_receipt_sidecar_v14,
     finalize_effect_free_stream_fold_sidecar_v14, list_sidecars,
     lookup_stream_claim_continuation_v14, new_stream_claim_sidecar_v14,
     new_stream_drain_fold_sidecar_v14, new_stream_fold_v2_sidecar_v14,
     new_stream_lifecycle_receipt_sidecar_v14, prepared_stream_claim_attempt_v14,
+    new_stream_resume_sidecar_v15, prepared_stream_resume_attempt_v15,
     rearm_stream_claim_checkpoint_sidecar_v14, receipt_first_rearm_stream_claim_sidecar_v14,
-    write_sidecar,
+    rearm_stream_resume_checkpoint_sidecar_v15, write_sidecar,
 };
 use crate::db::write_queue::StreamAdmissionKey;
 use crate::error::{OmniError, Result};
@@ -76,11 +83,14 @@ use super::stream_lifecycle::{
     CanonicalDataBlockEvidence, ClaimAttemptEvidence, ClaimAttemptRequest, ClaimOperationRequest,
     DataBlockEvidenceCollector, EmptyCutEvidence, QuiesceRequest, authenticate_claim_wal_segment,
     build_claim_adoption_row, build_claim_attempt_effect, build_draining_data_block,
-    build_draining_to_sealed, build_open_to_draining, build_terminal_claim,
+    build_draining_to_sealed, build_open_to_draining, build_resume_adoption_row,
+    build_terminal_claim,
     claim_wal_authentication_plan, claim_wal_key_discovery_plan, collect_claim_wal_segment_keys,
     current_generation_lww_projection_digest, lifecycle_generation_lww_projection_digest,
-    prepare_claim_attempt, prepare_claim_operation, stream_quiesce_request_digest,
+    prepare_claim_attempt, prepare_claim_operation, prepare_resume_claim_operation,
+    prepare_stream_resume_open, stream_quiesce_request_digest,
     stream_quiesce_request_payload_from_draining,
+    validate_selected_management_receipt_progress, StreamResumeRequest,
 };
 use super::{Omnigraph, WriteTxn};
 
@@ -1362,6 +1372,48 @@ impl Omnigraph {
     /// Finish one already-queued stream append.  B1 supplies an empty token
     /// projection; B2 supplies the exact watcher-confirmed updates which must
     /// become warm only after the post-durability fence check.
+    fn stream_idle_authority_check(
+        self: &Arc<Self>,
+        key: StreamWorkerKey,
+        admission_key: StreamAdmissionKey,
+        table_key: String,
+    ) -> IdleAuthorityCheck {
+        let idle_db = Arc::clone(self);
+        Arc::new(move |writer: Arc<ShardWriter>| {
+            let db = Arc::clone(&idle_db);
+            let admission_key = admission_key.clone();
+            let table_key = table_key.clone();
+            Box::pin(async move {
+                let shared = db.write_queue().acquire_stream_shared(&admission_key).await;
+                let authority = CheckedStreamAuthority::from_shared_admission(shared);
+                let checked = async {
+                    db.ensure_no_relevant_stream_sidecar(key.identity, "stream idle eviction")
+                        .await?;
+                    let before = db
+                        .capture_stream_authority(&table_key, "stream idle eviction")
+                        .await?;
+                    ensure_same_binding(key, &before, "stream idle eviction authority")?;
+                    db.validate_claimed_writer_for_capture(&writer, key, &before)
+                        .await?;
+
+                    db.ensure_no_relevant_stream_sidecar(key.identity, "stream idle eviction")
+                        .await?;
+                    let after = db
+                        .capture_stream_authority(&table_key, "stream idle eviction")
+                        .await?;
+                    ensure_same_capture(&before, &after, "stream idle eviction final authority")?;
+                    db.validate_claimed_writer_for_capture(&writer, key, &after)
+                        .await
+                }
+                .await;
+                match checked {
+                    Ok(()) => Ok(authority),
+                    Err(error) => Err(IdleAuthorityFailure::new(error, authority)),
+                }
+            })
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn finish_reserved_stream_put(
         self: &Arc<Self>,
@@ -1375,43 +1427,8 @@ impl Omnigraph {
         confirmed_token_updates: ConfirmedStreamTokenOverlay,
     ) -> Result<DurableBatchAck> {
         let admitted_batch = batch.clone();
-        let idle_db = Arc::clone(self);
-        let idle_key = key;
-        let idle_admission_key = admission_key.clone();
-        let idle_table_key = table_key.clone();
-        let idle_authority: IdleAuthorityCheck = Arc::new(move |writer: Arc<ShardWriter>| {
-            let db = Arc::clone(&idle_db);
-            let admission_key = idle_admission_key.clone();
-            let table_key = idle_table_key.clone();
-            Box::pin(async move {
-                let shared = db.write_queue().acquire_stream_shared(&admission_key).await;
-                let authority = CheckedStreamAuthority::from_shared_admission(shared);
-                let checked = async {
-                    db.ensure_no_relevant_stream_sidecar(idle_key.identity, "stream idle eviction")
-                        .await?;
-                    let before = db
-                        .capture_stream_authority(&table_key, "stream idle eviction")
-                        .await?;
-                    ensure_same_binding(idle_key, &before, "stream idle eviction authority")?;
-                    db.validate_claimed_writer_for_capture(&writer, idle_key, &before)
-                        .await?;
-
-                    db.ensure_no_relevant_stream_sidecar(idle_key.identity, "stream idle eviction")
-                        .await?;
-                    let after = db
-                        .capture_stream_authority(&table_key, "stream idle eviction")
-                        .await?;
-                    ensure_same_capture(&before, &after, "stream idle eviction final authority")?;
-                    db.validate_claimed_writer_for_capture(&writer, idle_key, &after)
-                        .await
-                }
-                .await;
-                match checked {
-                    Ok(()) => Ok(authority),
-                    Err(error) => Err(IdleAuthorityFailure::new(error, authority)),
-                }
-            })
-        });
+        let idle_authority =
+            self.stream_idle_authority_check(key, admission_key, table_key.clone());
         let db = Arc::clone(self);
         let prepare_table_key = table_key.clone();
         let prepare = Box::new(move |warm_writer: Option<Arc<ShardWriter>>| {
@@ -1834,31 +1851,15 @@ impl Omnigraph {
         )
         .await?
         {
-            if receipt.from_revision != expected_lifecycle_revision
-                || receipt.actor_id != actor_id
-                || receipt.identity != initial_entry.identity
-                || receipt.operation_kind != "QUIESCE"
-            {
-                return Err(OmniError::StreamLifecycleIdempotencyConflict {
-                    stable_table_id: initial_entry.identity.stable_table_id,
-                    table_incarnation_id: initial_entry.identity.table_incarnation_id,
-                    operation_kind: "QUIESCE".to_string(),
-                    operation_id: drain_id,
-                });
-            }
-            receipt.validate(receipt.to_revision)?;
-            if initial_lifecycle.lifecycle == StreamLifecycle::Sealed
-                && initial_lifecycle
-                    .management_receipt_chain
-                    .head_record_id
-                    .as_deref()
-                    == Some(receipt.record_id.as_str())
-            {
-                return Ok(());
-            }
-            return Err(OmniError::manifest_internal(
-                "selected terminal quiesce receipt is not the current SEALED lifecycle head",
-            ));
+            validate_selected_quiesce_receipt(
+                &initial_lifecycle,
+                &receipt,
+                &graph_identity_digest,
+                &drain_id,
+                expected_lifecycle_revision,
+                &actor_id,
+            )?;
+            return Ok(());
         }
 
         let provisional = match initial_lifecycle.lifecycle {
@@ -1979,15 +1980,15 @@ impl Omnigraph {
                 &drain_id,
             )
             .await?
-                && receipt.from_revision == expected_lifecycle_revision
-                && receipt.actor_id == actor_id
-                && settled_lifecycle.lifecycle == StreamLifecycle::Sealed
-                && settled_lifecycle
-                    .management_receipt_chain
-                    .head_record_id
-                    .as_deref()
-                    == Some(receipt.record_id.as_str())
             {
+                validate_selected_quiesce_receipt(
+                    &settled_lifecycle,
+                    &receipt,
+                    &graph_identity_digest,
+                    &drain_id,
+                    expected_lifecycle_revision,
+                    &actor_id,
+                )?;
                 return Ok(());
             }
         }
@@ -2016,23 +2017,15 @@ impl Omnigraph {
         )
         .await?
         {
-            if receipt.from_revision == expected_lifecycle_revision
-                && receipt.actor_id == actor_id
-                && current_lifecycle.lifecycle == StreamLifecycle::Sealed
-                && current_lifecycle
-                    .management_receipt_chain
-                    .head_record_id
-                    .as_deref()
-                    == Some(receipt.record_id.as_str())
-            {
-                return Ok(());
-            }
-            return Err(OmniError::StreamLifecycleIdempotencyConflict {
-                stable_table_id: key.identity.stable_table_id,
-                table_incarnation_id: key.identity.table_incarnation_id,
-                operation_kind: "QUIESCE".to_string(),
-                operation_id: drain_id,
-            });
+            validate_selected_quiesce_receipt(
+                &current_lifecycle,
+                &receipt,
+                &graph_identity_digest,
+                &drain_id,
+                expected_lifecycle_revision,
+                &actor_id,
+            )?;
+            return Ok(());
         }
         if current_lifecycle.lifecycle == StreamLifecycle::Open {
             if current_lifecycle.lifecycle_revision != expected_lifecycle_revision {
@@ -3349,6 +3342,1308 @@ impl Omnigraph {
         .await
     }
 
+    /// Resume one exact closed lifecycle lane through recovery-v15.
+    ///
+    /// The detached owner retains the profile-shared gate even if the caller
+    /// is cancelled. The worker registry then owns the exclusive lane from
+    /// physical claim through terminal `OPEN` publication and writer install.
+    pub(crate) async fn stream_resume_as(
+        self: &Arc<Self>,
+        table_key: &str,
+        resume_id: &str,
+        expected_lifecycle_revision: u64,
+        mode: StreamResumeMode,
+        actor_id: &str,
+    ) -> Result<()> {
+        let db = Arc::clone(self);
+        let table_key = table_key.to_string();
+        let resume_id = resume_id.to_string();
+        let actor_id = actor_id.to_string();
+        crate::instrumentation::spawn_with_query_io_probes(async move {
+            Box::pin(db.stream_resume_background(
+                table_key,
+                resume_id,
+                expected_lifecycle_revision,
+                mode,
+                actor_id,
+            ))
+            .await
+        })
+        .await
+        .map_err(|error| OmniError::Lance(format!("stream resume task failed: {error}")))?
+    }
+
+    async fn stream_resume_background(
+        self: Arc<Self>,
+        table_key: String,
+        resume_id: String,
+        expected_lifecycle_revision: u64,
+        mode: StreamResumeMode,
+        actor_id: String,
+    ) -> Result<()> {
+        let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+        let initial = self.open_write_txn(None).await?;
+        let entry = initial.base.entry(&table_key).cloned().ok_or_else(|| {
+            OmniError::manifest_not_found(format!(
+                "stream resume cannot resolve unknown table '{table_key}'"
+            ))
+        })?;
+        let lifecycle = initial
+            .base
+            .stream_lifecycle(entry.identity)
+            .cloned()
+            .ok_or_else(|| {
+                OmniError::manifest_conflict(format!(
+                    "stream resume requires an enrolled stream for '{table_key}'"
+                ))
+            })?;
+        let graph_identity_digest =
+            stream_graph_identity_digest(&initial.authority.schema_identity_domain)?;
+        if self
+            .selected_resume_receipt_matches(
+                &initial.base,
+                &lifecycle,
+                &graph_identity_digest,
+                &resume_id,
+                expected_lifecycle_revision,
+                mode,
+                &actor_id,
+            )
+            .await?
+        {
+            self.complete_selected_resume_sidecar(&initial.base, &lifecycle, &resume_id)
+                .await?;
+            return Ok(());
+        }
+        if lifecycle.lifecycle_revision != expected_lifecycle_revision {
+            return Err(OmniError::StreamLifecycleChanged {
+                stable_table_id: entry.identity.stable_table_id,
+                table_incarnation_id: entry.identity.table_incarnation_id,
+                expected_revision: expected_lifecycle_revision,
+                current_revision: lifecycle.lifecycle_revision,
+            });
+        }
+        let provisional = match mode {
+            StreamResumeMode::ResumeSealed if lifecycle.lifecycle == StreamLifecycle::Sealed => {
+                self.capture_sealed_stream_authority(&table_key, "stream resume")
+                    .await?
+            }
+            StreamResumeMode::AbortDrain
+                if lifecycle.lifecycle == StreamLifecycle::Draining =>
+            {
+                let drain_id = lifecycle
+                    .drain
+                    .as_ref()
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "stream abort-drain lost its drain descriptor",
+                        )
+                    })?
+                    .drain_id
+                    .clone();
+                self.capture_draining_stream_authority(
+                    &table_key,
+                    "stream abort-drain",
+                    &drain_id,
+                )
+                .await?
+            }
+            _ => {
+                return Err(OmniError::manifest_stream_lifecycle_conflict(
+                    entry.identity.stable_table_id,
+                    entry.identity.table_incarnation_id,
+                    &table_key,
+                    lifecycle.lifecycle.as_str(),
+                    match mode {
+                        StreamResumeMode::ResumeSealed => "stream resume",
+                        StreamResumeMode::AbortDrain => "stream abort-drain",
+                    },
+                ));
+            }
+        };
+        validate_stream_resume_profile_authority(&provisional.txn.base)?;
+        self.prepare_stream_resume_preflight(
+            &provisional,
+            &graph_identity_digest,
+            &resume_id,
+            expected_lifecycle_revision,
+            mode,
+            &actor_id,
+        )
+        .await?;
+        let key = provisional.worker_key;
+        let exclusive = self
+            .write_queue()
+            .acquire_stream_exclusive(&provisional.admission_key)
+            .await;
+
+        // The exclusive wait can outlive the authority captured above. Check
+        // the receipt and current lane before the registry retires any writer:
+        // a concurrent exact retry must not retire the writer just installed
+        // by the winning resume, and DISABLING must refuse before mutation.
+        let post_wait = self.open_write_txn(None).await?;
+        let post_wait_lifecycle = post_wait
+            .base
+            .stream_lifecycle(key.identity)
+            .cloned()
+            .ok_or_else(|| {
+                OmniError::manifest_read_set_changed(
+                    format!("stream_resume_lifecycle:{table_key}"),
+                    Some(format!("{:?}", provisional.lifecycle)),
+                    None,
+                )
+            })?;
+        if self
+            .selected_resume_receipt_matches(
+                &post_wait.base,
+                &post_wait_lifecycle,
+                &graph_identity_digest,
+                &resume_id,
+                expected_lifecycle_revision,
+                mode,
+                &actor_id,
+            )
+            .await?
+        {
+            self.complete_selected_resume_sidecar(
+                &post_wait.base,
+                &post_wait_lifecycle,
+                &resume_id,
+            )
+            .await?;
+            return Ok(());
+        }
+        if post_wait_lifecycle.lifecycle_revision != expected_lifecycle_revision {
+            return Err(OmniError::StreamLifecycleChanged {
+                stable_table_id: key.identity.stable_table_id,
+                table_incarnation_id: key.identity.table_incarnation_id,
+                expected_revision: expected_lifecycle_revision,
+                current_revision: post_wait_lifecycle.lifecycle_revision,
+            });
+        }
+        let recaptured = self
+            .recapture_stream_resume_lane(
+                &provisional,
+                mode,
+                "stream resume post-wait authority",
+            )
+            .await?;
+        validate_stream_resume_profile_authority(&recaptured.txn.base)?;
+        self.prepare_stream_resume_preflight(
+            &recaptured,
+            &graph_identity_digest,
+            &resume_id,
+            expected_lifecycle_revision,
+            mode,
+            &actor_id,
+        )
+        .await?;
+        self.exact_pending_stream_resume(
+            &recaptured,
+            &resume_id,
+            expected_lifecycle_revision,
+            mode,
+            &actor_id,
+        )
+        .await?;
+        ensure_same_binding(key, &recaptured, "stream resume post-wait binding")?;
+        if recaptured.admission_key != provisional.admission_key {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("stream_resume_admission:{table_key}"),
+                Some(format!("{:?}", provisional.admission_key)),
+                Some(format!("{:?}", recaptured.admission_key)),
+            ));
+        }
+        let exclusive_authority =
+            CheckedExclusiveStreamAuthority::from_exclusive_admission(exclusive);
+        let opener_db = Arc::clone(&self);
+        let opener_capture = recaptured.clone();
+        let opener_resume_id = resume_id.clone();
+        let opener_actor = actor_id.clone();
+        let idle_authority = self.stream_idle_authority_check(
+            key,
+            recaptured.admission_key.clone(),
+            table_key.clone(),
+        );
+        let opener = move || {
+            let opener_db = Arc::clone(&opener_db);
+            let opener_capture = opener_capture.clone();
+            let opener_resume_id = opener_resume_id.clone();
+            let opener_actor = opener_actor.clone();
+            Box::pin(async move {
+                Box::pin(opener_db.open_stream_writer_with_resume(
+                    &opener_capture,
+                    &opener_resume_id,
+                    expected_lifecycle_revision,
+                    mode,
+                    &opener_actor,
+                ))
+                .await
+            }) as crate::table_store::mem_wal::WorkerOpenFuture
+        };
+        let open_result = self
+            .stream_workers
+            .install_resumed_writer(
+                key,
+                table_key.clone(),
+                exclusive_authority,
+                Box::new(opener),
+                idle_authority,
+            )
+            .await;
+
+        // A recovered invocation can publish the exact terminal receipt
+        // without reconstructing a process-local ShardWriter. In that case
+        // the registry opener reports an unclaimed stop, but receipt-first
+        // classification still makes the caller-visible result successful.
+        self.refresh_coordinator_only().await?;
+        let terminal = self.open_write_txn(None).await?;
+        let terminal_lifecycle = terminal
+            .base
+            .stream_lifecycle(key.identity)
+            .cloned()
+            .ok_or_else(|| {
+                OmniError::manifest_internal("stream resume lost its lifecycle lane")
+            })?;
+        if self
+            .selected_resume_receipt_matches(
+                &terminal.base,
+                &terminal_lifecycle,
+                &graph_identity_digest,
+                &resume_id,
+                expected_lifecycle_revision,
+                mode,
+                &actor_id,
+            )
+            .await?
+        {
+            self.complete_selected_resume_sidecar(
+                &terminal.base,
+                &terminal_lifecycle,
+                &resume_id,
+            )
+            .await?;
+            return Ok(());
+        }
+        open_result.map_err(worker_error)
+    }
+
+    async fn prepare_stream_resume_preflight(
+        &self,
+        capture: &StreamAuthorityCapture,
+        graph_identity_digest: &str,
+        resume_id: &str,
+        expected_lifecycle_revision: u64,
+        mode: StreamResumeMode,
+        actor_id: &str,
+    ) -> Result<(
+        super::stream_lifecycle::PreparedStreamResumeOpen,
+        Vec<String>,
+    )> {
+        let public_named_branches = self
+            .coordinator
+            .read()
+            .await
+            .branch_list()
+            .await?
+            .into_iter()
+            .filter(|branch| {
+                branch != "main" && !crate::db::is_internal_system_branch(branch)
+            })
+            .collect::<Vec<_>>();
+        let prepared = prepare_stream_resume_open(
+            &capture.lifecycle,
+            StreamResumeRequest {
+                graph_identity_digest: graph_identity_digest.to_string(),
+                resume_id: resume_id.to_string(),
+                expected_lifecycle_revision,
+                mode,
+                actor_id: actor_id.to_string(),
+                initiated_at: crate::db::now_micros()?,
+                public_named_branches: public_named_branches.clone(),
+            },
+        )?;
+        Ok((prepared, public_named_branches))
+    }
+
+    /// Finish stale sidecar cleanup only after the manifest-selected receipt
+    /// has already proved the terminal OPEN result. This path never invokes a
+    /// claim or publishes lifecycle authority without exclusive admission; it
+    /// merely makes a lost sidecar-delete response idempotent.
+    async fn complete_selected_resume_sidecar(
+        &self,
+        snapshot: &crate::db::manifest::Snapshot,
+        lifecycle: &StreamLifecycleEntry,
+        resume_id: &str,
+    ) -> Result<()> {
+        let mut exact = None;
+        for sidecar in list_sidecars(self.root_uri(), self.storage_adapter()).await? {
+            let Some(RecoveryProtocolV15::StreamResume(protocol)) =
+                sidecar.protocol_v15.as_deref()
+            else {
+                continue;
+            };
+            if protocol.request.resume_id != resume_id
+                || protocol.admission_scope.identity != lifecycle.identity
+                || protocol.admission_scope.binding_scope_id != lifecycle.binding_scope_id
+            {
+                continue;
+            }
+            if exact.replace(sidecar).is_some() {
+                return Err(OmniError::manifest_internal(
+                    "multiple selected StreamResume sidecars match one occurrence",
+                ));
+            }
+        }
+        let Some(sidecar) = exact else {
+            return Ok(());
+        };
+        match complete_stream_resume_sidecar_v15(
+            self.root_uri(),
+            Arc::clone(&self.storage),
+            snapshot,
+            &sidecar,
+        )
+        .await?
+        {
+            RecoveryStreamResumeOutcomeV15::TerminalVisible {
+                lifecycle: selected,
+                ..
+            } if selected == *lifecycle => Ok(()),
+            _ => Err(OmniError::recovery_required(
+                sidecar.operation_id,
+                "selected resume receipt has a nonterminal recovery sidecar",
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn selected_resume_receipt_matches(
+        &self,
+        snapshot: &crate::db::manifest::Snapshot,
+        lifecycle: &StreamLifecycleEntry,
+        graph_identity_digest: &str,
+        resume_id: &str,
+        expected_lifecycle_revision: u64,
+        mode: StreamResumeMode,
+        actor_id: &str,
+    ) -> Result<bool> {
+        let selected = snapshot.open_stream_token_authority().await?;
+        let Some(receipt) = lookup_management_receipt(
+            &selected,
+            snapshot.stream_token_authority(),
+            graph_identity_digest,
+            lifecycle.identity,
+            &lifecycle.enrollment_receipt.stream_incarnation_id,
+            STREAM_RESUME_OPERATION_KIND,
+            resume_id,
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        receipt.validate(receipt.to_revision)?;
+        let request: StreamResumeRequestPayload =
+            serde_json::from_value(receipt.request_payload.clone()).map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "selected stream resume receipt has an invalid request payload: {error}"
+                ))
+            })?;
+        let expected_to_revision = expected_lifecycle_revision.checked_add(1).ok_or_else(|| {
+            OmniError::manifest_internal("selected stream resume receipt revision overflow")
+        })?;
+        let exact = receipt.graph_identity_digest == graph_identity_digest
+            && receipt.identity == lifecycle.identity
+            && receipt.stream_incarnation_id
+                == lifecycle.enrollment_receipt.stream_incarnation_id
+            && receipt.binding_scope_id == lifecycle.binding_scope_id
+            && receipt.operation_kind == STREAM_RESUME_OPERATION_KIND
+            && receipt.operation_id == resume_id
+            && receipt.from_revision == expected_lifecycle_revision
+            && receipt.to_revision == expected_to_revision
+            && receipt.actor_id == actor_id
+            && request.resume_id == resume_id
+            && request.expected_lifecycle_revision == expected_lifecycle_revision
+            && request.mode == mode
+            && request.actor_id == actor_id
+            && request.graph_identity_digest == graph_identity_digest
+            && request.identity == lifecycle.identity
+            && request.stream_incarnation_id
+                == lifecycle.enrollment_receipt.stream_incarnation_id
+            && request.binding_scope_id == lifecycle.binding_scope_id
+            && request.enrollment_id == lifecycle.binding.enrollment_id
+            && request.public_named_branches.is_empty()
+            && request.request_digest()? == receipt.request_digest
+            && receipt.result_payload == stream_resume_result_payload(receipt.to_revision)?;
+        if !exact {
+            return Err(OmniError::StreamLifecycleIdempotencyConflict {
+                stable_table_id: lifecycle.identity.stable_table_id,
+                table_incarnation_id: lifecycle.identity.table_incarnation_id,
+                operation_kind: STREAM_RESUME_OPERATION_KIND.to_string(),
+                operation_id: resume_id.to_string(),
+            });
+        }
+        validate_selected_management_receipt_progress(
+            lifecycle,
+            &receipt,
+            StreamLifecycle::Open,
+        )?;
+        Ok(true)
+    }
+
+    /// The recovery-v15 physical claimant. This deliberately does not call or
+    /// relax the ordinary v14 claim path: v14's wire meaning remains frozen.
+    #[allow(clippy::too_many_arguments)]
+    async fn open_stream_writer_with_resume(
+        self: &Arc<Self>,
+        capture: &StreamAuthorityCapture,
+        resume_id: &str,
+        expected_lifecycle_revision: u64,
+        mode: StreamResumeMode,
+        actor_id: &str,
+    ) -> std::result::Result<OpenedMemWalWorker, WorkerOpenFailure> {
+        let write_queue = self.write_queue();
+        let _schema_guard = write_queue
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        let _branch_guard = write_queue.acquire_branch(None).await;
+        let _stream_token_guard = write_queue.acquire_stream_token().await;
+        let _table_guards = write_queue
+            .acquire_many(&[(capture.entry.table_key.clone(), None)])
+            .await;
+        let gated_capture = match mode {
+            StreamResumeMode::ResumeSealed => self
+                .capture_sealed_stream_authority(
+                    &capture.entry.table_key,
+                    "stream resume gated recapture",
+                )
+                .await,
+            StreamResumeMode::AbortDrain => {
+                let drain_id = capture
+                    .lifecycle
+                    .drain
+                    .as_ref()
+                    .map(|drain| drain.drain_id.as_str())
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "stream abort-drain gated recapture lost its drain descriptor",
+                        )
+                    });
+                match drain_id {
+                    Ok(drain_id) => {
+                        self.capture_draining_stream_authority(
+                            &capture.entry.table_key,
+                            "stream abort-drain gated recapture",
+                            drain_id,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+        .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+        ensure_same_capture(capture, &gated_capture, "stream resume gated authority")
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+        let capture = &gated_capture;
+        let graph_identity_digest =
+            stream_graph_identity_digest(&capture.txn.authority.schema_identity_domain)
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+        let (prepared_open, public_named_branches) = self
+            .prepare_stream_resume_preflight(
+                capture,
+                &graph_identity_digest,
+                resume_id,
+                expected_lifecycle_revision,
+                mode,
+                actor_id,
+            )
+            .await
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+        let prior_claim = if capture.lifecycle.current_claim_receipt_id.is_some() {
+            Some(
+                self.selected_claim_receipt(&capture.txn.base, &capture.lifecycle)
+                    .await
+                    .map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?,
+            )
+        } else {
+            None
+        };
+        let tailer = claim_wal_tailer(capture)
+            .await
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+        let pending = self
+            .exact_pending_stream_resume(
+                capture,
+                resume_id,
+                expected_lifecycle_revision,
+                mode,
+                actor_id,
+            )
+            .await
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+        let (
+            operation,
+            mut attempt,
+            mut prior_attempt_chain,
+            mut snapshot,
+            mut sidecar,
+            mut invoke_attempt,
+        ) = if let Some(pending_sidecar) = pending {
+            let outcome = complete_stream_resume_sidecar_v15(
+                self.root_uri(),
+                Arc::clone(&self.storage),
+                &capture.txn.base,
+                &pending_sidecar,
+            )
+            .await
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            let pending_attempt = prepared_stream_resume_attempt_v15(&pending_sidecar)
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            match outcome {
+                RecoveryStreamResumeOutcomeV15::AttemptPending {
+                    prior_attempt_chain,
+                    ..
+                } => {
+                    read_claim_physical_prestate_after_attempt(capture)
+                        .await
+                        .map_err(|error| {
+                            WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                        })?;
+                    (
+                        pending_attempt.operation.clone(),
+                        pending_attempt,
+                        prior_attempt_chain,
+                        capture.txn.base.clone(),
+                        pending_sidecar,
+                        false,
+                    )
+                }
+                RecoveryStreamResumeOutcomeV15::CheckpointVisible { .. } => {
+                    self.refresh_coordinator_only().await.map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                    let checkpoint_snapshot = self.coordinator.read().await.snapshot();
+                    let physical = read_claim_physical_prestate_after_attempt(capture)
+                        .await
+                        .map_err(|error| {
+                            WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                        })?;
+                    let next_attempt =
+                        prepare_next_claim_attempt(&pending_attempt.operation, &tailer, physical)
+                            .await
+                            .map_err(|error| {
+                                WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                            })?;
+                    let mut pending_sidecar = pending_sidecar;
+                    rearm_stream_resume_checkpoint_sidecar_v15(
+                        self.root_uri(),
+                        self.storage_adapter(),
+                        &checkpoint_snapshot,
+                        &mut pending_sidecar,
+                        &next_attempt,
+                    )
+                    .await
+                    .map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                    let refreshed = self
+                        .recapture_stream_resume_lane(
+                            capture,
+                            mode,
+                            "stream resume checkpoint continuation",
+                        )
+                        .await
+                        .map_err(|error| {
+                            WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                        })?;
+                    drop(_table_guards);
+                    drop(_stream_token_guard);
+                    drop(_branch_guard);
+                    drop(_schema_guard);
+                    return Box::pin(self.open_stream_writer_with_resume(
+                        &refreshed,
+                        resume_id,
+                        expected_lifecycle_revision,
+                        mode,
+                        actor_id,
+                    ))
+                    .await;
+                }
+                RecoveryStreamResumeOutcomeV15::EffectFree => {
+                    self.refresh_coordinator_only().await.map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                    let refreshed = self
+                        .recapture_stream_resume_lane(
+                            capture,
+                            mode,
+                            "stream resume effect-free continuation",
+                        )
+                        .await
+                        .map_err(|error| {
+                            WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                        })?;
+                    drop(_table_guards);
+                    drop(_stream_token_guard);
+                    drop(_branch_guard);
+                    drop(_schema_guard);
+                    return Box::pin(self.open_stream_writer_with_resume(
+                        &refreshed,
+                        resume_id,
+                        expected_lifecycle_revision,
+                        mode,
+                        actor_id,
+                    ))
+                    .await;
+                }
+                RecoveryStreamResumeOutcomeV15::TerminalVisible { .. } => {
+                    return Err(WorkerOpenFailure::unclaimed(MemWalWorkerError::InvalidState {
+                        reason: "stream resume terminal receipt is already visible".to_string(),
+                    }));
+                }
+            }
+        } else {
+            let physical = read_claim_physical_prestate(capture)
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            if mode == StreamResumeMode::AbortDrain {
+                ensure_abort_drain_physical_cut_is_empty(capture, &tailer, physical)
+                    .await
+                    .map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+            }
+            let claim_id = ShardId::new_v4().to_string();
+            let operation = prepare_resume_claim_operation(
+                &capture.lifecycle,
+                ClaimOperationRequest {
+                    graph_identity_digest: graph_identity_digest.clone(),
+                    claim_id: claim_id.clone(),
+                    lifecycle_operation_id: Some(resume_id.to_string()),
+                    recovery_operation_id: claim_id,
+                    claim_kind: STREAM_RESUME_OPERATION_KIND.to_string(),
+                    profile: ClaimProfile::RetainAll,
+                    shard_id: capture.shard_id.to_string(),
+                    initial_shard_manifest_version: physical.shard_manifest_version,
+                    initial_writer_epoch: physical.writer_epoch,
+                    initial_replay_cursor: physical.replay_cursor,
+                    initial_current_generation: physical.current_generation,
+                    initial_base_merged_generation: physical.base_merged_generation,
+                    claim_contract_version: 1,
+                },
+                mode,
+                prepared_open.minimum_next_epoch_floor,
+            )
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            let attempt = prepare_next_claim_attempt(&operation, &tailer, physical)
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            let prior_attempt_chain = crate::db::manifest::stream::claim_attempt_chain_genesis();
+            let authority = RecoveryAuthorityToken {
+                branch_identifier: capture.txn.authority.branch_identifier.clone(),
+                graph_head: capture.txn.authority.graph_head.clone(),
+                schema_identity_domain: capture.txn.authority.schema_identity_domain.clone(),
+                schema_ir_hash: capture.txn.authority.schema_ir_hash.clone(),
+                schema_identity_version: capture.txn.authority.schema_identity_version,
+            };
+            let request = RecoveryStreamResumeRequestV15 {
+                protocol_version:
+                    crate::db::manifest::stream::STREAM_RESUME_REQUEST_PROTOCOL_VERSION,
+                graph_identity_digest: graph_identity_digest.clone(),
+                identity: capture.lifecycle.identity,
+                stream_incarnation_id: capture
+                    .lifecycle
+                    .enrollment_receipt
+                    .stream_incarnation_id
+                    .clone(),
+                binding_scope_id: capture.lifecycle.binding_scope_id.clone(),
+                enrollment_id: capture.lifecycle.binding.enrollment_id.clone(),
+                resume_id: resume_id.to_string(),
+                expected_lifecycle_revision,
+                mode,
+                actor_id: actor_id.to_string(),
+                public_named_branches,
+            };
+            let open_plan = RecoveryStreamOpenPlanV15 {
+                next_lifecycle_revision: prepared_open.next_lifecycle_revision,
+                expected_binding: capture.lifecycle.binding.clone(),
+                expected_base_head: capture.lifecycle.current_head_witness.clone(),
+                shard_id: capture.shard_id.to_string(),
+                minimum_next_epoch_floor: prepared_open.minimum_next_epoch_floor,
+            };
+            let snapshot = capture.txn.base.clone();
+            let sidecar = new_stream_resume_sidecar_v15(
+                authority,
+                snapshot.version(),
+                snapshot.stream_profile().clone(),
+                capture.lifecycle.clone(),
+                snapshot.stream_token_authority().clone(),
+                prior_claim,
+                request,
+                open_plan,
+                prior_attempt_chain.clone(),
+                &attempt,
+            )
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            write_sidecar(self.root_uri(), self.storage_adapter(), &sidecar)
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            (
+                operation,
+                attempt,
+                prior_attempt_chain,
+                snapshot,
+                sidecar,
+                true,
+            )
+        };
+
+        loop {
+            let (claim_was_invoked, mut claimed_writer, mut writer_claim_error) = if invoke_attempt
+            {
+                let config = reconstruct_b1_writer_config(
+                    &capture.details,
+                    capture.enrollment_id,
+                    capture.shard_id,
+                )
+                .map_err(WorkerOpenFailure::unclaimed)?;
+                match capture
+                    .head
+                    .dataset()
+                    .mem_wal_writer(capture.shard_id, config)
+                    .await
+                {
+                    Ok(writer) => (true, Some(ClaimedMemWalWorker::new(writer)), None),
+                    Err(error) => (true, None, Some(error)),
+                }
+            } else {
+                (false, None, None)
+            };
+            let (evidence, achieved) = observe_claim_attempt(capture, &tailer, &attempt)
+                .await
+                .map_err(|error| {
+                    worker_open_failure_preserving_claim(
+                        claim_open_worker_error(error),
+                        &mut claimed_writer,
+                    )
+                })?;
+            let effect = build_claim_attempt_effect(&prior_attempt_chain, &attempt, evidence)
+                .map_err(|error| {
+                    worker_open_failure_preserving_claim(
+                        claim_open_worker_error(error),
+                        &mut claimed_writer,
+                    )
+                })?;
+
+            if matches!(
+                evidence,
+                ClaimAttemptEvidence::NoEffect | ClaimAttemptEvidence::AbortedNoEffect
+            ) {
+                classify_effect_free_stream_resume_sidecar_v15(
+                    self.root_uri(),
+                    self.storage_adapter(),
+                    &mut sidecar,
+                    effect,
+                )
+                .await
+                .map_err(|error| {
+                    worker_open_failure_preserving_claim(
+                        claim_open_worker_error(error),
+                        &mut claimed_writer,
+                    )
+                })?;
+                complete_stream_resume_sidecar_v15(
+                    self.root_uri(),
+                    Arc::clone(&self.storage),
+                    &snapshot,
+                    &sidecar,
+                )
+                .await
+                .map_err(|error| {
+                    worker_open_failure_preserving_claim(
+                        claim_open_worker_error(error),
+                        &mut claimed_writer,
+                    )
+                })?;
+                if let Some(claimed) = claimed_writer.take() {
+                    return Err(WorkerOpenFailure::claimed(
+                        MemWalWorkerError::InvalidState {
+                            reason: "Lance reported resume-claim success without its exact manifest effect"
+                                .to_string(),
+                        },
+                        claimed,
+                    ));
+                }
+                if let Some(error) = writer_claim_error.take() {
+                    return Err(WorkerOpenFailure::unclaimed(MemWalWorkerError::Lance {
+                        operation: "resume writer claim",
+                        message: error.to_string(),
+                    }));
+                }
+                self.refresh_coordinator_only().await.map_err(|error| {
+                    WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                })?;
+                let refreshed = self
+                    .recapture_stream_resume_lane(
+                        capture,
+                        mode,
+                        "effect-free resume claim continuation",
+                    )
+                    .await
+                    .map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                drop(_table_guards);
+                drop(_stream_token_guard);
+                drop(_branch_guard);
+                drop(_schema_guard);
+                return Box::pin(self.open_stream_writer_with_resume(
+                    &refreshed,
+                    resume_id,
+                    expected_lifecycle_revision,
+                    mode,
+                    actor_id,
+                ))
+                .await;
+            }
+
+            if matches!(evidence, ClaimAttemptEvidence::StockManifestOnly { .. }) {
+                let records = [LifecycleLedgerRecord::ClaimAttemptEffect(effect.clone())];
+                let outcome = self
+                    .commit_stream_resume_ledger(
+                        &snapshot,
+                        &mut sidecar,
+                        &records,
+                        effect,
+                        None,
+                    )
+                    .await
+                    .map_err(|error| {
+                        worker_open_failure_preserving_claim(
+                            claim_open_worker_error(error),
+                            &mut claimed_writer,
+                        )
+                    })?;
+                let RecoveryStreamResumeOutcomeV15::CheckpointVisible {
+                    prior_attempt_chain: next_chain,
+                    ..
+                } = outcome
+                else {
+                    return Err(worker_open_failure_preserving_claim(
+                        MemWalWorkerError::InvalidState {
+                            reason: "manifest-only resume claim did not publish its checkpoint"
+                                .to_string(),
+                        },
+                        &mut claimed_writer,
+                    ));
+                };
+                if let Some(claimed) = claimed_writer.take() {
+                    return Err(WorkerOpenFailure::claimed(
+                        MemWalWorkerError::InvalidState {
+                            reason: "Lance reported resume-claim success but only its stock manifest effect was observable"
+                                .to_string(),
+                        },
+                        claimed,
+                    ));
+                }
+                self.refresh_coordinator_only().await.map_err(|error| {
+                    WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                })?;
+                snapshot = self.coordinator.read().await.snapshot();
+                let physical = read_claim_physical_prestate_after_attempt(capture)
+                    .await
+                    .map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                attempt = prepare_next_claim_attempt(&operation, &tailer, physical)
+                    .await
+                    .map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                rearm_stream_resume_checkpoint_sidecar_v15(
+                    self.root_uri(),
+                    self.storage_adapter(),
+                    &snapshot,
+                    &mut sidecar,
+                    &attempt,
+                )
+                .await
+                .map_err(|error| {
+                    WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                })?;
+                prior_attempt_chain = next_chain;
+                invoke_attempt = true;
+                continue;
+            }
+
+            if !claim_was_invoked {
+                let projection = recovered_current_generation_projection_source(
+                    capture, &tailer, &attempt, &achieved,
+                )
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+                self.publish_terminal_stream_resume(
+                    capture,
+                    &snapshot,
+                    &tailer,
+                    &attempt,
+                    &effect,
+                    &achieved,
+                    projection,
+                    &prepared_open,
+                    mode,
+                    &mut sidecar,
+                )
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+                return Err(WorkerOpenFailure::unclaimed(MemWalWorkerError::InvalidState {
+                    reason: "recovered stream resume published without a live process-local writer"
+                        .to_string(),
+                }));
+            }
+            if let Some(error) = writer_claim_error.take() {
+                return Err(WorkerOpenFailure::unclaimed(MemWalWorkerError::Lance {
+                    operation: "resume writer claim",
+                    message: format!(
+                        "{error}; exact terminal physical claim remains recovery-owned by {}",
+                        sidecar.operation_id
+                    ),
+                }));
+            }
+            let claimed = claimed_writer.take().ok_or_else(|| {
+                WorkerOpenFailure::unclaimed(MemWalWorkerError::InvalidState {
+                    reason: "resume claim returned neither a claimed writer nor an error"
+                        .to_string(),
+                })
+            })?;
+            let mut opened = claimed
+                .classify(
+                    capture.head.dataset(),
+                    &capture.full_path,
+                    &capture.details,
+                    operation.initial_writer_epoch,
+                )
+                .await?;
+            let projection = match opened.current_generation_projection_source() {
+                Ok(projection) => projection,
+                Err(error) => {
+                    return Err(WorkerOpenFailure::claimed(error, opened.into_claimed()));
+                }
+            };
+            let terminal = self
+                .publish_terminal_stream_resume(
+                    capture,
+                    &snapshot,
+                    &tailer,
+                    &attempt,
+                    &effect,
+                    &achieved,
+                    projection,
+                    &prepared_open,
+                    mode,
+                    &mut sidecar,
+                )
+                .await;
+            if let Err(error) = terminal {
+                return Err(WorkerOpenFailure::claimed(
+                    claim_open_worker_error(error),
+                    opened.into_claimed(),
+                ));
+            }
+            return Ok(opened);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_terminal_stream_resume(
+        &self,
+        capture: &StreamAuthorityCapture,
+        snapshot: &crate::db::manifest::Snapshot,
+        tailer: &WalTailer,
+        attempt: &super::stream_lifecycle::PreparedClaimAttempt,
+        effect: &crate::db::manifest::stream::ClaimAttemptEffect,
+        achieved: &ClaimPhysicalPrestate,
+        projection: CurrentGenerationProjectionSource,
+        prepared_open: &super::stream_lifecycle::PreparedStreamResumeOpen,
+        mode: StreamResumeMode,
+        sidecar: &mut crate::db::manifest::RecoverySidecar,
+    ) -> Result<()> {
+        if !matches!(projection, CurrentGenerationProjectionSource::Empty) {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                "stream resume claim observed an unmerged current generation",
+            ));
+        }
+        let schema = Arc::new(ArrowSchema::from(capture.head.dataset().schema()));
+        let key_plan = claim_wal_key_discovery_plan(attempt, effect, Arc::clone(&schema))?;
+        let keys = collect_claim_wal_segment_keys(tailer, &key_plan).await?;
+        if !keys.is_empty() {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                "stream resume authenticated a non-empty WAL suffix",
+            ));
+        }
+        let auth_plan = claim_wal_authentication_plan(
+            attempt,
+            effect,
+            capture.txn.authority.schema_ir_hash.clone(),
+            Arc::clone(&schema),
+            BTreeMap::new(),
+        )?;
+        let segment = authenticate_claim_wal_segment(tailer, &auth_plan).await?;
+        if segment.row_count != 0 {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                "stream resume terminal suffix contains rows",
+            ));
+        }
+        let full_lww = current_generation_lww_projection_digest(
+            &attempt.operation,
+            &capture.txn.authority.schema_ir_hash,
+            schema,
+            &[],
+        )?;
+        let attempt_chain = effect.next_attempt_chain_ref()?;
+        let current_lifecycle = snapshot
+            .stream_lifecycle(capture.entry.identity)
+            .ok_or_else(|| {
+                OmniError::manifest_internal("terminal resume lost its lifecycle lane")
+            })?;
+        let built = build_terminal_claim(
+            &current_lifecycle.claim_receipt_chain,
+            attempt,
+            effect,
+            &attempt_chain,
+            &segment,
+            &full_lww,
+            achieved.replay_cursor,
+            prepared_open.recorded_at,
+        )?;
+        let result_payload = stream_resume_result_payload(prepared_open.next_lifecycle_revision)?;
+        let management = ManagementReceipt::new(
+            attempt.operation.graph_identity_digest.clone(),
+            current_lifecycle.identity,
+            current_lifecycle
+                .enrollment_receipt
+                .stream_incarnation_id
+                .clone(),
+            current_lifecycle.binding_scope_id.clone(),
+            &current_lifecycle.management_receipt_chain,
+            attempt
+                .operation
+                .lifecycle_operation_id
+                .clone()
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("resume claim lost its occurrence ID")
+                })?,
+            STREAM_RESUME_OPERATION_KIND,
+            current_lifecycle.lifecycle_revision,
+            prepared_open.next_lifecycle_revision,
+            sidecar.actor_id.clone().ok_or_else(|| {
+                OmniError::manifest_internal("resume sidecar lost its actor")
+            })?,
+            prepared_open.request_payload.clone(),
+            result_payload,
+            prepared_open.recorded_at,
+        )?;
+        let next_lifecycle =
+            build_resume_adoption_row(current_lifecycle, &built, &management, mode)?;
+        let records = [
+            LifecycleLedgerRecord::ClaimAttemptEffect(effect.clone()),
+            LifecycleLedgerRecord::ClaimReceipt(built.receipt.clone()),
+            LifecycleLedgerRecord::ManagementReceipt(management.clone()),
+        ];
+        let outcome = self
+            .commit_stream_resume_ledger(
+                snapshot,
+                sidecar,
+                &records,
+                effect.clone(),
+                Some((built.receipt, management, next_lifecycle.clone())),
+            )
+            .await?;
+        match outcome {
+            RecoveryStreamResumeOutcomeV15::TerminalVisible { lifecycle, .. }
+                if lifecycle == next_lifecycle =>
+            {
+                self.refresh_coordinator_only().await?;
+                Ok(())
+            }
+            _ => Err(OmniError::manifest_internal(
+                "terminal resume did not publish its exact OPEN authority",
+            )),
+        }
+    }
+
+    async fn commit_stream_resume_ledger(
+        &self,
+        snapshot: &crate::db::manifest::Snapshot,
+        sidecar: &mut crate::db::manifest::RecoverySidecar,
+        records: &[LifecycleLedgerRecord],
+        effect: crate::db::manifest::stream::ClaimAttemptEffect,
+        terminal: Option<(
+            crate::db::manifest::stream::ClaimReceipt,
+            ManagementReceipt,
+            StreamLifecycleEntry,
+        )>,
+    ) -> Result<RecoveryStreamResumeOutcomeV15> {
+        let selected = snapshot.open_stream_token_authority().await?;
+        let staged =
+            stage_lifecycle_ledger_records(selected, snapshot.stream_token_authority(), records)
+                .await?;
+        let planned_transaction = staged.transaction_identity();
+        let token_head = SnapshotHandle::new(
+            open_stream_token_authority_head(
+                self.root_uri(),
+                snapshot.stream_token_authority(),
+                &self.control_session(),
+            )
+            .await?,
+        );
+        let staged = StagedHandle::new(staged);
+        match terminal {
+            Some((claim, management, lifecycle)) => {
+                arm_stream_resume_terminal_sidecar_v15(
+                    self.root_uri(),
+                    self.storage_adapter(),
+                    sidecar,
+                    effect,
+                    claim,
+                    management,
+                    lifecycle,
+                    planned_transaction,
+                )
+                .await?;
+            }
+            None => {
+                arm_stream_resume_checkpoint_sidecar_v15(
+                    self.root_uri(),
+                    self.storage_adapter(),
+                    sidecar,
+                    effect,
+                    planned_transaction,
+                )
+                .await?;
+            }
+        }
+        if let Ok(outcome) = self.storage().commit_staged_exact(token_head, staged).await {
+            if !outcome.is_exact() {
+                return Err(OmniError::recovery_required(
+                    sidecar.operation_id.clone(),
+                    "resume ledger participant committed a non-exact transaction",
+                ));
+            }
+            let next_authority =
+                stream_token_authority_entry_for_dataset(outcome.snapshot().dataset()).await?;
+            confirm_stream_resume_sidecar_v15(
+                self.root_uri(),
+                self.storage_adapter(),
+                sidecar,
+                outcome.committed_transaction().clone(),
+                next_authority.current_head_witness.clone(),
+                next_authority,
+            )
+            .await?;
+        }
+        let root_uri = self.root_uri().to_string();
+        let storage = Arc::clone(&self.storage);
+        let snapshot = snapshot.clone();
+        let sidecar = sidecar.clone();
+        crate::instrumentation::spawn_with_query_io_probes(async move {
+            complete_stream_resume_sidecar_v15(&root_uri, storage, &snapshot, &sidecar).await
+        })
+        .await
+        .map_err(|error| {
+            OmniError::Lance(format!(
+                "stream resume recovery owner task failed before returning its exact outcome: {error}"
+            ))
+        })?
+    }
+
+    async fn exact_pending_stream_resume(
+        &self,
+        capture: &StreamAuthorityCapture,
+        resume_id: &str,
+        expected_lifecycle_revision: u64,
+        mode: StreamResumeMode,
+        actor_id: &str,
+    ) -> Result<Option<crate::db::manifest::RecoverySidecar>> {
+        let mut exact = None;
+        for sidecar in list_sidecars(self.root_uri(), self.storage_adapter()).await? {
+            let relevant = sidecar.writer_kind.is_graph_global_barrier()
+                || sidecar
+                    .stream_admission_scope()
+                    .is_some_and(|scope| scope.identity == capture.entry.identity)
+                || sidecar
+                    .tables
+                    .iter()
+                    .any(|pin| pin.identity == capture.entry.identity);
+            if !relevant {
+                continue;
+            }
+            let is_exact = matches!(
+                sidecar.protocol_v15.as_deref(),
+                Some(RecoveryProtocolV15::StreamResume(protocol))
+                    if protocol.admission_scope.identity == capture.entry.identity
+                        && protocol.admission_scope.binding_scope_id
+                            == capture.lifecycle.binding_scope_id
+                        && protocol.request.resume_id == resume_id
+                        && protocol.request.expected_lifecycle_revision
+                            == expected_lifecycle_revision
+                        && protocol.request.mode == mode
+                        && protocol.request.actor_id == actor_id
+            );
+            if is_exact && exact.is_none() {
+                exact = Some(sidecar);
+                continue;
+            }
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id,
+                format!(
+                    "pending {:?} recovery operation overlaps stream resume for table identity {}",
+                    sidecar.writer_kind, capture.entry.identity
+                ),
+            ));
+        }
+        Ok(exact)
+    }
+
+    async fn recapture_stream_resume_lane(
+        &self,
+        prior: &StreamAuthorityCapture,
+        mode: StreamResumeMode,
+        operation: &str,
+    ) -> Result<StreamAuthorityCapture> {
+        match mode {
+            StreamResumeMode::ResumeSealed => {
+                self.capture_sealed_stream_authority(&prior.entry.table_key, operation)
+                    .await
+            }
+            StreamResumeMode::AbortDrain => {
+                let drain_id = prior
+                    .lifecycle
+                    .drain
+                    .as_ref()
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "abort-drain continuation lost its drain descriptor",
+                        )
+                    })?
+                    .drain_id
+                    .clone();
+                self.capture_draining_stream_authority(
+                    &prior.entry.table_key,
+                    operation,
+                    &drain_id,
+                )
+                .await
+            }
+        }
+    }
+
     /// The sole cold MemWAL writer opener.
     ///
     /// Every epoch claim is armed before Lance is invoked and remains
@@ -3397,7 +4692,6 @@ impl Omnigraph {
             .await
             .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
         let (
-            mut physical,
             operation,
             mut attempt,
             mut prior_attempt_chain,
@@ -3418,11 +4712,6 @@ impl Omnigraph {
                     prior_attempt_chain,
                     ..
                 } => (
-                    read_claim_physical_prestate_after_attempt(capture)
-                        .await
-                        .map_err(|error| {
-                            WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
-                        })?,
                     pending_attempt.operation.clone(),
                     pending_attempt,
                     prior_attempt_chain,
@@ -3555,7 +4844,6 @@ impl Omnigraph {
                 .await
                 .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
             (
-                physical,
                 operation,
                 attempt,
                 prior_attempt_chain,
@@ -3711,7 +4999,7 @@ impl Omnigraph {
                 // pre-claim floor.  Only the first attempt may require exact
                 // equality with that floor; continuation binds the achieved
                 // checkpoint through the durable attempt chain instead.
-                physical = read_claim_physical_prestate_after_attempt(capture)
+                let physical = read_claim_physical_prestate_after_attempt(capture)
                     .await
                     .map_err(|error| {
                         WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
@@ -4284,6 +5572,23 @@ impl Omnigraph {
         .await
     }
 
+    /// Capture one exact SEALED lane for the dedicated recovery-v15 resume
+    /// path. Ordinary writer admission continues to call
+    /// `capture_stream_authority` and therefore cannot opt into SEALED state.
+    async fn capture_sealed_stream_authority(
+        &self,
+        table_key: &str,
+        operation: &str,
+    ) -> Result<StreamAuthorityCapture> {
+        self.capture_stream_authority_for_lifecycle(
+            table_key,
+            operation,
+            StreamLifecycle::Sealed,
+            None,
+        )
+        .await
+    }
+
     async fn capture_stream_authority_for_lifecycle(
         &self,
         table_key: &str,
@@ -4321,7 +5626,13 @@ impl Omnigraph {
                 crate::db::manifest::StreamProfileMode::Enabled
                     | crate::db::manifest::StreamProfileMode::Disabling
             ),
-            StreamLifecycle::Sealed => false,
+            // This arm is reachable only through the dedicated sealed capture
+            // above. The normal OPEN capture remains the sole write-admission
+            // path, so accepting ENABLED here does not create a generic
+            // `allow_sealed` bypass.
+            StreamLifecycle::Sealed => {
+                profile_mode == crate::db::manifest::StreamProfileMode::Enabled
+            }
         };
         if !profile_authorized {
             return Err(OmniError::StreamingRequiresClusterRuntime {
@@ -4345,6 +5656,7 @@ impl Omnigraph {
             (StreamLifecycle::Open, None, None) => {}
             (StreamLifecycle::Draining, Some(drain), Some(expected))
                 if drain.drain_id == expected => {}
+            (StreamLifecycle::Sealed, None, None) => {}
             (StreamLifecycle::Draining, Some(_), Some(_)) => {
                 return Err(OmniError::manifest_read_set_changed(
                     format!("{operation}:stream_drain:{table_key}"),
@@ -4647,6 +5959,33 @@ impl Omnigraph {
             .await
     }
 
+    /// Feature-gated lifecycle seam for recovery-v15 `SEALED -> OPEN` resume
+    /// and guarded `DRAINING -> OPEN` abort tests.
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    pub async fn failpoint_stream_resume_for_test(
+        self: &Arc<Self>,
+        table_key: &str,
+        resume_id: &str,
+        expected_lifecycle_revision: u64,
+        abort_drain: bool,
+        actor_id: &str,
+    ) -> Result<()> {
+        let mode = if abort_drain {
+            StreamResumeMode::AbortDrain
+        } else {
+            StreamResumeMode::ResumeSealed
+        };
+        Box::pin(self.stream_resume_as(
+            table_key,
+            resume_id,
+            expected_lifecycle_revision,
+            mode,
+            actor_id,
+        ))
+        .await
+    }
+
     /// Feature-gated proof seam for one private B2 compare-and-chain row.
     /// It intentionally accepts/returns only wire strings so protocol types do
     /// not become public SDK surface.
@@ -4934,6 +6273,119 @@ async fn read_claim_physical_prestate_after_attempt(
         current_generation: manifest.current_generation,
         base_merged_generation,
     })
+}
+
+/// Prove an abortable DRAINING lane has no physical cut which would need a
+/// fold before a new epoch is claimed. Lifecycle authority authenticates the
+/// last selected claim, but later WAL puts can advance the shard cursor before
+/// another lifecycle publication. Arming resume first would strand that cut
+/// behind its own overlapping sidecar, so this check is deliberately
+/// effect-free and precedes sidecar arm.
+async fn ensure_abort_drain_physical_cut_is_empty(
+    capture: &StreamAuthorityCapture,
+    tailer: &WalTailer,
+    physical: ClaimPhysicalPrestate,
+) -> Result<()> {
+    if physical.replay_cursor != capture.lifecycle.authenticated_wal_tail.position {
+        return Err(OmniError::manifest_conflict(format!(
+            "stream abort-drain requires an empty physical cut; shard replay cursor {} differs from authenticated lifecycle position {}",
+            physical.replay_cursor, capture.lifecycle.authenticated_wal_tail.position
+        )));
+    }
+    let passive = validate_b1_lifecycle_physical_state(capture.head.dataset(), &capture.lifecycle)
+        .await
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    match passive {
+        PassiveB1PhysicalState::AdmitOrReplay {
+            shard_manifest_version,
+            current_generation,
+            replay_after_wal_entry_position,
+            writer_epoch,
+        } if shard_manifest_version == physical.shard_manifest_version
+            && current_generation == physical.current_generation
+            && replay_after_wal_entry_position == physical.replay_cursor
+            && writer_epoch == physical.writer_epoch =>
+        {
+            Ok(())
+        }
+        PassiveB1PhysicalState::FoldOnlyFlushed(_) => Err(OmniError::manifest_conflict(
+            "stream abort-drain requires an empty physical cut; an unmerged flushed generation remains",
+        )),
+        observed => Err(OmniError::manifest_read_set_changed(
+            format!(
+                "stream_abort_drain_physical_cut:{}",
+                capture.entry.table_key
+            ),
+            Some(format!("{physical:?}")),
+            Some(format!("{observed:?}")),
+        )),
+    }?;
+
+    let expected_next_position = physical
+        .replay_cursor
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("stream abort-drain WAL cursor overflow"))?;
+    let observed_successor = tailer
+        .read_entry(expected_next_position)
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    if observed_successor.is_some() {
+        return Err(OmniError::manifest_conflict(format!(
+            "stream abort-drain requires an empty physical cut; retained WAL contains successor position {expected_next_position}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_stream_resume_profile_authority(
+    snapshot: &crate::db::manifest::Snapshot,
+) -> Result<()> {
+    let profile = snapshot.stream_profile();
+    profile.validate()?;
+    if profile.mode() != crate::db::manifest::StreamProfileMode::Enabled {
+        return Err(OmniError::StreamingRequiresClusterRuntime {
+            mode: profile.mode().as_str().to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_selected_quiesce_receipt(
+    lifecycle: &StreamLifecycleEntry,
+    receipt: &ManagementReceipt,
+    graph_identity_digest: &str,
+    drain_id: &str,
+    expected_lifecycle_revision: u64,
+    actor_id: &str,
+) -> Result<()> {
+    if receipt.graph_identity_digest != graph_identity_digest
+        || receipt.identity != lifecycle.identity
+        || receipt.stream_incarnation_id
+            != lifecycle.enrollment_receipt.stream_incarnation_id
+        || receipt.binding_scope_id != lifecycle.binding_scope_id
+        || receipt.operation_kind != "QUIESCE"
+        || receipt.operation_id != drain_id
+        || receipt.from_revision != expected_lifecycle_revision
+        || receipt.actor_id != actor_id
+    {
+        return Err(OmniError::StreamLifecycleIdempotencyConflict {
+            stable_table_id: lifecycle.identity.stable_table_id,
+            table_incarnation_id: lifecycle.identity.table_incarnation_id,
+            operation_kind: "QUIESCE".to_string(),
+            operation_id: drain_id.to_string(),
+        });
+    }
+    receipt.validate(receipt.to_revision)?;
+    if receipt.result_payload != stream_quiesce_result_payload(receipt.to_revision)? {
+        return Err(OmniError::manifest_internal(
+            "selected terminal quiesce receipt has a noncanonical result payload",
+        ));
+    }
+    validate_selected_management_receipt_progress(
+        lifecycle,
+        receipt,
+        StreamLifecycle::Sealed,
+    )
 }
 
 async fn claim_wal_tailer(capture: &StreamAuthorityCapture) -> Result<WalTailer> {

@@ -12,10 +12,11 @@ owner: OmniGraph maintainers
 
 **Status:** Draft / private B2 compare-and-chain/token-fold core, B2a
 unbounded retain-all profile, experimental activation P1, v11 profile
-authority, and the hidden v12 lifecycle-v3/recovery-v14 claim/quiesce tranche
-implemented. Public row streaming and production enrollment/quiesce verbs,
-resume/abort, correction/retirement, maintenance/rebind, exclusive-cut public
-status, and CLI/HTTP/OpenAPI streaming surfaces remain inactive.
+authority, the hidden v12 lifecycle-v3/recovery-v14 claim/quiesce tranche, and
+private v13/recovery-v15 resume/abort-drain implemented. Public row streaming
+and production enrollment/quiesce/resume/abort verbs, correction/retirement,
+maintenance/rebind, exclusive-cut public status, and CLI/HTTP/OpenAPI streaming
+surfaces remain inactive.
 **Date:** 2026-07-10
 **Gate E0 evaluated:** 2026-07-18
 **Phase A foundation completed:** 2026-07-18
@@ -232,7 +233,7 @@ become canonical objects; this is atomic-write cleanup, not MemWAL GC. **B2b**
 remains the deferred managed-reclamation profile using a Lance-owned primitive.
 
 The private B2 row/fold slice introduced in internal schema v9 remains part of
-the currently served v12 format. It supplies stream-config v3, canonical
+the currently served v13 format. It supplies stream-config v3, canonical
 payload/token digests, trusted hidden row attribution, and manifest-selected
 graph-global token authority. Admission
 recaptures mutable authority after shared admission and same-key queue
@@ -241,7 +242,9 @@ ledger-chain/current and authenticated-tail authority. Recovery-v14 owns exact
 hidden enrollment, claims, ordinary/drain folds, and terminal management
 receipts; a fold publishes exact base plus token effects, lifecycle, lineage,
 and attribution only at one manifest CAS. Recovery-v11 is historical v8 state,
-and historical recovery-v12 lifecycle-v2 folds are refused under v12. The core
+and historical recovery-v12 lifecycle-v2 folds are refused under lifecycle-v3.
+Recovery-v15 owns private resume and guarded drain-abort without reinterpreting
+the v14 scaffold. The core
 remains reachable only through feature-gated, doc-hidden engine test seams and
 is not a product surface. V11's profile protocol v2 and exact recovery-v13
 `StreamProfileChange` remain unchanged.
@@ -632,8 +635,9 @@ first-row exception.
 This section owns both the implemented private B2 row/fold contract and the
 remaining future-public/control contract. Internal schema v9 implemented the
 §4.1 token/attribution substrate and historical recovery-v12 fold portion of
-§4.4. Current v12 adds the hidden lifecycle-v3/recovery-v14 enrollment,
-claim, fold, and quiesce core. It does not expose a production row caller. The
+§4.4. V12 adds the hidden lifecycle-v3/recovery-v14 enrollment, claim, fold,
+and quiesce core. Current v13/recovery-v15 adds crate-private resume and guarded
+drain-abort. It does not expose a production row caller. The
 graph-scoped `stream_ingest` /
 `stream_manage` Cedar vocabulary and embedded manifest-only read-only status
 are active under §4.7; v11 profile mutation additionally requires checked
@@ -690,7 +694,7 @@ distinct occurrence; SDKs still mint a fresh UUID for each new change.
 An `Admission` attempt ID names one possibly ambiguous call to the private B1
 worker; it is not a WAL position or receipt. `Correction` is a distinct durable
 origin because correction creates no physical admission attempt. The current
-implemented v9 row/token format (inside the current v12 graph wrapper) accepts
+implemented v9 row/token format (inside the current v13 graph wrapper) accepts
 those two variants only. F5 correction of a terminal dead letter is a fresh
 ordinary `Admission` occurrence with a new caller-owned `write_id` and the
 current terminal token as predecessor; it adds no Replay origin. Exactly one
@@ -1521,19 +1525,20 @@ that same descriptor without changing its goal and writes
 exact operation, cut, input rows/bytes, zero visible rows/bytes, and time in the
 same lifecycle CAS.
 
-Resume and abort-drain use the registered but fail-closed recovery-v14
-`StreamResume` payload once F3 activates it. Recovery-v13 remains
-`StreamProfileChange`-only. `StreamResume`'s `Armed` form binds the complete expected lifecycle
+Resume and abort-drain use the complete recovery-v15 `StreamResume` payload.
+The three-field recovery-v14 scaffold remains frozen and fail-closed;
+recovery-v13 remains `StreamProfileChange`-only. `StreamResume`'s `Armed` form binds the complete expected lifecycle
 row and revision, caller `resume_id`, canonical request digest, binding,
 configuration, base witness, graph-branch topology, fixed actor/operation, an
-`OPEN` template, management receipt, minimum next epoch floor, and exact
-`ENABLED` profile/delegation/runtime authority. Every `OPEN`-producing resume
-or abort acquires the graph-profile gate shared before the table gate and holds
-it through claim, `EffectsConfirmed`, and manifest publication. The exact
+`OPEN` plan, minimum next epoch floor, and exact `ENABLED` profile/delegation
+authority. The current hidden seam acquires the graph-profile gate shared
+before the table gate and holds it through claim, terminal ledger effect, and
+manifest publication; F7's production wrapper must additionally require
+matching checked serving-runtime authority before invocation. The exact
 achieved epoch is unknowable before the writer claim. After claiming, the
-adapter durably records `EffectsConfirmed` with the exact sentinel/epoch,
-profile-specific `ClaimReceipt`, achieved shard manifest/replay cursor, replay
-disposition, and final `OPEN` row; only that row may publish. B2b's achieved
+adapter durably records the exact classified sentinel/epoch and one ledger
+transaction containing the terminal `ClaimReceipt` and `ManagementReceipt`,
+plus the final `OPEN` row; only that row may publish. B2b's achieved
 manifest names the sentinel directly; B2a's stock manifest does not, so its
 persisted receipt carries the sidecar's already-classified binding. Recovery
 never compensates an epoch or fence sentinel: while admission remains closed it
@@ -4404,15 +4409,17 @@ but cannot claim history-flat cost while scanning manifest history.
 ## 11. Format activation and rebuild
 
 Streaming is a graph-format capability, not a feature activated by the first
-enrollment. Internal schema v12 is now the only served format. It preserves the
+enrollment. Internal schema v13 is now the only served format. It preserves the
 bounded B1 mechanics, complete v9 row/token contract, v10's frozen explicit-null
 dead-letter compatibility placeholder, and v11 profile protocol v2; replaces lifecycle state-v2
 inline histories with lifecycle-v3 fixed-size ledger/current authority; and
 keeps manifest-selected `_stream_tokens.lance` authority. Recovery-v14 owns
 the active hidden enrollment/claim/ordinary-fold/drain-fold/lifecycle-receipt
-families. Recovery-v13 `StreamProfileChange` remains active with its exact old
-meaning. Historical recovery-v10 enrollment and recovery-v12 lifecycle-v2
-folds are refused rather than synthesized under v12.
+families. Recovery-v15 owns the private revision-fenced resume and guarded
+drain-abort path, including the higher-epoch claim and terminal claim/management
+receipts. Recovery-v13 `StreamProfileChange` remains active with its exact old
+meaning. Historical recovery-v10 enrollment, recovery-v12 lifecycle-v2 folds,
+and the incomplete v14 resume scaffold are refused rather than synthesized.
 Uncovered lifecycle, token, or MemWAL mismatches are refused. A physical
 enrollment adds one table's MemWAL index, empty shard, and exact lifecycle row;
 it does not change the graph stamp.
@@ -5427,12 +5434,12 @@ ordinary writers refuse but cannot be corrected, quiesced, or rebuilt.
 |---|---|---|
 | E0 | production-neutral public-surface enrollment/witness classifier; no schema, API, sidecar, or format activation | **Passed 2026-07-18:** 14 substantive local cells, complete six-attempt zero-list 8/80 cost shape, Unix no-list/error tripwire, and one non-vacuous configured RustFS positive-plus-negative cell (§12.1) |
 | A | bounded main/unsharded/single-live-writer enrollment adapter, all-lifecycle effect exclusion with only the `SEALED` native-branch exception, lifecycle/admission lease, then graph-format capability/refusal and strict rebuild | **Implemented 2026-07-18 (§12.2):** internal schema v7, recovery-v10 enrollment, durable lifecycle CAS, process-local exclusion, crash/partial-format refusal, and genuine v6↔v7 strand evidence; no public enrollment or row path |
-| B1 | **Implemented privately 2026-07-19; acknowledgement containment added 2026-07-20; widest-shape closure repaired 2026-07-21:** internal schema v8/config-v2, root-scoped one-generation admission worker, durability-watcher success followed by a same-writer post-durability epoch check, conservative active-state reopen/replay, the pinned RC.1 replay-watermark bridge, and one explicit strict RFC-022 fold; no production caller | The graph-level behavior/crash/race suite and genuine v7↔v8 refusal/rebuild remain green. Fold charges logical dense-slice Arrow bytes and copies each scanner emission into dense owned arrays. The legal 8,192-row high-entropy near-cap generation folds and publishes exactly once without changing the logical 32-MiB admission cap; physical RSS is guarded only by the 384-MiB remeasurement tripwire (§12.4). Recovery-v11 is historical under the current v12 graph format |
+| B1 | **Implemented privately 2026-07-19; acknowledgement containment added 2026-07-20; widest-shape closure repaired 2026-07-21:** internal schema v8/config-v2, root-scoped one-generation admission worker, durability-watcher success followed by a same-writer post-durability epoch check, conservative active-state reopen/replay, the pinned RC.1 replay-watermark bridge, and one explicit strict RFC-022 fold; no production caller | The graph-level behavior/crash/race suite and genuine v7↔v8 refusal/rebuild remain green. Fold charges logical dense-slice Arrow bytes and copies each scanner emission into dense owned arrays. The legal 8,192-row high-entropy near-cap generation folds and publishes exactly once without changing the logical 32-MiB admission cap; physical RSS is guarded only by the 384-MiB remeasurement tripwire (§12.4). Recovery-v11 is historical under the current v13 graph format |
 | R0 | production-neutral retained-growth/source audit; current-object census; referenced-cut retry; legal high-entropy near-cap materialize/fold cell; no schema, public caller, or deletion | **Historical bounded-retention no-go 2026-07-20; disposition amended 2026-07-21 (§0.2/§12.4):** RC.1 still exposes neither a complete reserve-first physical envelope/receipt nor a durable cross-open randomized-attempt cap. Those facts prohibit a finite storage promise but do not block selected unbounded retain-all. The formerly red widest cell is now green locally and on the configured-RustFS CI path; current-object observations remain advisory retention evidence, not provider billing/accounting |
 | B2a | selected unbounded retain-all/no-GC profile on stock Lance | **Private gate implemented 2026-07-21 (§12.5):** no OmniGraph byte/object/file/history quota; zero canonical `_mem_wal` deletion; complete/partial provider residue remains retained, unreferenced, and untouched below its root through retry/reopen; provider failures are loud; local/configured-RustFS history sweeps are advisory. This gate itself activated no schema or product surface; the later private B2-common slice activates v9 |
 | B2b | candidate managed-reclamation retention profile | Inactive. Requires the Lance-owned durable inspect/plan/execute + receipt, post-success fencing, bounded checkpoint/inventory/accounting, local/RustFS enforced-bound validation, and the profile-specific crash matrix (§4.5.2/§12.6). Passing it alone activates no product surface |
 | B2-common | schema v9/config-v3/state-v2, compare-and-chain token/attribution, graph-global token authority, recovery-v12 base+token fold; then explicit enrollment, revision-fenced lifecycle/correction/full status, SDK row/control methods, HTTP, CLI, and OpenAPI | **Private row/fold subset implemented 2026-07-22 (§11/§12.6):** canonical digests, hidden attribution, stale-authority revalidation after shared admission, same-generation chains, exact two-participant recovery/publication, durable fold attribution, retain-all, and genuine v8↔v9 refusal/rebuild are green. Explicit production enrollment, lifecycle mutation/correction, exclusive-cut physical status, public row admission, cancellation/shutdown, API compatibility, and transport parity remain inactive. The Cedar vocabulary and embedded manifest-only status shipped in the later EXP slice. `GraphHistoryBudget` belongs only to a future bounded/managed profile |
-| EXP | experimental cluster-only activation of the §4.7 profile: capability-bound manifest enablement via offline `cluster apply`; lazy graph-wide enrollment; caller-supplied vectors; terminal per-key object-form dead letter plus recovery-bound structural-authority correction; irreversible same-format authority retirement for fresh-root rebuild; explicit lifecycle-aware content-preserving `SEALED` maintenance/rebind; no read-your-writes bridge; starvation-free serial dependency-prioritized fold core with non-overlapping resident-enabled and offline-disable owners; upsert-only; hidden-first ingress followed by atomic served HTTP/remote-client/CLI/OpenAPI activation with direct mutation refused | **Selected 2026-07-27 and protocol choices amended 2026-07-29 (§4.7); v10 P1, v11 profile authority, and the hidden v12 lifecycle-v3/recovery-v14 tranche are implemented.** V11 adds checked stopped/offline and runtime owners plus exact v13 profile receipts. V12 adds fixed-size lifecycle ledger authority and exact hidden enrollment, claim, ordinary/drain fold, and terminal quiesce recovery; empty and non-empty `OPEN → DRAINING → SEALED` restart paths are active only behind private seams. Resume/abort, correction, retirement transition, maintenance/rebind, full exclusive-cut public status, public ingress/enrollment/quiesce, and every streaming transport surface remain inactive. Public activation waits for hidden ingress/driver, complete lifecycle/dead-letter/maintenance/retirement evidence, and F7-co-landed served/remote DTO/OpenAPI parity. |
+| EXP | experimental cluster-only activation of the §4.7 profile: capability-bound manifest enablement via offline `cluster apply`; lazy graph-wide enrollment; caller-supplied vectors; terminal per-key object-form dead letter plus recovery-bound structural-authority correction; irreversible same-format authority retirement for fresh-root rebuild; explicit lifecycle-aware content-preserving `SEALED` maintenance/rebind; no read-your-writes bridge; starvation-free serial dependency-prioritized fold core with non-overlapping resident-enabled and offline-disable owners; upsert-only; hidden-first ingress followed by atomic served HTTP/remote-client/CLI/OpenAPI activation with direct mutation refused | **Selected 2026-07-27 and protocol choices amended 2026-07-29 (§4.7); v10 P1, v11 profile authority, hidden v12 lifecycle-v3/recovery-v14, and F3a v13/recovery-v15 are implemented.** V11 adds checked stopped/offline and runtime owners plus exact v13 profile receipts. V12 adds fixed-size lifecycle ledger authority and exact hidden enrollment, claim, ordinary/drain fold, and terminal quiesce recovery; empty and non-empty `OPEN → DRAINING → SEALED` restart paths are active only behind private seams. Current v13 adds crate-private `SEALED → OPEN` resume and guarded `DRAINING → OPEN` abort. Correction, retirement transition, maintenance/rebind, full exclusive-cut public status, public ingress/enrollment/lifecycle control, and every streaming transport surface remain inactive. Public activation waits for hidden ingress/driver, complete lifecycle/dead-letter/maintenance/retirement evidence, and F7-co-landed served/remote DTO/OpenAPI parity. |
 | C | restart-stable reject-row identity, atomic dead letter, richer status, and evidence-backed configurable bounds | reject crash matrix; reject-retention proof; backpressure and RSS/latency evidence. The §4.7 profile pulls a bounded object-form dead-letter subset forward using the §4.1 token as reject identity |
 | D | automatic operation drain, broader schema/branch/upgrade integration, and orchestrated rematerialization rebind beyond P7's explicit bridge | two-coordinator race, old/new physical-binding crash matrix, and format-transition suite |
 | E | fresh cuts and maintained-index reads; cross-process `Fresh` ships only if the substrate generation-retention guard exists (§9), otherwise same-process only | cut consistency; merged-generation exclusion |

@@ -16,10 +16,10 @@ use crate::db::manifest::stream::{
     EnrollmentReceiptV2, binding_receipt_chain_genesis, stream_graph_identity_digest,
     stream_physical_binding_digest,
 };
+use crate::db::manifest::stream_profile::ReceiptChainRef;
 use crate::db::manifest::token_store::{
-    LifecycleLedgerRecord, lookup_binding_receipt, lookup_enrollment_receipt_v2,
-    lookup_lifecycle_ledger_record_by_id, open_stream_token_authority_head,
-    stage_lifecycle_ledger_records,
+    LifecycleLedgerRecord, lookup_enrollment_receipt_v2, lookup_lifecycle_ledger_record_by_id,
+    open_stream_token_authority_head, stage_lifecycle_ledger_records,
 };
 use crate::db::manifest::{
     EnrollmentReceipt, RecoveryAuthorityToken, RecoveryLineageIntent, STREAM_CONFIG_VERSION,
@@ -38,6 +38,12 @@ use crate::table_store::mem_wal::{
 };
 
 use super::Omnigraph;
+
+/// Prepare is a cold, bodyless authority check, but it must still have a
+/// history-independent ceiling. Rebind appends one immutable binding receipt;
+/// exceeding this bound requires an explicit future chain-checkpoint format
+/// rather than an unbounded scan on every prepare retry.
+const MAX_SELECTED_BINDING_CHAIN_RECORDS: u64 = 1_024;
 
 /// Ephemeral, non-wire compare token for one absent eligible stream lane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,19 +360,13 @@ impl Omnigraph {
             &graph_identity_digest,
             &lifecycle,
         )?;
-        let initial_binding = lookup_binding_receipt(
+        validate_selected_binding_chain_authority(
             &token_dataset,
             txn.base.stream_token_authority(),
-            &graph_identity_digest,
-            entry.identity,
-            &winner_receipt.binding_scope_id,
-            &winner_receipt.enrollment_request_id,
+            &winner_receipt,
+            &lifecycle,
         )
-        .await?
-        .ok_or_else(|| {
-            OmniError::manifest_internal("stream enrollment has no initial binding receipt")
-        })?;
-        validate_unrebound_initial_enrollment_chain(&winner_receipt, &initial_binding, &lifecycle)?;
+        .await?;
         if winner_receipt.enrollment_request_id == enrollment_request_id.to_string() {
             if winner_receipt.actor_id != actor_id {
                 return Err(OmniError::manifest_conflict(format!(
@@ -881,29 +881,147 @@ fn validate_enrollment_receipt_against_lifecycle(
     Ok(())
 }
 
-fn validate_unrebound_initial_enrollment_chain(
-    receipt: &EnrollmentReceiptV2,
-    binding: &BindingReceipt,
+async fn validate_selected_binding_chain_authority(
+    token_dataset: &Dataset,
+    token_authority: &StreamTokenAuthorityEntry,
+    enrollment: &EnrollmentReceiptV2,
     lifecycle: &StreamLifecycleEntry,
 ) -> Result<()> {
-    let prior = receipt.next_chain_ref()?;
-    let initial_chain = binding.next_chain_ref()?;
-    if binding.graph_identity_digest != receipt.graph_identity_digest
-        || binding.identity != receipt.identity
-        || binding.binding_scope_id != receipt.binding_scope_id
-        || binding.stream_incarnation_id != receipt.stream_incarnation_id
-        || binding.physical_binding != receipt.physical_binding
-        || binding.operation_id != receipt.enrollment_request_id
-        || binding.predecessor_record_id != prior.head_record_id
-        || binding.prior_chain_digest != prior.chain_digest
-        || binding.chain_ordinal.checked_sub(1) != Some(prior.record_count)
-        || lifecycle.binding != receipt.physical_binding
-        || lifecycle.binding_scope_id != receipt.binding_scope_id
-        || lifecycle.current_binding_receipt_id != binding.record_id
-        || lifecycle.binding_receipt_chain != initial_chain
+    enrollment.validate()?;
+    lifecycle.validate()?;
+    if enrollment.chain_ordinal != 1
+        || enrollment.predecessor_record_id.is_some()
+        || lifecycle.binding_receipt_chain.record_count < 2
+        || lifecycle.binding_receipt_chain.record_count > MAX_SELECTED_BINDING_CHAIN_RECORDS
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "stream binding receipt ancestry must contain 2..={MAX_SELECTED_BINDING_CHAIN_RECORDS} records rooted at the enrollment receipt"
+        )));
+    }
+
+    let mut expected = lifecycle.binding_receipt_chain.clone();
+    let mut newest_to_oldest = Vec::with_capacity(
+        usize::try_from(expected.record_count.saturating_sub(1)).unwrap_or(usize::MAX),
+    );
+    while expected.record_count > enrollment.chain_ordinal {
+        let record_id = expected.head_record_id.as_deref().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "stream binding receipt ancestry has a non-genesis count without a head",
+            )
+        })?;
+        let record = lookup_lifecycle_ledger_record_by_id(
+            token_dataset,
+            token_authority,
+            BINDING_RECEIPT_TAG,
+            record_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "stream binding receipt ancestry selects missing record '{record_id}'"
+            ))
+        })?;
+        let LifecycleLedgerRecord::BindingReceipt(binding) = record else {
+            return Err(OmniError::manifest_internal(
+                "stream binding receipt ancestry decoded as another ledger family",
+            ));
+        };
+        if binding.graph_identity_digest != enrollment.graph_identity_digest
+            || binding.identity != enrollment.identity
+            || binding.stream_incarnation_id != enrollment.stream_incarnation_id
+            || binding.next_chain_ref()? != expected
+        {
+            return Err(OmniError::manifest_internal(
+                "stream binding receipt ancestry contains a foreign, reordered, or discontinuous record",
+            ));
+        }
+        let prior_count = binding.chain_ordinal.checked_sub(1).ok_or_else(|| {
+            OmniError::manifest_internal("stream binding receipt ancestry ordinal underflow")
+        })?;
+        newest_to_oldest.push(binding.clone());
+        expected = ReceiptChainRef {
+            head_record_id: binding.predecessor_record_id,
+            record_count: prior_count,
+            chain_digest: binding.prior_chain_digest,
+        };
+    }
+    validate_selected_binding_chain_records(enrollment, lifecycle, &newest_to_oldest)
+}
+
+/// Validate a fully bounded newest-to-oldest binding path. The selected head
+/// remains the only current authority; historical bindings prove ancestry and
+/// the immutable logical stream incarnation, never current paths or epochs.
+fn validate_selected_binding_chain_records(
+    enrollment: &EnrollmentReceiptV2,
+    lifecycle: &StreamLifecycleEntry,
+    newest_to_oldest: &[BindingReceipt],
+) -> Result<()> {
+    enrollment.validate()?;
+    lifecycle.validate()?;
+    if enrollment.chain_ordinal != 1 || enrollment.predecessor_record_id.is_some() {
+        return Err(OmniError::manifest_internal(
+            "stream binding receipt ancestry is not rooted at its enrollment receipt",
+        ));
+    }
+    let expected_len = lifecycle
+        .binding_receipt_chain
+        .record_count
+        .checked_sub(enrollment.chain_ordinal)
+        .ok_or_else(|| {
+            OmniError::manifest_internal(
+                "stream binding receipt chain predates its enrollment receipt",
+            )
+        })?;
+    if expected_len == 0
+        || expected_len > MAX_SELECTED_BINDING_CHAIN_RECORDS.saturating_sub(1)
+        || usize::try_from(expected_len).ok() != Some(newest_to_oldest.len())
     {
         return Err(OmniError::manifest_internal(
-            "stream enrollment receipt is not followed by its initial binding receipt",
+            "stream binding receipt ancestry is incomplete or exceeds its fixed traversal bound",
+        ));
+    }
+
+    let mut expected = lifecycle.binding_receipt_chain.clone();
+    for binding in newest_to_oldest {
+        binding.validate()?;
+        if binding.graph_identity_digest != enrollment.graph_identity_digest
+            || binding.identity != enrollment.identity
+            || binding.stream_incarnation_id != enrollment.stream_incarnation_id
+            || binding.next_chain_ref()? != expected
+        {
+            return Err(OmniError::manifest_internal(
+                "stream binding receipt ancestry contains a foreign, reordered, or discontinuous record",
+            ));
+        }
+        expected = ReceiptChainRef {
+            head_record_id: binding.predecessor_record_id.clone(),
+            record_count: binding.chain_ordinal.checked_sub(1).ok_or_else(|| {
+                OmniError::manifest_internal("stream binding receipt ancestry ordinal underflow")
+            })?,
+            chain_digest: binding.prior_chain_digest.clone(),
+        };
+    }
+
+    let enrollment_chain = enrollment.next_chain_ref()?;
+    let initial_binding = newest_to_oldest.last().ok_or_else(|| {
+        OmniError::manifest_internal("stream enrollment has no initial binding receipt")
+    })?;
+    let selected_binding = newest_to_oldest.first().ok_or_else(|| {
+        OmniError::manifest_internal("stream enrollment has no selected binding receipt")
+    })?;
+    if expected != enrollment_chain
+        || initial_binding.binding_scope_id != enrollment.binding_scope_id
+        || initial_binding.physical_binding != enrollment.physical_binding
+        || initial_binding.operation_id != enrollment.enrollment_request_id
+        || selected_binding.binding_scope_id != lifecycle.binding_scope_id
+        || selected_binding.enrollment_id != lifecycle.binding.enrollment_id
+        || selected_binding.physical_binding != lifecycle.binding
+        || selected_binding.shard_ids != lifecycle.binding.shard_ids
+        || lifecycle.current_binding_receipt_id != selected_binding.record_id
+        || lifecycle.binding_receipt_chain != selected_binding.next_chain_ref()?
+    {
+        return Err(OmniError::manifest_internal(
+            "stream selected binding chain does not terminate at its immutable initial enrollment",
         ));
     }
     Ok(())
@@ -1003,5 +1121,152 @@ fn mint_distinct_stream_uuid(excluded: &[ShardId]) -> ShardId {
         if !excluded.contains(&candidate) {
             return candidate;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use lance::dataset::refs::BranchIdentifier;
+
+    use super::*;
+    use crate::db::manifest::stream::{
+        AuthenticatedWalTail, claim_receipt_chain_genesis, management_receipt_chain_genesis,
+    };
+
+    fn digest(byte: char) -> String {
+        format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
+    fn binding_chain_fixture() -> (
+        EnrollmentReceiptV2,
+        BindingReceipt,
+        BindingReceipt,
+        StreamLifecycleEntry,
+    ) {
+        let identity = TableIdentity::new(7, 9).unwrap();
+        let stream_incarnation_id = "11111111-1111-4111-8111-111111111111";
+        let enrollment_request_id = "22222222-2222-4222-8222-222222222222";
+        let initial_scope = "33333333-3333-4333-8333-333333333333";
+        let initial_shard = "44444444-4444-4444-8444-444444444444";
+        let initial_binding = StreamPhysicalBinding {
+            stable_table_id: identity.stable_table_id,
+            table_incarnation_id: identity.table_incarnation_id,
+            table_location: "nodes/0000000000000007-0000000000000009".to_string(),
+            table_branch: None,
+            enrollment_id: "55555555-5555-4555-8555-555555555555".to_string(),
+            shard_ids: vec![initial_shard.to_string()],
+            stream_config_version: STREAM_CONFIG_VERSION,
+            stream_config_hash: digest('a'),
+        };
+        let graph_identity_digest = digest('b');
+        let enrollment = EnrollmentReceiptV2::new(
+            graph_identity_digest.clone(),
+            identity,
+            &binding_receipt_chain_genesis(),
+            enrollment_request_id,
+            digest('c'),
+            "act-operator",
+            stream_incarnation_id,
+            initial_scope,
+            initial_binding.clone(),
+            1,
+        )
+        .unwrap();
+        let initial_receipt = BindingReceipt::new(
+            graph_identity_digest.clone(),
+            identity,
+            &enrollment.next_chain_ref().unwrap(),
+            initial_scope,
+            stream_incarnation_id,
+            initial_binding.clone(),
+            enrollment_request_id,
+            2,
+        )
+        .unwrap();
+
+        let rebound_scope = "66666666-6666-4666-8666-666666666666";
+        let rebound_shard = "77777777-7777-4777-8777-777777777777";
+        let rebound_binding = StreamPhysicalBinding {
+            enrollment_id: "88888888-8888-4888-8888-888888888888".to_string(),
+            shard_ids: vec![rebound_shard.to_string()],
+            ..initial_binding.clone()
+        };
+        let rebound_receipt = BindingReceipt::new(
+            graph_identity_digest,
+            identity,
+            &initial_receipt.next_chain_ref().unwrap(),
+            rebound_scope,
+            stream_incarnation_id,
+            rebound_binding.clone(),
+            "99999999-9999-4999-8999-999999999999",
+            3,
+        )
+        .unwrap();
+        let legacy_enrollment = EnrollmentReceipt::new(
+            enrollment_request_id.to_string(),
+            digest('c'),
+            stream_incarnation_id.to_string(),
+            initial_binding,
+        )
+        .unwrap();
+        let lifecycle = StreamLifecycleEntry {
+            identity,
+            diagnostic_table_key: "node:Person".to_string(),
+            lifecycle: StreamLifecycle::Open,
+            binding: rebound_binding,
+            binding_scope_id: rebound_scope.to_string(),
+            current_head_witness: CurrentHeadWitness {
+                branch_identifier: BranchIdentifier::main(),
+                table_version: 4,
+                transaction_uuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+                manifest_e_tag: None,
+            },
+            epoch_floor_by_shard: BTreeMap::from([(rebound_shard.to_string(), 1)]),
+            lifecycle_revision: 2,
+            enrollment_receipt: legacy_enrollment,
+            current_binding_receipt_id: rebound_receipt.record_id.clone(),
+            binding_receipt_chain: rebound_receipt.next_chain_ref().unwrap(),
+            management_receipt_chain: management_receipt_chain_genesis(),
+            claim_receipt_chain: claim_receipt_chain_genesis(),
+            current_claim_receipt_id: None,
+            authenticated_wal_tail: AuthenticatedWalTail::genesis(rebound_scope).unwrap(),
+            drain: None,
+            strict_block: None,
+            sealed_proof: None,
+            last_fold_summary: None,
+        };
+        lifecycle.validate().unwrap();
+        (enrollment, initial_receipt, rebound_receipt, lifecycle)
+    }
+
+    #[test]
+    fn selected_binding_chain_accepts_rebind_ancestry_and_rejects_gaps_or_reordering() {
+        let (enrollment, initial, rebound, lifecycle) = binding_chain_fixture();
+        validate_selected_binding_chain_records(
+            &enrollment,
+            &lifecycle,
+            &[rebound.clone(), initial.clone()],
+        )
+        .unwrap();
+
+        assert!(
+            validate_selected_binding_chain_records(
+                &enrollment,
+                &lifecycle,
+                std::slice::from_ref(&rebound),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_selected_binding_chain_records(&enrollment, &lifecycle, &[initial, rebound],)
+                .is_err()
+        );
+
+        let mut over_bound = lifecycle;
+        over_bound.binding_receipt_chain.record_count =
+            MAX_SELECTED_BINDING_CHAIN_RECORDS.saturating_add(1);
+        assert!(validate_selected_binding_chain_records(&enrollment, &over_bound, &[]).is_err());
     }
 }

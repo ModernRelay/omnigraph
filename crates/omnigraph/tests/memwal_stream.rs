@@ -1159,6 +1159,23 @@ async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure
         "an exact blocked retry is lifecycle-inert"
     );
 
+    let abort_error = db
+        .failpoint_stream_resume_for_test(
+            TABLE,
+            "8a8a8a8a-8a8a-4a8a-8a8a-8a8a8a8a8a8a",
+            blocked.lifecycle_revision,
+            true,
+            "operator:blocked-abort",
+        )
+        .await
+        .expect_err("abort-drain must not reopen around a selected strict block");
+    assert!(
+        abort_error.to_string().contains("strict-blocked"),
+        "{abort_error:?}"
+    );
+    assert_eq!(stream_lane(&db).await, blocked);
+    assert_no_recovery_sidecars(&dir);
+
     drop(db);
     let reopened = reopen_enrolled(&dir).await;
     let reopen_error = reopened
@@ -1551,6 +1568,464 @@ async fn empty_quiesce_is_idempotent_and_refuses_rebound_or_stale_requests() {
     .expect("prepare must resolve a SEALED lane before applying enrollment topology checks");
     assert_eq!(prepared, "already_enrolled");
     assert_eq!(prepared_incarnation.as_deref(), Some(incarnation.as_str()));
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn sealed_resume_advances_epoch_replays_its_receipt_and_installs_the_writer() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let initial = stream_lane(&db).await;
+    let quiesce_id = "1a1a1a1a-1a1a-4a1a-8a1a-1a1a1a1a1a1a";
+    db.failpoint_stream_quiesce_for_test(
+        TABLE,
+        quiesce_id,
+        initial.lifecycle_revision,
+        "operator:resume-fixture",
+    )
+    .await
+    .expect("empty fixture lane must quiesce");
+    let sealed = stream_lane(&db).await;
+    assert_eq!(sealed.lifecycle, "SEALED");
+    let resume_id = "2a2a2a2a-2a2a-4a2a-8a2a-2a2a2a2a2a2a";
+    let actor = "operator:resume";
+
+    db.failpoint_stream_resume_for_test(
+        TABLE,
+        resume_id,
+        sealed.lifecycle_revision,
+        false,
+        actor,
+    )
+    .await
+    .expect("SEALED lane must resume through one recovery-owned claim");
+    let open = stream_lane(&db).await;
+    assert_eq!(open.lifecycle, "OPEN");
+    assert_eq!(open.lifecycle_revision, sealed.lifecycle_revision + 1);
+    assert!(
+        epoch_floor(&open) > epoch_floor(&sealed),
+        "resume must fence the sealed writer epoch before opening admission"
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    db.failpoint_stream_quiesce_for_test(
+        TABLE,
+        quiesce_id,
+        initial.lifecycle_revision,
+        "operator:resume-fixture",
+    )
+    .await
+    .expect("the earlier quiesce receipt remains idempotent after a later resume");
+
+    db.failpoint_stream_resume_for_test(
+        TABLE,
+        resume_id,
+        sealed.lifecycle_revision,
+        false,
+        actor,
+    )
+    .await
+    .expect("an exact lost-result retry must replay the selected receipt");
+    let rebound = db
+        .failpoint_stream_resume_for_test(
+            TABLE,
+            resume_id,
+            sealed.lifecycle_revision,
+            false,
+            "operator:different",
+        )
+        .await
+        .expect_err("one resume occurrence cannot be rebound to another actor");
+    assert!(
+        matches!(
+            rebound,
+            OmniError::StreamLifecycleIdempotencyConflict { .. }
+        ),
+        "{rebound:?}"
+    );
+    let stale = db
+        .failpoint_stream_resume_for_test(
+            TABLE,
+            "3a3a3a3a-3a3a-4a3a-8a3a-3a3a3a3a3a3a",
+            sealed.lifecycle_revision,
+            false,
+            actor,
+        )
+        .await
+        .expect_err("a new occurrence cannot reuse the stale sealed revision");
+    assert!(matches!(stale, OmniError::StreamLifecycleChanged { .. }));
+
+    let row = physical_batch(&db, &[("after-resume".to_string(), 41)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+        .await
+        .expect("the resume-owned resident writer must accept the next row");
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the resumed generation must fold normally");
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("after-resume".to_string(), 41)]
+    );
+    let after_fold = stream_lane(&db).await;
+    db.failpoint_stream_resume_for_test(
+        TABLE,
+        resume_id,
+        sealed.lifecycle_revision,
+        false,
+        actor,
+    )
+    .await
+    .expect("the selected resume receipt remains idempotent after a later fold");
+    assert_eq!(stream_lane(&db).await, after_fold);
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn concurrent_exact_resume_retry_does_not_retire_the_winners_writer() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let initial = stream_lane(&db).await;
+    db.failpoint_stream_quiesce_for_test(
+        TABLE,
+        "2b2b2b2b-2b2b-4b2b-8b2b-2b2b2b2b2b2b",
+        initial.lifecycle_revision,
+        "operator:resume-race-fixture",
+    )
+    .await
+    .expect("race fixture lane must quiesce");
+    let sealed = stream_lane(&db).await;
+    let sealed_revision = sealed.lifecycle_revision;
+    let resume_id = "2c2c2c2c-2c2c-4c2c-8c2c-2c2c2c2c2c2c";
+    let actor = "operator:resume-race";
+    let first_sidecar = helpers::failpoint::Rendezvous::park_first(
+        names::RECOVERY_SIDECAR_WRITE,
+    );
+
+    let first_db = Arc::clone(&db);
+    let first = tokio::spawn(async move {
+        first_db
+            .failpoint_stream_resume_for_test(
+                TABLE,
+                resume_id,
+                sealed_revision,
+                false,
+                actor,
+            )
+            .await
+    });
+    first_sidecar.wait_until_reached().await;
+
+    let second_db = Arc::clone(&db);
+    let mut second = tokio::spawn(async move {
+        second_db
+            .failpoint_stream_resume_for_test(
+                TABLE,
+                resume_id,
+                sealed_revision,
+                false,
+                actor,
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut second)
+            .await
+            .is_err(),
+        "the exact retry must wait outside the winner's exclusive resume"
+    );
+
+    first_sidecar.release();
+    first
+        .await
+        .expect("winning resume task must join")
+        .expect("winning resume must publish OPEN");
+    second
+        .await
+        .expect("exact retry task must join")
+        .expect("exact retry must replay the selected result");
+    let open = stream_lane(&db).await;
+
+    let row = physical_batch(&db, &[("resume-race-warm".to_string(), 42)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+        .await
+        .expect("the winner's resident writer must remain installed");
+    assert_eq!(
+        epoch_floor(&stream_lane(&db).await),
+        epoch_floor(&open),
+        "the waiting exact retry must not retire the winner and force another cold claim"
+    );
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the winner's generation must remain foldable");
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("resume-race-warm".to_string(), 42)]
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn resume_rolls_forward_a_confirmed_ledger_before_open_publication() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let initial = stream_lane(&db).await;
+    db.failpoint_stream_quiesce_for_test(
+        TABLE,
+        "9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a",
+        initial.lifecycle_revision,
+        "operator:resume-recovery-fixture",
+    )
+    .await
+    .expect("fixture lane must quiesce");
+    let sealed = stream_lane(&db).await;
+    let resume_id = "abababab-abab-4bab-8bab-abababababab";
+    let actor = "operator:resume-recovery";
+
+    let error = {
+        let _before_publish =
+            ScopedFailPoint::new(names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH, "return");
+        db.failpoint_stream_resume_for_test(
+            TABLE,
+            resume_id,
+            sealed.lifecycle_revision,
+            false,
+            actor,
+        )
+        .await
+        .expect_err("confirmed resume ledger must stop before the lifecycle CAS")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH),
+        "{error:?}"
+    );
+    assert_eq!(stream_lane(&db).await, sealed);
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+        1,
+        "the exact resume owner must remain durable"
+    );
+
+    db.failpoint_stream_resume_for_test(
+        TABLE,
+        resume_id,
+        sealed.lifecycle_revision,
+        false,
+        actor,
+    )
+    .await
+    .expect("the exact retry must publish the confirmed receipt and OPEN row");
+    let open = stream_lane(&db).await;
+    assert_eq!(open.lifecycle, "OPEN");
+    assert!(epoch_floor(&open) > epoch_floor(&sealed));
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn resume_retries_a_lost_terminal_sidecar_delete() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let initial = stream_lane(&db).await;
+    db.failpoint_stream_quiesce_for_test(
+        TABLE,
+        "acacacac-acac-4cac-8cac-acacacacacac",
+        initial.lifecycle_revision,
+        "operator:resume-delete-fixture",
+    )
+    .await
+    .expect("fixture lane must quiesce");
+    let sealed = stream_lane(&db).await;
+    let resume_id = "adadadad-adad-4dad-8dad-adadadadadad";
+    let actor = "operator:resume-delete";
+
+    {
+        let _delete = ScopedFailPoint::new(names::RECOVERY_SIDECAR_DELETE, "return");
+        db.failpoint_stream_resume_for_test(
+            TABLE,
+            resume_id,
+            sealed.lifecycle_revision,
+            false,
+            actor,
+        )
+        .await
+        .expect("cleanup failure after OPEN publication must not turn success into ambiguity");
+        assert_eq!(stream_lane(&db).await.lifecycle, "OPEN");
+        assert_eq!(
+            helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+            1
+        );
+    }
+
+    db.failpoint_stream_resume_for_test(
+        TABLE,
+        resume_id,
+        sealed.lifecycle_revision,
+        false,
+        actor,
+    )
+    .await
+    .expect("receipt-first retry must finish stale sidecar cleanup");
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn named_branch_keeps_a_sealed_lane_closed_without_claiming_an_epoch() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let initial = stream_lane(&db).await;
+    db.failpoint_stream_quiesce_for_test(
+        TABLE,
+        "4a4a4a4a-4a4a-4a4a-8a4a-4a4a4a4a4a4a",
+        initial.lifecycle_revision,
+        "operator:branch-fixture",
+    )
+    .await
+    .expect("fixture lane must quiesce");
+    let sealed = stream_lane(&db).await;
+    db.branch_create("sealed-resume-blocker")
+        .await
+        .expect("SEALED authority permits the native branch control");
+
+    let error = db
+        .failpoint_stream_resume_for_test(
+            TABLE,
+            "5a5a5a5a-5a5a-4a5a-8a5a-5a5a5a5a5a5a",
+            sealed.lifecycle_revision,
+            false,
+            "operator:branch-resume",
+        )
+        .await
+        .expect_err("bounded resume must refuse a named graph branch");
+    assert!(error.to_string().contains("main-only"), "{error:?}");
+    assert_eq!(stream_lane(&db).await, sealed);
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn guarded_abort_reopens_only_an_empty_unblocked_drain() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let initial = stream_lane(&db).await;
+    let drain_id = "6a6a6a6a-6a6a-4a6a-8a6a-6a6a6a6a6a6a";
+    let quiesce_error = {
+        let _before_claim = ScopedFailPoint::new(names::RECOVERY_SIDECAR_WRITE, "return");
+        db.failpoint_stream_quiesce_for_test(
+            TABLE,
+            drain_id,
+            initial.lifecycle_revision,
+            "operator:abort-fixture",
+        )
+        .await
+        .expect_err("fixture must stop after publishing DRAINING and before its claim")
+    };
+    assert!(
+        quiesce_error
+            .to_string()
+            .contains(names::RECOVERY_SIDECAR_WRITE),
+        "{quiesce_error:?}"
+    );
+    let draining = stream_lane(&db).await;
+    assert_eq!(draining.lifecycle, "DRAINING");
+    assert_eq!(draining.drain_id.as_deref(), Some(drain_id));
+    assert_no_recovery_sidecars(&dir);
+
+    let resume_id = "7a7a7a7a-7a7a-4a7a-8a7a-7a7a7a7a7a7a";
+    let actor = "operator:abort";
+    db.failpoint_stream_resume_for_test(
+        TABLE,
+        resume_id,
+        draining.lifecycle_revision,
+        true,
+        actor,
+    )
+    .await
+    .expect("an empty unguarded drain may abort through a higher epoch");
+    let open = stream_lane(&db).await;
+    assert_eq!(open.lifecycle, "OPEN");
+    assert_eq!(open.lifecycle_revision, draining.lifecycle_revision + 1);
+    assert!(epoch_floor(&open) > epoch_floor(&draining));
+    db.failpoint_stream_resume_for_test(
+        TABLE,
+        resume_id,
+        draining.lifecycle_revision,
+        true,
+        actor,
+    )
+    .await
+    .expect("an exact abort retry must replay its receipt");
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn abort_refuses_an_unmerged_cut_before_claim_and_quiesce_can_continue() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let row = physical_batch(&db, &[("abort-must-not-strand".to_string(), 43)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+        .await
+        .expect("fixture row must be durable in the active WAL generation");
+    let before = stream_lane(&db).await;
+    drop(db);
+
+    // Reopen without a resident writer so the acknowledged row exists only
+    // in retained, unflushed WAL. Cursor/generation scalars alone call this
+    // state AdmitOrReplay; abort must still prove the WAL suffix is empty.
+    let db = reopen_enrolled(&dir).await;
+
+    let drain_id = "bababaab-baba-4aba-8aba-bab5bab5bab5";
+    {
+        let _before_claim = ScopedFailPoint::new(names::RECOVERY_SIDECAR_WRITE, "return");
+        db.failpoint_stream_quiesce_for_test(
+            TABLE,
+            drain_id,
+            before.lifecycle_revision,
+            "operator:abort-nonempty-fixture",
+        )
+        .await
+        .expect_err("fixture must stop after DRAINING but before its physical claim");
+    }
+    let draining = stream_lane(&db).await;
+    assert_eq!(draining.lifecycle, "DRAINING");
+    assert_no_recovery_sidecars(&dir);
+
+    let error = db
+        .failpoint_stream_resume_for_test(
+            TABLE,
+            "cacacaca-caca-4aca-8aca-cac5cac5cac5",
+            draining.lifecycle_revision,
+            true,
+            "operator:abort-nonempty",
+        )
+        .await
+        .expect_err("abort must reject an unmerged cut before claiming another epoch");
+    assert!(
+        error.to_string().contains("empty physical cut"),
+        "{error:?}"
+    );
+    assert_eq!(stream_lane(&db).await, draining);
+    assert_no_recovery_sidecars(&dir);
+
+    db.failpoint_stream_quiesce_for_test(
+        TABLE,
+        drain_id,
+        before.lifecycle_revision,
+        "operator:abort-nonempty-fixture",
+    )
+    .await
+    .expect("the original drain must remain able to fold and seal its cut");
+    assert_eq!(stream_lane(&db).await.lifecycle, "SEALED");
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("abort-must-not-strand".to_string(), 43)]
+    );
     assert_no_recovery_sidecars(&dir);
 }
 

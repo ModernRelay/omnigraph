@@ -25,9 +25,11 @@ use crate::db::manifest::stream::{
     ClaimAttemptEffectPreimage, ClaimProfile, ClaimReceipt, ClaimReceiptPreimage,
     ClaimTerminalClassification, DisableDrainAdoption, DrainDescriptor, DrainGoal, LastFoldOutcome,
     LastFoldSummary, ManagementReceipt, QUIESCE_REQUEST_PROTOCOL_VERSION, QuiesceRequestPayload,
-    STREAM_DATA_BLOCK_VALIDATION_CONTRACT_VERSION, SealedProof, StreamGenerationCut,
-    StreamLifecycle, StreamLifecycleEntry, StrictBlock, authenticated_wal_tail_chain_digest,
-    stream_physical_binding_digest, stream_quiesce_result_payload,
+    STREAM_DATA_BLOCK_VALIDATION_CONTRACT_VERSION, STREAM_RESUME_OPERATION_KIND,
+    STREAM_RESUME_REQUEST_PROTOCOL_VERSION, SealedProof, StreamGenerationCut, StreamLifecycle,
+    StreamLifecycleEntry, StreamResumeMode, StreamResumeRequestPayload, StrictBlock,
+    authenticated_wal_tail_chain_digest,
+    stream_physical_binding_digest, stream_quiesce_result_payload, stream_resume_result_payload,
 };
 use crate::db::manifest::stream_profile::ReceiptChainRef;
 use crate::db::manifest::stream_token::{
@@ -96,6 +98,29 @@ pub(crate) struct StartedDrain {
     pub(crate) lifecycle: StreamLifecycleEntry,
     pub(crate) request_payload: serde_json::Value,
     pub(crate) request_digest: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StreamResumeRequest {
+    pub(crate) graph_identity_digest: String,
+    pub(crate) resume_id: String,
+    pub(crate) expected_lifecycle_revision: u64,
+    pub(crate) mode: StreamResumeMode,
+    pub(crate) actor_id: String,
+    pub(crate) initiated_at: i64,
+    /// Exact graph-branch topology captured under the branch gate. The
+    /// bounded profile currently accepts only the empty set.
+    pub(crate) public_named_branches: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedStreamResumeOpen {
+    pub(crate) mode: StreamResumeMode,
+    pub(crate) request_payload: serde_json::Value,
+    pub(crate) request_digest: String,
+    pub(crate) next_lifecycle_revision: u64,
+    pub(crate) minimum_next_epoch_floor: u64,
+    pub(crate) recorded_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -960,6 +985,177 @@ pub(crate) fn build_open_to_draining(
     })
 }
 
+/// Fix the caller-owned compare token and the minimum same-scope epoch which
+/// an `OPEN`-producing resume must achieve before recovery may publish it.
+pub(crate) fn prepare_stream_resume_open(
+    prior: &StreamLifecycleEntry,
+    request: StreamResumeRequest,
+) -> Result<PreparedStreamResumeOpen> {
+    validate_resume_mode_eligibility(prior, request.mode)?;
+    validate_digest(
+        "resume graph_identity_digest",
+        &request.graph_identity_digest,
+    )?;
+    validate_uuid_v4("resume_id", &request.resume_id)?;
+    validate_canonical_text("resume actor_id", &request.actor_id)?;
+    if request.expected_lifecycle_revision != prior.lifecycle_revision {
+        return Err(OmniError::manifest_internal(
+            "stream resume request must bind the exact current lifecycle revision",
+        ));
+    }
+    if request.initiated_at <= 0 {
+        return Err(OmniError::manifest_internal(
+            "stream resume initiated_at must be positive",
+        ));
+    }
+    if !request.public_named_branches.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "stream resume requires the exact empty public named-branch topology",
+        ));
+    }
+    let shard_id = prior.binding.shard_ids.as_slice().first().ok_or_else(|| {
+        OmniError::manifest_internal("stream resume requires one exact bound shard")
+    })?;
+    if prior.binding.shard_ids.len() != 1 {
+        return Err(OmniError::manifest_internal(
+            "stream resume requires the exact unsharded binding",
+        ));
+    }
+    let minimum_next_epoch_floor = prior
+        .epoch_floor_by_shard
+        .get(shard_id)
+        .copied()
+        .ok_or_else(|| {
+            OmniError::manifest_internal("stream resume has no authoritative shard epoch floor")
+        })?
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("stream resume epoch floor overflow"))?;
+    let next_lifecycle_revision = next_revision(prior.lifecycle_revision)?;
+    let payload = StreamResumeRequestPayload {
+        protocol_version: STREAM_RESUME_REQUEST_PROTOCOL_VERSION,
+        graph_identity_digest: request.graph_identity_digest,
+        identity: prior.identity,
+        stream_incarnation_id: prior.enrollment_receipt.stream_incarnation_id.clone(),
+        binding_scope_id: prior.binding_scope_id.clone(),
+        enrollment_id: prior.binding.enrollment_id.clone(),
+        resume_id: request.resume_id,
+        expected_lifecycle_revision: request.expected_lifecycle_revision,
+        mode: request.mode,
+        actor_id: request.actor_id,
+        public_named_branches: request.public_named_branches,
+    };
+    payload.validate_for_lifecycle(prior, request.mode)?;
+    let request_digest = payload.request_digest()?;
+    Ok(PreparedStreamResumeOpen {
+        mode: request.mode,
+        request_payload: payload.to_value()?,
+        request_digest,
+        next_lifecycle_revision,
+        minimum_next_epoch_floor,
+        recorded_at: request.initiated_at,
+    })
+}
+
+fn validate_resume_mode_eligibility(
+    prior: &StreamLifecycleEntry,
+    mode: StreamResumeMode,
+) -> Result<()> {
+    prior.validate()?;
+    match mode {
+        StreamResumeMode::ResumeSealed if prior.lifecycle == StreamLifecycle::Sealed => Ok(()),
+        StreamResumeMode::ResumeSealed => Err(OmniError::manifest_internal(
+            "plain stream resume requires exact SEALED lifecycle authority",
+        )),
+        StreamResumeMode::AbortDrain if prior.lifecycle == StreamLifecycle::Draining => {
+            let drain = prior.drain.as_ref().ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "stream abort-drain requires the exact active drain descriptor",
+                )
+            })?;
+            if drain.guarded_operation.is_some() {
+                return Err(OmniError::manifest_internal(
+                    "stream abort-drain cannot reopen after a guarded operation began",
+                ));
+            }
+            if prior.strict_block.is_some()
+                || prior
+                    .last_fold_summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.outcome == LastFoldOutcome::StrictBlocked)
+            {
+                return Err(OmniError::manifest_internal(
+                    "stream abort-drain cannot reopen around a strict-blocked cut",
+                ));
+            }
+            validate_abort_drain_has_no_selected_unmerged_rows(prior)
+        }
+        StreamResumeMode::AbortDrain => Err(OmniError::manifest_internal(
+            "stream abort-drain requires exact DRAINING lifecycle authority",
+        )),
+    }
+}
+
+/// Prove that an immutable management receipt selected by the current token
+/// witness is consistent with the lane's monotonic revision/chain authority.
+/// Later folds may advance only the lifecycle revision, and later management
+/// operations may extend the chain, so delayed exact retries must not require
+/// the receipt to remain the current head.
+pub(super) fn validate_selected_management_receipt_progress(
+    current: &StreamLifecycleEntry,
+    receipt: &ManagementReceipt,
+    terminal_lifecycle: StreamLifecycle,
+) -> Result<()> {
+    let receipt_chain = receipt.next_chain_ref()?;
+    if current.lifecycle_revision < receipt.to_revision
+        || current.management_receipt_chain.record_count < receipt.chain_ordinal
+        || (current.management_receipt_chain.record_count == receipt.chain_ordinal
+            && current.management_receipt_chain != receipt_chain)
+        || (current.lifecycle_revision == receipt.to_revision
+            && (current.lifecycle != terminal_lifecycle
+                || current.management_receipt_chain != receipt_chain))
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "selected {} management receipt '{}' is not consistent with the current stream lifecycle chain",
+            receipt.operation_kind, receipt.operation_id
+        )));
+    }
+    Ok(())
+}
+
+/// Lifecycle authority can prove a freshly armed drain empty from the genesis
+/// tail. Once a claim has been selected, its complete current-generation LWW
+/// projection must instead be the exact authority-scoped empty projection.
+/// Physical replay/generation checks remain the orchestration owner's job
+/// under exclusive admission; this guard prevents the pure planner from
+/// deliberately reopening a row which already commits to unmerged winners.
+fn validate_abort_drain_has_no_selected_unmerged_rows(prior: &StreamLifecycleEntry) -> Result<()> {
+    if prior.authenticated_wal_tail.segment_count == 0 {
+        return Ok(());
+    }
+    let [shard_id] = prior.binding.shard_ids.as_slice() else {
+        return Err(OmniError::manifest_internal(
+            "stream abort-drain requires the exact unsharded binding",
+        ));
+    };
+    let physical_binding_digest = stream_physical_binding_digest(&prior.binding)?;
+    let empty_projection_digest = lww_projection_digest_for_authority(
+        prior.identity,
+        &prior.binding_scope_id,
+        &prior.binding.enrollment_id,
+        shard_id,
+        &prior.enrollment_receipt.stream_incarnation_id,
+        &prior.binding.stream_config_hash,
+        &physical_binding_digest,
+        &BTreeMap::new(),
+    )?;
+    if prior.authenticated_wal_tail.lww_projection_digest != empty_projection_digest {
+        return Err(OmniError::manifest_internal(
+            "stream abort-drain cannot reopen around an authenticated unmerged WAL projection",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn prepare_claim_operation(
     lifecycle: &StreamLifecycleEntry,
     request: ClaimOperationRequest,
@@ -995,6 +1191,60 @@ pub(crate) fn prepare_claim_operation(
         }
         (StreamLifecycle::Sealed, _, _) => unreachable!("SEALED rejected above"),
     }
+    prepare_claim_operation_for_eligible_lifecycle(lifecycle, request)
+}
+
+/// Prepare the physical claim owned by a recovery-v15 resume/abort operation.
+/// This is intentionally separate from `prepare_claim_operation`: ordinary
+/// cold claims continue to reject SEALED authority and cannot opt into this
+/// path with a caller-chosen lifecycle operation ID.
+pub(crate) fn prepare_resume_claim_operation(
+    prior: &StreamLifecycleEntry,
+    request: ClaimOperationRequest,
+    mode: StreamResumeMode,
+    minimum_next_epoch_floor: u64,
+) -> Result<PreparedClaimOperation> {
+    validate_resume_mode_eligibility(prior, mode)?;
+    if request.claim_kind != STREAM_RESUME_OPERATION_KIND {
+        return Err(OmniError::manifest_internal(
+            "a stream resume claim must use the canonical RESUME claim kind",
+        ));
+    }
+    let resume_id = request.lifecycle_operation_id.as_deref().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "a stream resume claim must bind the exact resume occurrence ID",
+        )
+    })?;
+    validate_uuid_v4("resume claim lifecycle_operation_id", resume_id)?;
+    let [shard_id] = prior.binding.shard_ids.as_slice() else {
+        return Err(OmniError::manifest_internal(
+            "stream resume claim requires the exact unsharded binding",
+        ));
+    };
+    let authoritative_epoch = prior
+        .epoch_floor_by_shard
+        .get(shard_id)
+        .copied()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(
+                "stream resume claim has no authoritative shard epoch floor",
+            )
+        })?;
+    let expected_minimum = authoritative_epoch
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("stream resume epoch floor overflow"))?;
+    if minimum_next_epoch_floor != expected_minimum {
+        return Err(OmniError::manifest_internal(
+            "stream resume minimum next epoch differs from the exact lifecycle successor",
+        ));
+    }
+    prepare_claim_operation_for_eligible_lifecycle(prior, request)
+}
+
+fn prepare_claim_operation_for_eligible_lifecycle(
+    lifecycle: &StreamLifecycleEntry,
+    request: ClaimOperationRequest,
+) -> Result<PreparedClaimOperation> {
     validate_digest(
         "claim graph_identity_digest",
         &request.graph_identity_digest,
@@ -2506,6 +2756,155 @@ pub(crate) fn build_claim_adoption_row(
     Ok(next)
 }
 
+/// Apply the exact claim and management receipts of one recovery-v15 resume
+/// to its prior closed lifecycle row. The caller still owns the sole manifest
+/// CAS; this pure builder only derives the one `OPEN` value that CAS may name.
+pub(crate) fn build_resume_adoption_row(
+    prior: &StreamLifecycleEntry,
+    built: &BuiltTerminalClaim,
+    management_receipt: &ManagementReceipt,
+    mode: StreamResumeMode,
+) -> Result<StreamLifecycleEntry> {
+    validate_resume_mode_eligibility(prior, mode)?;
+    built.receipt.validate()?;
+    let next_lifecycle_revision = next_revision(prior.lifecycle_revision)?;
+    management_receipt.validate(next_lifecycle_revision)?;
+
+    let request: StreamResumeRequestPayload =
+        serde_json::from_value(management_receipt.request_payload.clone()).map_err(|error| {
+            OmniError::manifest_internal(format!(
+                "terminal stream resume receipt has a non-canonical request payload: {error}"
+            ))
+        })?;
+    request.validate_for_lifecycle(prior, mode)?;
+    let expected_request_payload = request.to_value()?;
+    let expected_request_digest = request.request_digest()?;
+    let expected_result_payload = stream_resume_result_payload(next_lifecycle_revision)?;
+    let expected_result_digest = ManagementReceipt::result_digest_for(&expected_result_payload)?;
+    let physical_binding_digest = stream_physical_binding_digest(&prior.binding)?;
+    let [shard_id] = prior.binding.shard_ids.as_slice() else {
+        return Err(OmniError::manifest_internal(
+            "terminal stream resume requires the exact unsharded binding",
+        ));
+    };
+    let expected_empty_projection_digest = lww_projection_digest_for_authority(
+        prior.identity,
+        &prior.binding_scope_id,
+        &prior.binding.enrollment_id,
+        shard_id,
+        &prior.enrollment_receipt.stream_incarnation_id,
+        &prior.binding.stream_config_hash,
+        &physical_binding_digest,
+        &BTreeMap::new(),
+    )?;
+    let expected_segment_count = prior
+        .authenticated_wal_tail
+        .segment_count
+        .checked_add(1)
+        .ok_or_else(|| {
+            OmniError::manifest_internal("terminal stream resume WAL-tail segment-count overflow")
+        })?;
+
+    if built.receipt.graph_identity_digest != request.graph_identity_digest
+        || built.receipt.identity != prior.identity
+        || built.receipt.lifecycle_operation_id.as_deref() != Some(request.resume_id.as_str())
+        || built.receipt.binding_scope_id != prior.binding_scope_id
+        || built.receipt.enrollment_id != prior.binding.enrollment_id
+        || built.receipt.shard_id != *shard_id
+        || built.receipt.stream_incarnation_id != prior.enrollment_receipt.stream_incarnation_id
+        || built.receipt.stream_configuration_digest != prior.binding.stream_config_hash
+        || built.receipt.physical_binding_digest != physical_binding_digest
+        || built.receipt.prior_chain_digest != prior.claim_receipt_chain.chain_digest
+        || built.receipt.predecessor_record_id != prior.claim_receipt_chain.head_record_id
+        || built.next_claim_chain.head_record_id.as_deref()
+            != Some(built.receipt.record_id.as_str())
+        || built.next_claim_chain != built.receipt.next_chain_ref()?
+        || built.next_authenticated_tail.binding_scope_id != prior.binding_scope_id
+        || built.receipt.authenticated_tail_prior_position != prior.authenticated_wal_tail.position
+        || built.receipt.authenticated_tail_prior_chain_digest
+            != prior.authenticated_wal_tail.chain_digest
+        || built.receipt.authenticated_tail_segment_count != expected_segment_count
+        || built
+            .receipt
+            .authenticated_tail_segment_lww_projection_digest
+            != expected_empty_projection_digest
+        || built.receipt.authenticated_tail_lww_projection_digest
+            != expected_empty_projection_digest
+        || built.next_authenticated_tail.position != built.receipt.authenticated_tail_position
+        || built.next_authenticated_tail.segment_count
+            != built.receipt.authenticated_tail_segment_count
+        || built.next_authenticated_tail.chain_digest
+            != built.receipt.authenticated_tail_chain_digest
+        || built.next_authenticated_tail.lww_projection_digest
+            != built.receipt.authenticated_tail_lww_projection_digest
+    {
+        return Err(OmniError::manifest_internal(
+            "terminal stream resume claim does not extend the exact closed lifecycle authority",
+        ));
+    }
+
+    let prior_epoch = prior
+        .epoch_floor_by_shard
+        .get(&built.receipt.shard_id)
+        .copied()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(
+                "terminal stream resume claim shard is absent from lifecycle authority",
+            )
+        })?;
+    if built.receipt.achieved_writer_epoch <= prior_epoch {
+        return Err(OmniError::manifest_internal(
+            "terminal stream resume claim must advance the selected writer epoch",
+        ));
+    }
+
+    let next_management_chain = management_receipt.next_chain_ref()?;
+    if management_receipt.graph_identity_digest != request.graph_identity_digest
+        || management_receipt.identity != prior.identity
+        || management_receipt.stream_incarnation_id
+            != prior.enrollment_receipt.stream_incarnation_id
+        || management_receipt.binding_scope_id != prior.binding_scope_id
+        || management_receipt.operation_kind != STREAM_RESUME_OPERATION_KIND
+        || management_receipt.operation_id != request.resume_id
+        || management_receipt.request_payload != expected_request_payload
+        || management_receipt.request_digest != expected_request_digest
+        || management_receipt.from_revision != prior.lifecycle_revision
+        || management_receipt.to_revision != next_lifecycle_revision
+        || management_receipt.actor_id != request.actor_id
+        || management_receipt.result_payload != expected_result_payload
+        || management_receipt.result_digest != expected_result_digest
+        || management_receipt.prior_chain_digest != prior.management_receipt_chain.chain_digest
+        || management_receipt.predecessor_record_id != prior.management_receipt_chain.head_record_id
+        || next_management_chain.head_record_id.as_deref()
+            != Some(management_receipt.record_id.as_str())
+    {
+        return Err(OmniError::manifest_internal(
+            "terminal stream resume management receipt does not extend the exact request authority",
+        ));
+    }
+
+    let mut next = prior.clone();
+    next.lifecycle = StreamLifecycle::Open;
+    next.lifecycle_revision = next_lifecycle_revision;
+    next.management_receipt_chain = next_management_chain;
+    next.claim_receipt_chain = built.next_claim_chain.clone();
+    next.current_claim_receipt_id = Some(built.receipt.record_id.clone());
+    next.authenticated_wal_tail = built.next_authenticated_tail.clone();
+    *next
+        .epoch_floor_by_shard
+        .get_mut(&built.receipt.shard_id)
+        .ok_or_else(|| {
+            OmniError::manifest_internal(
+                "terminal stream resume claim shard disappeared from lifecycle authority",
+            )
+        })? = built.receipt.achieved_writer_epoch;
+    next.drain = None;
+    next.strict_block = None;
+    next.sealed_proof = None;
+    next.validate_successor_of(prior)?;
+    Ok(next)
+}
+
 pub(crate) fn stream_verified_empty_digest(
     draining: &StreamLifecycleEntry,
     current_claim_receipt: &ClaimReceipt,
@@ -3145,11 +3544,17 @@ mod tests {
 
     use arrow_array::{ArrayRef, BooleanArray, StringArray, new_null_array};
     use arrow_schema::{DataType, Field};
+    use lance::dataset::refs::BranchIdentifier;
 
+    use crate::db::manifest::stream::{
+        claim_attempt_chain_genesis, claim_receipt_chain_genesis, management_receipt_chain_genesis,
+        test_sealed_lifecycle_from,
+    };
     use crate::db::manifest::stream_token::{
         StreamRowOrigin, StreamTokenInput, TrustedContributorId,
         build_trusted_stream_metadata_array, trusted_stream_metadata_field,
     };
+    use crate::db::manifest::{EnrollmentReceipt, STREAM_CONFIG_VERSION, StreamPhysicalBinding};
     use crate::validate::{Violation, ViolationCorrectionEvidence};
 
     const SCOPE_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -3245,6 +3650,379 @@ mod tests {
             bound_prestate_digest: digest('e'),
             claim_operation_digest: digest('f'),
         }
+    }
+
+    fn open_lifecycle() -> StreamLifecycleEntry {
+        let binding = StreamPhysicalBinding {
+            stable_table_id: 7,
+            table_incarnation_id: 9,
+            table_location: "nodes/0000000000000007-0000000000000009".to_string(),
+            table_branch: None,
+            enrollment_id: ENROLLMENT_ID.to_string(),
+            shard_ids: vec![SHARD_ID.to_string()],
+            stream_config_version: STREAM_CONFIG_VERSION,
+            stream_config_hash: digest('b'),
+        };
+        let binding_receipt_id = digest('1');
+        StreamLifecycleEntry {
+            identity: TableIdentity::new(7, 9).unwrap(),
+            diagnostic_table_key: "node:Person".to_string(),
+            lifecycle: StreamLifecycle::Open,
+            binding: binding.clone(),
+            binding_scope_id: SCOPE_ID.to_string(),
+            current_head_witness: crate::db::manifest::stream::CurrentHeadWitness {
+                branch_identifier: BranchIdentifier::main(),
+                table_version: 4,
+                transaction_uuid: "99999999-9999-4999-8999-999999999999".to_string(),
+                manifest_e_tag: None,
+            },
+            epoch_floor_by_shard: BTreeMap::from([(SHARD_ID.to_string(), 1)]),
+            lifecycle_revision: 1,
+            enrollment_receipt: EnrollmentReceipt::new(
+                "77777777-7777-4777-8777-777777777777".to_string(),
+                digest('2'),
+                INCARNATION_ID.to_string(),
+                binding,
+            )
+            .unwrap(),
+            current_binding_receipt_id: binding_receipt_id.clone(),
+            binding_receipt_chain: ReceiptChainRef {
+                head_record_id: Some(binding_receipt_id),
+                record_count: 1,
+                chain_digest: digest('3'),
+            },
+            management_receipt_chain: management_receipt_chain_genesis(),
+            claim_receipt_chain: claim_receipt_chain_genesis(),
+            current_claim_receipt_id: None,
+            authenticated_wal_tail: AuthenticatedWalTail::genesis(SCOPE_ID).unwrap(),
+            drain: None,
+            strict_block: None,
+            sealed_proof: None,
+            last_fold_summary: None,
+        }
+    }
+
+    fn resume_request(mode: StreamResumeMode, expected_revision: u64) -> StreamResumeRequest {
+        StreamResumeRequest {
+            graph_identity_digest: digest('d'),
+            resume_id: "88888888-8888-4888-8888-888888888888".to_string(),
+            expected_lifecycle_revision: expected_revision,
+            mode,
+            actor_id: "act-operator".to_string(),
+            initiated_at: 10,
+            public_named_branches: Vec::new(),
+        }
+    }
+
+    fn built_resume_claim(
+        prior: &StreamLifecycleEntry,
+        mode: StreamResumeMode,
+        plan: &PreparedStreamResumeOpen,
+        initial_shard_manifest_version: u64,
+        initial_replay_cursor: u64,
+        initial_current_generation: u64,
+        initial_base_merged_generation: u64,
+    ) -> BuiltTerminalClaim {
+        let resume_payload: StreamResumeRequestPayload =
+            serde_json::from_value(plan.request_payload.clone()).unwrap();
+        let operation = prepare_resume_claim_operation(
+            prior,
+            ClaimOperationRequest {
+                graph_identity_digest: resume_payload.graph_identity_digest,
+                claim_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+                lifecycle_operation_id: Some(resume_payload.resume_id),
+                recovery_operation_id: "stream-resume-recovery".to_string(),
+                claim_kind: STREAM_RESUME_OPERATION_KIND.to_string(),
+                profile: ClaimProfile::RetainAll,
+                shard_id: SHARD_ID.to_string(),
+                initial_shard_manifest_version,
+                initial_writer_epoch: prior.epoch_floor_by_shard[SHARD_ID],
+                initial_replay_cursor,
+                initial_current_generation,
+                initial_base_merged_generation,
+                claim_contract_version: 1,
+            },
+            mode,
+            plan.minimum_next_epoch_floor,
+        )
+        .unwrap();
+        let attempt = prepare_claim_attempt(
+            &operation,
+            ClaimAttemptRequest {
+                attempt_id: ATTEMPT_ID.to_string(),
+                pre_shard_manifest_version: initial_shard_manifest_version,
+                pre_writer_epoch: operation.initial_writer_epoch,
+                pre_replay_cursor: initial_replay_cursor,
+                planned_sentinel_position: prior.authenticated_wal_tail.position + 1,
+                planned_writer_epoch: plan.minimum_next_epoch_floor,
+                storage_envelope_digest: None,
+            },
+        )
+        .unwrap();
+        let prior_attempt_chain = claim_attempt_chain_genesis();
+        let effect = build_claim_attempt_effect(
+            &prior_attempt_chain,
+            &attempt,
+            ClaimAttemptEvidence::StockManifestPlusSentinel {
+                achieved_shard_manifest_version: initial_shard_manifest_version + 1,
+                achieved_writer_epoch: plan.minimum_next_epoch_floor,
+            },
+        )
+        .unwrap();
+        let attempt_chain = effect.next_attempt_chain_ref().unwrap();
+        let empty_projection_digest = lww_projection_digest_for_authority(
+            prior.identity,
+            &prior.binding_scope_id,
+            &prior.binding.enrollment_id,
+            SHARD_ID,
+            &prior.enrollment_receipt.stream_incarnation_id,
+            &prior.binding.stream_config_hash,
+            &stream_physical_binding_digest(&prior.binding).unwrap(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let empty_fence_state_digest = stream_empty_fence_state_digest(
+            &prior.binding_scope_id,
+            &prior.binding.enrollment_id,
+            SHARD_ID,
+            &prior.enrollment_receipt.stream_incarnation_id,
+            &prior.binding.stream_config_hash,
+            &stream_physical_binding_digest(&prior.binding).unwrap(),
+            attempt.planned_sentinel_position,
+            plan.minimum_next_epoch_floor,
+            &attempt.planned_sentinel_digest,
+        )
+        .unwrap();
+        let segment = AuthenticatedClaimWalSegment {
+            identity: prior.identity,
+            binding_scope_id: prior.binding_scope_id.clone(),
+            enrollment_id: prior.binding.enrollment_id.clone(),
+            shard_id: SHARD_ID.to_string(),
+            stream_incarnation_id: prior.enrollment_receipt.stream_incarnation_id.clone(),
+            prior_writer_epoch: operation.initial_writer_epoch,
+            achieved_writer_epoch: plan.minimum_next_epoch_floor,
+            prior_position: prior.authenticated_wal_tail.position,
+            position: attempt.planned_sentinel_position,
+            published_prefix_position: operation.folded_replay_cursor,
+            entry_count: 1,
+            row_count: 0,
+            arrow_bytes: 0,
+            sentinel_digest: attempt.planned_sentinel_digest.clone(),
+            segment_digest: digest('4'),
+            empty_fence_state_digest,
+            suffix_lww_projection_digest: empty_projection_digest.clone(),
+        };
+        build_terminal_claim(
+            &prior.claim_receipt_chain,
+            &attempt,
+            &effect,
+            &attempt_chain,
+            &segment,
+            &empty_projection_digest,
+            initial_replay_cursor,
+            plan.recorded_at,
+        )
+        .unwrap()
+    }
+
+    fn resume_management_receipt(
+        prior: &StreamLifecycleEntry,
+        plan: &PreparedStreamResumeOpen,
+    ) -> ManagementReceipt {
+        let request: StreamResumeRequestPayload =
+            serde_json::from_value(plan.request_payload.clone()).unwrap();
+        ManagementReceipt::new(
+            request.graph_identity_digest,
+            prior.identity,
+            prior.enrollment_receipt.stream_incarnation_id.clone(),
+            prior.binding_scope_id.clone(),
+            &prior.management_receipt_chain,
+            request.resume_id,
+            STREAM_RESUME_OPERATION_KIND,
+            prior.lifecycle_revision,
+            plan.next_lifecycle_revision,
+            request.actor_id,
+            plan.request_payload.clone(),
+            stream_resume_result_payload(plan.next_lifecycle_revision).unwrap(),
+            plan.recorded_at,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sealed_resume_prepares_a_higher_epoch_and_builds_only_the_exact_open_row() {
+        let sealed = test_sealed_lifecycle_from(&open_lifecycle()).unwrap();
+        let request = resume_request(StreamResumeMode::ResumeSealed, sealed.lifecycle_revision);
+        let plan = prepare_stream_resume_open(&sealed, request).unwrap();
+        assert_eq!(plan.mode, StreamResumeMode::ResumeSealed);
+        assert_eq!(plan.minimum_next_epoch_floor, 2);
+        assert_eq!(plan.next_lifecycle_revision, sealed.lifecycle_revision + 1);
+        assert_eq!(
+            plan.request_digest,
+            ManagementReceipt::request_digest_for(&plan.request_payload).unwrap()
+        );
+
+        let proof = sealed.sealed_proof.as_ref().unwrap();
+        let noncanonical_kind_error = prepare_resume_claim_operation(
+            &sealed,
+            ClaimOperationRequest {
+                graph_identity_digest: digest('d'),
+                claim_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+                lifecycle_operation_id: Some(
+                    "88888888-8888-4888-8888-888888888888".to_string(),
+                ),
+                recovery_operation_id: "stream-resume-recovery".to_string(),
+                claim_kind: "RESUME_FENCE".to_string(),
+                profile: ClaimProfile::RetainAll,
+                shard_id: SHARD_ID.to_string(),
+                initial_shard_manifest_version: proof.shard_manifest_version,
+                initial_writer_epoch: proof.writer_epoch,
+                initial_replay_cursor: proof.replay_cursor,
+                initial_current_generation: proof.current_generation,
+                initial_base_merged_generation: proof.base_merged_generation,
+                claim_contract_version: 1,
+            },
+            StreamResumeMode::ResumeSealed,
+            plan.minimum_next_epoch_floor,
+        )
+        .unwrap_err();
+        assert!(
+            noncanonical_kind_error
+                .to_string()
+                .contains("canonical RESUME claim kind")
+        );
+
+        let built = built_resume_claim(
+            &sealed,
+            StreamResumeMode::ResumeSealed,
+            &plan,
+            proof.shard_manifest_version,
+            proof.replay_cursor,
+            proof.current_generation,
+            proof.base_merged_generation,
+        );
+        assert!(
+            build_claim_adoption_row(&sealed, &built).is_err(),
+            "ordinary claim adoption must remain closed for SEALED authority"
+        );
+        let receipt = resume_management_receipt(&sealed, &plan);
+        let opened =
+            build_resume_adoption_row(&sealed, &built, &receipt, StreamResumeMode::ResumeSealed)
+                .unwrap();
+        assert_eq!(opened.lifecycle, StreamLifecycle::Open);
+        assert_eq!(opened.lifecycle_revision, plan.next_lifecycle_revision);
+        assert_eq!(opened.epoch_floor_by_shard[SHARD_ID], 2);
+        assert!(opened.drain.is_none());
+        assert!(opened.strict_block.is_none());
+        assert!(opened.sealed_proof.is_none());
+        assert_eq!(
+            opened.current_claim_receipt_id.as_deref(),
+            Some(built.receipt.record_id.as_str())
+        );
+        assert_eq!(
+            opened.management_receipt_chain.head_record_id.as_deref(),
+            Some(receipt.record_id.as_str())
+        );
+
+        let ordinary_error = prepare_claim_operation(
+            &sealed,
+            ClaimOperationRequest {
+                graph_identity_digest: digest('d'),
+                claim_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+                lifecycle_operation_id: None,
+                recovery_operation_id: "ordinary-claim".to_string(),
+                claim_kind: "COLD_OPEN".to_string(),
+                profile: ClaimProfile::RetainAll,
+                shard_id: SHARD_ID.to_string(),
+                initial_shard_manifest_version: proof.shard_manifest_version,
+                initial_writer_epoch: proof.writer_epoch,
+                initial_replay_cursor: proof.replay_cursor,
+                initial_current_generation: proof.current_generation,
+                initial_base_merged_generation: proof.base_merged_generation,
+                claim_contract_version: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(ordinary_error.to_string().contains("SEALED"));
+    }
+
+    #[test]
+    fn abort_drain_requires_unguarded_unblocked_empty_authority() {
+        let open = open_lifecycle();
+        let draining = build_open_to_draining(
+            &open,
+            QuiesceRequest {
+                graph_identity_digest: digest('d'),
+                drain_id: "77777777-7777-4777-8777-777777777777".to_string(),
+                expected_lifecycle_revision: open.lifecycle_revision,
+                goal: DrainGoal::OpenAfterFold,
+                initiating_actor: "act-operator".to_string(),
+                initiated_at: 5,
+                target_epoch_floor_by_shard: BTreeMap::from([(SHARD_ID.to_string(), 2)]),
+                seal_override: None,
+            },
+        )
+        .unwrap()
+        .lifecycle;
+        let request = resume_request(StreamResumeMode::AbortDrain, draining.lifecycle_revision);
+        let plan = prepare_stream_resume_open(&draining, request).unwrap();
+        let built = built_resume_claim(&draining, StreamResumeMode::AbortDrain, &plan, 1, 0, 1, 0);
+        let receipt = resume_management_receipt(&draining, &plan);
+        let opened =
+            build_resume_adoption_row(&draining, &built, &receipt, StreamResumeMode::AbortDrain)
+                .unwrap();
+        assert_eq!(opened.lifecycle, StreamLifecycle::Open);
+        assert!(opened.drain.is_none());
+        assert_eq!(opened.epoch_floor_by_shard[SHARD_ID], 2);
+
+        assert!(
+            prepare_stream_resume_open(
+                &draining,
+                resume_request(StreamResumeMode::ResumeSealed, draining.lifecycle_revision),
+            )
+            .is_err(),
+            "plain resume must not silently become abort-drain"
+        );
+
+        let mut guarded = draining.clone();
+        guarded.drain.as_mut().unwrap().guarded_operation = Some(serde_json::json!({
+            "operation_id": "maintenance"
+        }));
+        assert!(
+            prepare_stream_resume_open(
+                &guarded,
+                resume_request(StreamResumeMode::AbortDrain, guarded.lifecycle_revision),
+            )
+            .is_err()
+        );
+
+        let mut unmerged = draining.clone();
+        let current_claim_id = digest('5');
+        unmerged.current_claim_receipt_id = Some(current_claim_id.clone());
+        unmerged.claim_receipt_chain = ReceiptChainRef {
+            head_record_id: Some(current_claim_id),
+            record_count: 1,
+            chain_digest: digest('6'),
+        };
+        unmerged.authenticated_wal_tail = AuthenticatedWalTail {
+            binding_scope_id: SCOPE_ID.to_string(),
+            position: 1,
+            segment_count: 1,
+            chain_digest: digest('7'),
+            lww_projection_digest: digest('8'),
+        };
+        unmerged.validate().unwrap();
+        let error = prepare_stream_resume_open(
+            &unmerged,
+            resume_request(StreamResumeMode::AbortDrain, unmerged.lifecycle_revision),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unmerged WAL projection"));
+
+        let mut named_branch_request =
+            resume_request(StreamResumeMode::AbortDrain, draining.lifecycle_revision);
+        named_branch_request.public_named_branches = vec!["review".to_string()];
+        assert!(prepare_stream_resume_open(&draining, named_branch_request).is_err());
     }
 
     fn attributed_stored_batch(metadata_value: &str, stored_value: &str) -> RecordBatch {

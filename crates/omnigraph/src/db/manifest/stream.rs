@@ -29,6 +29,8 @@ pub(crate) const MANAGEMENT_RECEIPT_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const CLAIM_ATTEMPT_EFFECT_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const CLAIM_RECEIPT_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const QUIESCE_REQUEST_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const STREAM_RESUME_REQUEST_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const STREAM_RESUME_OPERATION_KIND: &str = "RESUME";
 pub(crate) const STREAM_DATA_BLOCK_VALIDATION_CONTRACT_VERSION: u32 = 1;
 
 pub(crate) const ENROLLMENT_RECEIPT_V2_TAG: &str = "STREAM_ENROLLMENT_RECEIPT_V2";
@@ -225,6 +227,19 @@ impl StreamLifecycle {
             Self::Sealed => "SEALED",
         }
     }
+}
+
+/// Exact caller-selected path for one `OPEN`-producing lifecycle operation.
+///
+/// Both modes use the same recovery and management-receipt family, but their
+/// admissible prior authority is intentionally disjoint. Keeping the mode in
+/// the canonical request prevents a retry from turning a sealed resume into a
+/// drain abort (or vice versa) under the same occurrence ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum StreamResumeMode {
+    ResumeSealed,
+    AbortDrain,
 }
 
 /// Immutable lost-result receipt for the one enrollment that created this
@@ -687,6 +702,29 @@ pub(crate) struct QuiesceRequestPayload {
     pub(crate) target_epoch_floor_by_shard: BTreeMap<String, u64>,
     #[serde(deserialize_with = "deserialize_present_option")]
     pub(crate) seal_override: Option<DisableDrainAdoption>,
+}
+
+/// Immutable canonical preimage of one explicit resume or abort-drain
+/// occurrence.
+///
+/// Physical binding, HEAD, profile, runtime, and minimum-epoch authority live
+/// in the recovery-v15 open plan beside the complete prior lifecycle row. The
+/// management request retains the caller-owned compare token and the exact
+/// topology cut so receipt-first replay cannot retarget the occurrence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StreamResumeRequestPayload {
+    pub(crate) protocol_version: u32,
+    pub(crate) graph_identity_digest: String,
+    pub(crate) identity: TableIdentity,
+    pub(crate) stream_incarnation_id: String,
+    pub(crate) binding_scope_id: String,
+    pub(crate) enrollment_id: String,
+    pub(crate) resume_id: String,
+    pub(crate) expected_lifecycle_revision: u64,
+    pub(crate) mode: StreamResumeMode,
+    pub(crate) actor_id: String,
+    pub(crate) public_named_branches: Vec<String>,
 }
 
 /// Durable restart plan for a revision-fenced drain.  Config-v3 requires the
@@ -2172,6 +2210,21 @@ pub(crate) fn stream_quiesce_result_payload(
     }))
 }
 
+/// Canonical semantic result of one successful resume or abort-drain.
+pub(crate) fn stream_resume_result_payload(
+    open_lifecycle_revision: u64,
+) -> Result<serde_json::Value> {
+    if open_lifecycle_revision == 0 {
+        return Err(OmniError::manifest_internal(
+            "terminal stream resume result requires a positive lifecycle revision",
+        ));
+    }
+    Ok(serde_json::json!({
+        "lifecycle": "OPEN",
+        "revision": open_lifecycle_revision,
+    }))
+}
+
 /// Canonical semantic result of adopting an in-flight drain into disable.
 pub(crate) fn stream_disable_drain_adoption_result_payload(
     next_lifecycle_revision: u64,
@@ -2884,6 +2937,76 @@ impl QuiesceRequestPayload {
                 "stream quiesce request preimage differs from its immutable lifecycle lane, occurrence, revision, or binding",
             ));
         }
+        Ok(())
+    }
+}
+
+impl StreamResumeRequestPayload {
+    pub(crate) fn to_value(&self) -> Result<serde_json::Value> {
+        self.validate_shape()?;
+        serde_json::to_value(self).map_err(|error| {
+            OmniError::manifest_internal(format!(
+                "failed to encode canonical stream resume request: {error}"
+            ))
+        })
+    }
+
+    pub(crate) fn request_digest(&self) -> Result<String> {
+        ManagementReceipt::request_digest_for(&self.to_value()?)
+    }
+
+    pub(crate) fn validate_for_lifecycle(
+        &self,
+        lifecycle: &StreamLifecycleEntry,
+        mode: StreamResumeMode,
+    ) -> Result<()> {
+        self.validate_shape()?;
+        lifecycle.validate()?;
+        if self.identity != lifecycle.identity
+            || self.stream_incarnation_id != lifecycle.enrollment_receipt.stream_incarnation_id
+            || self.binding_scope_id != lifecycle.binding_scope_id
+            || self.enrollment_id != lifecycle.binding.enrollment_id
+            || self.expected_lifecycle_revision != lifecycle.lifecycle_revision
+            || self.mode != mode
+        {
+            return Err(OmniError::manifest_internal(
+                "stream resume request differs from the exact lifecycle lane, revision, or mode",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_shape(&self) -> Result<()> {
+        if self.protocol_version != STREAM_RESUME_REQUEST_PROTOCOL_VERSION {
+            return Err(OmniError::manifest_internal(
+                "stream resume request has an unsupported protocol version",
+            ));
+        }
+        validate_digest("resume graph_identity_digest", &self.graph_identity_digest)?;
+        self.identity.validate()?;
+        validate_uuid("resume stream_incarnation_id", &self.stream_incarnation_id)?;
+        validate_uuid("resume binding_scope_id", &self.binding_scope_id)?;
+        validate_uuid("resume enrollment_id", &self.enrollment_id)?;
+        let resume_id = validate_uuid("resume resume_id", &self.resume_id)?;
+        if resume_id.get_version_num() != 4 {
+            return Err(OmniError::manifest_internal(
+                "stream resume resume_id must be a UUID v4 value",
+            ));
+        }
+        if self.expected_lifecycle_revision == 0 {
+            return Err(OmniError::manifest_internal(
+                "stream resume request requires a positive expected revision",
+            ));
+        }
+        validate_canonical_text("resume actor_id", &self.actor_id)?;
+        if !self.public_named_branches.is_empty() {
+            return Err(OmniError::manifest_internal(
+                "stream resume request requires the exact empty public named-branch topology",
+            ));
+        }
+        // Enforce the same bounded canonical JSON envelope as the immutable
+        // management receipt which eventually embeds this request.
+        bounded_json_bytes("resume request payload", self)?;
         Ok(())
     }
 }
