@@ -156,8 +156,10 @@ The implemented coverage keeps the boundaries split as follows:
   without advancing framing, over-limit-line discard and resume, separate
   root-wide/per-actor request and byte admission, the complete internal tagged
   status mapping, stop-tail precedence, `blocking_ordinal`, bounded
-  caller-order reordering, permit release, and propagation of a root request
-  task panic through the cancellation proof seam.
+  caller-order reordering, permit release, buffered-result-before-task-error
+  ordering, clean fused EOF, cancellation-safe join ownership, and propagation
+  of a root request task panic through both normal terminal receive and the
+  cancellation proof seam.
   `memwal_stream.rs` owns the composition of those pieces with the low-level B2
   path: one physical call may carry one non-empty contiguous caller-ordinal
   prefix with distinct keys, while invalid lines, repeated keys, token

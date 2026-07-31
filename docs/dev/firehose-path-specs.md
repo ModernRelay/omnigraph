@@ -1171,6 +1171,12 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
    allocation, normalized runs, and ordered results are bounded before their
    respective allocation or ownership boundaries.
 
+   Terminal result consumption drains every already-buffered per-line outcome,
+   then joins the root request task before reporting clean EOF. A task panic or
+   abort is therefore a loud request failure rather than a truncated successful
+   stream. Cancelling that terminal receive retains join ownership for the next
+   receive or explicit cancellation path.
+
    The seam forms contiguous multi-row physical prefixes containing distinct
    keys and closes a prefix at invalid input, a repeated key, a current-token
    disposition, or the row/byte ceiling. Authority classification is windowed

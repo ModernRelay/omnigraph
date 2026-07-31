@@ -57,22 +57,37 @@ struct TransportOwnership {
 
 pub(super) struct StreamRequestHandle {
     receiver: tokio::sync::mpsc::Receiver<StreamLineOutcome>,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
     _transport: Arc<TransportOwnership>,
 }
 
 impl StreamRequestHandle {
-    pub(super) async fn recv(&mut self) -> Option<StreamLineOutcome> {
-        self.receiver.recv().await
+    pub(super) async fn recv(&mut self) -> Result<Option<StreamLineOutcome>> {
+        let Some(outcome) = self.receiver.recv().await else {
+            self.wait_for_task().await?;
+            return Ok(None);
+        };
+        Ok(Some(outcome))
+    }
+
+    async fn wait_for_task(&mut self) -> Result<()> {
+        let Some(task) = self.task.as_mut() else {
+            return Ok(());
+        };
+        // Await in place so cancelling this future retains the join handle.
+        // A later recv/cancel can therefore still distinguish task failure
+        // from clean channel EOF.
+        let outcome = task.await;
+        self.task = None;
+        outcome
+            .map_err(|error| OmniError::Lance(format!("stream request task failed: {error}")))?;
+        Ok(())
     }
 
     #[cfg(feature = "failpoints")]
     async fn cancel_and_wait(mut self) -> Result<()> {
         self.receiver.close();
-        self.task
-            .await
-            .map_err(|error| OmniError::Lance(format!("stream request task failed: {error}")))?;
-        Ok(())
+        self.wait_for_task().await
     }
 }
 
@@ -248,7 +263,7 @@ impl Omnigraph {
         });
         Ok(StreamRequestHandle {
             receiver,
-            task,
+            task: Some(task),
             _transport: ownership,
         })
     }
@@ -269,7 +284,7 @@ impl Omnigraph {
             .stream_ingest_ndjson_as(table_key, actor_id, body)
             .await?;
         let mut results = Vec::new();
-        while let Some(outcome) = handle.recv().await {
+        while let Some(outcome) = handle.recv().await? {
             results.push(stream_line_outcome_json(&outcome).to_string());
         }
         Ok(results)
@@ -1436,25 +1451,126 @@ const _: () = assert!(STREAM_REQUEST_MAX_RESULT_STATUSES >= STREAM_RESULT_CHANNE
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn cancellation_seam_propagates_request_task_panics() {
+    fn test_request_handle(
+        receiver: tokio::sync::mpsc::Receiver<StreamLineOutcome>,
+        task: tokio::task::JoinHandle<()>,
+    ) -> StreamRequestHandle {
         let registry = super::super::stream_request::StreamRequestRegistry::for_root(&format!(
-            "memory://stream-request-cancel-panic/{}",
+            "memory://stream-request-task/{}",
             ulid::Ulid::new()
         ));
         let permit = registry
-            .try_acquire("agent:cancel-panic")
+            .try_acquire("agent:request-task")
             .expect("test request permit");
         let ownership = Arc::new(TransportOwnership { _permit: permit });
+        StreamRequestHandle {
+            receiver,
+            task: Some(task),
+            _transport: ownership,
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_drains_buffered_outcomes_then_propagates_request_task_panics() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            sender
+                .send(StreamLineOutcome::new(
+                    0,
+                    StreamLineDetail::Invalid {
+                        message: "buffered before panic".to_string(),
+                    },
+                ))
+                .await
+                .expect("test receiver remains open");
+            panic!("intentional request-task panic");
+        });
+        let mut handle = test_request_handle(receiver, task);
+
+        let outcome = handle
+            .recv()
+            .await
+            .expect("the buffered outcome must precede task settlement")
+            .expect("one buffered outcome");
+        assert_eq!(outcome.ordinal, 0);
+        let error = handle
+            .recv()
+            .await
+            .expect_err("task panic must not become clean EOF");
+        assert!(
+            error.to_string().contains("stream request task failed"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_reports_clean_fused_eof_after_request_task_completion() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            drop(sender);
+        });
+        let mut handle = test_request_handle(receiver, task);
+
+        assert!(
+            handle
+                .recv()
+                .await
+                .expect("clean request completion")
+                .is_none()
+        );
+        assert!(
+            handle
+                .recv()
+                .await
+                .expect("clean EOF remains fused")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_terminal_recv_retains_request_task_join_ownership() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            drop(sender);
+            closed_sender.send(()).expect("signal closed channel");
+            let _ = release_receiver.await;
+        });
+        let mut handle = test_request_handle(receiver, task);
+        closed_receiver.await.expect("request sender closed");
+
+        let mut first_recv = Box::pin(handle.recv());
+        assert!(matches!(
+            futures::poll!(first_recv.as_mut()),
+            std::task::Poll::Pending
+        ));
+        drop(first_recv);
+
+        let mut second_recv = Box::pin(handle.recv());
+        assert!(
+            matches!(
+                futures::poll!(second_recv.as_mut()),
+                std::task::Poll::Pending
+            ),
+            "a cancelled terminal receive must not detach the request task"
+        );
+        release_sender.send(()).expect("release request task");
+        assert!(
+            second_recv
+                .await
+                .expect("retained task joins cleanly")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_seam_propagates_request_task_panics() {
         let (_sender, receiver) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(async {
             panic!("intentional request-task panic");
         });
-        let handle = StreamRequestHandle {
-            receiver,
-            task,
-            _transport: ownership,
-        };
+        let handle = test_request_handle(receiver, task);
 
         let error = handle
             .cancel_and_wait()
