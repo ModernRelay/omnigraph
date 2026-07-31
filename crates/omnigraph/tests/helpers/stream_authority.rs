@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use omnigraph::db::Omnigraph;
+use omnigraph::error::Result;
 use omnigraph_control_authority::{
     AuthorityOperationClass, OfflineAuthorityRequest, RuntimeBindingRequest, StateLockAcquire,
     acquire_state_lock, mint_runtime_guard, validate_offline_guard, validate_runtime_binding,
@@ -72,6 +73,90 @@ pub async fn enable_stream_profile(db: &Omnigraph, cluster_uri: &str) {
     let authority = db.check_cluster_apply_authority(guard).await.unwrap();
     let result = db.set_streaming_profile_checked(authority).await.unwrap();
     assert!(result.streaming_enabled);
+}
+
+pub async fn disable_stream_profile(db: &Omnigraph, cluster_uri: &str) {
+    let cluster_uri = cluster_uri.trim_end_matches('/');
+    let status = db.stream_status().await.unwrap();
+    let state_cas = write_cluster_state(cluster_uri).await;
+    let storage = storage_handle_for_uri(cluster_uri).unwrap();
+    let lock_uri = format!("{cluster_uri}/__cluster/lock.json");
+    let lock = match acquire_state_lock(&storage, &lock_uri, "apply")
+        .await
+        .unwrap()
+    {
+        StateLockAcquire::Acquired(lock) => lock,
+        StateLockAcquire::Held => panic!("fresh MemWAL test apply lock is already held"),
+    };
+    let guard = validate_offline_guard(
+        &lock,
+        OfflineAuthorityRequest {
+            graph_id: GRAPH_ID,
+            graph_store_uri: db.uri(),
+            expected_state_cas: &state_cas,
+            state_revision: 1,
+            declaration_revision: STREAM_DECLARATION_REVISION,
+            declaration_digest: STREAM_DECLARATION_DIGEST,
+            expected_profile_revision: status.profile_revision,
+            operation_id: "memwal-stream-test-disable",
+            operation: AuthorityOperationClass::StreamProfileDisable,
+            actor: "operator:memwal-test",
+            confirm_stream_offline: true,
+        },
+    )
+    .await
+    .unwrap();
+    let authority = db.check_cluster_apply_authority(guard).await.unwrap();
+    let result = db.set_streaming_profile_checked(authority).await.unwrap();
+    assert!(!result.streaming_enabled);
+    assert_eq!(db.stream_status().await.unwrap().profile_mode, "DISABLED");
+}
+
+pub async fn rebind_stream_table_offline(
+    db: &Omnigraph,
+    cluster_uri: &str,
+    table_key: &str,
+    rebind_id: &str,
+    expected_lifecycle_revision: u64,
+) -> Result<String> {
+    let cluster_uri = cluster_uri.trim_end_matches('/');
+    let status = db.stream_status().await?;
+    let state_cas = write_cluster_state(cluster_uri).await;
+    let storage = storage_handle_for_uri(cluster_uri).unwrap();
+    let lock_uri = format!("{cluster_uri}/__cluster/lock.json");
+    let lock = match acquire_state_lock(&storage, &lock_uri, "apply")
+        .await
+        .unwrap()
+    {
+        StateLockAcquire::Acquired(lock) => lock,
+        StateLockAcquire::Held => panic!("fresh MemWAL test apply lock is already held"),
+    };
+    let guard = validate_offline_guard(
+        &lock,
+        OfflineAuthorityRequest {
+            graph_id: GRAPH_ID,
+            graph_store_uri: db.uri(),
+            expected_state_cas: &state_cas,
+            state_revision: 1,
+            declaration_revision: STREAM_DECLARATION_REVISION,
+            declaration_digest: STREAM_DECLARATION_DIGEST,
+            expected_profile_revision: status.profile_revision,
+            operation_id: rebind_id,
+            operation: AuthorityOperationClass::StreamMaintenance,
+            actor: "operator:memwal-rebind",
+            confirm_stream_offline: true,
+        },
+    )
+    .await
+    .unwrap();
+    let authority = db.check_cluster_maintenance_authority(guard).await?;
+    Box::pin(db.failpoint_stream_rebind_checked_for_test(
+        authority,
+        table_key,
+        rebind_id,
+        expected_lifecycle_revision,
+    ))
+    .await
 }
 
 pub async fn bind_checked_stream_runtime(db: Arc<Omnigraph>, cluster_uri: &str) -> Arc<Omnigraph> {

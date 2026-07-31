@@ -44,7 +44,9 @@ use omnigraph_policy::{PolicyChecker, PolicyEngine};
 use serial_test::serial;
 
 use helpers::memwal::{CurrentMemWalInventory, MemWalObjectKind};
-use helpers::stream_authority::enable_stream_profile;
+use helpers::stream_authority::{
+    disable_stream_profile, enable_stream_profile, rebind_stream_table_offline,
+};
 
 const STREAM_SCHEMA: &str = "node Person { score: I32 }\n";
 const NULLABLE_STREAM_SCHEMA: &str = "node Person { score: I32? }\n";
@@ -656,11 +658,8 @@ async fn init_productive_sealed_lane() -> (
     (dir, db, folded, sealed)
 }
 
-async fn init_productive_mixed_sealed_lane() -> (
-    EnrolledGraphDir,
-    Arc<Omnigraph>,
-    StreamTableStatus,
-) {
+async fn init_productive_mixed_sealed_lane() -> (EnrolledGraphDir, Arc<Omnigraph>, StreamTableStatus)
+{
     let cluster = tempfile::tempdir().unwrap();
     let graph = cluster.path().join("graphs/knowledge.omni");
     let db = Arc::new(
@@ -720,6 +719,354 @@ async fn raw_table_head(db: &Omnigraph, table_key: &str) -> u64 {
         entry.table_path.trim_start_matches('/')
     );
     Dataset::open(&table_uri).await.unwrap().version().version
+}
+
+async fn raw_stream_token_head(db: &Omnigraph) -> u64 {
+    let token_uri = format!("{}/_stream_tokens.lance", db.uri().trim_end_matches('/'));
+    Dataset::open(&token_uri).await.unwrap().version().version
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn checked_offline_rebind_retries_effect_free_intent_and_selects_fresh_sealed_binding() {
+    let _scenario = FailScenario::setup();
+    let (dir, served) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let open = stream_lane(&served).await;
+    served
+        .failpoint_stream_quiesce_for_test(
+            TABLE,
+            "a6a6a6a6-a6a6-46a6-86a6-a6a6a6a6a6a6",
+            open.lifecycle_revision,
+            "operator:offline-rebind-quiesce",
+        )
+        .await
+        .expect("the empty enrolled lane must seal before offline rebind");
+    let sealed = stream_lane(&served).await;
+    assert_eq!(sealed.lifecycle, "SEALED");
+    let old_stream_incarnation = sealed.stream_incarnation_id.clone();
+    let old_enrollment = sealed.enrollment_id.clone();
+    let old_shard = sealed.epoch_floor_by_shard[0].0.clone();
+    let cluster_uri = dir.cluster_uri();
+
+    // Offline authority is process-local as well as durable: release the
+    // served handle before reopening the graph as the stopped writer.
+    assert_eq!(
+        Arc::strong_count(&served),
+        1,
+        "the sealed fixture must not retain a served engine handle"
+    );
+    drop(served);
+    let db = reopen_enrolled(&dir).await;
+    disable_stream_profile(&db, &cluster_uri).await;
+    let disabled = stream_lane(&db).await;
+    assert_eq!(disabled.lifecycle, "SEALED");
+    assert_eq!(disabled.lifecycle_revision, sealed.lifecycle_revision);
+    let before_head = raw_table_head(&db, TABLE).await;
+    let before_inventory = mem_wal_inventory(db.uri()).await;
+    let rebind_id = "a7a7a7a7-a7a7-47a7-87a7-a7a7a7a7a7a7";
+
+    let error = {
+        let _failpoint =
+            ScopedFailPoint::new(names::STREAM_REBIND_POST_SIDECAR_PRE_PHYSICAL, "return");
+        rebind_stream_table_offline(
+            &db,
+            &cluster_uri,
+            TABLE,
+            rebind_id,
+            disabled.lifecycle_revision,
+        )
+        .await
+        .expect_err("the armed v18 intent must stop before either physical table effect")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(names::STREAM_REBIND_POST_SIDECAR_PRE_PHYSICAL),
+        "{error:?}"
+    );
+    assert_eq!(raw_table_head(&db, TABLE).await, before_head);
+    assert_eq!(stream_lane(&db).await, disabled);
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+        1,
+        "the effect-free v18 intent must remain available to the retry barrier"
+    );
+
+    let fresh_scope = rebind_stream_table_offline(
+        &db,
+        &cluster_uri,
+        TABLE,
+        rebind_id,
+        disabled.lifecycle_revision,
+    )
+    .await
+    .expect("retry must discard the effect-free intent and perform the exact rebind");
+    let rebound = stream_lane(&db).await;
+    let rebound_status = db.stream_status().await.unwrap();
+    assert_eq!(rebound_status.profile_mode, "DISABLED");
+    assert_eq!(rebound.lifecycle, "SEALED");
+    assert_eq!(rebound.lifecycle_revision, disabled.lifecycle_revision + 1);
+    assert_eq!(rebound.stream_incarnation_id, old_stream_incarnation);
+    assert_ne!(rebound.enrollment_id, old_enrollment);
+    assert_eq!(rebound.epoch_floor_by_shard.len(), 1);
+    let fresh_shard = &rebound.epoch_floor_by_shard[0].0;
+    assert_ne!(fresh_shard, &old_shard);
+    assert_ne!(fresh_scope, old_enrollment);
+    assert_ne!(fresh_scope, old_shard);
+    assert_ne!(fresh_scope, *fresh_shard);
+    assert_ne!(fresh_scope, rebind_id);
+    assert_eq!(raw_table_head(&db, TABLE).await, before_head + 2);
+    let rebound_inventory = mem_wal_inventory(db.uri()).await;
+    assert_inventory_retained(
+        &before_inventory,
+        &rebound_inventory,
+        "offline physical rebind",
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    let retry_scope = rebind_stream_table_offline(
+        &db,
+        &cluster_uri,
+        TABLE,
+        rebind_id,
+        disabled.lifecycle_revision,
+    )
+    .await
+    .expect("a lost successful response must return the selected rebind occurrence");
+    assert_eq!(retry_scope, fresh_scope);
+    assert_eq!(stream_lane(&db).await, rebound);
+    assert_eq!(raw_table_head(&db, TABLE).await, before_head + 2);
+    let retry_inventory = mem_wal_inventory(db.uri()).await;
+    assert_eq!(retry_inventory.objects, rebound_inventory.objects);
+    assert_eq!(
+        retry_inventory.generation_roots,
+        rebound_inventory.generation_roots
+    );
+    assert_eq!(
+        retry_inventory.referenced_generation_roots,
+        rebound_inventory.referenced_generation_roots
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn rebind_rolls_forward_confirmed_physical_and_ledger_without_a_third_table_head() {
+    let _scenario = FailScenario::setup();
+    let (dir, served) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let open = stream_lane(&served).await;
+    served
+        .failpoint_stream_quiesce_for_test(
+            TABLE,
+            "b6b6b6b6-b6b6-46b6-86b6-b6b6b6b6b6b6",
+            open.lifecycle_revision,
+            "operator:rebind-recovery-quiesce",
+        )
+        .await
+        .expect("the fresh empty lane must seal before offline rebind");
+    let sealed = stream_lane(&served).await;
+    assert_eq!(sealed.lifecycle, "SEALED");
+    let cluster_uri = dir.cluster_uri();
+
+    assert_eq!(
+        Arc::strong_count(&served),
+        1,
+        "offline rebind requires the served engine owner to stop"
+    );
+    drop(served);
+    let db = reopen_enrolled(&dir).await;
+    disable_stream_profile(&db, &cluster_uri).await;
+    let disabled = stream_lane(&db).await;
+    assert_eq!(disabled.lifecycle, "SEALED");
+    let before_head = raw_table_head(&db, TABLE).await;
+    let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        before_snapshot.entry(TABLE).unwrap().table_version,
+        before_head,
+        "the fixture must begin with one coherent manifest/table HEAD"
+    );
+
+    let rebind_id = "b7b7b7b7-b7b7-47b7-87b7-b7b7b7b7b7b7";
+    let error = {
+        let _before_publish =
+            ScopedFailPoint::new(names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH, "return");
+        rebind_stream_table_offline(
+            &db,
+            &cluster_uri,
+            TABLE,
+            rebind_id,
+            disabled.lifecycle_revision,
+        )
+        .await
+        .expect_err("confirmed rebind effects must stop before manifest publication")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH),
+        "{error:?}"
+    );
+
+    assert_eq!(
+        raw_table_head(&db, TABLE).await,
+        before_head + 2,
+        "index replacement must finish at the exact N+2 physical HEAD"
+    );
+    assert_eq!(
+        stream_lane(&db).await,
+        disabled,
+        "the pre-publish crash must leave the old lifecycle selected"
+    );
+    let failed_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        failed_snapshot.entry(TABLE).unwrap().table_version,
+        before_head,
+        "the old manifest must not expose either physical rebind effect"
+    );
+
+    let sidecar_id = helpers::recovery::single_sidecar_operation_id(dir.path());
+    let sidecar: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            dir.path()
+                .join("__recovery")
+                .join(format!("{sidecar_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let protocol = &sidecar["protocol_v18"]["payload"];
+    assert_eq!(protocol["request"]["rebind_id"], rebind_id);
+    assert_eq!(protocol["phase"], "LEDGER_EFFECTS_CONFIRMED");
+    assert_eq!(
+        protocol["physical"]["dropped_head"]["table_version"].as_u64(),
+        Some(before_head + 1)
+    );
+    assert_eq!(
+        protocol["physical"]["fresh_index_head"]["table_version"].as_u64(),
+        Some(before_head + 2)
+    );
+    assert_eq!(
+        protocol["physical"]["confirmed_update"]["table_version"].as_u64(),
+        Some(before_head + 2)
+    );
+    assert_eq!(
+        protocol["ledger"]["confirmed_transaction"], protocol["ledger"]["planned_transaction"],
+        "the durable token-ledger effect must be the pre-minted transaction"
+    );
+    assert_eq!(
+        protocol["ledger"]["confirmed_head"],
+        protocol["ledger"]["next_authority"]["current_head_witness"],
+        "the confirmed ledger HEAD must be the sole next token authority"
+    );
+    let confirmed_token_head = protocol["ledger"]["confirmed_head"]["table_version"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        protocol["terminal"]["management_receipt"]["operation_id"],
+        rebind_id
+    );
+    assert_eq!(
+        protocol["terminal"]["next_lifecycle"]["lifecycle"],
+        "SEALED"
+    );
+    assert_eq!(
+        protocol["terminal"]["next_lifecycle"]["current_head_witness"]["table_version"].as_u64(),
+        Some(before_head + 2)
+    );
+    assert_eq!(
+        protocol["terminal"]["next_lifecycle"]["current_binding_receipt_id"],
+        protocol["planned_binding_receipt"]["record_id"]
+    );
+    let fresh_scope = protocol["planned_binding_receipt"]["binding_scope_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let fresh_enrollment = protocol["intended_binding"]["enrollment_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let fresh_shard = protocol["intended_binding"]["shard_ids"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    drop(failed_snapshot);
+    drop(before_snapshot);
+    drop(db);
+    let db = reopen_enrolled(&dir).await;
+    let rebound = stream_lane(&db).await;
+    assert_eq!(rebound.lifecycle, "SEALED");
+    assert_eq!(rebound.lifecycle_revision, disabled.lifecycle_revision + 1);
+    assert_eq!(rebound.enrollment_id, fresh_enrollment);
+    assert_eq!(rebound.epoch_floor_by_shard[0].0, fresh_shard);
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .entry(TABLE)
+            .unwrap()
+            .table_version,
+        before_head + 2,
+        "cold recovery must select the already-confirmed N+2 table"
+    );
+    assert_eq!(raw_stream_token_head(&db).await, confirmed_token_head);
+    assert_eq!(
+        raw_table_head(&db, TABLE).await,
+        before_head + 2,
+        "cold recovery must not manufacture an N+3 retry effect"
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    db.branch_create("rebind-replay-topology")
+        .await
+        .expect("a fresh public branch must be allowed after terminal rebind");
+    let before_replay_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let before_replay_manifest = before_replay_snapshot.version();
+    let before_replay_table = raw_table_head(&db, TABLE).await;
+    let before_replay_token = raw_stream_token_head(&db).await;
+    assert_eq!(
+        rebind_stream_table_offline(
+            &db,
+            &cluster_uri,
+            TABLE,
+            rebind_id,
+            disabled.lifecycle_revision,
+        )
+        .await
+        .expect("the terminal ledger receipt must replay the selected occurrence"),
+        fresh_scope
+    );
+    let fresh_error = rebind_stream_table_offline(
+        &db,
+        &cluster_uri,
+        TABLE,
+        "b8b8b8b8-b8b8-48b8-88b8-b8b8b8b8b8b8",
+        disabled.lifecycle_revision,
+    )
+    .await
+    .expect_err("a fresh rebind occurrence must still obey current topology");
+    assert!(
+        fresh_error
+            .to_string()
+            .contains("stream rebind requires a main-only graph"),
+        "{fresh_error:?}"
+    );
+    assert!(
+        fresh_error.to_string().contains("rebind-replay-topology"),
+        "{fresh_error:?}"
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        before_replay_manifest,
+        "selected-receipt replay must precede fresh topology refusal and stay manifest-free"
+    );
+    assert_eq!(raw_table_head(&db, TABLE).await, before_replay_table);
+    assert_eq!(raw_stream_token_head(&db).await, before_replay_token);
+    assert_eq!(stream_lane(&db).await, rebound);
+    assert_no_recovery_sidecars(&dir);
 }
 
 fn stream_data_block_token(error: &OmniError) -> &str {
@@ -864,7 +1211,7 @@ async fn authorized_ingest_score(
     }))
     .unwrap();
     db.failpoint_stream_ingest_one_as_for_test(TABLE, &raw_json, caller_ordinal, actor_id)
-    .await
+        .await
 }
 
 fn ndjson_score_line(
@@ -1045,8 +1392,7 @@ async fn admission_rejects_value_violation_before_wal_or_manifest_effect() {
         "a value violation must not create or remove a listed MemWAL generation"
     );
     assert_eq!(
-        inventory_after.referenced_generation_roots,
-        inventory_before.referenced_generation_roots,
+        inventory_after.referenced_generation_roots, inventory_before.referenced_generation_roots,
         "a value violation must leave shard-manifest generation authority unchanged"
     );
     assert_eq!(
@@ -1474,10 +1820,7 @@ async fn sealed_optimize_refreshes_only_productive_enrolled_authority_and_preser
     let (dir, db, sealed) = init_productive_mixed_sealed_lane().await;
     let sealed_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let sealed_person_version = sealed_snapshot.entry(TABLE).unwrap().table_version;
-    let sealed_company_version = sealed_snapshot
-        .entry("node:Company")
-        .unwrap()
-        .table_version;
+    let sealed_company_version = sealed_snapshot.entry("node:Company").unwrap().table_version;
     let sealed_commit_count = db.list_commits(Some("main")).await.unwrap().len();
 
     let ordinary_error = db
@@ -1505,10 +1848,7 @@ async fn sealed_optimize_refreshes_only_productive_enrolled_authority_and_preser
         sealed_person_version
     );
     assert_eq!(
-        after_refusal
-            .entry("node:Company")
-            .unwrap()
-            .table_version,
+        after_refusal.entry("node:Company").unwrap().table_version,
         sealed_company_version
     );
     assert_eq!(stream_lane(&db).await, sealed);
@@ -1543,9 +1883,7 @@ async fn sealed_optimize_refreshes_only_productive_enrolled_authority_and_preser
         sealed_commit_count + 1,
         "all productive table pointers and lifecycle authority publish in one graph commit"
     );
-    assert!(
-        maintained_snapshot.entry(TABLE).unwrap().table_version > sealed_person_version
-    );
+    assert!(maintained_snapshot.entry(TABLE).unwrap().table_version > sealed_person_version);
     assert!(
         maintained_snapshot
             .entry("node:Company")
@@ -1638,15 +1976,16 @@ async fn sealed_optimize_effects_confirmed_reopens_with_atomic_authority() {
     let prior_table_version = prior_snapshot.entry(TABLE).unwrap().table_version;
 
     let error = {
-        let _failpoint = ScopedFailPoint::new(
-            names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _failpoint =
+            ScopedFailPoint::new(names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
         db.failpoint_stream_sealed_optimize_for_test("operator:sealed-optimize-recovery")
             .await
             .expect_err("the confirmed v17 intent must stop before manifest publication")
     };
-    assert!(matches!(&error, OmniError::RecoveryRequired { .. }), "{error:?}");
+    assert!(
+        matches!(&error, OmniError::RecoveryRequired { .. }),
+        "{error:?}"
+    );
     assert!(
         error
             .to_string()
@@ -1730,15 +2069,9 @@ async fn sealed_optimize_partial_armed_effect_restores_with_matching_lifecycle_p
     let prior_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let prior_manifest_version = prior_snapshot.version();
     let prior_person_pin = prior_snapshot.entry(TABLE).unwrap().table_version;
-    let prior_company_pin = prior_snapshot
-        .entry("node:Company")
-        .unwrap()
-        .table_version;
+    let prior_company_pin = prior_snapshot.entry("node:Company").unwrap().table_version;
     assert_eq!(raw_table_head(&db, TABLE).await, prior_person_pin);
-    assert_eq!(
-        raw_table_head(&db, "node:Company").await,
-        prior_company_pin
-    );
+    assert_eq!(raw_table_head(&db, "node:Company").await, prior_company_pin);
 
     let error = {
         // The first physical task stops before compaction while its sibling is
@@ -1756,12 +2089,12 @@ async fn sealed_optimize_partial_armed_effect_restores_with_matching_lifecycle_p
 
     let unpublished = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     assert_eq!(unpublished.version(), prior_manifest_version);
-    assert_eq!(unpublished.entry(TABLE).unwrap().table_version, prior_person_pin);
     assert_eq!(
-        unpublished
-            .entry("node:Company")
-            .unwrap()
-            .table_version,
+        unpublished.entry(TABLE).unwrap().table_version,
+        prior_person_pin
+    );
+    assert_eq!(
+        unpublished.entry("node:Company").unwrap().table_version,
         prior_company_pin
     );
     assert_eq!(stream_lane(&db).await, sealed);
@@ -1785,13 +2118,8 @@ async fn sealed_optimize_partial_armed_effect_restores_with_matching_lifecycle_p
         serde_json::from_str(&std::fs::read_to_string(sidecar_path).unwrap()).unwrap();
     assert_eq!(sidecar["schema_version"], 17);
     assert_eq!(sidecar["protocol_v17"]["kind"], "StreamSealedOptimize");
-    assert_eq!(
-        sidecar["protocol_v17"]["payload"]["effect_phase"],
-        "Armed"
-    );
-    assert!(
-        sidecar["protocol_v17"]["payload"]["confirmed_outputs"].is_null()
-    );
+    assert_eq!(sidecar["protocol_v17"]["payload"]["effect_phase"], "Armed");
+    assert!(sidecar["protocol_v17"]["payload"]["confirmed_outputs"].is_null());
 
     drop(unpublished);
     drop(prior_snapshot);
@@ -1893,21 +2221,13 @@ async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure
     db.failpoint_stream_b1_for_test(TABLE, Some(duplicate), 0)
         .await
         .expect("base-dependent uniqueness remains fold-time work");
-    let before = db
-        .snapshot_of(ReadTarget::branch("main"))
-        .await
-        .unwrap();
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let before_lane = stream_lane(&db).await;
     let drain_id = "96969696-9696-4696-8696-969696969696";
     let actor = "operator:strict-data-block";
 
     let first_error = db
-        .failpoint_stream_quiesce_for_test(
-            TABLE,
-            drain_id,
-            before_lane.lifecycle_revision,
-            actor,
-        )
+        .failpoint_stream_quiesce_for_test(TABLE, drain_id, before_lane.lifecycle_revision, actor)
         .await
         .expect_err("a permanent drain validator failure must publish a strict data block");
     let blocked = stream_lane(&db).await;
@@ -1918,19 +2238,13 @@ async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure
     assert_eq!(stream_data_block_token(&first_error), block_token);
     assert_eq!(blocked.lifecycle, "DRAINING");
     assert_eq!(blocked.drain_id.as_deref(), Some(drain_id));
-    assert_eq!(
-        blocked.last_fold_outcome.as_deref(),
-        Some("STRICT_BLOCKED")
-    );
+    assert_eq!(blocked.last_fold_outcome.as_deref(), Some("STRICT_BLOCKED"));
     assert_eq!(blocked.last_fold_graph_commit_id, None);
     assert!(
         blocked.lifecycle_revision > before_lane.lifecycle_revision,
         "start, claim, and block publications must advance lifecycle authority"
     );
-    let after = db
-        .snapshot_of(ReadTarget::branch("main"))
-        .await
-        .unwrap();
+    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     assert!(
         after.version() > before.version(),
         "the strict block is an operational manifest publication"
@@ -1947,12 +2261,7 @@ async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure
 
     let blocked_version = after.version();
     let exact_retry_error = db
-        .failpoint_stream_quiesce_for_test(
-            TABLE,
-            drain_id,
-            before_lane.lifecycle_revision,
-            actor,
-        )
+        .failpoint_stream_quiesce_for_test(TABLE, drain_id, before_lane.lifecycle_revision, actor)
         .await
         .expect_err("an exact retry must return the selected block");
     assert_eq!(stream_data_block_token(&exact_retry_error), block_token);
@@ -1987,12 +2296,7 @@ async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure
     drop(db);
     let reopened = reopen_enrolled(&dir).await;
     let reopen_error = reopened
-        .failpoint_stream_quiesce_for_test(
-            TABLE,
-            drain_id,
-            before_lane.lifecycle_revision,
-            actor,
-        )
+        .failpoint_stream_quiesce_for_test(TABLE, drain_id, before_lane.lifecycle_revision, actor)
         .await
         .expect_err("cold reopen must retain the same selected block");
     assert_eq!(stream_data_block_token(&reopen_error), block_token);
@@ -2340,12 +2644,7 @@ async fn empty_quiesce_is_idempotent_and_refuses_rebound_or_stale_requests() {
     }))
     .unwrap();
     let sealed = db
-        .failpoint_stream_ingest_one_as_for_test(
-            TABLE,
-            &raw_json,
-            1,
-            "agent:after-seal",
-        )
+        .failpoint_stream_ingest_one_as_for_test(TABLE, &raw_json, 1, "agent:after-seal")
         .await
         .expect_err("ordinary admission must not cross a SEALED lifecycle");
     let OmniError::Manifest(manifest_error) = sealed else {
@@ -2399,15 +2698,9 @@ async fn sealed_resume_advances_epoch_replays_its_receipt_and_installs_the_write
     let resume_id = "2a2a2a2a-2a2a-4a2a-8a2a-2a2a2a2a2a2a";
     let actor = "operator:resume";
 
-    db.failpoint_stream_resume_for_test(
-        TABLE,
-        resume_id,
-        sealed.lifecycle_revision,
-        false,
-        actor,
-    )
-    .await
-    .expect("SEALED lane must resume through one recovery-owned claim");
+    db.failpoint_stream_resume_for_test(TABLE, resume_id, sealed.lifecycle_revision, false, actor)
+        .await
+        .expect("SEALED lane must resume through one recovery-owned claim");
     let open = stream_lane(&db).await;
     assert_eq!(open.lifecycle, "OPEN");
     assert_eq!(open.lifecycle_revision, sealed.lifecycle_revision + 1);
@@ -2426,15 +2719,9 @@ async fn sealed_resume_advances_epoch_replays_its_receipt_and_installs_the_write
     .await
     .expect("the earlier quiesce receipt remains idempotent after a later resume");
 
-    db.failpoint_stream_resume_for_test(
-        TABLE,
-        resume_id,
-        sealed.lifecycle_revision,
-        false,
-        actor,
-    )
-    .await
-    .expect("an exact lost-result retry must replay the selected receipt");
+    db.failpoint_stream_resume_for_test(TABLE, resume_id, sealed.lifecycle_revision, false, actor)
+        .await
+        .expect("an exact lost-result retry must replay the selected receipt");
     let rebound = db
         .failpoint_stream_resume_for_test(
             TABLE,
@@ -2476,15 +2763,9 @@ async fn sealed_resume_advances_epoch_replays_its_receipt_and_installs_the_write
         vec![("after-resume".to_string(), 41)]
     );
     let after_fold = stream_lane(&db).await;
-    db.failpoint_stream_resume_for_test(
-        TABLE,
-        resume_id,
-        sealed.lifecycle_revision,
-        false,
-        actor,
-    )
-    .await
-    .expect("the selected resume receipt remains idempotent after a later fold");
+    db.failpoint_stream_resume_for_test(TABLE, resume_id, sealed.lifecycle_revision, false, actor)
+        .await
+        .expect("the selected resume receipt remains idempotent after a later fold");
     assert_eq!(stream_lane(&db).await, after_fold);
     assert_no_recovery_sidecars(&dir);
 }
@@ -2507,20 +2788,12 @@ async fn concurrent_exact_resume_retry_does_not_retire_the_winners_writer() {
     let sealed_revision = sealed.lifecycle_revision;
     let resume_id = "2c2c2c2c-2c2c-4c2c-8c2c-2c2c2c2c2c2c";
     let actor = "operator:resume-race";
-    let first_sidecar = helpers::failpoint::Rendezvous::park_first(
-        names::RECOVERY_SIDECAR_WRITE,
-    );
+    let first_sidecar = helpers::failpoint::Rendezvous::park_first(names::RECOVERY_SIDECAR_WRITE);
 
     let first_db = Arc::clone(&db);
     let first = tokio::spawn(async move {
         first_db
-            .failpoint_stream_resume_for_test(
-                TABLE,
-                resume_id,
-                sealed_revision,
-                false,
-                actor,
-            )
+            .failpoint_stream_resume_for_test(TABLE, resume_id, sealed_revision, false, actor)
             .await
     });
     first_sidecar.wait_until_reached().await;
@@ -2528,13 +2801,7 @@ async fn concurrent_exact_resume_retry_does_not_retire_the_winners_writer() {
     let second_db = Arc::clone(&db);
     let mut second = tokio::spawn(async move {
         second_db
-            .failpoint_stream_resume_for_test(
-                TABLE,
-                resume_id,
-                sealed_revision,
-                false,
-                actor,
-            )
+            .failpoint_stream_resume_for_test(TABLE, resume_id, sealed_revision, false, actor)
             .await
     });
     assert!(
@@ -2618,15 +2885,9 @@ async fn resume_rolls_forward_a_confirmed_ledger_before_open_publication() {
         "the exact resume owner must remain durable"
     );
 
-    db.failpoint_stream_resume_for_test(
-        TABLE,
-        resume_id,
-        sealed.lifecycle_revision,
-        false,
-        actor,
-    )
-    .await
-    .expect("the exact retry must publish the confirmed receipt and OPEN row");
+    db.failpoint_stream_resume_for_test(TABLE, resume_id, sealed.lifecycle_revision, false, actor)
+        .await
+        .expect("the exact retry must publish the confirmed receipt and OPEN row");
     let open = stream_lane(&db).await;
     assert_eq!(open.lifecycle, "OPEN");
     assert!(epoch_floor(&open) > epoch_floor(&sealed));
@@ -2669,15 +2930,9 @@ async fn resume_retries_a_lost_terminal_sidecar_delete() {
         );
     }
 
-    db.failpoint_stream_resume_for_test(
-        TABLE,
-        resume_id,
-        sealed.lifecycle_revision,
-        false,
-        actor,
-    )
-    .await
-    .expect("receipt-first retry must finish stale sidecar cleanup");
+    db.failpoint_stream_resume_for_test(TABLE, resume_id, sealed.lifecycle_revision, false, actor)
+        .await
+        .expect("receipt-first retry must finish stale sidecar cleanup");
     assert_no_recovery_sidecars(&dir);
 }
 
@@ -2746,28 +3001,16 @@ async fn guarded_abort_reopens_only_an_empty_unblocked_drain() {
 
     let resume_id = "7a7a7a7a-7a7a-4a7a-8a7a-7a7a7a7a7a7a";
     let actor = "operator:abort";
-    db.failpoint_stream_resume_for_test(
-        TABLE,
-        resume_id,
-        draining.lifecycle_revision,
-        true,
-        actor,
-    )
-    .await
-    .expect("an empty unguarded drain may abort through a higher epoch");
+    db.failpoint_stream_resume_for_test(TABLE, resume_id, draining.lifecycle_revision, true, actor)
+        .await
+        .expect("an empty unguarded drain may abort through a higher epoch");
     let open = stream_lane(&db).await;
     assert_eq!(open.lifecycle, "OPEN");
     assert_eq!(open.lifecycle_revision, draining.lifecycle_revision + 1);
     assert!(epoch_floor(&open) > epoch_floor(&draining));
-    db.failpoint_stream_resume_for_test(
-        TABLE,
-        resume_id,
-        draining.lifecycle_revision,
-        true,
-        actor,
-    )
-    .await
-    .expect("an exact abort retry must replay its receipt");
+    db.failpoint_stream_resume_for_test(TABLE, resume_id, draining.lifecycle_revision, true, actor)
+        .await
+        .expect("an exact abort retry must replay its receipt");
     assert_no_recovery_sidecars(&dir);
 }
 
@@ -3733,10 +3976,7 @@ async fn fold_audit_failure_after_manifest_publish_converges_exactly_once() {
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
     let audit_after = helpers::recovery::recovery_audit_kinds(dir.path()).await;
-    assert_eq!(
-        &audit_after[..audit_before.len()],
-        audit_before.as_slice()
-    );
+    assert_eq!(&audit_after[..audit_before.len()], audit_before.as_slice());
     assert_eq!(audit_after.len(), audit_before.len() + 1);
     assert_eq!(
         audit_after.last().map(String::as_str),
@@ -4517,19 +4757,13 @@ async fn strict_fold_validation_failure_keeps_manifest_old_and_stream_fold_only(
     db.failpoint_stream_b1_for_test(TABLE, Some(duplicate), 0)
         .await
         .expect("base-dependent uniqueness is fold-time work");
-    let snapshot_before_fold = db
-        .snapshot_of(ReadTarget::branch("main"))
-        .await
-        .unwrap();
+    let snapshot_before_fold = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let fold_error = db
         .failpoint_stream_b1_for_test(TABLE, None, 0)
         .await
         .expect_err("strict fold must reject a committed uniqueness conflict");
     assert!(fold_error.to_string().contains("unique"), "{fold_error:?}");
-    let snapshot_after_fold = db
-        .snapshot_of(ReadTarget::branch("main"))
-        .await
-        .unwrap();
+    let snapshot_after_fold = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     assert_eq!(
         snapshot_after_fold.version(),
         snapshot_before_fold.version(),
@@ -4793,10 +5027,7 @@ async fn prepare_stream_ingest_replays_actor_bound_durable_receipt() {
             .await
             .expect("an existing lane needs no witness challenge");
     assert_eq!(already_enrolled, "already_enrolled");
-    assert_eq!(
-        current_incarnation.as_deref(),
-        Some(incarnation.as_str())
-    );
+    assert_eq!(current_incarnation.as_deref(), Some(incarnation.as_str()));
 
     let mut altered_witness: serde_json::Value =
         serde_json::from_str(&witness).expect("the opaque witness is valid JSON");
@@ -4804,11 +5035,14 @@ async fn prepare_stream_ingest_replays_actor_bound_durable_receipt() {
         serde_json::json!("34343434-3434-4434-8434-343434343434");
     let altered_witness =
         serde_json::to_string(&altered_witness).expect("the altered witness remains valid JSON");
-    let intent_rebind =
-        prepare_stream_ingest(&db, request_id, Some(&altered_witness), "agent:a")
-            .await
-            .expect_err("one request id cannot be rebound to another enrollment intent");
-    assert!(intent_rebind.to_string().contains("different enrollment intent"));
+    let intent_rebind = prepare_stream_ingest(&db, request_id, Some(&altered_witness), "agent:a")
+        .await
+        .expect_err("one request id cannot be rebound to another enrollment intent");
+    assert!(
+        intent_rebind
+            .to_string()
+            .contains("different enrollment intent")
+    );
 
     let actor_rebind = prepare_stream_ingest(&db, request_id, Some(&witness), "agent:b")
         .await
@@ -5011,8 +5245,7 @@ rules:
 
     {
         // Both refusals must happen before recovery, JSON parsing, or a Lance put.
-        let _must_not_enter_recovery =
-            ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
+        let _must_not_enter_recovery = ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
         let _must_not_invoke_put =
             ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
         let denied_prepare = prepare_stream_ingest(
@@ -5028,12 +5261,7 @@ rules:
             "{denied_prepare:?}"
         );
         let denied = db
-            .failpoint_stream_ingest_one_as_for_test(
-                TABLE,
-                b"{",
-                1,
-                "act-denied",
-            )
+            .failpoint_stream_ingest_one_as_for_test(TABLE, b"{", 1, "act-denied")
             .await
             .expect_err("Cedar must reject an actor without stream_ingest");
         assert!(matches!(denied, OmniError::Policy(_)), "{denied:?}");
@@ -5054,12 +5282,7 @@ rules:
             "{no_runtime_prepare:?}"
         );
         let no_runtime = db
-            .failpoint_stream_ingest_one_as_for_test(
-                TABLE,
-                b"{",
-                2,
-                "act-allowed",
-            )
+            .failpoint_stream_ingest_one_as_for_test(TABLE, b"{", 2, "act-allowed")
             .await
             .expect_err("an enabled ambient handle is not a serving runtime");
         assert!(
@@ -5776,8 +5999,7 @@ async fn authorized_json_ingest_rejects_invalid_shape_and_reserved_fields_effect
         .unwrap()
         .version();
     let inventory_before = mem_wal_inventory(db.uri()).await;
-    let _must_not_enter_recovery =
-        ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
+    let _must_not_enter_recovery = ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
     let _must_not_invoke_put = ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
     for (ordinal, (case, raw_json, expected)) in cases.into_iter().enumerate() {
         let error = db
@@ -5793,9 +6015,8 @@ async fn authorized_json_ingest_rejects_invalid_shape_and_reserved_fields_effect
     }
 
     let many_values = format!("{}0", "0,".repeat(140_000));
-    let structurally_amplified = format!(
-        r#"{{"$stream":{envelope_json},"id":"strict-row","score":[{many_values}]}}"#
-    );
+    let structurally_amplified =
+        format!(r#"{{"$stream":{envelope_json},"id":"strict-row","score":[{many_values}]}}"#);
     let error = db
         .failpoint_stream_ingest_one_as_for_test(
             TABLE,
@@ -5819,12 +6040,7 @@ async fn authorized_json_ingest_rejects_invalid_shape_and_reserved_fields_effect
 
     let oversized = vec![b' '; (32 * 1024 * 1024) + 1];
     let error = db
-        .failpoint_stream_ingest_one_as_for_test(
-            TABLE,
-            &oversized,
-            99,
-            "agent:strict",
-        )
+        .failpoint_stream_ingest_one_as_for_test(TABLE, &oversized, 99, "agent:strict")
         .await
         .expect_err("one raw JSON line above 32 MiB must fail before parsing");
     assert!(
@@ -5857,8 +6073,7 @@ async fn authorized_json_ingest_rejects_invalid_shape_and_reserved_fields_effect
         "invalid stream JSON must not create a generation"
     );
     assert_eq!(
-        inventory_after.referenced_generation_roots,
-        inventory_before.referenced_generation_roots,
+        inventory_after.referenced_generation_roots, inventory_before.referenced_generation_roots,
         "invalid stream JSON must not move generation authority"
     );
     assert!(visible_rows(&db).await.is_empty());
@@ -5899,8 +6114,7 @@ async fn authorized_json_ingest_normalizes_and_folds_one_edge() {
         .await
         .unwrap();
     {
-        let _must_not_enter_recovery =
-            ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
+        let _must_not_enter_recovery = ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
         let invalid = [
             (
                 "missing src",
@@ -5955,12 +6169,7 @@ async fn authorized_json_ingest_normalizes_and_folds_one_edge() {
     }))
     .unwrap();
     let (_, already_durable) = db
-        .failpoint_stream_ingest_one_as_for_test(
-            MIN_CARD_EDGE_TABLE,
-            &raw_json,
-            0,
-            "agent:edge",
-        )
+        .failpoint_stream_ingest_one_as_for_test(MIN_CARD_EDGE_TABLE, &raw_json, 0, "agent:edge")
         .await
         .expect("the strict normalizer must admit the accepted edge shape");
     assert!(!already_durable);
@@ -6156,8 +6365,7 @@ async fn authorized_json_ingest_normalizes_typed_values_and_rejects_value_errors
         .unwrap()
         .version();
     let inventory_before = mem_wal_inventory(db.uri()).await;
-    let _must_not_enter_recovery =
-        ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
+    let _must_not_enter_recovery = ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
     let _must_not_invoke_put = ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
     for (ordinal, (case, row, expected)) in invalid.into_iter().enumerate() {
         let error = db
@@ -6239,8 +6447,7 @@ async fn blob_bearing_table_is_rejected_before_any_stream_put() {
         .unwrap()
         .version();
     let inventory_before = mem_wal_inventory(db.uri()).await;
-    let _must_not_enter_recovery =
-        ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
+    let _must_not_enter_recovery = ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
     let _must_not_invoke_put = ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
 
     let raw = serde_json::json!({

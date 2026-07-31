@@ -170,8 +170,7 @@ pub mod names {
     /// the first sidecar body. Tests let a live writer publish and delete its
     /// sidecar in this window, proving a raced NotFound is concurrent
     /// completion rather than a storage failure.
-    pub const RECOVERY_POST_SIDECAR_LIST_PRE_READ: &str =
-        "recovery.post_sidecar_list_pre_read";
+    pub const RECOVERY_POST_SIDECAR_LIST_PRE_READ: &str = "recovery.post_sidecar_list_pre_read";
     pub const RECOVERY_SIDECAR_WRITE: &str = "recovery.sidecar_write";
     pub const SCHEMA_APPLY_AFTER_MANIFEST_COMMIT: &str = "schema_apply.after_manifest_commit";
     pub const SCHEMA_APPLY_AFTER_STAGING_WRITE: &str = "schema_apply.after_staging_write";
@@ -195,6 +194,10 @@ pub mod names {
     /// the table pointer and OPEN lifecycle land in one manifest CAS.
     pub const STREAM_ENROLLMENT_POST_SHARD_PRE_MANIFEST: &str =
         "stream_enrollment.post_shard_pre_manifest";
+    /// Recovery-v18 has durably armed an offline physical rebind, before the
+    /// old sealed lane's base table or MemWAL state can change.
+    pub const STREAM_REBIND_POST_SIDECAR_PRE_PHYSICAL: &str =
+        "stream_rebind.post_sidecar_pre_physical";
     /// B1 completed every row-effect-free check and reservation but has not
     /// invoked `ShardWriter::put_no_wait` yet.
     pub const STREAM_B1_BEFORE_PUT_INVOKE: &str = "stream_b1.before_put_invoke";
@@ -206,8 +209,7 @@ pub mod names {
     /// shared admission lease. Tests publish a fold in this gap to prove that
     /// token lookup and every effect-free classification use the later gated
     /// authority capture rather than this stale snapshot.
-    pub const STREAM_B2_AFTER_PROVISIONAL_AUTHORITY: &str =
-        "stream_b2.after_provisional_authority";
+    pub const STREAM_B2_AFTER_PROVISIONAL_AUTHORITY: &str = "stream_b2.after_provisional_authority";
     /// A put owns its exact Arrow charge, shared admission, and the same-key
     /// input queue, but has not begun warm validation or a cold writer claim.
     /// Tests park a cold replay opener here so already-charged waiters exist

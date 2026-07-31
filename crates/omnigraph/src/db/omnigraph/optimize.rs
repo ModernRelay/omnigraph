@@ -48,7 +48,9 @@ const DEFAULT_MAINT_CONCURRENCY: usize = 8;
 enum OptimizeMode<'a> {
     Ambient,
     #[cfg_attr(not(feature = "failpoints"), allow(dead_code))]
-    SealedMaintenance { actor_id: &'a str },
+    SealedMaintenance {
+        actor_id: &'a str,
+    },
 }
 
 impl<'a> OptimizeMode<'a> {
@@ -565,11 +567,14 @@ async fn optimize_all_tables_with_mode(
             let next = prior_stream_lifecycles
                 .iter()
                 .map(|prior| {
-                    let receipt = selected_claim_receipts.get(&prior.identity).ok_or_else(|| {
-                        OmniError::manifest_internal(
-                            "SEALED Optimize lost its selected ClaimReceipt",
-                        )
-                    })?;
+                    let receipt =
+                        selected_claim_receipts
+                            .get(&prior.identity)
+                            .ok_or_else(|| {
+                                OmniError::manifest_internal(
+                                    "SEALED Optimize lost its selected ClaimReceipt",
+                                )
+                            })?;
                     let head = achieved_heads.get(&prior.identity).ok_or_else(|| {
                         OmniError::manifest_internal(
                             "SEALED Optimize lost its confirmed table HEAD",
@@ -579,16 +584,15 @@ async fn optimize_all_tables_with_mode(
                 })
                 .collect::<Result<Vec<_>>>()
                 .map_err(|error| optimize_recovery_required(&recovery_handle, error))?;
-            if let Err(error) =
-                crate::db::manifest::confirm_stream_sealed_optimize_sidecar_v17(
-                    db.root_uri(),
-                    db.storage_adapter(),
-                    &mut sidecar,
-                    &updates,
-                    &achieved_heads,
-                    next.clone(),
-                )
-                .await
+            if let Err(error) = crate::db::manifest::confirm_stream_sealed_optimize_sidecar_v17(
+                db.root_uri(),
+                db.storage_adapter(),
+                &mut sidecar,
+                &updates,
+                &achieved_heads,
+                next.clone(),
+            )
+            .await
             {
                 return Err(optimize_recovery_required(&recovery_handle, error));
             }

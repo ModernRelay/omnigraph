@@ -234,11 +234,18 @@ pub async fn acquire_state_lock(
 /// Operation class bound into a checked control-plane authority.
 ///
 /// The engine consumes this value; no caller-supplied boolean can retarget an
-/// already checked profile operation.
+/// already checked profile or maintenance operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorityOperationClass {
     StreamProfileEnable,
     StreamProfileDisable,
+    /// Offline stream-aware schema and physical-binding maintenance.
+    ///
+    /// The lower guard proves only cluster-lock and stopped-process ownership.
+    /// The engine must additionally prove the exact graph is `DISABLED` at the
+    /// request's expected profile revision before minting its narrower checked
+    /// maintenance capability.
+    StreamMaintenance,
     StreamRuntime,
 }
 
@@ -247,7 +254,7 @@ impl AuthorityOperationClass {
         match self {
             Self::StreamProfileEnable => Some(true),
             Self::StreamProfileDisable => Some(false),
-            Self::StreamRuntime => None,
+            Self::StreamMaintenance | Self::StreamRuntime => None,
         }
     }
 }
@@ -337,7 +344,12 @@ impl ValidatedOfflineGuard<'_> {
     }
 }
 
-/// Validate and mint one offline profile authority under the actual state lock.
+/// Validate and mint one offline streaming authority under the actual state
+/// lock.
+///
+/// Profile changes and maintenance deliberately share the same concrete
+/// stopped-process proof. Their engine capabilities remain distinct: this
+/// lower guard cannot turn maintenance into a profile change, or vice versa.
 pub async fn validate_offline_guard<'lock>(
     lock: &'lock StateLockGuard,
     request: OfflineAuthorityRequest<'_>,
@@ -348,17 +360,21 @@ pub async fn validate_offline_guard<'lock>(
         ));
     }
     if !request.confirm_stream_offline {
-        return Err(invalid_binding(
-            "streaming profile changes require explicit confirm_stream_offline",
-        ));
+        let message = if request.operation == AuthorityOperationClass::StreamMaintenance {
+            "streaming maintenance requires explicit confirm_stream_offline"
+        } else {
+            "streaming profile changes require explicit confirm_stream_offline"
+        };
+        return Err(invalid_binding(message));
     }
     if !matches!(
         request.operation,
         AuthorityOperationClass::StreamProfileEnable
             | AuthorityOperationClass::StreamProfileDisable
+            | AuthorityOperationClass::StreamMaintenance
     ) {
         return Err(invalid_binding(
-            "offline guard operation must be a streaming profile transition",
+            "offline guard operation must be a streaming profile transition or stream maintenance",
         ));
     }
     validate_held_apply_lock(lock).await?;
@@ -1044,6 +1060,32 @@ mod tests {
         );
         assert_eq!(guard.actor(), "operator");
         drop(guard);
+
+        let maintenance = validate_offline_guard(
+            &lock,
+            OfflineAuthorityRequest {
+                graph_id: "knowledge",
+                graph_store_uri: &graph_store,
+                expected_state_cas: &state_cas,
+                state_revision: 7,
+                declaration_revision: "stream-declaration-v1",
+                declaration_digest: "stream-declaration",
+                expected_profile_revision: 1,
+                operation_id: "maintenance-operation",
+                operation: AuthorityOperationClass::StreamMaintenance,
+                actor: "operator",
+                confirm_stream_offline: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            maintenance.operation(),
+            AuthorityOperationClass::StreamMaintenance
+        );
+        assert_eq!(maintenance.operation_id(), "maintenance-operation");
+        assert_eq!(maintenance.operation().requested_streaming_enabled(), None);
+        drop(maintenance);
 
         std::fs::write(
             dir.path().join(CLUSTER_LOCK_FILE),

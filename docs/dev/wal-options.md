@@ -270,11 +270,11 @@ Avoid deleting individual objects inside a live MemWAL binding. Instead:
 The new root/path is never reused, so a stale writer targeting the retired root
 cannot alter the new authoritative root.
 
-This is a whole-graph operational cutover. It is not the same as rebinding one
-table to a fresh physical lifetime inside the existing graph. Such an in-root
-table rebind is inactive Phase-D work and would need its own recovery-owned
-physical build plus one `__manifest` publication protocol before it could be
-used here.
+This is a whole-graph operational cutover. It is not the same as the private
+in-root rebind now owned by recovery-v18, which replaces one exact `SEALED`
+table binding while retaining its old physical prefixes. That narrower path
+does not retire a graph root, release whole-root storage, or provide a public
+operator workflow, so it is not a substitute for this cutover.
 
 ### What it solves
 

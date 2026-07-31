@@ -479,10 +479,11 @@ inline lifecycle history with lifecycle-v3 ledger heads and recovery-v14
 hidden enrollment, claim, ordinary/drain-fold, and terminal receipt authority.
 V13/recovery-v15 adds private resume and guarded drain-abort.
 V14/recovery-v16 adds the checked-runtime `SEALED` EnsureIndices bridge;
-current v15/recovery-v17 adds the distinct checked-runtime `SEALED` Optimize
-bridge. Neither adds a token receipt or caller operation ID. Public
-ingress/enrollment/lifecycle control, correction, retirement, physical rebind,
-and public maintenance surfaces remain inactive.
+v15/recovery-v17 adds the distinct checked-runtime `SEALED` Optimize bridge.
+Neither maintenance owner adds a token receipt or caller operation ID. Current
+v16/recovery-v18 adds the separate private physical-rebind owner for an exact
+`SEALED` lane. Public ingress/enrollment/lifecycle control, correction,
+retirement, rebind, and public maintenance surfaces remain inactive.
 None of the later formats reinterprets or
 backfills v5 in place. A v5
 graph was never served with a

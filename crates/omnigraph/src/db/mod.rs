@@ -12,7 +12,8 @@ pub use manifest::{Snapshot, SnapshotScanner, SnapshotTable, SubTableEntry, SubT
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub(crate) use omnigraph::stream_lifecycle::build_sealed_maintenance_successor;
 pub use omnigraph::{
-    CheckedClusterApplyAuthority, CheckedClusterStreamRuntimeAuthority, CleanupPolicyOptions,
+    CheckedClusterApplyAuthority, CheckedClusterMaintenanceAuthority,
+    CheckedClusterStreamRuntimeAuthority, CleanupPolicyOptions,
     InitOptions, MergeOutcome, Omnigraph, OpenMode, PendingIndex, RepairAction,
     RepairClassification, RepairOptions, RepairStats, SchemaApplyOptions, SchemaApplyResult,
     SkipReason, StreamStatus, StreamTableStatus, StreamingProfileResult, TableCleanupStats,

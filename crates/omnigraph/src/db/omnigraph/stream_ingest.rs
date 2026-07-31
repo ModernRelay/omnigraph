@@ -21,9 +21,9 @@ use lance_index::mem_wal::{MemWalIndexDetails, MergedGeneration, ShardId, ShardS
 
 use crate::db::manifest::stream::{
     CLAIM_RECEIPT_TAG, ClaimProfile, DrainGoal, LastFoldOutcome, LastFoldSummary,
-    ManagementReceipt, STREAM_RESUME_OPERATION_KIND, StreamGenerationCut, StreamResumeMode,
-    StreamResumeRequestPayload, stream_graph_identity_digest, stream_quiesce_result_payload,
-    stream_resume_result_payload,
+    ManagementReceipt, RetainedShardInventoryCommitment, STREAM_RESUME_OPERATION_KIND,
+    StreamGenerationCut, StreamResumeMode, StreamResumeRequestPayload,
+    stream_graph_identity_digest, stream_quiesce_result_payload, stream_resume_result_payload,
 };
 use crate::db::manifest::stream_token::{
     AdmissionClassification, AdmissionRequest, PayloadDigest, PayloadDigestInput,
@@ -43,24 +43,23 @@ use crate::db::manifest::{
     CurrentHeadWitness, ExpectedTableVersions, ManifestChange, RecoveryAuthorityToken,
     RecoveryLineageIntent, RecoveryProtocolV14, RecoveryProtocolV15,
     RecoveryStreamClaimContinuationV14, RecoveryStreamClaimOutcomeV14, RecoveryStreamFoldCut,
-    RecoveryStreamLifecycleReceiptKind, RecoveryStreamOpenPlanV15,
-    RecoveryStreamResumeOutcomeV15, RecoveryStreamResumeRequestV15, SidecarTablePin,
-    StreamLifecycle, StreamLifecycleEntry, StreamPhysicalBinding, TableIdentity,
-    TableVersionExpectation, arm_stream_claim_checkpoint_sidecar_v14,
-    arm_stream_claim_terminal_sidecar_v14, classify_effect_free_stream_claim_sidecar_v14,
+    RecoveryStreamLifecycleReceiptKind, RecoveryStreamOpenPlanV15, RecoveryStreamResumeOutcomeV15,
+    RecoveryStreamResumeRequestV15, SidecarTablePin, StreamLifecycle, StreamLifecycleEntry,
+    StreamPhysicalBinding, TableIdentity, TableVersionExpectation,
+    arm_stream_claim_checkpoint_sidecar_v14, arm_stream_claim_terminal_sidecar_v14,
     arm_stream_resume_checkpoint_sidecar_v15, arm_stream_resume_terminal_sidecar_v15,
-    classify_effect_free_stream_resume_sidecar_v15,
+    classify_effect_free_stream_claim_sidecar_v14, classify_effect_free_stream_resume_sidecar_v15,
     complete_stream_claim_sidecar_v14, complete_stream_fold_sidecar_v14,
-    complete_stream_lifecycle_receipt_sidecar_v14, confirm_stream_claim_sidecar_v14,
-    complete_stream_resume_sidecar_v15, confirm_stream_resume_sidecar_v15,
-    confirm_stream_fold_sidecar_v14, confirm_stream_lifecycle_receipt_sidecar_v14,
+    complete_stream_lifecycle_receipt_sidecar_v14, complete_stream_resume_sidecar_v15,
+    confirm_stream_claim_sidecar_v14, confirm_stream_fold_sidecar_v14,
+    confirm_stream_lifecycle_receipt_sidecar_v14, confirm_stream_resume_sidecar_v15,
     finalize_effect_free_stream_fold_sidecar_v14, list_sidecars,
     lookup_stream_claim_continuation_v14, new_stream_claim_sidecar_v14,
     new_stream_drain_fold_sidecar_v14, new_stream_fold_v2_sidecar_v14,
-    new_stream_lifecycle_receipt_sidecar_v14, prepared_stream_claim_attempt_v14,
-    new_stream_resume_sidecar_v15, prepared_stream_resume_attempt_v15,
-    rearm_stream_claim_checkpoint_sidecar_v14, receipt_first_rearm_stream_claim_sidecar_v14,
-    rearm_stream_resume_checkpoint_sidecar_v15, write_sidecar,
+    new_stream_lifecycle_receipt_sidecar_v14, new_stream_resume_sidecar_v15,
+    prepared_stream_claim_attempt_v14, prepared_stream_resume_attempt_v15,
+    rearm_stream_claim_checkpoint_sidecar_v14, rearm_stream_resume_checkpoint_sidecar_v15,
+    receipt_first_rearm_stream_claim_sidecar_v14, write_sidecar,
 };
 use crate::db::write_queue::StreamAdmissionKey;
 use crate::error::{OmniError, Result};
@@ -75,22 +74,22 @@ use crate::table_store::mem_wal::{
     QueuedBatchPermit, QuiesceCut, SealedGenerationCut, StreamWorkerKey, WorkerOpenFailure,
     b1_input_accounting, b1_logical_batch_bytes, capture_current_head_witness,
     reconstruct_b1_writer_config, scan_flushed_generation_projection,
-    validate_b1_lifecycle_physical_state, validate_stream_config_v3_binding,
+    validate_b1_lifecycle_current_binding_physical_state,
+    validate_b1_lifecycle_physical_state_with_binding_inventory, validate_stream_config_v3_binding,
 };
 use crate::validate::{ChangeSet, CommittedState, TableChange};
 
 use super::stream_lifecycle::{
     CanonicalDataBlockEvidence, ClaimAttemptEvidence, ClaimAttemptRequest, ClaimOperationRequest,
-    DataBlockEvidenceCollector, EmptyCutEvidence, QuiesceRequest, authenticate_claim_wal_segment,
-    build_claim_adoption_row, build_claim_attempt_effect, build_draining_data_block,
-    build_draining_to_sealed, build_open_to_draining, build_resume_adoption_row,
-    build_terminal_claim,
-    claim_wal_authentication_plan, claim_wal_key_discovery_plan, collect_claim_wal_segment_keys,
+    DataBlockEvidenceCollector, EmptyCutEvidence, QuiesceRequest, StreamResumeRequest,
+    authenticate_claim_wal_segment, build_claim_adoption_row, build_claim_attempt_effect,
+    build_draining_data_block, build_draining_to_sealed, build_open_to_draining,
+    build_resume_adoption_row, build_terminal_claim, claim_wal_authentication_plan,
+    claim_wal_key_discovery_plan, collect_claim_wal_segment_keys,
     current_generation_lww_projection_digest, lifecycle_generation_lww_projection_digest,
     prepare_claim_attempt, prepare_claim_operation, prepare_resume_claim_operation,
     prepare_stream_resume_open, stream_quiesce_request_digest,
-    stream_quiesce_request_payload_from_draining,
-    validate_selected_management_receipt_progress, StreamResumeRequest,
+    stream_quiesce_request_payload_from_draining, validate_selected_management_receipt_progress,
 };
 use super::{Omnigraph, WriteTxn};
 
@@ -230,6 +229,7 @@ pub(super) struct StreamAuthorityCapture {
     pub(super) admission_key: StreamAdmissionKey,
     pub(super) shard_id: ShardId,
     pub(super) enrollment_id: ShardId,
+    pub(super) retained_shard_inventory: Option<RetainedShardInventoryCommitment>,
     pub(super) epoch_floor: u64,
     pub(super) full_path: String,
     pub(super) head: SnapshotHandle,
@@ -2204,6 +2204,7 @@ impl Omnigraph {
                         exclusive_authority,
                         draining.head.dataset().clone(),
                         draining.lifecycle.clone(),
+                        draining.retained_shard_inventory.clone(),
                         receipt,
                     )
                     .await
@@ -2335,9 +2336,13 @@ impl Omnigraph {
         let current_claim_receipt = self
             .selected_claim_receipt(&capture.txn.base, &draining)
             .await?;
-        let physical = validate_b1_lifecycle_physical_state(capture.head.dataset(), &draining)
-            .await
-            .map_err(worker_error)?;
+        let physical = validate_b1_lifecycle_physical_state_with_binding_inventory(
+            capture.head.dataset(),
+            &draining,
+            capture.retained_shard_inventory.as_ref(),
+        )
+        .await
+        .map_err(worker_error)?;
         let (
             shard_manifest_version,
             current_generation,
@@ -2644,9 +2649,13 @@ impl Omnigraph {
                 Some(format!("{final_witness:?}")),
             ));
         }
-        match validate_b1_lifecycle_physical_state(final_head.dataset(), &live_lifecycle)
-            .await
-            .map_err(worker_error)?
+        match validate_b1_lifecycle_physical_state_with_binding_inventory(
+            final_head.dataset(),
+            &live_lifecycle,
+            prepared.retained_shard_inventory.as_ref(),
+        )
+        .await
+        .map_err(worker_error)?
         {
             PassiveB1PhysicalState::FoldOnlyFlushed(flushed)
                 if flushed.shard_manifest_version >= cut.shard_manifest_version
@@ -3428,25 +3437,17 @@ impl Omnigraph {
                 self.capture_sealed_stream_authority(&table_key, "stream resume")
                     .await?
             }
-            StreamResumeMode::AbortDrain
-                if lifecycle.lifecycle == StreamLifecycle::Draining =>
-            {
+            StreamResumeMode::AbortDrain if lifecycle.lifecycle == StreamLifecycle::Draining => {
                 let drain_id = lifecycle
                     .drain
                     .as_ref()
                     .ok_or_else(|| {
-                        OmniError::manifest_internal(
-                            "stream abort-drain lost its drain descriptor",
-                        )
+                        OmniError::manifest_internal("stream abort-drain lost its drain descriptor")
                     })?
                     .drain_id
                     .clone();
-                self.capture_draining_stream_authority(
-                    &table_key,
-                    "stream abort-drain",
-                    &drain_id,
-                )
-                .await?
+                self.capture_draining_stream_authority(&table_key, "stream abort-drain", &drain_id)
+                    .await?
             }
             _ => {
                 return Err(OmniError::manifest_stream_lifecycle_conflict(
@@ -3522,11 +3523,7 @@ impl Omnigraph {
             });
         }
         let recaptured = self
-            .recapture_stream_resume_lane(
-                &provisional,
-                mode,
-                "stream resume post-wait authority",
-            )
+            .recapture_stream_resume_lane(&provisional, mode, "stream resume post-wait authority")
             .await?;
         validate_stream_resume_profile_authority(&recaptured.txn.base)?;
         self.prepare_stream_resume_preflight(
@@ -3602,9 +3599,7 @@ impl Omnigraph {
             .base
             .stream_lifecycle(key.identity)
             .cloned()
-            .ok_or_else(|| {
-                OmniError::manifest_internal("stream resume lost its lifecycle lane")
-            })?;
+            .ok_or_else(|| OmniError::manifest_internal("stream resume lost its lifecycle lane"))?;
         if self
             .selected_resume_receipt_matches(
                 &terminal.base,
@@ -3617,12 +3612,8 @@ impl Omnigraph {
             )
             .await?
         {
-            self.complete_selected_resume_sidecar(
-                &terminal.base,
-                &terminal_lifecycle,
-                &resume_id,
-            )
-            .await?;
+            self.complete_selected_resume_sidecar(&terminal.base, &terminal_lifecycle, &resume_id)
+                .await?;
             return Ok(());
         }
         open_result.map_err(worker_error)
@@ -3647,9 +3638,7 @@ impl Omnigraph {
             .branch_list()
             .await?
             .into_iter()
-            .filter(|branch| {
-                branch != "main" && !crate::db::is_internal_system_branch(branch)
-            })
+            .filter(|branch| branch != "main" && !crate::db::is_internal_system_branch(branch))
             .collect::<Vec<_>>();
         let prepared = prepare_stream_resume_open(
             &capture.lifecycle,
@@ -3678,8 +3667,7 @@ impl Omnigraph {
     ) -> Result<()> {
         let mut exact = None;
         for sidecar in list_sidecars(self.root_uri(), self.storage_adapter()).await? {
-            let Some(RecoveryProtocolV15::StreamResume(protocol)) =
-                sidecar.protocol_v15.as_deref()
+            let Some(RecoveryProtocolV15::StreamResume(protocol)) = sidecar.protocol_v15.as_deref()
             else {
                 continue;
             };
@@ -3754,8 +3742,7 @@ impl Omnigraph {
         })?;
         let exact = receipt.graph_identity_digest == graph_identity_digest
             && receipt.identity == lifecycle.identity
-            && receipt.stream_incarnation_id
-                == lifecycle.enrollment_receipt.stream_incarnation_id
+            && receipt.stream_incarnation_id == lifecycle.enrollment_receipt.stream_incarnation_id
             && receipt.binding_scope_id == lifecycle.binding_scope_id
             && receipt.operation_kind == STREAM_RESUME_OPERATION_KIND
             && receipt.operation_id == resume_id
@@ -3768,8 +3755,7 @@ impl Omnigraph {
             && request.actor_id == actor_id
             && request.graph_identity_digest == graph_identity_digest
             && request.identity == lifecycle.identity
-            && request.stream_incarnation_id
-                == lifecycle.enrollment_receipt.stream_incarnation_id
+            && request.stream_incarnation_id == lifecycle.enrollment_receipt.stream_incarnation_id
             && request.binding_scope_id == lifecycle.binding_scope_id
             && request.enrollment_id == lifecycle.binding.enrollment_id
             && request.public_named_branches.is_empty()
@@ -3783,11 +3769,7 @@ impl Omnigraph {
                 operation_id: resume_id.to_string(),
             });
         }
-        validate_selected_management_receipt_progress(
-            lifecycle,
-            &receipt,
-            StreamLifecycle::Open,
-        )?;
+        validate_selected_management_receipt_progress(lifecycle, &receipt, StreamLifecycle::Open)?;
         Ok(true)
     }
 
@@ -3812,12 +3794,13 @@ impl Omnigraph {
             .acquire_many(&[(capture.entry.table_key.clone(), None)])
             .await;
         let gated_capture = match mode {
-            StreamResumeMode::ResumeSealed => self
-                .capture_sealed_stream_authority(
+            StreamResumeMode::ResumeSealed => {
+                self.capture_sealed_stream_authority(
                     &capture.entry.table_key,
                     "stream resume gated recapture",
                 )
-                .await,
+                .await
+            }
             StreamResumeMode::AbortDrain => {
                 let drain_id = capture
                     .lifecycle
@@ -4000,9 +3983,11 @@ impl Omnigraph {
                     .await;
                 }
                 RecoveryStreamResumeOutcomeV15::TerminalVisible { .. } => {
-                    return Err(WorkerOpenFailure::unclaimed(MemWalWorkerError::InvalidState {
-                        reason: "stream resume terminal receipt is already visible".to_string(),
-                    }));
+                    return Err(WorkerOpenFailure::unclaimed(
+                        MemWalWorkerError::InvalidState {
+                            reason: "stream resume terminal receipt is already visible".to_string(),
+                        },
+                    ));
                 }
             }
         } else {
@@ -4213,13 +4198,7 @@ impl Omnigraph {
             if matches!(evidence, ClaimAttemptEvidence::StockManifestOnly { .. }) {
                 let records = [LifecycleLedgerRecord::ClaimAttemptEffect(effect.clone())];
                 let outcome = self
-                    .commit_stream_resume_ledger(
-                        &snapshot,
-                        &mut sidecar,
-                        &records,
-                        effect,
-                        None,
-                    )
+                    .commit_stream_resume_ledger(&snapshot, &mut sidecar, &records, effect, None)
                     .await
                     .map_err(|error| {
                         worker_open_failure_preserving_claim(
@@ -4271,9 +4250,7 @@ impl Omnigraph {
                     &attempt,
                 )
                 .await
-                .map_err(|error| {
-                    WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
-                })?;
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
                 prior_attempt_chain = next_chain;
                 invoke_attempt = true;
                 continue;
@@ -4299,10 +4276,13 @@ impl Omnigraph {
                 )
                 .await
                 .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
-                return Err(WorkerOpenFailure::unclaimed(MemWalWorkerError::InvalidState {
-                    reason: "recovered stream resume published without a live process-local writer"
-                        .to_string(),
-                }));
+                return Err(WorkerOpenFailure::unclaimed(
+                    MemWalWorkerError::InvalidState {
+                        reason:
+                            "recovered stream resume published without a live process-local writer"
+                                .to_string(),
+                    },
+                ));
             }
             if let Some(error) = writer_claim_error.take() {
                 return Err(WorkerOpenFailure::unclaimed(MemWalWorkerError::Lance {
@@ -4442,9 +4422,10 @@ impl Omnigraph {
             STREAM_RESUME_OPERATION_KIND,
             current_lifecycle.lifecycle_revision,
             prepared_open.next_lifecycle_revision,
-            sidecar.actor_id.clone().ok_or_else(|| {
-                OmniError::manifest_internal("resume sidecar lost its actor")
-            })?,
+            sidecar
+                .actor_id
+                .clone()
+                .ok_or_else(|| OmniError::manifest_internal("resume sidecar lost its actor"))?,
             prepared_open.request_payload.clone(),
             result_payload,
             prepared_open.recorded_at,
@@ -4634,12 +4615,8 @@ impl Omnigraph {
                     })?
                     .drain_id
                     .clone();
-                self.capture_draining_stream_authority(
-                    &prior.entry.table_key,
-                    operation,
-                    &drain_id,
-                )
-                .await
+                self.capture_draining_stream_authority(&prior.entry.table_key, operation, &drain_id)
+                    .await
             }
         }
     }
@@ -5535,6 +5512,7 @@ impl Omnigraph {
             &capture.lifecycle,
         )
         .await
+        .map(|_| ())
     }
 
     pub(super) async fn capture_stream_authority(
@@ -5715,6 +5693,28 @@ impl Omnigraph {
         let binding = lifecycle.binding.clone();
         let (enrollment_id, shard_id) =
             validate_stream_config_v3_binding(&details, &binding).map_err(worker_error)?;
+        let token_dataset = txn.base.open_stream_token_authority().await?;
+        let graph_identity_digest =
+            stream_graph_identity_digest(&txn.authority.schema_identity_domain)?;
+        let retained_shard_inventory =
+            super::stream_enrollment::validate_selected_lifecycle_ledger_authority(
+                &token_dataset,
+                txn.base.stream_token_authority(),
+                &graph_identity_digest,
+                &lifecycle,
+            )
+            .await?;
+        // The selected BindingReceipt already authenticates retained history by
+        // one fixed-size commitment. Ordinary authority capture needs only the
+        // current index/shard; old shard prefixes are inert and their complete
+        // inventory is checked at cold-open, rebind, and recovery boundaries.
+        validate_b1_lifecycle_current_binding_physical_state(
+            head.dataset(),
+            &lifecycle,
+            retained_shard_inventory.as_ref(),
+        )
+        .await
+        .map_err(worker_error)?;
         let worker_key =
             StreamWorkerKey::new(entry.identity, enrollment_id, shard_id).map_err(worker_error)?;
         let epoch_floor = lifecycle
@@ -5736,6 +5736,7 @@ impl Omnigraph {
             admission_key,
             shard_id,
             enrollment_id,
+            retained_shard_inventory,
             epoch_floor,
             full_path,
             head,
@@ -6292,9 +6293,13 @@ async fn ensure_abort_drain_physical_cut_is_empty(
             physical.replay_cursor, capture.lifecycle.authenticated_wal_tail.position
         )));
     }
-    let passive = validate_b1_lifecycle_physical_state(capture.head.dataset(), &capture.lifecycle)
-        .await
-        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    let passive = validate_b1_lifecycle_physical_state_with_binding_inventory(
+        capture.head.dataset(),
+        &capture.lifecycle,
+        capture.retained_shard_inventory.as_ref(),
+    )
+    .await
+    .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
     match passive {
         PassiveB1PhysicalState::AdmitOrReplay {
             shard_manifest_version,
@@ -6360,8 +6365,7 @@ fn validate_selected_quiesce_receipt(
 ) -> Result<()> {
     if receipt.graph_identity_digest != graph_identity_digest
         || receipt.identity != lifecycle.identity
-        || receipt.stream_incarnation_id
-            != lifecycle.enrollment_receipt.stream_incarnation_id
+        || receipt.stream_incarnation_id != lifecycle.enrollment_receipt.stream_incarnation_id
         || receipt.binding_scope_id != lifecycle.binding_scope_id
         || receipt.operation_kind != "QUIESCE"
         || receipt.operation_id != drain_id
@@ -6381,11 +6385,7 @@ fn validate_selected_quiesce_receipt(
             "selected terminal quiesce receipt has a noncanonical result payload",
         ));
     }
-    validate_selected_management_receipt_progress(
-        lifecycle,
-        receipt,
-        StreamLifecycle::Sealed,
-    )
+    validate_selected_management_receipt_progress(lifecycle, receipt, StreamLifecycle::Sealed)
 }
 
 async fn claim_wal_tailer(capture: &StreamAuthorityCapture) -> Result<WalTailer> {
@@ -6415,9 +6415,13 @@ async fn recovered_current_generation_projection_source(
     attempt: &super::stream_lifecycle::PreparedClaimAttempt,
     achieved: &ClaimPhysicalPrestate,
 ) -> Result<CurrentGenerationProjectionSource> {
-    let physical = validate_b1_lifecycle_physical_state(capture.head.dataset(), &capture.lifecycle)
-        .await
-        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    let physical = validate_b1_lifecycle_physical_state_with_binding_inventory(
+        capture.head.dataset(),
+        &capture.lifecycle,
+        capture.retained_shard_inventory.as_ref(),
+    )
+    .await
+    .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
     match physical {
         PassiveB1PhysicalState::FoldOnlyFlushed(flushed) => {
             if flushed.shard_manifest_version != achieved.shard_manifest_version

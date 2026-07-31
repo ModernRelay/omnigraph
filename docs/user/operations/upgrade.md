@@ -43,14 +43,15 @@ from that line (the latest is safest):
 | internal schema v12 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
 | internal schema v13 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
 | internal schema v14 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v15 | unreleased (current 0.10.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
+| internal schema v15 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
+| internal schema v16 | unreleased (current 0.10.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
 
 **Stamps v5–v8 never shipped.** The storage format advanced five times inside
 the single 0.8.1 → 0.9.0 development window, so the only graphs carrying those
 stamps came from source builds off `main`; no published binary reads them and
 the refusal message names them `0.9.0-dev`. If you have one, export it with a
 build of the commit that created it, then load into a fresh current-format
-graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10–v15 are
+graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10–v16 are
 pre-release formats written by matching 0.10.0-dev source builds. The final
 0.10.0 format may use a later stamp.
 
@@ -122,6 +123,35 @@ complete. Do not use force-init to turn the old root into the new format.
   `append`/`merge` writes copy external payloads instead, as described below.
 - **Server deployments**: take the graph out of the serving set, rebuild it offline
   with the CLI, then point the cluster at the rebuilt graph (`cluster apply`).
+
+## Migrating from internal schema v15 to v16
+
+Internal schema v16 adds recovery-v18 for the private physical-rebind owner.
+Recovery-v18 binds a complete prior `SEALED` lifecycle, one fresh enrollment
+and empty shard namespace, the immutable binding and fence-only claim receipts,
+and the exact next `SEALED` proof. It does not reinterpret recovery-v14's
+three-field rebind scaffold or recovery-v17's Optimize envelope. Rebind itself
+never opens admission; a separate resume is required.
+
+Before exporting, use the final v15 source build at merge
+`84f3af758947970d16040a987cb1d6ea0f0931e8`:
+
+1. Gracefully stop every writer-capable process for the graph.
+2. Explicitly disable its streaming profile.
+3. Verify that the graph is clean, disabled, and unenrolled. Ordinary export
+   transfers logical rows, not private lifecycle, WAL, token, receipt, or
+   pending rebind authority.
+4. Export the visible logical graph.
+
+If step 3 finds a lifecycle row or other private stream authority, stop and
+keep the v15 root intact. V16 does not add stream-aware export, authority
+retirement, or an authority-preserving v15→v16 transfer; a logical-row rebuild
+must not be presented as migration of sequencing authority.
+
+Then use the v16 binary to initialize a **different** root, load the export,
+apply cluster configuration, and restart serving. Verify row/vector/blob
+fidelity and the v16 stamp before cutover. Keep the v15 root unchanged through
+the rollback window. A v16 binary refuses v15, and a v15 binary refuses v16.
 
 ## Migrating from internal schema v14 to v15
 
