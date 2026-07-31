@@ -2604,6 +2604,18 @@ impl Omnigraph {
         optimize::optimize_all_tables(self).await
     }
 
+    /// Feature-gated checked-runtime seam for canonical-main Optimize across
+    /// ordinary and productive `SEALED` stream tables. Public maintenance
+    /// transport remains an F7 concern.
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    pub async fn failpoint_stream_sealed_optimize_for_test(
+        &self,
+        actor_id: &str,
+    ) -> Result<Vec<optimize::TableOptimizeStats>> {
+        optimize::optimize_all_tables_sealed_as(self, actor_id).await
+    }
+
     /// Classify and explicitly repair uncovered manifest/head drift. See
     /// [`repair`] for the distinction between safe maintenance drift and
     /// suspicious/unverifiable drift.

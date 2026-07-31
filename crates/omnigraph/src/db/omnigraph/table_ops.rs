@@ -709,8 +709,9 @@ async fn ensure_indices_for_branch(
                 )
                 .await?;
             } else {
-                commit_sealed_ensure_indices_on_main(
+                commit_sealed_maintenance_on_main(
                     db,
+                    "sealed ensure_indices",
                     &updates,
                     &expected_versions,
                     &txn,
@@ -763,7 +764,7 @@ fn pre_minted_index_transaction(
     }
 }
 
-async fn selected_claim_receipts_for_sealed_maintenance(
+pub(super) async fn selected_claim_receipts_for_sealed_maintenance(
     snapshot: &crate::db::manifest::Snapshot,
     lifecycles: &[crate::db::manifest::StreamLifecycleEntry],
 ) -> Result<HashMap<crate::db::manifest::TableIdentity, crate::db::manifest::stream::ClaimReceipt>>
@@ -776,7 +777,7 @@ async fn selected_claim_receipts_for_sealed_maintenance(
             .as_deref()
             .ok_or_else(|| {
                 OmniError::manifest_internal(
-                    "SEALED EnsureIndices requires a selected current ClaimReceipt",
+                    "SEALED maintenance requires a selected current ClaimReceipt",
                 )
             })?;
         let record = crate::db::manifest::lookup_lifecycle_ledger_record_by_id(
@@ -788,19 +789,19 @@ async fn selected_claim_receipts_for_sealed_maintenance(
         .await?
         .ok_or_else(|| {
             OmniError::manifest_internal(
-                "SEALED EnsureIndices selected ClaimReceipt is absent from token authority",
+                "SEALED maintenance selected ClaimReceipt is absent from token authority",
             )
         })?;
         let crate::db::manifest::LifecycleLedgerRecord::ClaimReceipt(receipt) = record else {
             return Err(OmniError::manifest_internal(
-                "SEALED EnsureIndices selected ClaimReceipt ID decoded another ledger family",
+                "SEALED maintenance selected ClaimReceipt ID decoded another ledger family",
             ));
         };
         if receipt.record_id != record_id
             || lifecycle.claim_receipt_chain.head_record_id.as_deref() != Some(record_id)
         {
             return Err(OmniError::manifest_internal(
-                "SEALED EnsureIndices ClaimReceipt is not the selected claim-chain head",
+                "SEALED maintenance ClaimReceipt is not the selected claim-chain head",
             ));
         }
         receipts.insert(lifecycle.identity, receipt);
@@ -1901,8 +1902,9 @@ pub(super) async fn commit_updates_on_branch_with_expected(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn commit_sealed_ensure_indices_on_main(
+pub(super) async fn commit_sealed_maintenance_on_main(
     db: &Omnigraph,
+    operation: &str,
     updates: &[crate::db::SubTableUpdate],
     expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
     txn: &crate::db::WriteTxn,
@@ -1911,23 +1913,58 @@ async fn commit_sealed_ensure_indices_on_main(
     next_lifecycles: &[crate::db::manifest::StreamLifecycleEntry],
     profile: &crate::db::manifest::StreamProfileEntry,
 ) -> Result<u64> {
-    db.ensure_schema_apply_not_locked("sealed ensure_indices commit")
+    db.ensure_schema_apply_not_locked(&format!("{operation} commit"))
         .await?;
+    if prior_lifecycles.len() != next_lifecycles.len() {
+        return Err(OmniError::manifest_internal(format!(
+            "{operation} received {} prior lifecycle rows but {} successors",
+            prior_lifecycles.len(),
+            next_lifecycles.len(),
+        )));
+    }
+
+    let update_identities = updates
+        .iter()
+        .map(|update| update.identity)
+        .collect::<std::collections::HashSet<_>>();
+    if update_identities.len() != updates.len() {
+        return Err(OmniError::manifest_internal(format!(
+            "{operation} received duplicate productive table updates",
+        )));
+    }
+    let mut lifecycle_identities = std::collections::HashSet::new();
+    let mut lifecycle_changes = Vec::with_capacity(prior_lifecycles.len());
+    for (expected, next) in prior_lifecycles.iter().zip(next_lifecycles) {
+        if expected.identity != next.identity {
+            return Err(OmniError::manifest_internal(format!(
+                "{operation} lifecycle successor identity {:?} does not match prior identity {:?}",
+                next.identity, expected.identity,
+            )));
+        }
+        if !lifecycle_identities.insert(expected.identity) {
+            return Err(OmniError::manifest_internal(format!(
+                "{operation} received duplicate lifecycle identity {:?}",
+                expected.identity,
+            )));
+        }
+        if !update_identities.contains(&expected.identity) {
+            return Err(OmniError::manifest_internal(format!(
+                "{operation} lifecycle identity {:?} has no productive table update",
+                expected.identity,
+            )));
+        }
+        lifecycle_changes.push(ManifestChange::SetStreamLifecycle {
+            expected: Some(expected.clone()),
+            next: next.clone(),
+        });
+    }
+
     let prepared = prepare_updates_for_commit(db, None, updates, Some(txn)).await?;
     let mut changes = prepared
         .into_iter()
         .map(ManifestChange::Update)
         .collect::<Vec<_>>();
-    changes.extend(
-        prior_lifecycles
-            .iter()
-            .cloned()
-            .zip(next_lifecycles.iter().cloned())
-            .map(|(expected, next)| ManifestChange::SetStreamLifecycle {
-                expected: Some(expected),
-                next,
-            }),
-    );
+    changes.extend(lifecycle_changes);
     changes.push(ManifestChange::SetStreamProfile {
         expected: profile.clone(),
         next: profile.clone(),

@@ -477,10 +477,11 @@ replaces the profile boolean with protocol-v2 checked authority and adds
 recovery-v13 `StreamProfileChange`. The v12 format replaces
 inline lifecycle history with lifecycle-v3 ledger heads and recovery-v14
 hidden enrollment, claim, ordinary/drain-fold, and terminal receipt authority.
-V13/recovery-v15 adds private resume and guarded drain-abort. Current
-v14/recovery-v16 adds only the checked-runtime `SEALED` EnsureIndices bridge,
-without a token receipt or caller operation ID. Public
-ingress/enrollment/lifecycle control, correction, retirement, Optimize/rebind,
+V13/recovery-v15 adds private resume and guarded drain-abort.
+V14/recovery-v16 adds the checked-runtime `SEALED` EnsureIndices bridge;
+current v15/recovery-v17 adds the distinct checked-runtime `SEALED` Optimize
+bridge. Neither adds a token receipt or caller operation ID. Public
+ingress/enrollment/lifecycle control, correction, retirement, physical rebind,
 and public maintenance surfaces remain inactive.
 None of the later formats reinterprets or
 backfills v5 in place. A v5

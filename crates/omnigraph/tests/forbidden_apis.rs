@@ -207,6 +207,8 @@ const STREAM_ENROLLMENT_V14: WriteProtocol =
     WriteProtocol::Exact("StreamEnrollmentV2 recovery v14");
 const STREAM_LIFECYCLE_V14: WriteProtocol =
     WriteProtocol::Exact("private firehose lifecycle recovery v14");
+const STREAM_LIFECYCLE_V14_V15: WriteProtocol =
+    WriteProtocol::Composed("private firehose lifecycle recovery v14 + resume recovery v15");
 /// RFC-026 checked profile authority: ENABLED/DISABLED terminal transitions
 /// pair one immutable token-ledger receipt with one profile/lineage publish
 /// under recovery-v13. Disable additionally persists the admission-cutoff
@@ -242,6 +244,7 @@ write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::TestOnly => [
         "failpoint_publish_table_head_without_index_rebuild_for_test",
         "failpoint_stream_sealed_ensure_indices_for_test",
+        "failpoint_stream_sealed_optimize_for_test",
     ],
     "db/omnigraph/stream_enrollment.rs" => WriteProtocol::TestOnly => [
         "failpoint_enroll_stream_table_for_test",
@@ -694,16 +697,16 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", "write_sidecar(", 1, INDICES_V9),
     ("db/omnigraph/optimize.rs", "write_sidecar(", 1, OPTIMIZE_V9),
     ("db/omnigraph/stream_enrollment.rs", "write_sidecar(", 1, STREAM_ENROLLMENT_V14),
-    ("db/omnigraph/stream_ingest.rs", "write_sidecar(", 3, STREAM_LIFECYCLE_V14),
+    ("db/omnigraph/stream_ingest.rs", "write_sidecar(", 4, STREAM_LIFECYCLE_V14_V15),
     ("db/omnigraph/stream_profile.rs", "write_sidecar(", 1, STREAM_PROFILE_V13),
     ("db/manifest/token_store.rs", "Dataset::write(", 1, WriteProtocol::Bootstrap),
     ("db/manifest/token_store.rs", "MergeInsertBuilder::try_new(", 3, WriteProtocol::Composed("stream token + lifecycle-ledger staging")),
     ("db/manifest/token_store.rs", ".execute_uncommitted(", 3, WriteProtocol::Composed("stream token + lifecycle-ledger staging")),
     ("db/manifest/token_store.rs", "stage_lifecycle_ledger_records(", 5, WriteProtocol::Composed("typed lifecycle-ledger staging wrappers")),
     ("db/omnigraph/stream_enrollment.rs", "stage_lifecycle_ledger_records(", 1, STREAM_ENROLLMENT_V14),
-    ("db/omnigraph/stream_ingest.rs", "stage_lifecycle_ledger_records(", 1, STREAM_LIFECYCLE_V14),
+    ("db/omnigraph/stream_ingest.rs", "stage_lifecycle_ledger_records(", 2, STREAM_LIFECYCLE_V14_V15),
     ("db/omnigraph/stream_ingest.rs", "stage_management_receipt(", 1, STREAM_LIFECYCLE_V14),
-    ("db/manifest/recovery.rs", "stage_lifecycle_ledger_records(", 2, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "stage_lifecycle_ledger_records(", 3, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/stream_ingest.rs", "stage_stream_token_upsert(", 1, STREAM_LIFECYCLE_V14),
     ("db/manifest/recovery.rs", "stage_stream_token_upsert(", 2, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/stream_profile.rs", "stage_profile_management_receipt(", 1, STREAM_PROFILE_V13),
@@ -713,17 +716,18 @@ durable_calls! {
     ("db/omnigraph/schema_apply.rs", ".commit_staged_exact(", 1, SCHEMA_V9),
     ("db/omnigraph/table_ops.rs", ".commit_staged_exact(", 1, INDICES_V9),
     ("db/omnigraph/stream_enrollment.rs", ".commit_staged_exact(", 1, STREAM_ENROLLMENT_V14),
-    ("db/omnigraph/stream_ingest.rs", ".commit_staged_exact(", 4, STREAM_LIFECYCLE_V14),
+    ("db/omnigraph/stream_ingest.rs", ".commit_staged_exact(", 5, STREAM_LIFECYCLE_V14_V15),
     ("db/omnigraph/stream_profile.rs", ".commit_staged_exact(", 1, STREAM_PROFILE_V13),
     ("db/omnigraph/stream_profile.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/stream_profile.rs", "SnapshotHandle::new(", 1, STREAM_PROFILE_V13),
-    ("db/manifest/recovery.rs", ".commit_staged_exact(", 4, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", ".commit_staged_exact(", 5, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("adapter-owned first-touch data ref")),
     ("exec/staging.rs", "confirm_occ_sidecar_v9(", 1, WriteProtocol::Exact("Mutation/Load v9")),
     ("exec/merge.rs", "confirm_branch_merge_sidecar_v9(", 1, MERGE_V9),
     ("db/omnigraph/schema_apply.rs", "confirm_schema_apply_sidecar_v9(", 1, SCHEMA_V9),
     ("db/omnigraph/table_ops.rs", "confirm_ensure_indices_sidecar_v9(", 1, INDICES_V9),
+    ("db/omnigraph/optimize.rs", "confirm_stream_sealed_optimize_sidecar_v17(", 1, WriteProtocol::Bounded("StreamSealedOptimize recovery v17")),
     ("db/omnigraph/stream_enrollment.rs", "complete_stream_enrollment_sidecar_v14(", 1, STREAM_ENROLLMENT_V14),
     ("db/manifest/recovery.rs", "confirm_stream_enrollment_sidecar_v14(", 1, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/stream_ingest.rs", "confirm_stream_claim_sidecar_v14(", 1, STREAM_LIFECYCLE_V14),
@@ -763,7 +767,7 @@ durable_calls! {
     ("db/omnigraph.rs", ".write_text_if_absent(", 1, WriteProtocol::Bootstrap),
     ("db/omnigraph.rs", ".write_text(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".write_text(", 2, WriteProtocol::Composed("schema state publication")),
-    ("db/manifest/recovery.rs", ".write_text(", 13, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", ".write_text(", 18, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/schema_apply.rs", ".write_text(", 1, SCHEMA_V9),
     ("db/omnigraph.rs", ".delete(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".delete(", 3, WriteProtocol::Composed("schema staging cleanup")),
@@ -796,15 +800,15 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", ".force_delete_branch(", 1, WriteProtocol::Composed("first-touch reclaim")),
     ("db/omnigraph/optimize.rs", ".force_delete_branch(", 1, WriteProtocol::PhysicalOnly),
     ("db/manifest/recovery.rs", ".force_delete_branch(", 2, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", ".publish_with_precondition(", 5, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", ".publish_with_precondition(", 7, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".publish(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".restore(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", ".append(RecoveryAuditRecord", 14, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "publish_recovery_commit(", 11, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "restore_table_to_version(", 3, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "record_audit(", 11, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 32, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "delete_sidecar(", 3, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", ".append(RecoveryAuditRecord", 16, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "publish_recovery_commit(", 13, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "restore_table_to_version(", 4, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "record_audit(", 13, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 37, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "delete_sidecar(", 4, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", ".raw_dataset_append(", 1, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", "Dataset::write(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "promote_exact_schema_staging(", 2, WriteProtocol::RecoveryExecutor),
@@ -813,16 +817,16 @@ durable_calls! {
     ("exec/merge.rs", "TableStore::append_or_create_batch(", 1, WriteProtocol::EphemeralScratch),
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph.rs", ".into_arc()", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/table_ops.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/table_ops.rs", ".dataset()", 3, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
-    ("db/omnigraph/optimize.rs", ".dataset()", 5, WriteProtocol::Composed("Optimize v9 planning + physical cleanup")),
+    ("db/omnigraph/optimize.rs", ".dataset()", 7, WriteProtocol::Composed("Optimize v9/v17 planning, exact HEAD witness, + physical cleanup")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
     ("db/omnigraph/stream_enrollment.rs", ".dataset()", 7, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/stream_enrollment.rs", ".into_dataset()", 1, STREAM_ENROLLMENT_V14),
-    ("db/omnigraph/stream_ingest.rs", ".dataset()", 33, STREAM_LIFECYCLE_V14),
-    ("db/omnigraph/stream_ingest.rs", ".mem_wal_writer(", 1, STREAM_LIFECYCLE_V14),
+    ("db/omnigraph/stream_ingest.rs", ".dataset()", 38, STREAM_LIFECYCLE_V14_V15),
+    ("db/omnigraph/stream_ingest.rs", ".mem_wal_writer(", 2, STREAM_LIFECYCLE_V14_V15),
     ("db/omnigraph/stream_ingest.rs", ".put(", 1, STREAM_LIFECYCLE_V14),
     ("table_store/mem_wal.rs", ".initialize_mem_wal()", 1, STREAM_ENROLLMENT_V14),
     ("table_store/mem_wal.rs", ".mem_wal_writer(", 1, STREAM_ENROLLMENT_V14),
@@ -832,7 +836,7 @@ durable_calls! {
     ("table_store/mem_wal/worker.rs", ".wait_for_flush_drain()", 1, STREAM_LIFECYCLE_V14),
     ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V9),
     ("db/omnigraph/stream_enrollment.rs", "SnapshotHandle::new(", 1, STREAM_ENROLLMENT_V14),
-    ("db/omnigraph/stream_ingest.rs", "SnapshotHandle::new(", 3, STREAM_LIFECYCLE_V14),
+    ("db/omnigraph/stream_ingest.rs", "SnapshotHandle::new(", 4, STREAM_LIFECYCLE_V14_V15),
     ("exec/merge.rs", "SnapshotHandle::new(", 5, MERGE_V9),
 }
 
@@ -842,6 +846,7 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "confirm_branch_merge_sidecar_v9(",
     "confirm_schema_apply_sidecar_v9(",
     "confirm_ensure_indices_sidecar_v9(",
+    "confirm_stream_sealed_optimize_sidecar_v17(",
     "complete_stream_fold_sidecar_v11(",
     "finalize_effect_free_stream_fold_sidecar_v11(",
     "complete_stream_enrollment_sidecar_v14(",
@@ -1535,6 +1540,29 @@ const RETAIN_ALL_MAINTENANCE_FILES: &[&str] = &[
     "db/omnigraph/repair.rs",
     "db/omnigraph/schema_apply.rs",
     "db/omnigraph/table_ops.rs",
+];
+
+/// Checked `SEALED` maintenance reads Lance's composite dataset HEAD through
+/// this existing helper; despite its module path, the helper never enumerates,
+/// adopts, or deletes retained `_mem_wal` objects. Keep both the helper-call
+/// and `mem_wal` path-segment counts exact so this disposition cannot cover a
+/// second MemWAL API in the same maintenance function.
+const RETAIN_ALL_CHECKED_MAINTENANCE_HEAD_READS: &[(&str, &str, usize)] = &[
+    (
+        "db/omnigraph/optimize.rs",
+        "optimize_all_tables_with_mode",
+        1,
+    ),
+    (
+        "db/omnigraph/optimize.rs",
+        "apply_optimize_table_effects",
+        1,
+    ),
+    (
+        "db/omnigraph/table_ops.rs",
+        "ensure_indices_for_branch",
+        2,
+    ),
 ];
 
 const RETAIN_ALL_OMNIGRAPH_METHODS: &[&str] = &[
@@ -2385,8 +2413,22 @@ fn retain_all_mem_wal_has_no_production_reclamation_or_adoption_route() {
         RETAIN_ALL_DELETE_CALLS.len(),
         "retain-all delete callsite keys must be unique"
     );
+    let expected_checked_maintenance_head_reads =
+        RETAIN_ALL_CHECKED_MAINTENANCE_HEAD_READS
+            .iter()
+            .map(|(file, function, count)| {
+                (((*file).to_string(), (*function).to_string()), *count)
+            })
+            .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        expected_checked_maintenance_head_reads.len(),
+        RETAIN_ALL_CHECKED_MAINTENANCE_HEAD_READS.len(),
+        "checked-maintenance HEAD-read dispositions must be unique"
+    );
     let mut observed_raw_owners = BTreeMap::new();
     let mut observed_delete_calls = BTreeMap::new();
+    let mut observed_checked_maintenance_head_reads = BTreeMap::new();
+    let mut observed_checked_maintenance_mem_wal_segments = BTreeMap::new();
     let mut reclamation_symbols = Vec::new();
     let mut maintenance_mem_wal_uses = Vec::new();
     let mut hidden_delete_routes = Vec::new();
@@ -2455,12 +2497,30 @@ fn retain_all_mem_wal_has_no_production_reclamation_or_adoption_route() {
         }
 
         if RETAIN_ALL_MAINTENANCE_FILES.contains(&relative.as_str()) {
-            maintenance_mem_wal_uses.extend(
-                inventory
-                    .mem_wal_uses
-                    .iter()
-                    .map(|(function, usage)| format!("{relative}::{function}: {usage}")),
-            );
+            for ((function, primitive, shape), count) in &calls.call_shapes_by_function {
+                if primitive == "capture_current_head_witness"
+                    && shape.starts_with(
+                        "crate::table_store::mem_wal::capture_current_head_witness => ",
+                    )
+                {
+                    *observed_checked_maintenance_head_reads
+                        .entry((relative.clone(), function.clone()))
+                        .or_default() += *count;
+                }
+            }
+            for (function, usage) in &inventory.mem_wal_uses {
+                let key = (relative.clone(), function.clone());
+                if usage == "mem_wal"
+                    && expected_checked_maintenance_head_reads.contains_key(&key)
+                {
+                    *observed_checked_maintenance_mem_wal_segments
+                        .entry(key)
+                        .or_default() += 1;
+                } else {
+                    maintenance_mem_wal_uses
+                        .push(format!("{relative}::{function}: {usage}"));
+                }
+            }
         }
         if relative == "db/omnigraph.rs" {
             maintenance_mem_wal_uses.extend(
@@ -2483,6 +2543,16 @@ fn retain_all_mem_wal_has_no_production_reclamation_or_adoption_route() {
         reclamation_symbols.is_empty(),
         "retain-all forbids any production MemWAL reclamation/adoption/reclassification route:\n  {}",
         reclamation_symbols.join("\n  ")
+    );
+    assert_eq!(
+        observed_checked_maintenance_head_reads,
+        expected_checked_maintenance_head_reads,
+        "checked maintenance may call only the exact registered composite-HEAD witness sites"
+    );
+    assert_eq!(
+        observed_checked_maintenance_mem_wal_segments,
+        expected_checked_maintenance_head_reads,
+        "each checked-maintenance composite-HEAD read must own exactly one registered `mem_wal` path segment"
     );
     assert!(
         maintenance_mem_wal_uses.is_empty(),

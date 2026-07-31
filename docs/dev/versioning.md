@@ -136,32 +136,41 @@ Receipt lookup precedes revision refusal for idempotent retry. The v14
 resume/correction/retirement/ledger-maintenance/sealed-maintenance/rebind
 scaffolds retain their old bytes and continue to fail closed.
 
-Internal schema **v14 is the currently served format** (unreleased, current
-0.10.0-dev source builds; a later private control-plane strand may supersede it
-before release). It raises the sidecar ceiling to recovery-v16 for one active
-hidden discriminator, `StreamSealedEnsureIndices`. V16 reuses the frozen
+Internal schema v14 was an unreleased 0.10.0-dev format. It raised the sidecar
+ceiling to recovery-v16 for one active hidden discriminator,
+`StreamSealedEnsureIndices`. V16 reuses the frozen
 recovery-v8 exact CreateIndex plan and layers the enabled profile, selected
 token-authority witness, and complete sorted prior/next `SEALED` lifecycle rows
 around it. The table pointer, both HEAD witnesses, recomputed empty proof, and
 lifecycle revision publish atomically. This capability-only operation writes
 no token row, advances no receipt chain, and accepts no caller operation ID;
 recovery settlement followed by convergent EnsureIndices replanning supplies
-retry idempotency. Ambient EnsureIndices remains refused for enrolled tables;
-Optimize, physical rebind, and public maintenance surfaces remain inactive.
+retry idempotency. Ambient EnsureIndices remains refused for enrolled tables.
 Recovery-v14's sealed-maintenance
 scaffold keeps its original bytes and is not reinterpreted.
+
+Internal schema **v15 is the currently served format** (unreleased, current
+0.10.0-dev source builds; a later private control-plane strand may supersede it
+before release). It raises the sidecar ceiling to recovery-v17 for the distinct
+hidden `StreamSealedOptimize` discriminator. V17 owns Optimize's bounded,
+internally committing maintenance plan, exact confirmed outputs, and complete
+sorted prior/next `SEALED` lifecycle rows. Productive table pointers and proof
+refreshes publish atomically; a true no-work invocation is effect-free. It
+writes no token row, advances no receipt chain, and accepts no caller operation
+ID. Ambient Optimize remains refused for enrolled tables. Physical rebind and
+public maintenance surfaces remain inactive.
 
 Recovery-v13 remains exactly the v11 profile-change protocol. Historical
 recovery-v10 enrollment and recovery-v12 lifecycle-v2 folds retain their old
 wire meanings and are refused under lifecycle-v3 rather than synthesized.
 There is still no public firehose ingress, public production enrollment,
-quiesce, resume/abort, correction/retirement, Optimize/rebind, or streaming or
+quiesce, resume/abort, correction/retirement, physical rebind, or streaming or
 maintenance transport surface. The v15 and v16 paths remain crate-private and
-feature-gated.
+feature-gated; the v17 path is likewise crate-private and feature-gated.
 
-A v13 graph crosses by export/init/load rebuild into a different root. Because
-`MIN_SUPPORTED == CURRENT == 14`, v14 refuses v13 and a v13 binary refuses
-v14. The genuine v12↔v13 fence remains historical evidence.
+A v14 graph crosses by export/init/load rebuild into a different root. Because
+`MIN_SUPPORTED == CURRENT == 15`, v15 refuses v14 and a v14 binary refuses
+v15. The genuine v13↔v14 fence remains historical evidence.
 
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,
