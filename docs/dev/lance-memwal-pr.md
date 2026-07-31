@@ -64,10 +64,11 @@ are implemented and evidence-green at a deliberately narrow boundary:
 - replayed or flushed-but-unmerged state routes to fold only;
 - one strict fold stages exact base-table and `_stream_tokens.lance`
   participants and publishes both through `__manifest`; and
-- current internal schema v12 preserves the v9 row/token contract, adds
-  lifecycle-v3 fixed-size ledger heads, and activates recovery-v14 hidden
+- current internal schema v13 preserves the v9 row/token contract and v12's
+  lifecycle-v3 fixed-size ledger heads and recovery-v14 hidden
   enrollment, writer-claim, ordinary/drain-fold, and terminal management
-  authority. V11's checked profile-v2 and recovery-v13
+  authority. Recovery-v15 adds private revision-fenced resume and guarded
+  drain-abort. V11's checked profile-v2 and recovery-v13
   `StreamProfileChange` remain intact. Historical v8/config-v2/recovery-v11
   and v9 lifecycle-v2/recovery-v12 state cross that boundary only through
   export/init/load.
@@ -76,10 +77,11 @@ The core is intentionally reachable only through a feature-gated, doc-hidden
 engine seam. Checked profile control exists, including restart-stable
 `DISABLING`, but there is no `@stream` schema intent, public enrollment, SDK
 ingest method, HTTP route, CLI ingest command, OpenAPI surface, or enrolled-lane
-operator workflow. The hidden v12 core does implement recovery-covered
-empty/non-empty `OPEN → DRAINING → SEALED`; resume/abort and the production
-control/transport activation remain fail-closed. An acknowledgement means that
-the submitted batch is durable and
+operator workflow. The hidden core implements recovery-covered empty/non-empty
+`OPEN → DRAINING → SEALED` plus crate-private `SEALED → OPEN` resume and
+guarded `DRAINING → OPEN` abort. Physical rebind, the maintenance bridge, and
+production control/transport activation remain fail-closed. An acknowledgement
+means that the submitted batch is durable and
 replayable; it does not mean that the graph already exposes the rows.
 
 MemWAL is the strategic streaming substrate. OmniGraph is not designing a
@@ -107,14 +109,14 @@ RFC-026 Phase B2 specifies the remaining public contract:
   retained-storage admission promise.
 
 The private storage/correctness subset is implemented through current schema
-v12: v9 supplied stream-config v3, lifecycle state v2, canonical
+v13: v9 supplied stream-config v3, lifecycle state v2, canonical
 compare-and-chain tokens, trusted hidden row attribution, manifest-selected
 token authority, and recovery-v12's exact base-plus-token publication; v12
 adds lifecycle-v3 and recovery-v14 hidden enrollment, claims, ordinary/drain
-folds, and restartable empty/non-empty quiescence. Supported production
-enrollment/quiesce, resume/abort, correction/retirement, exclusive-cut
-physical status, SDK/HTTP/CLI/OpenAPI, and every other product surface remain
-inactive.
+folds, and restartable empty/non-empty quiescence; v13/recovery-v15 adds private
+resume and guarded drain-abort. Supported production enrollment/quiesce/resume/
+abort, correction/retirement, exclusive-cut physical status, maintenance/
+rebind, SDK/HTTP/CLI/OpenAPI, and every other product surface remain inactive.
 
 ## The missing Lance capabilities
 

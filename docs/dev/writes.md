@@ -19,7 +19,7 @@ authority.
 - No `omnigraph run *` CLI subcommands and no `/runs/*` HTTP endpoints.
 - No `__run__<id>` staging branches; `__run__*` is no longer a reserved
   name. The branch-name guard was removed in MR-770. Historically, the v2→v3
-  in-place migration swept stale `__run__*` entries; the current v12 strand is
+  in-place migration swept stale `__run__*` entries; the current v13 strand is
   strict single-version, so older graphs are refused and rebuilt by
   export/init/load rather than migrated on open. (Inert `_graph_runs.lance`
   bytes in an old export source remain irrelevant to the rebuilt graph.)
@@ -552,15 +552,17 @@ stream-config v3, lifecycle state-v2, recovery-v12, and the manifest-selected
 graph-global `_stream_tokens.lance` participant. The code is always compiled
 but remains crate-private; only the doc-hidden callable integration-test seam is
 feature-gated. V11 added checked profile protocol v2 plus exact recovery-v13
-`StreamProfileChange`. Current internal schema v12 replaces lifecycle
+`StreamProfileChange`. Internal schema v12 replaces lifecycle
 state-v2's inline histories with lifecycle-v3 fixed-size ledger heads and
 activates recovery-v14 enrollment, writer-claim, ordinary/drain-fold, and
-terminal-management effects. The hidden one-lane core can quiesce an enrolled
-lane `OPEN → DRAINING → SEALED`, including empty and non-empty lanes, but no
+terminal-management effects. Current v13 adds recovery-v15 for private,
+revision-fenced resume and guarded drain-abort. The hidden one-lane core can
+quiesce an enrolled lane `OPEN → DRAINING → SEALED`, including empty and non-empty lanes, but no
 supported production surface can invoke it. The Cedar vocabulary,
 manifest-only status, and checked stopped/offline and runtime ownership exist;
-there is no accepted-schema declaration, production enrollment/quiesce,
-public ingest, correction/retirement, or HTTP/CLI/OpenAPI streaming surface.
+there is no accepted-schema declaration, production enrollment/quiesce/resume,
+public ingest, correction/retirement, maintenance/rebind, or HTTP/CLI/OpenAPI
+streaming surface.
 
 Lifecycle-v3 enrollment owns the physical binding:
 
@@ -670,7 +672,7 @@ retire and retry; if the exact base effect landed but the token effect did not,
 recovery may complete only the exact token transaction described by the durable
 plan. A token-only, foreign, buried, differently marked, partially ambiguous,
 or authority-mismatched outcome fails closed. Historical recovery-v11 B1 and
-recovery-v12 lifecycle-v2 folds are refused under v12.
+recovery-v12 lifecycle-v2 folds are refused under lifecycle-v3 formats.
 
 Hidden quiesce first publishes a lineage-neutral `OPEN → DRAINING` manifest
 transition with an exact drain id and target epoch floor. It then claims/fences
@@ -688,6 +690,19 @@ itself authorize reuse of the durable cut. Operation paths that rely on
 `SEALED` re-prove the manifest-selected lifecycle ledger, physical binding,
 selected claim receipt, and receipt-bound cut before publishing or reusing that
 authority.
+
+Recovery-v15 `StreamResume` owns one complete hidden `SEALED → OPEN` resume
+or guarded `DRAINING → OPEN` abort. Receipt lookup runs before the lifecycle
+revision fence so an exact retry returns its durable outcome. A new operation
+binds the complete prior lifecycle/profile/topology and current physical
+binding, acquires a higher writer epoch under closed admission, records the
+exact claim effect, writes terminal `ClaimReceipt` and `ManagementReceipt`
+rows, and publishes only their canonical `OPEN` successor. Drain abort also
+requires no guarded operation, strict block, unmerged residue, or unsettled
+background owner. Named graph branches, stale binding ancestry, and any
+unresolved recovery fail before the claim. This path does not authorize a new
+physical binding: rebind and the `SEALED` Optimize/EnsureIndices bridge remain
+separate inactive effect shapes.
 
 B1 performs no fresh-tier reads and no generation GC. Acknowledged rows become
 query-visible only after fold. The support boundary remains main-only,
@@ -1305,7 +1320,7 @@ does not yet have a public CLI query.
 `db/manifest/migrations.rs` is the single place the on-disk `__manifest` shape is
 reconciled with what the binary expects. Storage is **strict-single-version** (the
 strand model): this binary reads exactly ONE internal-schema version
-(`MIN_SUPPORTED == CURRENT == 12`), so there is no in-place migration.
+(`MIN_SUPPORTED == CURRENT == 13`), so there is no in-place migration.
 
 - **Graph creation** stamps `omnigraph:internal_schema_version` at CURRENT, so a
   fresh graph always opens.
@@ -1351,14 +1366,15 @@ now-frozen explicit-null dead-letter compatibility placeholder. V11 replaces
 the v10 boolean with checked
 profile protocol v2 and adds recovery-v13 `StreamProfileChange`.
 `DISABLING` owns an exact restart/resume plan and drain-only continuation;
-`RETIRED` decodes fail-closed. Current v12 replaces lifecycle state-v2's inline
+`RETIRED` decodes fail-closed. V12 replaces lifecycle state-v2's inline
 histories with lifecycle-v3 fixed-size ledger heads and activates
 recovery-v14 enrollment, claim, ordinary/drain fold, and terminal management
-receipts. Its hidden seam can quiesce empty and non-empty lanes but is not a
-supported production lifecycle API. Historical v10 enrollment and v12 fold
-sidecars are refused, not reinterpreted. Public ingress/enrollment/quiesce,
-resume/abort, correction/retirement, and maintenance integration remain
-inactive.
+receipts. Current v13 activates recovery-v15 private resume and guarded
+drain-abort without reinterpreting v14's incomplete scaffold. These hidden
+seams are not supported production lifecycle APIs. Historical v10 enrollment,
+v12 fold, and v14 resume sidecars are refused, not reinterpreted. Public
+ingress/enrollment/quiesce/resume/abort, correction/retirement, and
+maintenance/rebind integration remain inactive.
 
 The stamp history (v1 PK-less, v2 unenforced-PK, v3 `__run__*` sweep, v4 lineage
 in `__manifest` with the commit-graph tables retired, v5 stable table identity,
@@ -1367,8 +1383,9 @@ lifecycle authority plus the recoverable empty-enrollment foundation, v8
 stream-config v2 plus the private recovery-v11 row/fold core, v9
 stream-config v3/state-v2 plus manifest-selected token authority and
 recovery-v12, v10 graph-profile enablement, v11 checked profile-v2 plus
-recovery-v13 profile receipts, and v12 lifecycle-v3 plus recovery-v14) is
-recorded on the `INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v12 is
+recovery-v13 profile receipts, v12 lifecycle-v3 plus recovery-v14, and v13
+private resume/guarded drain-abort plus recovery-v15) is
+recorded on the `INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v13 is
 served. An
 earlier-stamped graph is rebuilt via export/import, not migrated in place.
 

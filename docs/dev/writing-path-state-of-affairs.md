@@ -1,8 +1,8 @@
 # Write Path: State of Affairs
 
 **Type:** living architecture and execution summary
-**Status:** current as of 2026-07-29
-**Surveyed:** OmniGraph 0.9.0 development, internal manifest schema v12,
+**Status:** current as of 2026-07-31
+**Surveyed:** OmniGraph 0.9.0 development, internal manifest schema v13,
 Lance 9.0.0
 **Scope:** the direct-publish graph write path, its RFC-022–028 family,
 adjacent control and maintenance operations, known blockers, and the next
@@ -12,8 +12,9 @@ decision points
 Phase A foundation, historical private Phase B1 core, the Gate R0/near-cap
 closure work, the B2a unbounded retain-all gate, the private B2
 compare-and-chain/token-fold slice, the bounded v11/profile-v2 +
-recovery-v13 profile-authority tranche, and the hidden v12/lifecycle-v3 +
-recovery-v14 quiescence tranche.
+recovery-v13 profile-authority tranche, the hidden v12/lifecycle-v3 +
+recovery-v14 quiescence tranche, and v13/recovery-v15 private resume/guarded
+drain-abort.
 RFC-024, RFC-025, and RFC-027 remain research-blocked at their recorded
 evidence gates. Gate E0 first proved the bounded public Lance state classifier;
 Phase A activated internal schema v7 with recoverable empty enrollment, durable
@@ -66,7 +67,7 @@ is refused under v9. The genuine v8↔v9 gate proves two-way refusal and strict
 export/init/load rebuild without exporting hidden trusted metadata.
 
 Internal schema v11 added profile protocol v2 plus exact recovery-v13
-`StreamProfileChange`. Current schema v12 replaces lifecycle state-v2's
+`StreamProfileChange`. Schema v12 replaces lifecycle state-v2's
 inline histories with lifecycle-v3 fixed-size ledger heads and activates the
 hidden recovery-v14 enrollment, writer-claim, ordinary/drain-fold, and
 terminal-management families. Every cold opener and fold first publishes a
@@ -76,14 +77,18 @@ projection. A restartable hidden quiesce can take an enrolled lane
 `OPEN → DRAINING → SEALED`, including the never-written empty case and the
 non-empty fold case, without exposing an operator verb. Historical v10
 enrollment and v12 lifecycle-v2 fold sidecars retain their exact wire meaning
-and are refused under v12.
+and are refused under lifecycle-v3. Current v13 adds recovery-v15 for
+crate-private receipt-first `SEALED → OPEN` resume and guarded `DRAINING →
+OPEN` abort. The operation owns its higher-epoch physical claim and terminal
+claim/management receipts before the sole `OPEN` publication; v14's incomplete
+resume scaffold remains frozen.
 
 Opaque checked stopped/offline apply and served-runtime owners bind canonical
 cluster state, profile/declaration revision, actor, and runtime lifetime.
 `DISABLING` persists an exact restart/resume plan with drain-only continuation
-authority. Public ingress/enrollment/quiesce, resume/abort, correction,
-retirement, and maintenance integration remain inactive even though the hidden
-one-lane lifecycle core now exists.
+authority. Public ingress/enrollment/quiesce/resume/abort, correction,
+retirement, and maintenance/rebind integration remain inactive even though the
+hidden one-lane lifecycle core now exists.
 
 The RFC remains Draft and the implementation remains reachable only through a
 feature-gated private engine seam. The graph-scoped Cedar vocabulary,
@@ -155,10 +160,11 @@ keeps complete/partial orphan roots inert, and measures retained-history terms
 locally and on configured RustFS.
 Neither a test-only attempt ledger nor managed reclamation is on the immediate
 activation path. V11/profile-v2 adds capability-bound profile control,
-resumable `DISABLING`, and exact recovery-v13 profile receipts. Current v12
-adds the durable lifecycle ledger and recovery-v14 claim/quiesce/fold core.
-The next work is correction/retirement and explicit production contracts only
-after the hidden lifecycle evidence is green. B1's
+resumable `DISABLING`, and exact recovery-v13 profile receipts. V12 adds the
+durable lifecycle ledger and recovery-v14 claim/quiesce/fold core. Current v13
+adds private recovery-v15 resume/guarded drain-abort. The next work is the
+separate maintenance/rebind shape, correction/retirement, and explicit
+production contracts. B1's
 adapter recheck contains a stale epoch from becoming a clean OmniGraph
 acknowledgement; it is not a substrate retention/fencing primitive.
 
@@ -200,7 +206,7 @@ envelopes before their first independently durable effects. Current
 lifecycle-v3 stream operations use recovery-v14 envelopes for exact
 enrollment, claim, base-plus-token fold, drain-fold, and terminal-management
 receipt effects. Historical v10 enrollment and v12 lifecycle-v2 fold payloads
-remain decodable only so they can be refused under v12. Table ownership is
+remain decodable only so they can be refused under lifecycle-v3. Table ownership is
 keyed by `(stable_table_id, table_incarnation_id)`, never inferred from an
 alias, path, Lance version, or field ID. Mutation, Load, BranchMerge,
 SchemaApply, and EnsureIndices use exact protocols in which `Armed` is
@@ -235,10 +241,11 @@ gap between those Lance effects and graph visibility.
 | SchemaApply | Metadata-only pure type rename, exact staged rewrite for property/schema changes, or strict first-touch create | The fixed schema identity, table delta, lineage, and source/IR/state promotion are one recoverable outcome. Every supported rename preserves logical identity and table lifetime; only a pure type rename also preserves Lance version/index history. Drop/re-add does neither. |
 | EnsureIndices | One staged mixed `CreateIndex` transaction per productive table | Indexes remain derived state. Exact transactions and the complete pointer delta publish once; untrainable vector work stays pending instead of breaking logical writes. |
 | Optimize | Lance compaction, incremental index optimization, and missing-index materialization across productive tables | One graph-wide v9 envelope and at most one monotonic manifest/lineage publish. Provenance is bounded rather than exact because Lance does not expose a caller-minted maintenance transaction surface. |
-| StreamEnrollmentV2 (hidden lifecycle-v3 foundation) | Lance's public internally committing singleton MemWAL initializer, one pre-minted empty shard, and immutable enrollment/binding receipts | One v14 intent owns the physical index/shard effects and the exact token-ledger transaction, then selects binding, ledger heads, and `OPEN` lifecycle together. Once a physical effect exists it rolls forward only. Historical v10 enrollment retains its old wire meaning and is refused under v12. |
+| StreamEnrollmentV2 (hidden lifecycle-v3 foundation) | Lance's public internally committing singleton MemWAL initializer, one pre-minted empty shard, and immutable enrollment/binding receipts | One v14 intent owns the physical index/shard effects and the exact token-ledger transaction, then selects binding, ledger heads, and `OPEN` lifecycle together. Once a physical effect exists it rolls forward only. Historical v10 enrollment retains its old wire meaning and is refused under current lifecycle-v3. |
 | StreamClaim (hidden lifecycle-v3 writer authority) | The shard manifest claims a higher writer epoch and, for epoch ≥ 2, records Lance's zero-batch fence sentinel; bounded WAL replay derives the exact authenticated suffix and full current-generation LWW projection | One v14 intent owns the attempt/checkpoint/terminal claim-receipt chain. The terminal receipt and manifest-selected current-claim head publish together under the complete stream write-gate envelope. Restart discovers and continues the exact pending lane claim before minting another. |
 | StreamFoldV2 / StreamDrainFold (hidden lifecycle-v3 fold core) | After a current recovery-covered claim, exclusive admission seals and proves one exact empty or non-empty cut; a non-empty generation becomes one exact staged keyed base transaction plus one exact staged `_stream_tokens.lance` transaction | One v14 intent binds the current ClaimReceipt, authenticated tail, both prestates and transactions, full next lifecycle-v3 state, fixed lineage, and attribution. Only exact base + exact token publishes. Exact base-only may complete only the pre-minted token effect; token-only, foreign, buried, or mixed effects fail closed. `StreamDrainFold` additionally binds the active drain operation. |
 | StreamLifecycleReceipt (hidden lifecycle-v3 terminal management) | One exact immutable terminal-management receipt in `_stream_tokens.lance`; the empty path has no fake base fold | One v14 intent selects the receipt and the lineage-neutral `SEALED` lifecycle transition atomically. A restart after seal reuses the exact receipt-bound physical cut instead of claiming a new epoch. |
+| StreamResume (hidden resume / guarded drain-abort) | Under closed admission, Lance claims a higher writer epoch and the exact terminal ClaimReceipt plus ManagementReceipt land in one token-ledger transaction | One recovery-v15 intent binds the complete prior lifecycle/profile/topology, request, binding, attempt, and receipt plan. Only the canonical `OPEN` row may publish; receipt-first retry returns the durable outcome. Rebind and `SEALED` maintenance are not variants of this adapter. |
 | StreamProfileChange (bounded profile authority) | One exact `ProfileManagementReceipt` transaction in manifest-selected `_stream_tokens.lance` | One v13 intent fixes the old/new protocol-v2 profile and exact receipt transaction. Only the achieved receipt witness plus fixed next profile may publish at the sole manifest CAS. `DISABLING` is resumable; unknown v13 variants fail closed. |
 
 ### Explicit adjacent paths
@@ -258,14 +265,14 @@ These operations do not create a side door around the protocol:
 | Publication surface | The historical Run state machine and `__run__*` staging branches are gone. The graph-write storage surface is crate-private, sealed, and staged-only; source guards make a new durable gateway an explicit review event. |
 | Lineage | `graph_commit` and `graph_head` live in `__manifest` and land in the same CAS as table pointers. The former secondary commit-graph datasets are retired. |
 | Mutation / load | Multi-statement writes accumulate in `MutationStaging`, provide read-your-writes, stage deletes as well as constructive writes, and publish once after complete validation. D2 deliberately keeps one query constructive or destructive. |
-| Identity / schema | Accepted SchemaIR v2 owns graph-scoped, monotonic, no-reuse type/property/incarnation IDs. Supported renames preserve logical identity and table lifetime; a property rename rewrites that lifetime, while only a pure type rename also preserves physical/index history. Drop/re-add mints a new lifetime. The strict strand serves only internal schema v12 and upgrades by export/init/load rebuild. |
+| Identity / schema | Accepted SchemaIR v2 owns graph-scoped, monotonic, no-reuse type/property/incarnation IDs. Supported renames preserve logical identity and table lifetime; a property rename rewrites that lifetime, while only a pure type rename also preserves physical/index history. Drop/re-add mints a new lifetime. The strict strand serves only internal schema v13 and upgrades by export/init/load rebuild. |
 | Key fencing | Every graph table has exact non-null physical `id` as Lance's unenforced PK. Strict insert/upsert use the sealed exact-`id` filtered adapter; bare keyed Append is forbidden; effect-free conflicts have typed reprepare or `KeyConflict` outcomes. |
 | BranchMerge | The ordinary ordered diff remains the correctness path. A completely verified `omnigraph.insert_absence = "v1"` history permits the proven-insert shortcut without committing Append or weakening the final filter. |
 | Validation | Value, enum, uniqueness, edge-RI, and cardinality use one catalog-derived, delta-scoped evaluator across mutation, load, and merge. Committed non-key uniqueness probes are batched by constraint group and bounded chunks. |
-| Recovery | Same-process handles share ordered queues for the same canonical local root or identical normalized opaque remote/custom URI. Stream-admission domains are acquired outside profile-shared → schema → branch → stream-token → table gates where applicable. Mutation/load, SchemaApply, BranchMerge, EnsureIndices, active v14 stream operations, StreamProfileChange, and `refresh` heal roll-forward-only; Optimize, Repair, and Cleanup refuse pending recovery, while branch controls use specialized barriers. Read-write open performs the quiesced full sweep, including v14 enrollment/claim/fold/terminal-receipt completion and v13 profile-receipt completion; read-only open never repairs and refuses unresolved stream recovery. Historical recovery-v10 enrollment, v11 B1 fold, and v12 lifecycle-v2 fold are refused under v12. A resolved intent is audited internally with the original actor when present; no-effect cleanup need not create graph lineage. |
-| RFC-026 Phase A (v7 foundation) | Internal schema v7 introduced identity-keyed lifecycle rows and exact empty main/unsharded enrollment. At that Phase-A-only boundary, any lifecycle row—including `SEALED`—rejected base-table, schema, maintenance, repair-adoption, and recovery effects under a process-local admission lease because no drain/fold witness-update adapter existed. Native branch create/delete alone could proceed at `SEALED` because it did not move table HEAD; `OPEN`/`DRAINING` refused it. Enrollment and open-time validation rejected named-branch overlap and any uncovered lifecycle/MemWAL mismatch. Current v12 preserves these foundation guarantees while adding the guarded lifecycle-v3 claim/fold/quiesce transitions. |
+| Recovery | Same-process handles share ordered queues for the same canonical local root or identical normalized opaque remote/custom URI. Stream-admission domains are acquired outside profile-shared → schema → branch → stream-token → table gates where applicable. Mutation/load, SchemaApply, BranchMerge, EnsureIndices, active v14/v15 stream operations, StreamProfileChange, and `refresh` heal roll-forward-only; Optimize, Repair, and Cleanup refuse pending recovery, while branch controls use specialized barriers. Read-write open performs the quiesced full sweep, including v14 enrollment/claim/fold/terminal-receipt, v15 resume/abort, and v13 profile-receipt completion; read-only open never repairs and refuses unresolved stream recovery. Historical recovery-v10 enrollment, v11 B1 fold, v12 lifecycle-v2 fold, and v14 resume are refused. A resolved intent is audited internally with the original actor when present; no-effect cleanup need not create graph lineage. |
+| RFC-026 Phase A (v7 foundation) | Internal schema v7 introduced identity-keyed lifecycle rows and exact empty main/unsharded enrollment. At that Phase-A-only boundary, any lifecycle row—including `SEALED`—rejected base-table, schema, maintenance, repair-adoption, and recovery effects under a process-local admission lease because no drain/fold witness-update adapter existed. Native branch create/delete alone could proceed at `SEALED` because it did not move table HEAD; `OPEN`/`DRAINING` refused it. Enrollment and open-time validation rejected named-branch overlap and any uncovered lifecycle/MemWAL mismatch. Current v13 preserves these foundation guarantees while adding the guarded lifecycle-v3 claim/fold/quiesce/resume transitions. |
 | RFC-026 Phase B1 (historical private core) | Internal schema v8/config-v2 added one root-scoped, cross-handle serialized worker and a hard-bounded 8,192-row/32-MiB logical dense-slice Arrow no-roll generation. Watcher success proves durability; a clean `DurableBatchAck` additionally requires the same `ShardWriter::check_fenced()` to succeed immediately afterward. Fence loss, epoch-read failure, owner-task failure, or deadline ambiguity is post-invocation `AckUnknown` plus worker retirement. Reopen/replay is conservative and exact drain proof precedes quiesced abort. Gate R0's deterministic legal high-entropy near-cap cell exposed sparse scanner arrays; logical-slice charging plus dense copies repaired it. Physical RSS is evidence only. V9 preserves those worker/closure mechanics, but recovery-v11 itself is historical only. |
-| RFC-026 private B2 token/fold core + profile/lifecycle authority | Internal schema v9/config-v3/state-v2 adds canonical payload/token digests, hidden trusted row metadata, exact idempotency and compare-and-chain classification, same-generation token overlays, and post-admission authority recapture. `_stream_tokens.lance` is graph-global durable sequencing state selected only by its manifest witness. V11/profile-v2 adds checked stopped/offline and runtime ownership, resumable `DISABLING`, fail-closed `RETIRED`, and exact recovery-v13 profile receipts. Current v12/lifecycle-v3 replaces inline histories with fixed-size ledger heads; recovery-v14 covers enrollment, writer claims, ordinary/drain folds, and terminal management receipts. The hidden one-lane core can quiesce `OPEN → DRAINING → SEALED`. Public enrollment, row admission, lifecycle control/status with physical detail, and CLI/HTTP/OpenAPI surfaces remain inactive. |
+| RFC-026 private B2 token/fold core + profile/lifecycle authority | Internal schema v9/config-v3/state-v2 adds canonical payload/token digests, hidden trusted row metadata, exact idempotency and compare-and-chain classification, same-generation token overlays, and post-admission authority recapture. `_stream_tokens.lance` is graph-global durable sequencing state selected only by its manifest witness. V11/profile-v2 adds checked stopped/offline and runtime ownership, resumable `DISABLING`, fail-closed `RETIRED`, and exact recovery-v13 profile receipts. V12/lifecycle-v3 replaces inline histories with fixed-size ledger heads; recovery-v14 covers enrollment, writer claims, ordinary/drain folds, and terminal management receipts. Current v13/recovery-v15 adds private resume and guarded drain-abort. The hidden one-lane core can cycle `OPEN → DRAINING → SEALED → OPEN`; physical rebind and the `SEALED` maintenance bridge remain inactive. Public enrollment, row admission, lifecycle control/status with physical detail, and CLI/HTTP/OpenAPI surfaces remain inactive. |
 | Lance access | One process-wide `ObjectStoreRegistry` reuses clients. Each `Omnigraph` handle owns its cached data-table `Session`; one process-wide zero-cache control `Session` opens mutable tips. Only the object-store registry is shared between the data and control sessions. This is “cache the past, never the present,” not one global cached session. |
 | Maintenance | EnsureIndices stages exact missing-index transactions. Optimize coordinates graph-wide compaction/index work under one bounded recovery envelope. Periodic optimize compacts `__manifest`, but unmaintained history-dependent paths are not globally flat. |
 
@@ -287,12 +294,12 @@ retry rules, recovery classification, and the full owned limits.
 | RFC | Current disposition | What that means now |
 |---|---|---|
 | [022 — Unified graph-write protocol](../rfcs/0022-unified-write-path.md) | **Implemented** | The shared correctness state machine, per-writer adapters, recovery barrier, one visibility point, control exceptions, and test lattice are the stable chassis. Completion is scoped to one writer process per graph for destructive recovery. |
-| [023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | **Implemented** | Internal schema v6 introduced exact-`id` PK metadata, closed keyed routing, typed conflicts, bounded replay, rebuild/refusal, and accepted performance evidence; v12 preserves that contract. |
+| [023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | **Implemented** | Internal schema v6 introduced exact-`id` PK metadata, closed keyed routing, typed conflicts, bounded replay, rebuild/refusal, and accepted performance evidence; v13 preserves that contract. |
 | [024 — Durable table heads](../rfcs/0024-durable-table-heads.md) | **Research-blocked** | The first in-manifest BTREE candidate has a specified logical contract and flat indexed row/range work, but fails the complete physical-I/O gate. No head rows or heads format are active. |
 | [025 — Checkpoint retention](../rfcs/0025-checkpoint-retention.md) | **Research-blocked** | Lance tag/pin semantics pass, but the proposed in-manifest registry access shape is not history-flat after compaction. No checkpoint rows, `ogcp_` production tags, API, or cleanup integration are active. |
-| [026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | **Draft; private B2 token/fold, retain-all, profile-authority, and hidden lifecycle tranches implemented; no public row path** | Schema v9 introduced config-v3/state-v2 token authority plus recovery-v12 exact base+token fold. V11/profile-v2 adds checked profile ownership, resumable `DISABLING`, and exact recovery-v13 `StreamProfileChange`. Current v12/lifecycle-v3 + recovery-v14 adds immutable enrollment/binding receipts, recovery-covered claims, exact ordinary/drain folds, and restartable hidden empty/non-empty quiescence; historical recovery-v10/v12 payloads are refused. Gate R0's no-go still prohibits a finite storage promise. Production enrollment/quiesce, resume/abort, correction/retirement, exclusive-cut physical status, public row admission, and CLI/HTTP/OpenAPI surfaces remain inactive; B2b managed reclamation is optional future work. |
+| [026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | **Draft; private B2 token/fold, retain-all, profile-authority, and hidden lifecycle tranches implemented; no public row path** | Schema v9 introduced config-v3/state-v2 token authority plus recovery-v12 exact base+token fold. V11/profile-v2 adds checked profile ownership, resumable `DISABLING`, and exact recovery-v13 `StreamProfileChange`. V12/lifecycle-v3 + recovery-v14 adds immutable enrollment/binding receipts, recovery-covered claims, exact ordinary/drain folds, and restartable hidden empty/non-empty quiescence. Current v13/recovery-v15 adds private resume and guarded drain-abort; historical recovery-v10/v12/v14-resume payloads are refused. Gate R0's no-go still prohibits a finite storage promise. Production enrollment/quiesce/resume/abort, correction/retirement, exclusive-cut physical status, maintenance/rebind, public row admission, and CLI/HTTP/OpenAPI surfaces remain inactive; B2b managed reclamation is optional future work. |
 | [027 — Lineage merge deltas](../rfcs/0027-lineage-merge-deltas.md) | **Research-blocked** | The desired O(delta) classifier and fallback contract are specified. Selective live-row and deletion-delta discovery are not yet bounded, so `OrderedTableCursor` remains the correctness path. |
-| [028 — Stable schema identity](../rfcs/0028-stable-schema-identity.md) | **Implemented** | Rename-stable IDs, table incarnation, identity-derived paths, schema/recovery integration, and strict rebuild activation were introduced in v5 and remain active in v12. |
+| [028 — Stable schema identity](../rfcs/0028-stable-schema-identity.md) | **Implemented** | Rename-stable IDs, table incarnation, identity-derived paths, schema/recovery integration, and strict rebuild activation were introduced in v5 and remain active in v13. |
 
 ## Blockers and constraints discovered
 
@@ -371,9 +378,10 @@ or slightly lower incremental RSS. That is not a roadmap signal.
    must receive zero IO. Keep 384 MiB as a CI remeasurement tripwire for the
    isolated fold RSS delta, not as a runtime allocation promise or a retained-
    storage limit. Treat 1/8/32/128 LIST, timing, and RSS results as advisory.
-2. **Finish the remaining B2 control plane privately.** Build
+2. **Finish the remaining B2 control plane privately.** Preserve the existing
    request-idempotent first-use enrollment, authoritative status, persistent
-   revisioned quiesce/resume/abort-drain receipts, and bounded
+   quiesce, and v15 revisioned resume/abort-drain receipts; next add the
+   separate same-binding maintenance/rebind shape and bounded
    `REPLACE`/`WITHDRAW` correction on the v9 token/fold authority already in
    place. Keep every step under recovery and the manifest visibility CAS. Do
    not add a storage quota, materialization-attempt ledger,

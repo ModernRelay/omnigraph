@@ -474,10 +474,12 @@ and recovery-v12's exact base-plus-token fold. V10 adds the required
 disabled-from-genesis profile singleton and the now-frozen explicit-null
 dead-letter compatibility placeholder. V11
 replaces the profile boolean with protocol-v2 checked authority and adds
-recovery-v13 `StreamProfileChange`. The currently served v12 format replaces
+recovery-v13 `StreamProfileChange`. The v12 format replaces
 inline lifecycle history with lifecycle-v3 ledger heads and recovery-v14
 hidden enrollment, claim, ordinary/drain-fold, and terminal receipt authority.
-Public ingress/enrollment/quiesce, correction, and retirement remain inactive.
+Current v13/recovery-v15 adds private resume and guarded drain-abort. Public
+ingress/enrollment/lifecycle control, correction, retirement, and
+maintenance/rebind remain inactive.
 None of the later formats reinterprets or
 backfills v5 in place. A v5
 graph was never served with a

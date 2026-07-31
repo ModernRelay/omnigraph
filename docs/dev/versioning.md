@@ -109,8 +109,7 @@ accepted v13 discriminator. It owns the exact token-ledger
 selects its achieved token witness and the next profile together makes either
 authoritative.
 
-Internal schema **v12 is the currently served format** (unreleased — current
-0.10.0-dev source builds until the 0.10.0 release). It replaces lifecycle
+Internal schema v12 was an unreleased 0.10.0-dev format. It replaces lifecycle
 state-v2's inline receipt histories with lifecycle-v3 fixed-size
 ledger-chain/current pointers and an authenticated WAL-tail commitment. The
 recovery-sidecar ceiling is v14. Its active hidden discriminators are
@@ -122,23 +121,36 @@ the selected current claim and exact authenticated full-generation projection.
 The restartable private quiesce path handles never-written and non-empty lanes
 through `OPEN → DRAINING → SEALED`.
 
-Those dormant v14 discriminators have an immutable scaffold payload meaning.
-They may activate under v14 only if that exact grammar is sufficient. A final
-operation that needs another payload shape uses a new sidecar schema/internal
-stamp and pins predecessor-binary refusal; a dormant name is never a license
-to reinterpret persisted bytes. Before release, an honest additional strand
-is preferred to guessing a future on-disk shape.
+The v14 `StreamResume` discriminator's three-field scaffold is now permanently
+historical. It did not encode the complete prior lifecycle/profile/topology,
+the physical claim attempt, or the two terminal receipt families required to
+recover resume safely, so v13 does not reinterpret it.
+
+Internal schema **v13 is the currently served format** (unreleased, current
+0.10.0-dev source builds; a later private control-plane strand may supersede it
+before release). It preserves lifecycle-v3
+and raises the recovery-sidecar ceiling to v15. Recovery-v15 has one active
+hidden discriminator, `StreamResume`, which owns the complete revision-fenced
+`SEALED → OPEN` resume or guarded `DRAINING → OPEN` abort: exact request and
+actor, prior authority, a restartable physical higher-epoch claim, terminal
+`ClaimReceipt` plus `ManagementReceipt`, and the sole final `OPEN` publication.
+Receipt lookup precedes revision refusal for idempotent retry. The v14
+resume/correction/retirement/ledger-maintenance/sealed-maintenance/rebind
+scaffolds retain their old bytes and continue to fail closed. Physical rebind
+and the `SEALED` maintenance bridge need distinct finalized recovery shapes and
+remain inactive.
 
 Recovery-v13 remains exactly the v11 profile-change protocol. Historical
 recovery-v10 enrollment and recovery-v12 lifecycle-v2 folds retain their old
 wire meanings and are refused under lifecycle-v3 rather than synthesized.
-There is still no public firehose ingress, public production enrollment or
-quiesce verb, resume/abort, correction/retirement, maintenance bridge, or
-streaming transport surface.
+There is still no public firehose ingress, public production enrollment,
+quiesce, resume/abort, correction/retirement, maintenance bridge, rebind, or
+streaming transport surface. The v15 path remains crate-private and
+feature-gated.
 
-A v11 graph crosses by export/init/load rebuild into a different root. Because
-`MIN_SUPPORTED == CURRENT == 12`, v12 refuses v11 and a v11 binary refuses
-v12.
+A v12 graph crosses by export/init/load rebuild into a different root. Because
+`MIN_SUPPORTED == CURRENT == 13`, v13 refuses v12 and a v12 binary refuses
+v13. The genuine v11↔v12 fence remains historical evidence.
 
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,

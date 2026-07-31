@@ -4105,6 +4105,149 @@ impl MemWalWorkerRegistry {
         .map_err(|error| MemWalWorkerError::state(format!("quiesce task failed: {error}")))?
     }
 
+    /// Install the writer claimed by an exact lifecycle resume while the
+    /// caller still owns exclusive admission for the lane.
+    ///
+    /// Resume is unlike an ordinary cold put: its recovery owner publishes
+    /// `OPEN` before there is a caller batch to drive the normal registry
+    /// opener.  The claimed writer must nevertheless become registry-owned
+    /// before the exclusive gate is released.  Any post-claim failure is
+    /// transferred to the same exclusive retirement machinery used by
+    /// quiescence, so no raw writer is dropped outside the registry.
+    pub(crate) async fn install_resumed_writer(
+        self: &Arc<Self>,
+        key: StreamWorkerKey,
+        table_key: String,
+        authority: CheckedExclusiveStreamAuthority,
+        opener: WorkerOpener,
+        idle_authority: IdleAuthorityCheck,
+    ) -> Result<(), MemWalWorkerError> {
+        let inflight = self.reserve_inflight_core()?;
+        let registry = Arc::clone(self);
+        crate::instrumentation::spawn_with_query_io_probes(async move {
+            registry
+                .install_resumed_writer_background(
+                    key,
+                    table_key,
+                    authority,
+                    opener,
+                    idle_authority,
+                    inflight,
+                )
+                .await
+        })
+        .await
+        .map_err(|error| {
+            MemWalWorkerError::state(format!("resume writer task failed: {error}"))
+        })?
+    }
+
+    async fn install_resumed_writer_background(
+        self: Arc<Self>,
+        key: StreamWorkerKey,
+        table_key: String,
+        authority: CheckedExclusiveStreamAuthority,
+        opener: WorkerOpener,
+        idle_authority: IdleAuthorityCheck,
+        inflight: InFlightPermit,
+    ) -> Result<(), MemWalWorkerError> {
+        let slot = self.slot(key);
+        let authority = self
+            .retire_current_owner_for_quiesce(&slot, key, authority)
+            .await?;
+        let mut slot_state = slot.state.lock().await;
+        if !matches!(&*slot_state, RegistrySlotState::Vacant) {
+            return Err(MemWalWorkerError::state(
+                "resume writer slot was not vacant after exclusive retirement",
+            ));
+        }
+        self.reserve_resident(key.identity)?;
+        let opening = Arc::new(tokio::sync::Notify::new());
+        *slot_state = RegistrySlotState::Opening(Arc::clone(&opening));
+        drop(slot_state);
+
+        let opened = opener().await;
+        let mut slot_state = slot.state.lock().await;
+        match opened {
+            Ok(opened) => {
+                if !matches!(&*slot_state, RegistrySlotState::Opening(current) if Arc::ptr_eq(current, &opening))
+                {
+                    let fold_required = opened.fold_required_accounting();
+                    let worker = Arc::new(MemWalWorker::from_opened(key, table_key, opened));
+                    let install = self.install_worker_usage(&worker, fold_required);
+                    *slot_state = RegistrySlotState::Active(Arc::clone(&worker));
+                    opening.notify_waiters();
+                    drop(slot_state);
+                    *worker.mode.lock().await = WorkerMode::Retiring;
+                    self.retain_exclusive_retirement(&slot, &worker, authority)
+                        .await;
+                    drop(inflight);
+                    install?;
+                    return Err(MemWalWorkerError::state(
+                        "resume opening reservation changed; claimed writer is retiring",
+                    ));
+                }
+
+                let refusal = opened.put_refusal(&table_key);
+                let fold_required = opened.fold_required_accounting();
+                let worker = Arc::new(MemWalWorker::from_opened(key, table_key, opened));
+                *slot_state = RegistrySlotState::Active(Arc::clone(&worker));
+                opening.notify_waiters();
+                if let Err(error) = self.install_worker_usage(&worker, fold_required) {
+                    drop(slot_state);
+                    *worker.mode.lock().await = WorkerMode::Retiring;
+                    self.retain_exclusive_retirement(&slot, &worker, authority)
+                        .await;
+                    drop(inflight);
+                    return Err(error);
+                }
+                if let Some(error) = refusal {
+                    drop(slot_state);
+                    *worker.mode.lock().await = WorkerMode::Retiring;
+                    self.retain_exclusive_retirement(&slot, &worker, authority)
+                        .await;
+                    drop(inflight);
+                    return Err(MemWalWorkerError::state(format!(
+                        "resume claimed a non-empty generation: {error}"
+                    )));
+                }
+                drop(slot_state);
+                self.ensure_idle_task(&slot, &worker, idle_authority);
+                drop(authority);
+                drop(inflight);
+                Ok(())
+            }
+            Err(failure) => {
+                let (error, claimed) = failure.into_parts();
+                if let Some(claimed) = claimed {
+                    let worker = Arc::new(MemWalWorker::retiring_from_claimed(
+                        key, table_key, claimed,
+                    ));
+                    let install = self.install_conservative_retiring_usage(&worker);
+                    *slot_state = RegistrySlotState::Active(Arc::clone(&worker));
+                    opening.notify_waiters();
+                    drop(slot_state);
+                    *worker.mode.lock().await = WorkerMode::Retiring;
+                    self.retain_exclusive_retirement(&slot, &worker, authority)
+                        .await;
+                    drop(inflight);
+                    install?;
+                } else {
+                    if matches!(&*slot_state, RegistrySlotState::Opening(current) if Arc::ptr_eq(current, &opening))
+                    {
+                        *slot_state = RegistrySlotState::Vacant;
+                        opening.notify_waiters();
+                        self.release_resident_reservation(key.identity);
+                    }
+                    drop(slot_state);
+                    drop(authority);
+                    drop(inflight);
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Reconstruct a DRAINING cut without claiming a successor writer epoch.
     ///
     /// This is the restart path after a terminal drain claim has already been
@@ -5685,6 +5828,68 @@ mod tests {
             .await
             .expect("dropping extracted authority must release admission");
         fresh_epoch
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resumed_empty_writer_uses_the_normal_idle_eviction_path() {
+        let fixture = enrolled_worker_fixture("resumed-idle-eviction").await;
+        let mut bounded = limits();
+        bounded.max_resident_writers_root = 1;
+        bounded.max_resident_writers_per_table = 1;
+        bounded.idle_timeout = Duration::from_millis(20);
+        let registry = MemWalWorkerRegistry::for_root(
+            &format!("memory://resumed-idle-eviction/{}", ShardId::new_v4()),
+            bounded,
+        )
+        .unwrap();
+        let admission = Arc::new(tokio::sync::RwLock::new(()));
+        let exclusive = Arc::clone(&admission).write_owned().await;
+        let opener = fresh_worker_opener(
+            fixture.dataset.clone(),
+            fixture.uri.clone(),
+            fixture.details.clone(),
+            fixture.plan.enrollment_id,
+            fixture.plan.shard_id,
+            fixture.initial_epoch,
+        );
+        let idle_admission = Arc::clone(&admission);
+        let idle_authority: IdleAuthorityCheck = Arc::new(move |_writer| {
+            let admission = Arc::clone(&idle_admission);
+            Box::pin(async move {
+                let shared = admission.read_owned().await;
+                Ok(CheckedStreamAuthority::from_shared_admission(shared))
+            })
+        });
+
+        registry
+            .install_resumed_writer(
+                fixture.key,
+                "node:Test".to_string(),
+                CheckedExclusiveStreamAuthority::from_exclusive_admission(exclusive),
+                opener,
+                idle_authority,
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.usage.lock().unwrap().resident_writers_root, 1);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let released = registry.usage.lock().unwrap().resident_writers_root == 0;
+                let slot = registry.slot(fixture.key);
+                let vacant = matches!(&*slot.state.lock().await, RegistrySlotState::Vacant);
+                if released && vacant {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an unused resumed writer must release the sole resident slot");
+
+        let other_identity = TableIdentity::new(63, 65).unwrap();
+        registry.reserve_resident(other_identity).unwrap();
+        registry.release_resident_reservation(other_identity);
     }
 
     async fn assert_ordinary_seal_still_refuses_empty(fixture: &EnrolledWorkerFixture) {

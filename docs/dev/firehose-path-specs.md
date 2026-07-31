@@ -1,13 +1,13 @@
 # Firehose Path — Implementation Specs
 
 **Type:** implementation plan for in-flight work
-**Status:** slices F0–F1, F2 profile authority, and the hidden F2 lifecycle
-tranche are implemented. The lifecycle tranche selects internal schema v12,
-lifecycle protocol v3, and recovery-v14 exact enrollment/claim/fold/drain/
-terminal-receipt owners. It implements restartable empty and non-empty
-`OPEN → DRAINING → SEALED` behind private test seams. Public ingress and
-operator lifecycle verbs, resume/abort, correction/retirement, and maintenance
-integration remain inactive.
+**Status:** slices F0–F1, F2 profile authority, the hidden F2 lifecycle tranche,
+and private F3a resume/abort-drain are implemented. The current development
+strand selects internal schema v13, lifecycle protocol v3, recovery-v14 exact
+enrollment/claim/fold/drain/terminal-receipt owners, and recovery-v15 exact
+`SEALED → OPEN` resume plus guarded `DRAINING → OPEN` abort. Public ingress and
+operator lifecycle verbs, correction/retirement, physical rebind, and
+maintenance integration remain inactive.
 **Design authority:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) — this
 file never overrides it. Where they disagree, the RFC wins and this file is
 wrong. §4.7 records the selected experimental profile; §4.3/§4.6 record the
@@ -696,17 +696,20 @@ writer a sidecar-covered witness/rebind transition.
   retirement receipt ID and cut digest, but its transition and read/export
   activation remain inactive. Unknown v13 discriminators and unsupported
   transitions fail closed.
-- **The v12 lifecycle family is closed and selectively active.** Recovery-v14
+- **The v12 lifecycle family is frozen and selectively active.** Recovery-v14
   activates claim, `StreamEnrollmentV2`, ordinary fold-v2, drain-fold, and
-  `StreamLifecycleReceipt`. Resume/abort, correction, retirement,
+  `StreamLifecycleReceipt`. Its three-field resume scaffold, correction, retirement,
   token-ledger-index maintenance, sealed maintenance, and rebind are registered
-  but fail closed. Historical recovery-v10 enrollment and recovery-v12
+  but fail closed under v14. Current v13/recovery-v15 activates the complete
+  crate-private resume/guarded drain-abort owner without reinterpreting that
+  scaffold. Historical recovery-v10 enrollment and recovery-v12
   lifecycle-v2 base-plus-token fold retain their exact meanings and are refused
-  under lifecycle-v3. F3 must activate same-format retirement before correction
+  under lifecycle-v3. A later F3 slice must activate retirement before correction
   can create `WITHDRAWN`; F5 must extend that exit before `DEAD_LETTERED`.
-- **The v11↔v12 boundary requires genuine binary evidence.** The
+- **Each lifecycle strand requires genuine binary evidence.** The historical
+  v11↔v12 and current v12↔v13
   old-binary/new-format refusal and export/init/load rebuild test uses the
-  immutable final-v11 binary, not a stamp rewrite. The fixture is clean,
+  immutable final predecessor binary, not a stamp rewrite. The fixture is clean,
   disabled, and unenrolled because ordinary export does not transfer stream
   authority.
 
@@ -827,24 +830,34 @@ profile `DISABLED`, a separate offline
 `CheckedClusterMaintenanceAuthority`; neither becomes an ambient engine
 writer.
 
+**Implemented F3a:** current internal schema v13 and recovery-v15 now cover the
+crate-private `SEALED → OPEN` resume and guarded `DRAINING → OPEN` abort,
+including receipt-first idempotency, the recovery-owned physical claim,
+terminal claim/management receipts, and bounded current-binding ancestry
+validation. Public lifecycle surfaces remain absent. **F3b remains:** the
+same-binding `SEALED` maintenance bridge and fresh physical rebind are separate
+effect shapes and must not be smuggled through resume; items 5 onward below
+remain the next slice.
+
 ### 4.2 What must be built
 
-1. **`SidecarKind::StreamResume`** + its roll-forward-only payload in the next
-   lifecycle recovery strand. Recovery-v13 remains
+1. **`SidecarKind::StreamResume`** + its roll-forward-only payload in
+   recovery-v15. Recovery-v13 remains
    `StreamProfileChange`-specific and schema-v12 `protocol_v12` remains
    `StreamFold`-specific. `Armed` binds the
    complete expected row and revision, `resume_id`,
    request digest, binding, configuration, base witness, graph-branch
-   topology, fixed actor/operation, an `OPEN` template, the management
-   receipt, and a **minimum next epoch floor**. Every `OPEN`-producing resume or
-   abort first acquires the graph-profile gate shared, requires exact `ENABLED`
-   plus matching runtime/delegation authority, and retains that outer guard
-   through claim, `EffectsConfirmed`, and manifest publication.
+   topology, fixed actor/operation, an `OPEN` plan, and a **minimum next epoch
+   floor**. The current hidden seam first
+   acquires the graph-profile gate shared, binds the exact `ENABLED` profile and
+   delegation, and retains that outer guard through claim, terminal-ledger
+   confirmation, and manifest publication. F7's production wrapper must also
+   require matching checked serving-runtime authority before invoking it.
 2. **Two-phase epoch claim.** The achieved epoch is unknowable before the
-   claim, so: claim under closed admission → durably record
-   `EffectsConfirmed` with the exact sentinel/epoch, `ClaimReceipt`, achieved
-   shard manifest/replay cursor, and final `OPEN` row → **only that row may
-   publish.**
+   claim, so: claim under closed admission → durably record the exact
+   sentinel/epoch plus one terminal `ClaimReceipt` + `ManagementReceipt`
+   transaction, achieved shard manifest/replay cursor, and final `OPEN` row →
+   **only that row may publish.**
 3. **`SEALED → OPEN`** consuming the sealed proof (`sealed_proof = None`),
    advancing epoch floors, and publishing the terminal claim and management
    ledger rows with their bounded hot pointers.
@@ -852,7 +865,7 @@ writer.
    requires: no guarded operation began, binding and the complete current row
    still match, every background seal/abort owner settled, and **no unmerged
    or strict-blocked cut remains**.
-5. **The `SEALED` maintenance bridge.** Keep
+5. **The `SEALED` maintenance bridge (F3b; not yet active).** Keep
    `ensure_stream_effects_allowed` closed by default. Integrate each sanctioned
    writer explicitly:
    - a same-binding HEAD mover extends its existing recovery sidecar with the
@@ -1197,10 +1210,10 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
    fold scanner cannot yet materialize their logical Blob values.
 
    This is not a public transport or product surface: SDK, HTTP, CLI, API DTO,
-   and OpenAPI ingress remain absent. The seam exposes no F3 resume or rebind
-   path and continues to accept only the initial binding; full binding-chain
-   ancestry remains F3 work. Consequently this hidden tranche does not make the
-   formal F4 milestone complete until F3 lands.
+   and OpenAPI ingress remain absent. F3a now supplies the separate private
+   resume/abort owner and bounded current-binding ancestry validation; physical
+   rebind and its maintenance authority remain F3b work. Consequently this
+   hidden tranche still does not make the formal F4 product milestone complete.
 3. **Lazy enrollment with a prepare handshake** (§4.7 P2) — every table is
    stream-eligible only while the profile is exactly `ENABLED`, but the wire
    invariant above still requires the engine-minted stream incarnation before
@@ -1278,9 +1291,10 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
    validated lane. Blob-bearing tables are refused before enrollment. The
    witness is ephemeral, no manifest/recovery grammar changed, and the only
    externally reachable adapter remains the feature-gated test seam. This
-   slice fails closed unless the current binding is still the initial binding;
-   F3 must replace that check with full binding-chain ancestry when rebind
-   becomes active.
+   slice originally failed closed unless the current binding was still the
+   initial binding. F3a replaces that shortcut with bounded current-binding
+   chain validation; no code may mint a new physical binding until F3b's rebind
+   effect and receipt shape become active.
 
    This activates the actor-bound `EnrollmentReceiptV2` and
    `StreamEnrollmentV2` selected by the implemented hidden
