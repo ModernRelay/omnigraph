@@ -293,9 +293,14 @@ them explicit.
   small JSON tokens or schema dimensions from amplifying past that ownership.
   The same permit transfers into B2. The seam then reacquires and
   revalidates profile/runtime authority before delegating to the existing
-  low-level seam. It is not an incremental NDJSON,
-  transport, lazy-enrollment, or product surface. Blob-bearing tables are
-  refused before any MemWAL put: Lance's LSM fold scanner returns Blob
+  low-level seam. A separate feature-gated bodyless prepare seam now performs
+  private lazy enrollment: policy and checked-runtime authorization precede an
+  effect-free exact eligibility witness, and only an exact echo may reuse the
+  existing recovery-v14 enrollment path. Durable same-request retries return
+  the actor-bound receipt and concurrent request IDs converge on one validated
+  lane. The witness is never persisted and introduces no format shape. Neither
+  seam is an incremental NDJSON, transport, or product surface. Blob-bearing
+  tables are refused before any MemWAL put: Lance's LSM fold scanner returns Blob
   descriptors rather than foldable logical Blob values, so exact-generation
   Blob materialization across warm and cold recovery remains a separate
   prerequisite. The private path performs no GC or correction.

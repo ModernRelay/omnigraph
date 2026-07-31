@@ -240,7 +240,10 @@ write_surfaces! {
     "exec/merge.rs" => MERGE_V9 => ["branch_merge", "branch_merge_as"],
     "db/omnigraph.rs" => INDICES_V9 => ["ensure_indices", "ensure_indices_on"],
     "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test"],
-    "db/omnigraph/stream_enrollment.rs" => WriteProtocol::TestOnly => ["failpoint_enroll_stream_table_for_test"],
+    "db/omnigraph/stream_enrollment.rs" => WriteProtocol::TestOnly => [
+        "failpoint_enroll_stream_table_for_test",
+        "failpoint_prepare_stream_ingest_as_for_test",
+    ],
     "db/omnigraph/stream_ingest.rs" => WriteProtocol::TestOnly => [
         "failpoint_stream_b1_for_test",
         "failpoint_stream_b2_for_test",

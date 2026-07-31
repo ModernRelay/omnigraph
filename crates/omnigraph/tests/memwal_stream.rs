@@ -553,6 +553,26 @@ async fn init_enrolled_served_with_schema(schema: &str) -> (EnrolledGraphDir, Ar
     (dir, db)
 }
 
+async fn init_unenrolled_served_with_schema(schema: &str) -> (EnrolledGraphDir, Arc<Omnigraph>) {
+    let cluster = tempfile::tempdir().unwrap();
+    let graph = cluster.path().join("graphs/knowledge.omni");
+    let db = Arc::new(
+        Omnigraph::init(graph.to_str().unwrap(), schema)
+            .await
+            .unwrap(),
+    );
+    let cluster_uri = format!("file://{}", cluster.path().display());
+    enable_stream_profile(&db, &cluster_uri).await;
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    (
+        EnrolledGraphDir {
+            _cluster: cluster,
+            graph,
+        },
+        db,
+    )
+}
+
 async fn init_enrolled_with_profile(
     schema: &str,
     enable_profile: bool,
@@ -754,6 +774,21 @@ async fn authorized_ingest_score(
         TABLE,
         &raw_json,
         caller_ordinal,
+        actor_id,
+    )
+    .await
+}
+
+async fn prepare_stream_ingest(
+    db: &Omnigraph,
+    enrollment_request_id: &str,
+    witness_json: Option<&str>,
+    actor_id: &str,
+) -> Result<(String, Option<String>, Option<String>), OmniError> {
+    db.failpoint_prepare_stream_ingest_as_for_test(
+        TABLE,
+        enrollment_request_id,
+        witness_json,
         actor_id,
     )
     .await
@@ -1479,6 +1514,20 @@ async fn empty_quiesce_is_idempotent_and_refuses_rebound_or_stale_requests() {
         "{manifest_error:?}"
     );
     assert!(visible_rows(&db).await.is_empty());
+
+    db.branch_create("sealed-prepare")
+        .await
+        .expect("SEALED stream authority permits named branches");
+    let (prepared, _, prepared_incarnation) = prepare_stream_ingest(
+        &db,
+        "17171717-1717-4717-8717-171717171717",
+        None,
+        "agent:sealed-prepare",
+    )
+    .await
+    .expect("prepare must resolve a SEALED lane before applying enrollment topology checks");
+    assert_eq!(prepared, "already_enrolled");
+    assert_eq!(prepared_incarnation.as_deref(), Some(incarnation.as_str()));
     assert_no_recovery_sidecars(&dir);
 }
 
@@ -3204,11 +3253,40 @@ async fn strict_fold_validation_failure_keeps_manifest_old_and_stream_fold_only(
 #[serial]
 async fn authorized_ingest_happy_fold_retry_and_conflicts_are_effect_free() {
     let _scenario = FailScenario::setup();
-    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
-    let incarnation = db
-        .failpoint_stream_incarnation_for_test(TABLE)
+    let (dir, db) = init_unenrolled_served_with_schema(STREAM_SCHEMA).await;
+    let request_id = "10101010-1010-4010-8010-101010101010";
+    let manifest_before_prepare = db
+        .snapshot_of(ReadTarget::branch("main"))
         .await
-        .unwrap();
+        .unwrap()
+        .version();
+    let inventory_before_prepare = mem_wal_inventory(db.uri()).await;
+    let (challenge, witness, incarnation) = prepare_stream_ingest(&db, request_id, None, "agent:a")
+        .await
+        .expect("an eligible absent lane must return compare evidence");
+    assert_eq!(challenge, "witness_required");
+    assert!(incarnation.is_none());
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_before_prepare,
+        "the bodyless challenge must not publish"
+    );
+    assert_eq!(
+        mem_wal_inventory(db.uri()).await.objects,
+        inventory_before_prepare.objects,
+        "the bodyless challenge must not create MemWAL objects"
+    );
+    assert_no_recovery_sidecars(&dir);
+    let (prepared, no_witness, incarnation) =
+        prepare_stream_ingest(&db, request_id, witness.as_deref(), "agent:a")
+            .await
+            .expect("echoing the exact witness must enroll one OPEN lane");
+    assert_eq!(prepared, "enrolled");
+    assert!(no_witness.is_none());
+    let incarnation = incarnation.expect("enrollment returns its durable incarnation");
     let first_write = "11111111-1111-4111-8111-111111111111";
     let (token, already_durable) = authorized_ingest_score(
         &db,
@@ -3350,6 +3428,250 @@ async fn authorized_ingest_happy_fold_retry_and_conflicts_are_effect_free() {
     );
 }
 
+#[tokio::test]
+#[serial]
+async fn prepare_stream_ingest_replays_actor_bound_durable_receipt() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_unenrolled_served_with_schema(STREAM_SCHEMA).await;
+    let request_id = "12121212-1212-4212-8212-121212121212";
+    let (_, witness, _) = prepare_stream_ingest(&db, request_id, None, "agent:a")
+        .await
+        .unwrap();
+    let witness = witness.expect("challenge returns an opaque witness");
+
+    {
+        let _audit = ScopedFailPoint::new(names::RECOVERY_RECORD_AUDIT, "return");
+        let error = prepare_stream_ingest(&db, request_id, Some(&witness), "agent:a")
+            .await
+            .expect_err("lost post-publication audit result must stay recoverable");
+        assert!(
+            matches!(error, OmniError::RecoveryRequired { .. }),
+            "{error:?}"
+        );
+    }
+
+    drop(db);
+    let db = helpers::stream_authority::bind_checked_stream_runtime(
+        reopen_enrolled(&dir).await,
+        &dir.cluster_uri(),
+    )
+    .await;
+    let (replayed, _, incarnation) =
+        prepare_stream_ingest(&db, request_id, Some(&witness), "agent:a")
+            .await
+            .expect("retry must heal and replay the durable enrollment receipt");
+    assert_eq!(replayed, "enrolled");
+    let incarnation = incarnation.expect("the receipt carries its stream incarnation");
+    let manifest_after_replay = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    let (exact_retry, _, retry_incarnation) =
+        prepare_stream_ingest(&db, request_id, Some(&witness), "agent:a")
+            .await
+            .expect("an exact request retry must remain idempotent");
+    assert_eq!(exact_retry, "enrolled");
+    assert_eq!(retry_incarnation.as_deref(), Some(incarnation.as_str()));
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_after_replay,
+        "receipt replay must not publish a second enrollment"
+    );
+
+    let (already_enrolled, _, current_incarnation) =
+        prepare_stream_ingest(&db, request_id, None, "agent:a")
+            .await
+            .expect("an existing lane needs no witness challenge");
+    assert_eq!(already_enrolled, "already_enrolled");
+    assert_eq!(
+        current_incarnation.as_deref(),
+        Some(incarnation.as_str())
+    );
+
+    let mut altered_witness: serde_json::Value =
+        serde_json::from_str(&witness).expect("the opaque witness is valid JSON");
+    altered_witness["current_head"]["transaction_uuid"] =
+        serde_json::json!("34343434-3434-4434-8434-343434343434");
+    let altered_witness =
+        serde_json::to_string(&altered_witness).expect("the altered witness remains valid JSON");
+    let intent_rebind =
+        prepare_stream_ingest(&db, request_id, Some(&altered_witness), "agent:a")
+            .await
+            .expect_err("one request id cannot be rebound to another enrollment intent");
+    assert!(intent_rebind.to_string().contains("different enrollment intent"));
+
+    let actor_rebind = prepare_stream_ingest(&db, request_id, Some(&witness), "agent:b")
+        .await
+        .expect_err("one request id cannot be rebound to another actor");
+    assert!(actor_rebind.to_string().contains("another actor"));
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_after_replay,
+        "validated replay conflicts must remain graph-effect-free"
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn prepare_stream_ingest_rearms_same_request_after_zero_effect_crash() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_unenrolled_served_with_schema(STREAM_SCHEMA).await;
+    let request_id = "18181818-1818-4818-8818-181818181818";
+    let (_, witness, _) = prepare_stream_ingest(&db, request_id, None, "agent:a")
+        .await
+        .unwrap();
+    let witness = witness.expect("challenge returns an opaque witness");
+
+    {
+        let _before_index =
+            ScopedFailPoint::new(names::STREAM_ENROLLMENT_POST_SIDECAR_PRE_INDEX, "return");
+        prepare_stream_ingest(&db, request_id, Some(&witness), "agent:a")
+            .await
+            .expect_err("the pre-index crash must leave a zero-effect sidecar");
+    }
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+        1
+    );
+
+    let (outcome, _, incarnation) =
+        prepare_stream_ingest(&db, request_id, Some(&witness), "agent:a")
+            .await
+            .expect("the same request may re-arm after zero-effect retirement");
+    assert_eq!(outcome, "enrolled");
+    assert!(incarnation.is_some());
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn prepare_stream_ingest_refreshes_a_stale_witness_effect_free() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_unenrolled_served_with_schema(STREAM_SCHEMA).await;
+    let request_id = "16161616-1616-4616-8616-161616161616";
+    let (_, witness, _) = prepare_stream_ingest(&db, request_id, None, "agent:a")
+        .await
+        .unwrap();
+    let witness = witness.expect("challenge returns an opaque witness");
+    load_jsonl(
+        &db,
+        r#"{"type":"Person","data":{"id":"moved-head","score":5}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("the checked runtime may move an absent lane's ordinary table head");
+    let manifest_after_write = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    let inventory_before_retry = mem_wal_inventory(db.uri()).await;
+    let (outcome, refreshed, incarnation) =
+        prepare_stream_ingest(&db, request_id, Some(&witness), "agent:a")
+            .await
+            .expect("stale eligibility must return fresh compare evidence");
+    assert_eq!(outcome, "witness_required");
+    assert_ne!(refreshed.as_deref(), Some(witness.as_str()));
+    assert!(incarnation.is_none());
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_after_write
+    );
+    assert_eq!(
+        mem_wal_inventory(db.uri()).await.objects,
+        inventory_before_retry.objects
+    );
+    let mut foreign_witness: serde_json::Value =
+        serde_json::from_str(&witness).expect("the opaque witness is valid JSON");
+    foreign_witness["graph_identity_digest"] = serde_json::json!(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    let foreign_witness =
+        serde_json::to_string(&foreign_witness).expect("foreign witness remains valid JSON");
+    let foreign = prepare_stream_ingest(&db, request_id, Some(&foreign_witness), "agent:a")
+        .await
+        .expect_err("one request occurrence cannot be retargeted to another graph lifetime");
+    assert!(
+        matches!(
+            foreign,
+            OmniError::Manifest(ref error)
+                if matches!(
+                    error.details,
+                    Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged { .. })
+                )
+        ),
+        "{foreign:?}"
+    );
+    assert!(db.stream_status().await.unwrap().tables.is_empty());
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn concurrent_prepare_stream_ingest_converges_on_one_lane() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_unenrolled_served_with_schema(STREAM_SCHEMA).await;
+    let request_a = "13131313-1313-4313-8313-131313131313";
+    let request_b = "14141414-1414-4414-8414-141414141414";
+    let (_, witness, _) = prepare_stream_ingest(&db, request_a, None, "agent:a")
+        .await
+        .unwrap();
+    let witness = witness.expect("challenge returns an opaque witness");
+    let manifest_before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    let (left, right) = tokio::join!(
+        prepare_stream_ingest(&db, request_a, Some(&witness), "agent:a"),
+        prepare_stream_ingest(&db, request_b, Some(&witness), "agent:a"),
+    );
+    let mut outcomes = vec![left.unwrap(), right.unwrap()];
+    outcomes.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(outcomes[0].0, "already_enrolled");
+    assert_eq!(outcomes[1].0, "enrolled");
+    assert_eq!(outcomes[0].2, outcomes[1].2);
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_before + 1,
+        "exactly one enrollment publication must win"
+    );
+    let status = db.stream_status().await.unwrap();
+    assert_eq!(status.tables.len(), 1);
+    assert_eq!(status.tables[0].lifecycle, "OPEN");
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn prepare_stream_ingest_rejects_blob_table_before_enrollment() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_unenrolled_served_with_schema(BLOB_STREAM_SCHEMA).await;
+    let error = prepare_stream_ingest(&db, "15151515-1515-4515-8515-151515151515", None, "agent:a")
+        .await
+        .expect_err("Blob-bearing tables cannot open a lane before fold supports Blob");
+    assert!(
+        error.to_string().contains("Blob-bearing table"),
+        "{error:?}"
+    );
+    assert!(db.stream_status().await.unwrap().tables.is_empty());
+    assert_no_recovery_sidecars(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn authorized_ingest_checks_policy_then_runtime_before_input() {
@@ -3387,6 +3709,18 @@ rules:
             ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
         let _must_not_invoke_put =
             ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+        let denied_prepare = prepare_stream_ingest(
+            &db,
+            "20202020-2020-4020-8020-202020202020",
+            None,
+            "act-denied",
+        )
+        .await
+        .expect_err("Cedar must reject prepare before recovery");
+        assert!(
+            matches!(denied_prepare, OmniError::Policy(_)),
+            "{denied_prepare:?}"
+        );
         let denied = db
             .failpoint_stream_ingest_one_as_for_test(
                 TABLE,
@@ -3398,6 +3732,21 @@ rules:
             .expect_err("Cedar must reject an actor without stream_ingest");
         assert!(matches!(denied, OmniError::Policy(_)), "{denied:?}");
 
+        let no_runtime_prepare = prepare_stream_ingest(
+            &db,
+            "21212121-2121-4121-8121-212121212121",
+            None,
+            "act-allowed",
+        )
+        .await
+        .expect_err("prepare requires an exact checked serving runtime");
+        assert!(
+            matches!(
+                no_runtime_prepare,
+                OmniError::StreamingRequiresClusterRuntime { ref mode } if mode == "ENABLED"
+            ),
+            "{no_runtime_prepare:?}"
+        );
         let no_runtime = db
             .failpoint_stream_ingest_one_as_for_test(
                 TABLE,

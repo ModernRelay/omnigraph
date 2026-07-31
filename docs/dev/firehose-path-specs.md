@@ -1169,8 +1169,8 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
    refused before the write-recovery barrier.
    Blob-bearing tables fail before any MemWAL put because Lance's LSM fold
    scanner cannot yet materialize their logical Blob values. Incremental NDJSON,
-   multi-row/reorder handling, transport admission, lazy enrollment, and the
-   public surface remain pending; this does not complete F4.
+   multi-row/reorder handling, transport admission, and the public surface
+   remain pending; this does not complete F4.
 3. **Lazy enrollment with a prepare handshake** (§4.7 P2) — every table is
    stream-eligible only while the profile is exactly `ENABLED`, but the wire
    invariant above still requires the engine-minted stream incarnation before
@@ -1208,14 +1208,21 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
      authenticated actor, and engine-minted stream incarnation/binding in
      recovery before its first effect, then returns a durable
      `EnrollmentReceiptV2` carrying that actor. The client may reuse the
-     request ID after an effect-free witness challenge. Once arming occurs, same ID,
-     actor, and intent after a lost response returns that receipt; another
-     actor or intent conflicts. Concurrent prepare IDs resolve through one
-     lifecycle CAS, and
+     request ID after an effect-free witness challenge. Once a participant
+     effect makes the receipt durable, the same ID, actor, and intent after a
+     lost response returns that receipt; another
+     actor or intent conflicts. Durable intent covers the graph/table lifetime,
+     accepted schema, original table HEAD, and fixed stream configuration;
+     profile revision and fold delegation remain pre-arm freshness evidence
+     because the receipt does not persist them. Concurrent prepare IDs resolve
+     through one lifecycle CAS, and
      losers return `already_enrolled` only after revalidating the winner's
      complete receipt and current binding. A successful prepare followed by no
      body intentionally leaves an empty enrolled `OPEN` lane, owned by F2's
-     empty quiesce/disable path; and
+     empty quiesce/disable path. A sidecar crash that recovery proves had zero
+     participant effects may retire and re-arm the same request with new
+     engine-minted result IDs; no receipt or acknowledgement existed at that
+     boundary; and
    - only a later ingest request carrying that exact stream incarnation on
      every row may own/read the NDJSON body. An absent lane returns request-
      level `StreamPrepareRequired` before body ownership. The remote
@@ -1230,6 +1237,20 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
      reprepares/replays that body after `StreamBindingChanged`; crossing a
      rebuilt/re-enrolled authority requires a caller-owned new occurrence and
      predecessor decision.
+
+   **Implemented sub-slice:** the feature-gated bodyless prepare seam now
+   enforces `stream_ingest` and exact checked-runtime authority, accepts a
+   canonical caller-owned UUID-v4 request ID, and returns an effect-free
+   table-specific eligibility witness before it can mint plan IDs or arm
+   recovery. An exact echo reuses recovery-v14 enrollment; durable same-request
+   retries return the actor-bound receipt, while concurrent request IDs
+   serialize at the existing admission/gate envelope and converge on one
+   validated lane. Blob-bearing tables are refused before enrollment. The
+   witness is ephemeral, no manifest/recovery grammar changed, and the only
+   externally reachable adapter remains the feature-gated test seam. This
+   slice fails closed unless the current binding is still the initial binding;
+   F3 must replace that check with full binding-chain ancestry when rebind
+   becomes active.
 
    This activates the actor-bound `EnrollmentReceiptV2` and
    `StreamEnrollmentV2` selected by the implemented hidden

@@ -66,8 +66,14 @@ flip, intended cluster-apply-only propagation with refresh convergence and typed
 pending-until-drained refusal, and the genuine v9↔v10 refusal/rebuild fence
 in CI. Its ambient public method is a known pre-activation gap; F2 replaces it
 with the capability-bound cluster-control adapter and durable automatic-fold
-delegation selected below. P2–P7 remain unimplemented and no ingest surface is
-active
+delegation selected below. P2's product/transport surface and P3–P7 remain
+unimplemented; no ingest surface is active
+**Private P2 prepare proof implemented:** 2026-07-31 — a feature-gated,
+bodyless engine seam now proves effect-free witness challenge, lazy recovery-v14
+enrollment, durable actor/intent replay, and concurrent one-lane convergence.
+It exposes no production SDK, CLI, HTTP, or OpenAPI surface and fails closed
+unless the current binding is still the initial binding; F3 owns full
+binding-chain ancestry when rebind activates.
 **Streaming authorization split and read-only status implemented:**
 2026-07-28 — the `stream_ingest` / `stream_manage` Cedar actions of §4.6 are
 registered (both graph-scoped; the main-only profile makes a branch dimension
@@ -2588,7 +2594,8 @@ data/authority correction, `StreamAuthorityRetirement`, token-ledger-index
 maintenance, sealed maintenance, and rebind require another strict
 graph/recovery strand. That strand must activate retirement before correction
 can create `WITHDRAWN`; the later dead-letter strand must extend it before
-`DEAD_LETTERED`. P2–P7 remain unimplemented. The bounded tranche requires
+`DEAD_LETTERED`. P2's product/transport surface and P3–P7 remain unimplemented.
+The bounded tranche requires
 genuine v10↔v11 old-binary/new-format refusal and rebuild evidence.
 
 This section records the selected parameters for the first public activation
@@ -2618,8 +2625,9 @@ from one canonical-main manifest snapshot, including the lifecycle revision
 future management verbs pass back as their compare token. It is read-only,
 takes no admission lease, resolves no recovery, and deliberately omits
 physical observations. Full exclusive-cut status and all CLI/HTTP/OpenAPI
-streaming surfaces remain inactive. P2–P7 remain unimplemented; enabling the
-profile activates no ingest surface. Ambient embedded SDK and direct-store
+streaming surfaces remain inactive. The private P2 prepare proof has no row
+body or product surface; P3–P7 remain unimplemented, and enabling the profile
+activates no ingest surface. Ambient embedded SDK and direct-store
 callers cannot mint the checked authority required to mutate it.
 
 **Profile boundaries.** Main-only; unsharded; one resident writer root-wide; one
@@ -3077,13 +3085,20 @@ lifecycle uses an automatic bodyless prepare handshake before its first row:
    its first effect, recovery fixes the request/witness intent, authenticated
    actor, and engine-minted stream incarnation/binding. The durable
    `EnrollmentReceiptV2` retains that actor. The same request ID may be reused
-   after an effect-free witness challenge. Once arming occurs, same ID, actor,
-   and intent after a lost response returns the receipt; another actor or
-   intent conflicts. Concurrent IDs resolve through the one-winner lifecycle
+   after an effect-free witness challenge. Once a participant effect makes the
+   receipt durable, the same ID, actor, and intent after a lost response
+   returns the receipt; another actor or intent conflicts. Durable intent
+   covers the graph/table lifetime, accepted schema, original table HEAD, and
+   fixed stream configuration; profile revision and fold delegation remain
+   pre-arm freshness evidence because the receipt does not persist them.
+   Concurrent IDs resolve through the one-winner lifecycle
    CAS, and a loser returns `already_enrolled` only after revalidating the
    winner's complete receipt and current authority. A successful prepare
    followed by no body leaves an empty enrolled `OPEN` lane; the F2 empty-lane
-   drain path owns its quiesce/disable.
+   drain path owns its quiesce/disable. If recovery proves that an armed
+   sidecar had zero participant effects, it may retire that sidecar and re-arm
+   the same request with new engine-minted result IDs; no receipt or
+   acknowledgement existed at that boundary.
 4. Only a later ingest request whose every `$stream` envelope carries that
    exact incarnation may own or read NDJSON. Ingest against an absent lane
    returns request-level `StreamPrepareRequired` before body admission. There
@@ -5099,7 +5114,8 @@ ordinary writers refuse but cannot be corrected, quiesced, or rebuilt.
   Accepted-schema and runtime guards must refuse `@stream` on a type requiring
   `@embed` or any external/provider-derived field; caller-supplied physical
   vectors must round-trip without provider invocation.
-- **Inactive enrollment / prepare:** the full non-experimental profile retains
+- **Private prepare proof; inactive enrollment product surface:** the full
+  non-experimental profile retains
   §3/§4.6's explicit `/enroll`, `stream_manage`, and request-level
   `StreamNotEnrolled` contract. The selected experimental profile instead
   requires P2's `stream_ingest`-authorized bodyless prepare: complete
@@ -5113,7 +5129,9 @@ ordinary writers refuse but cannot be corrected, quiesced, or rebuilt.
   enrollment. Tests cover every selected-profile
   bootstrap/shard/lifecycle crash boundary plus Cedar/served/remote success and
   embedded/direct refusal. B2b additionally covers every genesis
-  body/pointer/new-details crash boundary.
+  body/pointer/new-details crash boundary. The feature-gated engine proof now
+  covers the bodyless challenge and recovery-v14 enrollment subset; public
+  enrollment, transport, and row-body activation remain inactive.
 - **Inactive public acknowledgement adapter:** the response must be status-only
   and caller-ordered. It must map the private durable batch result back to each
   caller ordinal and report the
