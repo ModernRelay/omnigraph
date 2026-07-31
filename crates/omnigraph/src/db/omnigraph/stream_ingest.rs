@@ -4055,7 +4055,7 @@ impl Omnigraph {
         Ok(())
     }
 
-    fn ensure_stream_table_admission_supported(
+    pub(super) fn ensure_stream_table_admission_supported(
         catalog: &omnigraph_compiler::catalog::Catalog,
         table_key: &str,
     ) -> Result<()> {
