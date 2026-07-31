@@ -656,6 +656,72 @@ async fn init_productive_sealed_lane() -> (
     (dir, db, folded, sealed)
 }
 
+async fn init_productive_mixed_sealed_lane() -> (
+    EnrolledGraphDir,
+    Arc<Omnigraph>,
+    StreamTableStatus,
+) {
+    let cluster = tempfile::tempdir().unwrap();
+    let graph = cluster.path().join("graphs/knowledge.omni");
+    let db = Arc::new(
+        Omnigraph::init(graph.to_str().unwrap(), TWO_TABLE_STREAM_SCHEMA)
+            .await
+            .unwrap(),
+    );
+
+    // Keep both tables productive while only Person owns stream authority.
+    // Each load publishes one small fragment per table, giving Optimize real
+    // compaction work without manufacturing physical state outside OmniGraph.
+    for ordinal in 0..4 {
+        load_jsonl(
+            &db,
+            &format!(
+                "{{\"type\":\"Person\",\"data\":{{\"id\":\"p{ordinal}\",\"score\":{ordinal}}}}}\n\
+                 {{\"type\":\"Company\",\"data\":{{\"id\":\"c{ordinal}\",\"score\":{ordinal}}}}}"
+            ),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    }
+    db.failpoint_enroll_stream_table_for_test(TABLE)
+        .await
+        .unwrap();
+    let cluster_uri = format!("file://{}", cluster.path().display());
+    enable_stream_profile(&db, &cluster_uri).await;
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let open = stream_lane(&db).await;
+    db.failpoint_stream_quiesce_for_test(
+        TABLE,
+        "93939393-9393-4393-8393-939393939393",
+        open.lifecycle_revision,
+        "operator:mixed-optimize-quiesce",
+    )
+    .await
+    .expect("an empty enrolled lane must quiesce before checked Optimize");
+    let sealed = stream_lane(&db).await;
+    assert_eq!(sealed.lifecycle, "SEALED");
+    (
+        EnrolledGraphDir {
+            _cluster: cluster,
+            graph,
+        },
+        db,
+        sealed,
+    )
+}
+
+async fn raw_table_head(db: &Omnigraph, table_key: &str) -> u64 {
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let entry = snapshot.entry(table_key).unwrap();
+    let table_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    Dataset::open(&table_uri).await.unwrap().version().version
+}
+
 fn stream_data_block_token(error: &OmniError) -> &str {
     match error {
         OmniError::StreamDataBlocked { block_token } => block_token,
@@ -1398,6 +1464,400 @@ async fn sealed_ensure_indices_armed_effect_compensates_with_refreshed_proof() {
         visible_rows(&db).await,
         vec![("ordinary-before-quiesce".to_string(), 13)]
     );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn sealed_optimize_refreshes_only_productive_enrolled_authority_and_preserves_resume() {
+    let _scenario = FailScenario::setup();
+    let (dir, db, sealed) = init_productive_mixed_sealed_lane().await;
+    let sealed_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let sealed_person_version = sealed_snapshot.entry(TABLE).unwrap().table_version;
+    let sealed_company_version = sealed_snapshot
+        .entry("node:Company")
+        .unwrap()
+        .table_version;
+    let sealed_commit_count = db.list_commits(Some("main")).await.unwrap().len();
+
+    let ordinary_error = db
+        .optimize()
+        .await
+        .expect_err("ambient Optimize must remain fenced by productive SEALED authority");
+    let OmniError::Manifest(manifest_error) = ordinary_error else {
+        panic!("expected typed lifecycle conflict, got {ordinary_error:?}");
+    };
+    assert!(
+        matches!(
+            manifest_error.details,
+            Some(omnigraph::error::ManifestConflictDetails::StreamLifecycleConflict {
+                ref lifecycle,
+                ref operation,
+                ..
+            }) if lifecycle == "SEALED" && operation == "optimize"
+        ),
+        "{manifest_error:?}"
+    );
+    let after_refusal = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(after_refusal.version(), sealed_snapshot.version());
+    assert_eq!(
+        after_refusal.entry(TABLE).unwrap().table_version,
+        sealed_person_version
+    );
+    assert_eq!(
+        after_refusal
+            .entry("node:Company")
+            .unwrap()
+            .table_version,
+        sealed_company_version
+    );
+    assert_eq!(stream_lane(&db).await, sealed);
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        sealed_commit_count
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    let stats = db
+        .failpoint_stream_sealed_optimize_for_test("operator:sealed-optimize")
+        .await
+        .expect("checked SEALED Optimize must compact the enrolled and ordinary siblings");
+    for table_key in [TABLE, "node:Company"] {
+        assert!(
+            stats
+                .iter()
+                .any(|stat| stat.table_key == table_key && stat.committed),
+            "{table_key} must complete productive Optimize work: {stats:?}"
+        );
+    }
+    let maintained = stream_lane(&db).await;
+    let mut expected_maintained = sealed.clone();
+    expected_maintained.lifecycle_revision += 1;
+    assert_eq!(
+        maintained, expected_maintained,
+        "only the productive enrolled lane needs one refreshed SEALED witness"
+    );
+    let maintained_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        sealed_commit_count + 1,
+        "all productive table pointers and lifecycle authority publish in one graph commit"
+    );
+    assert!(
+        maintained_snapshot.entry(TABLE).unwrap().table_version > sealed_person_version
+    );
+    assert!(
+        maintained_snapshot
+            .entry("node:Company")
+            .unwrap()
+            .table_version
+            > sealed_company_version
+    );
+    assert_eq!(helpers::count_rows(&db, TABLE).await, 4);
+    assert_eq!(helpers::count_rows(&db, "node:Company").await, 4);
+    assert_no_recovery_sidecars(&dir);
+
+    let before_no_work_status = db.stream_status().await.unwrap();
+    let before_no_work_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let before_no_work_commit_count = db.list_commits(Some("main")).await.unwrap().len();
+    let repeated = db
+        .failpoint_stream_sealed_optimize_for_test("operator:sealed-optimize")
+        .await
+        .expect("a repeated checked Optimize must recognize no data-table work");
+    assert!(
+        repeated
+            .iter()
+            .filter(|stat| stat.table_key == TABLE || stat.table_key == "node:Company")
+            .all(|stat| !stat.committed),
+        "the converged data tables must be true no-ops: {repeated:?}"
+    );
+    let after_no_work_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(db.stream_status().await.unwrap(), before_no_work_status);
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        before_no_work_commit_count,
+        "no-work Optimize must not create graph lineage"
+    );
+    assert_eq!(
+        after_no_work_snapshot.entry(TABLE).unwrap().table_version,
+        before_no_work_snapshot.entry(TABLE).unwrap().table_version
+    );
+    assert_eq!(
+        after_no_work_snapshot
+            .entry("node:Company")
+            .unwrap()
+            .table_version,
+        before_no_work_snapshot
+            .entry("node:Company")
+            .unwrap()
+            .table_version
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    db.failpoint_stream_resume_for_test(
+        TABLE,
+        "94949494-9494-4494-8494-949494949494",
+        maintained.lifecycle_revision,
+        false,
+        "operator:sealed-optimize",
+    )
+    .await
+    .expect("the Optimize-refreshed SEALED proof must remain resumable");
+    let open = stream_lane(&db).await;
+    assert_eq!(open.lifecycle, "OPEN");
+    assert_eq!(open.lifecycle_revision, maintained.lifecycle_revision + 1);
+
+    let (_, already_durable) = authorized_ingest_score(
+        &db,
+        &open.stream_incarnation_id,
+        "after-optimize",
+        14,
+        1,
+        "95959595-9595-4595-8595-959595959595",
+        None,
+        "operator:sealed-optimize",
+    )
+    .await
+    .expect("the resumed writer must accept authenticated ingress");
+    assert!(!already_durable);
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the resumed generation must fold normally");
+    assert_eq!(helpers::count_rows(&db, TABLE).await, 5);
+    assert_eq!(helpers::count_rows(&db, "node:Company").await, 4);
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn sealed_optimize_effects_confirmed_reopens_with_atomic_authority() {
+    let _scenario = FailScenario::setup();
+    let (dir, db, _, sealed) = init_productive_sealed_lane().await;
+    let prior_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let prior_manifest_version = prior_snapshot.version();
+    let prior_table_version = prior_snapshot.entry(TABLE).unwrap().table_version;
+
+    let error = {
+        let _failpoint = ScopedFailPoint::new(
+            names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
+        db.failpoint_stream_sealed_optimize_for_test("operator:sealed-optimize-recovery")
+            .await
+            .expect_err("the confirmed v17 intent must stop before manifest publication")
+    };
+    assert!(matches!(&error, OmniError::RecoveryRequired { .. }), "{error:?}");
+    assert!(
+        error
+            .to_string()
+            .contains(names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT),
+        "{error:?}"
+    );
+
+    let achieved_table_head = raw_table_head(&db, TABLE).await;
+    assert!(
+        achieved_table_head > prior_table_version,
+        "productive Optimize must have an exact achieved HEAD before confirmation"
+    );
+    let unpublished = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(unpublished.version(), prior_manifest_version);
+    assert_eq!(
+        unpublished.entry(TABLE).unwrap().table_version,
+        prior_table_version
+    );
+    assert_eq!(stream_lane(&db).await, sealed);
+
+    let operation_ids = helpers::recovery::sidecar_operation_ids(dir.path());
+    assert_eq!(operation_ids.len(), 1);
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{}.json", operation_ids[0]));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["schema_version"], 17);
+    assert_eq!(sidecar["protocol_v17"]["kind"], "StreamSealedOptimize");
+    assert_eq!(
+        sidecar["protocol_v17"]["payload"]["effect_phase"],
+        "EffectsConfirmed"
+    );
+    assert_eq!(
+        sidecar["protocol_v17"]["payload"]["confirmed_outputs"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        sidecar["protocol_v17"]["payload"]["next_lifecycles"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    drop(unpublished);
+    drop(prior_snapshot);
+    drop(db);
+    let reopened = reopen_enrolled(&dir).await;
+    let recovered_snapshot = reopened
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert_eq!(recovered_snapshot.version(), prior_manifest_version + 1);
+    assert_eq!(
+        recovered_snapshot.entry(TABLE).unwrap().table_version,
+        achieved_table_head,
+        "recovery must select only the exact confirmed Optimize HEAD"
+    );
+    let recovered = stream_lane(&reopened).await;
+    let mut expected_recovered = sealed;
+    expected_recovered.lifecycle_revision += 1;
+    assert_eq!(
+        recovered, expected_recovered,
+        "the table pointer and refreshed SEALED proof must roll forward together"
+    );
+    assert_eq!(
+        visible_rows(&reopened).await,
+        vec![("ordinary-before-quiesce".to_string(), 13)]
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn sealed_optimize_partial_armed_effect_restores_with_matching_lifecycle_proof() {
+    let _scenario = FailScenario::setup();
+    let (dir, db, sealed) = init_productive_mixed_sealed_lane().await;
+    let prior_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let prior_manifest_version = prior_snapshot.version();
+    let prior_person_pin = prior_snapshot.entry(TABLE).unwrap().table_version;
+    let prior_company_pin = prior_snapshot
+        .entry("node:Company")
+        .unwrap()
+        .table_version;
+    assert_eq!(raw_table_head(&db, TABLE).await, prior_person_pin);
+    assert_eq!(
+        raw_table_head(&db, "node:Company").await,
+        prior_company_pin
+    );
+
+    let error = {
+        // The first physical task stops before compaction while its sibling is
+        // allowed to finish. Recovery must compensate the proper prefix under
+        // the one v17 intent without publishing either table early.
+        let _failpoint = ScopedFailPoint::new(names::OPTIMIZE_BEFORE_COMPACT, "1*return");
+        db.failpoint_stream_sealed_optimize_for_test("operator:sealed-optimize-rollback")
+            .await
+            .expect_err("a partial Armed Optimize must retain recovery ownership")
+    };
+    assert!(
+        matches!(&error, OmniError::RecoveryRequired { .. }),
+        "{error:?}"
+    );
+
+    let unpublished = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(unpublished.version(), prior_manifest_version);
+    assert_eq!(unpublished.entry(TABLE).unwrap().table_version, prior_person_pin);
+    assert_eq!(
+        unpublished
+            .entry("node:Company")
+            .unwrap()
+            .table_version,
+        prior_company_pin
+    );
+    assert_eq!(stream_lane(&db).await, sealed);
+
+    let effected_person_head = raw_table_head(&db, TABLE).await;
+    let effected_company_head = raw_table_head(&db, "node:Company").await;
+    let person_moved = effected_person_head > prior_person_pin;
+    let company_moved = effected_company_head > prior_company_pin;
+    assert_ne!(
+        person_moved, company_moved,
+        "exactly one bounded-parallel table task must complete: Person {prior_person_pin}->{effected_person_head}, Company {prior_company_pin}->{effected_company_head}"
+    );
+
+    let operation_ids = helpers::recovery::sidecar_operation_ids(dir.path());
+    assert_eq!(operation_ids.len(), 1);
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{}.json", operation_ids[0]));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["schema_version"], 17);
+    assert_eq!(sidecar["protocol_v17"]["kind"], "StreamSealedOptimize");
+    assert_eq!(
+        sidecar["protocol_v17"]["payload"]["effect_phase"],
+        "Armed"
+    );
+    assert!(
+        sidecar["protocol_v17"]["payload"]["confirmed_outputs"].is_null()
+    );
+
+    drop(unpublished);
+    drop(prior_snapshot);
+    drop(db);
+    let recovered = reopen_enrolled(&dir).await;
+    let compensated_snapshot = recovered
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert_eq!(
+        compensated_snapshot.version(),
+        prior_manifest_version + 1,
+        "one compensating graph commit must select every restored pointer and proof"
+    );
+    let compensated_person_pin = compensated_snapshot.entry(TABLE).unwrap().table_version;
+    let compensated_company_pin = compensated_snapshot
+        .entry("node:Company")
+        .unwrap()
+        .table_version;
+    if person_moved {
+        assert!(compensated_person_pin > effected_person_head);
+    } else {
+        assert_eq!(compensated_person_pin, prior_person_pin);
+    }
+    if company_moved {
+        assert!(compensated_company_pin > effected_company_head);
+    } else {
+        assert_eq!(compensated_company_pin, prior_company_pin);
+    }
+    let compensated = stream_lane(&recovered).await;
+    let mut expected_compensated = sealed;
+    if person_moved {
+        expected_compensated.lifecycle_revision += 1;
+    }
+    assert_eq!(
+        compensated, expected_compensated,
+        "only a restored enrolled table receives a refreshed SEALED proof"
+    );
+    assert_eq!(helpers::count_rows(&recovered, TABLE).await, 4);
+    assert_eq!(helpers::count_rows(&recovered, "node:Company").await, 4);
+    assert_no_recovery_sidecars(&dir);
+
+    drop(compensated_snapshot);
+    let cluster_uri = dir.cluster_uri();
+    let recovered =
+        helpers::stream_authority::bind_checked_stream_runtime(recovered, &cluster_uri).await;
+    let stats = recovered
+        .failpoint_stream_sealed_optimize_for_test("operator:sealed-optimize-rollback")
+        .await
+        .expect("the compensated graph must remain retryable");
+    for table_key in [TABLE, "node:Company"] {
+        assert!(
+            stats
+                .iter()
+                .any(|stat| stat.table_key == table_key && stat.committed),
+            "the restored productive table must be replanned: {stats:?}"
+        );
+    }
+    let retried = stream_lane(&recovered).await;
+    assert_eq!(retried.lifecycle, "SEALED");
+    assert_eq!(
+        retried.lifecycle_revision,
+        compensated.lifecycle_revision + 1
+    );
+    assert_eq!(helpers::count_rows(&recovered, TABLE).await, 4);
+    assert_eq!(helpers::count_rows(&recovered, "node:Company").await, 4);
     assert_no_recovery_sidecars(&dir);
 }
 

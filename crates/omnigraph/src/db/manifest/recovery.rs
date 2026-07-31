@@ -149,6 +149,12 @@ async fn publish_recovery_commit(
             Some(RecoveryProtocolV14::StreamFoldV2(protocol))
             | Some(RecoveryProtocolV14::StreamDrainFold(protocol)) => Some(&protocol.lineage),
             _ => None,
+        })
+        .or_else(|| {
+            sidecar.protocol_v17.as_deref().map(|protocol| {
+                let RecoveryProtocolV17::StreamSealedOptimize(protocol) = protocol;
+                &protocol.lineage
+            })
         });
     let exact_rollback_id = sidecar
         .protocol_v3
@@ -181,6 +187,12 @@ async fn publish_recovery_commit(
                         .map(|protocol| protocol.rollback_graph_commit_id.as_str())
                 })
                 .flatten()
+        })
+        .or_else(|| {
+            sidecar.protocol_v17.as_deref().map(|protocol| {
+                let RecoveryProtocolV17::StreamSealedOptimize(protocol) = protocol;
+                protocol.rollback_graph_commit_id.as_str()
+            })
         });
     let mut intent = match (exact_lineage, exact_rollback_id, kind) {
         (Some(lineage), _, RecoveryKind::RolledForward) => LineageIntent::from(lineage),
@@ -289,6 +301,12 @@ async fn publish_recovery_commit(
             Some(RecoveryProtocolV14::StreamFoldV2(protocol))
             | Some(RecoveryProtocolV14::StreamDrainFold(protocol)) => Some(&protocol.authority),
             _ => None,
+        })
+        .or_else(|| {
+            sidecar.protocol_v17.as_deref().map(|protocol| {
+                let RecoveryProtocolV17::StreamSealedOptimize(protocol) = protocol;
+                &protocol.authority
+            })
         });
     let precondition = match (exact_authority, kind) {
         (Some(authority), RecoveryKind::RolledForward) => {
@@ -424,7 +442,14 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// frozen recovery-v8 exact CreateIndex plan with the complete prior SEALED
 /// authority and exact terminal lifecycle successors. V9 and v14 wire
 /// meanings remain unchanged.
-pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 16;
+///
+/// v16 → v17: RFC-026 F3c same-binding SEALED Optimize. Lance's public
+/// maintenance calls still commit internally, so v17 preserves Optimize's
+/// bounded loose Armed ownership under the single-live-writer-process support
+/// boundary, then binds the complete achieved table updates and composite HEAD
+/// witnesses before roll-forward is allowed. V16 remains the exact
+/// caller-minted CreateIndex grammar and is not reinterpreted.
+pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 17;
 
 /// The only recovery generation emitted by the manifest-v5 write paths.
 pub(crate) const IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION: u32 = 9;
@@ -455,6 +480,11 @@ pub(crate) const STREAM_RESUME_SIDECAR_SCHEMA_VERSION: u32 = 15;
 /// no caller operation-id or new receipt family. F7 transport reuses this
 /// recovery contract under checked serving-runtime authority.
 pub(crate) const STREAM_SEALED_MAINTENANCE_SIDECAR_SCHEMA_VERSION: u32 = 16;
+
+/// Exact checked-runtime SEALED Optimize generation. Unlike v16, its physical
+/// effects are Lance-owned multi-commit maintenance operations rather than one
+/// caller-minted transaction per table.
+pub(crate) const STREAM_SEALED_OPTIMIZE_SIDECAR_SCHEMA_VERSION: u32 = 17;
 
 /// Schema v11 is the first sidecar allowed to describe data-bearing MemWAL
 /// state, which is bound to stream-config v2 rather than Phase A's config-v1.
@@ -1832,6 +1862,54 @@ pub(crate) enum RecoveryProtocolV16 {
     StreamSealedEnsureIndices(RecoveryStreamSealedMaintenanceV16),
 }
 
+/// One productive table's exact post-maintenance output. Optimize cannot bind
+/// caller-minted transaction identities because Lance owns the compaction and
+/// index-maintenance commits. The complete composite HEAD witness therefore
+/// becomes the terminal proof; recovery never treats a later or buried HEAD as
+/// this operation's confirmed result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamSealedOptimizeOutputV17 {
+    pub identity: super::TableIdentity,
+    pub table_key: String,
+    pub update: RecoveryConfirmedTableUpdate,
+    pub achieved_head: super::CurrentHeadWitness,
+}
+
+/// Dedicated recovery owner for checked-runtime Optimize over productive main
+/// tables. Armed physical ownership deliberately retains the established
+/// Optimize loose classifier under the current single-live-writer-process
+/// boundary. EffectsConfirmed replaces that ambiguity with a complete exact
+/// output set before any table pointer or lifecycle proof may publish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamSealedOptimizeV17 {
+    pub authority: RecoveryAuthorityToken,
+    pub lineage: RecoveryLineageIntent,
+    pub rollback_graph_commit_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_audit_outcomes: Option<Vec<TableOutcome>>,
+    pub effect_phase: RecoveryEffectPhase,
+    pub profile: super::StreamProfileEntry,
+    pub token_authority: super::StreamTokenAuthorityEntry,
+    pub prior_lifecycles: Vec<super::StreamLifecycleEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_outputs: Option<Vec<RecoveryStreamSealedOptimizeOutputV17>>,
+    /// Exact SEALED successors selected by the successful Optimize publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_lifecycles: Option<Vec<super::StreamLifecycleEntry>>,
+    /// Exact SEALED successors for enrolled tables whose productive Optimize
+    /// effect was compensated by Restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_lifecycles: Option<Vec<super::StreamLifecycleEntry>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", deny_unknown_fields)]
+pub(crate) enum RecoveryProtocolV17 {
+    StreamSealedOptimize(RecoveryStreamSealedOptimizeV17),
+}
+
 /// Schema-v6 EnsureIndices rollback identity retained for compatibility.
 /// Recovery must still be able to prove that a previously published
 /// compensation was a rollback rather than infer the outcome from aligned
@@ -1929,6 +2007,11 @@ pub(crate) struct RecoverySidecar {
     /// only). The exact physical CreateIndex plan remains in `protocol_v8`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v16: Option<Box<RecoveryProtocolV16>>,
+    /// Exact RFC-026 checked-runtime SEALED Optimize envelope (schema v17
+    /// only). This is separate from v16 because Lance owns Optimize's
+    /// multi-commit transaction sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_v17: Option<Box<RecoveryProtocolV17>>,
     /// EnsureIndices-only fixed rollback identity. It does not make the
     /// physical index effects exact; it only makes compensation retry-safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2434,6 +2517,14 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             STREAM_SEALED_MAINTENANCE_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
         )));
     }
+    if sidecar.protocol_v17.is_some()
+        && sidecar.schema_version != STREAM_SEALED_OPTIMIZE_SIDECAR_SCHEMA_VERSION
+    {
+        return Err(malformed(format!(
+            "protocol_v17 requires schema-v{}, found schema-v{}",
+            STREAM_SEALED_OPTIMIZE_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
+        )));
+    }
 
     if sidecar.schema_version < EXACT_EFFECT_IDENTITY_SCHEMA_VERSION {
         if sidecar.protocol_v3.is_some()
@@ -2447,6 +2538,7 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             || sidecar.protocol_v14.is_some()
             || sidecar.protocol_v15.is_some()
             || sidecar.protocol_v16.is_some()
+            || sidecar.protocol_v17.is_some()
         {
             return Err(malformed(
                 "an exact-effect protocol is present on a pre-v3 sidecar".to_string(),
@@ -2481,6 +2573,10 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
 
     if sidecar.schema_version == STREAM_SEALED_MAINTENANCE_SIDECAR_SCHEMA_VERSION {
         return validate_stream_protocol_v16_shape(sidecar_uri, sidecar);
+    }
+
+    if sidecar.schema_version == STREAM_SEALED_OPTIMIZE_SIDECAR_SCHEMA_VERSION {
+        return validate_stream_protocol_v17_shape(sidecar_uri, sidecar);
     }
 
     if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
@@ -13571,6 +13667,12 @@ async fn process_sidecar(
     if sidecar.schema_version == STREAM_SEALED_MAINTENANCE_SIDECAR_SCHEMA_VERSION {
         return process_ensure_indices_sidecar_v8(root_uri, storage, snapshot, sidecar, mode).await;
     }
+    if sidecar.schema_version == STREAM_SEALED_OPTIMIZE_SIDECAR_SCHEMA_VERSION {
+        return process_stream_sealed_optimize_sidecar_v17(
+            root_uri, storage, snapshot, sidecar, mode,
+        )
+        .await;
+    }
     if sidecar.schema_version == STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION {
         return match sidecar
             .protocol_v14
@@ -14437,19 +14539,35 @@ async fn rebuild_stream_sealed_maintenance_successors_v16(
             "SEALED EnsureIndices successor rebuild requires protocol_v16 authority",
         )
     })?;
-    let token_dataset = super::token_store::open_stream_token_authority_at(
+    rebuild_stream_sealed_lifecycle_successors(
         root_uri,
         &overlay.token_authority,
+        &sidecar.tables,
+        priors,
+        "SEALED EnsureIndices",
+    )
+    .await
+}
+
+async fn rebuild_stream_sealed_lifecycle_successors(
+    root_uri: &str,
+    token_authority: &super::StreamTokenAuthorityEntry,
+    tables: &[SidecarTablePin],
+    priors: &[super::StreamLifecycleEntry],
+    operation: &str,
+) -> Result<Vec<super::StreamLifecycleEntry>> {
+    let token_dataset = super::token_store::open_stream_token_authority_at(
+        root_uri,
+        token_authority,
         &crate::lance_access::control_session(),
     )
     .await?;
     let mut rebuilt = Vec::with_capacity(priors.len());
     for prior in priors {
-        let pin = sidecar
-            .tables
+        let pin = tables
             .iter()
             .find(|pin| pin.identity == prior.identity)
-            .expect("validated v16 lifecycle rows are a subset of table pins");
+            .expect("validated lifecycle rows are a subset of table pins");
         let table_dataset = crate::instrumentation::open_dataset(
             &pin.table_path,
             crate::instrumentation::VersionResolution::Latest,
@@ -14461,26 +14579,26 @@ async fn rebuild_stream_sealed_maintenance_successors_v16(
             .await
             .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
         let record_id = prior.current_claim_receipt_id.as_deref().ok_or_else(|| {
-            OmniError::manifest_internal(
-                "SEALED EnsureIndices prior lifecycle has no selected ClaimReceipt",
-            )
+            OmniError::manifest_internal(format!(
+                "{operation} prior lifecycle has no selected ClaimReceipt"
+            ))
         })?;
         let record = super::token_store::lookup_lifecycle_ledger_record_by_id(
             &token_dataset,
-            &overlay.token_authority,
+            token_authority,
             super::stream::CLAIM_RECEIPT_TAG,
             record_id,
         )
         .await?
         .ok_or_else(|| {
-            OmniError::manifest_internal(
-                "SEALED EnsureIndices selected ClaimReceipt is absent from token authority",
-            )
+            OmniError::manifest_internal(format!(
+                "{operation} selected ClaimReceipt is absent from token authority"
+            ))
         })?;
         let super::token_store::LifecycleLedgerRecord::ClaimReceipt(receipt) = record else {
-            return Err(OmniError::manifest_internal(
-                "SEALED EnsureIndices selected ClaimReceipt ID decoded another ledger family",
-            ));
+            return Err(OmniError::manifest_internal(format!(
+                "{operation} selected ClaimReceipt ID decoded another ledger family"
+            )));
         };
         rebuilt.push(crate::db::build_sealed_maintenance_successor(
             prior,
@@ -16401,6 +16519,7 @@ fn has_exact_protocol(sidecar: &RecoverySidecar) -> bool {
         || sidecar.protocol_v10.is_some()
         || sidecar.protocol_v11.is_some()
         || sidecar.protocol_v12.is_some()
+        || sidecar.protocol_v17.is_some()
 }
 
 fn has_fixed_rollback_identity(sidecar: &RecoverySidecar) -> bool {
@@ -18411,6 +18530,7 @@ fn new_unvalidated_sidecar(
         protocol_v14: None,
         protocol_v15: None,
         protocol_v16: None,
+        protocol_v17: None,
         ensure_indices_rollback_v6: None,
     }
 }
@@ -20240,6 +20360,7 @@ pub(crate) fn new_ensure_indices_sidecar_v9(
         protocol_v14: None,
         protocol_v15: None,
         protocol_v16: None,
+        protocol_v17: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-ensure-indices-v9-sidecar>", &sidecar)?;
@@ -20598,6 +20719,7 @@ pub(crate) fn new_occ_sidecar_v9(
         protocol_v14: None,
         protocol_v15: None,
         protocol_v16: None,
+        protocol_v17: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-occ-sidecar>", &sidecar)?;
@@ -20790,6 +20912,7 @@ pub(crate) fn new_schema_apply_sidecar_v9(
         protocol_v14: None,
         protocol_v15: None,
         protocol_v16: None,
+        protocol_v17: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-schema-apply-v9-sidecar>", &sidecar)?;
@@ -20963,6 +21086,7 @@ pub(crate) fn new_branch_merge_sidecar_v9(
         protocol_v14: None,
         protocol_v15: None,
         protocol_v16: None,
+        protocol_v17: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-branch-merge-sidecar>", &sidecar)?;
@@ -21198,6 +21322,1434 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
     let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
         OmniError::manifest_internal(format!(
             "failed to serialize confirmed BranchMerge recovery sidecar: {error}"
+        ))
+    })?;
+    storage.write_text(&uri, &json).await?;
+    *sidecar = confirmed;
+    Ok(())
+}
+
+fn validate_stream_protocol_v17_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+    if sidecar.branch.is_some()
+        || sidecar.writer_kind != SidecarKind::StreamSealedMaintenance
+        || sidecar.actor_id.is_none()
+        || sidecar.protocol_v3.is_some()
+        || sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v8.is_some()
+        || sidecar.protocol_v10.is_some()
+        || sidecar.protocol_v11.is_some()
+        || sidecar.protocol_v12.is_some()
+        || sidecar.protocol_v13.is_some()
+        || sidecar.protocol_v14.is_some()
+        || sidecar.protocol_v15.is_some()
+        || sidecar.protocol_v16.is_some()
+        || sidecar.ensure_indices_rollback_v6.is_some()
+        || sidecar.merge_source_commit_id.is_some()
+        || !sidecar.additional_registrations.is_empty()
+        || !sidecar.tombstones.is_empty()
+        || sidecar.schema_apply_manifest_published
+        || sidecar.schema_apply_target_schema_ir_hash.is_some()
+    {
+        return Err(malformed(
+            "schema-v17 SEALED Optimize must target canonical main and carry only protocol_v17 authority"
+                .to_string(),
+        ));
+    }
+    validate_unique_pin_identities(&malformed, &sidecar.tables, true)?;
+    if sidecar.tables.iter().any(|pin| {
+        pin.table_branch.is_some()
+            || pin.post_commit_pin != pin.expected_version.saturating_add(1)
+            || pin.confirmed_version.is_some()
+    }) {
+        return Err(malformed(
+            "schema-v17 SEALED Optimize requires existing main-table loose-maintenance pins"
+                .to_string(),
+        ));
+    }
+
+    let protocol = sidecar
+        .protocol_v17
+        .as_deref()
+        .ok_or_else(|| malformed("missing required protocol_v17 payload".to_string()))?;
+    let RecoveryProtocolV17::StreamSealedOptimize(protocol) = protocol;
+    validate_authority_identity(&malformed, &protocol.authority)?;
+    if protocol.authority.branch_identifier
+        != lance::dataset::refs::BranchIdentifier::main()
+        || protocol.lineage.branch.is_some()
+        || protocol.lineage.merged_parent_commit_id.is_some()
+        || protocol.lineage.actor_id != sidecar.actor_id
+        || protocol.lineage.graph_commit_id.is_empty()
+        || protocol.rollback_graph_commit_id.is_empty()
+        || protocol.rollback_graph_commit_id == protocol.lineage.graph_commit_id
+        || sidecar.started_at.parse::<i64>().is_err()
+    {
+        return Err(malformed(
+            "schema-v17 SEALED Optimize requires fixed authenticated canonical-main authority and distinct lineage outcomes"
+                .to_string(),
+        ));
+    }
+    protocol
+        .profile
+        .validate()
+        .map_err(|error| malformed(error.to_string()))?;
+    if !protocol.profile.streaming_enabled() {
+        return Err(malformed(
+            "schema-v17 SEALED Optimize requires an ENABLED stream profile".to_string(),
+        ));
+    }
+    protocol
+        .token_authority
+        .validate()
+        .map_err(|error| malformed(error.to_string()))?;
+
+    let pin_ids = sidecar
+        .tables
+        .iter()
+        .map(|pin| pin.identity)
+        .collect::<HashSet<_>>();
+    let pin_aliases = sidecar
+        .tables
+        .iter()
+        .map(|pin| pin.table_key.as_str())
+        .collect::<HashSet<_>>();
+    if let Some(outcomes) = protocol.rollback_audit_outcomes.as_ref() {
+        let outcome_keys = outcomes
+            .iter()
+            .map(|outcome| outcome.table_key.as_str())
+            .collect::<HashSet<_>>();
+        if outcomes.is_empty()
+            || outcome_keys.len() != outcomes.len()
+            || !outcome_keys.is_subset(&pin_aliases)
+            || outcomes.iter().any(|outcome| {
+                let pin = sidecar
+                    .tables
+                    .iter()
+                    .find(|pin| pin.table_key == outcome.table_key)
+                    .expect("rollback outcome alias subset checked above");
+                outcome.to_version != pin.expected_version
+                    || outcome.from_version <= outcome.to_version
+            })
+        {
+            return Err(malformed(
+                "schema-v17 rollback audit outcomes must name a unique non-empty subset of moved table pins"
+                    .to_string(),
+            ));
+        }
+    }
+    let prior_ids = protocol
+        .prior_lifecycles
+        .iter()
+        .map(|entry| entry.identity)
+        .collect::<Vec<_>>();
+    if prior_ids.windows(2).any(|pair| pair[0] >= pair[1])
+        || prior_ids.iter().any(|identity| !pin_ids.contains(identity))
+    {
+        return Err(malformed(
+            "schema-v17 prior SEALED lifecycle rows must be a strictly sorted subset of productive table pins"
+                .to_string(),
+        ));
+    }
+    for prior in &protocol.prior_lifecycles {
+        prior
+            .validate()
+            .map_err(|error| malformed(error.to_string()))?;
+        let pin = sidecar
+            .tables
+            .iter()
+            .find(|pin| pin.identity == prior.identity)
+            .expect("prior lifecycle subset checked above");
+        if prior.lifecycle != super::StreamLifecycle::Sealed
+            || prior.current_head_witness.table_version != pin.expected_version
+        {
+            return Err(malformed(
+                "schema-v17 prior lifecycle must be SEALED at the exact table pin".to_string(),
+            ));
+        }
+    }
+
+    match (
+        protocol.effect_phase,
+        protocol.confirmed_outputs.as_ref(),
+        protocol.next_lifecycles.as_ref(),
+    ) {
+        (RecoveryEffectPhase::Armed, None, None) => {}
+        (RecoveryEffectPhase::EffectsConfirmed, Some(outputs), Some(next))
+            if outputs.len() == sidecar.tables.len()
+                && next.len() == protocol.prior_lifecycles.len() =>
+        {
+            let output_ids = outputs.iter().map(|output| output.identity).collect::<Vec<_>>();
+            if output_ids.windows(2).any(|pair| pair[0] >= pair[1])
+                || output_ids.iter().copied().collect::<HashSet<_>>() != pin_ids
+            {
+                return Err(malformed(
+                    "schema-v17 confirmed Optimize outputs must exactly and strictly sort the productive table pins"
+                        .to_string(),
+                ));
+            }
+            for output in outputs {
+                let pin = sidecar
+                    .tables
+                    .iter()
+                    .find(|pin| pin.identity == output.identity)
+                    .expect("confirmed output key set checked above");
+                validate_canonical_uuid_text(
+                    &malformed,
+                    "schema-v17 achieved transaction_uuid",
+                    &output.achieved_head.transaction_uuid,
+                    false,
+                )?;
+                if output.table_key != pin.table_key
+                    || output.update.table_branch.is_some()
+                    || output.update.table_version <= pin.expected_version
+                    || output.achieved_head.branch_identifier
+                        != lance::dataset::refs::BranchIdentifier::main()
+                    || output.achieved_head.table_version != output.update.table_version
+                    || output.achieved_head.manifest_e_tag.as_ref().is_some_and(|e_tag| {
+                        e_tag.is_empty() || e_tag.trim() != e_tag
+                    })
+                {
+                    return Err(malformed(
+                        "schema-v17 confirmed Optimize output differs from its main-table pin or exact achieved HEAD"
+                            .to_string(),
+                    ));
+                }
+            }
+            for (prior, next) in protocol.prior_lifecycles.iter().zip(next) {
+                next.validate_successor_of(prior)
+                    .map_err(|error| malformed(error.to_string()))?;
+                let output = outputs
+                    .iter()
+                    .find(|output| output.identity == prior.identity)
+                    .expect("prior lifecycle is a productive output subset");
+                let mut normalized = next.clone();
+                normalized.lifecycle_revision = prior.lifecycle_revision;
+                normalized.current_head_witness = prior.current_head_witness.clone();
+                let normalized_proof = normalized.sealed_proof.as_mut().ok_or_else(|| {
+                    malformed("confirmed SEALED lifecycle lost its empty proof".to_string())
+                })?;
+                let prior_proof = prior.sealed_proof.as_ref().expect("validated SEALED proof");
+                normalized_proof.base_current_head_witness =
+                    prior_proof.base_current_head_witness.clone();
+                normalized_proof.verified_empty_digest =
+                    prior_proof.verified_empty_digest.clone();
+                if next.lifecycle != super::StreamLifecycle::Sealed
+                    || next.current_head_witness != output.achieved_head
+                    || normalized != *prior
+                {
+                    return Err(malformed(
+                        "schema-v17 Optimize successor changes authority outside revision, exact achieved base HEAD, and recomputed empty proof"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(malformed(
+                "schema-v17 Optimize confirmation outputs and lifecycle successors must be wholly absent while Armed and complete when EffectsConfirmed"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let rollback_ids = protocol
+        .rollback_audit_outcomes
+        .as_ref()
+        .map(|outcomes| {
+            protocol
+                .prior_lifecycles
+                .iter()
+                .filter(|prior| {
+                    let pin = sidecar
+                        .tables
+                        .iter()
+                        .find(|pin| pin.identity == prior.identity)
+                        .expect("prior lifecycle subset checked above");
+                    outcomes
+                        .iter()
+                        .any(|outcome| outcome.table_key == pin.table_key)
+                })
+                .map(|prior| prior.identity)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    match protocol.rollback_lifecycles.as_ref() {
+        None => {}
+        Some(rollback) => {
+            let rollback_successor_ids = rollback
+                .iter()
+                .map(|entry| entry.identity)
+                .collect::<Vec<_>>();
+            if protocol.rollback_audit_outcomes.is_none() || rollback_successor_ids != rollback_ids
+            {
+                return Err(malformed(
+                    "schema-v17 rollback lifecycle successors must exactly cover enrolled compensated table effects"
+                        .to_string(),
+                ));
+            }
+            for next in rollback {
+                let prior = protocol
+                    .prior_lifecycles
+                    .iter()
+                    .find(|prior| prior.identity == next.identity)
+                    .expect("rollback successor identities checked above");
+                next.validate_successor_of(prior)
+                    .map_err(|error| malformed(error.to_string()))?;
+                let mut normalized = next.clone();
+                normalized.lifecycle_revision = prior.lifecycle_revision;
+                normalized.current_head_witness = prior.current_head_witness.clone();
+                let normalized_proof = normalized.sealed_proof.as_mut().ok_or_else(|| {
+                    malformed("rollback SEALED lifecycle lost its empty proof".to_string())
+                })?;
+                let prior_proof = prior.sealed_proof.as_ref().expect("validated SEALED proof");
+                normalized_proof.base_current_head_witness =
+                    prior_proof.base_current_head_witness.clone();
+                normalized_proof.verified_empty_digest =
+                    prior_proof.verified_empty_digest.clone();
+                if next.lifecycle != super::StreamLifecycle::Sealed
+                    || next.current_head_witness.branch_identifier
+                        != lance::dataset::refs::BranchIdentifier::main()
+                    || next.current_head_witness.table_version
+                        <= prior.current_head_witness.table_version
+                    || next.current_head_witness.transaction_uuid
+                        == prior.current_head_witness.transaction_uuid
+                    || normalized != *prior
+                {
+                    return Err(malformed(
+                        "schema-v17 rollback successor changes authority outside revision, restored base HEAD, and recomputed empty proof"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stream_sealed_optimize_v17(
+    sidecar: &RecoverySidecar,
+) -> Option<&RecoveryStreamSealedOptimizeV17> {
+    match sidecar.protocol_v17.as_deref() {
+        Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) => Some(protocol),
+        None => None,
+    }
+}
+
+async fn observe_stream_sealed_optimize_output_v17(
+    root_uri: &str,
+    pin: &SidecarTablePin,
+) -> Result<(
+    lance::Dataset,
+    RecoveryConfirmedTableUpdate,
+    super::CurrentHeadWitness,
+)> {
+    let dataset = crate::instrumentation::open_dataset(
+        &pin.table_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
+    let achieved_head = capture_current_head_witness(&dataset)
+        .await
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    let row_count = dataset
+        .count_rows(None)
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))? as u64;
+    let relative_path = super::table_path_for_identity(&pin.table_key, pin.identity)?;
+    let version_metadata =
+        super::metadata::TableVersionMetadata::from_dataset(root_uri, &relative_path, &dataset)?;
+    let update = RecoveryConfirmedTableUpdate {
+        table_version: achieved_head.table_version,
+        table_branch: None,
+        row_count,
+        version_metadata,
+    };
+    Ok((dataset, update, achieved_head))
+}
+
+fn stream_sealed_optimize_output_matches_physical_v17(
+    output: &RecoveryStreamSealedOptimizeOutputV17,
+    observed_update: &RecoveryConfirmedTableUpdate,
+    observed_head: &super::CurrentHeadWitness,
+) -> bool {
+    output.update == *observed_update && output.achieved_head == *observed_head
+}
+
+async fn validate_stream_sealed_optimize_outputs_v17(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    let protocol = stream_sealed_optimize_v17(sidecar).ok_or_else(|| {
+        OmniError::manifest_internal("SEALED Optimize output validation requires protocol_v17")
+    })?;
+    let outputs = protocol.confirmed_outputs.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal("SEALED Optimize output validation requires confirmation")
+    })?;
+    for output in outputs {
+        let pin = sidecar
+            .tables
+            .iter()
+            .find(|pin| pin.identity == output.identity)
+            .expect("validated v17 output key set");
+        let (_, observed_update, observed_head) =
+            observe_stream_sealed_optimize_output_v17(root_uri, pin).await?;
+        if !stream_sealed_optimize_output_matches_physical_v17(
+            output,
+            &observed_update,
+            &observed_head,
+        ) {
+            return Err(OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' table '{}' confirmed output differs from its exact physical HEAD state",
+                sidecar.operation_id, pin.table_key
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_stream_sealed_optimize_rollback_plan_v17(
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+) -> Result<()> {
+    let protocol = stream_sealed_optimize_v17(sidecar).expect("validated protocol_v17");
+    let Some(outcomes) = protocol.rollback_audit_outcomes.as_ref() else {
+        return Ok(());
+    };
+    let required = sidecar
+        .tables
+        .iter()
+        .zip(states)
+        .filter(|(_, state)| table_requires_rollback_effect(state))
+        .collect::<Vec<_>>();
+    let outcome_keys = outcomes
+        .iter()
+        .map(|outcome| outcome.table_key.as_str())
+        .collect::<HashSet<_>>();
+    if outcomes.len() != required.len()
+        || required
+            .iter()
+            .any(|(pin, _)| !outcome_keys.contains(pin.table_key.as_str()))
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "SEALED Optimize sidecar '{}' rollback plan does not exactly cover the moved table set",
+            sidecar.operation_id
+        )));
+    }
+    for outcome in outcomes {
+        let (pin, state) = required
+            .iter()
+            .find(|(pin, _)| pin.table_key == outcome.table_key)
+            .expect("rollback outcome and required key sets match");
+        let source_matches = if state.effect_ownership == EffectOwnership::OwnCompensatedAtHead {
+            let dataset = crate::instrumentation::open_dataset(
+                &pin.table_path,
+                crate::instrumentation::VersionResolution::Latest,
+                None,
+                crate::instrumentation::table_wrapper(),
+            )
+            .await?;
+            stream_optimize_compensating_restore_source_v17(&dataset, state.manifest_pinned)
+                .await?
+                == Some(outcome.from_version)
+        } else {
+            state.lance_head == outcome.from_version
+        };
+        if outcome.to_version != state.manifest_pinned || !source_matches {
+            return Err(OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' rollback plan for table '{}' differs from its exact pre-Restore observation",
+                sidecar.operation_id, pin.table_key
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_stream_sealed_optimize_prior_v17(
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    let protocol = stream_sealed_optimize_v17(sidecar).ok_or_else(|| {
+        OmniError::manifest_internal("SEALED Optimize recovery requires protocol_v17 authority")
+    })?;
+    if snapshot.stream_profile() != &protocol.profile
+        || snapshot.stream_token_authority() != &protocol.token_authority
+    {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "SEALED Optimize profile or selected token authority changed before publication",
+        ));
+    }
+    for pin in &sidecar.tables {
+        let recorded = protocol
+            .prior_lifecycles
+            .iter()
+            .find(|entry| entry.identity == pin.identity);
+        if snapshot.stream_lifecycle(pin.identity) != recorded {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                format!(
+                    "SEALED Optimize lifecycle authority changed for table '{}'",
+                    pin.table_key
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn rebuild_stream_sealed_optimize_successors_v17(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+    priors: &[super::StreamLifecycleEntry],
+) -> Result<Vec<super::StreamLifecycleEntry>> {
+    let protocol = stream_sealed_optimize_v17(sidecar).ok_or_else(|| {
+        OmniError::manifest_internal("SEALED Optimize successor rebuild requires protocol_v17")
+    })?;
+    rebuild_stream_sealed_lifecycle_successors(
+        root_uri,
+        &protocol.token_authority,
+        &sidecar.tables,
+        priors,
+        "SEALED Optimize",
+    )
+    .await
+}
+
+async fn validate_stream_sealed_optimize_terminal_v17(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    let protocol = stream_sealed_optimize_v17(sidecar).ok_or_else(|| {
+        OmniError::manifest_internal("SEALED Optimize terminal validation requires protocol_v17")
+    })?;
+    let next = protocol.next_lifecycles.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "confirmed SEALED Optimize sidecar has no lifecycle successors",
+        )
+    })?;
+    validate_stream_sealed_optimize_outputs_v17(root_uri, sidecar).await?;
+    let rebuilt = rebuild_stream_sealed_optimize_successors_v17(
+        root_uri,
+        sidecar,
+        &protocol.prior_lifecycles,
+    )
+    .await?;
+    if &rebuilt != next {
+        return Err(OmniError::manifest_internal(
+            "SEALED Optimize lifecycle successors differ from their exact physical/receipt rebuild",
+        ));
+    }
+    Ok(())
+}
+
+async fn prepare_stream_sealed_optimize_rollback_v17(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+) -> Result<RecoverySidecar> {
+    let protocol = stream_sealed_optimize_v17(sidecar).ok_or_else(|| {
+        OmniError::manifest_internal("SEALED Optimize rollback requires protocol_v17")
+    })?;
+    if protocol.rollback_audit_outcomes.is_some() {
+        return Ok(sidecar.clone());
+    }
+    let outcomes = sidecar
+        .tables
+        .iter()
+        .zip(states)
+        .filter(|(_, state)| table_requires_rollback_effect(state))
+        .map(|(pin, state)| TableOutcome {
+            table_key: pin.table_key.clone(),
+            from_version: state.lance_head,
+            to_version: state.manifest_pinned,
+        })
+        .collect::<Vec<_>>();
+    if outcomes.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "SEALED Optimize rollback preparation has no moved table",
+        ));
+    }
+    let mut prepared = sidecar.clone();
+    let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+        prepared.protocol_v17.as_deref_mut()
+    else {
+        unreachable!("caller checked protocol_v17")
+    };
+    protocol.rollback_audit_outcomes = Some(outcomes);
+    let uri = sidecar_uri(root_uri, &prepared.operation_id);
+    validate_sidecar_shape(&uri, &prepared)?;
+    let json = serde_json::to_string_pretty(&prepared).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize SEALED Optimize rollback plan for sidecar '{}': {error}",
+            prepared.operation_id
+        ))
+    })?;
+    storage.write_text(&uri, &json).await?;
+    Ok(prepared)
+}
+
+async fn bind_stream_sealed_optimize_rollback_lifecycles_v17(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+) -> Result<RecoverySidecar> {
+    let protocol = stream_sealed_optimize_v17(sidecar).ok_or_else(|| {
+        OmniError::manifest_internal("SEALED Optimize rollback requires protocol_v17")
+    })?;
+    let outcomes = protocol.rollback_audit_outcomes.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal("SEALED Optimize rollback has no durable audit plan")
+    })?;
+    let rollback_priors = protocol
+        .prior_lifecycles
+        .iter()
+        .filter(|prior| {
+            let pin = sidecar
+                .tables
+                .iter()
+                .find(|pin| pin.identity == prior.identity)
+                .expect("validated prior lifecycle subset");
+            outcomes
+                .iter()
+                .any(|outcome| outcome.table_key == pin.table_key)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let rebuilt =
+        rebuild_stream_sealed_optimize_successors_v17(root_uri, sidecar, &rollback_priors).await?;
+    if let Some(recorded) = protocol.rollback_lifecycles.as_ref() {
+        if recorded != &rebuilt {
+            return Err(OmniError::manifest_internal(
+                "SEALED Optimize rollback successors differ from their exact physical/receipt rebuild",
+            ));
+        }
+        return Ok(sidecar.clone());
+    }
+    let mut prepared = sidecar.clone();
+    let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+        prepared.protocol_v17.as_deref_mut()
+    else {
+        unreachable!("caller checked protocol_v17")
+    };
+    protocol.rollback_lifecycles = Some(rebuilt);
+    let uri = sidecar_uri(root_uri, &prepared.operation_id);
+    validate_sidecar_shape(&uri, &prepared)?;
+    let json = serde_json::to_string_pretty(&prepared).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize SEALED Optimize rollback successors for sidecar '{}': {error}",
+            prepared.operation_id
+        ))
+    })?;
+    storage.write_text(&uri, &json).await?;
+    Ok(prepared)
+}
+
+async fn stream_optimize_compensating_restore_source_v17(
+    dataset: &lance::Dataset,
+    expected_version: u64,
+) -> Result<Option<u64>> {
+    let transaction = dataset
+        .read_transaction()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    Ok(transaction.and_then(|transaction| {
+        matches!(
+            &transaction.operation,
+            lance::dataset::transaction::Operation::Restore { version }
+                if *version == expected_version
+        )
+        .then_some(transaction.read_version)
+    }))
+}
+
+async fn classify_stream_sealed_optimize_tables_v17(
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<Vec<ClassifiedTable>> {
+    let protocol = stream_sealed_optimize_v17(sidecar).expect("validated protocol_v17");
+    let rollback_started = protocol.rollback_audit_outcomes.is_some();
+    let mut states = Vec::with_capacity(sidecar.tables.len());
+    for pin in &sidecar.tables {
+        let manifest_entry = snapshot_entry_for_pin(snapshot, pin)?.ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "SEALED Optimize table '{}' disappeared while recovery was pending",
+                pin.table_key
+            ))
+        })?;
+        let manifest_pinned = manifest_entry.table_version;
+        if manifest_pinned != pin.expected_version {
+            return Err(OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' table '{}' manifest pin changed from {} to {} without either fixed outcome",
+                sidecar.operation_id, pin.table_key, pin.expected_version, manifest_pinned
+            )));
+        }
+        let dataset = crate::instrumentation::open_dataset(
+            &pin.table_path,
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::table_wrapper(),
+        )
+        .await?;
+        let observed = capture_current_head_witness(&dataset)
+            .await
+            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+        let compensated = rollback_started
+            && observed.table_version > manifest_pinned
+            && stream_optimize_compensating_restore_source_v17(&dataset, manifest_pinned)
+                .await?
+                .is_some();
+        let (classification, ownership) = if observed.table_version < manifest_pinned {
+            (
+                TableClassification::InvariantViolation {
+                    observed: observed.table_version,
+                },
+                EffectOwnership::Unverifiable,
+            )
+        } else if observed.table_version == manifest_pinned {
+            (TableClassification::NoMovement, EffectOwnership::None)
+        } else if compensated {
+            (
+                TableClassification::IncompletePhaseB,
+                EffectOwnership::OwnCompensatedAtHead,
+            )
+        } else if protocol.effect_phase == RecoveryEffectPhase::Armed {
+            // This is the deliberately bounded loose ownership inherited from
+            // ordinary Optimize. The sidecar is durable before the first
+            // internally committing Lance call and the supported topology has
+            // one live writer process under the complete gate envelope.
+            (
+                TableClassification::IncompletePhaseB,
+                EffectOwnership::OwnAtHead,
+            )
+        } else {
+            let output = protocol
+                .confirmed_outputs
+                .as_ref()
+                .and_then(|outputs| outputs.iter().find(|output| output.identity == pin.identity))
+                .expect("validated EffectsConfirmed output set");
+            if observed == output.achieved_head {
+                (
+                    TableClassification::RolledPastExpected,
+                    EffectOwnership::OwnAtHead,
+                )
+            } else {
+                return Err(OmniError::manifest_internal(format!(
+                    "SEALED Optimize sidecar '{}' table '{}' confirmed HEAD is buried, replaced, or otherwise differs from its exact composite witness",
+                    sidecar.operation_id, pin.table_key
+                )));
+            }
+        };
+        states.push(ClassifiedTable {
+            classification,
+            manifest_pinned,
+            lance_head: observed.table_version,
+            effect_ownership: ownership,
+            unpublished_fork: false,
+        });
+    }
+    Ok(states)
+}
+
+async fn validate_visible_stream_sealed_optimize_rollback_v17(
+    root_uri: &str,
+    committed: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    let protocol = stream_sealed_optimize_v17(sidecar).expect("validated protocol_v17");
+    let outcomes = protocol.rollback_audit_outcomes.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal("visible SEALED Optimize rollback has no durable audit plan")
+    })?;
+    let rollback_lifecycles = protocol.rollback_lifecycles.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "visible SEALED Optimize rollback has no exact lifecycle successors",
+        )
+    })?;
+    for outcome in outcomes {
+        let pin = sidecar
+            .tables
+            .iter()
+            .find(|pin| pin.table_key == outcome.table_key)
+            .expect("validated rollback outcome key set");
+        let (dataset, observed_update, observed_head) =
+            observe_stream_sealed_optimize_output_v17(root_uri, pin).await?;
+        let restore_source =
+            stream_optimize_compensating_restore_source_v17(&dataset, pin.expected_version)
+                .await?;
+        let entry = snapshot_entry_by_identity(committed, pin.identity);
+        let exact_entry = entry.is_some_and(|entry| {
+            entry.table_key == pin.table_key
+                && entry.table_version == observed_update.table_version
+                && entry.table_branch == observed_update.table_branch
+                && entry.row_count == observed_update.row_count
+                && entry.version_metadata == observed_update.version_metadata
+        });
+        let lifecycle_head_matches = rollback_lifecycles
+            .iter()
+            .find(|entry| entry.identity == pin.identity)
+            .is_none_or(|entry| entry.current_head_witness == observed_head);
+        if restore_source != Some(outcome.from_version)
+            || outcome.to_version != pin.expected_version
+            || !exact_entry
+            || !lifecycle_head_matches
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' visible rollback table '{}' differs from its exact compensating Restore outcome",
+                sidecar.operation_id, pin.table_key
+            )));
+        }
+    }
+    for pin in &sidecar.tables {
+        if outcomes
+            .iter()
+            .any(|outcome| outcome.table_key == pin.table_key)
+        {
+            continue;
+        }
+        let unchanged = snapshot_entry_by_identity(committed, pin.identity).is_some_and(|entry| {
+            entry.table_key == pin.table_key
+                && entry.table_version == pin.expected_version
+                && entry.table_branch.is_none()
+        });
+        if !unchanged {
+            return Err(OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' visible rollback changed unmoved table '{}'",
+                sidecar.operation_id, pin.table_key
+            )));
+        }
+    }
+
+    let rollback_priors = protocol
+        .prior_lifecycles
+        .iter()
+        .filter(|prior| {
+            let pin = sidecar
+                .tables
+                .iter()
+                .find(|pin| pin.identity == prior.identity)
+                .expect("validated prior lifecycle subset");
+            outcomes
+                .iter()
+                .any(|outcome| outcome.table_key == pin.table_key)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let rebuilt =
+        rebuild_stream_sealed_optimize_successors_v17(root_uri, sidecar, &rollback_priors).await?;
+    if &rebuilt != rollback_lifecycles {
+        return Err(OmniError::manifest_internal(
+            "visible SEALED Optimize rollback lifecycle successors differ from their exact physical/receipt rebuild",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisibleStreamSealedOptimizeOutcomeV17 {
+    Original,
+    RolledBack,
+}
+
+async fn detect_visible_stream_sealed_optimize_outcome_v17(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<Option<VisibleStreamSealedOptimizeOutcomeV17>> {
+    let protocol = stream_sealed_optimize_v17(sidecar).expect("validated protocol_v17");
+    let (commits, _) = ManifestCoordinator::read_graph_lineage_at(root_uri, None).await?;
+    let original = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id);
+    let rollback = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == protocol.rollback_graph_commit_id);
+
+    let original_visible = if let Some(commit) = original {
+        if commit.manifest_branch.is_some()
+            || commit.parent_commit_id != protocol.authority.graph_head
+            || commit.merged_parent_commit_id != protocol.lineage.merged_parent_commit_id
+            || commit.actor_id != protocol.lineage.actor_id
+            || commit.created_at != protocol.lineage.created_at
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' found original commit '{}' with mismatched lineage",
+                sidecar.operation_id, protocol.lineage.graph_commit_id
+            )));
+        }
+        validate_stream_sealed_optimize_terminal_v17(root_uri, sidecar).await?;
+        let committed = ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version)
+            .await?;
+        let outputs = protocol.confirmed_outputs.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "visible SEALED Optimize original has no confirmed output set",
+            )
+        })?;
+        let next = protocol.next_lifecycles.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "visible SEALED Optimize original has no lifecycle successors",
+            )
+        })?;
+        let exact = committed.stream_profile() == &protocol.profile
+            && committed.stream_token_authority() == &protocol.token_authority
+            && outputs.iter().all(|output| {
+                snapshot_entry_by_identity(&committed, output.identity).is_some_and(|entry| {
+                    entry.table_key == output.table_key
+                        && entry.table_version == output.update.table_version
+                        && entry.table_branch == output.update.table_branch
+                        && entry.row_count == output.update.row_count
+                        && entry.version_metadata == output.update.version_metadata
+                })
+            })
+            && sidecar.tables.iter().all(|pin| {
+                let expected = next.iter().find(|entry| entry.identity == pin.identity);
+                committed.stream_lifecycle(pin.identity) == expected
+            });
+        if !exact {
+            return Err(OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' found original commit '{}' but its exact manifest outcome differs",
+                sidecar.operation_id, protocol.lineage.graph_commit_id
+            )));
+        }
+        true
+    } else {
+        false
+    };
+
+    let rollback_visible = if let Some(commit) = rollback {
+        let rollback_created_at = sidecar.started_at.parse::<i64>().map_err(|error| {
+            OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' has an invalid fixed rollback timestamp: {error}",
+                sidecar.operation_id
+            ))
+        })?;
+        if commit.manifest_branch.is_some()
+            || commit.actor_id.as_deref() != Some(RECOVERY_ACTOR)
+            || commit.merged_parent_commit_id.is_some()
+            || commit.created_at != rollback_created_at
+            || protocol.rollback_audit_outcomes.is_none()
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' found rollback commit '{}' with mismatched lineage or no durable audit plan",
+                sidecar.operation_id, protocol.rollback_graph_commit_id
+            )));
+        }
+        let committed = ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version)
+            .await?;
+        validate_visible_stream_sealed_optimize_rollback_v17(root_uri, &committed, sidecar)
+            .await?;
+        let rollback_lifecycles = protocol
+            .rollback_lifecycles
+            .as_ref()
+            .expect("visible rollback validation requires lifecycle successors");
+        let exact = committed.stream_profile() == &protocol.profile
+            && committed.stream_token_authority() == &protocol.token_authority
+            && sidecar.tables.iter().all(|pin| {
+                let expected = rollback_lifecycles
+                    .iter()
+                    .find(|entry| entry.identity == pin.identity)
+                    .or_else(|| {
+                        protocol
+                            .prior_lifecycles
+                            .iter()
+                            .find(|entry| entry.identity == pin.identity)
+                    });
+                committed.stream_lifecycle(pin.identity) == expected
+            });
+        if !exact {
+            return Err(OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' found rollback commit '{}' but its exact lifecycle authority differs",
+                sidecar.operation_id, protocol.rollback_graph_commit_id
+            )));
+        }
+        true
+    } else {
+        false
+    };
+    match (original_visible, rollback_visible) {
+        (true, false) => Ok(Some(VisibleStreamSealedOptimizeOutcomeV17::Original)),
+        (false, true) => Ok(Some(VisibleStreamSealedOptimizeOutcomeV17::RolledBack)),
+        (false, false) => Ok(None),
+        (true, true) => Err(OmniError::manifest_internal(format!(
+            "SEALED Optimize sidecar '{}' has both fixed outcomes visible",
+            sidecar.operation_id
+        ))),
+    }
+}
+
+async fn finalize_visible_stream_sealed_optimize_outcome_v17(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    outcome: VisibleStreamSealedOptimizeOutcomeV17,
+) -> Result<bool> {
+    let protocol = stream_sealed_optimize_v17(sidecar).expect("validated protocol_v17");
+    let (kind, graph_commit_id, outcomes) = match outcome {
+        VisibleStreamSealedOptimizeOutcomeV17::Original => {
+            let outputs = protocol.confirmed_outputs.as_ref().ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "visible SEALED Optimize original has no confirmed output set",
+                )
+            })?;
+            (
+                RecoveryKind::RolledForward,
+                protocol.lineage.graph_commit_id.clone(),
+                outputs
+                    .iter()
+                    .map(|output| {
+                        let pin = sidecar
+                            .tables
+                            .iter()
+                            .find(|pin| pin.identity == output.identity)
+                            .expect("validated output set");
+                        TableOutcome {
+                            table_key: output.table_key.clone(),
+                            from_version: pin.expected_version,
+                            to_version: output.update.table_version,
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+        VisibleStreamSealedOptimizeOutcomeV17::RolledBack => (
+            RecoveryKind::RolledBack,
+            protocol.rollback_graph_commit_id.clone(),
+            protocol.rollback_audit_outcomes.clone().ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "visible SEALED Optimize rollback has no durable audit plan",
+                )
+            })?,
+        ),
+    };
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    let writer_kind = format!("{:?}", sidecar.writer_kind);
+    let records = audit.list().await?;
+    let matching = records
+        .iter()
+        .filter(|record| {
+            record.operation_id == sidecar.operation_id && record.recovery_kind == kind
+        })
+        .collect::<Vec<_>>();
+    if matching.iter().any(|record| {
+        record.graph_commit_id != graph_commit_id
+            || record.recovery_for_actor != sidecar.actor_id
+            || record.sidecar_writer_kind != writer_kind
+            || record.per_table_outcomes != outcomes
+    }) {
+        return Err(OmniError::manifest_internal(format!(
+            "SEALED Optimize sidecar '{}' found a mismatched existing recovery audit outcome",
+            sidecar.operation_id
+        )));
+    }
+    let already_recorded = !matching.is_empty();
+    if !already_recorded {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id,
+                recovery_kind: kind,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: writer_kind,
+                per_table_outcomes: outcomes,
+                created_at: crate::db::now_micros()?,
+            })
+            .await?;
+    }
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+async fn roll_forward_stream_sealed_optimize_v17(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let protocol = stream_sealed_optimize_v17(sidecar).expect("validated protocol_v17");
+    let outputs = protocol.confirmed_outputs.as_ref().expect("confirmed outputs");
+    let next_lifecycles = protocol.next_lifecycles.as_ref().expect("confirmed successors");
+    let mut changes = Vec::with_capacity(outputs.len() + next_lifecycles.len() + 1);
+    let mut expected = ExpectedTableVersions::with_capacity(outputs.len());
+    let mut outcomes = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let pin = sidecar
+            .tables
+            .iter()
+            .find(|pin| pin.identity == output.identity)
+            .expect("validated output set");
+        expected.insert(
+            output.identity,
+            TableVersionExpectation {
+                table_key: output.table_key.clone(),
+                table_version: pin.expected_version,
+            },
+        );
+        changes.push(ManifestChange::Update(SubTableUpdate {
+            identity: output.identity,
+            table_key: output.table_key.clone(),
+            table_version: output.update.table_version,
+            table_branch: output.update.table_branch.clone(),
+            row_count: output.update.row_count,
+            version_metadata: output.update.version_metadata.clone(),
+        }));
+        outcomes.push(TableOutcome {
+            table_key: output.table_key.clone(),
+            from_version: pin.expected_version,
+            to_version: output.update.table_version,
+        });
+    }
+    for (prior, next) in protocol.prior_lifecycles.iter().zip(next_lifecycles) {
+        changes.push(ManifestChange::SetStreamLifecycle {
+            expected: Some(prior.clone()),
+            next: next.clone(),
+        });
+    }
+    changes.push(ManifestChange::SetStreamProfile {
+        expected: protocol.profile.clone(),
+        next: protocol.profile.clone(),
+    });
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    let (_, graph_commit_id) = publish_recovery_commit(
+        root_uri,
+        sidecar,
+        RecoveryKind::RolledForward,
+        &changes,
+        &expected,
+    )
+    .await?;
+    record_audit(
+        root_uri,
+        sidecar,
+        graph_commit_id,
+        RecoveryKind::RolledForward,
+        outcomes,
+    )
+    .await?;
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+async fn roll_back_stream_sealed_optimize_v17(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+) -> Result<bool> {
+    let mut prepared =
+        prepare_stream_sealed_optimize_rollback_v17(root_uri, storage, sidecar, states).await?;
+    let protocol = stream_sealed_optimize_v17(&prepared).expect("prepared protocol_v17");
+    let outcomes = protocol
+        .rollback_audit_outcomes
+        .clone()
+        .expect("prepared rollback audit plan");
+    for (pin, state) in prepared.tables.iter().zip(states) {
+        if !table_requires_rollback_effect(state) {
+            continue;
+        }
+        if state.effect_ownership != EffectOwnership::OwnCompensatedAtHead {
+            restore_table_to_version(&pin.table_path, None, state.manifest_pinned).await?;
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
+            )?;
+        }
+    }
+    prepared = bind_stream_sealed_optimize_rollback_lifecycles_v17(
+        root_uri, storage, &prepared,
+    )
+    .await?;
+    let protocol = stream_sealed_optimize_v17(&prepared).expect("prepared protocol_v17");
+    let rollback_lifecycles = protocol
+        .rollback_lifecycles
+        .as_ref()
+        .expect("bound rollback lifecycle successors");
+    let moved_keys = outcomes
+        .iter()
+        .map(|outcome| outcome.table_key.as_str())
+        .collect::<HashSet<_>>();
+    let mut changes = Vec::with_capacity(outcomes.len() + rollback_lifecycles.len() + 1);
+    let mut expected = ExpectedTableVersions::with_capacity(outcomes.len());
+    for pin in prepared
+        .tables
+        .iter()
+        .filter(|pin| moved_keys.contains(pin.table_key.as_str()))
+    {
+        push_table_update(
+            root_uri,
+            pin.identity,
+            &pin.table_key,
+            &pin.table_path,
+            None,
+            pin.expected_version,
+            None,
+            &mut changes,
+            &mut expected,
+        )
+        .await?;
+    }
+    for next in rollback_lifecycles {
+        let prior = protocol
+            .prior_lifecycles
+            .iter()
+            .find(|prior| prior.identity == next.identity)
+            .expect("validated rollback successor");
+        changes.push(ManifestChange::SetStreamLifecycle {
+            expected: Some(prior.clone()),
+            next: next.clone(),
+        });
+    }
+    changes.push(ManifestChange::SetStreamProfile {
+        expected: protocol.profile.clone(),
+        next: protocol.profile.clone(),
+    });
+    let (_, graph_commit_id) = publish_recovery_commit(
+        root_uri,
+        &prepared,
+        RecoveryKind::RolledBack,
+        &changes,
+        &expected,
+    )
+    .await?;
+    crate::failpoints::maybe_fail(
+        crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
+    )?;
+    record_audit(
+        root_uri,
+        &prepared,
+        graph_commit_id,
+        RecoveryKind::RolledBack,
+        outcomes,
+    )
+    .await?;
+    delete_sidecar_by_operation_id(root_uri, storage, &prepared.operation_id).await?;
+    Ok(true)
+}
+
+async fn process_stream_sealed_optimize_sidecar_v17(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+    mode: RecoveryMode,
+) -> Result<bool> {
+    if let Some(outcome) =
+        detect_visible_stream_sealed_optimize_outcome_v17(root_uri, sidecar).await?
+    {
+        return finalize_visible_stream_sealed_optimize_outcome_v17(
+            root_uri,
+            storage.as_ref(),
+            sidecar,
+            outcome,
+        )
+        .await;
+    }
+    validate_stream_sealed_optimize_prior_v17(snapshot, sidecar)?;
+    let protocol = stream_sealed_optimize_v17(sidecar).expect("validated protocol_v17");
+    let states = classify_stream_sealed_optimize_tables_v17(snapshot, sidecar).await?;
+    if states.iter().any(|state| {
+        matches!(
+            state.classification,
+            TableClassification::InvariantViolation { .. }
+        )
+    }) {
+        return match mode {
+            RecoveryMode::RollForwardOnly => Ok(false),
+            RecoveryMode::Full => Err(OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' observed a table HEAD behind its manifest pin",
+                sidecar.operation_id
+            ))),
+        };
+    }
+    validate_stream_sealed_optimize_rollback_plan_v17(sidecar, &states).await?;
+    let any_movement = states
+        .iter()
+        .any(|state| state.lance_head > state.manifest_pinned);
+    if !any_movement {
+        if protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed {
+            return Err(OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' is EffectsConfirmed but no productive table effect remains at HEAD",
+                sidecar.operation_id
+            )));
+        }
+        if matches!(mode, RecoveryMode::RollForwardOnly) {
+            return Ok(false);
+        }
+        delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+        return Ok(true);
+    }
+
+    let live_authority = read_live_recovery_authority(root_uri, storage, None).await?;
+    let authority_changed = live_authority != protocol.authority;
+    let all_confirmed = protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+        && states
+            .iter()
+            .all(|state| state.classification == TableClassification::RolledPastExpected);
+    if all_confirmed && !authority_changed {
+        validate_stream_sealed_optimize_terminal_v17(root_uri, sidecar).await?;
+        return roll_forward_stream_sealed_optimize_v17(root_uri, storage.as_ref(), sidecar).await;
+    }
+    if matches!(mode, RecoveryMode::RollForwardOnly) {
+        warn!(
+            operation_id = sidecar.operation_id.as_str(),
+            authority_changed,
+            "recovery: deferring rollback-eligible SEALED Optimize sidecar"
+        );
+        return Ok(false);
+    }
+    roll_back_stream_sealed_optimize_v17(root_uri, storage.as_ref(), sidecar, &states).await
+}
+
+/// Arm checked-runtime Optimize before its first internally committing Lance
+/// maintenance call. The pin set contains only productive tables; an empty
+/// lifecycle subset is valid when all productive tables are ordinary while an
+/// enrolled no-work lane remains outside the physical plan.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new_stream_sealed_optimize_sidecar_v17(
+    actor_id: String,
+    mut tables: Vec<SidecarTablePin>,
+    authority: RecoveryAuthorityToken,
+    lineage: RecoveryLineageIntent,
+    profile: super::StreamProfileEntry,
+    token_authority: super::StreamTokenAuthorityEntry,
+    mut prior_lifecycles: Vec<super::StreamLifecycleEntry>,
+) -> Result<RecoverySidecar> {
+    tables.sort_by_key(|pin| pin.identity);
+    prior_lifecycles.sort_by_key(|entry| entry.identity);
+    let mut sidecar = new_unvalidated_sidecar(
+        STREAM_SEALED_OPTIMIZE_SIDECAR_SCHEMA_VERSION,
+        SidecarKind::StreamSealedMaintenance,
+        None,
+        Some(actor_id),
+        tables,
+    );
+    sidecar.protocol_v17 = Some(Box::new(RecoveryProtocolV17::StreamSealedOptimize(
+        RecoveryStreamSealedOptimizeV17 {
+            authority,
+            lineage,
+            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_audit_outcomes: None,
+            effect_phase: RecoveryEffectPhase::Armed,
+            profile,
+            token_authority,
+            prior_lifecycles,
+            confirmed_outputs: None,
+            next_lifecycles: None,
+            rollback_lifecycles: None,
+        },
+    )));
+    validate_sidecar_shape("<new-stream-sealed-optimize-v17-sidecar>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Bind the complete achieved Optimize output set before its one graph-visible
+/// table/lifecycle publication. The caller-provided witness map is checked
+/// against freshly reopened physical HEADs; a mismatch leaves the durable
+/// sidecar Armed and therefore rollback-only.
+pub(crate) async fn confirm_stream_sealed_optimize_sidecar_v17(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    updates: &[SubTableUpdate],
+    achieved_heads: &HashMap<TableIdentity, super::CurrentHeadWitness>,
+    next_lifecycles: Vec<super::StreamLifecycleEntry>,
+) -> Result<()> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    validate_sidecar_shape(&uri, sidecar)?;
+    let protocol = sidecar.protocol_v17.as_deref().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "confirm_stream_sealed_optimize_sidecar_v17 requires a schema-v17 sidecar",
+        )
+    })?;
+    let RecoveryProtocolV17::StreamSealedOptimize(protocol) = protocol;
+    if protocol.effect_phase != RecoveryEffectPhase::Armed {
+        return Err(OmniError::manifest_internal(format!(
+            "SEALED Optimize sidecar '{}' is already EffectsConfirmed",
+            sidecar.operation_id
+        )));
+    }
+    let pin_ids = sidecar
+        .tables
+        .iter()
+        .map(|pin| pin.identity)
+        .collect::<HashSet<_>>();
+    let update_ids = updates
+        .iter()
+        .map(|update| update.identity)
+        .collect::<HashSet<_>>();
+    if update_ids.len() != updates.len()
+        || update_ids != pin_ids
+        || achieved_heads.len() != pin_ids.len()
+        || !pin_ids
+            .iter()
+            .all(|identity| achieved_heads.contains_key(identity))
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "SEALED Optimize sidecar '{}' confirmation key set differs from its productive table pins",
+            sidecar.operation_id
+        )));
+    }
+
+    let mut outputs = Vec::with_capacity(sidecar.tables.len());
+    for pin in &sidecar.tables {
+        let update = updates
+            .iter()
+            .find(|update| update.identity == pin.identity)
+            .expect("confirmation key sets checked above");
+        let achieved_head = achieved_heads
+            .get(&pin.identity)
+            .expect("confirmation key sets checked above");
+        if update.table_key != pin.table_key
+            || update.table_branch.is_some()
+            || update.table_version <= pin.expected_version
+            || achieved_head.table_version != update.table_version
+            || achieved_head.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' table '{}' confirmation differs from its main-table pin",
+                sidecar.operation_id, pin.table_key
+            )));
+        }
+        let claimed_update = RecoveryConfirmedTableUpdate {
+            table_version: update.table_version,
+            table_branch: update.table_branch.clone(),
+            row_count: update.row_count,
+            version_metadata: update.version_metadata.clone(),
+        };
+        let (_, observed_update, observed_head) =
+            observe_stream_sealed_optimize_output_v17(root_uri, pin).await?;
+        if observed_update != claimed_update || &observed_head != achieved_head {
+            return Err(OmniError::manifest_internal(format!(
+                "SEALED Optimize sidecar '{}' table '{}' current physical state differs from its supplied update/HEAD; leaving recovery Armed",
+                sidecar.operation_id, pin.table_key
+            )));
+        }
+        outputs.push(RecoveryStreamSealedOptimizeOutputV17 {
+            identity: pin.identity,
+            table_key: pin.table_key.clone(),
+            update: claimed_update,
+            achieved_head: achieved_head.clone(),
+        });
+    }
+    outputs.sort_by_key(|output| output.identity);
+
+    let mut confirmed = sidecar.clone();
+    let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+        confirmed.protocol_v17.as_deref_mut()
+    else {
+        unreachable!("validated v17 SEALED Optimize sidecar")
+    };
+    protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+    protocol.confirmed_outputs = Some(outputs);
+    protocol.next_lifecycles = Some(next_lifecycles);
+    validate_sidecar_shape(&uri, &confirmed)?;
+    let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize confirmed SEALED Optimize sidecar: {error}"
         ))
     })?;
     storage.write_text(&uri, &json).await?;
@@ -25903,6 +27455,15 @@ mod tests {
 
         let post = Dataset::open(&uri).await.unwrap();
         assert_eq!(post.version().version, head_before + 1);
+        let restore = post.read_transaction().await.unwrap().unwrap();
+        assert_eq!(
+            restore.read_version, head_before,
+            "the Restore transaction must retain its exact pre-compensation HEAD"
+        );
+        assert!(matches!(
+            &restore.operation,
+            lance::dataset::transaction::Operation::Restore { version } if *version == 1
+        ));
         // Content matches v1 (just alice).
         let scanner = post.scan();
         let batches: Vec<RecordBatch> =
@@ -27544,4 +29105,340 @@ query delete_person($name: String) {
             "foreign movement must leave the sidecar authoritative"
         );
     }
+
+    fn stream_sealed_optimize_sidecar_v17_fixture()
+    -> (RecoverySidecar, super::super::stream::ClaimReceipt) {
+        let (ensure_indices, current_claim_receipt) =
+            stream_sealed_ensure_indices_sidecar_v16_fixture();
+        let physical = ensure_indices.protocol_v8.as_ref().unwrap();
+        let overlay = stream_sealed_maintenance_v16(&ensure_indices).unwrap();
+        let sidecar = new_stream_sealed_optimize_sidecar_v17(
+            ensure_indices.actor_id.clone().unwrap(),
+            ensure_indices.tables.clone(),
+            physical.authority.clone(),
+            RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000F1".to_string(),
+                branch: None,
+                actor_id: ensure_indices.actor_id.clone(),
+                merged_parent_commit_id: None,
+                created_at: 813,
+            },
+            overlay.profile.clone(),
+            overlay.token_authority.clone(),
+            overlay.prior_lifecycles.clone(),
+        )
+        .unwrap();
+        (sidecar, current_claim_receipt)
+    }
+
+    fn confirm_stream_sealed_optimize_shape_v17(
+        sidecar: &mut RecoverySidecar,
+        current_claim_receipt: &super::super::stream::ClaimReceipt,
+        achieved_head: CurrentHeadWitness,
+    ) -> super::super::stream::StreamLifecycleEntry {
+        let protocol = stream_sealed_optimize_v17(sidecar).unwrap();
+        let prior = protocol.prior_lifecycles[0].clone();
+        let next = crate::db::build_sealed_maintenance_successor(
+            &prior,
+            current_claim_receipt,
+            achieved_head.clone(),
+        )
+        .unwrap();
+        let pin = sidecar
+            .tables
+            .iter()
+            .find(|pin| pin.identity == prior.identity)
+            .unwrap();
+        let output = RecoveryStreamSealedOptimizeOutputV17 {
+            identity: pin.identity,
+            table_key: pin.table_key.clone(),
+            update: RecoveryConfirmedTableUpdate {
+                table_version: achieved_head.table_version,
+                table_branch: None,
+                row_count: 1,
+                version_metadata: test_version_metadata(),
+            },
+            achieved_head,
+        };
+        let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+            sidecar.protocol_v17.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+        protocol.confirmed_outputs = Some(vec![output]);
+        protocol.next_lifecycles = Some(vec![next.clone()]);
+        validate_sidecar_shape("<confirmed-stream-sealed-optimize-v17>", sidecar).unwrap();
+        next
+    }
+
+    #[test]
+    fn stream_sealed_optimize_v17_round_trips_armed_and_exact_confirmed_grammar() {
+        let (armed, current_claim_receipt) = stream_sealed_optimize_sidecar_v17_fixture();
+        assert_eq!(
+            armed.schema_version,
+            STREAM_SEALED_OPTIMIZE_SIDECAR_SCHEMA_VERSION
+        );
+        let encoded = serde_json::to_string(&armed).unwrap();
+        let parsed = parse_sidecar("<stream-sealed-optimize-v17-armed>", &encoded).unwrap();
+        let protocol = stream_sealed_optimize_v17(&parsed).unwrap();
+        assert_eq!(protocol.effect_phase, RecoveryEffectPhase::Armed);
+        assert!(protocol.confirmed_outputs.is_none());
+        assert!(protocol.next_lifecycles.is_none());
+
+        let expected_version = armed.tables[0].expected_version;
+        let mut confirmed = armed.clone();
+        confirm_stream_sealed_optimize_shape_v17(
+            &mut confirmed,
+            &current_claim_receipt,
+            CurrentHeadWitness {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                table_version: expected_version + 2,
+                transaction_uuid: "67676767-6767-4767-8767-676767676767".to_string(),
+                manifest_e_tag: Some("optimize-etag".to_string()),
+            },
+        );
+        let encoded = serde_json::to_string(&confirmed).unwrap();
+        let parsed = parse_sidecar("<stream-sealed-optimize-v17-confirmed>", &encoded).unwrap();
+        assert_eq!(
+            stream_sealed_optimize_v17(&parsed).unwrap().effect_phase,
+            RecoveryEffectPhase::EffectsConfirmed
+        );
+
+        let mut wrong_schema = armed;
+        wrong_schema.schema_version = STREAM_SEALED_MAINTENANCE_SIDECAR_SCHEMA_VERSION;
+        assert!(
+            validate_sidecar_shape("<v17-overlay-on-v16>", &wrong_schema)
+                .unwrap_err()
+                .to_string()
+                .contains("protocol_v17 requires schema-v17")
+        );
+    }
+
+    #[test]
+    fn stream_sealed_optimize_v17_rejects_malformed_output_key_head_and_lifecycle() {
+        let (mut confirmed, current_claim_receipt) =
+            stream_sealed_optimize_sidecar_v17_fixture();
+        let expected_version = confirmed.tables[0].expected_version;
+        confirm_stream_sealed_optimize_shape_v17(
+            &mut confirmed,
+            &current_claim_receipt,
+            CurrentHeadWitness {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                table_version: expected_version + 2,
+                transaction_uuid: "68686868-6868-4868-8868-686868686868".to_string(),
+                manifest_e_tag: Some("optimize-etag".to_string()),
+            },
+        );
+
+        let confirmed_output = stream_sealed_optimize_v17(&confirmed)
+            .unwrap()
+            .confirmed_outputs
+            .as_ref()
+            .unwrap()[0]
+            .clone();
+        assert!(stream_sealed_optimize_output_matches_physical_v17(
+            &confirmed_output,
+            &confirmed_output.update,
+            &confirmed_output.achieved_head,
+        ));
+        let mut wrong_physical_update = confirmed_output.update.clone();
+        wrong_physical_update.row_count += 1;
+        assert!(!stream_sealed_optimize_output_matches_physical_v17(
+            &confirmed_output,
+            &wrong_physical_update,
+            &confirmed_output.achieved_head,
+        ));
+
+        let mut wrong_key = confirmed.clone();
+        let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+            wrong_key.protocol_v17.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.confirmed_outputs.as_mut().unwrap()[0].table_key =
+            "node:Company".to_string();
+        assert!(
+            validate_sidecar_shape("<v17-wrong-output-key>", &wrong_key)
+                .unwrap_err()
+                .to_string()
+                .contains("differs from its main-table pin")
+        );
+
+        let mut wrong_head = confirmed.clone();
+        let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+            wrong_head.protocol_v17.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.confirmed_outputs.as_mut().unwrap()[0]
+            .achieved_head
+            .table_version += 1;
+        assert!(
+            validate_sidecar_shape("<v17-wrong-achieved-head>", &wrong_head)
+                .unwrap_err()
+                .to_string()
+                .contains("exact achieved HEAD")
+        );
+
+        let mut wrong_lifecycle = confirmed;
+        let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+            wrong_lifecycle.protocol_v17.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.next_lifecycles.as_mut().unwrap()[0].lifecycle_revision += 1;
+        assert!(
+            validate_sidecar_shape("<v17-wrong-lifecycle-successor>", &wrong_lifecycle).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_sealed_optimize_v17_rollback_plan_must_match_moved_observations() {
+        let (mut sidecar, _) = stream_sealed_optimize_sidecar_v17_fixture();
+        sidecar
+            .tables
+            .push(make_pin("node:Company", "ignored", 4, 5));
+        sidecar.tables.sort_by_key(|pin| pin.identity);
+        let person = sidecar.tables[0].clone();
+        let company = sidecar.tables[1].clone();
+        let states = vec![
+            ClassifiedTable {
+                classification: TableClassification::IncompletePhaseB,
+                manifest_pinned: person.expected_version,
+                lance_head: person.expected_version + 2,
+                effect_ownership: EffectOwnership::OwnAtHead,
+                unpublished_fork: false,
+            },
+            ClassifiedTable {
+                classification: TableClassification::NoMovement,
+                manifest_pinned: company.expected_version,
+                lance_head: company.expected_version,
+                effect_ownership: EffectOwnership::None,
+                unpublished_fork: false,
+            },
+        ];
+
+        let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+            sidecar.protocol_v17.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.rollback_audit_outcomes = Some(vec![TableOutcome {
+            table_key: company.table_key.clone(),
+            from_version: company.expected_version + 1,
+            to_version: company.expected_version,
+        }]);
+        validate_sidecar_shape("<v17-wrong-rollback-key-set>", &sidecar).unwrap();
+        assert!(
+            validate_stream_sealed_optimize_rollback_plan_v17(&sidecar, &states)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("does not exactly cover")
+        );
+
+        let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+            sidecar.protocol_v17.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.rollback_audit_outcomes = Some(vec![TableOutcome {
+            table_key: person.table_key.clone(),
+            from_version: person.expected_version + 2,
+            to_version: person.expected_version,
+        }]);
+        validate_stream_sealed_optimize_rollback_plan_v17(&sidecar, &states)
+            .await
+            .unwrap();
+
+        let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+            sidecar.protocol_v17.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.rollback_audit_outcomes.as_mut().unwrap()[0].from_version -= 1;
+        assert!(
+            validate_stream_sealed_optimize_rollback_plan_v17(&sidecar, &states)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("exact pre-Restore observation")
+        );
+    }
+
+    #[test]
+    fn stream_sealed_optimize_v17_allows_ordinary_only_productive_plan() {
+        let (mut sidecar, _) = stream_sealed_optimize_sidecar_v17_fixture();
+        let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+            sidecar.protocol_v17.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.prior_lifecycles.clear();
+        validate_sidecar_shape("<v17-ordinary-only-productive-plan>", &sidecar).unwrap();
+        let encoded = serde_json::to_string(&sidecar).unwrap();
+        parse_sidecar("<v17-ordinary-only-productive-plan>", &encoded).unwrap();
+    }
+
+    #[test]
+    fn stream_sealed_optimize_v17_rollback_rows_cover_only_enrolled_moved_tables() {
+        let (mut sidecar, current_claim_receipt) =
+            stream_sealed_optimize_sidecar_v17_fixture();
+        sidecar
+            .tables
+            .push(make_pin("node:Company", "ignored", 4, 5));
+        sidecar.tables.sort_by_key(|pin| pin.identity);
+
+        let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+            sidecar.protocol_v17.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.rollback_audit_outcomes = Some(vec![TableOutcome {
+            table_key: "node:Company".to_string(),
+            from_version: 6,
+            to_version: 4,
+        }]);
+        protocol.rollback_lifecycles = Some(Vec::new());
+        validate_sidecar_shape("<v17-only-ordinary-table-restored>", &sidecar).unwrap();
+
+        let prior = stream_sealed_optimize_v17(&sidecar).unwrap().prior_lifecycles[0].clone();
+        let restored = crate::db::build_sealed_maintenance_successor(
+            &prior,
+            &current_claim_receipt,
+            CurrentHeadWitness {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                table_version: prior.current_head_witness.table_version + 2,
+                transaction_uuid: "69696969-6969-4969-8969-696969696969".to_string(),
+                manifest_e_tag: Some("restore-etag".to_string()),
+            },
+        )
+        .unwrap();
+        let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+            sidecar.protocol_v17.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.rollback_audit_outcomes.as_mut().unwrap().push(TableOutcome {
+            table_key: prior.diagnostic_table_key.clone(),
+            from_version: prior.current_head_witness.table_version + 1,
+            to_version: prior.current_head_witness.table_version,
+        });
+        assert!(
+            validate_sidecar_shape("<v17-missing-enrolled-rollback-row>", &sidecar)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly cover enrolled compensated")
+        );
+
+        let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+            sidecar.protocol_v17.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.rollback_lifecycles = Some(vec![restored]);
+        validate_sidecar_shape("<v17-enrolled-and-ordinary-tables-restored>", &sidecar).unwrap();
+    }
+
 }

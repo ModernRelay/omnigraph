@@ -44,6 +44,26 @@ use super::*;
 /// flooding the runtime and the S3 connection pool.
 const DEFAULT_MAINT_CONCURRENCY: usize = 8;
 
+#[derive(Clone, Copy)]
+enum OptimizeMode<'a> {
+    Ambient,
+    #[cfg_attr(not(feature = "failpoints"), allow(dead_code))]
+    SealedMaintenance { actor_id: &'a str },
+}
+
+impl<'a> OptimizeMode<'a> {
+    fn actor_id(self) -> Option<&'a str> {
+        match self {
+            Self::Ambient => None,
+            Self::SealedMaintenance { actor_id } => Some(actor_id),
+        }
+    }
+
+    fn is_sealed_maintenance(self) -> bool {
+        matches!(self, Self::SealedMaintenance { .. })
+    }
+}
+
 fn maint_concurrency() -> usize {
     std::env::var("OMNIGRAPH_MAINTENANCE_CONCURRENCY")
         .ok()
@@ -196,6 +216,7 @@ enum OptimizePreparation {
 struct OptimizeEffectOutcome {
     stat: TableOptimizeStats,
     update: Option<crate::db::SubTableUpdate>,
+    achieved_head: Option<crate::db::manifest::CurrentHeadWitness>,
 }
 
 /// Run Lance maintenance across every node + edge table on `main` under one
@@ -205,6 +226,28 @@ struct OptimizeEffectOutcome {
 /// commit. The final physical `__manifest` compaction remains outside that
 /// graph-visible envelope because the internal table is read directly at HEAD.
 pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStats>> {
+    optimize_all_tables_with_mode(db, OptimizeMode::Ambient).await
+}
+
+#[cfg_attr(not(feature = "failpoints"), allow(dead_code))]
+pub(super) async fn optimize_all_tables_sealed_as(
+    db: &Omnigraph,
+    actor_id: &str,
+) -> Result<Vec<TableOptimizeStats>> {
+    db.enforce(
+        omnigraph_policy::PolicyAction::StreamManage,
+        &omnigraph_policy::ResourceScope::Graph,
+        Some(actor_id),
+    )?;
+    db.ensure_streaming_sealed_maintenance_runtime_authorized()
+        .await?;
+    optimize_all_tables_with_mode(db, OptimizeMode::SealedMaintenance { actor_id }).await
+}
+
+async fn optimize_all_tables_with_mode(
+    db: &Omnigraph,
+    mode: OptimizeMode<'_>,
+) -> Result<Vec<TableOptimizeStats>> {
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("optimize").await?;
 
@@ -237,10 +280,35 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     // before a physical maintenance effect instead of acquiring a late lease.
     let admission_txn = db.open_write_txn(None).await?;
     let stream_admission_keys = Omnigraph::stream_admission_keys_for_snapshot(&admission_txn.base);
-    let _stream_admission_guards = db
-        .write_queue()
-        .acquire_stream_shared_many(&stream_admission_keys)
-        .await;
+    let _stream_profile_guard = if mode.is_sealed_maintenance() {
+        Some(db.write_queue().acquire_stream_profile_shared().await)
+    } else {
+        None
+    };
+    if mode.is_sealed_maintenance() {
+        // The entry preflight avoids doing ordinary recovery/schema work on an
+        // unbound handle. Recheck while retaining the profile gate so the
+        // checked runtime and exact ENABLED revision cannot move underneath
+        // admission, planning, effects, or publication.
+        db.ensure_streaming_sealed_maintenance_runtime_authorized()
+            .await?;
+    }
+    let mut _shared_stream_admission_guards = Vec::new();
+    let mut _exclusive_stream_admission_guards = Vec::new();
+    if mode.is_sealed_maintenance() {
+        // Checked SEALED Optimize conservatively closes every current main
+        // table identity before planning. This keeps no-work classification
+        // and the eventual productive subset inside one stable admission cut.
+        _exclusive_stream_admission_guards = db
+            .write_queue()
+            .acquire_stream_exclusive_many(&stream_admission_keys)
+            .await;
+    } else {
+        _shared_stream_admission_guards = db
+            .write_queue()
+            .acquire_stream_shared_many(&stream_admission_keys)
+            .await;
+    }
 
     // Canonical writer order: schema -> branch -> sorted tables. Planning reads
     // catalog index intent, so it must use an operation-local accepted catalog
@@ -309,9 +377,59 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     prepared.sort_by(|left, right| left.table_key.cmp(&right.table_key));
 
     // Planning above is read-only. This is the final durable lifecycle check
-    // before recovery ownership is armed or any base-table HEAD can move.
-    snapshot
-        .ensure_stream_effects_allowed("optimize", prepared.iter().map(|work| work.identity))?;
+    // before recovery ownership is armed or any base-table HEAD can move. A
+    // checked operation validates only the productive enrolled subset: an
+    // enrolled no-work lane must not poison productive ordinary maintenance.
+    let mut prior_stream_lifecycles = Vec::new();
+    if mode.is_sealed_maintenance() {
+        for work in &prepared {
+            let Some(lifecycle) = snapshot.stream_lifecycle(work.identity) else {
+                continue;
+            };
+            if lifecycle.lifecycle != crate::db::manifest::StreamLifecycle::Sealed {
+                return Err(OmniError::manifest_stream_lifecycle_conflict(
+                    work.identity.stable_table_id,
+                    work.identity.table_incarnation_id,
+                    &work.table_key,
+                    lifecycle.lifecycle.as_str(),
+                    "sealed optimize",
+                ));
+            }
+            if lifecycle.current_head_witness.table_version != work.expected_version {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("stream_base_head:{}", work.table_key),
+                    Some(work.expected_version.to_string()),
+                    Some(lifecycle.current_head_witness.table_version.to_string()),
+                ));
+            }
+            let physical_head = crate::table_store::mem_wal::capture_current_head_witness(
+                work.initial_snapshot.dataset(),
+            )
+            .await
+            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+            if physical_head != lifecycle.current_head_witness {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("stream_base_head:{}", work.table_key),
+                    Some(format!("{:?}", lifecycle.current_head_witness)),
+                    Some(format!("{physical_head:?}")),
+                ));
+            }
+            prior_stream_lifecycles.push(lifecycle.clone());
+        }
+        prior_stream_lifecycles.sort_by_key(|entry| entry.identity);
+    } else {
+        snapshot
+            .ensure_stream_effects_allowed("optimize", prepared.iter().map(|work| work.identity))?;
+    }
+    let selected_claim_receipts = if prior_stream_lifecycles.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        super::table_ops::selected_claim_receipts_for_sealed_maintenance(
+            &snapshot,
+            &prior_stream_lifecycles,
+        )
+        .await?
+    };
 
     if !prepared.is_empty() {
         // Phase A: one durable bounded-v2 intent before the first table HEAD
@@ -330,8 +448,59 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
                 confirmed_version: None,
                 table_branch: None,
             })
-            .collect();
-        let sidecar = crate::db::manifest::new_optimize_sidecar_v9(pins)?;
+            .collect::<Vec<_>>();
+        let expected_versions = pins
+            .iter()
+            .map(|pin| {
+                (
+                    pin.identity,
+                    crate::db::manifest::TableVersionExpectation {
+                        table_key: pin.table_key.clone(),
+                        table_version: pin.expected_version,
+                    },
+                )
+            })
+            .collect::<crate::db::manifest::ExpectedTableVersions>();
+        let lineage = if mode.is_sealed_maintenance() {
+            Some(
+                db.new_lineage_intent_for_branch(None, mode.actor_id())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let mut sidecar = if mode.is_sealed_maintenance() {
+            let lineage = lineage
+                .as_ref()
+                .expect("checked Optimize must pre-mint graph lineage");
+            let authority = crate::db::manifest::RecoveryAuthorityToken {
+                branch_identifier: admission_txn.authority.branch_identifier.clone(),
+                graph_head: admission_txn.authority.graph_head.clone(),
+                schema_identity_domain: admission_txn.authority.schema_identity_domain.clone(),
+                schema_ir_hash: admission_txn.authority.schema_ir_hash.clone(),
+                schema_identity_version: admission_txn.authority.schema_identity_version,
+            };
+            let recovery_lineage = crate::db::manifest::RecoveryLineageIntent {
+                graph_commit_id: lineage.graph_commit_id.clone(),
+                branch: lineage.branch.clone(),
+                actor_id: lineage.actor_id.clone(),
+                merged_parent_commit_id: lineage.merged_parent_commit_id.clone(),
+                created_at: lineage.created_at,
+            };
+            crate::db::manifest::new_stream_sealed_optimize_sidecar_v17(
+                mode.actor_id()
+                    .expect("checked Optimize requires an actor")
+                    .to_string(),
+                pins.clone(),
+                authority,
+                recovery_lineage,
+                snapshot.stream_profile().clone(),
+                snapshot.stream_token_authority().clone(),
+                prior_stream_lifecycles.clone(),
+            )?
+        } else {
+            crate::db::manifest::new_optimize_sidecar_v9(pins.clone())?
+        };
         let recovery_handle =
             crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
                 .await?;
@@ -344,7 +513,15 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
             futures::stream::iter(prepared.into_iter())
                 .map(|work| {
                     let catalog = std::sync::Arc::clone(&catalog);
-                    async move { apply_optimize_table_effects(db, catalog.as_ref(), work).await }
+                    async move {
+                        apply_optimize_table_effects(
+                            db,
+                            catalog.as_ref(),
+                            work,
+                            mode.is_sealed_maintenance(),
+                        )
+                        .await
+                    }
                 })
                 .buffer_unordered(effect_concurrency)
                 .collect()
@@ -363,19 +540,90 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
             return Err(optimize_recovery_required(&recovery_handle, error));
         }
 
+        let updates = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.update.clone())
+            .collect::<Vec<_>>();
+        let achieved_heads = outcomes
+            .iter()
+            .filter_map(|outcome| {
+                Some((
+                    outcome.update.as_ref()?.identity,
+                    outcome.achieved_head.clone()?,
+                ))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let next_stream_lifecycles = if mode.is_sealed_maintenance() {
+            if updates.len() != pins.len() || achieved_heads.len() != pins.len() {
+                return Err(optimize_recovery_required(
+                    &recovery_handle,
+                    OmniError::manifest_internal(
+                        "checked Optimize did not confirm one achieved update and HEAD for every productive table",
+                    ),
+                ));
+            }
+            let next = prior_stream_lifecycles
+                .iter()
+                .map(|prior| {
+                    let receipt = selected_claim_receipts.get(&prior.identity).ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "SEALED Optimize lost its selected ClaimReceipt",
+                        )
+                    })?;
+                    let head = achieved_heads.get(&prior.identity).ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "SEALED Optimize lost its confirmed table HEAD",
+                        )
+                    })?;
+                    crate::db::build_sealed_maintenance_successor(prior, receipt, head.clone())
+                })
+                .collect::<Result<Vec<_>>>()
+                .map_err(|error| optimize_recovery_required(&recovery_handle, error))?;
+            if let Err(error) =
+                crate::db::manifest::confirm_stream_sealed_optimize_sidecar_v17(
+                    db.root_uri(),
+                    db.storage_adapter(),
+                    &mut sidecar,
+                    &updates,
+                    &achieved_heads,
+                    next.clone(),
+                )
+                .await
+            {
+                return Err(optimize_recovery_required(&recovery_handle, error));
+            }
+            next
+        } else {
+            Vec::new()
+        };
+
         // One graph-wide Phase-B -> Phase-C crash seam, after every physical
-        // effect and before the only graph visibility point.
+        // effect (and checked-mode confirmation) and before the only graph
+        // visibility point.
         if let Err(error) = crate::failpoints::maybe_fail(
             crate::failpoints::names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
         ) {
             return Err(optimize_recovery_required(&recovery_handle, error));
         }
 
-        let updates = outcomes
-            .iter()
-            .filter_map(|outcome| outcome.update.clone())
-            .collect::<Vec<_>>();
-        if let Err(error) = publish_optimize_batch_monotonic(db, &updates).await {
+        let publish_result = if mode.is_sealed_maintenance() {
+            super::table_ops::commit_sealed_maintenance_on_main(
+                db,
+                "sealed optimize",
+                &updates,
+                &expected_versions,
+                &admission_txn,
+                lineage.expect("checked Optimize must retain graph lineage"),
+                &prior_stream_lifecycles,
+                &next_stream_lifecycles,
+                snapshot.stream_profile(),
+            )
+            .await
+            .map(|_| ())
+        } else {
+            publish_optimize_batch_monotonic(db, &updates).await
+        };
+        if let Err(error) = publish_result {
             return Err(optimize_recovery_required(&recovery_handle, error));
         }
 
@@ -513,6 +761,7 @@ async fn apply_optimize_table_effects(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     work: PreparedOptimizeTable,
+    capture_achieved_head: bool,
 ) -> Result<OptimizeEffectOutcome> {
     let identity = work.identity;
     let table_key = work.table_key;
@@ -604,7 +853,11 @@ async fn apply_optimize_table_effects(
                 false,
             );
             stat.pending_indexes = index_work.pending;
-            return Ok(OptimizeEffectOutcome { stat, update: None });
+            return Ok(OptimizeEffectOutcome {
+                stat,
+                update: None,
+                achieved_head: None,
+            });
         }
 
         // Test seam: a concurrent (cross-process) writer can interleave here, before
@@ -624,7 +877,6 @@ async fn apply_optimize_table_effects(
         let mut ds = selected.into_dataset();
         let version_before = ds.version().version;
         match clear_stale_auto_cleanup_config(&mut ds).await {
-            // `true` ⇒ the strip committed and advanced HEAD past the manifest.
             Ok(stripped) => head_advanced |= stripped,
             Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
                 continue;
@@ -687,20 +939,36 @@ async fn apply_optimize_table_effects(
 
     let mut stat = TableOptimizeStats::compacted(table_key, &metrics, committed);
     stat.pending_indexes = pending_indexes;
-    let update = if committed {
+    let (update, achieved_head) = if committed {
+        let achieved_head = if capture_achieved_head {
+            Some(
+                crate::table_store::mem_wal::capture_current_head_witness(snapshot.dataset())
+                    .await
+                    .map_err(|error| OmniError::manifest_internal(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         let state = db.storage().table_state(&full_path, &snapshot).await?;
-        Some(crate::db::SubTableUpdate {
-            identity,
-            table_key: stat.table_key.clone(),
-            table_version: state.version,
-            table_branch: None,
-            row_count: state.row_count,
-            version_metadata: state.version_metadata,
-        })
+        (
+            Some(crate::db::SubTableUpdate {
+                identity,
+                table_key: stat.table_key.clone(),
+                table_version: state.version,
+                table_branch: None,
+                row_count: state.row_count,
+                version_metadata: state.version_metadata,
+            }),
+            achieved_head,
+        )
     } else {
-        None
+        (None, None)
     };
-    Ok(OptimizeEffectOutcome { stat, update })
+    Ok(OptimizeEffectOutcome {
+        stat,
+        update,
+        achieved_head,
+    })
 }
 
 /// Publish every still-needed table pointer in one manifest/lineage CAS. This

@@ -42,14 +42,15 @@ from that line (the latest is safest):
 | internal schema v11 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
 | internal schema v12 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
 | internal schema v13 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v14 | unreleased (current 0.10.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
+| internal schema v14 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
+| internal schema v15 | unreleased (current 0.10.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
 
 **Stamps v5–v8 never shipped.** The storage format advanced five times inside
 the single 0.8.1 → 0.9.0 development window, so the only graphs carrying those
 stamps came from source builds off `main`; no published binary reads them and
 the refusal message names them `0.9.0-dev`. If you have one, export it with a
 build of the commit that created it, then load into a fresh current-format
-graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10–v14 are
+graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10–v15 are
 pre-release formats written by matching 0.10.0-dev source builds. The final
 0.10.0 format may use a later stamp.
 
@@ -121,6 +122,35 @@ complete. Do not use force-init to turn the old root into the new format.
   `append`/`merge` writes copy external payloads instead, as described below.
 - **Server deployments**: take the graph out of the serving set, rebuild it offline
   with the CLI, then point the cluster at the rebuilt graph (`cluster apply`).
+
+## Migrating from internal schema v14 to v15
+
+Internal schema v15 adds recovery-v17 for the private, capability-bound,
+same-binding `SEALED` Optimize bridge. Lance's compaction and index-optimization
+operations commit internally, so recovery-v17 owns their bounded maintenance
+plan, achieved physical HEADs, and complete prior/next lifecycle proof rows;
+it does not reinterpret recovery-v16's caller-minted CreateIndex grammar. The
+bridge writes no token receipt and provides no public maintenance command.
+
+Before exporting, use the final v14 source build at merge
+`1afc89b8602dba6525a200916fab0fdf3f1eabd6`:
+
+1. Gracefully stop every writer-capable process for the graph.
+2. Explicitly disable its streaming profile.
+3. Verify that the graph is clean, disabled, and unenrolled. Ordinary export
+   transfers logical rows, not private lifecycle, WAL, token, receipt, or
+   pending maintenance authority.
+4. Export the visible logical graph.
+
+If step 3 finds a lifecycle row or other private stream authority, stop and
+keep the v14 root intact. V15 does not add stream-aware export, authority
+retirement, or an authority-preserving v14→v15 transfer; a logical-row rebuild
+must not be presented as migration of sequencing authority.
+
+Then use the v15 binary to initialize a **different** root, load the export,
+apply cluster configuration, and restart serving. Verify row/vector/blob
+fidelity and the v15 stamp before cutover. Keep the v14 root unchanged through
+the rollback window. A v15 binary refuses v14, and a v14 binary refuses v15.
 
 ## Migrating from internal schema v13 to v14
 

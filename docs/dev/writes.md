@@ -19,7 +19,7 @@ authority.
 - No `omnigraph run *` CLI subcommands and no `/runs/*` HTTP endpoints.
 - No `__run__<id>` staging branches; `__run__*` is no longer a reserved
   name. The branch-name guard was removed in MR-770. Historically, the v2→v3
-  in-place migration swept stale `__run__*` entries; the current v14 strand is
+  in-place migration swept stale `__run__*` entries; the current v15 strand is
   strict single-version, so older graphs are refused and rebuilt by
   export/init/load rather than migrated on open. (Inert `_graph_runs.lance`
   bytes in an old export source remain irrelevant to the rebuilt graph.)
@@ -556,13 +556,14 @@ feature-gated. V11 added checked profile protocol v2 plus exact recovery-v13
 state-v2's inline histories with lifecycle-v3 fixed-size ledger heads and
 activates recovery-v14 enrollment, writer-claim, ordinary/drain-fold, and
 terminal-management effects. V13 adds recovery-v15 for private,
-revision-fenced resume and guarded drain-abort. Current v14 adds recovery-v16
-for the narrow checked-runtime `SEALED` EnsureIndices bridge. The hidden one-lane core can
+revision-fenced resume and guarded drain-abort. V14 adds recovery-v16 for the
+narrow checked-runtime `SEALED` EnsureIndices bridge; current v15 adds the
+distinct recovery-v17 `SEALED` Optimize bridge. The hidden one-lane core can
 quiesce an enrolled lane `OPEN → DRAINING → SEALED`, including empty and non-empty lanes, but no
 supported production surface can invoke it. The Cedar vocabulary,
 manifest-only status, and checked stopped/offline and runtime ownership exist;
 there is no accepted-schema declaration, production enrollment/quiesce/resume,
-public ingest, correction/retirement, Optimize/rebind, or HTTP/CLI/OpenAPI
+public ingest, correction/retirement, physical rebind, or HTTP/CLI/OpenAPI
 streaming or maintenance surface.
 
 Lifecycle-v3 enrollment owns the physical binding:
@@ -702,8 +703,8 @@ rows, and publishes only their canonical `OPEN` successor. Drain abort also
 requires no guarded operation, strict block, unmerged residue, or unsettled
 background owner. Named graph branches, stale binding ancestry, and any
 unresolved recovery fail before the claim. This path does not authorize a new
-physical binding. Rebind and Optimize remain separate inactive effect shapes;
-EnsureIndices uses the distinct recovery-v16 bridge below.
+physical binding. EnsureIndices and Optimize use distinct recovery-v16 and
+recovery-v17 bridges below; physical rebind remains inactive.
 
 Recovery-v16 `StreamSealedEnsureIndices` owns the capability-only same-binding
 maintenance path. Its crate-private entry point requires a `stream_manage`
@@ -721,6 +722,17 @@ or lifecycle successor. If exact-effect compensation commits a Lance Restore,
 recovery constructs and publishes an exact `SEALED` successor for that Restore
 HEAD; it does not put the stale pre-effect witness back into authority. The
 ambient/direct EnsureIndices path retains the generic enrolled-table refusal.
+
+Recovery-v17 `StreamSealedOptimize` owns the separate capability-only
+same-binding Optimize path under the same checked-runtime, canonical-main,
+exact-`SEALED`, and sorted-exclusive-admission boundary. It records the
+complete confirmed Optimize output set and each exact achieved table HEAD;
+only those outcomes may drive the manifest CAS that refreshes productive
+pointers, both HEAD-witness copies, verified-empty proofs, and lifecycle
+revisions. It writes no token row, advances no management receipt chain,
+accepts no caller operation ID, and records no recovery or lineage for true
+no-work. The ambient/direct Optimize path retains the generic enrolled-table
+refusal.
 
 B1 performs no fresh-tier reads and no generation GC. Acknowledged rows become
 query-visible only after fold. The support boundary remains main-only,
@@ -1388,13 +1400,14 @@ profile protocol v2 and adds recovery-v13 `StreamProfileChange`.
 histories with lifecycle-v3 fixed-size ledger heads and activates
 recovery-v14 enrollment, claim, ordinary/drain fold, and terminal management
 receipts. V13 activates recovery-v15 private resume and guarded
-drain-abort without reinterpreting v14's incomplete scaffold. Current v14
-activates recovery-v16 private SEALED EnsureIndices without reinterpreting the
-v14 maintenance scaffold. These hidden
+drain-abort without reinterpreting v14's incomplete scaffold. V14 activates
+recovery-v16 private SEALED EnsureIndices; current v15 activates the distinct
+recovery-v17 private SEALED Optimize path without reinterpreting the v14
+maintenance scaffold. These hidden
 seams are not supported production lifecycle APIs. Historical v10 enrollment,
 v12 fold, and v14 resume/maintenance sidecars are refused, not reinterpreted. Public
-ingress/enrollment/quiesce/resume/abort, correction/retirement, and
-Optimize/rebind integration remain inactive.
+ingress/enrollment/quiesce/resume/abort, correction/retirement, and physical
+rebind integration remain inactive.
 
 The stamp history (v1 PK-less, v2 unenforced-PK, v3 `__run__*` sweep, v4 lineage
 in `__manifest` with the commit-graph tables retired, v5 stable table identity,
@@ -1404,9 +1417,10 @@ stream-config v2 plus the private recovery-v11 row/fold core, v9
 stream-config v3/state-v2 plus manifest-selected token authority and
 recovery-v12, v10 graph-profile enablement, v11 checked profile-v2 plus
 recovery-v13 profile receipts, v12 lifecycle-v3 plus recovery-v14, v13
-private resume/guarded drain-abort plus recovery-v15, and v14 private SEALED
-EnsureIndices plus recovery-v16) is
-recorded on the `INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v14 is
+private resume/guarded drain-abort plus recovery-v15, v14 private SEALED
+EnsureIndices plus recovery-v16, and v15 private SEALED Optimize plus
+recovery-v17) is
+recorded on the `INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v15 is
 served. An
 earlier-stamped graph is rebuilt via export/import, not migrated in place.
 
