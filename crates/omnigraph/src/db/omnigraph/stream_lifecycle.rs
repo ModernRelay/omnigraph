@@ -23,13 +23,14 @@ use crate::db::manifest::TableIdentity;
 use crate::db::manifest::stream::{
     AuthenticatedWalTail, ClaimAttemptClassification, ClaimAttemptEffect,
     ClaimAttemptEffectPreimage, ClaimProfile, ClaimReceipt, ClaimReceiptPreimage,
-    ClaimTerminalClassification, DisableDrainAdoption, DrainDescriptor, DrainGoal, LastFoldOutcome,
-    LastFoldSummary, ManagementReceipt, QUIESCE_REQUEST_PROTOCOL_VERSION, QuiesceRequestPayload,
+    ClaimTerminalClassification, CurrentHeadWitness, DisableDrainAdoption, DrainDescriptor,
+    DrainGoal, LastFoldOutcome, LastFoldSummary, ManagementReceipt,
+    QUIESCE_REQUEST_PROTOCOL_VERSION, QuiesceRequestPayload,
     STREAM_DATA_BLOCK_VALIDATION_CONTRACT_VERSION, STREAM_RESUME_OPERATION_KIND,
     STREAM_RESUME_REQUEST_PROTOCOL_VERSION, SealedProof, StreamGenerationCut, StreamLifecycle,
     StreamLifecycleEntry, StreamResumeMode, StreamResumeRequestPayload, StrictBlock,
-    authenticated_wal_tail_chain_digest,
-    stream_physical_binding_digest, stream_quiesce_result_payload, stream_resume_result_payload,
+    authenticated_wal_tail_chain_digest, stream_physical_binding_digest,
+    stream_quiesce_result_payload, stream_resume_result_payload,
 };
 use crate::db::manifest::stream_profile::ReceiptChainRef;
 use crate::db::manifest::stream_token::{
@@ -2911,28 +2912,47 @@ pub(crate) fn stream_verified_empty_digest(
     evidence: EmptyCutEvidence,
 ) -> Result<String> {
     validate_empty_cut(draining, current_claim_receipt, evidence)?;
-    let binding_bytes = canonical_json_bytes("verified-empty physical binding", &draining.binding)?;
+    verified_empty_digest_from_validated_authority(draining, current_claim_receipt, evidence)
+}
+
+/// Hash an already-validated empty-cut authority. Callers must first prove the
+/// operation-specific relationship between `lifecycle`, `receipt`, and
+/// `evidence`; this helper deliberately preserves the v1 preimage byte for
+/// byte while allowing both DRAINING finalization and SEALED HEAD refreshes to
+/// use it.
+fn verified_empty_digest_from_validated_authority(
+    lifecycle: &StreamLifecycleEntry,
+    current_claim_receipt: &ClaimReceipt,
+    evidence: EmptyCutEvidence,
+) -> Result<String> {
+    let binding_bytes =
+        canonical_json_bytes("verified-empty physical binding", &lifecycle.binding)?;
     let head_bytes = canonical_json_bytes(
         "verified-empty base HEAD witness",
-        &draining.current_head_witness,
+        &lifecycle.current_head_witness,
     )?;
     let claim_chain_bytes =
-        canonical_json_bytes("verified-empty claim chain", &draining.claim_receipt_chain)?;
+        canonical_json_bytes("verified-empty claim chain", &lifecycle.claim_receipt_chain)?;
     let tail_bytes = canonical_json_bytes(
         "verified-empty authenticated WAL tail",
-        &draining.authenticated_wal_tail,
+        &lifecycle.authenticated_wal_tail,
     )?;
     let fold_summary_bytes = canonical_json_bytes(
         "verified-empty last fold summary",
-        &draining.last_fold_summary,
+        &lifecycle.last_fold_summary,
     )?;
     let mut digest = CanonicalHasher::new(VERIFIED_EMPTY_DOMAIN);
     digest.u32(VERIFIED_EMPTY_PROTOCOL_VERSION);
-    digest.u64(draining.identity.stable_table_id);
-    digest.u64(draining.identity.table_incarnation_id);
-    digest.field(draining.binding_scope_id.as_bytes());
-    digest.field(draining.enrollment_receipt.stream_incarnation_id.as_bytes());
-    digest.field(draining.binding.stream_config_hash.as_bytes());
+    digest.u64(lifecycle.identity.stable_table_id);
+    digest.u64(lifecycle.identity.table_incarnation_id);
+    digest.field(lifecycle.binding_scope_id.as_bytes());
+    digest.field(
+        lifecycle
+            .enrollment_receipt
+            .stream_incarnation_id
+            .as_bytes(),
+    );
+    digest.field(lifecycle.binding.stream_config_hash.as_bytes());
     digest.field(&binding_bytes);
     digest.field(&head_bytes);
     digest.field(current_claim_receipt.shard_id.as_bytes());
@@ -2948,6 +2968,103 @@ pub(crate) fn stream_verified_empty_digest(
     digest.u64(current_claim_receipt.sentinel_position);
     digest.field(current_claim_receipt.sentinel_digest.as_bytes());
     Ok(digest.finish())
+}
+
+/// Build the sole allowed same-binding SEALED maintenance successor after a
+/// content-preserving writer has classified its exact new table HEAD.
+///
+/// The result is deterministic from `(prior, current_claim_receipt,
+/// next_current_head_witness)`: recovery can rebuild it and require a
+/// byte-identical stored row. Every field is cloned from `prior` except the
+/// lifecycle revision, both copies of the HEAD witness, and the recomputed
+/// verified-empty digest.
+pub(crate) fn build_sealed_maintenance_successor(
+    prior: &StreamLifecycleEntry,
+    current_claim_receipt: &ClaimReceipt,
+    next_current_head_witness: CurrentHeadWitness,
+) -> Result<StreamLifecycleEntry> {
+    prior.validate()?;
+    current_claim_receipt.validate()?;
+    if prior.lifecycle != StreamLifecycle::Sealed {
+        return Err(OmniError::manifest_internal(
+            "same-binding stream HEAD refresh requires exact SEALED authority",
+        ));
+    }
+    if next_current_head_witness.table_version <= prior.current_head_witness.table_version
+        || next_current_head_witness.transaction_uuid == prior.current_head_witness.transaction_uuid
+    {
+        return Err(OmniError::manifest_internal(
+            "same-binding stream HEAD refresh must advance to an exact new transaction witness",
+        ));
+    }
+
+    let proof = prior.sealed_proof.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal("same-binding stream HEAD refresh lost its SEALED proof")
+    })?;
+    if current_claim_receipt.identity != prior.identity
+        || current_claim_receipt.binding_scope_id != prior.binding_scope_id
+        || current_claim_receipt.enrollment_id != prior.binding.enrollment_id
+        || current_claim_receipt.stream_incarnation_id
+            != prior.enrollment_receipt.stream_incarnation_id
+        || current_claim_receipt.stream_configuration_digest != prior.binding.stream_config_hash
+        || current_claim_receipt.physical_binding_digest
+            != stream_physical_binding_digest(&prior.binding)?
+        || current_claim_receipt.lifecycle_operation_id.as_deref() != Some(proof.drain_id.as_str())
+        || prior.current_claim_receipt_id.as_deref()
+            != Some(current_claim_receipt.record_id.as_str())
+        || prior.claim_receipt_chain.head_record_id.as_deref()
+            != Some(current_claim_receipt.record_id.as_str())
+        || proof.current_claim_receipt_id != current_claim_receipt.record_id
+        || current_claim_receipt.achieved_shard_manifest_version > proof.shard_manifest_version
+        || current_claim_receipt.achieved_writer_epoch != proof.writer_epoch
+        || current_claim_receipt.sentinel_position != proof.current_sentinel_position
+        || current_claim_receipt.sentinel_digest != proof.current_sentinel_digest
+        || current_claim_receipt.authenticated_tail_position
+            != prior.authenticated_wal_tail.position
+        || current_claim_receipt.authenticated_tail_segment_count
+            != prior.authenticated_wal_tail.segment_count
+        || current_claim_receipt.authenticated_tail_chain_digest
+            != prior.authenticated_wal_tail.chain_digest
+        || current_claim_receipt.authenticated_tail_lww_projection_digest
+            != prior.authenticated_wal_tail.lww_projection_digest
+        || prior
+            .epoch_floor_by_shard
+            .get(&current_claim_receipt.shard_id)
+            .copied()
+            != Some(proof.writer_epoch)
+    {
+        return Err(OmniError::manifest_internal(
+            "same-binding stream HEAD refresh claim differs from the exact SEALED authority",
+        ));
+    }
+
+    let evidence = EmptyCutEvidence {
+        shard_manifest_version: proof.shard_manifest_version,
+        writer_epoch: proof.writer_epoch,
+        replay_cursor: proof.replay_cursor,
+        current_generation: proof.current_generation,
+        base_merged_generation: proof.base_merged_generation,
+    };
+    let expected_prior_digest =
+        verified_empty_digest_from_validated_authority(prior, current_claim_receipt, evidence)?;
+    if proof.verified_empty_digest != expected_prior_digest {
+        return Err(OmniError::manifest_internal(
+            "same-binding stream HEAD refresh SEALED proof digest is not exact",
+        ));
+    }
+
+    let mut next = prior.clone();
+    next.lifecycle_revision = next_revision(prior.lifecycle_revision)?;
+    next.current_head_witness = next_current_head_witness.clone();
+    let verified_empty_digest =
+        verified_empty_digest_from_validated_authority(&next, current_claim_receipt, evidence)?;
+    let next_proof = next.sealed_proof.as_mut().ok_or_else(|| {
+        OmniError::manifest_internal("same-binding stream HEAD refresh lost its SEALED proof")
+    })?;
+    next_proof.base_current_head_witness = next_current_head_witness;
+    next_proof.verified_empty_digest = verified_empty_digest;
+    next.validate_successor_of(prior)?;
+    Ok(next)
 }
 
 /// Construct the exact terminal SEALED row. The caller supplies the immutable
@@ -3849,6 +3966,169 @@ mod tests {
         .unwrap()
     }
 
+    fn sealed_lifecycle_with_current_claim() -> (StreamLifecycleEntry, ClaimReceipt) {
+        let initial = test_sealed_lifecycle_from(&open_lifecycle()).unwrap();
+        let plan = prepare_stream_resume_open(
+            &initial,
+            resume_request(StreamResumeMode::ResumeSealed, initial.lifecycle_revision),
+        )
+        .unwrap();
+        let initial_proof = initial.sealed_proof.as_ref().unwrap();
+        let built = built_resume_claim(
+            &initial,
+            StreamResumeMode::ResumeSealed,
+            &plan,
+            initial_proof.shard_manifest_version,
+            initial_proof.replay_cursor,
+            initial_proof.current_generation,
+            initial_proof.base_merged_generation,
+        );
+        let current_claim_receipt = built.receipt.clone();
+        let management_receipt = resume_management_receipt(&initial, &plan);
+        let opened = build_resume_adoption_row(
+            &initial,
+            &built,
+            &management_receipt,
+            StreamResumeMode::ResumeSealed,
+        )
+        .unwrap();
+        let evidence = EmptyCutEvidence {
+            shard_manifest_version: current_claim_receipt.achieved_shard_manifest_version,
+            writer_epoch: current_claim_receipt.achieved_writer_epoch,
+            replay_cursor: current_claim_receipt.replay_cursor,
+            current_generation: initial_proof.current_generation,
+            base_merged_generation: initial_proof.base_merged_generation,
+        };
+
+        let mut sealed = opened;
+        sealed.lifecycle = StreamLifecycle::Sealed;
+        sealed.lifecycle_revision += 1;
+        sealed.sealed_proof = Some(SealedProof {
+            drain_id: current_claim_receipt
+                .lifecycle_operation_id
+                .clone()
+                .unwrap(),
+            binding_scope_id: sealed.binding_scope_id.clone(),
+            shard_manifest_version: evidence.shard_manifest_version,
+            writer_epoch: evidence.writer_epoch,
+            replay_cursor: evidence.replay_cursor,
+            current_generation: evidence.current_generation,
+            base_merged_generation: evidence.base_merged_generation,
+            base_current_head_witness: sealed.current_head_witness.clone(),
+            current_claim_receipt_id: current_claim_receipt.record_id.clone(),
+            claim_receipt_chain: sealed.claim_receipt_chain.clone(),
+            authenticated_tail_position: sealed.authenticated_wal_tail.position,
+            authenticated_tail_segment_count: sealed.authenticated_wal_tail.segment_count,
+            authenticated_tail_chain_digest: sealed.authenticated_wal_tail.chain_digest.clone(),
+            current_sentinel_position: current_claim_receipt.sentinel_position,
+            current_sentinel_digest: current_claim_receipt.sentinel_digest.clone(),
+            verified_empty_digest: digest('0'),
+        });
+        sealed.sealed_proof.as_mut().unwrap().verified_empty_digest =
+            verified_empty_digest_from_validated_authority(
+                &sealed,
+                &current_claim_receipt,
+                evidence,
+            )
+            .unwrap();
+        sealed.validate().unwrap();
+        (sealed, current_claim_receipt)
+    }
+
+    #[test]
+    fn sealed_same_binding_head_refresh_changes_only_exact_maintenance_delta() {
+        let (prior, current_claim_receipt) = sealed_lifecycle_with_current_claim();
+        let next_head = CurrentHeadWitness {
+            branch_identifier: BranchIdentifier::main(),
+            table_version: prior.current_head_witness.table_version + 1,
+            transaction_uuid: "abababab-abab-4bab-8bab-abababababab".to_string(),
+            manifest_e_tag: Some("etag-next".to_string()),
+        };
+
+        let next =
+            build_sealed_maintenance_successor(&prior, &current_claim_receipt, next_head.clone())
+                .unwrap();
+        let prior_proof = prior.sealed_proof.as_ref().unwrap();
+        let next_proof = next.sealed_proof.as_ref().unwrap();
+        assert_eq!(next.lifecycle, StreamLifecycle::Sealed);
+        assert_eq!(next.lifecycle_revision, prior.lifecycle_revision + 1);
+        assert_eq!(next.current_head_witness, next_head);
+        assert_eq!(next_proof.base_current_head_witness, next_head);
+        assert_ne!(
+            next_proof.verified_empty_digest,
+            prior_proof.verified_empty_digest
+        );
+
+        let mut expected = prior.clone();
+        expected.lifecycle_revision += 1;
+        expected.current_head_witness = next_head.clone();
+        expected
+            .sealed_proof
+            .as_mut()
+            .unwrap()
+            .base_current_head_witness = next_head.clone();
+        expected
+            .sealed_proof
+            .as_mut()
+            .unwrap()
+            .verified_empty_digest = next_proof.verified_empty_digest.clone();
+        assert_eq!(next, expected, "no other lifecycle authority may move");
+        assert_eq!(
+            build_sealed_maintenance_successor(&prior, &current_claim_receipt, next_head,).unwrap(),
+            next,
+            "recovery must deterministically rebuild the same terminal row"
+        );
+    }
+
+    #[test]
+    fn sealed_same_binding_head_refresh_refuses_stale_or_unproved_authority() {
+        let (prior, current_claim_receipt) = sealed_lifecycle_with_current_claim();
+        let error = build_sealed_maintenance_successor(
+            &prior,
+            &current_claim_receipt,
+            prior.current_head_witness.clone(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exact new transaction witness"));
+
+        let mut forged = prior.clone();
+        forged.sealed_proof.as_mut().unwrap().verified_empty_digest = digest('f');
+        forged.validate().unwrap();
+        let error = build_sealed_maintenance_successor(
+            &forged,
+            &current_claim_receipt,
+            CurrentHeadWitness {
+                branch_identifier: BranchIdentifier::main(),
+                table_version: forged.current_head_witness.table_version + 1,
+                transaction_uuid: "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd".to_string(),
+                manifest_e_tag: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("proof digest is not exact"));
+
+        let mut open = prior;
+        open.lifecycle = StreamLifecycle::Open;
+        open.sealed_proof = None;
+        open.validate().unwrap();
+        let error = build_sealed_maintenance_successor(
+            &open,
+            &current_claim_receipt,
+            CurrentHeadWitness {
+                branch_identifier: BranchIdentifier::main(),
+                table_version: open.current_head_witness.table_version + 1,
+                transaction_uuid: "dededede-dede-4ede-8ede-dededededede".to_string(),
+                manifest_e_tag: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires exact SEALED authority")
+        );
+    }
+
     #[test]
     fn sealed_resume_prepares_a_higher_epoch_and_builds_only_the_exact_open_row() {
         let sealed = test_sealed_lifecycle_from(&open_lifecycle()).unwrap();
@@ -3868,9 +4148,7 @@ mod tests {
             ClaimOperationRequest {
                 graph_identity_digest: digest('d'),
                 claim_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
-                lifecycle_operation_id: Some(
-                    "88888888-8888-4888-8888-888888888888".to_string(),
-                ),
+                lifecycle_operation_id: Some("88888888-8888-4888-8888-888888888888".to_string()),
                 recovery_operation_id: "stream-resume-recovery".to_string(),
                 claim_kind: "RESUME_FENCE".to_string(),
                 profile: ClaimProfile::RetainAll,

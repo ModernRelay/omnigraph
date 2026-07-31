@@ -2569,6 +2569,18 @@ impl Omnigraph {
         table_ops::ensure_indices_on(self, branch).await
     }
 
+    /// Feature-gated checked-runtime seam for the canonical-main,
+    /// same-binding SEALED EnsureIndices bridge. Public maintenance transport
+    /// remains an F7 concern.
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    pub async fn failpoint_stream_sealed_ensure_indices_for_test(
+        &self,
+        actor_id: &str,
+    ) -> Result<Vec<PendingIndex>> {
+        table_ops::ensure_indices_sealed_as(self, actor_id).await
+    }
+
     #[cfg(feature = "failpoints")]
     #[doc(hidden)]
     pub async fn failpoint_publish_table_head_without_index_rebuild_for_test(

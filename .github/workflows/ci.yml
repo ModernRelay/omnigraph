@@ -223,8 +223,8 @@ jobs:
           grep -Fq "fold_delta_remeasure_bytes=402653184" "$test_log" \
             || { echo "::error::Gate R0 RSS evidence line or 384-MiB tripwire changed"; exit 1; }
 
-  v12_v13_format_fence:
-    name: V12 ↔ V13 Format Fence
+  v13_v14_format_fence:
+    name: V13 ↔ V14 Format Fence
     needs: classify_changes
     if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
@@ -257,29 +257,29 @@ jobs:
         with:
           workspaces: |
             . -> target
-          key: crossversion-v12-v13
+          key: crossversion-v13-v14
 
       # CI pins only the immediate predecessor. Older seams remain env-gated
       # and on-demand, per docs/dev/testing.md.
-      - name: Build genuine final-v12 CLI
+      - name: Build genuine final-v13 CLI
         env:
-          # Last v12-writing main commit before recovery-v15 resume/abort
-          # authority activates v13. Keep this immutable: HEAD^ stops being
-          # v12 after the first v13 merge.
-          FINAL_INTERNAL_V12_COMMIT: f1bdeca60eeb16540de24309eb3483feffbe27c8
+          # Last v13-writing main commit before recovery-v16 SEALED
+          # EnsureIndices authority activates v14. Keep this immutable: HEAD^
+          # stops being v13 after the first v14 merge.
+          FINAL_INTERNAL_V13_COMMIT: 0c098640e0a8972ea0c15d03a39b2220c1207500
         run: |
           set -euo pipefail
-          v12_source="$RUNNER_TEMP/omnigraph-final-v12"
-          v12_bin="$RUNNER_TEMP/omnigraph-final-v12-bin"
-          git fetch --no-tags --depth=1 origin "$FINAL_INTERNAL_V12_COMMIT"
-          git worktree add --detach "$v12_source" "$FINAL_INTERNAL_V12_COMMIT"
+          v13_source="$RUNNER_TEMP/omnigraph-final-v13"
+          v13_bin="$RUNNER_TEMP/omnigraph-final-v13-bin"
+          git fetch --no-tags --depth=1 origin "$FINAL_INTERNAL_V13_COMMIT"
+          git worktree add --detach "$v13_source" "$FINAL_INTERNAL_V13_COMMIT"
           cargo build --locked \
-            --manifest-path "$v12_source/Cargo.toml" \
+            --manifest-path "$v13_source/Cargo.toml" \
             --package omnigraph-cli \
             --bin omnigraph \
             --target-dir "$GITHUB_WORKSPACE/target"
-          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v12_bin"
-          test -x "$v12_bin"
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v13_bin"
+          test -x "$v13_bin"
           cargo clean --target-dir "$GITHUB_WORKSPACE/target" \
             --package omnigraph-compiler \
             --package omnigraph-policy \
@@ -288,23 +288,23 @@ jobs:
             --package omnigraph-cluster \
             --package omnigraph-server \
             --package omnigraph-cli
-          echo "OMNIGRAPH_V12_BIN=$v12_bin" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_V13_BIN=$v13_bin" >> "$GITHUB_ENV"
 
-      - name: Run exact v12↔v13 refusal and rebuild fence
+      - name: Run exact v13↔v14 refusal and rebuild fence
         run: |
           set -euo pipefail
-          test_log="$RUNNER_TEMP/v12-v13-format-fence.log"
+          test_log="$RUNNER_TEMP/v13-v14-format-fence.log"
           cargo test --locked -p omnigraph-cli --test crossversion_upgrade \
-            current_v13_refuses_and_rebuilds_genuine_v12_and_v12_refuses_v13 \
+            current_v14_refuses_and_rebuilds_genuine_v13_and_v13_refuses_v14 \
             -- --exact --nocapture 2>&1 | tee "$test_log"
-          if grep -Fq "skipping immediate-predecessor v12 upgrade test" "$test_log"; then
-            echo "::error::v12↔v13 format fence skipped despite a configured predecessor binary"
+          if grep -Fq "skipping immediate-predecessor v13 upgrade test" "$test_log"; then
+            echo "::error::v13↔v14 format fence skipped despite a configured predecessor binary"
             exit 1
           fi
-          grep -Eq "test current_v13_refuses_and_rebuilds_genuine_v12_and_v12_refuses_v13 \.\.\. ok" "$test_log" \
-            || { echo "::error::exact v12↔v13 format fence did not execute normally"; exit 1; }
+          grep -Eq "test current_v14_refuses_and_rebuilds_genuine_v13_and_v13_refuses_v14 \.\.\. ok" "$test_log" \
+            || { echo "::error::exact v13↔v14 format fence did not execute normally"; exit 1; }
           grep -Eq "test result: ok\. 1 passed; 0 failed" "$test_log" \
-            || { echo "::error::v12↔v13 format fence matched the wrong test set"; exit 1; }
+            || { echo "::error::v13↔v14 format fence matched the wrong test set"; exit 1; }
 
   test_aws_feature:
     name: Test omnigraph-server --features aws

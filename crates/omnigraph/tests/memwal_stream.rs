@@ -629,6 +629,33 @@ fn assert_no_recovery_sidecars(dir: &EnrolledGraphDir) {
     );
 }
 
+async fn init_productive_sealed_lane() -> (
+    EnrolledGraphDir,
+    Arc<Omnigraph>,
+    StreamTableStatus,
+    StreamTableStatus,
+) {
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let row = physical_batch(&db, &[("ordinary-before-quiesce".to_string(), 13)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+        .await
+        .expect("fixture row must be durably acknowledged");
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the ordinary fold must publish before quiesce");
+    let folded = stream_lane(&db).await;
+    db.failpoint_stream_quiesce_for_test(
+        TABLE,
+        "90909090-9090-4090-8090-909090909090",
+        folded.lifecycle_revision,
+        "operator:ordinary-fold-quiesce",
+    )
+    .await
+    .expect("the retained published prefix plus one new sentinel proves the successor empty");
+    let sealed = stream_lane(&db).await;
+    (dir, db, folded, sealed)
+}
+
 fn stream_data_block_token(error: &OmniError) -> &str {
     match error {
         OmniError::StreamDataBlocked { block_token } => block_token,
@@ -1013,39 +1040,360 @@ async fn durable_put_is_graph_content_invisible_until_one_explicit_fold() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn quiesce_accepts_an_empty_successor_after_an_ordinary_published_fold() {
+async fn sealed_ensure_indices_refreshes_a_productive_lane_and_preserves_resume() {
     let _scenario = FailScenario::setup();
-    let (dir, db) = init_enrolled().await;
-    let row = physical_batch(&db, &[("ordinary-before-quiesce".to_string(), 13)]).await;
-    db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
-        .await
-        .expect("fixture row must be durably acknowledged");
-    db.failpoint_stream_b1_for_test(TABLE, None, 0)
-        .await
-        .expect("the ordinary fold must publish before quiesce");
-
-    let folded = stream_lane(&db).await;
+    let (dir, db, folded, sealed) = init_productive_sealed_lane().await;
     assert_eq!(folded.lifecycle, "OPEN");
     assert_eq!(folded.last_fold_outcome.as_deref(), Some("PUBLISHED"));
     let folded_epoch = epoch_floor(&folded);
-    let drain_id = "90909090-9090-4090-8090-909090909090";
-
-    db.failpoint_stream_quiesce_for_test(
-        TABLE,
-        drain_id,
-        folded.lifecycle_revision,
-        "operator:ordinary-fold-quiesce",
-    )
-    .await
-    .expect("the retained published prefix plus one new sentinel proves the successor empty");
-
-    let sealed = stream_lane(&db).await;
     assert_eq!(sealed.lifecycle, "SEALED");
     assert_eq!(
         epoch_floor(&sealed),
         folded_epoch + 1,
         "quiesce must need exactly one drain claim after the published fold"
     );
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("ordinary-before-quiesce".to_string(), 13)]
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    let sealed_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let sealed_table_version = sealed_snapshot.entry(TABLE).unwrap().table_version;
+    let ordinary_error = db
+        .ensure_indices()
+        .await
+        .expect_err("ordinary EnsureIndices must remain fenced by SEALED authority");
+    let OmniError::Manifest(manifest_error) = ordinary_error else {
+        panic!("expected typed lifecycle conflict, got {ordinary_error:?}");
+    };
+    assert!(
+        matches!(
+            manifest_error.details,
+            Some(omnigraph::error::ManifestConflictDetails::StreamLifecycleConflict {
+                ref lifecycle,
+                ref operation,
+                ..
+            }) if lifecycle == "SEALED" && operation == "ensure_indices"
+        ),
+        "{manifest_error:?}"
+    );
+    let after_refusal = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        after_refusal.version(),
+        sealed_snapshot.version(),
+        "ordinary EnsureIndices refusal must not advance graph authority"
+    );
+    assert_eq!(
+        after_refusal.entry(TABLE).unwrap().table_version,
+        sealed_table_version,
+        "ordinary EnsureIndices refusal must not publish a table effect"
+    );
+    assert_eq!(stream_lane(&db).await, sealed);
+    assert_no_recovery_sidecars(&dir);
+
+    let pending = db
+        .failpoint_stream_sealed_ensure_indices_for_test("operator:sealed-indices")
+        .await
+        .expect("checked SEALED maintenance must build the deferred id index");
+    assert!(pending.is_empty());
+    let maintained = stream_lane(&db).await;
+    let mut expected_maintained = sealed.clone();
+    expected_maintained.lifecycle_revision += 1;
+    assert_eq!(
+        maintained, expected_maintained,
+        "maintenance may refresh only the exposed lifecycle revision while staying SEALED"
+    );
+    let maintained_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        maintained_snapshot.entry(TABLE).unwrap().table_version,
+        sealed_table_version + 1,
+        "productive index work must publish one exact table HEAD"
+    );
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("ordinary-before-quiesce".to_string(), 13)],
+        "index maintenance must preserve graph content"
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    let before_no_work_status = db.stream_status().await.unwrap();
+    let before_no_work_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let pending = db
+        .failpoint_stream_sealed_ensure_indices_for_test("operator:sealed-indices")
+        .await
+        .expect("a repeated checked maintenance call must recognize no work");
+    assert!(pending.is_empty());
+    let after_no_work_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        db.stream_status().await.unwrap(),
+        before_no_work_status,
+        "no-work maintenance must not advance lifecycle authority"
+    );
+    assert_eq!(
+        after_no_work_snapshot.version(),
+        before_no_work_snapshot.version(),
+        "no-work maintenance must not publish graph lineage"
+    );
+    assert_eq!(
+        after_no_work_snapshot.entry(TABLE).unwrap().table_version,
+        before_no_work_snapshot.entry(TABLE).unwrap().table_version,
+        "no-work maintenance must not advance the table HEAD"
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    db.failpoint_stream_resume_for_test(
+        TABLE,
+        "91919191-9191-4191-8191-919191919191",
+        maintained.lifecycle_revision,
+        false,
+        "operator:sealed-indices",
+    )
+    .await
+    .expect("the maintained SEALED proof must remain resumable");
+    let open = stream_lane(&db).await;
+    assert_eq!(open.lifecycle, "OPEN");
+    assert_eq!(open.lifecycle_revision, maintained.lifecycle_revision + 1);
+    assert!(epoch_floor(&open) > epoch_floor(&maintained));
+
+    let (_, already_durable) = authorized_ingest_score(
+        &db,
+        &open.stream_incarnation_id,
+        "after-maintenance",
+        14,
+        1,
+        "92919191-9291-4291-8291-929191919191",
+        None,
+        "operator:sealed-indices",
+    )
+    .await
+    .expect("the resumed writer must accept authenticated ingress");
+    assert!(!already_durable);
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the resumed generation must fold normally");
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![
+            ("after-maintenance".to_string(), 14),
+            ("ordinary-before-quiesce".to_string(), 13),
+        ]
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn sealed_ensure_indices_effects_confirmed_reopens_with_atomic_authority() {
+    let _scenario = FailScenario::setup();
+    let (dir, db, _, sealed) = init_productive_sealed_lane().await;
+    let prior_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let prior_manifest_version = prior_snapshot.version();
+    let prior_table_version = prior_snapshot.entry(TABLE).unwrap().table_version;
+
+    let error = {
+        let _failpoint = ScopedFailPoint::new(
+            names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
+        db.failpoint_stream_sealed_ensure_indices_for_test("operator:sealed-indices-recovery")
+            .await
+            .expect_err("the confirmed v16 intent must stop before manifest publication")
+    };
+    assert!(
+        matches!(&error, OmniError::RecoveryRequired { .. }),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT),
+        "{error:?}"
+    );
+
+    let unpublished = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(unpublished.version(), prior_manifest_version);
+    assert_eq!(
+        unpublished.entry(TABLE).unwrap().table_version,
+        prior_table_version,
+        "the graph pointer must remain on the prior table HEAD"
+    );
+    assert_eq!(
+        stream_lane(&db).await,
+        sealed,
+        "the unpublished lifecycle successor must remain invisible"
+    );
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("ordinary-before-quiesce".to_string(), 13)]
+    );
+
+    let operation_ids = helpers::recovery::sidecar_operation_ids(dir.path());
+    assert_eq!(
+        operation_ids.len(),
+        1,
+        "confirmed v16 intent must remain durable"
+    );
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{}.json", operation_ids[0]));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["schema_version"], 16);
+    assert_eq!(sidecar["writer_kind"], "StreamSealedMaintenance");
+    assert_eq!(sidecar["protocol_v8"]["effect_phase"], "EffectsConfirmed");
+    assert_eq!(sidecar["protocol_v16"]["kind"], "StreamSealedEnsureIndices");
+    assert!(
+        sidecar["protocol_v16"]["payload"]["next_lifecycles"]
+            .as_array()
+            .is_some_and(|entries| entries.len() == 1),
+        "EffectsConfirmed v16 must bind the complete lifecycle successor"
+    );
+
+    drop(unpublished);
+    drop(prior_snapshot);
+    drop(db);
+    let reopened = reopen_enrolled(&dir).await;
+    let recovered_snapshot = reopened
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered_snapshot.version(),
+        prior_manifest_version + 1,
+        "recovery must publish one graph-authority transition"
+    );
+    assert_eq!(
+        recovered_snapshot.entry(TABLE).unwrap().table_version,
+        prior_table_version + 1,
+        "recovery must select the exact confirmed index HEAD"
+    );
+    let recovered = stream_lane(&reopened).await;
+    let mut expected_recovered = sealed;
+    expected_recovered.lifecycle_revision += 1;
+    assert_eq!(
+        recovered, expected_recovered,
+        "the table pointer and SEALED lifecycle refresh must roll forward together"
+    );
+    assert_eq!(
+        visible_rows(&reopened).await,
+        vec![("ordinary-before-quiesce".to_string(), 13)],
+        "index recovery must preserve graph content"
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn sealed_ensure_indices_armed_effect_compensates_with_refreshed_proof() {
+    let _scenario = FailScenario::setup();
+    let (dir, db, _, sealed) = init_productive_sealed_lane().await;
+    let prior_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let prior_manifest_version = prior_snapshot.version();
+    let prior_table_version = prior_snapshot.entry(TABLE).unwrap().table_version;
+
+    let error = {
+        let _failpoint =
+            ScopedFailPoint::new(names::ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM, "return");
+        db.failpoint_stream_sealed_ensure_indices_for_test("operator:sealed-indices-rollback")
+            .await
+            .expect_err("the v16 intent must stop after its index effect but remain Armed")
+    };
+    assert!(
+        matches!(&error, OmniError::RecoveryRequired { .. }),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(names::ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM),
+        "{error:?}"
+    );
+
+    let unpublished = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(unpublished.version(), prior_manifest_version);
+    assert_eq!(
+        unpublished.entry(TABLE).unwrap().table_version,
+        prior_table_version,
+        "the unconfirmed CreateIndex effect must not move the graph pointer"
+    );
+    assert_eq!(
+        stream_lane(&db).await,
+        sealed,
+        "Armed physical work must not publish lifecycle authority"
+    );
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("ordinary-before-quiesce".to_string(), 13)]
+    );
+
+    let operation_ids = helpers::recovery::sidecar_operation_ids(dir.path());
+    assert_eq!(
+        operation_ids.len(),
+        1,
+        "the Armed v16 intent must remain durable"
+    );
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{}.json", operation_ids[0]));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["schema_version"], 16);
+    assert_eq!(sidecar["writer_kind"], "StreamSealedMaintenance");
+    assert_eq!(sidecar["protocol_v8"]["effect_phase"], "Armed");
+    assert!(sidecar["protocol_v16"]["payload"]["next_lifecycles"].is_null());
+    assert!(sidecar["protocol_v16"]["payload"]["rollback_lifecycles"].is_null());
+
+    drop(unpublished);
+    drop(prior_snapshot);
+    let reopened = reopen_enrolled(&dir).await;
+    let compensated_snapshot = reopened
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert_eq!(
+        compensated_snapshot.version(),
+        prior_manifest_version + 1,
+        "compensation must publish one graph-authority transition"
+    );
+    assert_eq!(
+        compensated_snapshot.entry(TABLE).unwrap().table_version,
+        prior_table_version + 2,
+        "CreateIndex followed by compensation must publish the exact Restore HEAD"
+    );
+    let compensated = stream_lane(&reopened).await;
+    let mut expected_compensated = sealed;
+    expected_compensated.lifecycle_revision += 1;
+    assert_eq!(
+        compensated, expected_compensated,
+        "the Restore HEAD must be selected with one refreshed SEALED proof"
+    );
+    assert_eq!(
+        visible_rows(&reopened).await,
+        vec![("ordinary-before-quiesce".to_string(), 13)],
+        "compensation must preserve graph content"
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    drop(compensated_snapshot);
+    drop(reopened);
+    let pending = db
+        .failpoint_stream_sealed_ensure_indices_for_test("operator:sealed-indices-rollback")
+        .await
+        .expect("the checked handle must refresh and rebuild the compensated index");
+    assert!(pending.is_empty());
+    let rebuilt_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        rebuilt_snapshot.entry(TABLE).unwrap().table_version,
+        prior_table_version + 3,
+        "the missing index must still require one real CreateIndex commit"
+    );
+    let rebuilt = stream_lane(&db).await;
+    let mut expected_rebuilt = compensated;
+    expected_rebuilt.lifecycle_revision += 1;
+    assert_eq!(rebuilt, expected_rebuilt);
     assert_eq!(
         visible_rows(&db).await,
         vec![("ordinary-before-quiesce".to_string(), 13)]

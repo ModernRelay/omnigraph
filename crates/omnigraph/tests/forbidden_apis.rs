@@ -239,7 +239,10 @@ write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Composed("SchemaApply v9 + sentinel ref + optional hard-drop GC") => ["apply_schema", "apply_schema_with_options", "apply_schema_as", "apply_schema_as_with_catalog_check"],
     "exec/merge.rs" => MERGE_V9 => ["branch_merge", "branch_merge_as"],
     "db/omnigraph.rs" => INDICES_V9 => ["ensure_indices", "ensure_indices_on"],
-    "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test"],
+    "db/omnigraph.rs" => WriteProtocol::TestOnly => [
+        "failpoint_publish_table_head_without_index_rebuild_for_test",
+        "failpoint_stream_sealed_ensure_indices_for_test",
+    ],
     "db/omnigraph/stream_enrollment.rs" => WriteProtocol::TestOnly => [
         "failpoint_enroll_stream_table_for_test",
         "failpoint_prepare_stream_ingest_as_for_test",
@@ -249,6 +252,7 @@ write_surfaces! {
         "failpoint_stream_b2_for_test",
         "failpoint_stream_ingest_one_as_for_test",
         "failpoint_stream_quiesce_for_test",
+        "failpoint_stream_resume_for_test",
     ],
     "db/omnigraph/stream_ndjson.rs" => WriteProtocol::TestOnly => [
         "failpoint_stream_ingest_ndjson_as_for_test",
