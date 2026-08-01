@@ -109,6 +109,46 @@ jobs:
       - name: Verify omnigraph-server entrypoint arg composition
         run: sh docker/entrypoint_test.sh
 
+  check_default_features:
+    name: Check default features
+    needs: classify_changes
+    # PR-time compile check of the default-feature workspace. Every test job
+    # builds a feature superset (failpoints, aws), so a default-features-only
+    # break — a variant or module gated differently between a crate and its
+    # consumer — is otherwise first seen post-merge by the format fence, the
+    # noisiest possible channel. `cargo check` with a warm cache is minutes;
+    # this is a reporting check, not a required context.
+    if: github.event_name == 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          key: default-features-check
+
+      - name: Check workspace with default features
+        run: cargo check --workspace --locked
+
   test:
     name: Test Workspace
     needs: classify_changes
@@ -175,7 +215,11 @@ jobs:
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/workspace-tests.log"
-          cargo test --workspace --locked \
+          # --no-fail-fast: this post-merge run is a detection channel, not a
+          # gate. Stopping at the first red suite hides every independent
+          # failure behind it, which makes later regressions unattributable
+          # (suite order decided what CI could see, not what was broken).
+          cargo test --workspace --locked --no-fail-fast \
             --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
             -- --nocapture 2>&1 | tee "$test_log"
 
@@ -280,14 +324,12 @@ jobs:
             --target-dir "$GITHUB_WORKSPACE/target"
           cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v15_bin"
           test -x "$v15_bin"
-          cargo clean --target-dir "$GITHUB_WORKSPACE/target" \
-            --package omnigraph-compiler \
-            --package omnigraph-policy \
-            --package omnigraph-engine \
-            --package omnigraph-api-types \
-            --package omnigraph-cluster \
-            --package omnigraph-server \
-            --package omnigraph-cli
+          # Clean every current member through Cargo's workspace selector. A
+          # hand-maintained list rots when the workspace gains crates, and a
+          # missed member lets the fence cell link the predecessor's rlib
+          # (same name+version in the shared target) into the current tree.
+          cargo clean --workspace --locked \
+            --target-dir "$GITHUB_WORKSPACE/target"
           echo "OMNIGRAPH_V15_BIN=$v15_bin" >> "$GITHUB_ENV"
 
       - name: Run exact v15↔v16 refusal and rebuild fence
@@ -378,8 +420,8 @@ jobs:
     permissions:
       contents: read
     env:
-      AWS_ACCESS_KEY_ID: rustfsadmin
-      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_ACCESS_KEY_ID: omnigraphci
+      AWS_SECRET_ACCESS_KEY: omnigraphci-secret
       AWS_REGION: us-east-1
       AWS_ENDPOINT_URL: http://127.0.0.1:9000
       AWS_ENDPOINT_URL_S3: http://127.0.0.1:9000
@@ -413,12 +455,14 @@ jobs:
             . -> target
 
       - name: Start RustFS
-        # Pinned to 1.0.0-beta.8 (2026-06-10). beta.4+ refuses "default"
-        # credentials (rustfsadmin/rustfsadmin) unless
-        # RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true is set — fine for
-        # an ephemeral CI container. The three S3 suites were validated
-        # against the beta.8 binary locally before this bump. Keep the pin
-        # explicit (never `latest`) so upgrades are deliberate.
+        # Pinned to 1.0.0-beta.12 (2026-07-30). beta.8 carried hyper's short
+        # header_read_timeout for idle keep-alive connections (rustfs#4360,
+        # fixed in beta.10), matching the intermittent "error sending request"
+        # PUT failures observed here on pooled connections. The S3 suites
+        # (engine s3_storage, server s3, cluster s3_cluster, engine failpoints
+        # s3_, the memwal provider cell) were validated against the beta.12
+        # binary locally before this bump. Keep CI pinned to the immutable
+        # multi-arch index digest so upgrades are deliberate.
         run: |
           docker rm -f rustfs >/dev/null 2>&1 || true
           docker run -d \
@@ -427,8 +471,7 @@ jobs:
             -p 9001:9001 \
             -e RUSTFS_ACCESS_KEY="${AWS_ACCESS_KEY_ID}" \
             -e RUSTFS_SECRET_KEY="${AWS_SECRET_ACCESS_KEY}" \
-            -e RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true \
-            rustfs/rustfs:1.0.0-beta.8 \
+            rustfs/rustfs:1.0.0-beta.12@sha256:41fe89380f4120a337790c02af192c3fe7bb55c3edc2e6e9357b487b47c6ab21 \
             /data
 
       - name: Install AWS CLI
