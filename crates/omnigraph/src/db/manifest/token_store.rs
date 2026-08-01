@@ -34,7 +34,8 @@ use super::layout::{stream_token_authority_object_id, stream_token_uri};
 use super::stream::{
     BINDING_RECEIPT_TAG, BindingReceipt, CLAIM_ATTEMPT_EFFECT_TAG, CLAIM_RECEIPT_TAG,
     ClaimAttemptEffect, ClaimReceipt, ENROLLMENT_RECEIPT_V2_TAG, EnrollmentReceiptV2,
-    MANAGEMENT_RECEIPT_TAG, ManagementReceipt,
+    MANAGEMENT_RECEIPT_TAG, ManagementReceipt, STREAM_CORRECTION_RECEIPT_TAG,
+    StreamCorrectionReceipt,
 };
 use super::stream_profile::{
     AUTHORITY_RETIREMENT_RECEIPT_TAG, AuthorityRetirementReceipt, PROFILE_MANAGEMENT_RECEIPT_TAG,
@@ -69,50 +70,55 @@ pub(crate) enum LifecycleLedgerRecord {
     EnrollmentReceiptV2(EnrollmentReceiptV2),
     BindingReceipt(BindingReceipt),
     ManagementReceipt(ManagementReceipt),
+    StreamCorrectionReceipt(StreamCorrectionReceipt),
     ClaimAttemptEffect(ClaimAttemptEffect),
     ClaimReceipt(ClaimReceipt),
     AuthorityRetirementReceipt(AuthorityRetirementReceipt),
 }
 
 impl LifecycleLedgerRecord {
-    fn record_id(&self) -> &str {
+    pub(crate) fn record_id(&self) -> &str {
         match self {
             Self::EnrollmentReceiptV2(value) => &value.record_id,
             Self::BindingReceipt(value) => &value.record_id,
             Self::ManagementReceipt(value) => &value.record_id,
+            Self::StreamCorrectionReceipt(value) => &value.record_id,
             Self::ClaimAttemptEffect(value) => &value.record_id,
             Self::ClaimReceipt(value) => &value.record_id,
             Self::AuthorityRetirementReceipt(value) => &value.record_id,
         }
     }
 
-    fn record_tag(&self) -> &'static str {
+    pub(crate) fn record_tag(&self) -> &'static str {
         match self {
             Self::EnrollmentReceiptV2(_) => ENROLLMENT_RECEIPT_V2_TAG,
             Self::BindingReceipt(_) => BINDING_RECEIPT_TAG,
             Self::ManagementReceipt(_) => MANAGEMENT_RECEIPT_TAG,
+            Self::StreamCorrectionReceipt(_) => STREAM_CORRECTION_RECEIPT_TAG,
             Self::ClaimAttemptEffect(_) => CLAIM_ATTEMPT_EFFECT_TAG,
             Self::ClaimReceipt(_) => CLAIM_RECEIPT_TAG,
             Self::AuthorityRetirementReceipt(_) => AUTHORITY_RETIREMENT_RECEIPT_TAG,
         }
     }
 
-    fn record_lookup_key(&self) -> &str {
+    pub(crate) fn record_lookup_key(&self) -> &str {
         match self {
             Self::EnrollmentReceiptV2(value) => &value.record_lookup_key,
             Self::BindingReceipt(value) => &value.record_lookup_key,
             Self::ManagementReceipt(value) => &value.record_lookup_key,
+            Self::StreamCorrectionReceipt(value) => &value.record_lookup_key,
             Self::ClaimAttemptEffect(value) => &value.record_lookup_key,
             Self::ClaimReceipt(value) => &value.record_lookup_key,
             Self::AuthorityRetirementReceipt(value) => &value.record_lookup_key,
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         match self {
             Self::EnrollmentReceiptV2(value) => value.validate(),
             Self::BindingReceipt(value) => value.validate(),
             Self::ManagementReceipt(value) => value.validate(value.to_revision),
+            Self::StreamCorrectionReceipt(value) => value.validate(),
             Self::ClaimAttemptEffect(value) => value.validate(),
             Self::ClaimReceipt(value) => value.validate(),
             Self::AuthorityRetirementReceipt(value) => value.validate(),
@@ -125,6 +131,7 @@ impl LifecycleLedgerRecord {
             Self::EnrollmentReceiptV2(value) => serde_json::to_string(value),
             Self::BindingReceipt(value) => serde_json::to_string(value),
             Self::ManagementReceipt(value) => serde_json::to_string(value),
+            Self::StreamCorrectionReceipt(value) => serde_json::to_string(value),
             Self::ClaimAttemptEffect(value) => serde_json::to_string(value),
             Self::ClaimReceipt(value) => serde_json::to_string(value),
             Self::AuthorityRetirementReceipt(value) => serde_json::to_string(value),
@@ -162,6 +169,13 @@ impl LifecycleLedgerRecord {
                 serde_json::from_str(&envelope.record_payload_json).map_err(|error| {
                     OmniError::manifest_internal(format!(
                         "failed to decode lifecycle management receipt: {error}"
+                    ))
+                })?,
+            ),
+            STREAM_CORRECTION_RECEIPT_TAG => Self::StreamCorrectionReceipt(
+                serde_json::from_str(&envelope.record_payload_json).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to decode lifecycle correction receipt: {error}"
                     ))
                 })?,
             ),
@@ -1424,6 +1438,39 @@ pub(crate) async fn lookup_management_receipt(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) async fn lookup_stream_correction_receipt(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    graph_identity_digest: &str,
+    identity: TableIdentity,
+    stream_incarnation_id: &str,
+    block_token: &str,
+    correction_id: &str,
+) -> Result<Option<StreamCorrectionReceipt>> {
+    let lookup_key = StreamCorrectionReceipt::lookup_key_for(
+        graph_identity_digest,
+        identity,
+        stream_incarnation_id,
+        block_token,
+        correction_id,
+    )?;
+    match lookup_lifecycle_ledger_record(
+        dataset,
+        authority,
+        STREAM_CORRECTION_RECEIPT_TAG,
+        &lookup_key,
+    )
+    .await?
+    {
+        Some(LifecycleLedgerRecord::StreamCorrectionReceipt(value)) => Ok(Some(value)),
+        None => Ok(None),
+        Some(_) => Err(OmniError::manifest_internal(
+            "correction receipt lookup decoded another lifecycle ledger family",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn lookup_claim_attempt_effect(
     dataset: &Dataset,
     authority: &StreamTokenAuthorityEntry,
@@ -1872,6 +1919,169 @@ pub(crate) async fn stage_profile_management_receipt(
 /// validates that witness before producing any staged files. The returned
 /// [`crate::table_store::StagedWrite`] must enter recovery-v12 before its one
 /// strict `commit_staged_exact` invocation.
+pub(crate) async fn stage_stream_token_and_lifecycle_records(
+    dataset: Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    token_rows: &[StreamTokenAuthorityRow],
+    records: &[LifecycleLedgerRecord],
+) -> Result<crate::table_store::StagedWrite> {
+    validate_exact_dataset(&dataset, authority).await?;
+    if records.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "mixed stream-token staging requires at least one immutable lifecycle record",
+        ));
+    }
+    if !token_rows.is_empty() {
+        validate_stream_token_plan_bounds(token_rows)?;
+    }
+    for record in records {
+        record.validate()?;
+        // The mixed transaction uses UpdateAll for current-token rows. Prove
+        // every immutable operation lookup key and record id absent in the
+        // selected version first so that policy can never reinterpret an
+        // operation id or rewrite a receipt. A later competing commit still
+        // loses the exact read-version commit; transparent retries are off.
+        if lookup_lifecycle_ledger_envelope(
+            &dataset,
+            authority,
+            record.record_tag(),
+            record.record_lookup_key(),
+        )
+        .await?
+        .is_some()
+        {
+            return Err(OmniError::manifest_conflict(format!(
+                "immutable lifecycle record id or operation lookup key '{}' already exists at the manifest-selected stream-token version",
+                record.record_lookup_key()
+            )));
+        }
+        let mut scanner = dataset.scan();
+        scanner.filter_expr(col("id").eq(lit(record.record_id())));
+        scanner.batch_size(2);
+        scanner.batch_size_bytes(MAX_LIFECYCLE_LEDGER_TRANSACTION_ARROW_BYTES);
+        scanner
+            .limit(Some(2), None)
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let mut stream = scanner
+            .try_into_stream()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let mut selected_rows = 0usize;
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+        {
+            selected_rows = selected_rows.checked_add(batch.num_rows()).ok_or_else(|| {
+                OmniError::manifest_internal("immutable record preflight row-count overflow")
+            })?;
+        }
+        if selected_rows != 0 {
+            return Err(OmniError::manifest_conflict(format!(
+                "immutable lifecycle record id '{}' already exists at the manifest-selected stream-token version",
+                record.record_id()
+            )));
+        }
+    }
+
+    let ledger_batch = lifecycle_ledger_records_to_batch(records)?;
+    let batch = if token_rows.is_empty() {
+        ledger_batch
+    } else {
+        let token_batch = stream_token_rows_to_batch(token_rows)?;
+        let schema = token_batch.schema();
+        arrow_select::concat::concat_batches(&schema, &[token_batch, ledger_batch]).map_err(
+            |error| {
+                OmniError::manifest_internal(format!(
+                    "failed to combine current-token and lifecycle-ledger rows: {error}"
+                ))
+            },
+        )?
+    };
+    let combined_limit = crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES
+        .checked_add(MAX_LIFECYCLE_LEDGER_TRANSACTION_ARROW_BYTES)
+        .ok_or_else(|| OmniError::manifest_internal("mixed staging byte limit overflow"))?;
+    let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+        OmniError::manifest_internal("mixed stream-token staging Arrow size exceeds u64")
+    })?;
+    if batch_bytes > combined_limit {
+        return Err(OmniError::resource_limit(
+            "stream_token_and_lifecycle_arrow_bytes",
+            combined_limit,
+            batch_bytes,
+        ));
+    }
+    let row_count = u64::try_from(batch.num_rows())
+        .map_err(|_| OmniError::manifest_internal("mixed staging row count exceeds u64"))?;
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+    let mut builder =
+        MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+    builder
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .use_index(false)
+        .conflict_retries(0)
+        .source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+    let uncommitted = builder
+        .try_build()
+        .map_err(|error| OmniError::Lance(error.to_string()))?
+        .execute_uncommitted(stream)
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    if uncommitted.transaction.read_version != authority.current_head_witness.table_version {
+        return Err(OmniError::manifest_internal(format!(
+            "mixed stream-token transaction read version {} does not match manifest-selected version {}",
+            uncommitted.transaction.read_version, authority.current_head_witness.table_version
+        )));
+    }
+    crate::table_store::staged_exact_id_upsert_result(
+        &dataset,
+        uncommitted,
+        row_count,
+        "stage_stream_token_and_lifecycle_records",
+    )
+}
+
+pub(crate) async fn stage_stream_correction_effect(
+    dataset: Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    token_rows: &[StreamTokenAuthorityRow],
+    correction_receipt: &StreamCorrectionReceipt,
+    management_receipt: &ManagementReceipt,
+) -> Result<crate::table_store::StagedWrite> {
+    correction_receipt.validate()?;
+    management_receipt.validate(management_receipt.to_revision)?;
+    if management_receipt.operation_kind != super::stream::STREAM_CORRECTION_OPERATION_KIND
+        || management_receipt.operation_id != correction_receipt.correction_id
+        || management_receipt.graph_identity_digest != correction_receipt.graph_identity_digest
+        || management_receipt.identity != correction_receipt.identity
+        || management_receipt.stream_incarnation_id != correction_receipt.stream_incarnation_id
+        || management_receipt.binding_scope_id != correction_receipt.binding_scope_id
+        || management_receipt.actor_id != correction_receipt.actor_id
+        || management_receipt.to_revision != correction_receipt.resulting_lifecycle_revision
+        || management_receipt.result_payload != correction_receipt.result_payload
+        || management_receipt.result_digest != correction_receipt.result_digest
+        || management_receipt.recorded_at != correction_receipt.recorded_at
+    {
+        return Err(OmniError::manifest_internal(
+            "stream correction and management receipts do not describe one exact terminal result",
+        ));
+    }
+    stage_stream_token_and_lifecycle_records(
+        dataset,
+        authority,
+        token_rows,
+        &[
+            LifecycleLedgerRecord::StreamCorrectionReceipt(correction_receipt.clone()),
+            LifecycleLedgerRecord::ManagementReceipt(management_receipt.clone()),
+        ],
+    )
+    .await
+}
+
 pub(crate) async fn stage_stream_token_upsert(
     dataset: Dataset,
     authority: &StreamTokenAuthorityEntry,
@@ -2170,8 +2380,9 @@ mod tests {
     use super::*;
     use crate::db::manifest::stream::{
         ClaimAttemptClassification, ClaimAttemptEffectPreimage, ClaimProfile, ClaimReceiptPreimage,
-        ClaimTerminalClassification, StreamPhysicalBinding, binding_receipt_chain_genesis,
-        claim_attempt_chain_genesis, claim_receipt_chain_genesis, management_receipt_chain_genesis,
+        ClaimTerminalClassification, StreamCorrectionReceiptPreimage, StreamPhysicalBinding,
+        binding_receipt_chain_genesis, claim_attempt_chain_genesis, claim_receipt_chain_genesis,
+        management_receipt_chain_genesis,
     };
     use crate::db::manifest::stream_profile::{
         FoldDelegation, ProfileManagementResult, ReceiptChainRef, StreamProfileMode,
@@ -2336,6 +2547,23 @@ mod tests {
             1_700_000_000_000_003,
         )
         .unwrap();
+        let correction = StreamCorrectionReceipt::new(StreamCorrectionReceiptPreimage {
+            graph_identity_digest: graph_digest.clone(),
+            identity,
+            stream_incarnation_id: stream_incarnation_id.to_string(),
+            binding_scope_id: binding_scope_id.to_string(),
+            block_token: format!("sha256:{}", "4".repeat(64)),
+            correction_id: "abababab-abab-4bab-8bab-abababababab".to_string(),
+            correction_plan_digest: format!("sha256:{}", "5".repeat(64)),
+            actor_id: "operator:alice".to_string(),
+            graph_commit_id: "01H000000000000000000000C1".to_string(),
+            resulting_manifest_version: 10,
+            resulting_lifecycle_revision: 3,
+            resulting_lifecycle_digest: format!("sha256:{}", "6".repeat(64)),
+            resulting_token_authority_digest: format!("sha256:{}", "7".repeat(64)),
+            recorded_at: 1_700_000_000_000_004,
+        })
+        .unwrap();
         let claim_id = "77777777-7777-4777-8777-777777777777";
         let attempt_id = "88888888-8888-4888-8888-888888888888";
         let tail_prior_position = 0;
@@ -2476,6 +2704,7 @@ mod tests {
             LifecycleLedgerRecord::EnrollmentReceiptV2(enrollment),
             LifecycleLedgerRecord::BindingReceipt(binding),
             LifecycleLedgerRecord::ManagementReceipt(management),
+            LifecycleLedgerRecord::StreamCorrectionReceipt(correction),
             LifecycleLedgerRecord::ClaimAttemptEffect(attempt),
             LifecycleLedgerRecord::ClaimReceipt(claim),
             LifecycleLedgerRecord::AuthorityRetirementReceipt(retirement),
@@ -2792,15 +3021,19 @@ mod tests {
             LifecycleLedgerRecord::ManagementReceipt(value) => value.clone(),
             _ => unreachable!(),
         };
-        let attempt = match &records[3] {
+        let correction = match &records[3] {
+            LifecycleLedgerRecord::StreamCorrectionReceipt(value) => value.clone(),
+            _ => unreachable!(),
+        };
+        let attempt = match &records[4] {
             LifecycleLedgerRecord::ClaimAttemptEffect(value) => value.clone(),
             _ => unreachable!(),
         };
-        let claim = match &records[4] {
+        let claim = match &records[5] {
             LifecycleLedgerRecord::ClaimReceipt(value) => value.clone(),
             _ => unreachable!(),
         };
-        let retirement = match &records[5] {
+        let retirement = match &records[6] {
             LifecycleLedgerRecord::AuthorityRetirementReceipt(value) => value.clone(),
             _ => unreachable!(),
         };
@@ -2880,6 +3113,20 @@ mod tests {
             Some(management)
         );
         assert_eq!(
+            lookup_stream_correction_receipt(
+                &achieved,
+                &next,
+                &correction.graph_identity_digest,
+                correction.identity,
+                &correction.stream_incarnation_id,
+                &correction.block_token,
+                &correction.correction_id,
+            )
+            .await
+            .unwrap(),
+            Some(correction)
+        );
+        assert_eq!(
             lookup_claim_attempt_effect(
                 &achieved,
                 &next,
@@ -2953,5 +3200,73 @@ mod tests {
                 .is_err(),
             "WhenMatched::Fail must reject rebinding an immutable lifecycle record"
         );
+    }
+
+    #[tokio::test]
+    async fn mixed_token_and_correction_receipt_stage_is_one_effect_and_never_rewrites_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let session = crate::lance_access::control_session();
+        let authority = initialize_stream_token_authority(root, &session)
+            .await
+            .unwrap();
+        let dataset = open_stream_token_authority_at(root, &authority, &session)
+            .await
+            .unwrap();
+        let row = authority_row();
+        let record = typed_lifecycle_records()
+            .into_iter()
+            .find(|record| matches!(record, LifecycleLedgerRecord::StreamCorrectionReceipt(_)))
+            .unwrap();
+        let correction = match &record {
+            LifecycleLedgerRecord::StreamCorrectionReceipt(value) => value.clone(),
+            _ => unreachable!(),
+        };
+        let staged = stage_stream_token_and_lifecycle_records(
+            dataset.clone(),
+            &authority,
+            std::slice::from_ref(&row),
+            std::slice::from_ref(&record),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+        let store = crate::table_store::TableStore::new(root, Arc::clone(&session));
+        let (achieved, _) = store
+            .commit_staged_exact(Arc::new(dataset), staged)
+            .await
+            .unwrap();
+        let next = stream_token_authority_entry_for_dataset(&achieved)
+            .await
+            .unwrap();
+        assert_eq!(
+            lookup_stream_token_row(&achieved, &next, row.identity, &row.logical_id)
+                .await
+                .unwrap(),
+            Some(row.clone())
+        );
+        assert_eq!(
+            lookup_stream_correction_receipt(
+                &achieved,
+                &next,
+                &correction.graph_identity_digest,
+                correction.identity,
+                &correction.stream_incarnation_id,
+                &correction.block_token,
+                &correction.correction_id,
+            )
+            .await
+            .unwrap(),
+            Some(correction)
+        );
+        let error = stage_stream_token_and_lifecycle_records(
+            achieved,
+            &next,
+            std::slice::from_ref(&row),
+            std::slice::from_ref(&record),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("immutable lifecycle record id"));
     }
 }

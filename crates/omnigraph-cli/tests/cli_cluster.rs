@@ -1,4 +1,4 @@
-//! Cluster command surface: validate/plan/apply/approve/status/sync/force-unlock/stream retirement.
+//! Cluster command surface: validate/plan/apply/approve/status/sync/force-unlock/stream control.
 //! Moved verbatim from tests/cli.rs in the modularization.
 
 use std::fs;
@@ -1213,4 +1213,121 @@ fn cluster_stream_retirement_reports_structured_offline_preflight_errors() {
     assert!(codes.contains(&"stream_authority_retirement_actor_required"));
     assert!(codes.contains(&"streaming_offline_confirmation_required"));
     assert!(!temp.path().join("__cluster/lock.json").exists());
+}
+
+#[test]
+fn cluster_stream_block_requires_graph_and_accepts_only_config_scope() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let missing_graph = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-cluster-test")
+            .arg("cluster")
+            .arg("stream")
+            .arg("block")
+            .arg("show")
+            .arg("node:Person")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--block-token")
+            .arg("block-1")
+            .arg("--confirm-stream-offline"),
+    );
+    let stderr = String::from_utf8_lossy(&missing_graph.stderr);
+    assert!(stderr.contains("requires --graph"), "{stderr}");
+
+    let wrong_cluster_scope = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-cluster-test")
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("--cluster")
+            .arg(temp.path())
+            .arg("cluster")
+            .arg("stream")
+            .arg("block")
+            .arg("show")
+            .arg("node:Person")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--block-token")
+            .arg("block-1")
+            .arg("--confirm-stream-offline"),
+    );
+    let stderr = String::from_utf8_lossy(&wrong_cluster_scope.stderr);
+    assert!(stderr.contains("--cluster"), "{stderr}");
+    assert!(stderr.contains("does not apply"), "{stderr}");
+}
+
+#[test]
+fn cluster_stream_block_reports_structured_offline_preflight_errors() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let output = output_failure(
+        cli()
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("cluster")
+            .arg("stream")
+            .arg("block")
+            .arg("show")
+            .arg("node:Person")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--block-token")
+            .arg("block-1")
+            .arg("--json"),
+    );
+    let json = parse_stdout_json(&output);
+    let codes = json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| diagnostic["code"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(codes.contains(&"stream_block_actor_required"));
+    assert!(codes.contains(&"streaming_offline_confirmation_required"));
+    assert!(!temp.path().join("__cluster/lock.json").exists());
+}
+
+#[test]
+fn cluster_stream_block_correct_rejects_unknown_plan_fields_before_preflight() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let plan = temp.path().join("correction.json");
+    fs::write(&plan, r#"{"version":1,"actions":[],"unexpected":true}"#).unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-cluster-test")
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("cluster")
+            .arg("stream")
+            .arg("block")
+            .arg("correct")
+            .arg("node:Person")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--block-token")
+            .arg("block-1")
+            .arg("--correction-id")
+            .arg("00000000-0000-4000-8000-000000000001")
+            .arg("--expected-lifecycle-revision")
+            .arg("1")
+            .arg("--plan")
+            .arg(&plan)
+            .arg("--confirm-stream-offline"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown field `unexpected`"), "{stderr}");
+    assert!(
+        !temp.path().join("__cluster/lock.json").exists(),
+        "plan parsing must precede cluster preflight"
+    );
 }

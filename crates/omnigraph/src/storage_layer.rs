@@ -617,6 +617,18 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         generation: u64,
     ) -> Result<StagedHandle>;
 
+    /// Stage a correction projection for one blocked generation. Unlike an
+    /// ordinary fold this accepts an empty row set so an all-WITHDRAW plan can
+    /// publish only the exact merged-generation marker.
+    async fn stage_stream_correction(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        batches: Vec<RecordBatch>,
+        shard_id: ShardId,
+        generation: u64,
+    ) -> Result<StagedHandle>;
+
     /// Stage a provenance-proven strict insert without re-running Lance's
     /// target merge join or exact target-membership preflight. The caller's
     /// complete durable absence proof and final target-incarnation/baseline
@@ -1074,6 +1086,20 @@ impl TableStorage for TableStore {
     ) -> Result<StagedHandle> {
         let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
         TableStore::stage_stream_fold(self, ds, table_key, batches, shard_id, generation)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    async fn stage_stream_correction(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        batches: Vec<RecordBatch>,
+        shard_id: ShardId,
+        generation: u64,
+    ) -> Result<StagedHandle> {
+        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
+        TableStore::stage_stream_correction(self, ds, table_key, batches, shard_id, generation)
             .await
             .map(StagedHandle::new)
     }

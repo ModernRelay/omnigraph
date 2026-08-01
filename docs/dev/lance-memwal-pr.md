@@ -64,7 +64,7 @@ are implemented and evidence-green at a deliberately narrow boundary:
 - replayed or flushed-but-unmerged state routes to fold only;
 - one strict fold stages exact base-table and `_stream_tokens.lance`
   participants and publishes both through `__manifest`; and
-- current internal schema v17 preserves the v9 row/token contract and v12's
+- current internal schema v18 preserves the v9 row/token contract and v12's
   lifecycle-v3 fixed-size ledger heads and recovery-v14 hidden
   enrollment, writer-claim, ordinary/drain-fold, and terminal management
   authority. Recovery-v15 adds private revision-fenced resume and guarded
@@ -74,8 +74,9 @@ are implemented and evidence-green at a deliberately narrow boundary:
   checked-runtime `SEALED` Optimize path with exact achieved-HEAD recovery.
   Recovery-v18 adds the private physical-rebind owner for an exact `SEALED`
   lane. Recovery-v19 adds the cluster-only stopped/offline terminal authority-
-  retirement and root-receipt plus selected-branch-witness export exit;
-  correction and public/production rebind remain inactive. V11's checked
+  retirement and root-receipt plus selected-branch-witness export exit.
+  Recovery-v20 adds stopped/offline exact DataBlock correction; public/
+  production rebind remains inactive. V11's checked
   profile-v2 and recovery-v13
   `StreamProfileChange` remain intact. Historical v8/config-v2/recovery-v11
   and v9 lifecycle-v2/recovery-v12 state cross that boundary only through

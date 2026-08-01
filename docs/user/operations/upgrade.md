@@ -17,7 +17,7 @@ message that **names the release line that wrote it** and the exact commands —
 so you can fetch the right old binary without guessing:
 
 ```
-__manifest is stamped at internal schema v4, but this omnigraph reads only v17.
+__manifest is stamped at internal schema v4, but this omnigraph reads only v18.
 This graph was created by omnigraph 0.8.x. Rebuild it: with an omnigraph
 0.8.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
 binary run `omnigraph init --schema <schema.pg> <new-graph>` and `omnigraph load
@@ -45,14 +45,15 @@ from that line (the latest is safest):
 | internal schema v14 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
 | internal schema v15 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
 | internal schema v16 | unreleased (earlier 0.10.0-dev source builds) | final v16 source build at merge `ac59c4f6d1d83acc8118c410c39de2bed91f9c15` |
-| internal schema v17 | unreleased (current 0.10.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
+| internal schema v17 | unreleased (earlier 0.10.0-dev source builds) | final v17 source build at merge `41a5990d53238d63d17e139859c66613f9c25867` |
+| internal schema v18 | unreleased (current 0.10.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
 
 **Stamps v5–v8 never shipped.** The storage format advanced five times inside
 the single 0.8.1 → 0.9.0 development window, so the only graphs carrying those
 stamps came from source builds off `main`; no published binary reads them and
 the refusal message names them `0.9.0-dev`. If you have one, export it with a
 build of the commit that created it, then load into a fresh current-format
-graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10–v17 are
+graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10–v18 are
 pre-release formats written by matching 0.10.0-dev source builds. The final
 0.10.0 format may use a later stamp.
 
@@ -124,6 +125,33 @@ complete. Do not use force-init to turn the old root into the new format.
   `append`/`merge` writes copy external payloads instead, as described below.
 - **Server deployments**: take the graph out of the serving set, rebuild it offline
   with the CLI, then point the cluster at the rebuilt graph (`cluster apply`).
+
+## Migrating from internal schema v17 to v18
+
+Internal schema v18 adds recovery-v20 for exact `DataBlock` correction. It
+does not reinterpret recovery-v14's frozen correction scaffold or
+recovery-v19's terminal-retirement envelope.
+
+For a clean v17 graph, use the final v17 source build at merge
+`41a5990d53238d63d17e139859c66613f9c25867`:
+
+1. Gracefully stop every writer-capable process for the graph.
+2. Explicitly disable its streaming profile.
+3. Verify that it is clean, disabled, and unenrolled. Ordinary v17 export
+   transfers logical rows, vectors, blobs, and ordinary properties—not private
+   lifecycle, WAL, token, receipt, maintenance, rebind, retirement, or
+   correction authority.
+4. Export the visible logical graph.
+
+Then use the v18 binary to initialize a **different** root, load the export,
+apply cluster configuration, and restart serving. Verify row/vector/blob
+fidelity and the v18 stamp before cutover. Keep the v17 root unchanged through
+the rollback window. A v18 binary refuses v17, and a v17 binary refuses v18.
+
+If the v17 source is enrolled, blocked, or carries private stream authority,
+keep it intact. A logical-row rebuild is not an authority-preserving migration;
+use the source format's documented retirement/export exit when its exact
+preconditions hold.
 
 ## Migrating from internal schema v16 to v17
 

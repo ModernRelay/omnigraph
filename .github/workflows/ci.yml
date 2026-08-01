@@ -267,8 +267,8 @@ jobs:
           grep -Fq "fold_delta_remeasure_bytes=402653184" "$test_log" \
             || { echo "::error::Gate R0 RSS evidence line or 384-MiB tripwire changed"; exit 1; }
 
-  v16_v17_format_fence:
-    name: V16 ↔ V17 Format Fence
+  v17_v18_format_fence:
+    name: V17 ↔ V18 Format Fence
     needs: classify_changes
     if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
@@ -301,52 +301,52 @@ jobs:
         with:
           workspaces: |
             . -> target
-          key: crossversion-v16-v17
+          key: crossversion-v17-v18
 
       # CI pins only the immediate predecessor. Older seams remain env-gated
       # and on-demand, per docs/dev/testing.md.
-      - name: Build genuine final-v16 CLI
+      - name: Build genuine final-v17 CLI
         env:
-          # Merge of the final v16-writing PR before recovery-v19 authority
-          # retirement activates v17. Keep this immutable: HEAD^ stops being
-          # v16 after the first v17 merge.
-          FINAL_INTERNAL_V16_COMMIT: ac59c4f6d1d83acc8118c410c39de2bed91f9c15
+          # Merge of the final v17-writing PR before recovery-v20 DataBlock
+          # correction activates v18. Keep this immutable: HEAD^ stops being
+          # v17 after the first v18 merge.
+          FINAL_INTERNAL_V17_COMMIT: 41a5990d53238d63d17e139859c66613f9c25867
         run: |
           set -euo pipefail
-          v16_source="$RUNNER_TEMP/omnigraph-final-v16"
-          v16_bin="$RUNNER_TEMP/omnigraph-final-v16-bin"
-          git fetch --no-tags --depth=1 origin "$FINAL_INTERNAL_V16_COMMIT"
-          git worktree add --detach "$v16_source" "$FINAL_INTERNAL_V16_COMMIT"
+          v17_source="$RUNNER_TEMP/omnigraph-final-v17"
+          v17_bin="$RUNNER_TEMP/omnigraph-final-v17-bin"
+          git fetch --no-tags --depth=1 origin "$FINAL_INTERNAL_V17_COMMIT"
+          git worktree add --detach "$v17_source" "$FINAL_INTERNAL_V17_COMMIT"
           cargo build --locked \
-            --manifest-path "$v16_source/Cargo.toml" \
+            --manifest-path "$v17_source/Cargo.toml" \
             --package omnigraph-cli \
             --bin omnigraph \
             --target-dir "$GITHUB_WORKSPACE/target"
-          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v16_bin"
-          test -x "$v16_bin"
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v17_bin"
+          test -x "$v17_bin"
           # Clean every current member through Cargo's workspace selector. A
           # hand-maintained list rots when the workspace gains crates, and a
           # missed member lets the fence cell link the predecessor's rlib
           # (same name+version in the shared target) into the current tree.
           cargo clean --workspace --locked \
             --target-dir "$GITHUB_WORKSPACE/target"
-          echo "OMNIGRAPH_V16_BIN=$v16_bin" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_V17_BIN=$v17_bin" >> "$GITHUB_ENV"
 
-      - name: Run exact v16↔v17 refusal and rebuild fence
+      - name: Run exact v17↔v18 refusal and rebuild fence
         run: |
           set -euo pipefail
-          test_log="$RUNNER_TEMP/v16-v17-format-fence.log"
+          test_log="$RUNNER_TEMP/v17-v18-format-fence.log"
           cargo test --locked -p omnigraph-cli --test crossversion_upgrade \
-            current_v17_refuses_and_rebuilds_genuine_v16_and_v16_refuses_v17 \
+            current_v18_refuses_and_rebuilds_genuine_v17_and_v17_refuses_v18 \
             -- --exact --nocapture 2>&1 | tee "$test_log"
-          if grep -Fq "skipping immediate-predecessor v16 upgrade test" "$test_log"; then
-            echo "::error::v16↔v17 format fence skipped despite a configured predecessor binary"
+          if grep -Fq "skipping immediate-predecessor v17 upgrade test" "$test_log"; then
+            echo "::error::v17↔v18 format fence skipped despite a configured predecessor binary"
             exit 1
           fi
-          grep -Eq "test current_v17_refuses_and_rebuilds_genuine_v16_and_v16_refuses_v17 \.\.\. ok" "$test_log" \
-            || { echo "::error::exact v16↔v17 format fence did not execute normally"; exit 1; }
+          grep -Eq "test current_v18_refuses_and_rebuilds_genuine_v17_and_v17_refuses_v18 \.\.\. ok" "$test_log" \
+            || { echo "::error::exact v17↔v18 format fence did not execute normally"; exit 1; }
           grep -Eq "test result: ok\. 1 passed; 0 failed" "$test_log" \
-            || { echo "::error::v16↔v17 format fence matched the wrong test set"; exit 1; }
+            || { echo "::error::v17↔v18 format fence matched the wrong test set"; exit 1; }
 
   test_aws_feature:
     name: Test omnigraph-server --features aws

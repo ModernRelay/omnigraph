@@ -7,9 +7,9 @@ This file is the always-on map of the test surface. **Consult it before every ta
 | Crate | Path | Style |
 |---|---|---|
 | `omnigraph` (engine) | `crates/omnigraph/tests/` | Integration tests (one file per behavior area — see the table below), fixture-driven, share `tests/helpers/mod.rs` |
-| `omnigraph-cli` | `crates/omnigraph-cli/tests/` | Per-area suites (post-modularization): `cli_cluster.rs` (cluster command surface + operator-actor cascade), `cli_cluster_e2e.rs` (spawned-binary lifecycle compositions — lost-state re-import recovery, out-of-band drift, graph-root destruction, multi-graph mixed-disposition convergence), `cli_data.rs` (load/read/change/branch/commit/export/snapshot/policy/embed/maintenance + operator format cascade), `cli_schema_config.rs` (init/config, schema plan/apply), `cli_queries.rs`, `parity_matrix.rs` (RFC-009 Phase 1: the embedded-vs-remote referee — every forked verb run against both arms with matched Cedar policy and the same actor, scrubbed-JSON + exit-code equality; divergences are pinned in its `KNOWN_DIVERGENCES` ledger, never silently repaired), `system_local.rs` (full-cycle cluster lifecycle with a spawned `--cluster` server, applied-policy enforcement over HTTP, keyed-credential auth, operator aliases), `system_remote.rs`, `crossversion_upgrade.rs` (genuine historical format fences through v15↔v16 plus the current v16↔v17 rebuild/refusal harness — see below); share `tests/support/mod.rs` (hermetic `OMNIGRAPH_HOME` by default) |
+| `omnigraph-cli` | `crates/omnigraph-cli/tests/` | Per-area suites (post-modularization): `cli_cluster.rs` (cluster command surface + operator-actor cascade, including strict stream-block grammar, scope, plan parsing, and effect-free offline preflight), `cli_cluster_e2e.rs` (spawned-binary lifecycle compositions — lost-state re-import recovery, out-of-band drift, graph-root destruction, multi-graph mixed-disposition convergence), `cli_data.rs` (load/read/change/branch/commit/export/snapshot/policy/embed/maintenance + operator format cascade), `cli_schema_config.rs` (init/config, schema plan/apply), `cli_queries.rs`, `parity_matrix.rs` (RFC-009 Phase 1: the embedded-vs-remote referee — every forked verb run against both arms with matched Cedar policy and the same actor, scrubbed-JSON + exit-code equality; divergences are pinned in its `KNOWN_DIVERGENCES` ledger, never silently repaired), `system_local.rs` (full-cycle cluster lifecycle with a spawned `--cluster` server, applied-policy enforcement over HTTP, keyed-credential auth, operator aliases), `system_remote.rs`, `crossversion_upgrade.rs` (genuine historical source→CURRENT rebuild/refusal cells through v16 plus the current v17↔v18 adjacent harness — see below); share `tests/support/mod.rs` (hermetic `OMNIGRAPH_HOME` by default) |
 | `omnigraph-control-authority` | in-source `#[cfg(test)] mod tests` | Concrete-storage, lock-derived checked authority: offline confirmation/actor/operation binding, state-CAS and graph/declaration/profile-revision validation, normalized graph-root binding, non-cloneable runtime guards, and one process-local writer registration per cluster graph |
-| `omnigraph-cluster` | mostly in-source `#[cfg(test)] mod tests`; `tests/failpoints.rs` (feature-gated); `tests/s3_cluster.rs` (bucket-gated full lifecycle on object storage) | Cluster config parser, local JSON state diff, state CAS/lock handling/recovery, read-only validate/plan/status plus explicit refresh/import graph observations, config-only apply (content-addressed payload publish, disposition gating, composite-digest convergence, idempotent re-apply), catalog payload verification (status read-only, refresh drift + self-heal), failpoint crash-mid-apply / CAS-race coverage, Stage 4A graph creation (create executor, recovery sidecars + sweep rows, create crash windows), Stage 4B schema apply (migration previews in plan, schema executor, schema-apply sweep classification, schema crash windows), Stage 4C gated deletes (digest-bound approvals, delete executor + tombstones, delete sweep rows, delete crash windows), 5A policy binding metadata (applies_to in the applied revision, binding-change diffing + convergence, pre-5A backfill), the 5B serving-snapshot read API (converged read, refusal rows), v11 streaming-profile ownership (pre-effect lock/confirmation/actor refusal, exact published profile revision in state, validated serving binding, and quarantine of incomplete enabled authority), and v17 authority-retirement preflight (actor/offline/declaration/state-lock binding) |
+| `omnigraph-cluster` | mostly in-source `#[cfg(test)] mod tests`; `tests/failpoints.rs` (feature-gated); `tests/s3_cluster.rs` (bucket-gated full lifecycle on object storage) | Cluster config parser, local JSON state diff, state CAS/lock handling/recovery, read-only validate/plan/status plus explicit refresh/import graph observations, config-only apply (content-addressed payload publish, disposition gating, composite-digest convergence, idempotent re-apply), catalog payload verification (status read-only, refresh drift + self-heal), failpoint crash-mid-apply / CAS-race coverage, Stage 4A graph creation (create executor, recovery sidecars + sweep rows, create crash windows), Stage 4B schema apply (migration previews in plan, schema executor, schema-apply sweep classification, schema crash windows), Stage 4C gated deletes (digest-bound approvals, delete executor + tombstones, delete sweep rows, delete crash windows), 5A policy binding metadata (applies_to in the applied revision, binding-change diffing + convergence, pre-5A backfill), the 5B serving-snapshot read API (converged read, refusal rows), v11 streaming-profile ownership (pre-effect lock/confirmation/actor refusal, exact published profile revision in state, validated serving binding, and quarantine of incomplete enabled authority), v17 authority-retirement preflight (actor/offline/declaration/state-lock binding), and v20 block-control preflight (actor/offline/applied-streaming/declaration/state-lock binding before inspection or correction) |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | Per-area suites (post-modularization): `auth_policy.rs`, `data_routes.rs`, `schema_routes.rs`, `stored_queries.rs`, `multi_graph.rs` (cluster-mode boot — converged serving, policy binding wiring, boot refusals — + the concurrent branch-ops matrix), `boot_settings.rs` (mode inference, PolicySource), `s3.rs` (bucket-gated: single-graph serving + config-free `--cluster s3://` boot), `openapi.rs` (OpenAPI drift / regeneration); share `tests/support/mod.rs` |
 | `omnigraph-compiler` | mostly in-source `#[cfg(test)] mod tests` | Parser, type-checker, IR lowering, lint. Schema parser and SchemaIR validation tests both reject the five exact Lance virtual system-column property names while preserving near-miss identifiers |
 
@@ -53,13 +53,13 @@ it is not inferred from a local syntax check. See [ci.md](ci.md).
 | `memwal_stream.rs` | Feature-gated RFC-026 private B1 mechanics, B2 compare-and-chain behavior, B2a provider-failure evidence, and the hidden lifecycle-v3 integration. B1 owns bounded put/ack/replay, authority, cancellation, and manifest-only visibility, including row-local value rejection before any WAL or manifest effect. B2 owns idempotency conflicts, same-generation overlays, stale-authority recapture, durable attribution, and one watcher/fence result over a distinct-key contiguous multi-row physical prefix. The hidden F4 request proof additionally pins graph-scoped `stream_ingest` policy and exact checked-runtime authority before body work; separate root-wide and per-actor transport admission before polling; incremental NDJSON framing across accepted chunks, CRLF, EOF, and over-limit-line boundaries without whole-request retention; strict `$stream` parsing; duplicate, unknown, and reserved-field refusal; explicit canonical IDs; dense schema-ordered node/edge conversion; scalar/list/enum/vector and value-constraint validation before recovery entry; and effect-free Blob-table refusal through a deliberately stale pre-schema-apply handle before either the request or lower B1/B2 seam can invoke MemWAL. Run-splitting cells cover invalid lines, repeated keys, token dispositions, and row/byte ceilings; bounded result/reorder ownership preserves caller order and stop-tail `blocking_ordinal` precedence, while disconnect stops new body polling/admission and transfers the invoked tail to root-owned settlement. The bodyless prepare cells pin effect-free witness challenge, checked-runtime/policy ordering, Blob refusal before enrollment, actor-bound durable-receipt replay, and two concurrent request IDs converging on one OPEN lane before ingest/fold composition. It remains inaccessible to production callers and exposes no SDK/HTTP/CLI/API/OpenAPI ingress or public rebind surface. Lifecycle-v3 owns recovery-covered cold/fold claims, exact full-generation projection after flush/reopen, recovery-v14 ordinary/drain folds, empty and non-empty `OPEN → DRAINING → SEALED`, an empty successor after an ordinary published fold, durable/reopen-stable typed `DataBlock` publication with no base or graph commit (including a fresh-source minimum-cardinality violation whose streamed edge supplies correction identity), idempotent same-request restart, conflicting request/stale-revision refusal, and the claim-before-seal plus seal-before-fold crash boundaries. Recovery-v15 adds receipt-first idempotent `SEALED → OPEN` resume, guarded `DRAINING → OPEN` abort, higher-epoch claim, terminal receipt publication, named-branch refusal, and current-binding-chain ancestry checks. The strict-block path streams `DRAINING` validation directly into the bounded evidence collector; unit owners below pin the detailed cap, empty-evidence refusal, and non-materialized overflow digest. F3d's checked-offline cell releases the served runtime, reaches terminal `DISABLED`, crashes after arming v18 but before a physical effect, and proves retry selects one fresh `SEALED` scope while retaining the old MemWAL inventory; repeating the same occurrence is physically effect-free. B2a injects a recording/failing store at the real Lance table-store boundary and covers post-invocation ambiguity and inert orphan residue. No test here implies a transport-backed/public ingress or a supported lifecycle API. |
 | `memwal_stream_cost.rs` | Feature-gated RFC-026 B1, Gate-R0, and B2a decision instrument. It separately measures warm already-claimed durability acknowledgement, cold replay, selected-generation fold scanning, visibility, retained merged metadata, the uncompacted graph-manifest term, legal no-roll estimates, and paired peak RSS. Gate R0 adds a revision-pinned source-audit tripwire, strict current-object classification/reference census, listed path/class/size retain-all comparisons at one/four/eight folds, referenced-cut retry reuse, and deterministic high-entropy near-cap local/configured-RustFS cells. The near-cap cell proves the exact B2-attributed boundary through the real adapter: 3,742 payload bytes per row admits 8,192 rows at 33,550,336 logical bytes, while 3,743 is rejected effect-free at 33,558,528 bytes. The legal generation acknowledges without graph visibility, then folds and publishes exactly once after logical-slice charging plus dense per-scanner-batch take. The reference-environment paired fold peak-RSS lift measured 286,441,472 bytes (about 273 MiB), below a one-sided 384-MiB remeasurement tripwire; common initialization may censor that lifetime high-water lift to zero or a negative value on another runner, and the tripwire is not a runtime allocator limit. B2a adds 1/8/32/128 local and configured-RustFS retained-history sweeps whose terms remain separate: warm ack, cold reopen/replay, fold, visibility, MemWAL/base-table/token-authority/other table-store work, graph-manifest/adapter work, advisory current-object bytes, and whole-process peak RSS. Older retained roots must receive zero reads, writes, or deletes. The only allowed delete shape is Lance's losing manifest-CAS `.binpb.tmp.<uuid>` staging; canonical durable MemWAL delete requests remain zero. LIST totals, wall times, and RSS are advisory—not a quota, SLO, isolated WAL slope, or provider billing. A green test proves private closure/retention behavior; it does not activate a public API. |
 | `durable_head_lookup_cost.rs` | RFC-024 Gate A decision instrument, isolated from the production manifest schema/publisher. At fixed catalog width 10 it runs the full absent/reconciled/one-uncovered/eight-uncovered/reconciled-after-tail matrix over compacted and uncompacted histories, with cold-open and warm-repeat measurements on local FS and bucket-gated S3/RustFS. Default depths are 20/80; the ignored decision-scale cell runs 10/100/1,000. Correct exact heads, flat indexed `rows_scanned`/range work, an index-absent growing negative control, and observable bounded tails all pass; after the eight-fragment tail, `optimize_indices` returns coverage to zero uncovered and representative `rows_scanned`/range work from 27→10 / 17→10. The test deliberately pins the no-go: uncompacted RustFS cold object reads/bytes and compacted byte terms grow, while RC.1 also crosses a bounded one-operation boundary by 1,000 commits, so RFC-024 remains research-blocked. `rows_scanned` is an RC.1 debug proxy, not a universal decoded-row counter. Object-store wrapper bytes and Lance execution-summary bytes are separate fixture-owned metrics and are not additive |
-| `checkpoint_retention_cost.rs` | RFC-025 Gate 0 decision instrument, isolated from the production manifest schema. It models three live checkpoints at catalog width 10 and measures complete list, exact show, and cleanup-root authority reads across absent/reconciled/eight-uncovered index states, compacted/uncompacted layouts, and cold/warm access. It also owns the reference V1 name-normalization matrix. Default local depths 20/80 pass the checked-in **no-go-preservation** assertions; the RC.1 ignored 10/100/1,000 run shows reconciled uncompacted work and the bounded tail flat, but rejects the current format shape after compaction: list/cleanup scan bytes grow 17,012→38,000 cold and 12,336→15,064 warm; show grows 29,348→53,064 and 24,672→30,128; scan operations add one at 1,000. The S3/RustFS cell is bucket-gated and was not run for this decision. The result keeps RFC-025 research-blocked; current v17 adds no checkpoint state |
+| `checkpoint_retention_cost.rs` | RFC-025 Gate 0 decision instrument, isolated from the production manifest schema. It models three live checkpoints at catalog width 10 and measures complete list, exact show, and cleanup-root authority reads across absent/reconciled/eight-uncovered index states, compacted/uncompacted layouts, and cold/warm access. It also owns the reference V1 name-normalization matrix. Default local depths 20/80 pass the checked-in **no-go-preservation** assertions; the RC.1 ignored 10/100/1,000 run shows reconciled uncompacted work and the bounded tail flat, but rejects the current format shape after compaction: list/cleanup scan bytes grow 17,012→38,000 cold and 12,336→15,064 warm; show grows 29,348→53,064 and 24,672→30,128; scan operations add one at 1,000. The S3/RustFS cell is bucket-gated and was not run for this decision. The result keeps RFC-025 research-blocked; current v18 adds no checkpoint state |
 | `warm_read_cost.rs` | Cost-budget tests for the warm read/control path (query-latency work), measured at the object-store boundary with Lance `IOTracker` (the LanceDB IO-counted pattern): a warm same-branch read does 0 manifest opens, 1 version probe, validates the schema once (Fix 1 / finding A / Fix 2 at commit-history depth); a cold other-branch resolution derives snapshot state and lineage from one coherent manifest open/scan; native branch create and create-from each use one post-gate open/scan, while delete uses one target capture plus one native-ref opener and only one row scan; stale same-branch reads perform exactly 2 probes and refresh manifest-only; recreated non-main branches with the same Lance version refresh by incarnation; recreated branch-owned table handles are distinguished by table e_tag or refresh-time cache clearing; recreated traversal topology is protected by per-edge-table e_tag in the graph-index cache key or refresh-time cache clearing; a warm *repeat* read does 0 table opens via the held-handle cache and a write re-opens only the changed table at its new version/e_tag (Fix 3/6A). Also the CSR topology-build cost guards: `fresh_branch_traversal_reuses_main_graph_index` (A1 — a lazy-fork branch reuses main's cached CSR index, 0 rebuilds via `graph_build_count`) and `single_edge_query_builds_only_referenced_edge` (A2 — a one-edge query builds only that edge via `graph_edges_built`); both force CSR via the scoped `with_traversal_mode` seam, so they need no `#[serial]`. See "Cost-budget tests" below. |
 | `write_cost.rs` | Cost-budget tests for the WRITE path (RFC-013), the latency twin of `warm_read_cost.rs` on the **shared `helpers::cost` harness** (`measure`/`IoCounts`/`assert_flat`/`local_graph`). Runs on **local FS**; gates the **internal-table** term (`__manifest` scans flat in commit-history depth, lineage rows included — `internal_table_scans_are_flat_in_history`, now **green every-PR** since RFC-013 step 2 brought the internal tables into `optimize`; the test compacts at each depth before measuring), graph-visible maintenance arbitration (`ensure_indices_manifest_reads_are_flat_in_history` and `optimize_manifest_reads_are_flat_in_history`), plus green every-PR guards (single-insert `data_writes` bounded, a per-write read-op ceiling that fails the moment a round-trip is added, and a `measure_with_staged` fitness assert that a keyed insert routes through the exact-`id` fenced adapter once with no bare `stage_append`/vector-index build). Also gates the batched committed `@unique` probe: `unique_probe_io_is_flat_in_delta_rows` sweeps DELTA size (4 vs 64 rows) at fixed shallow history and asserts `data_open_count`/`data_scan_reads` flat — red when the cross-version probe regresses to per-row scans/opens. The **data-table opener** term is S3-only — see `write_cost_s3.rs` and the backend-split note in "Cost-budget tests" below. RFC-023's representative row-count and peak-RSS decision measurements use the scenario harness, not this every-PR I/O budget |
 | `write_cost_s3.rs` | Bucket-gated (skips without `OMNIGRAPH_S3_TEST_BUCKET`) twin of `write_cost.rs` on the same `helpers::cost` harness: gates the **data-table opener** term (per-write latest-version resolution flat across commit depth on a real object store — per-version GETs are invisible on local FS). A cost gate, not a correctness test — run on demand, not in the every-merge `rustfs_integration` job (see the backend-split note in "Cost-budget tests" below) |
 | `helpers/cost.rs` | The shared cost-budget harness (not a test): `IoCounts`/`StagedCounts` (counts by table class), `measure`/`measure_with_staged` (the one place the `with_query_io_probes` + `MergeWriteProbes` task-local + `IOTracker` wiring lives; reads per-op deltas via lance's `incremental_stats()`, the upstream per-request idiom from `rust/lance/src/dataset/tests/dataset_io.rs`), `cost_harness`/`GraphIoMeter` (installs ONE `__manifest` `IOTracker` for a whole test body so the graph opens **under** it and `manifest_reads` is **ground truth** — every read regardless of handle age, the warm-coordinator freshness probe included — closing the blind spot where a per-op tracker installed at measure time cannot see a long-lived handle's reads; outside `cost_harness`, `measure` falls back to fresh per-op tracking, so `write_cost_s3.rs` is unaffected), `open_tracked_lance_dataset` (attaches a caller-owned `IOTracker` before `DatasetBuilder::load`, so a cold-open fixture includes latest-manifest resolution), `last_manifest_reads()` (the manifest read log for `assert_io_eq!`-style failure diagnostics), `assert_flat(curve, select, slack, what)`, and store-agnostic `local_graph`/`s3_graph` fixtures. The general `IoCounts` vocabulary remains operation counts; RFC-024's decision fixture owns its object/plan byte metrics. `warm_read_cost.rs`, `write_cost.rs`, `write_cost_s3.rs`, and the RFC-024 instrument consume the relevant seams |
 | `benchmark_scenario_contract.rs` | Source/protocol contract for the non-CI scenario harness. RFC-023 pins the production route's explicit `strict_insert_preflight_calls == 0` assertion and emitted `probe_strict_insert_preflight_calls` field, alongside route labels, clean-tree/binary identity, child-protocol refusal, and exact-content verification fields. A benchmark record therefore cannot silently claim the proven path after paying a target preflight |
-| `lifecycle.rs` | Graph lifecycle and schema state, including the v6-origin creation invariant—preserved through current v17—that every fresh node/edge table declares exactly physical `id` as Lance's unenforced PK |
+| `lifecycle.rs` | Graph lifecycle and schema state, including the v6-origin creation invariant—preserved through current v18—that every fresh node/edge table declares exactly physical `id` as Lance's unenforced PK |
 | `point_in_time.rs` | Snapshots, time travel (`snapshot_at_version`, `entity_at`) |
 | `changes.rs` | `diff_between` / `diff_commits` |
 | `consistency.rs` | Cross-table snapshot isolation and atomic publish; RFC-023 cells prove `LoadMode::Append` is strict (existing `id` rejected without update/version movement), pin the inclusive 8,192-row load ceiling with a one-over pre-effect refusal, reject an input above 32 MiB through the shared Mutation/Load staging seam with raw table HEAD/manifest/sidecar unchanged, reject an oversized external blob on a lazy branch from object metadata before payload access/ref creation/sidecar arm, and use a barrier-synchronized stress cell over 16 pre-opened handles to prove one same-key winner, 15 typed `KeyConflict` losers, exactly one stored row carrying the winner's value, and survival of disjoint IDs |
@@ -83,7 +83,7 @@ it is not inferred from a local syntax check. See [ci.md](ci.md).
 | `maintenance.rs` | `ensure_indices`, `optimize` (compaction), `repair` (explicit uncovered-drift publish), and `cleanup` (version GC): empty/idempotent/no-op edges, policy validation, head preservation. EnsureIndices refuses uncovered drift before arming its identity-bearing v9 envelope and keeps untrainable Vector work pending. Cleanup pins exact keep-count behavior, lazy-branch retention, graph-wide fail-closed ordering, and refusal of uncovered main HEAD drift before GC. Optimize's bounded payload inside the v9 envelope publishes multiple productive data tables through one graph commit, emits no lineage/sidecar at steady state, skips uncovered drift, refuses pending recovery, and compacts blob-v2 tables. Repair previews/heals verified maintenance drift and requires `--force` for semantic drift |
 | `failpoints.rs` | Failure-injection coverage (gated on `failpoints` feature). RFC-026 Phase A owns exact enrollment no-effect, index-only, and index-plus-empty-shard crash recovery; named-branch enrollment refusal; uncovered-index format refusal; typed maintenance/GC/index-build exclusion on an `OPEN` lifecycle; and disjoint-table maintenance/repair allowance. RFC-022 includes deterministic post-stage/pre-effect races for mutation/load uniqueness and strict disjoint-head changes, plus the cross-handle post-effect `RecoveryRequired` → read-write-open rollback cell. Branch merge adds the captured-source advance cell; post-confirm target-winner compensation; mixed physical + pointer-only delta recovery with fixed commit id/actor/parents; both sidecar-before-first-ref and ambiguous-ref-create recovery; and an 8,193-delete between-chunk crash proving an `Armed` exact-transaction prefix is rolled back before the successful retry. Identity-bearing v9 SchemaApply is pinned by `schema_apply_phase_b_failure_recovered_on_next_open` (exact confirmed roll-forward with fixed commit id + initiating actor), `schema_apply_partial_table_effect_rolls_back_exactly` (Armed proper-prefix compensation), `schema_apply_recovery_reclaims_owned_add_type_target_and_retry_succeeds` (strict owned first-touch cleanup), `schema_apply_first_touch_foreign_winner_is_preserved_not_adopted` (foreign unregistered winner preservation), `schema_apply_post_effect_disjoint_winner_is_preserved` (winner-preserving compensation), `schema_apply_post_effect_same_table_winner_fails_closed` (buried-effect refusal), `schema_apply_recovers_partial_schema_promotion_after_commit_crash` (read-only refusal for both valid and corrupt intents in the torn manifest/schema window, followed by fixed-outcome completion of a partial source/IR/state promotion), and `schema_apply_live_query_waits_for_coherent_schema_publication` (same-handle publication wait plus pre-apply-handle query/export/whole-graph-index capture from the operation-local accepted catalog). Metadata-only before/after-staging and rollback-retry cells keep the empty-effect v9 boundary pinned. EnsureIndices v9 recovery retains both boundaries in `recovery_rolls_forward_ensure_indices_on_feature_branch`: the first residual rolls forward on the next read-write open, and a second roll-forward-eligible `EffectsConfirmed` residual under an unchanged captured token is completed by a same-handle retry before new planning. `ensure_indices_complete_armed_effects_roll_back` keeps the authority-clean complete-effect Armed rollback rule isolated, while `ensure_indices_entry_barrier_refuses_partial_armed_before_staging` leaves one of two table effects pending and proves the original `RecoveryRequired` wins before the remaining index can reach the post-stage failpoint. Its remaining cells are `ensure_indices_stage_btree_failure_leaves_existing_tables_writable` (after a clean entry barrier, expensive mixed-index staging remains outside the final authority/gates), `ensure_indices_first_touch_crash_before_ref_recovers_cleanly` (sidecar-before-ref no-effect recovery), `ensure_indices_mixed_first_touch_rollback_does_not_delete_moved_ref` (owned-effect rollback and sibling first-touch cleanup), and the no-work/no-sidecar failpoint cell; the recovery module separately pins existing + first-touch payload round-trip and identity-less-input refusal. Optimize's graph-wide identity-bearing v9 envelope is pinned by `optimize_phase_b_failure_recovered_on_next_open` (two-table roll-forward), `optimize_multi_table_partial_effect_rolls_back_under_one_v2_sidecar` (one shared sidecar, no partial visibility, compensation), `optimize_post_manifest_failure_finalizes_multi_table_v2_sidecar` (lost publish acknowledgement), and `optimize_excludes_pending_only_vector_table_from_v2_sidecar` (pending status cannot poison sibling recovery), plus its late-sidecar/main-gate/retry cells. Native controls are pinned by `native_branch_controls_reclassify_lost_acknowledgements` (matching create and absent-ref delete, with no version/lineage movement); `armed_first_touch_recovery_accepts_missing_target_ref` additionally forges and reclaims the clone-only/no-`BranchContents` table state. Legacy path overlap has both sides pinned: `armed_first_touch_recovery_defers_legacy_path_overlap_until_leaf_delete` permits open only for a proven no-effect intent, while `partial_first_touch_recovery_fails_closed_on_legacy_path_overlap` leaves one exact multi-table effect and verifies open fails closed until offline leaf cleanup lets rollback converge. Other control/recovery race cells include `first_touch_post_create_open_error_keeps_recovery_ownership`, `branch_delete_orphans_sidecar_armed_after_initial_barrier`, `branch_merge_fences_target_delete_recreate_aba`, `branch_merge_fences_concurrent_sync_on_same_handle`, `branch_merge_rejects_fresh_target_manifest_change_before_effects`, `branch_merge_rechecks_late_sidecar_after_table_gates`, `optimize_rechecks_late_schema_apply_sidecar_after_main_gate` (late zero-pin graph-global intent), `optimize_rechecks_late_disjoint_main_sidecar_after_main_gate` (table-disjoint intent sharing `graph_head:main`), `optimize_holds_main_gate_through_disjoint_table_effects` (post-relist branch-gate lifetime), `cleanup_rechecks_sidecars_under_gc_gates`, `full_recovery_rereads_sidecar_body_after_discovery`, `recovery_discovery_skips_sidecar_deleted_after_list` (an unrelated write succeeds after a listed sidecar is published/deleted), and `read_only_recovery_discovery_skips_sidecar_deleted_after_list` (read-only open succeeds against that same concurrent completion). The suite also includes the established per-writer effect → manifest-CAS recovery tests, write-entry in-process heal contract, storage-fault matrix, S3 recovery twin, and convergence-idempotent roll-forward regression. |
 | `failpoint_names_guard.rs` | Source-walk guard (same defense-in-depth shape as `forbidden_apis.rs`): every failpoint call site across engine + cluster (`maybe_fail`, `ScopedFailPoint::new`/`with_callback`, `Rendezvous::park_first`) must reference a compile-checked `failpoints::names` const, never a bare string literal — a typo'd literal compiles but silently never fires |
-| `recovery.rs` | Open-time recovery sweep — identity-bearing schema-v9 envelopes for established graph writers, exact recovery-v13 profile changes, recovery-v14 lifecycle-v3 enrollment/claim/fold/terminal-receipt families, recovery-v15 resume/guarded drain-abort, recovery-v16 `StreamSealedEnsureIndices`, recovery-v17 `StreamSealedOptimize`, recovery-v18 `StreamRebind`, and recovery-v19 `StreamAuthorityRetirement`. V14 tests pin claim attempt/checkpoint/terminal continuation, exact ledger selection, base/token participant classification, fixed lineage/attribution, and publication only for the exact allowed outcome; token-only, foreign, buried, mixed, stale-authority, or corrupt outcomes fail closed. V15 tests additionally pin the complete request/prior authority, physical claim classification, terminal ClaimReceipt + ManagementReceipt transaction, receipt-first idempotency, and sole `OPEN` publication. V16 validates a recovery-v8 CreateIndex plan plus complete prior/next lifecycle authority and gives a Lance Restore compensation a newly derived exact `SEALED` successor for the restored HEAD rather than reinstalling a stale prior row. V17 separately pins confirmed Optimize outputs and achieved HEADs. V18 pins the exact `PhysicalArmed` grammar, pre-minted fresh binding/receipt intent, exclusive recovery strand, and explicit common-dispatch routing to the v18 owner; lifecycle tests separately pin the only valid fresh-scope `SEALED` successor. V19 pins its closed lineage-neutral grammar, exact N+1 immutable receipt effect, zero-`WITHDRAWN` refusal, exact retired cut, exclusive profile gate, and cold roll-forward with no graph-head, lineage, or `RecoveryAudit` movement; the same cell reopens the retired source, verifies receipt-bearing export provenance, and proves mutation/maintenance refusal. Historical recovery-v10 enrollment, recovery-v11 base-only fold, recovery-v12 lifecycle-v2 fold, and the frozen v14 resume/maintenance/retirement/rebind scaffolds retain their wire meanings and fail closed. Explicit refusal replaces alias inference for identity-less input; restartable compensation, fixed logical/rollback IDs, branch-token comparison, fresh under-gate reread/reparse, all-or-nothing roll-forward/rollback/refusal, recovery audit, and read-only guards remain pinned. |
+| `recovery.rs` | Open-time recovery sweep — identity-bearing schema-v9 envelopes for established graph writers, exact recovery-v13 profile changes, recovery-v14 lifecycle-v3 enrollment/claim/fold/terminal-receipt families, recovery-v15 resume/guarded drain-abort, recovery-v16 `StreamSealedEnsureIndices`, recovery-v17 `StreamSealedOptimize`, recovery-v18 `StreamRebind`, recovery-v19 `StreamAuthorityRetirement`, and recovery-v20 `StreamCorrection`. V14 tests pin claim attempt/checkpoint/terminal continuation, exact ledger selection, base/token participant classification, fixed lineage/attribution, and publication only for the exact allowed outcome; token-only, foreign, buried, mixed, stale-authority, or corrupt outcomes fail closed. V15 tests additionally pin the complete request/prior authority, physical claim classification, terminal ClaimReceipt + ManagementReceipt transaction, receipt-first idempotency, and sole `OPEN` publication. V16 validates a recovery-v8 CreateIndex plan plus complete prior/next lifecycle authority and gives a Lance Restore compensation a newly derived exact `SEALED` successor for the restored HEAD rather than reinstalling a stale prior row. V17 separately pins confirmed Optimize outputs and achieved HEADs. V18 pins the exact `PhysicalArmed` grammar, pre-minted fresh binding/receipt intent, exclusive recovery strand, and explicit common-dispatch routing to the v18 owner; lifecycle tests separately pin the only valid fresh-scope `SEALED` successor. V19 pins its closed lineage-neutral grammar, exact N+1 immutable receipt effect, zero-`WITHDRAWN` refusal, exact retired cut, exclusive profile gate, and cold roll-forward with no graph-head, lineage, or `RecoveryAudit` movement; the same cell reopens the retired source, verifies receipt-bearing export provenance, and proves mutation/maintenance refusal. V20 pins its closed exact-cut grammar, unchanged/replaced/withdrawn token-successor proof, pre-minted base plus combined token/receipt transactions, optional all-WITHDRAW attribution, commit-order matrix, and sole joint lineage/lifecycle publication. Historical recovery-v10 enrollment, recovery-v11 base-only fold, recovery-v12 lifecycle-v2 fold, and the frozen v14 resume/maintenance/retirement/rebind scaffolds retain their wire meanings and fail closed. Explicit refusal replaces alias inference for identity-less input; restartable compensation, fixed logical/rollback IDs, branch-token comparison, fresh under-gate reread/reparse, all-or-nothing roll-forward/rollback/refusal, recovery audit, and read-only guards remain pinned. |
 | `composite_flow.rs` | Compositional/narrative end-to-end stories — multi-step flows that compose mechanics covered by other test files. Catches integration regressions where individual operations all pass their unit tests but their composition breaks (sequential merges, post-merge main writes, time-travel through merge DAG, reopen consistency over multi-merge histories, post-optimize and post-cleanup strict writes). |
 
 RFC-026 reclamation qualification: the two B2b runtime guards do not prove
@@ -175,7 +175,9 @@ selected-branch-member witness, and proves a normal maintenance writer is
 fenced. Stream-profile tests pin the immutable,
 actor- and plan-bound receipt chain. Cluster and CLI tests own actor/offline/
 declared-graph preflight plus the exact `--graph`/`--config` command scope.
-`crossversion_upgrade.rs` owns the genuine v16↔v17 refusal/rebuild fence.
+The final-v17 merge recorded the genuine v16↔v17 refusal/rebuild fence. The
+current source suite retains v16→CURRENT evidence; the required live adjacent
+gate is now v17↔v18.
 
 The retired-export cells pin `branch_member` as a closed selected-member
 witness: canonical branch, exact Lance branch identifier, optional graph head,
@@ -220,7 +222,7 @@ topology, uncovered index and raw-shard residue without lifecycle authority,
 live HEAD movement past the durable witness, typed maintenance/index/GC
 exclusion for `OPEN`, and allowance of a disjoint-table effect. These historical
 cells remain the enrollment crash owner; the private row/fold/quiesce coverage
-lives in `memwal_stream.rs` and the v14–v18 in-source suites below. In-source
+lives in `memwal_stream.rs` and the v14–v20 in-source suites below. In-source
 manifest/engine tests separately pin lifecycle CAS, effect refusal for
 `OPEN`/`DRAINING`/`SEALED`, admission ordering, and the narrow native-branch
 rule: create/delete refuse active lifecycle state but may proceed at `SEALED`
@@ -426,12 +428,13 @@ ack-cost claim. These debug timings still are not a product latency or group-
 commit claim, and B2 must re-qualify any higher resident-writer/resource limit
 before exposing public admission.
 
-Format tests own genuine unenrolled-v7 ↔ v8/config-v2 and v8/config-v2 ↔
-v9/config-v3 refusal/rebuild. The v7 binary exposes no production enrollment
-route, so that leg proves its real format fence and no in-place adoption but
-does not claim recovery of retained physical config-v1 state. The v8 leg also
-pins that the new trusted physical attribution column is absent from logical
-exports. Focused behavior covers empty-batch refusal, exact-cap admission,
+Format tests retain historical source-v7 and source-v8 refusal/rebuild evidence
+against CURRENT; the required immediate-predecessor CI cell owns v17 ↔ v18.
+The v7 binary exposes no production enrollment route, so its historical-source
+cell proves refusal and no in-place adoption but does not claim recovery of
+retained physical config-v1 state. The v8-source cell also pins that the new
+trusted physical attribution column is absent from logical exports. Focused
+behavior covers empty-batch refusal, exact-cap admission,
 one-row/one-byte
 over-cap refusal before `put_no_wait` with no row/WAL batch, automatic-rollover
 refusal, higher-epoch reopen,
@@ -624,12 +627,13 @@ preserving byte-for-byte `protocol_v10` enrollment and `protocol_v12` fold shape
 under an enabled profile while the exact cluster-booted runtime remains the
 only ordinary content-write owner. The CLI exercises the offline
 `cluster apply --confirm-stream-offline` profile surface and the separate
-`cluster stream retire-for-rebuild plan|confirm` terminal-exit handshake. No
+`cluster stream retire-for-rebuild plan|confirm` terminal-exit handshake and
+the stopped/offline `cluster stream block show|correct` DataBlock surface. No
 test in the v11 profile-authority slice activated ingress, enrollment, claim,
-or lifecycle mutation. The current v17 hidden lifecycle owners are
-`memwal_stream.rs` plus the v14/v15/v16/v17/v18/v19 in-source recovery/
+or ordinary lifecycle mutation. The current v18 hidden lifecycle owners are
+`memwal_stream.rs` plus the v14/v15/v16/v17/v18/v19/v20 in-source recovery/
 lifecycle suites described above; those tests still do not activate a
-production row or lifecycle transport surface.
+production row or ordinary lifecycle transport surface.
 
 The remaining B1/B2a and private B2-common work adds no parser/server/ingest-CLI
 tests because it has no public row surface. The
@@ -823,51 +827,54 @@ absent. CI separately rejects a skipped S3 ABA surface guard.
 coverage—not the stamp-rewind stand-in in
 `db/manifest/tests.rs::sub_current_graph_is_refused_then_rebuilt_via_export_import`.
 The long-baseline case mints internal schema v3 with OmniGraph 0.7.2; the v4
-case uses 0.8.1. Both are historical v9-target gates: they prove v9 refusal,
-export/init/load into a different v9 root, row/vector fidelity, and exact-`id`
-PK metadata on every rebuilt graph table; the v4 case also pins reverse refusal
-by the old binary. The current required gate is the final-v16 → v17 seam below.
+case uses 0.8.1. Both are genuine-old-source→CURRENT gates: the archived binary
+mints and exports the source, while the binary under test refuses it, rebuilds
+a different current-format root, and proves row/vector fidelity plus exact-`id`
+PK metadata; the v4 case also pins reverse refusal by the old binary. Historical
+cells below have the same shape. They do **not** invoke an archived intermediate
+target binary and therefore do not claim an adjacent vN↔vN+1 gate. The current
+required adjacent gate is the final-v17 → v18 seam below.
 
 RFC-023 added its then-immediate-predecessor case gated on `OMNIGRAPH_V5_BIN`, built
 from the final internal-v5 commit. It mints a genuine SchemaIR-v2 v5 graph,
-proves v9 refuses it with the `0.9.0-dev` rebuild guidance, exports with v5, rebuilds
-under v9, checks row/vector/blob fidelity, exact blob bytes, and exact-`id` PK
-metadata, then proves the v5 binary refuses the v9 root. The same cell injects
-a duplicate logical ID into the v5 export: v9 rejects the load atomically,
+proves CURRENT refuses it with the `0.9.0-dev` rebuild guidance, exports with v5,
+rebuilds under CURRENT, checks row/vector/blob fidelity, exact blob bytes, and
+exact-`id` PK metadata, then proves the v5 binary refuses the current root. The
+same cell injects a duplicate logical ID into the v5 export: CURRENT rejects the load atomically,
 leaves every initialized target table empty, and a canonical re-export proves
 the v5 source unchanged. The initialized empty target remains a valid graph;
 the operator must not serve it and should discard it after the failed rebuild.
 
-RFC-026 Phase A added its immediate-predecessor seam
-`OMNIGRAPH_V6_BIN`. It mints a genuine internal-v6 graph, proves v9 refuses it
-before serving, exports with v6, rebuilds into a different v9 root, verifies
-row/vector fidelity and exact-`id` PK metadata, and proves the v6 binary refuses
-the v9 root across the v7 foundation. This is format-boundary evidence that a
+RFC-026 Phase A added the `OMNIGRAPH_V6_BIN` source seam. It mints a genuine
+internal-v6 graph, proves CURRENT refuses it before serving, exports with v6,
+rebuilds into a different current root, verifies row/vector fidelity and
+exact-`id` PK metadata, and proves the v6 binary refuses that current root.
+This is old-source format-boundary evidence that a
 stamp-rewind test cannot supply.
 
-RFC-026 Phase B1 added its then-immediate-predecessor seam
-`OMNIGRAPH_V7_BIN`. It mints a genuine internal-v7 graph with no physical
-enrollment (the v7 binary exposes no production enrollment route), proves v9
-refuses it before serving, exports with v7, rebuilds into a different
-v9/config-v3 root, verifies row/vector fidelity and exact-`id` PK metadata, and
-proves the v7 binary refuses the v9 root. This owns the real format fence, not a
+RFC-026 Phase B1 added the historical `OMNIGRAPH_V7_BIN` source seam. It mints
+a genuine internal-v7 graph with no physical enrollment (the v7 binary exposes
+no production enrollment route), proves CURRENT refuses it before serving,
+exports with v7, rebuilds into a different current-format root, verifies
+row/vector fidelity and exact-`id` PK metadata, and proves the v7 binary refuses
+the current root. This is old-source format-boundary evidence, not a
 retained-enrollment/config-v1 recovery claim. Run it with:
 
 ```bash
 OMNIGRAPH_V7_BIN=/path/to/final-v7/omnigraph \
   cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
-  current_v9_refuses_and_rebuilds_genuine_v7_and_v7_refuses_v9 -- --exact --nocapture
+  current_refuses_and_rebuilds_genuine_v7_and_v7_refuses_current -- --exact --nocapture
 ```
 
-RFC-026 Phase B2 adds the immediate-predecessor `OMNIGRAPH_V8_BIN` seam. It
-mints a genuine internal-v8/config-v2 graph, proves v9 refuses it with
+RFC-026 Phase B2 added the historical `OMNIGRAPH_V8_BIN` source seam. It mints
+a genuine internal-v8/config-v2 graph, proves CURRENT refuses it with
 `0.9.0-dev` rebuild guidance (no published release ever stamped v5–v8, so the
 refusal names the development window rather than a release line), exports with
-v8, rebuilds a distinct v9/config-v3 root, and
-proves row/vector fidelity plus exact-`id` PK metadata. The v9 re-export must
+v8, rebuilds a distinct current-format root, and proves row/vector fidelity
+plus exact-`id` PK metadata. The current re-export must
 not expose the physical `__omnigraph_stream_v1$` attribution column, and the v8
 fixture's ordinary user property `__omnigraph_stream_v1` must retain its value;
-the v8 binary must refuse the v9 root. CI pinned this seam while v9 was
+the v8 binary must refuse the current root. CI pinned this seam while v9 was
 CURRENT; with v10 and later formats it became a historical boundary and joined
 the env-gated seams, so it now skips unless `OMNIGRAPH_V8_BIN` points at a build of
 the last merged schema-v8 commit
@@ -876,71 +883,72 @@ the last merged schema-v8 commit
 ```bash
 OMNIGRAPH_V8_BIN=/path/to/final-v8/omnigraph \
   cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
-  current_v9_refuses_and_rebuilds_genuine_v8_and_v8_refuses_v9 -- --exact --nocapture
+  current_refuses_and_rebuilds_genuine_v8_and_v8_refuses_current -- --exact --nocapture
 ```
 
 RFC-026 §4.7 P1 (the v10 stream-profile format) added the historical
 `OMNIGRAPH_V9_BIN` seam. It mints a genuine internal-v9 graph with the pinned
-final-v9 binary, proves v10 refuses it naming the published `0.9.x` line in
+final-v9 binary, proves CURRENT refuses it naming the published `0.9.x` line in
 both message slots (`created by omnigraph 0.9.x` and `with an omnigraph 0.9.x
 binary` — the exact strings are also pinned in-source by
 `migrations.rs::release_names_the_writing_line_for_each_stamp`), exports with
-v9, rebuilds a distinct v10 root, proves row/vector fidelity plus exact-`id` PK
-metadata, and proves the v9 binary refuses the v10 root. It remains env-gated
+v9, rebuilds a distinct current-format root, proves row/vector fidelity plus
+exact-`id` PK metadata, and proves the v9 binary refuses the current root. It remains env-gated
 historical evidence. Run it locally with:
 
 ```bash
 OMNIGRAPH_V9_BIN=/path/to/final-v9/omnigraph \
   cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
-  current_v10_refuses_and_rebuilds_genuine_v9_and_v9_refuses_v10 -- --exact --nocapture
+  current_refuses_and_rebuilds_genuine_v9_and_v9_refuses_current -- --exact --nocapture
 ```
 
 The historical `OMNIGRAPH_V10_BIN` seam mints a genuine final-v10 graph with
-the matching 0.10.0-dev source build, proves v11 refuses it with
-source-build/export guidance, exports with v10, rebuilds a distinct v11 root,
-and proves row/vector/blob fidelity plus exact-`id` PK metadata. The old v10
-binary must refuse the v11 root. It remains available on demand:
+the matching 0.10.0-dev source build, proves CURRENT refuses it with
+source-build/export guidance, exports with v10, rebuilds a distinct
+current-format root, and proves row/vector/blob fidelity plus exact-`id` PK
+metadata. The old v10 binary must refuse the current root. It remains available
+on demand:
 
 ```bash
 OMNIGRAPH_V10_BIN=/path/to/final-v10/omnigraph \
   cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
-  current_v11_refuses_and_rebuilds_genuine_v10_and_v10_refuses_v11 -- --exact --nocapture
+  current_refuses_and_rebuilds_genuine_v10_and_v10_refuses_current -- --exact --nocapture
 ```
 
 The historical `OMNIGRAPH_V11_BIN` seam mints a genuine final-v11 graph from immutable commit
-`5589529cd784759c33cb34bdadd10b912955d4bd`, proves v12 refuses it with
-source-build/export guidance, exports with v11, rebuilds a distinct v12 root,
+`5589529cd784759c33cb34bdadd10b912955d4bd`, proves CURRENT refuses it with
+source-build/export guidance, exports with v11, rebuilds a distinct current-format root,
 and proves row/vector/blob fidelity plus exact-`id` PK metadata. The old v11
-binary must refuse the v12 root. This is format evidence only: the fixture is
+binary must refuse the current root. This is format evidence only: the fixture is
 clean, disabled, and unenrolled, and rebuild deliberately transfers no private
 lifecycle, WAL, token, ledger, or receipt authority. Run it locally with:
 
 ```bash
 OMNIGRAPH_V11_BIN=/path/to/final-v11/omnigraph \
   cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
-  current_v12_refuses_and_rebuilds_genuine_v11_and_v11_refuses_v12 -- --exact --nocapture
+  current_refuses_and_rebuilds_genuine_v11_and_v11_refuses_current -- --exact --nocapture
 ```
 
 The historical `OMNIGRAPH_V12_BIN` seam mints a
 genuine final-v12 graph from immutable main commit
-`f1bdeca60eeb16540de24309eb3483feffbe27c8`, proves v13 refuses it with
-source-build/export guidance, exports with v12, rebuilds a distinct v13 root,
+`f1bdeca60eeb16540de24309eb3483feffbe27c8`, proves CURRENT refuses it with
+source-build/export guidance, exports with v12, rebuilds a distinct current-format root,
 and proves row/vector/blob fidelity plus exact-`id` PK metadata. The old v12
-binary must refuse the v13 root. The fixture is clean, disabled, and
+binary must refuse the current root. The fixture is clean, disabled, and
 unenrolled; ordinary export deliberately transfers no private lifecycle, WAL,
 token, ledger, or receipt authority. Run it locally with:
 
 ```bash
 OMNIGRAPH_V12_BIN=/path/to/final-v12/omnigraph \
   cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
-  current_v13_refuses_and_rebuilds_genuine_v12_and_v12_refuses_v13 -- --exact --nocapture
+  current_refuses_and_rebuilds_genuine_v12_and_v12_refuses_current -- --exact --nocapture
 ```
 
 The historical `OMNIGRAPH_V13_BIN` seam mints a
-genuine final-v13 graph with the matching 0.10.0-dev source build, proves v14
+genuine final-v13 graph with the matching 0.10.0-dev source build, proves CURRENT
 refuses it with source-build/export guidance, exports with v13, rebuilds a
-distinct v14 root, and proves row/vector/blob fidelity plus exact-`id` PK
-metadata. The old v13 binary must refuse the v14 root. The fixture is clean,
+distinct current-format root, and proves row/vector/blob fidelity plus exact-`id` PK
+metadata. The old v13 binary must refuse the current root. The fixture is clean,
 disabled, and unenrolled; ordinary export deliberately transfers no private
 lifecycle, WAL, token, ledger, receipt, or maintenance authority. Run it
 locally with:
@@ -948,15 +956,15 @@ locally with:
 ```bash
 OMNIGRAPH_V13_BIN=/path/to/final-v13/omnigraph \
   cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
-  current_v14_refuses_and_rebuilds_genuine_v13_and_v13_refuses_v14 -- --exact --nocapture
+  current_refuses_and_rebuilds_genuine_v13_and_v13_refuses_current -- --exact --nocapture
 ```
 
 The historical `OMNIGRAPH_V14_BIN` seam builds the
 final v14 binary from immutable merge
 `1afc89b8602dba6525a200916fab0fdf3f1eabd6`, mints a genuine v14 graph, proves
-v15 refuses it with source-build/export guidance, exports with v14, rebuilds a
-distinct v15 root, and proves row/vector/blob fidelity plus exact-`id` PK
-metadata. The old v14 binary must refuse the v15 root. The fixture is clean,
+CURRENT refuses it with source-build/export guidance, exports with v14, rebuilds
+a distinct current-format root, and proves row/vector/blob fidelity plus
+exact-`id` PK metadata. The old v14 binary must refuse the current root. The fixture is clean,
 disabled, and unenrolled; ordinary export deliberately transfers no private
 lifecycle, WAL, token, ledger, receipt, or maintenance authority. Run it
 locally with:
@@ -964,14 +972,14 @@ locally with:
 ```bash
 OMNIGRAPH_V14_BIN=/path/to/final-v14/omnigraph \
   cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
-  current_v15_refuses_and_rebuilds_genuine_v14_and_v14_refuses_v15 -- --exact --nocapture
+  current_refuses_and_rebuilds_genuine_v14_and_v14_refuses_current -- --exact --nocapture
 ```
 
 The historical `OMNIGRAPH_V15_BIN` seam builds the final v15 binary from immutable merge
 `84f3af758947970d16040a987cb1d6ea0f0931e8`, mints a genuine v15 graph, proves
-v16 refuses it with source-build/export guidance, exports with v15, rebuilds a
-distinct v16 root, and proves row/vector/blob fidelity plus exact-`id` PK
-metadata. The old v15 binary must refuse the v16 root. The fixture is clean,
+CURRENT refuses it with source-build/export guidance, exports with v15, rebuilds
+a distinct current-format root, and proves row/vector/blob fidelity plus
+exact-`id` PK metadata. The old v15 binary must refuse the current root. The fixture is clean,
 disabled, and unenrolled; ordinary export deliberately transfers no private
 lifecycle, WAL, token, ledger, receipt, maintenance, or rebind authority. Run
 it locally with:
@@ -979,15 +987,14 @@ it locally with:
 ```bash
 OMNIGRAPH_V15_BIN=/path/to/final-v15/omnigraph \
   cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
-  current_v16_refuses_and_rebuilds_genuine_v15_and_v15_refuses_v16 -- --exact --nocapture
+  current_refuses_and_rebuilds_genuine_v15_and_v15_refuses_current -- --exact --nocapture
 ```
 
-The current immediate-predecessor seam is `OMNIGRAPH_V16_BIN`. CI builds the
-final v16 binary from immutable merge
+The historical `OMNIGRAPH_V16_BIN` seam builds the final v16 binary from immutable merge
 `ac59c4f6d1d83acc8118c410c39de2bed91f9c15`, mints a genuine v16 graph, proves
-v17 refuses it with source-build/export guidance, exports with v16, rebuilds a
-distinct v17 root, and proves row/vector/blob fidelity plus exact-`id` PK
-metadata. The old v16 binary must refuse the v17 root. The fixture is clean,
+CURRENT refuses it with source-build/export guidance, exports with v16, rebuilds
+a distinct current-format root, and proves row/vector/blob fidelity plus
+exact-`id` PK metadata. The old v16 binary must refuse the current root. The fixture is clean,
 disabled, and unenrolled; this strict format fence deliberately transfers no
 private lifecycle, WAL, token, ledger, receipt, maintenance, rebind, or
 retirement authority. Run it locally with:
@@ -995,7 +1002,23 @@ retirement authority. Run it locally with:
 ```bash
 OMNIGRAPH_V16_BIN=/path/to/final-v16/omnigraph \
   cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
-  current_v17_refuses_and_rebuilds_genuine_v16_and_v16_refuses_v17 -- --exact --nocapture
+  current_refuses_and_rebuilds_genuine_v16_and_v16_refuses_current -- --exact --nocapture
+```
+
+The current immediate-predecessor seam is `OMNIGRAPH_V17_BIN`. CI builds the
+final v17 binary from immutable merge
+`41a5990d53238d63d17e139859c66613f9c25867`, mints a genuine v17 graph, proves
+v18 refuses it with source-build/export guidance, exports with v17, rebuilds a
+distinct v18 root, and proves row/vector/blob fidelity plus exact-`id` PK
+metadata. The old v17 binary must refuse the v18 root. The fixture is clean,
+disabled, and unenrolled; this strict format fence deliberately transfers no
+private lifecycle, WAL, token, ledger, receipt, maintenance, rebind,
+retirement, or correction authority. Run it locally with:
+
+```bash
+OMNIGRAPH_V17_BIN=/path/to/final-v17/omnigraph \
+  cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
+  current_v18_refuses_and_rebuilds_genuine_v17_and_v17_refuses_v18 -- --exact --nocapture
 ```
 
 Older cross-version seams remain gated on absolute old-binary paths and skip
@@ -1003,7 +1026,8 @@ gracefully when unset because rebuilding every historical source revision in
 default CI would be expensive. A set but invalid path, including
 `OMNIGRAPH_V8_BIN`, `OMNIGRAPH_V9_BIN`, `OMNIGRAPH_V10_BIN`,
 `OMNIGRAPH_V11_BIN`, `OMNIGRAPH_V12_BIN`, `OMNIGRAPH_V13_BIN`, and
-`OMNIGRAPH_V14_BIN`, `OMNIGRAPH_V15_BIN`, and `OMNIGRAPH_V16_BIN`, fails loudly
+`OMNIGRAPH_V14_BIN`, `OMNIGRAPH_V15_BIN`, `OMNIGRAPH_V16_BIN`, and
+`OMNIGRAPH_V17_BIN`, fails loudly
 rather than making the proof vacuous.
 
 ## System e2e requirements and suppression

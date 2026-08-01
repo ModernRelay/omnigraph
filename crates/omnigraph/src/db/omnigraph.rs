@@ -38,6 +38,7 @@ mod export;
 mod optimize;
 mod repair;
 mod schema_apply;
+mod stream_correction;
 mod stream_enrollment;
 mod stream_ingest;
 pub(crate) mod stream_lifecycle;
@@ -54,9 +55,13 @@ pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
 };
 pub use schema_apply::SchemaApplyOptions;
+pub use stream_correction::{
+    StreamDataBlockEntry, StreamDataBlockPage, StreamDataCorrectionAction,
+    StreamDataCorrectionRequest, StreamDataCorrectionResult,
+};
 #[doc(hidden)]
 pub use stream_profile::{
-    CheckedClusterApplyAuthority, CheckedClusterMaintenanceAuthority,
+    CheckedClusterApplyAuthority, CheckedClusterBlockAuthority, CheckedClusterMaintenanceAuthority,
     CheckedClusterRetirementAuthority, CheckedClusterStreamRuntimeAuthority,
     StreamingProfileResult,
 };

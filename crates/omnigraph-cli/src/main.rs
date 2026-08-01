@@ -1,6 +1,9 @@
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, bail};
-use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
+use omnigraph::db::{
+    Omnigraph, ReadTarget, SnapshotId, StreamDataCorrectionAction, StreamDataCorrectionRequest,
+};
+use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
     ChangeOutput, CommitOutput, ErrorOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
@@ -9,11 +12,13 @@ use omnigraph_api_types::{
 use omnigraph_cluster::{
     ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput,
     StateSyncOutput, StatusOutput, StreamAuthorityRetirementConfirmOutput,
-    StreamAuthorityRetirementOptions, StreamAuthorityRetirementPlanOutput, ValidateOutput,
+    StreamAuthorityRetirementOptions, StreamAuthorityRetirementPlanOutput,
+    StreamBlockControlOptions, StreamBlockCorrectOutput, StreamBlockShowOutput, ValidateOutput,
     apply_config_dir_with_options, approve_config_dir,
-    confirm_stream_authority_retirement_config_dir, force_unlock_config_dir, import_config_dir,
-    plan_config_dir, plan_stream_authority_retirement_config_dir, refresh_config_dir,
-    status_config_dir, validate_config_dir,
+    confirm_stream_authority_retirement_config_dir, correct_stream_data_block_config_dir,
+    force_unlock_config_dir, import_config_dir, plan_config_dir,
+    plan_stream_authority_retirement_config_dir, refresh_config_dir,
+    show_stream_data_block_config_dir, status_config_dir, validate_config_dir,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -28,13 +33,13 @@ use omnigraph_server::{
 };
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 mod embed;
 mod operator;
@@ -42,6 +47,48 @@ mod read_format;
 
 use embed::{EmbedArgs, EmbedOutput, execute_embed};
 use read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamDataCorrectionPlanFile {
+    version: u32,
+    actions: Vec<StreamDataCorrectionAction>,
+}
+
+fn read_stream_data_correction_plan(path: &Path) -> Result<Vec<u8>> {
+    read_stream_data_correction_plan_with_limit(
+        path,
+        StreamDataCorrectionRequest::MAX_SERIALIZED_BYTES,
+    )
+}
+
+fn read_stream_data_correction_plan_with_limit(path: &Path, byte_limit: u64) -> Result<Vec<u8>> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > byte_limit {
+        return Err(OmniError::ResourceLimitExceeded {
+            resource: "stream_correction_plan_file_bytes".to_string(),
+            limit: byte_limit,
+            actual: metadata.len(),
+        }
+        .into());
+    }
+
+    let file = fs::File::open(path)?;
+    let mut bounded = file.take(byte_limit.saturating_add(1));
+    let initial_capacity = usize::try_from(metadata.len().min(64 * 1024)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    bounded.read_to_end(&mut bytes)?;
+    let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual > byte_limit {
+        return Err(OmniError::ResourceLimitExceeded {
+            resource: "stream_correction_plan_file_bytes".to_string(),
+            limit: byte_limit,
+            actual,
+        }
+        .into());
+    }
+    Ok(bytes)
+}
 
 mod cli;
 mod client;
@@ -1143,6 +1190,84 @@ async fn main() -> Result<()> {
                 finish_cluster_force_unlock(&output, json)?;
             }
             ClusterCommand::Stream { command } => match command {
+                ClusterStreamCommand::Block { command } => {
+                    let Some(graph_id) = cli.graph.as_deref() else {
+                        bail!("`cluster stream block` requires --graph <GRAPH_ID>");
+                    };
+                    let actor = resolve_cluster_actor(cli.as_actor.as_deref())?;
+                    match command {
+                        StreamBlockCommand::Show {
+                            table_key,
+                            config,
+                            block_token,
+                            cursor,
+                            confirm_stream_offline,
+                            json,
+                        } => {
+                            let output = show_stream_data_block_config_dir(
+                                config,
+                                graph_id,
+                                table_key,
+                                block_token,
+                                cursor.as_deref(),
+                                StreamBlockControlOptions {
+                                    actor,
+                                    confirm_stream_offline,
+                                },
+                            )
+                            .await;
+                            finish_stream_block_show(&output, json)?;
+                        }
+                        StreamBlockCommand::Correct {
+                            table_key,
+                            config,
+                            block_token,
+                            correction_id,
+                            expected_lifecycle_revision,
+                            plan,
+                            expected_plan_digest,
+                            confirm_stream_offline,
+                            json,
+                        } => {
+                            let plan_path = plan.display().to_string();
+                            let plan_bytes = read_stream_data_correction_plan(&plan)?;
+                            let plan: StreamDataCorrectionPlanFile = serde_json::from_slice(
+                                &plan_bytes,
+                            )
+                            .map_err(|error| {
+                                color_eyre::eyre::eyre!(
+                                    "could not parse stream correction plan '{plan_path}': {error}"
+                                )
+                            })?;
+                            if plan.version != 1 {
+                                bail!(
+                                    "stream correction plan '{plan_path}' has unsupported version {}; expected 1",
+                                    plan.version
+                                );
+                            }
+                            let request = StreamDataCorrectionRequest {
+                                protocol_version: plan.version,
+                                block_token,
+                                correction_id,
+                                expected_lifecycle_revision,
+                                actions: plan.actions,
+                                expected_plan_digest,
+                            };
+                            let output = correct_stream_data_block_config_dir(
+                                config,
+                                graph_id,
+                                table_key,
+                                request,
+                                StreamBlockControlOptions {
+                                    actor,
+                                    confirm_stream_offline,
+                                },
+                            )
+                            .await;
+                            finish_stream_block_correct(&output, json)?;
+                        }
+                    }
+                }
                 ClusterStreamCommand::RetireForRebuild { command } => {
                     let Some(graph_id) = cli.graph.as_deref() else {
                         bail!("`cluster stream retire-for-rebuild` requires --graph <GRAPH_ID>");

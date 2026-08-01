@@ -24,6 +24,7 @@ mod config;
 mod diff;
 mod serve;
 mod store;
+mod stream_block;
 mod stream_policy;
 mod stream_retirement;
 mod sweep;
@@ -48,6 +49,7 @@ pub use omnigraph_control_authority::{
     RuntimeAuthorityBinding, ValidatedRuntimeGuard, mint_runtime_guard,
 };
 use store::ClusterStore;
+pub use stream_block::{correct_stream_data_block_config_dir, show_stream_data_block_config_dir};
 use stream_policy::stream_profile_policy_checker;
 pub use stream_retirement::{
     confirm_stream_authority_retirement_config_dir, plan_stream_authority_retirement_config_dir,

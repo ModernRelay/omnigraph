@@ -24,9 +24,14 @@ pub(crate) const STREAM_TOKEN_DERIVATION_VERSION: u32 = 1;
 pub(crate) const STREAM_PAYLOAD_DIGEST_VERSION: u32 = 1;
 pub(crate) const STREAM_PAYLOAD_ENCODING_VERSION: u32 = 1;
 pub(crate) const STREAM_TOKEN_WIRE_VERSION: &str = "sha256-lowerhex-v1";
+/// Admission starts at depth one; one correction may advance the exact
+/// predecessor chain through depth 8,193. A further successor is refused
+/// before any durable effect.
+pub(crate) const MAX_STREAM_CHAIN_DEPTH: u32 = 8_193;
 const STREAM_TOKEN_DOMAIN_V1: &[u8] = b"omnigraph.stream-token.v1\0";
 const PAYLOAD_DIGEST_DOMAIN_V1: &[u8] = b"omnigraph.stream-payload.v1\0";
 const FOLD_ATTRIBUTION_DOMAIN_V1: &[u8] = b"omnigraph.stream-fold-attribution.v1\0";
+const TOKEN_AUTHORITY_PLAN_DOMAIN_V1: &[u8] = b"omnigraph.stream-token-authority-plan.v1\0";
 /// Conservative per-entry allowance for the BTree node, allocator headers,
 /// and the duplicated logical-id key retained by exact authority lookups.
 const STREAM_LOOKUP_ENTRY_OVERHEAD_BYTES: usize = 256;
@@ -710,6 +715,66 @@ impl TrustedStreamRowMetadata {
         Ok(metadata)
     }
 
+    /// Mint one replacement occurrence chained to the exact blocked winner.
+    ///
+    /// Corrections cannot reset sequencing authority: the blocked token is
+    /// always the predecessor, the original fold-base token is inherited, and
+    /// depth advances exactly once.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_correction(
+        blocked_winner: &StreamTokenAuthorityRow,
+        contributor_id: TrustedContributorId,
+        write_id: String,
+        payload_digest: PayloadDigest,
+        correction_id: String,
+        plan_ordinal: u64,
+    ) -> ProtocolResult<Self> {
+        blocked_winner.validate()?;
+        if blocked_winner.disposition != StreamTokenDisposition::Present {
+            return Err(StreamTokenProtocolError::invalid(
+                "blocked_winner.disposition",
+                "a replacement correction requires PRESENT token authority",
+            ));
+        }
+        canonical_uuid_bytes("write_id", &write_id)?;
+        canonical_uuid_bytes("correction_id", &correction_id)?;
+        let chain_depth = blocked_winner.chain_depth.checked_add(1).ok_or_else(|| {
+            StreamTokenProtocolError::invalid("chain_depth", "successor depth overflow")
+        })?;
+        if chain_depth > MAX_STREAM_CHAIN_DEPTH {
+            return Err(StreamTokenProtocolError::invalid(
+                "chain_depth",
+                format!("must not exceed {MAX_STREAM_CHAIN_DEPTH}"),
+            ));
+        }
+        let predecessor_token = Some(blocked_winner.current_token);
+        let stream_token = StreamToken::derive(&StreamTokenInput {
+            identity: blocked_winner.identity,
+            logical_id: &blocked_winner.logical_id,
+            stream_incarnation_id: &blocked_winner.stream_incarnation_id,
+            predecessor_token,
+            write_id: &write_id,
+            contributor_id: &contributor_id,
+            payload_digest,
+        })?;
+        let metadata = Self {
+            stream_incarnation_id: blocked_winner.stream_incarnation_id.clone(),
+            contributor_id,
+            write_id,
+            predecessor_token,
+            stream_token,
+            fold_base_token: blocked_winner.fold_base_token,
+            chain_depth,
+            origin: StreamRowOrigin::Correction {
+                correction_id,
+                plan_ordinal,
+            },
+            payload_digest,
+        };
+        metadata.validate_for(blocked_winner.identity, &blocked_winner.logical_id)?;
+        Ok(metadata)
+    }
+
     fn validate_structure(&self) -> ProtocolResult<()> {
         canonical_uuid_bytes("stream_incarnation_id", &self.stream_incarnation_id)?;
         canonical_uuid_bytes("write_id", &self.write_id)?;
@@ -718,6 +783,12 @@ impl TrustedStreamRowMetadata {
             return Err(StreamTokenProtocolError::invalid(
                 "chain_depth",
                 "must be non-zero",
+            ));
+        }
+        if self.chain_depth > MAX_STREAM_CHAIN_DEPTH {
+            return Err(StreamTokenProtocolError::invalid(
+                "chain_depth",
+                format!("must not exceed {MAX_STREAM_CHAIN_DEPTH}"),
             ));
         }
         if self.chain_depth == 1 && self.fold_base_token != self.predecessor_token {
@@ -898,6 +969,31 @@ impl StreamTokenAuthorityRow {
         Ok(row)
     }
 
+    /// Preserve the blocked occurrence as terminal sequencing authority while
+    /// removing its base row from the corrected visible graph.
+    pub(crate) fn withdraw_blocked_winner(
+        blocked_winner: &Self,
+        actor: TrustedContributorId,
+        correction_id: String,
+    ) -> ProtocolResult<Self> {
+        blocked_winner.validate()?;
+        if blocked_winner.disposition != StreamTokenDisposition::Present {
+            return Err(StreamTokenProtocolError::invalid(
+                "blocked_winner.disposition",
+                "a withdrawal correction requires PRESENT token authority",
+            ));
+        }
+        canonical_uuid_bytes("correction_id", &correction_id)?;
+        let mut withdrawn = blocked_winner.clone();
+        withdrawn.disposition = StreamTokenDisposition::Withdrawn;
+        withdrawn.terminal_correction = Some(StreamTerminalCorrection {
+            actor,
+            correction_id,
+        });
+        withdrawn.validate()?;
+        Ok(withdrawn)
+    }
+
     pub(crate) fn validate(&self) -> ProtocolResult<()> {
         self.identity.validate().map_err(|error| {
             StreamTokenProtocolError::invalid("table_identity", error.to_string())
@@ -916,6 +1012,12 @@ impl StreamTokenAuthorityRow {
             return Err(StreamTokenProtocolError::invalid(
                 "chain_depth",
                 "must be non-zero",
+            ));
+        }
+        if self.chain_depth > MAX_STREAM_CHAIN_DEPTH {
+            return Err(StreamTokenProtocolError::invalid(
+                "chain_depth",
+                format!("must not exceed {MAX_STREAM_CHAIN_DEPTH}"),
             ));
         }
         match (self.disposition, &self.terminal_correction) {
@@ -1132,6 +1234,54 @@ pub(crate) fn stream_fold_attribution_commitment(
         // Frozen explicit-null v10 slot; the digest preimage excludes it.
         dead_letter_object: None,
     })
+}
+
+/// Commit to the complete post-correction token-authority plan independent of
+/// caller order. There may be only one row per stable table identity/key.
+pub(crate) fn stream_token_authority_plan_digest(
+    rows: &[StreamTokenAuthorityRow],
+) -> ProtocolResult<String> {
+    let mut canonical = Vec::with_capacity(rows.len());
+    for row in rows {
+        row.validate()?;
+        let bytes = serde_json::to_vec(row).map_err(|error| {
+            StreamTokenProtocolError::Corruption(format!(
+                "failed to encode canonical token-authority plan row: {error}"
+            ))
+        })?;
+        canonical.push((
+            row.identity.stable_table_id,
+            row.identity.table_incarnation_id,
+            row.logical_id.as_bytes().to_vec(),
+            bytes,
+        ));
+    }
+    canonical
+        .sort_by(|left, right| (&left.0, &left.1, &left.2).cmp(&(&right.0, &right.1, &right.2)));
+    for pair in canonical.windows(2) {
+        if pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1 && pair[0].2 == pair[1].2 {
+            return Err(StreamTokenProtocolError::invalid(
+                "token_authority_plan",
+                "contains duplicate table-identity/logical-id authority rows",
+            ));
+        }
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(TOKEN_AUTHORITY_PLAN_DOMAIN_V1);
+    hasher.update(
+        u64::try_from(canonical.len())
+            .map_err(|_| {
+                StreamTokenProtocolError::invalid("token_authority_plan", "count exceeds u64")
+            })?
+            .to_be_bytes(),
+    );
+    for (stable_table_id, table_incarnation_id, logical_id, bytes) in canonical {
+        hasher.update(stable_table_id.to_be_bytes());
+        hasher.update(table_incarnation_id.to_be_bytes());
+        hash_bytes(&mut hasher, &logical_id);
+        hash_bytes(&mut hasher, &bytes);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 /// Fully normalized trusted request presented to the admission classifier.
@@ -1999,6 +2149,89 @@ mod tests {
         assert!(authority.validate().is_ok());
         authority.terminal_correction = None;
         assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn correction_successor_preserves_sequence_authority_and_withdrawal_is_terminal() {
+        let first = request(WRITE_X, None, "actor:alice", payload(1));
+        let token = first.candidate_token().unwrap();
+        let (authority, _) = present_authority(&first, token, ATTEMPT_X, 0);
+        let replacement = TrustedStreamRowMetadata::new_correction(
+            &authority,
+            contributor("actor:operator"),
+            WRITE_Y.to_string(),
+            payload(2),
+            ATTEMPT_Y.to_string(),
+            7,
+        )
+        .unwrap();
+        assert_eq!(replacement.predecessor_token, Some(authority.current_token));
+        assert_eq!(replacement.fold_base_token, authority.fold_base_token);
+        assert_eq!(replacement.chain_depth, authority.chain_depth + 1);
+        assert_eq!(
+            replacement.origin,
+            StreamRowOrigin::Correction {
+                correction_id: ATTEMPT_Y.to_string(),
+                plan_ordinal: 7,
+            }
+        );
+        replacement
+            .validate_for(authority.identity, &authority.logical_id)
+            .unwrap();
+
+        let withdrawn = StreamTokenAuthorityRow::withdraw_blocked_winner(
+            &authority,
+            contributor("actor:operator"),
+            ATTEMPT_Y.to_string(),
+        )
+        .unwrap();
+        assert_eq!(withdrawn.current_token, authority.current_token);
+        assert_eq!(withdrawn.predecessor_token, authority.predecessor_token);
+        assert_eq!(withdrawn.disposition, StreamTokenDisposition::Withdrawn);
+        assert_eq!(
+            withdrawn
+                .terminal_correction
+                .as_ref()
+                .unwrap()
+                .correction_id,
+            ATTEMPT_Y
+        );
+
+        let mut maximum = authority;
+        maximum.chain_depth = MAX_STREAM_CHAIN_DEPTH;
+        maximum.validate().unwrap();
+        assert!(
+            TrustedStreamRowMetadata::new_correction(
+                &maximum,
+                contributor("actor:operator"),
+                WRITE_Y.to_string(),
+                payload(2),
+                ATTEMPT_Y.to_string(),
+                8,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn token_authority_plan_digest_is_order_independent_complete_and_unique() {
+        let first = request(WRITE_X, None, "actor:alice", payload(1));
+        let first_token = first.candidate_token().unwrap();
+        let (first_row, _) = present_authority(&first, first_token, ATTEMPT_X, 0);
+        let mut second = request(WRITE_Y, None, "actor:bob", payload(2));
+        second.logical_id = "person-18".to_string();
+        let second_token = second.candidate_token().unwrap();
+        let (second_row, _) = present_authority(&second, second_token, ATTEMPT_Y, 1);
+
+        let forward =
+            stream_token_authority_plan_digest(&[first_row.clone(), second_row.clone()]).unwrap();
+        let reverse = stream_token_authority_plan_digest(&[second_row, first_row.clone()]).unwrap();
+        assert_eq!(forward, reverse);
+        assert_ne!(
+            forward,
+            stream_token_authority_plan_digest(std::slice::from_ref(&first_row)).unwrap()
+        );
+        assert!(stream_token_authority_plan_digest(&[first_row.clone(), first_row]).is_err());
     }
 
     #[test]

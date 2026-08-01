@@ -26,6 +26,7 @@ pub(crate) const INITIAL_LIFECYCLE_REVISION: u64 = 1;
 pub(crate) const ENROLLMENT_RECEIPT_V2_PROTOCOL_VERSION: u32 = 2;
 pub(crate) const BINDING_RECEIPT_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const MANAGEMENT_RECEIPT_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const STREAM_CORRECTION_RECEIPT_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const CLAIM_ATTEMPT_EFFECT_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const CLAIM_RECEIPT_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const QUIESCE_REQUEST_PROTOCOL_VERSION: u32 = 1;
@@ -33,11 +34,13 @@ pub(crate) const STREAM_RESUME_REQUEST_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const STREAM_RESUME_OPERATION_KIND: &str = "RESUME";
 pub(crate) const STREAM_REBIND_REQUEST_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const STREAM_REBIND_OPERATION_KIND: &str = "REBIND";
+pub(crate) const STREAM_CORRECTION_OPERATION_KIND: &str = "CORRECTION";
 pub(crate) const STREAM_DATA_BLOCK_VALIDATION_CONTRACT_VERSION: u32 = 1;
 
 pub(crate) const ENROLLMENT_RECEIPT_V2_TAG: &str = "STREAM_ENROLLMENT_RECEIPT_V2";
 pub(crate) const BINDING_RECEIPT_TAG: &str = "STREAM_BINDING_RECEIPT_V1";
 pub(crate) const MANAGEMENT_RECEIPT_TAG: &str = "STREAM_MANAGEMENT_RECEIPT_V1";
+pub(crate) const STREAM_CORRECTION_RECEIPT_TAG: &str = "STREAM_CORRECTION_RECEIPT_V1";
 pub(crate) const CLAIM_ATTEMPT_EFFECT_TAG: &str = "STREAM_CLAIM_ATTEMPT_EFFECT_V1";
 pub(crate) const CLAIM_RECEIPT_TAG: &str = "STREAM_CLAIM_RECEIPT_V1";
 
@@ -61,6 +64,12 @@ const MANAGEMENT_RECEIPT_LOOKUP_DOMAIN: &[u8] = b"omnigraph.stream-management-re
 const MANAGEMENT_RECEIPT_RECORD_DOMAIN: &[u8] = b"omnigraph.stream-management-receipt-record.v1\0";
 const MANAGEMENT_REQUEST_DOMAIN: &[u8] = b"omnigraph.stream-management-request.v1\0";
 const MANAGEMENT_RESULT_DOMAIN: &[u8] = b"omnigraph.stream-management-result.v1\0";
+const STREAM_CORRECTION_RECEIPT_LOOKUP_DOMAIN: &[u8] =
+    b"omnigraph.stream-correction-receipt-lookup.v1\0";
+const STREAM_CORRECTION_RECEIPT_RECORD_DOMAIN: &[u8] =
+    b"omnigraph.stream-correction-receipt-record.v1\0";
+const STREAM_LIFECYCLE_AUTHORITY_DIGEST_DOMAIN: &[u8] =
+    b"omnigraph.stream-lifecycle-authority.v1\0";
 const CLAIM_ATTEMPT_LOOKUP_DOMAIN: &[u8] = b"omnigraph.stream-claim-attempt-lookup.v1\0";
 const CLAIM_ATTEMPT_RECORD_DOMAIN: &[u8] = b"omnigraph.stream-claim-attempt-record.v1\0";
 const CLAIM_ATTEMPT_CHAIN_GENESIS_DOMAIN: &[u8] =
@@ -420,6 +429,64 @@ pub(crate) struct ManagementReceipt {
     pub(crate) actor_id: String,
     pub(crate) result_payload: serde_json::Value,
     pub(crate) result_digest: String,
+    pub(crate) recorded_at: i64,
+}
+
+/// Semantic preimage for one immutable, receipt-first DataBlock correction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamCorrectionReceiptPreimage {
+    pub(crate) graph_identity_digest: String,
+    pub(crate) identity: TableIdentity,
+    pub(crate) stream_incarnation_id: String,
+    pub(crate) binding_scope_id: String,
+    pub(crate) block_token: String,
+    pub(crate) correction_id: String,
+    pub(crate) correction_plan_digest: String,
+    pub(crate) actor_id: String,
+    pub(crate) graph_commit_id: String,
+    pub(crate) resulting_manifest_version: u64,
+    pub(crate) resulting_lifecycle_revision: u64,
+    pub(crate) resulting_lifecycle_digest: String,
+    pub(crate) resulting_token_authority_digest: String,
+    pub(crate) recorded_at: i64,
+}
+
+/// Immutable terminal disposition for one exact `(block, correction_id)`.
+/// A retry looks this record up before consulting current lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StreamCorrectionReceipt {
+    pub(crate) protocol_version: u32,
+    pub(crate) record_id: String,
+    pub(crate) record_lookup_key: String,
+    pub(crate) record_tag: String,
+    pub(crate) graph_identity_digest: String,
+    pub(crate) identity: TableIdentity,
+    pub(crate) stream_incarnation_id: String,
+    pub(crate) binding_scope_id: String,
+    pub(crate) block_token: String,
+    pub(crate) correction_id: String,
+    pub(crate) correction_plan_digest: String,
+    pub(crate) actor_id: String,
+    pub(crate) graph_commit_id: String,
+    pub(crate) result_payload: serde_json::Value,
+    pub(crate) result_digest: String,
+    pub(crate) resulting_manifest_version: u64,
+    pub(crate) resulting_lifecycle_revision: u64,
+    pub(crate) resulting_lifecycle_digest: String,
+    pub(crate) resulting_token_authority_digest: String,
+    pub(crate) recorded_at: i64,
+}
+
+/// Exact graph-visible outcome needed to release one DataBlock while keeping
+/// its drain in progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamDataCorrectionOutcome {
+    pub(crate) graph_commit_id: String,
+    pub(crate) manifest_version: u64,
+    pub(crate) current_head_witness: CurrentHeadWitness,
+    pub(crate) visible_rows: u64,
+    pub(crate) visible_bytes: u64,
     pub(crate) recorded_at: i64,
 }
 
@@ -2337,6 +2404,354 @@ impl ManagementReceipt {
             ],
         )
     }
+}
+
+impl StreamCorrectionReceipt {
+    pub(crate) fn new(preimage: StreamCorrectionReceiptPreimage) -> Result<Self> {
+        let result_payload = stream_correction_result_payload(
+            &preimage.correction_id,
+            &preimage.correction_plan_digest,
+            &preimage.graph_commit_id,
+            preimage.resulting_manifest_version,
+            preimage.resulting_lifecycle_revision,
+        )?;
+        let mut value = Self {
+            protocol_version: STREAM_CORRECTION_RECEIPT_PROTOCOL_VERSION,
+            record_id: String::new(),
+            record_lookup_key: Self::lookup_key_for(
+                &preimage.graph_identity_digest,
+                preimage.identity,
+                &preimage.stream_incarnation_id,
+                &preimage.block_token,
+                &preimage.correction_id,
+            )?,
+            record_tag: STREAM_CORRECTION_RECEIPT_TAG.to_string(),
+            graph_identity_digest: preimage.graph_identity_digest,
+            identity: preimage.identity,
+            stream_incarnation_id: preimage.stream_incarnation_id,
+            binding_scope_id: preimage.binding_scope_id,
+            block_token: preimage.block_token,
+            correction_id: preimage.correction_id,
+            correction_plan_digest: preimage.correction_plan_digest,
+            actor_id: preimage.actor_id,
+            graph_commit_id: preimage.graph_commit_id,
+            result_payload,
+            result_digest: String::new(),
+            resulting_manifest_version: preimage.resulting_manifest_version,
+            resulting_lifecycle_revision: preimage.resulting_lifecycle_revision,
+            resulting_lifecycle_digest: preimage.resulting_lifecycle_digest,
+            resulting_token_authority_digest: preimage.resulting_token_authority_digest,
+            recorded_at: preimage.recorded_at,
+        };
+        value.result_digest = ManagementReceipt::result_digest_for(&value.result_payload)?;
+        value.record_id = value.compute_record_id();
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(crate) fn lookup_key_for(
+        graph_identity_digest: &str,
+        identity: TableIdentity,
+        stream_incarnation_id: &str,
+        block_token: &str,
+        correction_id: &str,
+    ) -> Result<String> {
+        validate_digest(
+            "correction receipt graph_identity_digest",
+            graph_identity_digest,
+        )?;
+        identity.validate()?;
+        validate_uuid(
+            "correction receipt stream_incarnation_id",
+            stream_incarnation_id,
+        )?;
+        validate_digest("correction receipt block_token", block_token)?;
+        validate_uuid("correction receipt correction_id", correction_id)?;
+        Ok(format!(
+            "stream-correction-v1:{}",
+            hash_fields(
+                STREAM_CORRECTION_RECEIPT_LOOKUP_DOMAIN,
+                &[
+                    graph_identity_digest.as_bytes(),
+                    &identity.stable_table_id.to_be_bytes(),
+                    &identity.table_incarnation_id.to_be_bytes(),
+                    stream_incarnation_id.as_bytes(),
+                    block_token.as_bytes(),
+                    correction_id.as_bytes(),
+                ],
+            )
+        ))
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.protocol_version != STREAM_CORRECTION_RECEIPT_PROTOCOL_VERSION
+            || self.record_tag != STREAM_CORRECTION_RECEIPT_TAG
+        {
+            return Err(OmniError::manifest_internal(
+                "stream correction receipt has an unsupported protocol or tag",
+            ));
+        }
+        validate_digest(
+            "correction receipt graph_identity_digest",
+            &self.graph_identity_digest,
+        )?;
+        self.identity.validate()?;
+        validate_uuid(
+            "correction receipt stream_incarnation_id",
+            &self.stream_incarnation_id,
+        )?;
+        validate_uuid(
+            "correction receipt binding_scope_id",
+            &self.binding_scope_id,
+        )?;
+        validate_digest("correction receipt block_token", &self.block_token)?;
+        validate_uuid("correction receipt correction_id", &self.correction_id)?;
+        validate_digest(
+            "correction receipt correction_plan_digest",
+            &self.correction_plan_digest,
+        )?;
+        validate_canonical_text("correction receipt actor_id", &self.actor_id)?;
+        validate_canonical_text("correction receipt graph_commit_id", &self.graph_commit_id)?;
+        if self.resulting_manifest_version == 0
+            || self.resulting_lifecycle_revision == 0
+            || self.recorded_at <= 0
+        {
+            return Err(OmniError::manifest_internal(
+                "stream correction receipt requires positive manifest/lifecycle versions and timestamp",
+            ));
+        }
+        validate_digest(
+            "correction receipt resulting_lifecycle_digest",
+            &self.resulting_lifecycle_digest,
+        )?;
+        validate_digest(
+            "correction receipt resulting_token_authority_digest",
+            &self.resulting_token_authority_digest,
+        )?;
+        let expected_result = stream_correction_result_payload(
+            &self.correction_id,
+            &self.correction_plan_digest,
+            &self.graph_commit_id,
+            self.resulting_manifest_version,
+            self.resulting_lifecycle_revision,
+        )?;
+        if self.result_payload != expected_result
+            || self.result_digest != ManagementReceipt::result_digest_for(&expected_result)?
+            || self.record_lookup_key
+                != Self::lookup_key_for(
+                    &self.graph_identity_digest,
+                    self.identity,
+                    &self.stream_incarnation_id,
+                    &self.block_token,
+                    &self.correction_id,
+                )?
+            || self.record_id != self.compute_record_id()
+        {
+            return Err(OmniError::manifest_internal(
+                "stream correction receipt differs from its canonical occurrence or result",
+            ));
+        }
+        Ok(())
+    }
+
+    fn compute_record_id(&self) -> String {
+        hash_fields(
+            STREAM_CORRECTION_RECEIPT_RECORD_DOMAIN,
+            &[
+                self.record_tag.as_bytes(),
+                self.record_lookup_key.as_bytes(),
+                self.graph_identity_digest.as_bytes(),
+                &self.identity.stable_table_id.to_be_bytes(),
+                &self.identity.table_incarnation_id.to_be_bytes(),
+                self.stream_incarnation_id.as_bytes(),
+                self.binding_scope_id.as_bytes(),
+                self.block_token.as_bytes(),
+                self.correction_id.as_bytes(),
+                self.correction_plan_digest.as_bytes(),
+                self.actor_id.as_bytes(),
+                self.graph_commit_id.as_bytes(),
+                self.result_digest.as_bytes(),
+                &self.resulting_manifest_version.to_be_bytes(),
+                &self.resulting_lifecycle_revision.to_be_bytes(),
+                self.resulting_lifecycle_digest.as_bytes(),
+                self.resulting_token_authority_digest.as_bytes(),
+                &self.recorded_at.to_be_bytes(),
+            ],
+        )
+    }
+}
+
+pub(crate) fn stream_correction_result_payload(
+    correction_id: &str,
+    correction_plan_digest: &str,
+    graph_commit_id: &str,
+    manifest_version: u64,
+    lifecycle_revision: u64,
+) -> Result<serde_json::Value> {
+    validate_uuid("correction result correction_id", correction_id)?;
+    validate_digest(
+        "correction result correction_plan_digest",
+        correction_plan_digest,
+    )?;
+    validate_canonical_text("correction result graph_commit_id", graph_commit_id)?;
+    if manifest_version == 0 || lifecycle_revision == 0 {
+        return Err(OmniError::manifest_internal(
+            "stream correction result requires positive manifest and lifecycle versions",
+        ));
+    }
+    Ok(serde_json::json!({
+        "correction_id": correction_id,
+        "correction_plan_digest": correction_plan_digest,
+        "graph_commit_id": graph_commit_id,
+        "lifecycle": "DRAINING",
+        "manifest_version": manifest_version,
+        "revision": lifecycle_revision,
+    }))
+}
+
+pub(crate) fn stream_lifecycle_authority_digest(
+    lifecycle: &StreamLifecycleEntry,
+) -> Result<String> {
+    let canonical = lifecycle.to_metadata_json()?;
+    Ok(hash_fields(
+        STREAM_LIFECYCLE_AUTHORITY_DIGEST_DOMAIN,
+        &[canonical.as_bytes()],
+    ))
+}
+
+/// Release one exact DataBlock after its corrected base/token effects have
+/// been prepared. The drain remains DRAINING and all claim/cut authority is
+/// preserved; only the graph HEAD, block, fold outcome, revision, and
+/// management-receipt chain may change.
+pub(crate) fn build_data_block_correction_successor(
+    prior: &StreamLifecycleEntry,
+    expected_block_token: &str,
+    correction_plan_digest: &str,
+    management_receipt: &ManagementReceipt,
+    outcome: StreamDataCorrectionOutcome,
+) -> Result<StreamLifecycleEntry> {
+    prior.validate()?;
+    validate_digest("correction expected_block_token", expected_block_token)?;
+    validate_digest("correction plan digest", correction_plan_digest)?;
+    let block = prior.strict_block.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal("stream correction requires a current strict block")
+    })?;
+    if prior.lifecycle != StreamLifecycle::Draining
+        || block.block_token != expected_block_token
+        || !matches!(block.evidence, StrictBlockEvidence::DataBlock { .. })
+    {
+        return Err(OmniError::manifest_internal(
+            "stream correction requires the exact current DataBlock authority",
+        ));
+    }
+    let blocked_summary = prior.last_fold_summary.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal("stream correction requires the blocked fold summary")
+    })?;
+    let drain_id = prior
+        .drain
+        .as_ref()
+        .expect("validated DRAINING lifecycle has a drain")
+        .drain_id
+        .clone();
+    if blocked_summary.outcome != LastFoldOutcome::StrictBlocked {
+        return Err(OmniError::manifest_internal(
+            "stream correction requires a STRICT_BLOCKED fold summary",
+        ));
+    }
+    let next_revision = prior.lifecycle_revision.checked_add(1).ok_or_else(|| {
+        OmniError::manifest_internal("stream correction lifecycle revision overflow")
+    })?;
+    let expected_table_version = prior
+        .current_head_witness
+        .table_version
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("stream correction table version overflow"))?;
+    outcome.current_head_witness.validate()?;
+    validate_canonical_text("correction graph_commit_id", &outcome.graph_commit_id)?;
+    if outcome.recorded_at <= 0
+        || outcome.current_head_witness.branch_identifier
+            != prior.current_head_witness.branch_identifier
+        || outcome.current_head_witness.table_version != expected_table_version
+        || outcome.current_head_witness.transaction_uuid
+            == prior.current_head_witness.transaction_uuid
+        || outcome.visible_rows > blocked_summary.input_rows
+    {
+        return Err(OmniError::manifest_internal(
+            "stream correction outcome does not name the exact next base-table effect",
+        ));
+    }
+    management_receipt.validate(next_revision)?;
+    let request_block_token = management_receipt
+        .request_payload
+        .get("block_token")
+        .and_then(serde_json::Value::as_str);
+    let request_plan_digest = management_receipt
+        .request_payload
+        .get("correction_plan_digest")
+        .and_then(serde_json::Value::as_str);
+    let expected_result = stream_correction_result_payload(
+        &management_receipt.operation_id,
+        correction_plan_digest,
+        &outcome.graph_commit_id,
+        outcome.manifest_version,
+        next_revision,
+    )?;
+    if management_receipt.identity != prior.identity
+        || management_receipt.stream_incarnation_id
+            != prior.enrollment_receipt.stream_incarnation_id
+        || management_receipt.binding_scope_id != prior.binding_scope_id
+        || management_receipt.operation_kind != STREAM_CORRECTION_OPERATION_KIND
+        || management_receipt.from_revision != prior.lifecycle_revision
+        || management_receipt.to_revision != next_revision
+        || management_receipt.predecessor_record_id != prior.management_receipt_chain.head_record_id
+        || management_receipt.prior_chain_digest != prior.management_receipt_chain.chain_digest
+        || management_receipt.chain_ordinal
+            != prior
+                .management_receipt_chain
+                .record_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "stream correction management receipt chain overflow",
+                    )
+                })?
+        || request_block_token != Some(expected_block_token)
+        || request_plan_digest != Some(correction_plan_digest)
+        || management_receipt.result_payload != expected_result
+        || management_receipt.recorded_at != outcome.recorded_at
+    {
+        return Err(OmniError::manifest_internal(
+            "stream correction management receipt differs from its exact block, plan, or result",
+        ));
+    }
+
+    let mut successor = prior.clone();
+    successor.current_head_witness = outcome.current_head_witness;
+    successor.lifecycle_revision = next_revision;
+    successor.management_receipt_chain = management_receipt.next_chain_ref()?;
+    successor.strict_block = None;
+    successor
+        .drain
+        .as_mut()
+        .expect("validated DRAINING lifecycle has a drain")
+        .expected_current_head_witness = successor.current_head_witness.clone();
+    successor.last_fold_summary = Some(LastFoldSummary {
+        // LastFoldSummary is the continuation proof for the active drain. The
+        // immutable correction/management receipts own the correction-id
+        // audit; retaining the drain id here lets the next empty-cut proof
+        // recognize this corrected publication as that drain's fold.
+        operation_id: drain_id,
+        graph_commit_id: Some(outcome.graph_commit_id),
+        exact_generation_cut: blocked_summary.exact_generation_cut.clone(),
+        outcome: LastFoldOutcome::Published,
+        input_rows: blocked_summary.input_rows,
+        input_bytes: blocked_summary.input_bytes,
+        visible_rows: outcome.visible_rows,
+        visible_bytes: outcome.visible_bytes,
+        recorded_at: outcome.recorded_at,
+    });
+    successor.validate_successor_of(prior)?;
+    Ok(successor)
 }
 
 /// Canonical semantic result of one successful quiesce transition.
@@ -5675,5 +6090,157 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn data_block_correction_successor_releases_only_the_block_and_advances_receipt_chain() {
+        let prior = strict_blocked_entry();
+        let block_token = prior.strict_block.as_ref().unwrap().block_token.clone();
+        let correction_id = "88888888-8888-4888-8888-888888888888";
+        let plan_digest = format!("sha256:{}", "8".repeat(64));
+        let graph_commit_id = "01H000000000000000000000C1";
+        let next_revision = prior.lifecycle_revision + 1;
+        let request_payload = serde_json::json!({
+            "block_token": block_token,
+            "correction_plan_digest": plan_digest,
+        });
+        let result_payload = stream_correction_result_payload(
+            correction_id,
+            &plan_digest,
+            graph_commit_id,
+            10,
+            next_revision,
+        )
+        .unwrap();
+        let management = ManagementReceipt::new(
+            format!("sha256:{}", "1".repeat(64)),
+            prior.identity,
+            prior.enrollment_receipt.stream_incarnation_id.clone(),
+            prior.binding_scope_id.clone(),
+            &prior.management_receipt_chain,
+            correction_id,
+            STREAM_CORRECTION_OPERATION_KIND,
+            prior.lifecycle_revision,
+            next_revision,
+            "actor:operator",
+            request_payload,
+            result_payload,
+            9,
+        )
+        .unwrap();
+        let mut next_head = prior.current_head_witness.clone();
+        next_head.table_version += 1;
+        next_head.transaction_uuid = "99999999-9999-4999-8999-999999999999".to_string();
+        let successor = build_data_block_correction_successor(
+            &prior,
+            &block_token,
+            &plan_digest,
+            &management,
+            StreamDataCorrectionOutcome {
+                graph_commit_id: graph_commit_id.to_string(),
+                manifest_version: 10,
+                current_head_witness: next_head.clone(),
+                visible_rows: 1,
+                visible_bytes: 1,
+                recorded_at: 9,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(successor.lifecycle, StreamLifecycle::Draining);
+        assert!(successor.strict_block.is_none());
+        assert_eq!(successor.current_head_witness, next_head);
+        assert_eq!(
+            successor
+                .drain
+                .as_ref()
+                .unwrap()
+                .expected_current_head_witness,
+            successor.current_head_witness
+        );
+        assert_eq!(
+            successor.management_receipt_chain,
+            management.next_chain_ref().unwrap()
+        );
+        assert_eq!(successor.binding, prior.binding);
+        assert_eq!(successor.claim_receipt_chain, prior.claim_receipt_chain);
+        let summary = successor.last_fold_summary.as_ref().unwrap();
+        assert_eq!(summary.outcome, LastFoldOutcome::Published);
+        assert_eq!(summary.operation_id, prior.drain.as_ref().unwrap().drain_id);
+        assert_eq!(
+            &summary.exact_generation_cut,
+            &prior
+                .last_fold_summary
+                .as_ref()
+                .unwrap()
+                .exact_generation_cut
+        );
+
+        let mut stale = management;
+        stale.request_payload["block_token"] =
+            serde_json::Value::String(format!("sha256:{}", "f".repeat(64)));
+        assert!(
+            build_data_block_correction_successor(
+                &prior,
+                &block_token,
+                &plan_digest,
+                &stale,
+                StreamDataCorrectionOutcome {
+                    graph_commit_id: graph_commit_id.to_string(),
+                    manifest_version: 10,
+                    current_head_witness: next_head,
+                    visible_rows: 1,
+                    visible_bytes: 1,
+                    recorded_at: 9,
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn correction_receipt_is_occurrence_keyed_and_commits_final_authority() {
+        let prior = strict_blocked_entry();
+        let block_token = prior.strict_block.as_ref().unwrap().block_token.clone();
+        let correction_id = "88888888-8888-4888-8888-888888888888".to_string();
+        let receipt = StreamCorrectionReceipt::new(StreamCorrectionReceiptPreimage {
+            graph_identity_digest: format!("sha256:{}", "1".repeat(64)),
+            identity: prior.identity,
+            stream_incarnation_id: prior.enrollment_receipt.stream_incarnation_id.clone(),
+            binding_scope_id: prior.binding_scope_id.clone(),
+            block_token: block_token.clone(),
+            correction_id: correction_id.clone(),
+            correction_plan_digest: format!("sha256:{}", "2".repeat(64)),
+            actor_id: "actor:operator".to_string(),
+            graph_commit_id: "01H000000000000000000000C1".to_string(),
+            resulting_manifest_version: 10,
+            resulting_lifecycle_revision: prior.lifecycle_revision + 1,
+            resulting_lifecycle_digest: format!("sha256:{}", "3".repeat(64)),
+            resulting_token_authority_digest: format!("sha256:{}", "4".repeat(64)),
+            recorded_at: 9,
+        })
+        .unwrap();
+        receipt.validate().unwrap();
+        assert_eq!(
+            receipt.record_lookup_key,
+            StreamCorrectionReceipt::lookup_key_for(
+                &receipt.graph_identity_digest,
+                prior.identity,
+                &receipt.stream_incarnation_id,
+                &block_token,
+                &correction_id,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<StreamCorrectionReceipt>(
+                &serde_json::to_string(&receipt).unwrap()
+            )
+            .unwrap(),
+            receipt
+        );
+        let mut tampered = receipt;
+        tampered.resulting_token_authority_digest = format!("sha256:{}", "5".repeat(64));
+        assert!(tampered.validate().is_err());
     }
 }

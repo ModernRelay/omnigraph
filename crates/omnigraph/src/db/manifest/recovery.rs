@@ -76,6 +76,10 @@ pub(crate) use stream_rebind_v18::*;
 mod stream_retirement_v19;
 pub(crate) use stream_retirement_v19::*;
 
+#[path = "recovery/stream_correction_v20.rs"]
+mod stream_correction_v20;
+pub(crate) use stream_correction_v20::*;
+
 /// System actor identifier for recovery-owned lineage: legacy recovery,
 /// exact-protocol rollback, schema-v6 EnsureIndices rollback, and orphan
 /// discard. A v3/v4 roll-forward
@@ -161,6 +165,12 @@ async fn publish_recovery_commit(
         .or_else(|| {
             sidecar.protocol_v17.as_deref().map(|protocol| {
                 let RecoveryProtocolV17::StreamSealedOptimize(protocol) = protocol;
+                &protocol.lineage
+            })
+        })
+        .or_else(|| {
+            sidecar.protocol_v20.as_deref().map(|protocol| {
+                let RecoveryProtocolV20::StreamCorrection(protocol) = protocol;
                 &protocol.lineage
             })
         });
@@ -252,6 +262,10 @@ async fn publish_recovery_commit(
         ) = sidecar.protocol_v14.as_deref()
         {
             intent.stream_fold_attribution = Some(protocol.token.attribution_summary.clone());
+        } else if let Some(RecoveryProtocolV20::StreamCorrection(protocol)) =
+            sidecar.protocol_v20.as_deref()
+        {
+            intent.stream_fold_attribution = protocol.token.attribution_summary.clone();
         }
     }
     let publisher = GraphNamespacePublisher::new_with_session(
@@ -313,6 +327,12 @@ async fn publish_recovery_commit(
         .or_else(|| {
             sidecar.protocol_v17.as_deref().map(|protocol| {
                 let RecoveryProtocolV17::StreamSealedOptimize(protocol) = protocol;
+                &protocol.authority
+            })
+        })
+        .or_else(|| {
+            sidecar.protocol_v20.as_deref().map(|protocol| {
+                let RecoveryProtocolV20::StreamCorrection(protocol) = protocol;
                 &protocol.authority
             })
         });
@@ -468,7 +488,13 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// lineage-neutral `DISABLED -> RETIRED` manifest publication. It never moves
 /// a graph head, creates a GraphCommit, or appends a RecoveryAudit row. The
 /// frozen v14 retirement scaffold keeps its old fail-closed meaning.
-pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 19;
+///
+/// v19 → v20: RFC-026 F3f exact DataBlock correction. V20 owns the exact
+/// blocked cut, base-table transaction, combined token/receipt transaction,
+/// fixed lineage, and sole manifest publication that clears that exact block
+/// while keeping the drain active. The frozen v14 correction scaffold keeps
+/// its old fail-closed meaning.
+pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 20;
 
 /// The only recovery generation emitted by the manifest-v5 write paths.
 pub(crate) const IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION: u32 = 9;
@@ -510,6 +536,9 @@ pub(crate) const STREAM_REBIND_SIDECAR_SCHEMA_VERSION: u32 = 18;
 
 /// Exact offline root-wide authority-retirement generation.
 pub(crate) const STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION: u32 = 19;
+
+/// Exact offline DataBlock-correction generation.
+pub(crate) const STREAM_CORRECTION_SIDECAR_SCHEMA_VERSION: u32 = 20;
 
 /// Schema v11 is the first sidecar allowed to describe data-bearing MemWAL
 /// state, which is bound to stream-config v2 rather than Phase A's config-v1.
@@ -2044,6 +2073,9 @@ pub(crate) struct RecoverySidecar {
     /// v19 only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v19: Option<Box<RecoveryProtocolV19>>,
+    /// Exact RFC-026 offline DataBlock-correction envelope (schema v20 only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_v20: Option<Box<RecoveryProtocolV20>>,
     /// EnsureIndices-only fixed rollback identity. It does not make the
     /// physical index effects exact; it only makes compensation retry-safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2066,6 +2098,11 @@ impl RecoverySidecar {
                 self.protocol_v18
                     .as_deref()
                     .map(RecoveryProtocolV18::admission_scope)
+            })
+            .or_else(|| {
+                self.protocol_v20
+                    .as_deref()
+                    .map(RecoveryProtocolV20::admission_scope)
             })
     }
 }
@@ -2578,6 +2615,14 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
         )));
     }
+    if sidecar.protocol_v20.is_some()
+        && sidecar.schema_version != STREAM_CORRECTION_SIDECAR_SCHEMA_VERSION
+    {
+        return Err(malformed(format!(
+            "protocol_v20 requires schema-v{}, found schema-v{}",
+            STREAM_CORRECTION_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
+        )));
+    }
 
     if sidecar.schema_version < EXACT_EFFECT_IDENTITY_SCHEMA_VERSION {
         if sidecar.protocol_v3.is_some()
@@ -2594,6 +2639,7 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             || sidecar.protocol_v17.is_some()
             || sidecar.protocol_v18.is_some()
             || sidecar.protocol_v19.is_some()
+            || sidecar.protocol_v20.is_some()
         {
             return Err(malformed(
                 "an exact-effect protocol is present on a pre-v3 sidecar".to_string(),
@@ -2640,6 +2686,10 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
 
     if sidecar.schema_version == STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION {
         return validate_stream_protocol_v19_shape(sidecar_uri, sidecar);
+    }
+
+    if sidecar.schema_version == STREAM_CORRECTION_SIDECAR_SCHEMA_VERSION {
+        return validate_stream_protocol_v20_shape(sidecar_uri, sidecar);
     }
 
     if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
@@ -8129,11 +8179,15 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
     let mut processed_any = false;
     let mut unresolved = Vec::new();
     for sidecar in sidecars {
-        let outcome = if sidecar.schema_version == STREAM_REBIND_SIDECAR_SCHEMA_VERSION {
-            // The v18 continuation reaches deep Lance coordinator planning.
-            // Its fresh task owns the complete gate envelope, under-gate
-            // reread, classification, and effects, so parent cancellation can
-            // never release recovery ownership while the child keeps running.
+        let outcome = if matches!(
+            sidecar.schema_version,
+            STREAM_REBIND_SIDECAR_SCHEMA_VERSION | STREAM_CORRECTION_SIDECAR_SCHEMA_VERSION
+        ) {
+            // The v18 and v20 continuations reach deep Lance coordinator and
+            // exact-effect planning. Their fresh task owns the complete gate
+            // envelope, under-gate reread, classification, and effects, so
+            // parent cancellation can never release recovery ownership while
+            // the child keeps running.
             let root_uri = root_uri.to_string();
             let storage = std::sync::Arc::clone(&storage);
             let write_queue = std::sync::Arc::clone(&write_queue);
@@ -8143,7 +8197,7 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
             .await
             .map_err(|error| {
                 OmniError::Lance(format!(
-                    "stream rebind recovery owner task failed before returning its exact outcome: {error}"
+                    "stream recovery owner task failed before returning its exact outcome: {error}"
                 ))
             })??
         } else {
@@ -10705,6 +10759,7 @@ async fn validate_stream_fold_token_rows_against_base(
     sidecar: &RecoverySidecar,
     binding: &super::StreamPhysicalBinding,
     planned_rows: &[super::stream_token::StreamTokenAuthorityRow],
+    forbidden_rows: &[super::stream_token::StreamTokenAuthorityRow],
 ) -> Result<()> {
     let pin = &sidecar.tables[0];
     let uri = format!(
@@ -10723,8 +10778,15 @@ async fn validate_stream_fold_token_rows_against_base(
     .map_err(|error| stream_fold_effect_error(sidecar, error))?;
     let exact_ids = planned_rows
         .iter()
+        .chain(forbidden_rows)
         .map(|row| row.logical_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
+    if exact_ids.is_empty() {
+        return Err(stream_fold_effect_error(
+            sidecar,
+            OmniError::manifest_internal("recovery base-token probe requires at least one key"),
+        ));
+    }
     let mut scanner = dataset.scan();
     scanner.filter_expr(
         datafusion::prelude::col("id").in_list(
@@ -10761,7 +10823,20 @@ async fn validate_stream_fold_token_rows_against_base(
         .iter()
         .map(|row| (row.logical_id.as_str(), row))
         .collect::<BTreeMap<_, _>>();
-    let mut observed = std::collections::BTreeSet::new();
+    let forbidden = forbidden_rows
+        .iter()
+        .map(|row| (row.logical_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    if planned.keys().any(|key| forbidden.contains_key(key)) {
+        return Err(stream_fold_effect_error(
+            sidecar,
+            OmniError::manifest_internal(
+                "recovery base-token probe has contradictory required and forbidden authority",
+            ),
+        ));
+    }
+    let mut seen_rows = std::collections::BTreeSet::new();
+    let mut observed_planned = std::collections::BTreeSet::new();
     let mut observed_rows = 0_usize;
     let mut retained_bytes = 0_u64;
     while let Some(batch) = futures::TryStreamExt::try_next(&mut stream)
@@ -10774,10 +10849,10 @@ async fn validate_stream_fold_token_rows_against_base(
                 OmniError::manifest_internal("recovery base-token probe row-count overflow"),
             )
         })?;
-        if observed_rows > planned.len() {
+        if observed_rows > exact_ids.len() {
             return Err(OmniError::recovery_required(
                 sidecar.operation_id.clone(),
-                "recovery base-token probe returned more than one row per planned key",
+                "recovery base-token probe returned more than one row per queried key",
             ));
         }
         let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
@@ -10827,51 +10902,68 @@ async fn validate_stream_fold_token_rows_against_base(
                 ));
             }
             let logical_id = ids.value(row_index);
-            let expected = planned.get(logical_id).ok_or_else(|| {
-                OmniError::recovery_required(
+            let expected = planned.get(logical_id);
+            let forbidden = forbidden.get(logical_id);
+            if expected.is_none() && forbidden.is_none() {
+                return Err(OmniError::recovery_required(
                     sidecar.operation_id.clone(),
                     "recovery base-token probe returned an unplanned logical id",
-                )
-            })?;
+                ));
+            }
+            if !seen_rows.insert(logical_id.to_string()) {
+                return Err(OmniError::recovery_required(
+                    sidecar.operation_id.clone(),
+                    "recovery base-token probe returned more than one row for a logical id",
+                ));
+            }
             let decoded =
                 super::stream_token::decode_trusted_stream_metadata(metadata.as_ref(), row_index)
                     .map_err(|error| {
-                        OmniError::recovery_required(
-                            sidecar.operation_id.clone(),
-                            error.to_string(),
+                    OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
+                })?;
+            if let Some(decoded) = &decoded {
+                retained_bytes = super::token_store::add_stream_lookup_retained_bytes(
+                    "stream_fold_recovery_probe_retained_bytes",
+                    retained_bytes,
+                    decoded.lookup_retained_bytes(logical_id).map_err(|error| {
+                        stream_fold_effect_error(
+                            sidecar,
+                            OmniError::manifest_internal(error.to_string()),
                         )
-                    })?
-                    .ok_or_else(|| {
-                        OmniError::recovery_required(
-                            sidecar.operation_id.clone(),
-                            "planned StreamFold token row has null base attribution",
-                        )
-                    })?;
-            retained_bytes = super::token_store::add_stream_lookup_retained_bytes(
-                "stream_fold_recovery_probe_retained_bytes",
-                retained_bytes,
-                decoded.lookup_retained_bytes(logical_id).map_err(|error| {
-                    stream_fold_effect_error(
-                        sidecar,
-                        OmniError::manifest_internal(error.to_string()),
-                    )
-                })?,
-                crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES,
-            )
-            .map_err(|error| stream_fold_effect_error(sidecar, error))?;
-            if !decoded.agrees_with_authority(expected) || !observed.insert(logical_id.to_string())
-            {
+                    })?,
+                    crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES,
+                )
+                .map_err(|error| stream_fold_effect_error(sidecar, error))?;
+            }
+            if expected.is_some_and(|expected| {
+                decoded
+                    .as_ref()
+                    .is_none_or(|decoded| !decoded.agrees_with_authority(expected))
+            }) {
                 return Err(OmniError::recovery_required(
                     sidecar.operation_id.clone(),
-                    "planned StreamFold token authority differs from the achieved base winner",
+                    "planned stream-token authority differs from the achieved base winner",
                 ));
+            }
+            if forbidden.is_some_and(|forbidden| {
+                decoded
+                    .as_ref()
+                    .is_some_and(|decoded| decoded.agrees_with_authority(forbidden))
+            }) {
+                return Err(OmniError::recovery_required(
+                    sidecar.operation_id.clone(),
+                    "withdrawn blocked winner remains the achieved base authority",
+                ));
+            }
+            if expected.is_some() {
+                observed_planned.insert(logical_id.to_string());
             }
         }
     }
-    if observed.len() != planned.len() {
+    if observed_planned.len() != planned.len() {
         return Err(OmniError::recovery_required(
             sidecar.operation_id.clone(),
-            "achieved StreamFold base version is missing one or more planned token winners",
+            "achieved stream base version is missing one or more planned token winners",
         ));
     }
     Ok(())
@@ -10890,6 +10982,7 @@ async fn validate_stream_fold_token_rows_against_base_v12(
         sidecar,
         &protocol.binding,
         &protocol.token.planned_rows,
+        &[],
     )
     .await
 }
@@ -10904,6 +10997,7 @@ async fn validate_stream_fold_token_rows_against_base_v14(
         sidecar,
         &protocol.binding,
         &protocol.token.planned_rows,
+        &[],
     )
     .await
 }
@@ -13813,6 +13907,13 @@ async fn process_sidecar_inner(
     }
     if sidecar.schema_version == STREAM_REBIND_SIDECAR_SCHEMA_VERSION {
         return process_stream_rebind_sidecar_v18(root_uri, storage, snapshot, sidecar).await;
+    }
+    if sidecar.schema_version == STREAM_CORRECTION_SIDECAR_SCHEMA_VERSION {
+        // Recovery-v20 retains a bounded generation-sized blocked-winner and
+        // successor plan. Keep that processor's async state behind its own
+        // heap boundary so adding the variant does not inflate the closed
+        // recovery dispatcher's stack frame on every open.
+        return process_stream_correction_sidecar_v20(root_uri, storage, snapshot, sidecar).await;
     }
     if sidecar.schema_version == STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION {
         return match sidecar
@@ -18674,6 +18775,7 @@ fn new_unvalidated_sidecar(
         protocol_v17: None,
         protocol_v18: None,
         protocol_v19: None,
+        protocol_v20: None,
         ensure_indices_rollback_v6: None,
     }
 }
@@ -20505,6 +20607,7 @@ pub(crate) fn new_ensure_indices_sidecar_v9(
         protocol_v17: None,
         protocol_v18: None,
         protocol_v19: None,
+        protocol_v20: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-ensure-indices-v9-sidecar>", &sidecar)?;
@@ -20866,6 +20969,7 @@ pub(crate) fn new_occ_sidecar_v9(
         protocol_v17: None,
         protocol_v18: None,
         protocol_v19: None,
+        protocol_v20: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-occ-sidecar>", &sidecar)?;
@@ -21061,6 +21165,7 @@ pub(crate) fn new_schema_apply_sidecar_v9(
         protocol_v17: None,
         protocol_v18: None,
         protocol_v19: None,
+        protocol_v20: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-schema-apply-v9-sidecar>", &sidecar)?;
@@ -21237,6 +21342,7 @@ pub(crate) fn new_branch_merge_sidecar_v9(
         protocol_v17: None,
         protocol_v18: None,
         protocol_v19: None,
+        protocol_v20: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-branch-merge-sidecar>", &sidecar)?;

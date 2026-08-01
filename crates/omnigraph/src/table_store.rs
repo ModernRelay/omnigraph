@@ -1562,28 +1562,76 @@ impl TableStore {
         shard_id: ShardId,
         generation: u64,
     ) -> Result<StagedWrite> {
-        const CONTEXT: &str = "stage_stream_fold";
+        self.stage_stream_generation_update(
+            ds,
+            table_key,
+            batches,
+            shard_id,
+            generation,
+            false,
+            "stage_stream_fold",
+        )
+        .await
+    }
 
+    /// Stage one F3f correction result and consume its immutable MemWAL cut.
+    ///
+    /// A correction may withdraw every winner. In that case the logical base
+    /// effect is deliberately empty, but Lance must still record the exact
+    /// `MergedGeneration` in the same transaction so restart cannot offer the
+    /// blocked generation again. Ordinary folds continue to reject empty
+    /// input through [`Self::stage_stream_fold`].
+    pub async fn stage_stream_correction(
+        &self,
+        ds: Dataset,
+        table_key: &str,
+        batches: Vec<RecordBatch>,
+        shard_id: ShardId,
+        generation: u64,
+    ) -> Result<StagedWrite> {
+        self.stage_stream_generation_update(
+            ds,
+            table_key,
+            batches,
+            shard_id,
+            generation,
+            true,
+            "stage_stream_correction",
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_stream_generation_update(
+        &self,
+        ds: Dataset,
+        table_key: &str,
+        mut batches: Vec<RecordBatch>,
+        shard_id: ShardId,
+        generation: u64,
+        allow_empty: bool,
+        context: &'static str,
+    ) -> Result<StagedWrite> {
         if shard_id.is_nil() {
-            return Err(OmniError::manifest_internal(
-                "stage_stream_fold requires a non-nil MemWAL shard identity",
-            ));
+            return Err(OmniError::manifest_internal(format!(
+                "{context} requires a non-nil MemWAL shard identity"
+            )));
         }
         if generation == 0 {
-            return Err(OmniError::manifest_internal(
-                "stage_stream_fold requires a positive MemWAL generation",
-            ));
+            return Err(OmniError::manifest_internal(format!(
+                "{context} requires a positive MemWAL generation"
+            )));
         }
 
-        let id_field_id = exact_id_primary_key_field_id(&ds, CONTEXT)?;
+        let id_field_id = exact_id_primary_key_field_id(&ds, context)?;
         let mem_wal = ds
             .mem_wal_index_details()
             .await
             .map_err(|error| OmniError::Lance(error.to_string()))?
             .ok_or_else(|| {
-                OmniError::manifest_internal(
-                    "stage_stream_fold requires an already-enrolled MemWAL index",
-                )
+                OmniError::manifest_internal(format!(
+                    "{context} requires an already-enrolled MemWAL index"
+                ))
             })?;
         if let Some(existing) = mem_wal
             .merged_generations
@@ -1592,7 +1640,7 @@ impl TableStore {
             && existing.generation >= generation
         {
             return Err(OmniError::manifest_internal(format!(
-                "stage_stream_fold generation {generation} for shard {shard_id} is not fresh; \
+                "{context} generation {generation} for shard {shard_id} is not fresh; \
                  base table already records generation {}",
                 existing.generation
             )));
@@ -1626,16 +1674,26 @@ impl TableStore {
                     input_bytes,
                 ));
             }
-            for id in validate_keyed_write_batch_ids(batch, table_key, CONTEXT)? {
+            for id in validate_keyed_write_batch_ids(batch, table_key, context)? {
                 if !source_ids.insert(id.clone()) {
                     return Err(OmniError::key_conflict(table_key, id));
                 }
             }
         }
-        if total_rows == 0 {
+        if total_rows == 0 && !allow_empty {
             return Err(OmniError::manifest_internal(
                 "stage_stream_fold called without fresh rows",
             ));
+        }
+
+        // Lance's merge-insert planner still needs the exact physical source
+        // schema when the correction is marker-only. A zero-row batch creates
+        // no data effect; it merely lets Lance build the Update transaction
+        // that carries the merged-generation marker.
+        if batches.is_empty() {
+            batches.push(RecordBatch::new_empty(Arc::new(
+                arrow_schema::Schema::from(ds.schema()),
+            )));
         }
 
         let mut materialized_bytes = 0_u64;
@@ -1645,15 +1703,15 @@ impl TableStore {
             let expected_rows = batch.num_rows();
             let batch = self.prepare_keyed_write_batch(table_key, batch).await?;
             if batch.num_rows() != expected_rows {
-                return Err(OmniError::manifest_internal(
-                    "stage_stream_fold blob preparation changed the source row count",
-                ));
+                return Err(OmniError::manifest_internal(format!(
+                    "{context} blob preparation changed the source row count"
+                )));
             }
             if let Some(expected) = &source_schema {
                 if expected.as_ref() != batch.schema().as_ref() {
-                    return Err(OmniError::manifest_internal(
-                        "stage_stream_fold received prepared batches with different schemas",
-                    ));
+                    return Err(OmniError::manifest_internal(format!(
+                        "{context} received prepared batches with different schemas"
+                    )));
                 }
             } else {
                 source_schema = Some(batch.schema());
@@ -1676,7 +1734,7 @@ impl TableStore {
         }
 
         let source_schema = source_schema.ok_or_else(|| {
-            OmniError::manifest_internal("stage_stream_fold has rows but no source schema")
+            OmniError::manifest_internal(format!("{context} has no source schema"))
         })?;
         let reader = arrow_array::RecordBatchIterator::new(
             prepared.into_iter().map(Ok).collect::<Vec<_>>(),
@@ -1700,10 +1758,10 @@ impl TableStore {
             .await
             .map_err(|error| OmniError::Lance(error.to_string()))?;
 
-        validate_exact_id_filter(&uncommitted, id_field_id, CONTEXT)?;
-        validate_stream_fold_result(&uncommitted, &marker, total_rows)?;
+        validate_exact_id_filter(&uncommitted, id_field_id, context)?;
+        validate_stream_generation_update_result(&uncommitted, &marker, total_rows, context)?;
         crate::instrumentation::record_stage_merge_insert(total_rows);
-        staged_keyed_merge_result(uncommitted, CONTEXT)
+        staged_keyed_merge_result(uncommitted, context)
     }
 
     /// Stage the narrow RFC-023 pure-insert fast path.
@@ -3980,22 +4038,23 @@ fn validate_strict_insert_merge_stats(
 
 /// Fail closed unless Lance staged every fold row once and embedded exactly
 /// the selected fresh-generation cut in that same transaction.
-fn validate_stream_fold_result(
+fn validate_stream_generation_update_result(
     uncommitted: &UncommittedMergeInsert,
     expected_marker: &MergedGeneration,
     expected_rows: u64,
+    context: &'static str,
 ) -> Result<()> {
     let Operation::Update {
         merged_generations, ..
     } = &uncommitted.transaction.operation
     else {
-        return Err(OmniError::manifest_internal(
-            "stage_stream_fold did not produce a Lance Update transaction",
-        ));
+        return Err(OmniError::manifest_internal(format!(
+            "{context} did not produce a Lance Update transaction"
+        )));
     };
     if merged_generations.as_slice() != std::slice::from_ref(expected_marker) {
         return Err(OmniError::manifest_internal(format!(
-            "stage_stream_fold transaction carried merged generations {merged_generations:?}; \
+            "{context} transaction carried merged generations {merged_generations:?}; \
              expected exactly {expected_marker:?}"
         )));
     }
@@ -4011,7 +4070,7 @@ fn validate_stream_fold_result(
         || stats.num_attempts != 1
     {
         return Err(OmniError::manifest_internal(format!(
-            "stage_stream_fold merge stats were inserted={}, updated={}, deleted={}, skipped={}, attempts={}; expected inserted+updated={expected_rows}, deleted=0, skipped=0, attempts=1",
+            "{context} merge stats were inserted={}, updated={}, deleted={}, skipped={}, attempts={}; expected inserted+updated={expected_rows}, deleted=0, skipped=0, attempts=1",
             stats.num_inserted_rows,
             stats.num_updated_rows,
             stats.num_deleted_rows,

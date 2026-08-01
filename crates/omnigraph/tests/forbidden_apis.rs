@@ -211,6 +211,10 @@ const STREAM_LIFECYCLE_V14_V15: WriteProtocol =
     WriteProtocol::Composed("private firehose lifecycle recovery v14 + resume recovery v15");
 const STREAM_REBIND_V18: WriteProtocol =
     WriteProtocol::Exact("private physical rebind recovery v18");
+const STREAM_RETIREMENT_V19: WriteProtocol =
+    WriteProtocol::Exact("stream authority retirement recovery v19");
+const STREAM_CORRECTION_V20: WriteProtocol =
+    WriteProtocol::Exact("stream DataBlock correction recovery v20");
 const STREAM_ENROLLMENT_V14_REBIND_V18: WriteProtocol =
     WriteProtocol::Composed("StreamEnrollmentV2 recovery v14 + physical rebind recovery v18");
 const STREAM_LIFECYCLE_V14_V15_V18: WriteProtocol =
@@ -265,6 +269,19 @@ write_surfaces! {
     "db/omnigraph/stream_rebind.rs" => WriteProtocol::TestOnly => [
         "failpoint_stream_rebind_checked_for_test",
     ],
+    "db/omnigraph/stream_retirement.rs" => STREAM_RETIREMENT_V19 => [
+        "confirm_stream_authority_retirement",
+    ],
+    "db/omnigraph/stream_retirement.rs" => WriteProtocol::TestOnly => [
+        "failpoint_withdraw_stream_token_for_retirement_test",
+    ],
+    "db/omnigraph/stream_correction.rs" => STREAM_CORRECTION_V20 => [
+        "correct_stream_data_block",
+    ],
+    "db/omnigraph/stream_correction.rs" => WriteProtocol::TestOnly => [
+        "failpoint_correct_stream_data_block_for_test",
+        "failpoint_show_stream_data_block_for_test",
+    ],
     "db/omnigraph/stream_ndjson.rs" => WriteProtocol::TestOnly => [
         "failpoint_stream_ingest_ndjson_as_for_test",
         "failpoint_stream_ingest_ndjson_cancel_for_test",
@@ -291,6 +308,14 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     (
         "db/omnigraph/stream_profile.rs",
         "check_cluster_maintenance_authority",
+    ),
+    (
+        "db/omnigraph/stream_profile.rs",
+        "check_cluster_block_authority",
+    ),
+    (
+        "db/omnigraph/stream_profile.rs",
+        "check_cluster_retirement_authority",
     ),
     (
         "db/omnigraph/stream_profile.rs",
@@ -325,6 +350,14 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     // admission lease, no recovery resolution, no publication. Registering it
     // read-only is the structural claim that it cannot move a lifecycle.
     ("db/omnigraph/stream_status.rs", "stream_status"),
+    (
+        "db/omnigraph/stream_retirement.rs",
+        "plan_stream_authority_retirement",
+    ),
+    (
+        "db/omnigraph/stream_correction.rs",
+        "show_stream_data_block",
+    ),
     ("exec/query.rs", "query"),
     ("exec/query.rs", "run_query_at"),
 ];
@@ -587,7 +620,8 @@ gateway_surfaces! {
         "prepare_keyed_write_batch", "validate_keyed_write_batch", "first_existing_id",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::StageOnly => [
-        "stage_create", "stage_keyed_write", "stage_stream_fold", "stage_proven_strict_insert", "stage_overwrite",
+        "stage_create", "stage_keyed_write", "stage_stream_fold", "stage_stream_correction",
+        "stage_proven_strict_insert", "stage_overwrite",
         "stage_delete", "stage_create_indices",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
@@ -622,7 +656,8 @@ gateway_surfaces! {
         "materialize_blob_batch_bounded",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
-        "stage_create", "stage_keyed_write", "stage_stream_fold", "stage_proven_strict_insert", "stage_overwrite",
+        "stage_create", "stage_keyed_write", "stage_stream_fold", "stage_stream_correction",
+        "stage_proven_strict_insert", "stage_overwrite",
         "stage_delete", "stage_create_indices",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
@@ -701,8 +736,9 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_create_exact(", 1, WriteProtocol::Exact("sealed TableStorage create forwarding")),
     ("storage_layer.rs", ".commit_staged(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".stage_stream_correction(", 1, WriteProtocol::Composed("sealed TableStorage correction staging forwarding")),
     ("storage_layer.rs", ".dataset()", 25, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".into_arc()", 5, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
@@ -721,11 +757,14 @@ durable_calls! {
     ("db/omnigraph/stream_ingest.rs", "write_sidecar(", 4, STREAM_LIFECYCLE_V14_V15),
     ("db/omnigraph/stream_profile.rs", "write_sidecar(", 1, STREAM_PROFILE_V13),
     ("db/omnigraph/stream_rebind.rs", "write_sidecar(", 1, STREAM_REBIND_V18),
+    ("db/omnigraph/stream_retirement.rs", "write_sidecar(", 1, STREAM_RETIREMENT_V19),
+    ("db/omnigraph/stream_correction.rs", "write_sidecar(", 1, STREAM_CORRECTION_V20),
     ("db/manifest/recovery/stream_rebind_v18.rs", "write_sidecar(", 1, STREAM_REBIND_V18),
     ("db/manifest/token_store.rs", "Dataset::write(", 1, WriteProtocol::Bootstrap),
-    ("db/manifest/token_store.rs", "MergeInsertBuilder::try_new(", 3, WriteProtocol::Composed("stream token + lifecycle-ledger staging")),
-    ("db/manifest/token_store.rs", ".execute_uncommitted(", 3, WriteProtocol::Composed("stream token + lifecycle-ledger staging")),
-    ("db/manifest/token_store.rs", "stage_lifecycle_ledger_records(", 5, WriteProtocol::Composed("typed lifecycle-ledger staging wrappers")),
+    ("db/manifest/token_store.rs", "MergeInsertBuilder::try_new(", 4, WriteProtocol::Composed("stream token + lifecycle-ledger staging")),
+    ("db/manifest/token_store.rs", ".execute_uncommitted(", 4, WriteProtocol::Composed("stream token + lifecycle-ledger staging")),
+    ("db/manifest/token_store.rs", "stage_lifecycle_ledger_records(", 6, WriteProtocol::Composed("typed lifecycle-ledger staging wrappers")),
+    ("db/manifest/token_store.rs", "stage_stream_token_and_lifecycle_records(", 1, WriteProtocol::Composed("combined stream token + lifecycle-ledger staging wrapper")),
     ("db/omnigraph/stream_enrollment.rs", "stage_lifecycle_ledger_records(", 1, STREAM_ENROLLMENT_V14),
     ("db/omnigraph/stream_ingest.rs", "stage_lifecycle_ledger_records(", 2, STREAM_LIFECYCLE_V14_V15),
     ("db/manifest/recovery/stream_rebind_v18.rs", "stage_lifecycle_ledger_records(", 2, STREAM_REBIND_V18),
@@ -733,6 +772,11 @@ durable_calls! {
     ("db/manifest/recovery.rs", "stage_lifecycle_ledger_records(", 3, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/stream_ingest.rs", "stage_stream_token_upsert(", 1, STREAM_LIFECYCLE_V14),
     ("db/manifest/recovery.rs", "stage_stream_token_upsert(", 2, WriteProtocol::RecoveryExecutor),
+    ("db/omnigraph/stream_retirement.rs", "stage_stream_token_upsert(", 1, STREAM_RETIREMENT_V19),
+    ("db/omnigraph/stream_retirement.rs", "stage_authority_retirement_receipt(", 1, STREAM_RETIREMENT_V19),
+    ("db/manifest/recovery/stream_retirement_v19.rs", "stage_authority_retirement_receipt(", 1, STREAM_RETIREMENT_V19),
+    ("db/omnigraph/stream_correction.rs", "stage_stream_correction_effect(", 1, STREAM_CORRECTION_V20),
+    ("db/manifest/recovery/stream_correction_v20.rs", "stage_stream_correction_effect(", 1, STREAM_CORRECTION_V20),
     ("db/omnigraph/stream_profile.rs", "stage_profile_management_receipt(", 1, STREAM_PROFILE_V13),
     ("exec/staging.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("Mutation/Load v9")),
     ("exec/merge.rs", ".commit_staged_exact(", 1, MERGE_V9),
@@ -742,10 +786,14 @@ durable_calls! {
     ("db/omnigraph/stream_enrollment.rs", ".commit_staged_exact(", 1, STREAM_ENROLLMENT_V14),
     ("db/omnigraph/stream_ingest.rs", ".commit_staged_exact(", 5, STREAM_LIFECYCLE_V14_V15),
     ("db/omnigraph/stream_profile.rs", ".commit_staged_exact(", 1, STREAM_PROFILE_V13),
+    ("db/omnigraph/stream_retirement.rs", ".commit_staged_exact(", 2, STREAM_RETIREMENT_V19),
+    ("db/omnigraph/stream_correction.rs", ".commit_staged_exact(", 2, STREAM_CORRECTION_V20),
     ("db/omnigraph/stream_profile.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/stream_profile.rs", "SnapshotHandle::new(", 1, STREAM_PROFILE_V13),
     ("db/manifest/recovery.rs", ".commit_staged_exact(", 5, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery/stream_rebind_v18.rs", ".commit_staged_exact(", 1, STREAM_REBIND_V18),
+    ("db/manifest/recovery/stream_retirement_v19.rs", ".commit_staged_exact(", 1, STREAM_RETIREMENT_V19),
+    ("db/manifest/recovery/stream_correction_v20.rs", ".commit_staged_exact(", 1, STREAM_CORRECTION_V20),
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("adapter-owned first-touch data ref")),
     ("exec/staging.rs", "confirm_occ_sidecar_v9(", 1, WriteProtocol::Exact("Mutation/Load v9")),
@@ -769,6 +817,12 @@ durable_calls! {
     ("db/omnigraph/stream_profile.rs", "confirm_stream_profile_change_sidecar_v13(", 1, STREAM_PROFILE_V13),
     ("db/manifest/recovery.rs", "confirm_stream_profile_change_sidecar_v13(", 1, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/stream_profile.rs", "complete_stream_profile_change_sidecar_v13(", 2, STREAM_PROFILE_V13),
+    ("db/omnigraph/stream_retirement.rs", "confirm_stream_authority_retirement_sidecar_v19(", 1, STREAM_RETIREMENT_V19),
+    ("db/manifest/recovery/stream_retirement_v19.rs", "confirm_stream_authority_retirement_sidecar_v19(", 1, STREAM_RETIREMENT_V19),
+    ("db/omnigraph/stream_retirement.rs", "complete_stream_authority_retirement_sidecar_v19(", 2, STREAM_RETIREMENT_V19),
+    ("db/omnigraph/stream_correction.rs", "confirm_stream_correction_sidecar_v20(", 1, STREAM_CORRECTION_V20),
+    ("db/manifest/recovery/stream_correction_v20.rs", "confirm_stream_correction_sidecar_v20(", 1, STREAM_CORRECTION_V20),
+    ("db/omnigraph/stream_correction.rs", "complete_stream_correction_sidecar_v20(", 3, STREAM_CORRECTION_V20),
     ("exec/mutation.rs", "delete_sidecar(", 1, MUTATION_V9),
     ("loader/mod.rs", "delete_sidecar(", 1, LOAD_V9),
     ("exec/merge.rs", "delete_sidecar(", 1, MERGE_V9),
@@ -794,6 +848,8 @@ durable_calls! {
     ("db/omnigraph.rs", ".write_text(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".write_text(", 2, WriteProtocol::Composed("schema state publication")),
     ("db/manifest/recovery.rs", ".write_text(", 18, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery/stream_retirement_v19.rs", ".write_text(", 1, STREAM_RETIREMENT_V19),
+    ("db/manifest/recovery/stream_correction_v20.rs", ".write_text(", 1, STREAM_CORRECTION_V20),
     ("db/omnigraph/schema_apply.rs", ".write_text(", 1, SCHEMA_V9),
     ("db/omnigraph.rs", ".delete(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".delete(", 3, WriteProtocol::Composed("schema staging cleanup")),
@@ -828,15 +884,20 @@ durable_calls! {
     ("db/manifest/recovery.rs", ".force_delete_branch(", 2, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".publish_with_precondition(", 7, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery/stream_rebind_v18.rs", ".publish_with_precondition(", 1, STREAM_REBIND_V18),
+    ("db/manifest/recovery/stream_retirement_v19.rs", ".publish_with_precondition(", 1, STREAM_RETIREMENT_V19),
     ("db/manifest/recovery.rs", ".publish(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".restore(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".append(RecoveryAuditRecord", 16, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery/stream_rebind_v18.rs", ".append(RecoveryAuditRecord", 1, STREAM_REBIND_V18),
+    ("db/manifest/recovery/stream_correction_v20.rs", ".append(RecoveryAuditRecord", 1, STREAM_CORRECTION_V20),
     ("db/manifest/recovery.rs", "publish_recovery_commit(", 13, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery/stream_correction_v20.rs", "publish_recovery_commit(", 1, STREAM_CORRECTION_V20),
     ("db/manifest/recovery.rs", "restore_table_to_version(", 4, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "record_audit(", 13, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 37, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery/stream_rebind_v18.rs", "delete_sidecar_by_operation_id(", 1, STREAM_REBIND_V18),
+    ("db/manifest/recovery/stream_retirement_v19.rs", "delete_sidecar_by_operation_id(", 1, STREAM_RETIREMENT_V19),
+    ("db/manifest/recovery/stream_correction_v20.rs", "delete_sidecar_by_operation_id(", 2, STREAM_CORRECTION_V20),
     ("db/manifest/recovery.rs", "delete_sidecar(", 4, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", ".raw_dataset_append(", 1, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", "Dataset::write(", 1, WriteProtocol::RecoveryExecutor),
@@ -856,6 +917,9 @@ durable_calls! {
     ("db/omnigraph/stream_enrollment.rs", ".into_dataset()", 1, STREAM_ENROLLMENT_V14),
     ("db/omnigraph/stream_ingest.rs", ".dataset()", 39, STREAM_LIFECYCLE_V14_V15_V18),
     ("db/omnigraph/stream_rebind.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/stream_retirement.rs", ".dataset()", 3, STREAM_RETIREMENT_V19),
+    ("db/omnigraph/stream_correction.rs", ".dataset()", 7, STREAM_CORRECTION_V20),
+    ("db/omnigraph/stream_correction.rs", ".stage_stream_correction(", 1, STREAM_CORRECTION_V20),
     ("db/omnigraph/stream_ingest.rs", ".mem_wal_writer(", 2, STREAM_LIFECYCLE_V14_V15),
     ("db/omnigraph/stream_ingest.rs", ".put(", 1, STREAM_LIFECYCLE_V14),
     ("table_store/mem_wal.rs", ".initialize_mem_wal()", 2, STREAM_ENROLLMENT_V14_REBIND_V18),
@@ -867,6 +931,8 @@ durable_calls! {
     ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V9),
     ("db/omnigraph/stream_enrollment.rs", "SnapshotHandle::new(", 1, STREAM_ENROLLMENT_V14),
     ("db/omnigraph/stream_ingest.rs", "SnapshotHandle::new(", 4, STREAM_LIFECYCLE_V14_V15),
+    ("db/omnigraph/stream_retirement.rs", "SnapshotHandle::new(", 1, STREAM_RETIREMENT_V19),
+    ("db/omnigraph/stream_correction.rs", "SnapshotHandle::new(", 1, STREAM_CORRECTION_V20),
     ("exec/merge.rs", "SnapshotHandle::new(", 5, MERGE_V9),
 }
 
@@ -892,12 +958,20 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "stage_management_receipt(",
     "confirm_stream_profile_change_sidecar_v13(",
     "complete_stream_profile_change_sidecar_v13(",
+    "confirm_stream_authority_retirement_sidecar_v19(",
+    "complete_stream_authority_retirement_sidecar_v19(",
+    "confirm_stream_correction_sidecar_v20(",
+    "complete_stream_correction_sidecar_v20(",
     "stage_stream_token_upsert(",
+    "stage_authority_retirement_receipt(",
+    "stage_stream_token_and_lifecycle_records(",
+    "stage_stream_correction_effect(",
     "stage_profile_management_receipt(",
     "delete_sidecar(",
     ".commit_staged_create_exact(",
     ".commit_staged_exact(",
     ".commit_staged(",
+    ".stage_stream_correction(",
     ".fork_branch_from_state(",
     "commit_updates_on_branch_with_expected(",
     ".commit_changes_with_intent_and_expected(",
