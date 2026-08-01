@@ -109,6 +109,46 @@ jobs:
       - name: Verify omnigraph-server entrypoint arg composition
         run: sh docker/entrypoint_test.sh
 
+  check_default_features:
+    name: Check default features
+    needs: classify_changes
+    # PR-time compile check of the default-feature workspace. Every test job
+    # builds a feature superset (failpoints, aws), so a default-features-only
+    # break — a variant or module gated differently between a crate and its
+    # consumer — is otherwise first seen post-merge by the format fence, the
+    # noisiest possible channel. `cargo check` with a warm cache is minutes;
+    # this is a reporting check, not a required context.
+    if: github.event_name == 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          key: default-features-check
+
+      - name: Check workspace with default features
+        run: cargo check --workspace --locked
+
   test:
     name: Test Workspace
     needs: classify_changes
@@ -175,7 +215,11 @@ jobs:
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/workspace-tests.log"
-          cargo test --workspace --locked \
+          # --no-fail-fast: this post-merge run is a detection channel, not a
+          # gate. Stopping at the first red suite hides every independent
+          # failure behind it, which makes later regressions unattributable
+          # (suite order decided what CI could see, not what was broken).
+          cargo test --workspace --locked --no-fail-fast \
             --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
             -- --nocapture 2>&1 | tee "$test_log"
 
@@ -280,14 +324,13 @@ jobs:
             --target-dir "$GITHUB_WORKSPACE/target"
           cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v15_bin"
           test -x "$v15_bin"
-          cargo clean --target-dir "$GITHUB_WORKSPACE/target" \
-            --package omnigraph-compiler \
-            --package omnigraph-policy \
-            --package omnigraph-engine \
-            --package omnigraph-api-types \
-            --package omnigraph-cluster \
-            --package omnigraph-server \
-            --package omnigraph-cli
+          # Clean every current workspace member, derived from cargo metadata:
+          # a hand-maintained list rots when the workspace gains crates, and a
+          # missed member lets the fence cell link the predecessor's rlib
+          # (same name+version in the shared target) into the current tree.
+          cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[].name' \
+            | xargs -n 1 cargo clean --target-dir "$GITHUB_WORKSPACE/target" --package
           echo "OMNIGRAPH_V15_BIN=$v15_bin" >> "$GITHUB_ENV"
 
       - name: Run exact v15↔v16 refusal and rebuild fence
