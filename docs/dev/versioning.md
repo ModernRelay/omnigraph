@@ -168,8 +168,7 @@ recovery-v15 resume must claim a higher epoch within the fresh binding scope.
 The v14 rebind scaffold and recovery-v17 Optimize envelope retain their exact
 historical meanings and are never reinterpreted.
 
-Internal schema **v17 is the currently served format** (unreleased, current
-0.10.0-dev source builds). It raises the sidecar ceiling to recovery-v19 for
+Internal schema v17 was an unreleased 0.10.0-dev format. It raised the sidecar ceiling to recovery-v19 for
 one active `StreamAuthorityRetirement` discriminator. Under checked
 stopped/offline cluster authority, a read-only plan proves an exact `DISABLED`
 profile, settled recovery, every enrolled lane `SEALED`, base/token parity, and
@@ -186,22 +185,32 @@ branch, exact Lance branch identifier, graph head, manifest version,
 `selected_member_index` let load prove the selected member's exact slot and
 recompute the receipt's `export_cut_digest`. The source schema hash commits the
 retired source cut; it need not equal the fresh target graph identity, whose
-schema compatibility remains ordinary loader validation. Authority correction
-remains inactive, and this slice adds no production path that creates
-`WITHDRAWN`.
+schema compatibility remains ordinary loader validation. This slice added no
+production path that creates `WITHDRAWN`.
+
+Internal schema **v18 is the currently served format** (unreleased, current
+0.10.0-dev source builds). It raises the sidecar ceiling to recovery-v20 for
+exact `DataBlock` correction while leaving the frozen recovery-v14 correction
+scaffold unchanged. Recovery-v20 binds the exact blocked generation cut, one
+base-table effect, one combined current-token plus immutable correction and
+management-receipt effect, fixed graph lineage, and the complete next
+`DRAINING` lifecycle. Only the exact joint outcome may clear the matching
+block; receipt lookup precedes stale block/revision refusal on exact retries.
 
 Recovery-v13 remains exactly the v11 profile-change protocol. Historical
 recovery-v10 enrollment and recovery-v12 lifecycle-v2 folds retain their old
 wire meanings and are refused under lifecycle-v3 rather than synthesized.
 There is still no public firehose ingress, public production enrollment,
-quiesce, resume/abort, correction, physical rebind, or streaming or maintenance
-transport surface. Retirement is exposed only by the narrow offline
-`cluster stream retire-for-rebuild plan|confirm` control-plane handshake. The
-v15 through v18 recovery paths remain crate-private and feature-gated.
+quiesce, resume/abort, physical rebind, or streaming or maintenance
+transport surface. The narrow offline operator surfaces are
+`cluster stream retire-for-rebuild plan|confirm` and exact `DataBlock`
+inspection/correction through `cluster stream block show|correct`. Their
+recovery owners remain crate-private; neither activates public row ingress or
+ordinary lifecycle control.
 
-A v16 graph crosses by export/init/load rebuild into a different root. Because
-`MIN_SUPPORTED == CURRENT == 17`, v17 refuses v16 and a v16 binary refuses
-v17. The genuine v15↔v16 fence remains historical evidence.
+A v17 graph crosses by export/init/load rebuild into a different root. Because
+`MIN_SUPPORTED == CURRENT == 18`, v18 refuses v17 and a v17 binary refuses
+v18. The genuine v16↔v17 fence remains historical evidence.
 
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,

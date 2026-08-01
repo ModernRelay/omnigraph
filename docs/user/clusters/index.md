@@ -206,9 +206,40 @@ lane in this release. Only the no-lane case restores the direct physical lane.
 Already-`SEALED` enrollments remain fenced, so use the strict export/init/load
 rebuild to return an enrolled graph to that non-streaming lane.
 
+### Strict drain blocks: inspect → correct → retry
+
+When a strict drain reports a `DataBlock`, stop every writer-capable process
+and inspect the exact blocked cut through the cluster control plane:
+
+```bash
+omnigraph --graph knowledge --as andrew \
+  cluster stream block show node:Person \
+  --config company-brain --block-token <token> \
+  --confirm-stream-offline --json
+
+omnigraph --graph knowledge --as andrew \
+  cluster stream block correct node:Person \
+  --config company-brain --block-token <token> \
+  --correction-id <uuid> --expected-lifecycle-revision <revision> \
+  --plan correction.json --confirm-stream-offline --json
+```
+
+`show` reconstructs validator evidence from the retained immutable WAL
+generation and returns a bounded page; follow `next_cursor` until it is absent.
+Build an ordered plan that chooses `REPLACE` or `WITHDRAW` for the entries it
+changes; unmentioned keys retain their blocked winner, and the resulting
+complete overlay must clear every violation. `correct` revalidates the block,
+profile revision, predecessor tokens, and complete corrected overlay before
+any graph effect. It then publishes the
+base rows, token dispositions, lifecycle state, and graph commit together under
+one correction UUID. Repeating the same actor, UUID, and plan returns the
+durable receipt; reusing the UUID for a different plan is refused. The cluster
+state lock plus `--confirm-stream-offline` bind the stopped-writer protocol,
+but do not replace the operator's responsibility to stop all processes first.
+
 ### Terminal authority retirement: plan → confirm → rebuild
 
-If a v17 graph has current `WITHDRAWN` sequencing authority, ordinary export
+If a graph has current `WITHDRAWN` sequencing authority, ordinary export
 refuses rather than silently discarding it. After stopping every writer and
 reaching exact `DISABLED` with every enrolled lane `SEALED`, use the separate
 cluster-only retirement handshake:

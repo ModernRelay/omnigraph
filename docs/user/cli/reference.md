@@ -20,7 +20,7 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `commit list \| show` | inspect commit graph. `list` is newest-first; `--branch <name>` lists that branch's reachable history, omitted = `main` |
 | `schema plan \| apply \| show (alias: get)` | migrations. `apply` refuses a cluster-managed graph (one whose storage is inside a cluster) and points at `cluster apply` — those graphs evolve through the cluster ledger, not a direct apply |
 | `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
-| `cluster validate \| plan \| apply \| approve \| status \| refresh \| import \| force-unlock; cluster stream retire-for-rebuild plan \| confirm` | declarative cluster control plane. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state at `__cluster/state.json`, annotates dispositions, and embeds real schema-migration previews; `apply` converges the cluster — stored-query/policy catalog writes (content-addressed under `__cluster/resources/`), graph creates, schema updates (soft drops only; `--as` records the actor), and graph deletes behind a digest-bound approval from `cluster approve <resource> --as <actor>` (`apply`/`approve` default the actor from `~/.omnigraph/config.yaml`'s `operator.actor` when `--as` is omitted); what apply converges is what an `omnigraph-server --cluster <dir>` deployment serves on its next restart (`--cluster` is the server's only boot source — cluster-only); `status` reads the state ledger; `refresh`/`import` explicitly update local JSON state from read-only graph observations; `force-unlock <LOCK_ID>` manually removes a held local state lock by exact id; `stream retire-for-rebuild` is the irreversible stopped/offline terminal-authority export/rebuild exit described below |
+| `cluster validate \| plan \| apply \| approve \| status \| refresh \| import \| force-unlock; cluster stream block show \| correct; cluster stream retire-for-rebuild plan \| confirm` | declarative cluster control plane. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state at `__cluster/state.json`, annotates dispositions, and embeds real schema-migration previews; `apply` converges the cluster — stored-query/policy catalog writes (content-addressed under `__cluster/resources/`), graph creates, schema updates (soft drops only; `--as` records the actor), and graph deletes behind a digest-bound approval from `cluster approve <resource> --as <actor>` (`apply`/`approve` default the actor from `~/.omnigraph/config.yaml`'s `operator.actor` when `--as` is omitted); what apply converges is what an `omnigraph-server --cluster <dir>` deployment serves on its next restart (`--cluster` is the server's only boot source — cluster-only); `status` reads the state ledger; `refresh`/`import` explicitly update local JSON state from read-only graph observations; `force-unlock <LOCK_ID>` manually removes a held local state lock by exact id; `stream block` is the stopped/offline inspection and correction surface for one exact strict drain block; `stream retire-for-rebuild` is the irreversible terminal-authority export/rebuild exit described below |
 | `optimize` | non-destructive Lance compaction + index reconciliation (blob-bearing tables use the normal path; tables with uncovered drift are skipped and `--json` reports `skipped`) |
 | `repair [--confirm] [--force]` | preview or explicitly publish uncovered manifest/head drift. `--confirm` heals verified maintenance drift and exits non-zero if suspicious/unverifiable drift is refused; `--force --confirm` publishes suspicious/unverifiable drift after operator review |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC (`--confirm` to execute; also needs `--yes` against a non-local `s3://` target — see *Write diagnostics & destructive confirmation*) |
@@ -43,7 +43,7 @@ Every command declares the **capability** it needs — what it requires to reach
 
 These restrictions are enforced and reported, not silent:
 
-- A scope flag on a verb that can't consume it fails loudly rather than being silently dropped — `--server` outside a served scope, `--cluster` outside cluster-scoped verbs, `--graph` where no multi-graph scope applies (the retirement handshake intentionally uses it with `--config`), `--store` outside the verbs that consume it (`any`, and the `direct` maintenance verbs — `init` addresses its target positionally, so it rejects `--store`), `--as` outside the verbs that record an actor (`any`, `cluster apply`/`cluster approve`, and the actor-bound retirement handshake), or `--profile` on verbs that never resolve a scope (`init`, the `cluster` family, and local verbs — the ambient `$OMNIGRAPH_PROFILE` default is simply ignored there), e.g.: ``optimize is a direct (storage-native) command; --server addresses a served graph and does not apply. Pass a storage URI, or --cluster <dir> --graph <id>.``
+- A scope flag on a verb that can't consume it fails loudly rather than being silently dropped — `--server` outside a served scope, `--cluster` outside cluster-scoped verbs, `--graph` where no multi-graph scope applies (the stream-control handshakes intentionally use it with `--config`), `--store` outside the verbs that consume it (`any`, and the `direct` maintenance verbs — `init` addresses its target positionally, so it rejects `--store`), `--as` outside the verbs that record an actor (`any`, `cluster apply`/`cluster approve`, and the actor-bound stream-control handshakes), or `--profile` on verbs that never resolve a scope (`init`, the `cluster` family, and local verbs — the ambient `$OMNIGRAPH_PROFILE` default is simply ignored there), e.g.: ``optimize is a direct (storage-native) command; --server addresses a served graph and does not apply. Pass a storage URI, or --cluster <dir> --graph <id>.``
 - A `direct` verb pointed at a remote URI fails loudly, e.g.: ``optimize is a direct (storage-native) command and needs direct storage access; the resolved target is a remote server (https://…). Pass the graph's file:// or s3:// URI.``
 - A data verb pointed at a positional `http(s)://` URI fails loudly: ``a remote graph must be addressed with --server <url> — a positional (or --uri) http(s):// URL no longer dispatches to a server.``
 - `init` into an **established cluster's** storage layout (`<root>/graphs/<id>.omni` where `<root>` holds `__cluster/state.json`) is refused — graphs in a cluster are created by `cluster apply` (which records ledger / recovery / approvals), not `init`.
@@ -192,13 +192,25 @@ omnigraph cluster status   --config company-brain --json
 omnigraph cluster refresh  --config company-brain --json
 omnigraph cluster import   --config company-brain --json
 omnigraph cluster force-unlock <LOCK_ID> --config company-brain --json
-# For a v17 graph whose current WITHDRAWN authority blocks ordinary export:
+# Inspect and correct one exact strict drain block while every writer is stopped:
+omnigraph --graph <graph-id> --as <actor> cluster stream block show node:Person \
+  --config company-brain --block-token <token> \
+  --confirm-stream-offline --json
+omnigraph --graph <graph-id> --as <actor> cluster stream block correct node:Person \
+  --config company-brain --block-token <token> --correction-id <uuid> \
+  --expected-lifecycle-revision <revision> --plan correction.json \
+  --confirm-stream-offline --json
+# When current WITHDRAWN authority blocks ordinary export:
 omnigraph --graph <graph-id> --as <actor> cluster stream retire-for-rebuild plan \
   --config company-brain --confirm-stream-offline --json
 omnigraph --graph <graph-id> --as <actor> cluster stream retire-for-rebuild confirm \
   --config company-brain --retirement-id <uuid> \
   --expected-plan-digest <sha256:...> --confirm-stream-offline --json
 ```
+
+`cluster stream block correct --plan` accepts a strict JSON file of at most
+256 MiB. The CLI refuses a larger file before parsing it, and the engine
+independently bounds the complete request and aggregate REPLACE preprocessing.
 
 `--config` is a directory containing `cluster.yaml`; it defaults to `.`. The
 config declares graphs, schemas, stored queries, and policy bundle file
@@ -226,6 +238,36 @@ existing lanes are already `SEALED`; it does not drain a non-`SEALED` lane or
 de-enroll an existing `SEALED` lane. `cluster
 status` reads state only and reports any existing lock metadata. `force-unlock`
 removes a lock only when the supplied id exactly matches the lock file.
+`cluster stream block` is also separate from normal apply. Both `show` and
+`correct` require a declared/applied graph with an applied streaming resource,
+`state.lock: true`, an authenticated actor, the held state lock, settled
+cluster recovery, and `--confirm-stream-offline`. The flag is an operator
+attestation, not a distributed lease. `show` revalidates the exact block and
+returns at most one bounded page; pass its opaque `--cursor` to fetch the next
+page. `correct` accepts a strict JSON file with no unknown fields:
+
+```json
+{
+  "version": 1,
+  "actions": [
+    {
+      "action": "WITHDRAW",
+      "ordinal": 0,
+      "logical_key": "person-42",
+      "current_blocked_winner_stream_token": "<token>"
+    }
+  ]
+}
+```
+
+Actions name correction-view entries in increasing ordinal order, with at most
+one action per logical key. Unmentioned keys retain their blocked winner, and
+the resulting complete overlay must clear every violation. `REPLACE`
+additionally carries a new UUID `write_id` and a complete object in `row`. The
+optional `--expected-plan-digest` makes a retry assert the exact
+engine-normalized plan. A correction UUID is an idempotency key: reuse it only
+for an exact retry of the same actor and plan.
+
 `cluster stream retire-for-rebuild` is separate from normal apply. Both `plan`
 and `confirm` require a declared/applied graph, `state.lock: true`, an
 authenticated actor, the held state lock, settled cluster and graph recovery,

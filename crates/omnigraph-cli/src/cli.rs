@@ -484,11 +484,69 @@ pub(crate) enum ClusterCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ClusterStreamCommand {
+    /// Inspect or correct one exact strict stream block while writers are stopped.
+    Block {
+        #[command(subcommand)]
+        command: StreamBlockCommand,
+    },
     /// Irreversibly freeze a terminal-authority graph for logical rebuild.
     #[command(name = "retire-for-rebuild")]
     RetireForRebuild {
         #[command(subcommand)]
         command: StreamRetireForRebuildCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum StreamBlockCommand {
+    /// Revalidate and print one bounded page of correction evidence.
+    Show {
+        /// Exact manifest table key, for example node:Person.
+        table_key: String,
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Exact strict-block token returned by status or quiesce.
+        #[arg(long)]
+        block_token: String,
+        /// Opaque cursor returned by a previous page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Attest that every writer-capable process for the graph is stopped.
+        #[arg(long)]
+        confirm_stream_offline: bool,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply one ordered REPLACE/WITHDRAW plan to the exact blocked cut.
+    Correct {
+        /// Exact manifest table key, for example node:Person.
+        table_key: String,
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Exact strict-block token returned by `block show`.
+        #[arg(long)]
+        block_token: String,
+        /// New UUID occurrence key for this correction.
+        #[arg(long)]
+        correction_id: String,
+        /// Lifecycle revision returned by `block show`.
+        #[arg(long)]
+        expected_lifecycle_revision: u64,
+        /// Strict JSON correction plan file (maximum 256 MiB).
+        #[arg(long)]
+        plan: PathBuf,
+        /// Optional equality assertion for the engine-derived plan digest.
+        #[arg(long)]
+        expected_plan_digest: Option<String>,
+        /// Attest that every writer-capable process for the graph is stopped.
+        #[arg(long)]
+        confirm_stream_offline: bool,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
     },
 }
 

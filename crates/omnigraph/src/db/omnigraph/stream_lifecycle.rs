@@ -16,7 +16,7 @@ use arrow_schema::{Schema, SchemaRef};
 use arrow_select::take::take;
 use lance::dataset::mem_wal::{TOMBSTONE, WalReadEntry, WalTailer, schema_with_tombstone};
 use lance_index::mem_wal::ShardId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::db::manifest::TableIdentity;
@@ -138,12 +138,38 @@ struct CanonicalDataViolationBody<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CanonicalDataBlockEvidence {
-    violation_code: String,
-    violation_digest: String,
-    correction_view_digest: String,
-    offending_key_count: u64,
-    entry_count: usize,
-    canonical_bytes: usize,
+    pub(super) violation_code: String,
+    pub(super) violation_digest: String,
+    pub(super) correction_view_digest: String,
+    pub(super) offending_key_count: u64,
+    pub(super) entry_count: usize,
+    pub(super) canonical_bytes: usize,
+}
+
+/// One owned entry in the exact correction view committed by a `DataBlock`.
+///
+/// The declaration order is the canonical JSON order. `ordinal` is renamed on
+/// the wire so serializing this type reproduces the bytes hashed by the
+/// collector rather than defining a second correction-view encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CanonicalDataBlockViewEntry {
+    #[serde(rename = "entry_ordinal")]
+    pub(super) ordinal: u64,
+    pub(super) table_key: String,
+    pub(super) logical_key: String,
+    pub(super) current_blocked_winner_stream_token: String,
+    pub(super) violation_code: String,
+    pub(super) field_path_or_group: Vec<String>,
+    pub(super) violation_instance_id: String,
+    pub(super) allowed_actions: Vec<String>,
+}
+
+/// Reconstructed, bounded correction view and the evidence that commits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CanonicalDataBlockView {
+    pub(super) evidence: CanonicalDataBlockEvidence,
+    pub(super) entries: Vec<CanonicalDataBlockViewEntry>,
 }
 
 /// Incremental validator sink for one immutable fold cut.
@@ -279,6 +305,10 @@ impl<'a> DataBlockEvidenceCollector<'a> {
     }
 
     pub(super) fn finish(self) -> Result<Option<CanonicalDataBlockEvidence>> {
+        Ok(self.finish_with_view()?.map(|view| view.evidence))
+    }
+
+    pub(super) fn finish_with_view(self) -> Result<Option<CanonicalDataBlockView>> {
         if !self.saw_violation {
             return Ok(None);
         }
@@ -298,7 +328,7 @@ impl<'a> DataBlockEvidenceCollector<'a> {
     fn detailed_evidence(
         &self,
         detailed_bodies: &BTreeSet<Vec<u8>>,
-    ) -> Result<Option<CanonicalDataBlockEvidence>> {
+    ) -> Result<Option<CanonicalDataBlockView>> {
         let mut serialized_bytes = 0usize;
         for (ordinal, body) in detailed_bodies.iter().enumerate() {
             let record_len = canonical_ordinal_record_len(ordinal, body)?;
@@ -313,6 +343,7 @@ impl<'a> DataBlockEvidenceCollector<'a> {
         }
 
         let mut digests = CanonicalRecordSetDigests::new(detailed_bodies.len());
+        let mut entries = Vec::with_capacity(detailed_bodies.len());
         for (ordinal, body) in detailed_bodies.iter().enumerate() {
             let record = canonical_ordinal_record_bytes(ordinal, body, self.max_detailed_bytes)?
                 .ok_or_else(|| {
@@ -321,6 +352,37 @@ impl<'a> DataBlockEvidenceCollector<'a> {
                     )
                 })?;
             digests.push(ordinal, &record)?;
+            let body: CanonicalDataViolationBodyOwned =
+                serde_json::from_slice(body).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to decode retained stream DataBlock body: {error}"
+                    ))
+                })?;
+            let entry = CanonicalDataBlockViewEntry {
+                ordinal: u64::try_from(ordinal).map_err(|_| {
+                    OmniError::manifest_internal(
+                        "stream DataBlock correction-view ordinal exceeds u64",
+                    )
+                })?,
+                table_key: body.table_key,
+                logical_key: body.logical_key,
+                current_blocked_winner_stream_token: body.current_blocked_winner_stream_token,
+                violation_code: body.violation_code,
+                field_path_or_group: body.field_path_or_group,
+                violation_instance_id: body.violation_instance_id,
+                allowed_actions: body.allowed_actions,
+            };
+            if serde_json::to_vec(&entry).map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "failed to encode owned stream DataBlock entry: {error}"
+                ))
+            })? != record
+            {
+                return Err(OmniError::manifest_internal(
+                    "owned stream DataBlock entry differs from its committed canonical bytes",
+                ));
+            }
+            entries.push(entry);
         }
         let violation_code = if self.violation_codes.len() == 1 {
             self.violation_codes
@@ -332,18 +394,22 @@ impl<'a> DataBlockEvidenceCollector<'a> {
             "MULTIPLE_VALIDATION_VIOLATIONS".to_string()
         };
         let (violation_digest, correction_view_digest) = digests.finish()?;
-        Ok(Some(CanonicalDataBlockEvidence {
-            violation_code,
-            violation_digest,
-            correction_view_digest,
-            offending_key_count: u64::try_from(self.offending_keys.len())
-                .map_err(|_| OmniError::manifest_internal("strict-block key count exceeds u64"))?,
-            entry_count: detailed_bodies.len(),
-            canonical_bytes: serialized_bytes,
+        Ok(Some(CanonicalDataBlockView {
+            evidence: CanonicalDataBlockEvidence {
+                violation_code,
+                violation_digest,
+                correction_view_digest,
+                offending_key_count: u64::try_from(self.offending_keys.len()).map_err(|_| {
+                    OmniError::manifest_internal("strict-block key count exceeds u64")
+                })?,
+                entry_count: detailed_bodies.len(),
+                canonical_bytes: serialized_bytes,
+            },
+            entries,
         }))
     }
 
-    fn overflow_evidence(&self) -> Result<CanonicalDataBlockEvidence> {
+    fn overflow_evidence(&self) -> Result<CanonicalDataBlockView> {
         let count = self.offending_keys.len();
         let mut violation =
             CanonicalHasher::new(DATA_BLOCK_CORRECTION_VIEW_OVERFLOW_VIOLATION_DOMAIN);
@@ -356,6 +422,7 @@ impl<'a> DataBlockEvidenceCollector<'a> {
             digest.u64(count_u64);
         }
         let mut canonical_bytes = self.expected_table_key.len();
+        let mut entries = Vec::with_capacity(count);
         for (ordinal, (logical_key, token)) in self.offending_keys.iter().enumerate() {
             let instance_id = overflow_instance_id(self.expected_table_key, logical_key, token);
             for digest in [&mut violation, &mut correction] {
@@ -378,17 +445,47 @@ impl<'a> DataBlockEvidenceCollector<'a> {
                         "stream DataBlock overflow-view byte accounting overflow",
                     )
                 })?;
+            entries.push(CanonicalDataBlockViewEntry {
+                ordinal: u64::try_from(ordinal).map_err(|_| {
+                    OmniError::manifest_internal(
+                        "stream DataBlock correction-view ordinal exceeds u64",
+                    )
+                })?,
+                table_key: self.expected_table_key.to_string(),
+                logical_key: logical_key.clone(),
+                current_blocked_winner_stream_token: token.clone(),
+                violation_code: DATA_BLOCK_CORRECTION_VIEW_OVERFLOW.to_string(),
+                field_path_or_group: vec![DATA_BLOCK_CORRECTION_VIEW_OVERFLOW.to_string()],
+                violation_instance_id: instance_id,
+                allowed_actions: vec!["REPLACE".to_string()],
+            });
         }
-        Ok(CanonicalDataBlockEvidence {
-            violation_code: DATA_BLOCK_CORRECTION_VIEW_OVERFLOW.to_string(),
-            violation_digest: violation.finish(),
-            correction_view_digest: correction.finish(),
-            offending_key_count: u64::try_from(count)
-                .map_err(|_| OmniError::manifest_internal("strict-block key count exceeds u64"))?,
-            entry_count: count,
-            canonical_bytes,
+        Ok(CanonicalDataBlockView {
+            evidence: CanonicalDataBlockEvidence {
+                violation_code: DATA_BLOCK_CORRECTION_VIEW_OVERFLOW.to_string(),
+                violation_digest: violation.finish(),
+                correction_view_digest: correction.finish(),
+                offending_key_count: u64::try_from(count).map_err(|_| {
+                    OmniError::manifest_internal("strict-block key count exceeds u64")
+                })?,
+                entry_count: count,
+                canonical_bytes,
+            },
+            entries,
         })
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalDataViolationBodyOwned {
+    table_key: String,
+    logical_key: String,
+    current_blocked_winner_stream_token: String,
+    violation_code: String,
+    field_path_or_group: Vec<String>,
+    violation_instance_id: String,
+    allowed_actions: Vec<String>,
 }
 
 struct BoundedJsonWriter {
@@ -5110,6 +5207,50 @@ mod tests {
         assert_eq!(expected.violation_code, "UNIQUE_VIOLATION");
         assert_eq!(expected.entry_count, 2);
         assert_eq!(expected.offending_key_count, 2);
+    }
+
+    #[test]
+    fn data_block_collector_reconstructs_the_owned_hashed_view() {
+        let tokens = BTreeMap::from([
+            ("key-a".to_string(), "token-a".to_string()),
+            ("key-b".to_string(), "token-b".to_string()),
+        ]);
+        let violation = unique_violation(vec![
+            correction("key-b", 'b', "username", &["REPLACE", "WITHDRAW"]),
+            correction("key-a", 'a', "email", &["REPLACE"]),
+        ]);
+        let mut collector = DataBlockEvidenceCollector::new("node:Person", &tokens);
+        collector.push(&violation).unwrap();
+        let view = collector.finish_with_view().unwrap().unwrap();
+
+        assert_eq!(view.entries.len(), view.evidence.entry_count);
+        assert_eq!(view.entries[0].ordinal, 0);
+        assert_eq!(view.entries[0].logical_key, "key-a");
+        assert_eq!(
+            view.entries[0].current_blocked_winner_stream_token,
+            "token-a"
+        );
+        assert_eq!(view.entries[1].ordinal, 1);
+        assert_eq!(view.entries[1].logical_key, "key-b");
+        assert_eq!(view.entries[1].allowed_actions, ["REPLACE", "WITHDRAW"]);
+        assert!(is_canonical_sha256_digest(
+            &view.evidence.correction_view_digest
+        ));
+
+        let mut overflow =
+            DataBlockEvidenceCollector::with_limits("node:Person", &tokens, 1, usize::MAX);
+        overflow.push(&violation).unwrap();
+        let overflow = overflow.finish_with_view().unwrap().unwrap();
+        assert_eq!(
+            overflow.evidence.violation_code,
+            DATA_BLOCK_CORRECTION_VIEW_OVERFLOW
+        );
+        assert_eq!(overflow.entries.len(), 2);
+        assert!(overflow.entries.iter().all(|entry| {
+            entry.allowed_actions == ["REPLACE"]
+                && entry.field_path_or_group == [DATA_BLOCK_CORRECTION_VIEW_OVERFLOW]
+                && entry.violation_code == DATA_BLOCK_CORRECTION_VIEW_OVERFLOW
+        }));
     }
 
     #[test]

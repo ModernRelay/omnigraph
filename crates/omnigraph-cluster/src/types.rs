@@ -306,6 +306,45 @@ pub struct StreamAuthorityRetirementConfirmOutput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Shared stopped-writer inputs for strict stream-block inspection and
+/// correction. Direct library callers receive the same structured preflight
+/// diagnostics as the CLI.
+#[derive(Debug, Clone, Default)]
+pub struct StreamBlockControlOptions {
+    pub actor: Option<String>,
+    pub confirm_stream_offline: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamBlockShowOutput {
+    pub ok: bool,
+    pub config_dir: String,
+    pub graph_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    pub state_observations: StateObservations,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<omnigraph::db::StreamDataBlockPage>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamBlockCorrectOutput {
+    pub ok: bool,
+    pub config_dir: String,
+    pub graph_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    pub state_observations: StateObservations,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<omnigraph::db::StreamDataCorrectionResult>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 /// Output of config-only `cluster apply`. "Applied" means recorded in the
 /// local cluster catalog (`__cluster/`); nothing applied here serves traffic —
 /// the server still boots from `omnigraph.yaml` until the server-boot stage.

@@ -247,19 +247,22 @@ pub mod names {
     /// The immutable generation cut is proven and the worker retired, before
     /// the schema-v12 recovery intent is armed.
     pub const STREAM_FOLD_POST_DRAIN_PRE_SIDECAR: &str = "stream_fold.post_drain_pre_sidecar";
-    /// Schema-v12: the recovery intent is durably armed, but neither exact
-    /// Lance participant has been invoked. Recovery must classify this cell
-    /// as `EffectFree` and retire the intent without publishing.
+    /// A stream-fold or DataBlock-correction recovery intent is durably armed,
+    /// but neither exact Lance participant has been invoked. Recovery must
+    /// classify this cell as `EffectFree` and retire the intent without
+    /// publishing.
     pub const STREAM_FOLD_POST_SIDECAR_PRE_BASE_COMMIT: &str =
         "stream_fold.post_sidecar_pre_base_commit";
-    /// Schema-v12: the exact base-table fold committed, while the separate
+    /// The exact base-table fold/correction committed, while the separate
     /// `_stream_tokens.lance` participant is still at its manifest-selected
-    /// prior witness. Recovery must classify this partial cell as sticky.
+    /// prior witness. Recovery must classify this partial cell under the
+    /// owning protocol rather than expose the base effect alone.
     pub const STREAM_FOLD_POST_BASE_COMMIT_PRE_TOKEN_COMMIT: &str =
         "stream_fold.post_base_commit_pre_token_commit";
-    /// Schema-v12: both exact Lance participants committed, while the Armed
-    /// sidecar has not yet been rewritten with their achieved witnesses.
-    /// Recovery may reconstruct the exact/exact confirmation and roll forward.
+    /// Both exact stream-fold/correction Lance participants committed, while
+    /// the Armed sidecar has not yet been rewritten with their achieved
+    /// witnesses. Recovery may reconstruct the exact/exact confirmation and
+    /// roll forward.
     pub const STREAM_FOLD_POST_TOKEN_COMMIT_PRE_CONFIRM: &str =
         "stream_fold.post_token_commit_pre_confirm";
     /// Lifecycle receipt intent is durable, but its immutable token-ledger

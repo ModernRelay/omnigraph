@@ -35,7 +35,10 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
     UploadPart,
 };
-use omnigraph::db::{Omnigraph, ReadTarget, StreamAuthorityRetirementPlan, StreamTableStatus};
+use omnigraph::db::{
+    Omnigraph, ReadTarget, StreamAuthorityRetirementPlan, StreamDataCorrectionAction,
+    StreamDataCorrectionRequest, StreamTableStatus,
+};
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
 use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
@@ -2719,6 +2722,543 @@ async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure
         "cold exact retry must not mint another block or claim"
     );
     assert_no_recovery_sidecars(&dir);
+}
+
+async fn prepare_unique_data_block(
+    logical_id: &str,
+    drain_id: &str,
+    actor: &str,
+    seed_prior_value_for_logical_id: bool,
+) -> (EnrolledGraphDir, Arc<Omnigraph>, StreamTableStatus, u64) {
+    let cluster = tempfile::tempdir().unwrap();
+    let graph = cluster.path().join("graphs/knowledge.omni");
+    let db = Arc::new(
+        Omnigraph::init(graph.to_str().unwrap(), UNIQUE_STREAM_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    if seed_prior_value_for_logical_id {
+        let seed = [
+            serde_json::json!({
+                "type": "Person",
+                "data": {"id": logical_id, "score": 1},
+            }),
+            serde_json::json!({
+                "type": "Person",
+                "data": {"id": "uniqueness-conflict", "score": 7},
+            }),
+        ]
+        .into_iter()
+        .map(|row| row.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        load_jsonl(&db, &seed, LoadMode::Overwrite)
+            .await
+            .expect("seed the prior winner and uniqueness conflict before enrollment");
+    } else {
+        db.mutate(
+            "main",
+            INSERT_PERSON,
+            "insert_person",
+            &helpers::int_params(&[("$score", 7)]),
+        )
+        .await
+        .expect("seed the committed uniqueness conflict before enrollment");
+    }
+    db.failpoint_enroll_stream_table_for_test(TABLE)
+        .await
+        .unwrap();
+    enable_stream_profile(&db, &format!("file://{}", cluster.path().display())).await;
+    let dir = EnrolledGraphDir {
+        _cluster: cluster,
+        graph,
+    };
+
+    let duplicate = physical_batch(&db, &[(logical_id.to_string(), 7)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(duplicate), 0)
+        .await
+        .expect("base-dependent uniqueness remains fold-time work");
+    let open_revision = stream_lane(&db).await.lifecycle_revision;
+    let error = db
+        .failpoint_stream_quiesce_for_test(TABLE, drain_id, open_revision, actor)
+        .await
+        .expect_err("the uniqueness conflict must publish a strict DataBlock");
+    let blocked = stream_lane(&db).await;
+    assert_eq!(
+        stream_data_block_token(&error),
+        blocked.strict_block_token.as_deref().unwrap()
+    );
+    assert_no_recovery_sidecars(&dir);
+    (dir, db, blocked, open_revision)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn data_block_show_and_replace_unstrand_the_exact_drain() {
+    let _scenario = FailScenario::setup();
+    let logical_id = "replace-blocked";
+    let drain_id = "a1a1a1a1-a1a1-41a1-81a1-a1a1a1a1a1a1";
+    let actor = "operator:data-block-replace";
+    let (dir, db, blocked, open_revision) =
+        prepare_unique_data_block(logical_id, drain_id, actor, false).await;
+    let block_token = blocked.strict_block_token.clone().unwrap();
+
+    drop(db);
+    let reopened = reopen_enrolled(&dir).await;
+    let page = reopened
+        .failpoint_show_stream_data_block_for_test(TABLE, &block_token, None)
+        .await
+        .expect("cold inspection must reconstruct the exact immutable blocked generation");
+    assert_eq!(page.block_token, block_token);
+    assert_eq!(page.lifecycle_revision, blocked.lifecycle_revision);
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].ordinal, 0);
+    assert_eq!(page.entries[0].logical_key, logical_id);
+    assert_eq!(page.entries[0].table_key, TABLE);
+    assert_eq!(page.entries[0].violation_code, "UNIQUE_VIOLATION");
+    assert_eq!(page.entries[0].allowed_actions, ["REPLACE", "WITHDRAW"]);
+    assert!(page.next_cursor.is_none());
+
+    let correction_id = "b2b2b2b2-b2b2-42b2-82b2-b2b2b2b2b2b2";
+    let request = StreamDataCorrectionRequest {
+        protocol_version: 1,
+        block_token: block_token.clone(),
+        correction_id: correction_id.to_string(),
+        expected_lifecycle_revision: blocked.lifecycle_revision,
+        actions: vec![StreamDataCorrectionAction::Replace {
+            ordinal: page.entries[0].ordinal,
+            logical_key: logical_id.to_string(),
+            current_blocked_winner_stream_token: page.entries[0]
+                .current_blocked_winner_stream_token
+                .clone(),
+            write_id: "c3c3c3c3-c3c3-43c3-83c3-c3c3c3c3c3c3".to_string(),
+            row: serde_json::json!({"id": logical_id, "score": 8}),
+        }],
+        expected_plan_digest: None,
+    };
+    let corrected = reopened
+        .failpoint_correct_stream_data_block_for_test(TABLE, request.clone(), actor)
+        .await
+        .expect("a valid replacement must publish one exact base/token correction");
+    assert!(corrected.changed);
+    assert_eq!(corrected.correction_id, correction_id);
+    let corrected_lane = stream_lane(&reopened).await;
+    assert_eq!(corrected_lane.lifecycle, "DRAINING");
+    assert_eq!(
+        corrected_lane.lifecycle_revision,
+        corrected.lifecycle_revision
+    );
+    assert_eq!(corrected_lane.strict_block_token, None);
+    assert_eq!(
+        corrected_lane.last_fold_outcome.as_deref(),
+        Some("PUBLISHED")
+    );
+    assert_eq!(corrected_lane.drain_id.as_deref(), Some(drain_id));
+    let rows = visible_rows(&reopened).await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.contains(&(logical_id.to_string(), 8)));
+    assert!(
+        rows.iter()
+            .any(|(id, score)| id != logical_id && *score == 7),
+        "replacement must preserve the prior visible base row"
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    let corrected_version = corrected.manifest_version;
+    let replay = reopened
+        .failpoint_correct_stream_data_block_for_test(TABLE, request.clone(), actor)
+        .await
+        .expect(
+            "receipt-first correction replay must ignore the now-cleared block and stale revision",
+        );
+    assert!(!replay.changed);
+    assert_eq!(replay.correction_id, corrected.correction_id);
+    assert_eq!(replay.plan_digest, corrected.plan_digest);
+    assert_eq!(replay.graph_commit_id, corrected.graph_commit_id);
+    assert_eq!(replay.lifecycle_revision, corrected.lifecycle_revision);
+    assert_eq!(replay.manifest_version, corrected_version);
+
+    let mut wrong_revision_retry = request.clone();
+    wrong_revision_retry.expected_lifecycle_revision = wrong_revision_retry
+        .expected_lifecycle_revision
+        .checked_add(1)
+        .unwrap();
+    let wrong_revision_error = reopened
+        .failpoint_correct_stream_data_block_for_test(TABLE, wrong_revision_retry, actor)
+        .await
+        .expect_err("receipt replay must bind the exact expected lifecycle revision");
+    assert!(
+        matches!(
+            wrong_revision_error,
+            OmniError::StreamLifecycleIdempotencyConflict { .. }
+        ),
+        "{wrong_revision_error:?}"
+    );
+
+    reopened
+        .failpoint_stream_quiesce_for_test(TABLE, drain_id, open_revision, actor)
+        .await
+        .expect("the corrected fold proof must let the original drain reach SEALED");
+    assert_eq!(stream_lane(&reopened).await.lifecycle, "SEALED");
+    let replay_after_later_manifest = reopened
+        .failpoint_correct_stream_data_block_for_test(TABLE, request, actor)
+        .await
+        .expect("the correction receipt must retain its original result after a later manifest");
+    assert!(!replay_after_later_manifest.changed);
+    assert_eq!(
+        replay_after_later_manifest.manifest_version,
+        corrected_version,
+        "receipt-first replay must return the correction's manifest, not the current graph head"
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn correction_id_reuse_on_a_later_block_is_effect_free() {
+    let _scenario = FailScenario::setup();
+    let actor = "operator:correction-id-reuse";
+    let first_logical_id = "first-correction-id-owner";
+    let first_drain_id = "a4a4a4a4-a4a4-44a4-84a4-a4a4a4a4a4a4";
+    let correction_id = "b5b5b5b5-b5b5-45b5-85b5-b5b5b5b5b5b5";
+    let (dir, db, first_blocked, first_open_revision) =
+        prepare_unique_data_block(first_logical_id, first_drain_id, actor, false).await;
+    let first_block_token = first_blocked.strict_block_token.clone().unwrap();
+    let first_page = db
+        .failpoint_show_stream_data_block_for_test(TABLE, &first_block_token, None)
+        .await
+        .unwrap();
+    db.failpoint_correct_stream_data_block_for_test(
+        TABLE,
+        StreamDataCorrectionRequest {
+            protocol_version: 1,
+            block_token: first_block_token,
+            correction_id: correction_id.to_string(),
+            expected_lifecycle_revision: first_blocked.lifecycle_revision,
+            actions: vec![StreamDataCorrectionAction::Replace {
+                ordinal: first_page.entries[0].ordinal,
+                logical_key: first_logical_id.to_string(),
+                current_blocked_winner_stream_token: first_page.entries[0]
+                    .current_blocked_winner_stream_token
+                    .clone(),
+                write_id: "c6c6c6c6-c6c6-46c6-86c6-c6c6c6c6c6c6".to_string(),
+                row: serde_json::json!({"id": first_logical_id, "score": 8}),
+            }],
+            expected_plan_digest: None,
+        },
+        actor,
+    )
+    .await
+    .expect("the first correction must bind the operation id");
+    db.failpoint_stream_quiesce_for_test(TABLE, first_drain_id, first_open_revision, actor)
+        .await
+        .expect("the first corrected drain must seal");
+    let sealed = stream_lane(&db).await;
+    db.failpoint_stream_resume_for_test(
+        TABLE,
+        "d7d7d7d7-d7d7-47d7-87d7-d7d7d7d7d7d7",
+        sealed.lifecycle_revision,
+        false,
+        actor,
+    )
+    .await
+    .expect("the same stream incarnation must reopen for a later block");
+    let reopened = stream_lane(&db).await;
+
+    let second_logical_id = "second-correction-id-owner";
+    let duplicate = physical_batch(&db, &[(second_logical_id.to_string(), 7)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(duplicate), 0)
+        .await
+        .expect("the later conflicting generation must become durable");
+    let second_drain_id = "e8e8e8e8-e8e8-48e8-88e8-e8e8e8e8e8e8";
+    let block_error = db
+        .failpoint_stream_quiesce_for_test(
+            TABLE,
+            second_drain_id,
+            reopened.lifecycle_revision,
+            actor,
+        )
+        .await
+        .expect_err("the later uniqueness conflict must publish another DataBlock");
+    let second_blocked = stream_lane(&db).await;
+    let second_block_token = second_blocked.strict_block_token.clone().unwrap();
+    assert_eq!(stream_data_block_token(&block_error), second_block_token);
+    let second_page = db
+        .failpoint_show_stream_data_block_for_test(TABLE, &second_block_token, None)
+        .await
+        .unwrap();
+    let reused_request = StreamDataCorrectionRequest {
+        protocol_version: 1,
+        block_token: second_block_token,
+        correction_id: correction_id.to_string(),
+        expected_lifecycle_revision: second_blocked.lifecycle_revision,
+        actions: vec![StreamDataCorrectionAction::Replace {
+            ordinal: second_page.entries[0].ordinal,
+            logical_key: second_logical_id.to_string(),
+            current_blocked_winner_stream_token: second_page.entries[0]
+                .current_blocked_winner_stream_token
+                .clone(),
+            write_id: "f9f9f9f9-f9f9-49f9-89f9-f9f9f9f9f9f9".to_string(),
+            row: serde_json::json!({"id": second_logical_id, "score": 9}),
+        }],
+        expected_plan_digest: None,
+    };
+    let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let before_table_head = raw_table_head(&db, TABLE).await;
+    let before_token_head = raw_stream_token_head(&db).await;
+    let before_rows = visible_rows(&db).await;
+    let before_commit_count = db.list_commits(Some("main")).await.unwrap().len();
+
+    let error = db
+        .failpoint_correct_stream_data_block_for_test(TABLE, reused_request, actor)
+        .await
+        .expect_err("one correction operation id cannot be rebound to a later block");
+    assert!(
+        matches!(error, OmniError::StreamLifecycleIdempotencyConflict { .. }),
+        "{error:?}"
+    );
+    let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(after_snapshot.version(), before_snapshot.version());
+    assert_eq!(
+        after_snapshot.entry(TABLE).unwrap().table_version,
+        before_snapshot.entry(TABLE).unwrap().table_version
+    );
+    assert_eq!(raw_table_head(&db, TABLE).await, before_table_head);
+    assert_eq!(raw_stream_token_head(&db).await, before_token_head);
+    assert_eq!(stream_lane(&db).await, second_blocked);
+    assert_eq!(visible_rows(&db).await, before_rows);
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        before_commit_count
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn data_block_withdraw_uses_a_marker_only_base_effect_and_unstrands_the_drain() {
+    let _scenario = FailScenario::setup();
+    let logical_id = "withdraw-blocked";
+    let drain_id = "d4d4d4d4-d4d4-44d4-84d4-d4d4d4d4d4d4";
+    let actor = "operator:data-block-withdraw";
+    let (dir, db, blocked, open_revision) =
+        prepare_unique_data_block(logical_id, drain_id, actor, true).await;
+    let block_token = blocked.strict_block_token.clone().unwrap();
+    let page = db
+        .failpoint_show_stream_data_block_for_test(TABLE, &block_token, None)
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert!(
+        page.entries[0]
+            .allowed_actions
+            .iter()
+            .any(|action| action == "WITHDRAW")
+    );
+    let request = StreamDataCorrectionRequest {
+        protocol_version: 1,
+        block_token,
+        correction_id: "e5e5e5e5-e5e5-45e5-85e5-e5e5e5e5e5e5".to_string(),
+        expected_lifecycle_revision: blocked.lifecycle_revision,
+        actions: vec![StreamDataCorrectionAction::Withdraw {
+            ordinal: page.entries[0].ordinal,
+            logical_key: logical_id.to_string(),
+            current_blocked_winner_stream_token: page.entries[0]
+                .current_blocked_winner_stream_token
+                .clone(),
+        }],
+        expected_plan_digest: None,
+    };
+    let corrected = db
+        .failpoint_correct_stream_data_block_for_test(TABLE, request.clone(), actor)
+        .await
+        .expect("all-WITHDRAW must still commit an exact marker-only base transaction");
+    assert!(corrected.changed);
+    let lane = stream_lane(&db).await;
+    assert_eq!(lane.lifecycle, "DRAINING");
+    assert_eq!(lane.strict_block_token, None);
+    let rows = visible_rows(&db).await;
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter().any(|(id, score)| id == logical_id && *score == 1),
+        "withdrawal must preserve the older visible winner for the same logical key"
+    );
+    assert!(
+        rows.iter()
+            .any(|(id, score)| id == "uniqueness-conflict" && *score == 7)
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    drop(db);
+    let reopened = reopen_enrolled(&dir).await;
+    let replay = reopened
+        .failpoint_correct_stream_data_block_for_test(TABLE, request, actor)
+        .await
+        .expect("the immutable withdrawal receipt must survive cold reopen");
+    assert!(!replay.changed);
+    assert_eq!(replay.graph_commit_id, corrected.graph_commit_id);
+    reopened
+        .failpoint_stream_quiesce_for_test(TABLE, drain_id, open_revision, actor)
+        .await
+        .expect("withdrawal must let the original drain prove an empty cut");
+    assert_eq!(stream_lane(&reopened).await.lifecycle, "SEALED");
+    assert_no_recovery_sidecars(&dir);
+}
+
+struct DataBlockCorrectionRecoveryBoundary {
+    failpoint: &'static str,
+    logical_id: &'static str,
+    drain_id: &'static str,
+    correction_id: &'static str,
+    write_id: &'static str,
+    recovery_publishes: bool,
+}
+
+async fn assert_data_block_correction_recovery_boundary(
+    boundary: DataBlockCorrectionRecoveryBoundary,
+) {
+    let actor = "operator:data-block-recovery";
+    let (dir, db, blocked, open_revision) =
+        prepare_unique_data_block(
+            boundary.logical_id,
+            boundary.drain_id,
+            actor,
+            false,
+        )
+        .await;
+    let block_token = blocked.strict_block_token.clone().unwrap();
+    let page = db
+        .failpoint_show_stream_data_block_for_test(TABLE, &block_token, None)
+        .await
+        .unwrap();
+    let request = StreamDataCorrectionRequest {
+        protocol_version: 1,
+        block_token: block_token.clone(),
+        correction_id: boundary.correction_id.to_string(),
+        expected_lifecycle_revision: blocked.lifecycle_revision,
+        actions: vec![StreamDataCorrectionAction::Replace {
+            ordinal: page.entries[0].ordinal,
+            logical_key: boundary.logical_id.to_string(),
+            current_blocked_winner_stream_token: page.entries[0]
+                .current_blocked_winner_stream_token
+                .clone(),
+            write_id: boundary.write_id.to_string(),
+            row: serde_json::json!({"id": boundary.logical_id, "score": 8}),
+        }],
+        expected_plan_digest: None,
+    };
+
+    let error = {
+        let _boundary = ScopedFailPoint::new(boundary.failpoint, "return");
+        db.failpoint_correct_stream_data_block_for_test(TABLE, request.clone(), actor)
+            .await
+            .expect_err("the injected crash cell must retain recovery ownership")
+    };
+    assert!(
+        matches!(error, OmniError::RecoveryRequired { .. }),
+        "{error:?}"
+    );
+    assert!(
+        visible_rows(&db)
+            .await
+            .iter()
+            .all(|(id, _)| id != boundary.logical_id),
+        "an unconfirmed correction participant must not become graph-visible"
+    );
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+        1,
+        "the injected correction cell must remain recovery-owned"
+    );
+    drop(db);
+
+    if !boundary.recovery_publishes {
+        let inspect_error = match Omnigraph::open_read_only(dir.path().to_str().unwrap()).await {
+            Ok(_) => panic!("read-only block inspection must refuse pending recovery"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(inspect_error, OmniError::RecoveryRequired { .. }),
+            "{inspect_error:?}"
+        );
+        assert_eq!(
+            helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+            1,
+            "read-only inspection must leave recovery ownership untouched"
+        );
+    }
+
+    let reopened = reopen_enrolled(&dir).await;
+    assert_no_recovery_sidecars(&dir);
+    let result = if boundary.recovery_publishes {
+        let lane = stream_lane(&reopened).await;
+        assert_eq!(lane.lifecycle, "DRAINING");
+        assert_eq!(lane.strict_block_token, None);
+        let replay = reopened
+            .failpoint_correct_stream_data_block_for_test(TABLE, request.clone(), actor)
+            .await
+            .expect("recovery-published correction must replay from its receipt");
+        assert!(!replay.changed);
+        replay
+    } else {
+        let lane = stream_lane(&reopened).await;
+        assert_eq!(
+            lane.strict_block_token.as_deref(),
+            Some(block_token.as_str())
+        );
+        reopened
+            .failpoint_correct_stream_data_block_for_test(TABLE, request.clone(), actor)
+            .await
+            .expect("effect-free recovery must leave the exact correction retryable")
+    };
+    assert_eq!(result.correction_id, boundary.correction_id);
+    assert!(
+        visible_rows(&reopened)
+            .await
+            .contains(&(boundary.logical_id.to_string(), 8))
+    );
+    reopened
+        .failpoint_stream_quiesce_for_test(TABLE, boundary.drain_id, open_revision, actor)
+        .await
+        .expect("every recovered correction must let the original drain finish");
+    assert_eq!(stream_lane(&reopened).await.lifecycle, "SEALED");
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn data_block_correction_recovery_closes_each_two_participant_crash_cell() {
+    let _scenario = FailScenario::setup();
+    let boundaries = [
+        DataBlockCorrectionRecoveryBoundary {
+            failpoint: names::STREAM_FOLD_POST_SIDECAR_PRE_BASE_COMMIT,
+            logical_id: "correction-arm-only",
+            drain_id: "11111111-1111-4111-8111-111111111111",
+            correction_id: "21111111-1111-4111-8111-111111111111",
+            write_id: "31111111-1111-4111-8111-111111111111",
+            recovery_publishes: false,
+        },
+        DataBlockCorrectionRecoveryBoundary {
+            failpoint: names::STREAM_FOLD_POST_BASE_COMMIT_PRE_TOKEN_COMMIT,
+            logical_id: "correction-base-only",
+            drain_id: "12222222-2222-4222-8222-222222222222",
+            correction_id: "22222222-2222-4222-8222-222222222222",
+            write_id: "32222222-2222-4222-8222-222222222222",
+            recovery_publishes: true,
+        },
+        DataBlockCorrectionRecoveryBoundary {
+            failpoint: names::STREAM_FOLD_POST_TOKEN_COMMIT_PRE_CONFIRM,
+            logical_id: "correction-both-effects",
+            drain_id: "13333333-3333-4333-8333-333333333333",
+            correction_id: "23333333-3333-4333-8333-333333333333",
+            write_id: "33333333-3333-4333-8333-333333333333",
+            recovery_publishes: true,
+        },
+    ];
+
+    for boundary in boundaries {
+        Box::pin(assert_data_block_correction_recovery_boundary(boundary)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

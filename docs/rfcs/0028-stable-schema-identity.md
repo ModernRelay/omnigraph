@@ -482,11 +482,13 @@ V14/recovery-v16 adds the checked-runtime `SEALED` EnsureIndices bridge;
 v15/recovery-v17 adds the distinct checked-runtime `SEALED` Optimize bridge.
 Neither maintenance owner adds a token receipt or caller operation ID.
 V16/recovery-v18 adds the separate private physical-rebind owner for an exact
-`SEALED` lane. Current v17/recovery-v19 adds the narrow stopped/offline,
-cluster-only authority-retirement and receipt-bearing export exit. Public
-ingress/enrollment/lifecycle control, correction, rebind, and public
-maintenance surfaces remain inactive; retirement is the sole narrow CLI
-exception.
+`SEALED` lane. V17/recovery-v19 adds the narrow stopped/offline, cluster-only
+authority-retirement and receipt-bearing export exit. Current
+v18/recovery-v20 adds exact stopped/offline `DataBlock` correction through the
+cluster-only `stream block show|correct` commands. Public ingress, enrollment,
+ordinary lifecycle control, authority repair, rebind, and public maintenance
+surfaces remain inactive; retirement and DataBlock control are the two narrow
+CLI exceptions.
 None of the later formats reinterprets or
 backfills v5 in place. A v5
 graph was never served with a

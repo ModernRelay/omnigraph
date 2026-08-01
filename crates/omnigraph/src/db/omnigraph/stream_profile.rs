@@ -59,6 +59,18 @@ pub struct CheckedClusterMaintenanceAuthority<'lock> {
     guard: ValidatedOfflineGuard<'lock>,
 }
 
+/// Engine-checked stopped-writer authority for inspecting or correcting one
+/// exact strict stream block.
+///
+/// A block belongs to an active `DRAINING` lane, so this capability is kept
+/// separate from `DISABLED`-only maintenance. The lower guard retains the
+/// concrete cluster apply lock and process-local runtime exclusion for the
+/// complete operation.
+#[doc(hidden)]
+pub struct CheckedClusterBlockAuthority<'lock> {
+    pub(super) guard: ValidatedOfflineGuard<'lock>,
+}
+
 /// Engine-checked stopped-writer authority for one root-wide retirement
 /// occurrence. Unlike ordinary maintenance, this capability may reach an
 /// already-RETIRED graph so confirmation can perform receipt-first replay.
@@ -107,6 +119,32 @@ impl CheckedClusterMaintenanceAuthority<'_> {
     /// for this pre-effect recapture.
     pub(crate) fn validate_profile(&self, profile: &StreamProfileEntry) -> Result<()> {
         validate_offline_maintenance_profile_binding(profile, &self.guard)
+    }
+}
+
+impl CheckedClusterBlockAuthority<'_> {
+    pub(super) fn operation_id(&self) -> &str {
+        self.guard.operation_id()
+    }
+
+    pub(super) fn actor(&self) -> &str {
+        self.guard.actor()
+    }
+
+    #[cfg(test)]
+    pub(super) fn expected_profile_revision(&self) -> u64 {
+        self.guard.expected_profile_revision()
+    }
+
+    #[cfg(test)]
+    pub(super) fn graph_store_uri(&self) -> &str {
+        self.guard.graph_store_uri()
+    }
+
+    /// Revalidate the exact active profile after the correction adapter has
+    /// acquired its final admission and graph-write gates.
+    pub(super) fn validate_profile(&self, profile: &StreamProfileEntry) -> Result<()> {
+        validate_offline_block_profile_binding(profile, &self.guard)
     }
 }
 
@@ -320,6 +358,36 @@ fn validate_offline_maintenance_profile_binding(
     Ok(())
 }
 
+fn validate_offline_block_profile_binding(
+    profile: &StreamProfileEntry,
+    guard: &ValidatedOfflineGuard<'_>,
+) -> Result<()> {
+    if let Some(error) = profile.retired_error() {
+        return Err(error);
+    }
+    if !matches!(
+        profile.mode(),
+        StreamProfileMode::Enabled | StreamProfileMode::Disabling
+    ) {
+        return Err(OmniError::StreamingAuthorityMismatch {
+            reason: format!(
+                "offline stream-block control requires exact ENABLED or DISABLING profile mode; graph is {}",
+                profile.mode().as_str()
+            ),
+        });
+    }
+    if profile.profile_revision != guard.expected_profile_revision() {
+        return Err(OmniError::StreamingAuthorityMismatch {
+            reason: format!(
+                "offline stream-block control expected profile revision {} but graph is at {}",
+                guard.expected_profile_revision(),
+                profile.profile_revision
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl Omnigraph {
     /// Consume a lower stopped-writer guard into the only engine capability
     /// that can change the graph-global stream profile.
@@ -391,6 +459,39 @@ impl Omnigraph {
         let profile = self.current_canonical_stream_profile().await?;
         validate_offline_maintenance_profile_binding(&profile, &guard)?;
         Ok(CheckedClusterMaintenanceAuthority { guard })
+    }
+
+    /// Consume a lower stopped-writer guard into the only offline capability
+    /// that can inspect or correct a strict stream block.
+    #[doc(hidden)]
+    pub async fn check_cluster_block_authority<'lock>(
+        &self,
+        guard: ValidatedOfflineGuard<'lock>,
+    ) -> Result<CheckedClusterBlockAuthority<'lock>> {
+        if guard.graph_store_uri() != self.uri() {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: format!(
+                    "validated stream-block store '{}' does not match opened graph '{}'",
+                    guard.graph_store_uri(),
+                    self.uri()
+                ),
+            });
+        }
+        if guard.operation() != AuthorityOperationClass::StreamBlockControl {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: "offline authority is not a stream-block control operation".to_string(),
+            });
+        }
+        self.enforce(
+            omnigraph_policy::PolicyAction::StreamManage,
+            &omnigraph_policy::ResourceScope::Graph,
+            Some(guard.actor()),
+        )?;
+
+        let _profile_gate = self.write_queue().acquire_stream_profile_shared().await;
+        let profile = self.current_canonical_stream_profile().await?;
+        validate_offline_block_profile_binding(&profile, &guard)?;
+        Ok(CheckedClusterBlockAuthority { guard })
     }
 
     /// Consume the dedicated offline guard used only by authority retirement.
@@ -1281,6 +1382,57 @@ node Person {
         Ok(())
     }
 
+    async fn check_block_authority(
+        db: &Omnigraph,
+        cluster: &tempfile::TempDir,
+        state_cas: &str,
+        graph_store_uri: &str,
+        expected_profile_revision: u64,
+        operation_id: &str,
+        actor: &str,
+    ) -> Result<()> {
+        let cluster_uri = format!("file://{}", cluster.path().display());
+        let storage = storage_handle_for_uri(&cluster_uri).unwrap();
+        let lock_uri = format!("{cluster_uri}/__cluster/lock.json");
+        let lock = match acquire_state_lock(&storage, &lock_uri, "apply")
+            .await
+            .unwrap()
+        {
+            StateLockAcquire::Acquired(lock) => lock,
+            StateLockAcquire::Held => panic!("fresh test apply lock is already held"),
+        };
+        let declaration_digest = format!("sha256:{}", "e".repeat(64));
+        let guard = validate_offline_guard(
+            &lock,
+            OfflineAuthorityRequest {
+                graph_id: "knowledge",
+                graph_store_uri,
+                expected_state_cas: state_cas,
+                state_revision: 1,
+                declaration_revision: "stream-block-declaration-v1",
+                declaration_digest: &declaration_digest,
+                expected_profile_revision,
+                operation_id,
+                operation: AuthorityOperationClass::StreamBlockControl,
+                actor,
+                confirm_stream_offline: true,
+            },
+        )
+        .await
+        .unwrap();
+        let authority = db.check_cluster_block_authority(guard).await?;
+        assert_eq!(authority.operation_id(), operation_id);
+        assert_eq!(authority.actor(), actor);
+        assert_eq!(
+            authority.expected_profile_revision(),
+            expected_profile_revision
+        );
+        assert_eq!(authority.graph_store_uri(), graph_store_uri);
+        let profile = db.current_canonical_stream_profile().await?;
+        authority.validate_profile(&profile)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn checked_maintenance_authority_requires_exact_disabled_profile_revision() {
         let cluster = tempfile::tempdir().unwrap();
@@ -1367,6 +1519,131 @@ node Person {
             enabled,
             OmniError::StreamingAuthorityMismatch { ref reason }
                 if reason.contains("requires exact DISABLED profile mode; graph is ENABLED")
+        ));
+    }
+
+    #[tokio::test]
+    async fn checked_block_authority_requires_exact_active_profile_revision() {
+        let cluster = tempfile::tempdir().unwrap();
+        let state_cas = write_cluster_state(&cluster);
+        let graph = cluster.path().join("graphs/knowledge.omni");
+        let db = Omnigraph::init(graph.to_str().unwrap(), TEST_SCHEMA)
+            .await
+            .unwrap();
+
+        let disabled = check_block_authority(
+            &db,
+            &cluster,
+            &state_cas,
+            db.uri(),
+            1,
+            "block-at-disabled-r1",
+            "operator:alice",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            disabled,
+            OmniError::StreamingAuthorityMismatch { ref reason }
+                if reason.contains("requires exact ENABLED or DISABLING profile mode; graph is DISABLED")
+        ));
+
+        apply_profile(
+            &db,
+            &cluster,
+            &state_cas,
+            1,
+            "enable-before-block-control",
+            AuthorityOperationClass::StreamProfileEnable,
+            "stream-declaration-enabled-v1",
+            &format!("sha256:{}", "a".repeat(64)),
+            "operator:alice",
+        )
+        .await
+        .unwrap();
+        check_block_authority(
+            &db,
+            &cluster,
+            &state_cas,
+            db.uri(),
+            2,
+            "block-at-enabled-r2",
+            "operator:alice",
+        )
+        .await
+        .unwrap();
+
+        // Model the blocked-disable state the command is primarily for: the
+        // admission-cutoff CAS landed and the drain could not terminalize.
+        let mut coordinator = ManifestCoordinator::open(db.uri()).await.unwrap();
+        let enabled = coordinator.snapshot().stream_profile().clone();
+        let active = match &enabled.state {
+            StreamProfileState::Enabled {
+                active_fold_delegation,
+            } => active_fold_delegation,
+            other => panic!("expected ENABLED, got {other:?}"),
+        };
+        let disabling_revision = enabled.profile_revision + 1;
+        let cluster_root =
+            omnigraph_storage::normalize_root_uri(cluster.path().to_str().unwrap()).unwrap();
+        let cluster_root_digest = stream_profile_cluster_root_digest(&cluster_root).unwrap();
+        let graph_identity_digest =
+            stream_profile_graph_identity_digest(&cluster_root_digest, "knowledge", db.uri())
+                .unwrap();
+        let declaration_digest = format!("sha256:{}", "b".repeat(64));
+        let request_digest = stream_profile_management_request_digest(
+            &graph_identity_digest,
+            "disable-blocked",
+            "stream-declaration-disabled-v1",
+            &declaration_digest,
+            disabling_revision,
+            StreamProfileMode::Disabled,
+        )
+        .unwrap();
+        let plan = DisablePlan::new(
+            "disable-blocked",
+            request_digest,
+            "stream-declaration-disabled-v1",
+            &declaration_digest,
+            "operator:alice",
+            FoldContinuation::derive(active, disabling_revision).unwrap(),
+        )
+        .unwrap();
+        let disabling = StreamProfileEntry::disabling_from(&enabled, plan).unwrap();
+        coordinator
+            .commit_changes(&[ManifestChange::SetStreamProfile {
+                expected: enabled,
+                next: disabling,
+            }])
+            .await
+            .unwrap();
+        check_block_authority(
+            &db,
+            &cluster,
+            &state_cas,
+            db.uri(),
+            disabling_revision,
+            "block-at-disabling-r3",
+            "operator:alice",
+        )
+        .await
+        .unwrap();
+
+        let stale_revision = check_block_authority(
+            &db,
+            &cluster,
+            &state_cas,
+            db.uri(),
+            2,
+            "block-at-stale-r2",
+            "operator:alice",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            stale_revision,
+            OmniError::StreamingAuthorityMismatch { ref reason }
+                if reason.contains("expected profile revision 2 but graph is at 3")
         ));
     }
 
@@ -1519,6 +1796,19 @@ rules:
         .await
         .unwrap_err();
         assert!(matches!(denied_maintenance, OmniError::Policy(_)));
+
+        let denied_block = check_block_authority(
+            &db,
+            &cluster,
+            &state_cas,
+            db.uri(),
+            1,
+            "denied-block-operation",
+            "operator:denied",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(denied_block, OmniError::Policy(_)));
 
         let denied = apply_profile(
             &db,

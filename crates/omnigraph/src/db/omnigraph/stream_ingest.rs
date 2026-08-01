@@ -237,9 +237,9 @@ pub(super) struct StreamAuthorityCapture {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AttributedFoldPlan {
-    token_rows: Vec<StreamTokenAuthorityRow>,
-    summary: StreamFoldAttributionSummary,
+pub(super) struct AttributedFoldPlan {
+    pub(super) token_rows: Vec<StreamTokenAuthorityRow>,
+    pub(super) summary: StreamFoldAttributionSummary,
 }
 
 struct StreamJsonRowWire {
@@ -5398,7 +5398,7 @@ impl Omnigraph {
         Ok(Some((sidecar, attempt)))
     }
 
-    async fn selected_claim_receipt(
+    pub(super) async fn selected_claim_receipt(
         &self,
         snapshot: &crate::db::manifest::Snapshot,
         lifecycle: &StreamLifecycleEntry,
@@ -5806,7 +5806,7 @@ impl Omnigraph {
         validate_stream_value_constraints(&capture.entry.table_key, batch, &capture.txn.catalog)
     }
 
-    async fn ensure_no_relevant_stream_sidecar(
+    pub(super) async fn ensure_no_relevant_stream_sidecar(
         &self,
         identity: TableIdentity,
         operation: &str,
@@ -6619,7 +6619,7 @@ fn stream_data_block_error(block_token: &str) -> OmniError {
     }
 }
 
-fn validate_stream_value_constraints(
+pub(super) fn validate_stream_value_constraints(
     table_key: &str,
     batch: &RecordBatch,
     catalog: &omnigraph_compiler::catalog::Catalog,
@@ -6642,7 +6642,7 @@ fn validate_stream_value_constraints(
     Ok(())
 }
 
-fn validate_stream_input_bounds(table_key: &str, batch: &RecordBatch) -> Result<()> {
+pub(super) fn validate_stream_input_bounds(table_key: &str, batch: &RecordBatch) -> Result<()> {
     if batch.num_rows() == 0 {
         return Err(OmniError::manifest("stream batch must be non-empty"));
     }
@@ -6743,7 +6743,7 @@ where
     }))
 }
 
-fn append_trusted_stream_metadata(
+pub(super) fn append_trusted_stream_metadata(
     batch: RecordBatch,
     metadata: Vec<Option<TrustedStreamRowMetadata>>,
 ) -> Result<RecordBatch> {
@@ -7013,7 +7013,7 @@ async fn scan_fresh_generation(
     Ok(batches)
 }
 
-async fn plan_fold_attribution(
+pub(super) async fn plan_fold_attribution(
     snapshot: &crate::db::manifest::Snapshot,
     identity: TableIdentity,
     lifecycle: &StreamLifecycleEntry,
@@ -7153,7 +7153,7 @@ async fn plan_fold_attribution(
     })
 }
 
-fn validate_fold_output_bounds(table_key: &str, batches: &[RecordBatch]) -> Result<()> {
+pub(super) fn validate_fold_output_bounds(table_key: &str, batches: &[RecordBatch]) -> Result<()> {
     let (rows, bytes) = fold_output_size(batches)?;
     if rows == 0 {
         return Err(OmniError::manifest_internal(
@@ -7177,7 +7177,7 @@ fn validate_fold_output_bounds(table_key: &str, batches: &[RecordBatch]) -> Resu
     Ok(())
 }
 
-fn fold_output_size(batches: &[RecordBatch]) -> Result<(u64, u64)> {
+pub(super) fn fold_output_size(batches: &[RecordBatch]) -> Result<(u64, u64)> {
     let mut rows = 0_u64;
     let mut bytes = 0_u64;
     for batch in batches {
@@ -7195,7 +7195,7 @@ fn fold_output_size(batches: &[RecordBatch]) -> Result<(u64, u64)> {
     Ok((rows, bytes))
 }
 
-fn exact_merged_generation(
+pub(super) fn exact_merged_generation(
     details: &MemWalIndexDetails,
     shard_id: ShardId,
 ) -> Result<Option<MergedGeneration>> {

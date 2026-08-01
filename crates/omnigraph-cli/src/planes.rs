@@ -14,7 +14,7 @@ use color_eyre::eyre::bail;
 
 use crate::cli::{
     Cli, ClusterCommand, ClusterStreamCommand, Command, GraphsCommand, QueriesCommand,
-    SchemaCommand, StreamRetireForRebuildCommand,
+    SchemaCommand, StreamBlockCommand, StreamRetireForRebuildCommand,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,7 +173,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // writes; served writes resolve the actor from the bearer token
         // (rejected downstream with its own message), and `direct`
         // maintenance verbs record no actor. `control` refines per command:
-        // `cluster apply`/`approve` and the actor-bound retirement handshake
+        // `cluster apply`/`approve` and the actor-bound stream-control commands
         // attribute an actor — the other read-only control verbs
         // (status/plan/validate, policy, queries) never read it.
         ScopeFlag::As => match capability {
@@ -298,6 +298,18 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Repair { .. } => "repair",
         Command::Cleanup { .. } => "cleanup",
         Command::Cluster { command } => match command {
+            ClusterCommand::Stream {
+                command:
+                    ClusterStreamCommand::Block {
+                        command: StreamBlockCommand::Show { .. },
+                    },
+            } => "cluster stream block show",
+            ClusterCommand::Stream {
+                command:
+                    ClusterStreamCommand::Block {
+                        command: StreamBlockCommand::Correct { .. },
+                    },
+            } => "cluster stream block correct",
             ClusterCommand::Stream {
                 command:
                     ClusterStreamCommand::RetireForRebuild {
@@ -446,7 +458,7 @@ mod tests {
         // The full flag × capability contract in one place. Rows cover every
         // capability, both cluster_ok refinements of `direct` (optimize vs
         // init) and of `control` (queries vs cluster), plus the graph-only
-        // retirement selector. `served` is the registry scope: server
+        // stream-control selectors. `served` is the registry scope: server
         // addressing only — --graph/--store/--as are rejected (--graph used
         // to corrupt the registry URL to /graphs/<id>/graphs).
         let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
@@ -472,9 +484,9 @@ mod tests {
                 [false, false, false, false, false, false],
             ),
             // Read-only control verbs never read the actor; `cluster
-            // apply`/`approve` and retirement do. The `cluster` family
+            // apply`/`approve` and stream control do. The `cluster` family
             // addresses its config with --config and never resolves a profile
-            // scope. Retirement is the one member that also selects a graph.
+            // scope. Both stream-control families also select one graph.
             (
                 parse(&["omnigraph", "queries", "list"]),
                 [false, true, true, false, false, true],
@@ -496,6 +508,19 @@ mod tests {
                     "plan",
                     "--config",
                     ".",
+                ]),
+                [false, false, true, false, true, false],
+            ),
+            (
+                parse(&[
+                    "omnigraph",
+                    "cluster",
+                    "stream",
+                    "block",
+                    "show",
+                    "node:Person",
+                    "--block-token",
+                    "block-1",
                 ]),
                 [false, false, true, false, true, false],
             ),
@@ -541,6 +566,25 @@ mod tests {
         );
         assert_eq!(
             cap(&["omnigraph", "cluster", "status", "--config", "."]),
+            Capability::Control
+        );
+        assert_eq!(
+            cap(&[
+                "omnigraph",
+                "cluster",
+                "stream",
+                "block",
+                "correct",
+                "node:Person",
+                "--block-token",
+                "block-1",
+                "--correction-id",
+                "00000000-0000-4000-8000-000000000002",
+                "--expected-lifecycle-revision",
+                "1",
+                "--plan",
+                "plan.json",
+            ]),
             Capability::Control
         );
         assert_eq!(

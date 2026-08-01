@@ -7,6 +7,8 @@
     use std::path::Path;
 
     use omnigraph::db::Omnigraph;
+    use omnigraph_compiler::ir::ParamMap;
+    use omnigraph_compiler::query::ast::Literal;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -4763,5 +4765,243 @@ policies: {}
         assert!(
             !dir.path().join(CLUSTER_LOCK_FILE).exists(),
             "engine refusal must release the dedicated retirement lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_block_preflight_requires_actor_confirmation_and_declared_graph() {
+        let dir = fixture();
+        let missing_authority = show_stream_data_block_config_dir(
+            dir.path(),
+            "knowledge",
+            "node:Person",
+            "block-1",
+            None,
+            StreamBlockControlOptions::default(),
+        )
+        .await;
+        assert!(!missing_authority.ok);
+        assert!(missing_authority
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "stream_block_actor_required"));
+        assert!(missing_authority.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "streaming_offline_confirmation_required"
+        }));
+        assert!(
+            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
+            "preflight refusal must happen before lock acquisition"
+        );
+
+        let unknown_graph = show_stream_data_block_config_dir(
+            dir.path(),
+            "other",
+            "node:Person",
+            "block-1",
+            None,
+            StreamBlockControlOptions {
+                actor: Some("stream-operator".to_string()),
+                confirm_stream_offline: true,
+            },
+        )
+        .await;
+        assert!(!unknown_graph.ok);
+        assert!(unknown_graph.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "stream_block_graph_not_declared"
+                && diagnostic.path == "graphs.other"
+        }));
+        assert!(
+            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
+            "unknown graph refusal must happen before lock acquisition"
+        );
+
+        init_derived_graph(dir.path()).await;
+        let import = import_config_dir(dir.path()).await;
+        assert!(import.ok, "{import:?}");
+        let unapplied_profile = show_stream_data_block_config_dir(
+            dir.path(),
+            "knowledge",
+            "node:Person",
+            "block-1",
+            None,
+            StreamBlockControlOptions {
+                actor: Some("stream-operator".to_string()),
+                confirm_stream_offline: true,
+            },
+        )
+        .await;
+        assert!(!unapplied_profile.ok);
+        assert!(unapplied_profile.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "stream_block_profile_not_applied"
+                && diagnostic.path == "streaming.knowledge"
+        }));
+        assert!(
+            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
+            "applied-profile refusal must release the state lock"
+        );
+    }
+
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn stream_block_authority_and_shape_refusals_precede_recovery() {
+        let _scenario = fail::FailScenario::setup();
+
+        fn graph_tree(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            fn visit(
+                root: &Path,
+                current: &Path,
+                files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+            ) {
+                let mut entries = fs::read_dir(current)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                entries.sort();
+                for path in entries {
+                    if path.is_dir() {
+                        visit(root, &path, files);
+                    } else {
+                        files.insert(
+                            path.strip_prefix(root).unwrap().to_path_buf(),
+                            fs::read(path).unwrap(),
+                        );
+                    }
+                }
+            }
+
+            let mut files = std::collections::BTreeMap::new();
+            visit(root, root, &mut files);
+            files
+        }
+
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+        let applied = confirmed_streaming_apply(dir.path()).await;
+        assert!(applied.ok && applied.converged, "{applied:?}");
+        let serving = read_serving_snapshot(dir.path()).await.unwrap();
+        let runtime_binding = serving.graphs[0]
+            .stream_runtime_authority
+            .clone()
+            .expect("enabled graph carries a validated runtime binding");
+        let graph_root = dir.path().join("graphs/knowledge.omni");
+        let runtime_guard = mint_runtime_guard(
+            runtime_binding.clone(),
+            "stream-block-recovery-fixture",
+            "stream-operator",
+        )
+        .await
+        .unwrap();
+        let db = Omnigraph::open(graph_root.to_str().unwrap())
+            .await
+            .unwrap()
+            .with_checked_cluster_stream_runtime(runtime_guard)
+            .await
+            .unwrap();
+        db.branch_create("recovery-fixture").await.unwrap();
+        let mut params = ParamMap::new();
+        params.insert(
+            "name".to_string(),
+            Literal::String("pending-recovery".to_string()),
+        );
+        params.insert("age".to_string(), Literal::Integer(42));
+        let mutation_error = {
+            let _failpoint = omnigraph::failpoints::ScopedFailPoint::new(
+                omnigraph::failpoints::names::MUTATION_POST_SIDECAR_PRE_FORK,
+                "return",
+            );
+            db.mutate(
+                "recovery-fixture",
+                r#"
+query arm_recovery($name: String, $age: I32) {
+  insert Person { name: $name, age: $age }
+}
+"#,
+                "arm_recovery",
+                &params,
+            )
+            .await
+            .expect_err("the fixture must retain one arm-only graph recovery sidecar")
+        };
+        assert!(
+            matches!(
+                mutation_error,
+                omnigraph::error::OmniError::RecoveryRequired { .. }
+            ),
+            "{mutation_error:?}"
+        );
+        drop(db);
+        let recovery_dir = graph_root.join("__recovery");
+        assert_eq!(fs::read_dir(&recovery_dir).unwrap().count(), 1);
+        let before_graph = graph_tree(&graph_root);
+        let runtime_guard = mint_runtime_guard(
+            runtime_binding.clone(),
+            "stream-block-runtime-owner",
+            "operator:runtime-owner",
+        )
+        .await
+        .unwrap();
+
+        let request = omnigraph::db::StreamDataCorrectionRequest {
+            protocol_version: 1,
+            block_token: format!("sha256:{}", "a".repeat(64)),
+            correction_id: "abababab-abab-4bab-8bab-abababababab".to_string(),
+            expected_lifecycle_revision: 1,
+            actions: Vec::new(),
+            expected_plan_digest: None,
+        };
+        let refused = correct_stream_data_block_config_dir(
+            dir.path(),
+            "knowledge",
+            "node:Person",
+            request.clone(),
+            StreamBlockControlOptions {
+                actor: Some("stream-operator".to_string()),
+                confirm_stream_offline: true,
+            },
+        )
+        .await;
+        assert!(!refused.ok, "{refused:?}");
+        assert!(refused.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "stream_block_correct_failed"
+                && diagnostic.message.contains("live runtime")
+        }));
+        assert_eq!(
+            graph_tree(&graph_root),
+            before_graph,
+            "runtime exclusion must reject before RW open can resolve the sidecar or move any graph physical/manifest file"
+        );
+        assert_eq!(fs::read_dir(&recovery_dir).unwrap().count(), 1);
+        assert!(
+            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
+            "runtime refusal must release the cluster state lock"
+        );
+
+        drop(runtime_guard);
+        let malformed = correct_stream_data_block_config_dir(
+            dir.path(),
+            "knowledge",
+            "node:Person",
+            request,
+            StreamBlockControlOptions {
+                actor: Some("stream-operator".to_string()),
+                confirm_stream_offline: true,
+            },
+        )
+        .await;
+        assert!(!malformed.ok, "{malformed:?}");
+        assert!(malformed.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "stream_block_correct_failed"
+                && diagnostic.message.contains("stream correction actions")
+        }));
+        assert_eq!(
+            graph_tree(&graph_root),
+            before_graph,
+            "request-shape refusal must happen before pending graph recovery can move any physical or manifest file"
+        );
+        assert_eq!(fs::read_dir(&recovery_dir).unwrap().count(), 1);
+        assert!(
+            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
+            "shape refusal must release the cluster state lock"
         );
     }

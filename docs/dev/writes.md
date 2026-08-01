@@ -19,7 +19,7 @@ authority.
 - No `omnigraph run *` CLI subcommands and no `/runs/*` HTTP endpoints.
 - No `__run__<id>` staging branches; `__run__*` is no longer a reserved
   name. The branch-name guard was removed in MR-770. Historically, the v2→v3
-  in-place migration swept stale `__run__*` entries; the current v17 strand is
+  in-place migration swept stale `__run__*` entries; the current v18 strand is
   strict single-version, so older graphs are refused and rebuilt by
   export/init/load rather than migrated on open. (Inert `_graph_runs.lance`
   bytes in an old export source remain irrelevant to the rebuilt graph.)
@@ -559,15 +559,16 @@ terminal-management effects. V13 adds recovery-v15 for private,
 revision-fenced resume and guarded drain-abort. V14 adds recovery-v16 for the
 narrow checked-runtime `SEALED` EnsureIndices bridge; v15 adds the distinct
   recovery-v17 `SEALED` Optimize bridge; v16 adds recovery-v18 private physical
-rebind for an exact `SEALED` lane; current v17 adds recovery-v19 terminal
-stream-authority retirement. The hidden one-lane core can
+rebind for an exact `SEALED` lane; v17 adds recovery-v19 terminal
+stream-authority retirement; current v18 adds recovery-v20 exact `DataBlock`
+correction. The hidden one-lane core can
 quiesce an enrolled lane `OPEN → DRAINING → SEALED`, including empty and non-empty lanes, but no
 supported production surface can invoke it. The Cedar vocabulary,
 manifest-only status, and checked stopped/offline and runtime ownership exist;
 there is no accepted-schema declaration, production enrollment/quiesce/resume/rebind,
-public ingest, correction, or HTTP/OpenAPI streaming, rebind, or maintenance
-surface. The only supported retirement surface is the narrow offline cluster
-plan/confirm handshake described below.
+public ingest, or HTTP/OpenAPI streaming, rebind, or maintenance surface. The
+narrow supported exceptions are the offline cluster retirement plan/confirm
+handshake and stopped/offline `stream block show|correct` DataBlock control.
 
 Lifecycle-v3 enrollment owns the physical binding:
 
@@ -867,14 +868,16 @@ table-disjoint writers. A final-barrier late discovery releases the complete
 gate suffix and restarts from the root barrier; it never recovers while
 retaining a leaf gate.
 
-The remaining product contract is still inactive. `@stream` eligibility,
+Most of the remaining product contract is still inactive. `@stream` eligibility,
 request-idempotent public enrollment, authoritative status, revisioned
 `OPEN -> DRAINING -> SEALED -> OPEN` management, bounded terminal receipts,
-`REPLACE`/`WITHDRAW` correction, authorization, and wire/SDK/CLI parity have no
-production caller yet. The retirement handshake does not activate any of those
-surfaces or a production path that creates `WITHDRAWN`. State-v2 reserves and
-validates their durable slots; it does not imply that their transitions are
-implemented. The B2b
+or wire/SDK/HTTP parity have no production caller yet. V18's stopped/offline
+cluster-only DataBlock surface is the narrow exception: `show` reconstructs a
+bounded receipt-bound view, while `correct` authorizes an ordered
+`REPLACE`/`WITHDRAW` plan and recovery-v20 publishes one exact base plus
+combined token/receipt outcome without resuming the drain. The retirement
+handshake and correction surface still do not activate a production ingress
+path that creates `WITHDRAWN`. The B2b
 managed-reclamation profile requires Lance-owned durable reclamation with whole-cut proof,
 attempt/receipt recovery, bounded history checkpointing, strong PUT/DELETE
 inventory plus multipart accounting/abort or durable accounting, a post-success
@@ -1401,7 +1404,7 @@ chain is the audit record, so it appends neither graph lineage nor
 `db/manifest/migrations.rs` is the single place the on-disk `__manifest` shape is
 reconciled with what the binary expects. Storage is **strict-single-version** (the
 strand model): this binary reads exactly ONE internal-schema version
-(`MIN_SUPPORTED == CURRENT == 17`), so there is no in-place migration.
+(`MIN_SUPPORTED == CURRENT == 18`), so there is no in-place migration.
 
 - **Graph creation** stamps `omnigraph:internal_schema_version` at CURRENT, so a
   fresh graph always opens.
@@ -1455,13 +1458,15 @@ drain-abort without reinterpreting v14's incomplete scaffold. V14 activates
 recovery-v16 private SEALED EnsureIndices; v15 activates the distinct
   recovery-v17 private SEALED Optimize path without reinterpreting the v14
   maintenance scaffold; v16 activates recovery-v18 private physical rebind
-  without reinterpreting v14's three-field rebind scaffold. Current v17
-  activates recovery-v19 root-wide authority retirement and receipt-bearing
-  export/rebuild. The older hidden seams are not supported production lifecycle
-  APIs. Historical v10 enrollment, v12 fold, and v14 resume/maintenance/
-  retirement sidecars are refused, not reinterpreted. Public ingress,
-  enrollment/quiesce/resume/abort/rebind, correction, and public integration
-  remain inactive.
+  without reinterpreting v14's three-field rebind scaffold. V17 activates
+  recovery-v19 root-wide authority retirement and receipt-bearing
+  export/rebuild. Current v18 activates recovery-v20 exact DataBlock
+  correction without reinterpreting v14's incomplete correction scaffold. The
+  older hidden seams are not supported production lifecycle APIs. Historical
+  v10 enrollment, v12 fold, and v14 resume/maintenance/correction/retirement
+  sidecars are refused, not reinterpreted. Public ingress,
+  enrollment/quiesce/resume/abort/rebind, and public integration remain
+  inactive.
 
 The stamp history (v1 PK-less, v2 unenforced-PK, v3 `__run__*` sweep, v4 lineage
 in `__manifest` with the commit-graph tables retired, v5 stable table identity,
@@ -1473,9 +1478,9 @@ recovery-v12, v10 graph-profile enablement, v11 checked profile-v2 plus
 recovery-v13 profile receipts, v12 lifecycle-v3 plus recovery-v14, v13
 private resume/guarded drain-abort plus recovery-v15, v14 private SEALED
   EnsureIndices plus recovery-v16, v15 private SEALED Optimize plus
-  recovery-v17, v16 private physical rebind plus recovery-v18, and v17
-  authority retirement plus recovery-v19) is recorded on the
-`INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v17 is
+  recovery-v17, v16 private physical rebind plus recovery-v18, v17 authority
+  retirement plus recovery-v19, and v18 DataBlock correction plus recovery-v20)
+is recorded on the `INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v18 is
 served. An
 earlier-stamped graph is rebuilt via export/import, not migrated in place.
 

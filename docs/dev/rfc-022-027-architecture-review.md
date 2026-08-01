@@ -9,12 +9,13 @@ manifest-only status plus bounded v11/profile-v2 and recovery-v13
 profile-authority implemented, hidden v12/lifecycle-v3/recovery-v14
 enrollment/claim/fold/quiesce, v13/recovery-v15 resume/abort-drain,
 v14/recovery-v16 `SEALED` EnsureIndices, v15/recovery-v17 `SEALED` Optimize,
-v16/recovery-v18 checked offline physical rebind, and v17/recovery-v19 terminal
-authority retirement/export implemented; public row
+v16/recovery-v18 checked offline physical rebind, v17/recovery-v19 terminal
+authority retirement/export, and v18/recovery-v20 stopped/offline DataBlock
+correction implemented; public row
 streaming, production enrollment/quiesce/rebind, resume/abort,
-correction, exclusive-cut status, and row/lifecycle transport surfaces inactive
+exclusive-cut status, and row/lifecycle transport surfaces inactive
 **Date:** 2026-07-11
-**Last updated:** 2026-07-31
+**Last updated:** 2026-08-01
 **Audience:** RFC authors, engine/storage maintainers, and release reviewers
 **Reviewed against:** OmniGraph 0.8.1; Lance 9.0.0-beta.15 at
 `f24e42c11a742581365e1cbe17c906ea2dac1bc6`; full Lance transaction,
@@ -83,11 +84,12 @@ V13/recovery-v15 adds private resume and guarded drain-abort.
 V14/recovery-v16 adds the narrow checked `SEALED` EnsureIndices bridge;
 v15/recovery-v17 adds the distinct checked `SEALED` Optimize bridge;
 v16/recovery-v18 adds the private physical-rebind owner for an exact `SEALED`
-lane; current v17/recovery-v19 adds the cluster-only stopped/offline terminal
-authority-retirement and receipt-bearing export exit. Public/production rebind
-remains inactive.
+lane; v17/recovery-v19 adds the cluster-only stopped/offline terminal
+authority-retirement and receipt-bearing export exit; current v18/recovery-v20
+adds exact stopped/offline DataBlock correction while retaining `DRAINING`.
+Public/production rebind remains inactive.
 Historical recovery-v12 fold keeps its wire meaning and is refused rather than
-reinterpreted. Production enrollment/quiesce, resume/abort, correction, full
+reinterpreted. Production enrollment/quiesce, resume/abort, full
 status, and product parity remain specified,
 required, and inactive. Two RC.1 surface guards prove generic cleanup
 non-ownership and the stale-writer hazard created by deleting the successor's
@@ -101,7 +103,7 @@ audit and RFC-025.
 **RFC-023 substrate evidence revalidated against:** the same beta.21 revision;
 filter-shape and conflict-order probes are recorded in RFC-023 §2. Internal
 schema v6 introduced that evidence through exact-`id` fenced production
-routing, and current v17 preserves it. Its final insertion-absence certificate/no-target-preflight route and
+routing, and current v18 preserves it. Its final insertion-absence certificate/no-target-preflight route and
 predeclared 10K/100K production series now satisfy the remaining implementation
 and acceptance gates.
 **RFC-026 substrate contract revalidated against:** RC.1 at the current revision;
@@ -122,7 +124,7 @@ so the candidate and format are research-blocked rather than accepted.
 RFC-025 Gate 0 was measured on 2026-07-17: Lance tag semantics pass, but the
 current in-manifest checkpoint-registry BTREE shape has history-sensitive
 compacted scan bytes and crosses another scan-operation boundary at 1,000
-commits. RFC-025 is therefore also research-blocked; current internal schema v17
+commits. RFC-025 is therefore also research-blocked; current internal schema v18
 still contains no retention state. The bucket-gated S3/RustFS cost cell is checked in but was
 not run for that decision.
 
@@ -545,9 +547,9 @@ private resume/guarded drain-abort path. V14/recovery-v16 adds the checked
 `SEALED` EnsureIndices bridge; v15/recovery-v17 adds the distinct checked
 `SEALED` Optimize bridge. Neither maintenance owner adds a token receipt or
 caller operation ID. V16/recovery-v18 adds the separate private physical-rebind
-owner; current v17/recovery-v19 adds terminal stopped/offline authority
-retirement and receipt-bearing export while leaving public/production rebind
-and correction inactive. RFC-026
+owner; v17/recovery-v19 adds terminal stopped/offline authority retirement and
+receipt-bearing export; current v18/recovery-v20 adds stopped/offline exact
+DataBlock correction while leaving public/production rebind inactive. RFC-026
 remains draft and public row streaming remains inactive.
 
 Enrollment creates persistent MemWAL metadata and `stream_state` changes the
@@ -581,15 +583,16 @@ internal schema v9, stream-config v3, stream-state protocol v2, and
 recovery-v12 to trusted hidden row metadata, canonical payload/token digests,
 the manifest-selected current-token participant, and exact base-plus-token fold
 publication. Genuine v8↔v9 refusal/rebuild evidence is green. Explicit
-production enrollment/quiesce, correction/status, and product parity remain
+production enrollment/quiesce, full status, and product parity remain
 inactive. Internal schema v11/profile-v2 and recovery-v13 own checked profile
 changes and their exact receipt. V12/lifecycle-v3 and recovery-v14 own
 the hidden enrollment, claim, ordinary/drain fold, and terminal management
 receipt families. V13/recovery-v15 owns private resume and guarded drain-abort.
 V14/recovery-v16 owns checked `SEALED` EnsureIndices; v15/recovery-v17 owns the
 distinct checked `SEALED` Optimize shape; v16/recovery-v18 owns exact offline
-physical rebind into a fresh empty `SEALED` scope; current v17/recovery-v19 owns
-terminal root-wide authority retirement and receipt-bearing export. The older
+physical rebind into a fresh empty `SEALED` scope; v17/recovery-v19 owns
+terminal root-wide authority retirement and receipt-bearing export; current
+v18/recovery-v20 owns stopped/offline exact DataBlock correction. The older
 v14 resume/maintenance/retirement/rebind scaffolds and correction variant remain
 fail-closed. The selected unbounded
 B2a profile adds no storage watermark or `GraphHistoryBudget`; those mechanisms
@@ -1156,7 +1159,7 @@ protected by symmetry in either case.
 > scalar-indexed/default-v1 path still emits `None`, keyed Append remains
 > reachable in today's engine, and beta.21 still permits unfiltered Update or
 > Append to land second after a filtered Update. Internal schema v6 introduced
-> the routing closure, and current v17 preserves it: every production
+> the routing closure, and current v18 preserves it: every production
 > insertion-bearing graph path uses
 > the exact-`id`, forced-v2 keyed adapter, generic Append is test-only, and the
 > adapter verifies the emitted field-ID filter. Upstream symmetry is therefore
@@ -1282,7 +1285,7 @@ The review does not require all RFCs to land together. A safe order is:
 4. RFC-024's independent physical lookup evaluation completed on 2026-07-15:
    the exact BTREE's scan work is flat, but uncompacted RustFS cold object
    reads/bytes and compacted byte terms grow, so the format is research-blocked
-   and the current development format remains on internal schema v17 without table heads;
+   and the current development format remains on internal schema v18 without table heads;
 5. keep RFC-025 research-blocked after its 2026-07-17 Gate 0 no-go; reconsider
    only after a history-flat current-authority lookup shape or revised
    evidence-backed operational contract passes the full physical-I/O boundary,

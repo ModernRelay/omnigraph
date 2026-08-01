@@ -440,6 +440,70 @@ pub(crate) fn finish_stream_authority_retirement_plan(
     Ok(())
 }
 
+pub(crate) fn finish_stream_block_show(output: &StreamBlockShowOutput, json: bool) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else if let Some(page) = output.page.as_ref() {
+        println!("stream data block for {}", output.graph_id);
+        println!("  table: {}", page.table_key);
+        println!(
+            "  table identity: {}:{}",
+            page.stable_table_id, page.table_incarnation_id
+        );
+        println!("  block token: {}", page.block_token);
+        println!("  lifecycle revision: {}", page.lifecycle_revision);
+        println!("  correction view: {}", page.correction_view_digest);
+        println!("  entries:");
+        for entry in &page.entries {
+            println!("    {}", serde_json::to_string(entry)?);
+        }
+        if let Some(cursor) = page.next_cursor.as_deref() {
+            println!("  next cursor: {cursor}");
+        }
+        print_cluster_diagnostics(&output.diagnostics);
+    } else {
+        println!(
+            "stream data-block inspection failed for {}",
+            output.graph_id
+        );
+        print_cluster_diagnostics(&output.diagnostics);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_stream_block_correct(
+    output: &StreamBlockCorrectOutput,
+    json: bool,
+) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else if let Some(result) = output.result.as_ref() {
+        println!("stream data block corrected for {}", output.graph_id);
+        println!("  correction id: {}", result.correction_id);
+        println!("  plan digest: {}", result.plan_digest);
+        println!("  graph commit: {}", result.graph_commit_id);
+        println!("  lifecycle revision: {}", result.lifecycle_revision);
+        println!("  manifest version: {}", result.manifest_version);
+        println!("  changed: {}", result.changed);
+        print_cluster_diagnostics(&output.diagnostics);
+    } else {
+        println!(
+            "stream data-block correction failed for {}",
+            output.graph_id
+        );
+        print_cluster_diagnostics(&output.diagnostics);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 pub(crate) fn finish_stream_authority_retirement_confirm(
     output: &StreamAuthorityRetirementConfirmOutput,
     json: bool,

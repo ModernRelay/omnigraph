@@ -234,7 +234,8 @@ pub async fn acquire_state_lock(
 /// Operation class bound into a checked control-plane authority.
 ///
 /// The engine consumes this value; no caller-supplied boolean can retarget an
-/// already checked profile or maintenance operation.
+/// already checked profile, maintenance, block-control, or retirement
+/// operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorityOperationClass {
     StreamProfileEnable,
@@ -246,6 +247,13 @@ pub enum AuthorityOperationClass {
     /// request's expected profile revision before minting its narrower checked
     /// maintenance capability.
     StreamMaintenance,
+    /// Offline inspection and correction of one exact strict stream block.
+    ///
+    /// This is deliberately distinct from general stream maintenance. A
+    /// blocked lane is still `DRAINING`, normally under an `ENABLED` or
+    /// `DISABLING` profile, while rebind and schema maintenance remain
+    /// `DISABLED`-only.
+    StreamBlockControl,
     /// Irreversible, graph-wide stream-authority retirement for rebuild.
     ///
     /// This is deliberately distinct from ordinary offline maintenance.  A
@@ -261,15 +269,19 @@ impl AuthorityOperationClass {
         match self {
             Self::StreamProfileEnable => Some(true),
             Self::StreamProfileDisable => Some(false),
-            Self::StreamMaintenance | Self::StreamAuthorityRetirement | Self::StreamRuntime => None,
+            Self::StreamMaintenance
+            | Self::StreamBlockControl
+            | Self::StreamAuthorityRetirement
+            | Self::StreamRuntime => None,
         }
     }
 
     fn offline_lock_operation(self) -> Option<&'static str> {
         match self {
-            Self::StreamProfileEnable | Self::StreamProfileDisable | Self::StreamMaintenance => {
-                Some("apply")
-            }
+            Self::StreamProfileEnable
+            | Self::StreamProfileDisable
+            | Self::StreamMaintenance
+            | Self::StreamBlockControl => Some("apply"),
             Self::StreamAuthorityRetirement => Some(STREAM_AUTHORITY_RETIREMENT_LOCK_OPERATION),
             Self::StreamRuntime => None,
         }
@@ -369,16 +381,17 @@ impl ValidatedOfflineGuard<'_> {
 /// Validate and mint one offline streaming authority under the actual state
 /// lock.
 ///
-/// Profile changes, maintenance, and authority retirement deliberately share
-/// the same concrete stopped-process proof. Their engine capabilities remain
-/// distinct: this lower guard cannot turn one operation class into another.
+/// Profile changes, maintenance, block control, and authority retirement
+/// deliberately share the same concrete stopped-process proof. Their engine
+/// capabilities remain distinct: this lower guard cannot turn one operation
+/// class into another.
 pub async fn validate_offline_guard<'lock>(
     lock: &'lock StateLockGuard,
     request: OfflineAuthorityRequest<'_>,
 ) -> Result<ValidatedOfflineGuard<'lock>, AuthorityError> {
     let Some(required_lock_operation) = request.operation.offline_lock_operation() else {
         return Err(invalid_binding(
-            "offline guard operation must be a streaming profile transition, stream maintenance, or stream-authority retirement",
+            "offline guard operation must be a streaming profile transition, stream maintenance, stream-block control, or stream-authority retirement",
         ));
     };
     if lock.operation() != required_lock_operation {
@@ -391,6 +404,9 @@ pub async fn validate_offline_guard<'lock>(
         let message = match request.operation {
             AuthorityOperationClass::StreamMaintenance => {
                 "streaming maintenance requires explicit confirm_stream_offline"
+            }
+            AuthorityOperationClass::StreamBlockControl => {
+                "stream-block control requires explicit confirm_stream_offline"
             }
             AuthorityOperationClass::StreamAuthorityRetirement => {
                 "stream-authority retirement requires explicit confirm_stream_offline"
@@ -1118,6 +1134,38 @@ mod tests {
         assert_eq!(maintenance.operation().requested_streaming_enabled(), None);
         drop(maintenance);
 
+        let block_control = validate_offline_guard(
+            &lock,
+            OfflineAuthorityRequest {
+                graph_id: "knowledge",
+                graph_store_uri: &graph_store,
+                expected_state_cas: &state_cas,
+                state_revision: 7,
+                declaration_revision: "stream-block-declaration-v1",
+                declaration_digest: "stream-block-declaration",
+                expected_profile_revision: 1,
+                operation_id: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                operation: AuthorityOperationClass::StreamBlockControl,
+                actor: "operator",
+                confirm_stream_offline: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            block_control.operation(),
+            AuthorityOperationClass::StreamBlockControl
+        );
+        assert_eq!(
+            block_control.operation_id(),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            block_control.operation().requested_streaming_enabled(),
+            None
+        );
+        drop(block_control);
+
         std::fs::write(
             dir.path().join(CLUSTER_LOCK_FILE),
             serde_json::json!({
@@ -1357,6 +1405,28 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             offline,
+            AuthorityError::RuntimeStillRegistered { .. }
+        ));
+        let block_control = validate_offline_guard(
+            &lock,
+            OfflineAuthorityRequest {
+                graph_id: "knowledge",
+                graph_store_uri: &graph_store,
+                expected_state_cas: &state_cas,
+                state_revision: 11,
+                declaration_revision: "stream-declaration-v1",
+                declaration_digest: "stream-declaration",
+                expected_profile_revision: 4,
+                operation_id: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                operation: AuthorityOperationClass::StreamBlockControl,
+                actor: "operator",
+                confirm_stream_offline: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            block_control,
             AuthorityError::RuntimeStillRegistered { .. }
         ));
         drop(lock);
