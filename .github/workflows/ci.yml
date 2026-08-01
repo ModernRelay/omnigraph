@@ -456,12 +456,18 @@ jobs:
             . -> target
 
       - name: Start RustFS
-        # Pinned to 1.0.0-beta.8 (2026-06-10). beta.4+ refuses "default"
-        # credentials (rustfsadmin/rustfsadmin) unless
+        # Pinned to 1.0.0-beta.12 (2026-07-30). beta.8 idle-closed keep-alive
+        # connections via hyper's header_read_timeout (rustfs#4360, fixed in
+        # beta.10), which surfaced here as intermittent "error sending
+        # request" PUT failures on pooled connections — random victim tests,
+        # ~40% of default-shard runs. beta.4+ refuses "default" credentials
+        # (rustfsadmin/rustfsadmin) unless
         # RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true is set — fine for
-        # an ephemeral CI container. The three S3 suites were validated
-        # against the beta.8 binary locally before this bump. Keep the pin
-        # explicit (never `latest`) so upgrades are deliberate.
+        # an ephemeral CI container. The S3 suites (engine s3_storage, server
+        # s3, cluster s3_cluster, engine failpoints s3_, the memwal provider
+        # cell) were validated against the beta.12 binary locally before this
+        # bump. Keep the pin explicit (never `latest`) so upgrades are
+        # deliberate.
         run: |
           docker rm -f rustfs >/dev/null 2>&1 || true
           docker run -d \
@@ -471,7 +477,7 @@ jobs:
             -e RUSTFS_ACCESS_KEY="${AWS_ACCESS_KEY_ID}" \
             -e RUSTFS_SECRET_KEY="${AWS_SECRET_ACCESS_KEY}" \
             -e RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true \
-            rustfs/rustfs:1.0.0-beta.8 \
+            rustfs/rustfs:1.0.0-beta.12 \
             /data
 
       - name: Install AWS CLI
