@@ -14,6 +14,10 @@ lineage-neutral root-wide authority retirement, and recovery-v20 exact
 DataBlock correction. Public ingress, operator lifecycle/rebind verbs, and
 every maintenance transport surface remain inactive; retirement and DataBlock
 inspection/correction are exposed only by narrow offline cluster controls.
+The format-neutral F4, F5a, and F5b0 hidden-path slices are also implemented:
+caller-shaped ingest/prepare, automatic `OPEN` folding, exact-`ENABLED`
+goal-`SEALED` drain continuation, and the checked offline `DISABLING` loop.
+F5b0 adds no public API or persisted format.
 **Design authority:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) — this
 file never overrides it. Where they disagree, the RFC wins and this file is
 wrong. §4.7 records the selected experimental profile; §4.3/§4.6 record the
@@ -105,6 +109,7 @@ reachable; F5b must extend that path before `DEAD_LETTERED` becomes reachable.
 | Stopped/offline exact `DataBlock` show/correct with recovery-v20 | cluster control/manifest recovery | F3f DataBlock correction |
 | Caller-shaped authorized JSON/NDJSON ingest plus bodyless lazy-enrollment prepare, behind doc-hidden test seams | engine private seams | F4 |
 | Format-neutral automatic `OPEN`-lane fold supervisor over the existing recovery-v14 fold adapter | engine private server bridge | F5a |
+| Format-neutral resident goal-`SEALED` continuation plus checked offline `DISABLING` drain loop | engine private server bridge + existing cluster apply | F5b0 |
 
 Internal schema is **v18**, profile protocol is **v2**, and lifecycle protocol
 is **v3**. Recovery-v13 remains exactly `StreamProfileChange`: it owns the exact
@@ -175,12 +180,24 @@ round visits ready nodes before ready edges with a carried cursor inside both
 cohorts. Every effect still enters the
 existing recovery-v14 fold adapter under the live profile `FoldDelegation` and
 checked served-runtime authority. Cluster server boot starts every selected
-graph supervisor after binding the listener; graceful shutdown joins them
-concurrently by one bounded deadline and keeps failures loud. The hidden
-lifecycle core can drain a non-`SEALED` lane to `SEALED`, but the automatic
-supervisor does not yet own ordinary `DRAINING` continuation and no
-cluster/CLI/HTTP/SDK management path
-invokes that continuation. There is still no dead-letter authority, public
+graph supervisor after binding the listener. Graceful shutdown first fences
+and joins the driver, then reacquires the profile fence plus every resident
+lane's exclusive admission, aborts the process-local writers, and joins their
+idle authority owners. One detached owner keeps those gates across caller
+cancellation or the shared deadline; failure stays fail-closed and loud. The hidden
+lifecycle core can drain a non-`SEALED` lane to `SEALED`. F5b0 extends the same
+exact-`ENABLED`, checked-runtime resident owner to restart and continue an
+unblocked `DRAINING(goal = SEALED)` lane through recovery-v14. It also makes
+the existing checked offline `cluster apply` disable path operational:
+`DISABLING` is published before work; one finite manifest-derived lane cut is
+visited deterministically, nodes before edges and one identity at a time;
+`OPEN`, goal-`SEALED`, and existing `OPEN_AFTER_FOLD` lanes converge through
+the existing quiesce and recovery-v14 lifecycle-receipt owners. A selected
+`DataBlock` parks the exact durable disable plan loudly until stopped/offline
+correction and an apply retry; apply resumes that continuation before schema
+work, so schema and dependent queries cannot move ahead of the parked drain.
+The resident and offline owners cannot overlap.
+There is still no dead-letter authority, public
 driver health/backlog projection, public lifecycle control, or public
 maintenance integration. The doc-hidden offline seam can perform an exact physical rebind
 while the profile is terminal `DISABLED`; doc-hidden checked-runtime seams can
@@ -195,8 +212,9 @@ current-`WITHDRAWN` cut; it makes the source permanently query/status/export-onl
 and carries its receipt into the rebuild artifact. No active writer can produce
 the reserved `AuthorityBlock` evidence shape, so its repair stays fail-closed
 until a reachable producer and finalized evidence grammar exist. F5b
-`DEAD_LETTERED` authority, ordinary `DRAINING` continuation, public driver
-status, and every served SDK/HTTP/OpenAPI streaming surface remain inactive.
+`DEAD_LETTERED` authority, public driver status, and every served
+SDK/HTTP/OpenAPI streaming surface remain inactive. F5b0 introduced no new
+format or public method.
 
 ---
 
@@ -214,10 +232,11 @@ status, and every served SDK/HTTP/OpenAPI streaming surface remain inactive.
 | ~~F3d physical rebind~~ | Offline, terminal-`DISABLED`, exact fresh-scope `SEALED` physical rebind | internal v16 + recovery v18 | implemented; no public rebind surface |
 | ~~F3e authority retirement~~ | Cluster-only stopped/offline terminal `WITHDRAWN` retirement plus receipt-bearing export/rebuild | internal v17 + recovery v19 | implemented; source becomes permanently query/status/export-only |
 | ~~F3f DataBlock correction~~ | State-lock-held, stopped/offline exact `DataBlock` show plus bounded `REPLACE`/`WITHDRAW` correction | internal v18 + recovery v20 | implemented; clears one exact block and remains `DRAINING` |
-| **Later authority repair** | Activate reason-gated `AuthorityBlock` repair only if a reachable producer and finalized evidence grammar exist; frozen v14 scaffolds are never reinterpreted | a new finalized authority-correction shape | deferred; not an F4/F5a prerequisite |
+| **Later authority repair** | Activate reason-gated `AuthorityBlock` repair only if a reachable producer and finalized evidence grammar exist; frozen v14 scaffolds are never reinterpreted | a new finalized authority-correction shape | deferred; not an F4/F5a/F5b0 prerequisite |
 | ~~F4~~ | Hidden ingest vertical slice + lazy enrollment | no format change | implemented behind doc-hidden seams; no public transport |
 | ~~F5a~~ | Hidden automatic `OPEN`-lane timer/cap fold supervisor, cold discovery, finite node-before-edge round-robin cohorts, and bounded server shutdown ownership | no format change; reuses recovery-v14 | implemented and server-owned; public status remains closed |
-| **F5b** | Ordinary `DRAINING` continuation plus minimal `DEAD_LETTERED` authority, one object, ordinary-ingest correction, and retirement | a new strand after lifecycle activation | after F5a |
+| ~~F5b0 operational cut~~ | Resident exact-`ENABLED` goal-`SEALED` continuation plus deterministic checked offline `DISABLING` convergence, `OPEN_AFTER_FOLD` adoption, and loud `DataBlock` park/resume | no format change; reuses recovery-v13/v14 and existing cluster controls | implemented; no public API |
+| **F5b** | Minimal `DEAD_LETTERED` authority, one object, ordinary-ingest correction, and retirement | a new strand after lifecycle activation | after F5b0 |
 | **F6** | Guardrails + acceptance evidence | — | after F5b |
 | **F7** | Served SDK / HTTP / remote CLI / OpenAPI activation | — | only after F6 passes |
 
@@ -407,7 +426,7 @@ writer a sidecar-covered witness/rebind transition.
    reacquires from the root in canonical order, and recaptures/revalidates the
    exact cleared authority. Ambiguous old recovery returns `RecoveryRequired`
    with no profile effect. Enable then publishes its receipt and exits before
-   the server restarts. Disable is owned synchronously by the same no-ingress
+   the server restarts. F5b0 makes disable owned synchronously by the same no-ingress
    apply process: it publishes `DISABLING`, instantiates a temporary drain
    owner with only the durable fold continuation, recovers/drains every
    manifest-selected lane, and publishes `DISABLED`.
@@ -435,7 +454,9 @@ writer a sidecar-covered witness/rebind transition.
    F3e later activated the exact `DISABLED → RETIRED` transition before F3f
    made `WITHDRAWN` reachable.
 
-   Disable is a durable multi-publication operation, not a retrying error. The
+   Disable is a durable multi-publication operation, not a retrying error. F5b0
+   implements the continuation below without changing its v11/v14 persisted
+   shapes. The
    profile-authority tranche introduces one graph-profile admission gate outside
    every table gate and takes it exclusively for the first disable CAS; F4 makes
    every row path hold
@@ -1550,10 +1571,10 @@ boundary, bounded reorder/backpressure, and every stop-tail precedence cell.
 **Stopping after F4 is safe:** the seam remains inaccessible to production
 callers, and the graph flag alone still acknowledges nothing.
 
-**Stopping after F5a is also safe:** automatic folding is reachable only
-through the checked, doc-hidden supervisor bridge and changes no persisted
-grammar. Public transport, ordinary `DRAINING` continuation, and terminal
-dead-letter authority remain closed.
+**Stopping after F5b0 is also safe:** automatic folding and goal-`SEALED`
+continuation are reachable only through checked resident/offline owners and
+change no persisted grammar. Public transport and terminal dead-letter
+authority remain closed.
 
 ---
 
@@ -1608,13 +1629,47 @@ meaning as an explicit private fold.
   retains the live task handle, and leaves any sidecar-owned effect recoverable.
   Public health/backlog status remains later work.
 
-**Deferred to F5b or later:** the resident supervisor does not yet own ordinary
-`DRAINING` continuation, operator-requested fold receipts, the offline
-`DISABLING` continuation owner, dependency-level ordering, or a public
-health/backlog projection. No active path creates `AuthorityBlock`;
+**F5b0 implemented (hidden, format-neutral):** the operational continuation
+cut extends existing owners without adding a manifest field, token
+disposition, sidecar discriminator, public method, or transport.
+
+- **Resident goal-`SEALED` continuation.** Exact `ENABLED` startup and cold
+  discovery now include unblocked `DRAINING` rows whose durable descriptor has
+  `goal = SEALED`. Each attempt rechecks the same checked runtime and profile
+  delegation as an automatic `OPEN` fold, then invokes the existing
+  recovery-v14 quiesce adapter with the stored drain ID, expected revision,
+  and actor. `OPEN_AFTER_FOLD`, blocked, and `SEALED` rows are not retargeted by
+  this owner. A selected `DataBlock` is parked rather than hot-looped; exact
+  correction makes the lane eligible again, and the next checked-runtime cold
+  start rediscovers any still-unblocked goal-`SEALED` lane.
+- **Offline disable continuation.** Checked `cluster apply` publishes the
+  exact `ENABLED → DISABLING` plan before doing drain work. With admission
+  durably closed, it derives one finite lane set from the accepted manifest,
+  orders nodes before edges and immutable identities within each cohort, and
+  owns one lane at a time. `OPEN` gets the deterministic disable drain;
+  `DRAINING(goal = SEALED)` keeps its occurrence; and
+  `DRAINING(goal = OPEN_AFTER_FOLD)` is narrowed once by deterministic
+  `DisableDrainAdoption`, whose metadata CAS and immutable receipt use the
+  existing recovery-v14 `StreamLifecycleReceipt` owner. `SEALED` is skipped.
+  Once the finite cut is sealed, recovery-v13 publishes the existing terminal
+  `DISABLING → DISABLED` receipt/CAS.
+- **Loud park and retry.** A selected `DataBlock` returns its typed block token
+  and leaves the exact `DISABLING` revision in both manifest truth and the
+  cluster ledger; no later lane is attempted. The existing stopped/offline
+  correction command clears only that exact block, and a rerun of apply
+  reconstructs the same stored plan and deterministic lane order. It does not
+  mint a second disable operation or relabel its actor.
+- **No owner overlap.** A serving supervisor runs only at exact `ENABLED` with
+  the checked runtime. Offline apply holds the stopped-writer cluster
+  authority and runs only the persisted `DISABLING` continuation. The existing
+  process-handoff contract, not a new distributed lease, separates them.
+
+**Deferred to F5b or later:** operator-requested fold receipts,
+dependency-level ordering, and a public health/backlog projection remain
+inactive. No active path creates `AuthorityBlock`;
 reason-gated repair stays fail-closed until such a producer and its finalized
 evidence grammar exist. Section 6.2's `DEAD_LETTERED` token/object/recovery
-shape is the next format-bearing strand, not part of F5a.
+shape is the next format-bearing strand, not part of F5b0.
 
 Cadence is the visibility gap. Expect ~seconds under load; the contract says
 "typically seconds, unbounded tail" and there is **no producer-facing flush**
@@ -2125,9 +2180,10 @@ cadence, dead-letter object layout, status field shapes.
 F2+F3 deliver no row-admission capability, but they provide a real exit and the
 authority bridge required for maintenance while narrowing the profile flip to
 cluster control. F4+F5a build the caller-shaped lane and automatic `OPEN`
-progress owner while it remains hidden; F5b adds the terminal disposition. F6
-then proves correctness, bounded ownership, sustainable CI, and the performance
-premise. F7 alone activates the surface.
+progress owner while it remains hidden; F5b0 closes goal-`SEALED` resident
+continuation and the offline disable loop without a format change; F5b adds
+the terminal disposition. F6 then proves correctness, bounded ownership,
+sustainable CI, and the performance premise. F7 alone activates the surface.
 
 This ordering makes every intermediate merge safe:
 
@@ -2135,12 +2191,14 @@ This ordering makes every intermediate merge safe:
 - after F4, only tests can acknowledge through the hidden seam;
 - after F5a, the server-owned hidden seam has automatic `OPEN` progress but no
   terminal dead-letter disposition;
+- after F5b0, goal-`SEALED` drains and checked offline disable converge, but
+  terminal data conflicts still have no dead-letter disposition;
 - after F5b, the hidden seam also has that terminal disposition;
 - after F6, all gates are proved but no compatibility surface is committed;
 - F7 exposes the served SDK, HTTP, remote CLI, and OpenAPI together while
   direct mutation remains a typed refusal.
 
-A performance spike may still invoke the hidden F4/F5a seam after F3. It never
+A performance spike may still invoke the hidden F4/F5a/F5b0 seam after F3. It never
 lands a production writer or claims an SLO before F6.
 
 ---
@@ -2153,9 +2211,9 @@ lands a production writer or claims an SLO before F6.
 | Receipt authority | Tagged immutable rows live in manifest-selected `_stream_tokens.lance`; hot profile/lifecycle rows retain bounded current pointers/count/chain commitments. Exact lookup remains recovery/idempotency authority, but EXP exposes no public receipt-history pagination. Uncovered-fragment fallback is correct and observable; a measured threshold, not F3, schedules reconciliation |
 | Quiesce ownership | One exclusive admission lease; folds consume injected checked authority |
 | Empty lane | Dedicated fence/tail/empty-proof path with an incremental authenticated WAL-segment cursor/chain; never scan from genesis or invent/seal an empty generation |
-| Lifecycle format | Internal v12/lifecycle-v3 + recovery-v14 activates hidden enrollment, claim, ordinary/drain fold, and terminal lifecycle receipt with fixed-size ledger-chain/current authority. Dormant v14 scaffold meanings are immutable: F3 uses them only if exact, otherwise takes a new pre-release strand. F5a changes no format; F5b requires a new terminal-authority/object strand. The release gate records the final strand count |
+| Lifecycle format | Internal v12/lifecycle-v3 + recovery-v14 activates hidden enrollment, claim, ordinary/drain fold, and terminal lifecycle receipt with fixed-size ledger-chain/current authority. Dormant v14 scaffold meanings are immutable: F3 uses them only if exact, otherwise takes a new pre-release strand. F5a and F5b0 change no format; F5b requires a new terminal-authority/object strand. The release gate records the final strand count |
 | Maintenance | Explicit lifecycle-aware integration per writer; no generic `SEALED` bypass |
-| Public ordering | Hidden F4/F5a → format-bearing F5b → evidence F6 → atomic served/remote activation F7 |
+| Public ordering | Hidden F4/F5a/F5b0 → format-bearing F5b → evidence F6 → atomic served/remote activation F7 |
 | Dead letter | One terminal LWW candidate per losing key; one deterministic, conditionally created NDJSON object under a measured byte/RSS cap; one current `DEAD_LETTERED` token per losing key; ordinary-ingest correction; pre-effect `DataBlock` on expansion |
 | Process topology | One externally enforced writer process; profile apply requires stop → cluster-state-locked offline owner → restart; schema/rebind additionally requires terminal `DISABLED` before its checked offline authority, with no claim that process-local locks detect foreign processes |
 | Capability placement | `omnigraph-storage` plus `omnigraph-control-authority` resolve the engine/storage/cluster-lock dependency without a cycle; opaque stopped/offline and runtime guards preserve one storage path and expose no forgeable mint |

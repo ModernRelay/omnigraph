@@ -3,9 +3,9 @@
 //! The supervisor is orchestration only. It owns no durable queue and adds no
 //! persisted grammar: readiness is derived from the manifest-selected
 //! lifecycle plus the current Lance MemWAL authority, and every effect still
-//! goes through the existing recovery-v14 fold adapter.
+//! goes through the existing recovery-v14 fold or lifecycle adapter.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -16,11 +16,16 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::db::manifest::{StreamLifecycle, StreamProfileMode, TableIdentity};
-use crate::db::{Omnigraph, ReadTarget};
+use crate::db::manifest::stream::DrainGoal;
+use crate::db::manifest::{
+    StreamLifecycle, StreamLifecycleEntry, StreamProfileMode, TableIdentity,
+};
+use crate::db::write_queue::StreamAdmissionKey;
+use crate::db::{Omnigraph, ReadTarget, Snapshot};
 use crate::error::{OmniError, Result};
+use crate::table_store::mem_wal::CheckedRuntimeShutdownAuthority;
 
-use super::stream_ingest::ResidentFoldOutcome;
+use super::stream_ingest::{ResidentFoldOutcome, ResidentQuiesceOutcome};
 
 /// A non-full generation becomes visible on this cadence. Capacity pressure
 /// shortens the same pending entry to `now`; it never creates another job.
@@ -280,7 +285,7 @@ impl StreamFoldDriverRegistry {
             .expect("stream fold driver state poisoned");
         let (mut nodes, mut edges): (Vec<_>, Vec<_>) = candidates
             .into_iter()
-            .partition(|candidate| candidate.kind == DriverCandidateKind::Node);
+            .partition(|candidate| candidate.kind == StreamLaneKind::Node);
         fn rotate_after(candidates: &mut Vec<DriverCandidate>, cursor: Option<TableIdentity>) {
             candidates.sort_by_key(|candidate| candidate.identity);
             let Some(cursor) = cursor else {
@@ -298,14 +303,14 @@ impl StreamFoldDriverRegistry {
         nodes
     }
 
-    fn mark_attempted(&self, kind: DriverCandidateKind, identity: TableIdentity) {
+    fn mark_attempted(&self, kind: StreamLaneKind, identity: TableIdentity) {
         let mut shared = self
             .shared
             .lock()
             .expect("stream fold driver state poisoned");
         match kind {
-            DriverCandidateKind::Node => shared.last_node = Some(identity),
-            DriverCandidateKind::Edge => shared.last_edge = Some(identity),
+            StreamLaneKind::Node => shared.last_node = Some(identity),
+            StreamLaneKind::Edge => shared.last_edge = Some(identity),
         }
     }
 
@@ -335,9 +340,9 @@ impl StreamFoldDriverRegistry {
 
         // Make cold-start discovery part of server startup, rather than the
         // first fallible action in a detached task. A graph whose manifest
-        // cannot establish its eligible OPEN lanes must refuse startup instead
-        // of briefly serving beside an already-dead supervisor.
-        let initial = db.stream_driver_open_identities().await?;
+        // cannot establish its eligible OPEN or DRAINING lanes must refuse
+        // startup instead of briefly serving beside an already-dead supervisor.
+        let initial = db.stream_driver_eligible_identities().await?;
         self.stop.store(false, Ordering::Release);
         self.mark_running(true);
         for identity in initial {
@@ -369,18 +374,11 @@ impl StreamFoldDriverRegistry {
         Ok(())
     }
 
-    async fn shutdown(&self, deadline: Instant) -> Result<()> {
+    async fn shutdown(&self) -> Result<()> {
         // Start and stop serialize through the task slot before either changes
         // the shared stop flag. Otherwise a concurrent start could reset a
         // pre-lock stop request and leave shutdown joining a live idle task.
-        let mut task_slot = tokio::time::timeout_at(deadline, self.task.lock())
-            .await
-            .map_err(|_| {
-                OmniError::manifest(format!(
-                    "stream fold driver ownership transition did not settle within {} seconds; its task remains owned and running",
-                    STREAM_FOLD_SHUTDOWN_DEADLINE.as_secs()
-                ))
-            })?;
+        let mut task_slot = self.task.lock().await;
         self.stop.store(true, Ordering::Release);
         // `notify_one` retains a permit when the task is between its stop check
         // and construction of the wait future. `notify_waiters` would lose
@@ -394,27 +392,15 @@ impl StreamFoldDriverRegistry {
             self.mark_running(false);
             return Ok(());
         };
-        match tokio::time::timeout_at(deadline, task).await {
-            Ok(joined) => {
-                task_slot.take();
-                joined
-                    .map_err(|error| {
-                        OmniError::manifest_internal(format!(
-                            "stream fold driver task failed during shutdown: {error}"
-                        ))
-                    })
-                    .and_then(|outcome| outcome)
-            }
-            Err(_) => {
-                // The handle never left the slot, so timeout—or cancellation
-                // of this shutdown future—cannot detach it and permit a second
-                // supervisor beside the still-running owner.
-                Err(OmniError::manifest(format!(
-                    "stream fold driver did not settle within {} seconds; its live task remains owned and any armed fold remains recovery-owned",
-                    STREAM_FOLD_SHUTDOWN_DEADLINE.as_secs()
-                )))
-            }
-        }
+        let joined = task.await;
+        task_slot.take();
+        joined
+            .map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "stream fold driver task failed during shutdown: {error}"
+                ))
+            })
+            .and_then(|outcome| outcome)
     }
 
     #[cfg(feature = "failpoints")]
@@ -439,13 +425,42 @@ struct DriverCandidate {
     identity: TableIdentity,
     observed_sequence: u64,
     table_key: String,
-    kind: DriverCandidateKind,
+    kind: StreamLaneKind,
+    action: DriverCandidateAction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DriverCandidateKind {
+pub(super) enum StreamLaneKind {
     Node,
     Edge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverCandidateAction {
+    FoldOpen,
+    ContinueDrain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OrderedEnrolledStreamLane {
+    pub(super) identity: TableIdentity,
+    pub(super) table_key: String,
+    pub(super) kind: StreamLaneKind,
+}
+
+fn driver_candidate_action(lifecycle: &StreamLifecycleEntry) -> Option<DriverCandidateAction> {
+    if lifecycle.strict_block.is_some() {
+        return None;
+    }
+    match lifecycle.lifecycle {
+        StreamLifecycle::Open => Some(DriverCandidateAction::FoldOpen),
+        StreamLifecycle::Draining => lifecycle
+            .drain
+            .as_ref()
+            .filter(|drain| drain.goal == DrainGoal::Sealed)
+            .map(|_| DriverCandidateAction::ContinueDrain),
+        StreamLifecycle::Sealed => None,
+    }
 }
 
 async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegistry>) -> Result<()> {
@@ -508,23 +523,49 @@ async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegist
         // that was ready when this round began.
         for candidate in candidates {
             driver.mark_attempted(candidate.kind, candidate.identity);
-            match db
-                .stream_fold_from_resident_driver(candidate.identity, &candidate.table_key)
-                .await
-            {
-                Ok(ResidentFoldOutcome::Published) => {
-                    driver.complete(candidate.identity, candidate.observed_sequence, true)
+            match candidate.action {
+                DriverCandidateAction::FoldOpen => {
+                    match db
+                        .stream_fold_from_resident_driver(candidate.identity, &candidate.table_key)
+                        .await
+                    {
+                        Ok(ResidentFoldOutcome::Published) => {
+                            driver.complete(candidate.identity, candidate.observed_sequence, true)
+                        }
+                        Ok(ResidentFoldOutcome::Idle | ResidentFoldOutcome::Inactive) => {
+                            driver.complete(candidate.identity, candidate.observed_sequence, false)
+                        }
+                        Err(error @ OmniError::StreamDataBlocked { .. }) => {
+                            driver.blocked(candidate.identity, candidate.observed_sequence, &error)
+                        }
+                        Err(error) => {
+                            driver.failed(candidate.identity, candidate.observed_sequence, &error);
+                            if driver.stop.load(Ordering::Acquire) {
+                                return Err(error);
+                            }
+                        }
+                    }
                 }
-                Ok(ResidentFoldOutcome::Idle | ResidentFoldOutcome::Inactive) => {
-                    driver.complete(candidate.identity, candidate.observed_sequence, false)
-                }
-                Err(error @ OmniError::StreamDataBlocked { .. }) => {
-                    driver.blocked(candidate.identity, candidate.observed_sequence, &error)
-                }
-                Err(error) => {
-                    driver.failed(candidate.identity, candidate.observed_sequence, &error);
-                    if driver.stop.load(Ordering::Acquire) {
-                        return Err(error);
+                DriverCandidateAction::ContinueDrain => {
+                    match db
+                        .stream_quiesce_from_resident_driver(
+                            candidate.identity,
+                            &candidate.table_key,
+                        )
+                        .await
+                    {
+                        Ok(ResidentQuiesceOutcome::Sealed | ResidentQuiesceOutcome::Inactive) => {
+                            driver.complete(candidate.identity, candidate.observed_sequence, false)
+                        }
+                        Err(error @ OmniError::StreamDataBlocked { .. }) => {
+                            driver.blocked(candidate.identity, candidate.observed_sequence, &error)
+                        }
+                        Err(error) => {
+                            driver.failed(candidate.identity, candidate.observed_sequence, &error);
+                            if driver.stop.load(Ordering::Acquire) {
+                                return Err(error);
+                            }
+                        }
                     }
                 }
             }
@@ -542,16 +583,72 @@ impl Omnigraph {
         self.stream_fold_driver.notify(identity, true);
     }
 
-    async fn stream_driver_open_identities(&self) -> Result<Vec<TableIdentity>> {
+    pub(super) fn ordered_enrolled_stream_lanes(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<Vec<OrderedEnrolledStreamLane>> {
+        let catalog = self.catalog();
+        let schema_ir = catalog.bound_schema_ir().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "stream lane ordering requires the identity-bound accepted catalog",
+            )
+        })?;
+        let nodes = schema_ir
+            .nodes
+            .iter()
+            .map(|node| TableIdentity::new(node.type_id.get(), node.table_incarnation_id.get()))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let edges = schema_ir
+            .edges
+            .iter()
+            .map(|edge| TableIdentity::new(edge.type_id.get(), edge.table_incarnation_id.get()))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let mut lanes = snapshot
+            .entries()
+            .filter(|entry| snapshot.stream_lifecycle(entry.identity).is_some())
+            .map(|entry| {
+                let kind = if nodes.contains(&entry.identity) {
+                    StreamLaneKind::Node
+                } else if edges.contains(&entry.identity) {
+                    StreamLaneKind::Edge
+                } else {
+                    return Err(OmniError::manifest_internal(format!(
+                        "enrolled stream lane {} is absent from the accepted schema identity set",
+                        entry.identity
+                    )));
+                };
+                Ok(OrderedEnrolledStreamLane {
+                    identity: entry.identity,
+                    table_key: entry.table_key.clone(),
+                    kind,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        lanes.sort_by_key(|lane| {
+            (
+                match lane.kind {
+                    StreamLaneKind::Node => 0_u8,
+                    StreamLaneKind::Edge => 1_u8,
+                },
+                lane.identity,
+            )
+        });
+        Ok(lanes)
+    }
+
+    async fn stream_driver_eligible_identities(&self) -> Result<Vec<TableIdentity>> {
         let snapshot = self.snapshot_of(ReadTarget::branch("main")).await?;
         if snapshot.stream_profile().mode() != StreamProfileMode::Enabled {
             return Ok(Vec::new());
         }
-        Ok(snapshot
-            .stream_lifecycles()
-            .filter_map(|(identity, lifecycle)| {
-                (lifecycle.lifecycle == StreamLifecycle::Open && lifecycle.strict_block.is_none())
-                    .then_some(*identity)
+        Ok(self
+            .ordered_enrolled_stream_lanes(&snapshot)?
+            .into_iter()
+            .filter_map(|lane| {
+                snapshot
+                    .stream_lifecycle(lane.identity)
+                    .and_then(driver_candidate_action)
+                    .map(|_| lane.identity)
             })
             .collect())
     }
@@ -565,56 +662,21 @@ impl Omnigraph {
             return Ok(Vec::new());
         }
         let due = due.iter().copied().collect::<BTreeMap<_, _>>();
-        let lifecycles = snapshot.stream_lifecycles().collect::<BTreeMap<_, _>>();
-        let catalog = self.catalog();
-        let schema_ir = catalog.bound_schema_ir().ok_or_else(|| {
-            OmniError::manifest_internal(
-                "stream fold driver requires the identity-bound accepted catalog",
-            )
-        })?;
-        let nodes = schema_ir
-            .nodes
-            .iter()
-            .map(|node| TableIdentity::new(node.type_id.get(), node.table_incarnation_id.get()))
-            .collect::<Result<std::collections::BTreeSet<_>>>()?;
-        let edges = schema_ir
-            .edges
-            .iter()
-            .map(|edge| TableIdentity::new(edge.type_id.get(), edge.table_incarnation_id.get()))
-            .collect::<Result<std::collections::BTreeSet<_>>>()?;
-        let candidates = snapshot
-            .entries()
-            .map(|entry| -> Result<Option<DriverCandidate>> {
-                let Some(observed_sequence) = due.get(&entry.identity).copied() else {
-                    return Ok(None);
-                };
-                let Some(lifecycle) = lifecycles.get(&entry.identity) else {
-                    return Ok(None);
-                };
-                if lifecycle.lifecycle != StreamLifecycle::Open || lifecycle.strict_block.is_some()
-                {
-                    return Ok(None);
-                }
-                let kind = if nodes.contains(&entry.identity) {
-                    DriverCandidateKind::Node
-                } else if edges.contains(&entry.identity) {
-                    DriverCandidateKind::Edge
-                } else {
-                    return Err(OmniError::manifest_internal(format!(
-                        "stream fold candidate {} is absent from the accepted schema identity set",
-                        entry.identity
-                    )));
-                };
-                Ok(Some(DriverCandidate {
-                    identity: entry.identity,
-                    observed_sequence,
-                    table_key: entry.table_key.clone(),
-                    kind,
-                }))
-            })
-            .collect::<Result<Vec<_>>>()?
+        let candidates = self
+            .ordered_enrolled_stream_lanes(&snapshot)?
             .into_iter()
-            .flatten()
+            .filter_map(|lane| {
+                let observed_sequence = due.get(&lane.identity).copied()?;
+                let lifecycle = snapshot.stream_lifecycle(lane.identity)?;
+                let action = driver_candidate_action(lifecycle)?;
+                Some(DriverCandidate {
+                    identity: lane.identity,
+                    observed_sequence,
+                    table_key: lane.table_key,
+                    kind: lane.kind,
+                    action,
+                })
+            })
             .collect();
         Ok(candidates)
     }
@@ -629,13 +691,51 @@ impl Omnigraph {
         self.stream_fold_driver.start(self).await
     }
 
+    async fn shutdown_stream_runtime_background(self: &Arc<Self>) -> Result<()> {
+        // Axum has already stopped admission and settled request futures. The
+        // production B2 path transfers this profile-shared guard into every
+        // detached worker, so one exclusive acquire/release proves that no
+        // canceled pre-invocation owner can create a fold trigger after stop.
+        // Drop it before joining: the driver needs shared profile admission to
+        // drain triggers that became ready ahead of this barrier.
+        let producers_settled = self.write_queue().acquire_stream_profile_exclusive().await;
+        drop(producers_settled);
+        self.stream_fold_driver.shutdown().await?;
+
+        // The supervisor needed profile-shared admission to settle its final
+        // finite round. Close the profile again after it has joined, then take
+        // every still-resident table admission domain in stable identity
+        // order. No new slot can appear while this graph-global guard is held.
+        let runtime_profile = self.write_queue().acquire_stream_profile_exclusive().await;
+        let identities = self
+            .stream_workers
+            .served_runtime_resident_identities()
+            .await;
+        let mut admission_guards = Vec::with_capacity(identities.len());
+        for identity in identities {
+            let admission_key = StreamAdmissionKey::for_resolved_ref(identity, None);
+            let guard = self
+                .write_queue()
+                .acquire_stream_exclusive(&admission_key)
+                .await;
+            admission_guards.push((identity, guard));
+        }
+        let authority = CheckedRuntimeShutdownAuthority::new(runtime_profile, admission_guards);
+        self.stream_workers
+            .shutdown_served_runtime_owned(authority)
+            .await
+            .map_err(|error| {
+                OmniError::manifest(format!("served stream runtime shutdown failed: {error}"))
+            })
+    }
+
     /// After the caller has stopped transport admission, fence detached
-    /// trigger creation, request stop, and join the resident supervisor under
-    /// one deadline. An already armed fold remains owned by its detached
-    /// recovery adapter until it settles; timeout is loud and never aborts
-    /// that task.
+    /// trigger creation, join the resident supervisor, then abort and join all
+    /// process-local MemWAL owners under one deadline. The complete handoff is
+    /// detached and retains the checked engine registration, so cancellation
+    /// or timeout can never reopen offline authority while cleanup is live.
     #[doc(hidden)]
-    pub async fn shutdown_stream_fold_driver(&self) -> Result<()> {
+    pub async fn shutdown_stream_fold_driver(self: &Arc<Self>) -> Result<()> {
         if self.stream_runtime_authority.is_none() {
             return Err(OmniError::StreamingAuthorityMismatch {
                 reason: "resident fold driver shutdown requires the checked cluster-served runtime handle that owns it"
@@ -643,25 +743,46 @@ impl Omnigraph {
             });
         }
         let deadline = Instant::now() + STREAM_FOLD_SHUTDOWN_DEADLINE;
-        // Axum has already stopped admission and settled request futures. The
-        // production B2 path transfers this profile-shared guard into every
-        // detached worker, so one exclusive acquire/release proves that no
-        // canceled pre-invocation owner can create a fold trigger after stop.
-        // Drop it before joining: the driver needs shared profile admission to
-        // drain triggers that became ready ahead of this barrier.
-        let producers_settled = tokio::time::timeout_at(
-            deadline,
-            self.write_queue().acquire_stream_profile_exclusive(),
-        )
-        .await
-        .map_err(|_| {
-            OmniError::manifest(format!(
-                "detached stream producers did not settle within {} seconds; the resident fold driver remains owned and running",
+        let db = Arc::clone(self);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let outcome = AssertUnwindSafe(db.shutdown_stream_runtime_background())
+                .catch_unwind()
+                .await;
+            match outcome {
+                Ok(Ok(())) => {
+                    let _ = result_tx.send(Ok(()));
+                }
+                Ok(Err(error)) => {
+                    let _ = result_tx.send(Err(error));
+                    // Cleanup may have failed before or after transferring its
+                    // checked gates to the worker owner. Retain the engine so
+                    // the exclusive local runtime registration cannot
+                    // disappear after either failure.
+                    let _db = db;
+                    std::future::pending::<()>().await;
+                }
+                Err(_) => {
+                    let error = OmniError::manifest_internal(
+                        "served stream runtime shutdown owner panicked",
+                    );
+                    let _ = result_tx.send(Err(error));
+                    let _db = db;
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+
+        match tokio::time::timeout_at(deadline, result_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(OmniError::manifest_internal(
+                "served stream runtime shutdown owner exited without reporting an outcome",
+            )),
+            Err(_) => Err(OmniError::manifest(format!(
+                "served stream runtime did not settle within {} seconds; its detached owner still retains runtime and admission authority",
                 STREAM_FOLD_SHUTDOWN_DEADLINE.as_secs()
-            ))
-        })?;
-        drop(producers_settled);
-        self.stream_fold_driver.shutdown(deadline).await
+            ))),
+        }
     }
 
     #[cfg(feature = "failpoints")]
@@ -679,12 +800,13 @@ mod tests {
         TableIdentity::new(stable, stable + 100).unwrap()
     }
 
-    fn candidate(stable: u64, kind: DriverCandidateKind) -> DriverCandidate {
+    fn candidate(stable: u64, kind: StreamLaneKind) -> DriverCandidate {
         DriverCandidate {
             identity: identity(stable),
             observed_sequence: 1,
             table_key: format!("diagnostic:{stable}"),
             kind,
+            action: DriverCandidateAction::FoldOpen,
         }
     }
 
@@ -701,23 +823,23 @@ mod tests {
     fn finite_round_is_node_first_and_rotates_after_the_last_attempt() {
         let driver = driver();
         let first = driver.order_round(vec![
-            candidate(4, DriverCandidateKind::Edge),
-            candidate(2, DriverCandidateKind::Node),
-            candidate(3, DriverCandidateKind::Edge),
-            candidate(1, DriverCandidateKind::Node),
+            candidate(4, StreamLaneKind::Edge),
+            candidate(2, StreamLaneKind::Node),
+            candidate(3, StreamLaneKind::Edge),
+            candidate(1, StreamLaneKind::Node),
         ]);
         assert_eq!(
             first.iter().map(|item| item.identity).collect::<Vec<_>>(),
             vec![identity(1), identity(2), identity(3), identity(4)]
         );
 
-        driver.mark_attempted(DriverCandidateKind::Node, identity(1));
-        driver.mark_attempted(DriverCandidateKind::Edge, identity(3));
+        driver.mark_attempted(StreamLaneKind::Node, identity(1));
+        driver.mark_attempted(StreamLaneKind::Edge, identity(3));
         let second = driver.order_round(vec![
-            candidate(1, DriverCandidateKind::Node),
-            candidate(3, DriverCandidateKind::Edge),
-            candidate(2, DriverCandidateKind::Node),
-            candidate(4, DriverCandidateKind::Edge),
+            candidate(1, StreamLaneKind::Node),
+            candidate(3, StreamLaneKind::Edge),
+            candidate(2, StreamLaneKind::Node),
+            candidate(4, StreamLaneKind::Edge),
         ]);
         assert_eq!(
             second.iter().map(|item| item.identity).collect::<Vec<_>>(),

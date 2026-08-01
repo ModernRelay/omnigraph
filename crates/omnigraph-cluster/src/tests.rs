@@ -4,10 +4,16 @@
 #![allow(clippy::all)]
 
     use std::fs;
+    #[cfg(feature = "failpoints")]
+    use std::future::Future;
     use std::path::Path;
+    #[cfg(feature = "failpoints")]
+    use std::sync::Arc;
 
     use omnigraph::db::Omnigraph;
+    #[cfg(feature = "failpoints")]
     use omnigraph_compiler::ir::ParamMap;
+    #[cfg(feature = "failpoints")]
     use omnigraph_compiler::query::ast::Literal;
     use serde_json::json;
     use tempfile::tempdir;
@@ -59,6 +65,28 @@ policies:
         )
         .unwrap();
         dir
+    }
+
+    /// Run a composed streaming lifecycle scenario outside libtest's 2-MiB
+    /// thread. Individual operations run on ordinary stacks elsewhere; this
+    /// only bounds the large debug future assembled by an end-to-end test.
+    #[cfg(feature = "failpoints")]
+    fn on_big_stack<F>(body: impl FnOnce() -> F + Send + 'static)
+    where
+        F: Future<Output = ()>,
+    {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(body());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     fn write_mock_embedding_cluster(config_dir: &Path, model: &str) {
@@ -3860,6 +3888,22 @@ policies:
     }
 
     #[test]
+    fn unreadable_pre_schema_stream_probe_is_unknown_not_safe() {
+        assert_eq!(
+            classify_pre_schema_stream_probe(Err::<&str, ()>(())),
+            PreSchemaStreamProbe::Unknown
+        );
+        assert_eq!(
+            classify_pre_schema_stream_probe(Ok::<&str, ()>("DISABLING")),
+            PreSchemaStreamProbe::Disabling
+        );
+        assert_eq!(
+            classify_pre_schema_stream_probe(Ok::<&str, ()>("ENABLED")),
+            PreSchemaStreamProbe::Other
+        );
+    }
+
+    #[test]
     fn streaming_config_accepts_bool_and_rejects_non_bool() {
         let dir = fixture();
         write_streaming_cluster(dir.path(), Some(true));
@@ -4175,6 +4219,224 @@ graphs:
         assert!(
             !live_streaming_enabled(dir.path()).await,
             "unmanaging after explicit disable must preserve DISABLED"
+        );
+    }
+
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn blocked_disable_persists_exact_disabling_correction_authority() {
+        on_big_stack(blocked_disable_persists_exact_disabling_correction_authority_body);
+    }
+
+    #[cfg(feature = "failpoints")]
+    async fn blocked_disable_persists_exact_disabling_correction_authority_body() {
+        let _scenario = fail::FailScenario::setup();
+        let dir = fixture();
+        fs::write(
+            dir.path().join("people.pg"),
+            r#"
+node Person {
+  name: String @key
+  age: I32
+  @unique(age)
+}
+"#,
+        )
+        .unwrap();
+        write_streaming_cluster(dir.path(), Some(false));
+        write_state_resources(dir.path(), &[]);
+        let created = confirmed_streaming_apply(dir.path()).await;
+        assert!(created.ok && created.converged, "{created:?}");
+
+        let graph_root = dir.path().join("graphs/knowledge.omni");
+        let db = Arc::new(Omnigraph::open(graph_root.to_str().unwrap()).await.unwrap());
+        let mut params = ParamMap::new();
+        params.insert("name".to_string(), Literal::String("base".to_string()));
+        params.insert("age".to_string(), Literal::Integer(7));
+        db.mutate(
+            "main",
+            r#"
+query seed($name: String, $age: I32) {
+  insert Person { name: $name, age: $age }
+}
+"#,
+            "seed",
+            &params,
+        )
+        .await
+        .unwrap();
+        db.failpoint_enroll_stream_table_for_test("node:Person")
+            .await
+            .unwrap();
+        drop(db);
+
+        write_streaming_cluster(dir.path(), Some(true));
+        let enabled = confirmed_streaming_apply(dir.path()).await;
+        assert!(enabled.ok && enabled.converged, "{enabled:?}");
+        let serving = read_serving_snapshot(dir.path()).await.unwrap();
+        let binding = serving.graphs[0]
+            .stream_runtime_authority
+            .clone()
+            .expect("enabled graph carries runtime authority");
+        let runtime_guard = mint_runtime_guard(
+            binding,
+            "cluster-blocked-disable-fixture",
+            "stream-operator",
+        )
+        .await
+        .unwrap();
+        let db = Arc::new(
+            Omnigraph::open(graph_root.to_str().unwrap())
+                .await
+                .unwrap()
+                .with_checked_cluster_stream_runtime(runtime_guard)
+                .await
+                .unwrap(),
+        );
+        let incarnation = db
+            .failpoint_stream_incarnation_for_test("node:Person")
+            .await
+            .unwrap();
+        let row = serde_json::to_vec(&serde_json::json!({
+            "$stream": {
+                "stream_incarnation_id": incarnation,
+                "write_id": "b1b1b1b1-b1b1-41b1-81b1-b1b1b1b1b1b1",
+                "predecessor_token": null,
+            },
+            "id": "stream-conflict",
+            "name": "stream-conflict",
+            "age": 7,
+        }))
+        .unwrap();
+        db.failpoint_stream_ingest_one_as_for_test(
+            "node:Person",
+            &row,
+            0,
+            "stream-operator",
+        )
+        .await
+        .expect("the conflicting row remains durable until the disable fold validates it");
+        db.shutdown_stream_fold_driver()
+            .await
+            .expect("runtime shutdown must fence and settle detached stream producers");
+        drop(db);
+
+        write_streaming_cluster(dir.path(), Some(false));
+        let blocked = confirmed_streaming_apply(dir.path()).await;
+        assert!(blocked.ok && !blocked.converged, "{blocked:?}");
+        let change = blocked
+            .changes
+            .iter()
+            .find(|change| change.resource == "streaming.knowledge")
+            .unwrap();
+        assert_eq!(change.disposition, Some(ApplyDisposition::Blocked));
+        assert_eq!(change.reason.as_deref(), Some("streaming_data_blocked"));
+        assert!(blocked.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "streaming_data_blocked"
+                && diagnostic.message.contains("inspect and correct")
+        }));
+
+        let observed_digest = observed_streaming_digest("knowledge", "DISABLING");
+        let state = read_state_json(dir.path());
+        let streaming = &state["applied_revision"]["resources"]["streaming.knowledge"];
+        assert_eq!(streaming["digest"], serde_json::json!(observed_digest));
+        assert_eq!(streaming["streaming_enabled"], serde_json::json!(false));
+        assert_eq!(streaming["profile_mode"], serde_json::json!("DISABLING"));
+        assert_eq!(streaming["profile_revision"], serde_json::json!(3));
+        assert_eq!(
+            streaming["declaration_revision"],
+            serde_json::json!(streaming_declaration_revision(
+                "knowledge",
+                streaming["digest"].as_str().unwrap()
+            ))
+        );
+        assert_ne!(
+            streaming["digest"],
+            serde_json::json!(streaming_digest("knowledge", false))
+        );
+
+        let live = Omnigraph::open_read_only(graph_root.to_str().unwrap())
+            .await
+            .unwrap()
+            .stream_status()
+            .await
+            .unwrap();
+        let block_token = live.tables[0]
+            .strict_block_token
+            .as_deref()
+            .expect("disable must retain the strict block");
+        let shown = show_stream_data_block_config_dir(
+            dir.path(),
+            "knowledge",
+            "node:Person",
+            block_token,
+            None,
+            StreamBlockControlOptions {
+                actor: Some("stream-operator".to_string()),
+                confirm_stream_offline: true,
+            },
+        )
+        .await;
+        assert!(shown.ok && shown.page.is_some(), "{shown:?}");
+
+        // A desired schema edit must not run ahead of the parked disable.
+        // The pre-schema attempt resumes the exact continuation, then the
+        // ordinary streaming phase still owns the blocked observation and
+        // persists the same DISABLING revision for correction authority.
+        fs::write(
+            dir.path().join("people.pg"),
+            r#"
+node Person {
+  name: String @key
+  age: I32
+  nickname: String?
+  @unique(age)
+}
+"#,
+        )
+        .unwrap();
+        let schema_parked = confirmed_streaming_apply(dir.path()).await;
+        assert!(schema_parked.ok && !schema_parked.converged, "{schema_parked:?}");
+        let schema_change = schema_parked
+            .changes
+            .iter()
+            .find(|change| change.resource == "schema.knowledge")
+            .expect("desired schema edit remains planned");
+        assert_eq!(
+            schema_change.disposition,
+            Some(ApplyDisposition::Blocked)
+        );
+        assert_eq!(
+            schema_change.reason.as_deref(),
+            Some("streaming_disable_continuation_pending")
+        );
+        let streaming_change = schema_parked
+            .changes
+            .iter()
+            .find(|change| change.resource == "streaming.knowledge")
+            .expect("desired false remains unresolved beside DISABLING");
+        assert_eq!(
+            streaming_change.disposition,
+            Some(ApplyDisposition::Blocked)
+        );
+        assert_eq!(
+            streaming_change.reason.as_deref(),
+            Some("streaming_data_blocked")
+        );
+
+        let state_after_schema_attempt = read_state_json(dir.path());
+        assert_eq!(
+            state_after_schema_attempt["applied_revision"]["resources"]
+                ["streaming.knowledge"],
+            state["applied_revision"]["resources"]["streaming.knowledge"]
+        );
+        let live_after_schema_attempt =
+            Omnigraph::open_read_only(graph_root.to_str().unwrap())
+                .await
+                .unwrap();
+        assert!(
+            !live_after_schema_attempt.schema_source().contains("nickname"),
+            "schema movement must wait until the disable continuation reaches DISABLED"
         );
     }
 

@@ -5,26 +5,35 @@
 //! profile transitions pair an immutable management receipt in the selected
 //! token ledger with the next profile in one recovery-v13 publication.
 //! Disable first consumes the live delegation into a durable `DISABLING`
-//! continuation. This bounded slice can finish only an already-clean cut;
-//! later lifecycle slices add the drain owner without changing this authority
-//! boundary.
+//! continuation. The checked offline owner then drains the finite enrolled cut
+//! one lane at a time before publishing the terminal `DISABLED` receipt.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::db::Omnigraph;
+use crate::db::manifest::stream::{
+    DisableDrainAdoption, DrainGoal, ManagementReceipt,
+    STREAM_DISABLE_DRAIN_ADOPTION_OPERATION_KIND, stream_disable_drain_adoption_id,
+    stream_disable_drain_adoption_operation_id, stream_disable_drain_adoption_request_payload,
+    stream_disable_drain_adoption_result_payload, stream_disable_drain_id,
+    stream_graph_identity_digest,
+};
+use crate::db::manifest::stream_profile::STREAM_FOLD_PRINCIPAL;
 use crate::db::manifest::{
     DisablePlan, FoldContinuation, FoldDelegation, ManifestChange, ProfileManagementReceipt,
     ProfileManagementResult, PublishPrecondition, RecoveryAuthorityToken, RecoveryLineageIntent,
-    RecoveryStreamProfileChangeKind, StreamLifecycle, StreamProfileEntry, StreamProfileMode,
-    StreamProfileState, complete_stream_profile_change_sidecar_v13,
-    confirm_stream_profile_change_sidecar_v13, lookup_profile_management_receipt,
+    RecoveryStreamLifecycleReceiptKind, RecoveryStreamProfileChangeKind, StreamLifecycle,
+    StreamProfileEntry, StreamProfileMode, StreamProfileState,
+    complete_stream_profile_change_sidecar_v13, confirm_stream_profile_change_sidecar_v13,
+    lookup_management_receipt, lookup_profile_management_receipt,
     new_stream_profile_change_sidecar_v13, open_stream_token_authority_head,
     schema_apply_serial_queue_key, stage_profile_management_receipt,
     stream_profile_cluster_root_digest, stream_profile_graph_identity_digest,
     stream_profile_management_request_digest, stream_token_authority_entry_for_dataset,
     write_sidecar,
 };
+use crate::db::write_queue::StreamAdmissionKey;
 use crate::error::{OmniError, Result};
 use crate::storage_layer::{SnapshotHandle, StagedHandle};
 use lance_index::mem_wal::ShardId;
@@ -33,6 +42,8 @@ use omnigraph_control_authority::{
 };
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+
+use super::stream_ingest::ResidentQuiesceOutcome;
 
 /// Engine-checked stopped-writer authority for one exact cluster profile
 /// reconciliation.
@@ -191,6 +202,11 @@ impl StreamingProfileResult {
             manifest_version: receipt.result.manifest_version,
         }
     }
+}
+
+enum StreamingProfileReconcileStep {
+    Complete(StreamingProfileResult),
+    ContinueDisable(StreamProfileEntry),
 }
 
 fn sealed_identity_cut(snapshot: &crate::db::Snapshot) -> Result<(u64, String)> {
@@ -918,9 +934,323 @@ impl Omnigraph {
     /// capability. No raw boolean or actor is accepted at this boundary.
     #[doc(hidden)]
     pub async fn set_streaming_profile_checked(
-        &self,
+        self: &Arc<Self>,
         authority: CheckedClusterApplyAuthority<'_>,
     ) -> Result<StreamingProfileResult> {
+        loop {
+            match Box::pin(self.reconcile_streaming_profile_step(&authority)).await? {
+                StreamingProfileReconcileStep::Complete(result) => return Ok(result),
+                StreamingProfileReconcileStep::ContinueDisable(profile) => {
+                    Box::pin(self.continue_disabling_stream_lanes(&authority, &profile)).await?;
+                }
+            }
+        }
+    }
+
+    /// Converge the finite enrolled cut selected by one durable disable plan.
+    ///
+    /// The manifest is the work list: no parallel queue or checkpoint is
+    /// maintained. Each replacement apply reconstructs the same lane order and
+    /// the same per-lane drain occurrence from durable profile/table identity.
+    /// Only one lane is owned at a time so node activity cannot retain locks
+    /// needed by a later edge lane.
+    async fn continue_disabling_stream_lanes(
+        self: &Arc<Self>,
+        authority: &CheckedClusterApplyAuthority<'_>,
+        expected_profile: &StreamProfileEntry,
+    ) -> Result<()> {
+        expected_profile.validate()?;
+        let disable_plan = match &expected_profile.state {
+            StreamProfileState::Disabling { disable_plan } => disable_plan,
+            _ => {
+                return Err(OmniError::manifest_internal(
+                    "offline disable continuation requires exact DISABLING profile state",
+                ));
+            }
+        };
+        let current_cluster_root_digest =
+            stream_profile_cluster_root_digest(authority.guard.cluster_root())?;
+        if disable_plan.fold_continuation.cluster_root_digest != current_cluster_root_digest
+            || disable_plan.fold_continuation.disabling_profile_revision
+                != expected_profile.profile_revision
+        {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: "stored disable continuation belongs to a different cluster root or profile revision"
+                    .to_string(),
+            });
+        }
+
+        let frozen = self.open_write_txn(None).await?;
+        if frozen.base.stream_profile() != expected_profile {
+            return Err(OmniError::manifest_read_set_changed(
+                "offline_disable_profile",
+                Some(format!("{expected_profile:?}")),
+                Some(format!("{:?}", frozen.base.stream_profile())),
+            ));
+        }
+        let lanes = self.ordered_enrolled_stream_lanes(&frozen.base)?;
+
+        for lane in lanes {
+            loop {
+                // Recovery owns any interrupted receipt publication. Run it
+                // before acquiring the profile/lane gates used by quiesce.
+                self.heal_pending_recovery_sidecars_for_write(&[None])
+                    .await?;
+                let current = self.open_write_txn(None).await?;
+                if current.base.stream_profile() != expected_profile {
+                    return Err(OmniError::manifest_read_set_changed(
+                        "offline_disable_profile",
+                        Some(format!("{expected_profile:?}")),
+                        Some(format!("{:?}", current.base.stream_profile())),
+                    ));
+                }
+                let lifecycle = current
+                    .base
+                    .stream_lifecycle(lane.identity)
+                    .cloned()
+                    .ok_or_else(|| {
+                        OmniError::manifest_read_set_changed(
+                            format!("offline_disable_lifecycle:{}", lane.identity),
+                            Some("enrolled".to_string()),
+                            None,
+                        )
+                    })?;
+                if lifecycle.diagnostic_table_key != lane.table_key {
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("offline_disable_table_key:{}", lane.identity),
+                        Some(lane.table_key.clone()),
+                        Some(lifecycle.diagnostic_table_key.clone()),
+                    ));
+                }
+                if let Some(block) = lifecycle.strict_block.as_ref() {
+                    return Err(OmniError::StreamDataBlocked {
+                        block_token: block.block_token.clone(),
+                    });
+                }
+
+                let (drain_id, expected_lifecycle_revision, actor_id) = match lifecycle.lifecycle {
+                    StreamLifecycle::Sealed => break,
+                    StreamLifecycle::Open => (
+                        stream_disable_drain_id(&disable_plan.operation_id, lane.identity)?,
+                        lifecycle.lifecycle_revision,
+                        STREAM_FOLD_PRINCIPAL.to_string(),
+                    ),
+                    StreamLifecycle::Draining => {
+                        let drain = lifecycle.drain.as_ref().ok_or_else(|| {
+                                OmniError::manifest_internal(
+                                    "offline disable found DRAINING lifecycle without a drain descriptor",
+                                )
+                            })?;
+                        if drain.goal == crate::db::manifest::stream::DrainGoal::OpenAfterFold {
+                            Box::pin(self.adopt_disable_drain(
+                                expected_profile,
+                                &lane.table_key,
+                                lane.identity,
+                            ))
+                            .await?;
+                            continue;
+                        }
+                        (
+                            drain.drain_id.clone(),
+                            drain.operation_expected_revision,
+                            drain.initiating_actor.clone(),
+                        )
+                    }
+                };
+
+                match Box::pin(self.stream_quiesce_offline_disabling_inline(
+                    &lane.table_key,
+                    expected_profile,
+                    lane.identity,
+                    &drain_id,
+                    expected_lifecycle_revision,
+                    &actor_id,
+                ))
+                .await?
+                {
+                    ResidentQuiesceOutcome::Sealed => break,
+                    ResidentQuiesceOutcome::Inactive => continue,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Narrow an existing OPEN_AFTER_FOLD drain into the goal-SEALED disable
+    /// continuation. This is metadata-only, but still pairs the lifecycle CAS
+    /// with an immutable management receipt through recovery-v14.
+    async fn adopt_disable_drain(
+        self: &Arc<Self>,
+        expected_profile: &StreamProfileEntry,
+        table_key: &str,
+        expected_identity: crate::db::manifest::TableIdentity,
+    ) -> Result<()> {
+        let disable_plan = match &expected_profile.state {
+            StreamProfileState::Disabling { disable_plan } => disable_plan,
+            _ => {
+                return Err(OmniError::manifest_internal(
+                    "disable-drain adoption requires exact DISABLING profile state",
+                ));
+            }
+        };
+        let write_queue = self.write_queue();
+        let _profile_guard = write_queue.acquire_stream_profile_shared().await;
+        let admission_key = StreamAdmissionKey::for_resolved_ref(expected_identity, None);
+        let _admission_guard = write_queue.acquire_stream_exclusive(&admission_key).await;
+        let _schema_guard = write_queue.acquire(&schema_apply_serial_queue_key()).await;
+        let _branch_guard = write_queue.acquire_branch(None).await;
+        let _stream_token_guard = write_queue.acquire_stream_token().await;
+        let _table_guards = write_queue
+            .acquire_many(&[(table_key.to_string(), None)])
+            .await;
+        self.ensure_no_pending_recovery_sidecars_under_gates(&[None], "disable-drain adoption")
+            .await?;
+
+        let txn = self.open_write_txn(None).await?;
+        if txn.base.stream_profile() != expected_profile {
+            return Err(OmniError::manifest_read_set_changed(
+                "disable_drain_adoption_profile",
+                Some(format!("{expected_profile:?}")),
+                Some(format!("{:?}", txn.base.stream_profile())),
+            ));
+        }
+        let entry = txn.base.entry(table_key).ok_or_else(|| {
+            OmniError::manifest_read_set_changed(
+                format!("disable_drain_adoption_table:{expected_identity}"),
+                Some(table_key.to_string()),
+                None,
+            )
+        })?;
+        if entry.identity != expected_identity || entry.table_branch.is_some() {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("disable_drain_adoption_identity:{table_key}"),
+                Some(expected_identity.to_string()),
+                Some(entry.identity.to_string()),
+            ));
+        }
+        let prior = txn
+            .base
+            .stream_lifecycle(expected_identity)
+            .cloned()
+            .ok_or_else(|| {
+                OmniError::manifest_read_set_changed(
+                    format!("disable_drain_adoption_lifecycle:{expected_identity}"),
+                    Some("DRAINING".to_string()),
+                    None,
+                )
+            })?;
+        if let Some(block) = prior.strict_block.as_ref() {
+            return Err(OmniError::StreamDataBlocked {
+                block_token: block.block_token.clone(),
+            });
+        }
+        if prior.lifecycle != StreamLifecycle::Draining {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("disable_drain_adoption_lifecycle:{expected_identity}"),
+                Some("DRAINING".to_string()),
+                Some(format!("{:?}", prior.lifecycle)),
+            ));
+        }
+        let prior_drain = prior.drain.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal("disable-drain adoption lost its drain descriptor")
+        })?;
+        let adoption_id = stream_disable_drain_adoption_id(
+            &disable_plan.operation_id,
+            expected_identity,
+            &prior_drain.drain_id,
+            expected_profile.profile_revision,
+        )?;
+        let adoption_operation_id = stream_disable_drain_adoption_operation_id(
+            &disable_plan.operation_id,
+            expected_identity,
+            &prior_drain.drain_id,
+            expected_profile.profile_revision,
+        )?;
+        let request_payload = stream_disable_drain_adoption_request_payload(
+            &disable_plan.operation_id,
+            expected_identity,
+            &prior_drain.drain_id,
+            expected_profile.profile_revision,
+        )?;
+        let graph_identity_digest =
+            stream_graph_identity_digest(&txn.authority.schema_identity_domain)?;
+        let selected_token = txn.base.open_stream_token_authority().await?;
+        let selected_receipt = lookup_management_receipt(
+            &selected_token,
+            txn.base.stream_token_authority(),
+            &graph_identity_digest,
+            expected_identity,
+            &prior.enrollment_receipt.stream_incarnation_id,
+            STREAM_DISABLE_DRAIN_ADOPTION_OPERATION_KIND,
+            &adoption_operation_id,
+        )
+        .await?;
+
+        if prior_drain.goal != DrainGoal::OpenAfterFold || prior_drain.seal_override.is_some() {
+            return Err(OmniError::manifest_internal(
+                "disable-drain adoption requires an unadopted OPEN_AFTER_FOLD drain",
+            ));
+        }
+        if selected_receipt.is_some() {
+            return Err(OmniError::recovery_required(
+                adoption_id,
+                "selected disable-drain adoption receipt is not reflected in the lifecycle row",
+            ));
+        }
+
+        let next_revision = prior
+            .lifecycle_revision
+            .checked_add(1)
+            .ok_or_else(|| OmniError::manifest_internal("stream lifecycle revision overflow"))?;
+        let recorded_at = crate::db::now_micros()?;
+        let receipt = ManagementReceipt::new(
+            graph_identity_digest,
+            expected_identity,
+            prior.enrollment_receipt.stream_incarnation_id.clone(),
+            prior.binding_scope_id.clone(),
+            &prior.management_receipt_chain,
+            adoption_operation_id,
+            STREAM_DISABLE_DRAIN_ADOPTION_OPERATION_KIND,
+            prior.lifecycle_revision,
+            next_revision,
+            disable_plan.actor.clone(),
+            request_payload,
+            stream_disable_drain_adoption_result_payload(next_revision)?,
+            recorded_at,
+        )?;
+        let mut next = prior.clone();
+        next.lifecycle_revision = next_revision;
+        next.management_receipt_chain = receipt.next_chain_ref()?;
+        let next_drain = next
+            .drain
+            .as_mut()
+            .expect("validated DRAINING lifecycle has a drain descriptor");
+        next_drain.goal = DrainGoal::Sealed;
+        next_drain.seal_override = Some(DisableDrainAdoption {
+            adoption_id,
+            disable_operation_id: disable_plan.operation_id.clone(),
+            request_digest: receipt.request_digest.clone(),
+            profile_revision: expected_profile.profile_revision,
+            management_receipt_id: receipt.record_id.clone(),
+            adopted_at: recorded_at,
+        });
+        next.validate_successor_of(&prior)?;
+
+        Box::pin(self.publish_stream_lifecycle_receipt_v14(
+            &txn,
+            prior,
+            None,
+            next,
+            receipt,
+            RecoveryStreamLifecycleReceiptKind::DisableDrainAdoption,
+        ))
+        .await
+    }
+
+    async fn reconcile_streaming_profile_step(
+        &self,
+        authority: &CheckedClusterApplyAuthority<'_>,
+    ) -> Result<StreamingProfileReconcileStep> {
         let enabled = authority
             .guard
             .operation()
@@ -998,13 +1328,15 @@ impl Omnigraph {
         )
         .await?
         {
-            return validate_recorded_profile_result(
-                &expected,
-                &authority.guard,
-                &graph_identity_digest,
-                desired_mode,
-                &receipt,
-            );
+            return Ok(StreamingProfileReconcileStep::Complete(
+                validate_recorded_profile_result(
+                    &expected,
+                    &authority.guard,
+                    &graph_identity_digest,
+                    desired_mode,
+                    &receipt,
+                )?,
+            ));
         }
 
         // A durable continuation belongs to its original operation, actor,
@@ -1014,11 +1346,14 @@ impl Omnigraph {
         // in one checked apply without ever restoring the consumed delegation.
         let mut completed_prior_disable = false;
         if expected.mode() == StreamProfileMode::Disabling {
+            if txn.base.streaming_status().undrained {
+                return Ok(StreamingProfileReconcileStep::ContinueDisable(expected));
+            }
             let completed = self
                 .finish_disabling_stream_profile(&txn, &cluster_root_digest, &graph_identity_digest)
                 .await?;
             if desired_mode == StreamProfileMode::Disabled {
-                return Ok(completed);
+                return Ok(StreamingProfileReconcileStep::Complete(completed));
             }
             completed_prior_disable = true;
             txn = self.open_write_txn(None).await?;
@@ -1050,17 +1385,13 @@ impl Omnigraph {
         match (desired_mode, expected.mode()) {
             (StreamProfileMode::Enabled, StreamProfileMode::Enabled) => {
                 validate_enabled_profile_for_apply(&expected, &authority.guard)?;
-                return Ok(StreamingProfileResult::from_profile(
-                    false,
-                    &expected,
-                    txn.base.version(),
+                return Ok(StreamingProfileReconcileStep::Complete(
+                    StreamingProfileResult::from_profile(false, &expected, txn.base.version()),
                 ));
             }
             (StreamProfileMode::Disabled, StreamProfileMode::Disabled) => {
-                return Ok(StreamingProfileResult::from_profile(
-                    false,
-                    &expected,
-                    txn.base.version(),
+                return Ok(StreamingProfileReconcileStep::Complete(
+                    StreamingProfileResult::from_profile(false, &expected, txn.base.version()),
                 ));
             }
             (_, StreamProfileMode::Retired) => {
@@ -1083,17 +1414,6 @@ impl Omnigraph {
         }
 
         if desired_mode == StreamProfileMode::Disabled {
-            if txn.base.streaming_status().undrained {
-                let mut undrained_tables: Vec<String> = txn
-                    .base
-                    .stream_lifecycles()
-                    .filter(|(_, lifecycle)| lifecycle.lifecycle != StreamLifecycle::Sealed)
-                    .map(|(_, lifecycle)| lifecycle.diagnostic_table_key.clone())
-                    .collect();
-                undrained_tables.sort();
-                return Err(OmniError::StreamingDisablePending { undrained_tables });
-            }
-
             let active_delegation = match &expected.state {
                 StreamProfileState::Enabled {
                     active_fold_delegation,
@@ -1164,9 +1484,17 @@ impl Omnigraph {
                     "disable plan publication did not install its exact DISABLING state",
                 ));
             }
-            return self
-                .finish_disabling_stream_profile(&txn, &cluster_root_digest, &graph_identity_digest)
-                .await;
+            if txn.base.streaming_status().undrained {
+                return Ok(StreamingProfileReconcileStep::ContinueDisable(disabling));
+            }
+            return Ok(StreamingProfileReconcileStep::Complete(
+                self.finish_disabling_stream_profile(
+                    &txn,
+                    &cluster_root_digest,
+                    &graph_identity_digest,
+                )
+                .await?,
+            ));
         }
 
         // The only remaining path is a fresh DISABLED -> ENABLED terminal
@@ -1239,14 +1567,16 @@ impl Omnigraph {
                 ));
             }
         };
-        self.commit_terminal_stream_profile_change(
-            &txn,
-            prior,
-            next,
-            receipt,
-            RecoveryStreamProfileChangeKind::EnableReceipt,
-        )
-        .await
+        Ok(StreamingProfileReconcileStep::Complete(
+            self.commit_terminal_stream_profile_change(
+                &txn,
+                prior,
+                next,
+                receipt,
+                RecoveryStreamProfileChangeKind::EnableReceipt,
+            )
+            .await?,
+        ))
     }
 }
 
@@ -1289,7 +1619,7 @@ node Person {
     }
 
     async fn apply_profile(
-        db: &Omnigraph,
+        db: &Arc<Omnigraph>,
         cluster: &tempfile::TempDir,
         state_cas: &str,
         expected_profile_revision: u64,
@@ -1438,14 +1768,18 @@ node Person {
         let cluster = tempfile::tempdir().unwrap();
         let state_cas = write_cluster_state(&cluster);
         let graph = cluster.path().join("graphs/knowledge.omni");
-        let db = Omnigraph::init(graph.to_str().unwrap(), TEST_SCHEMA)
-            .await
-            .unwrap();
+        let db = Arc::new(
+            Omnigraph::init(graph.to_str().unwrap(), TEST_SCHEMA)
+                .await
+                .unwrap(),
+        );
 
         let other_graph = cluster.path().join("graphs/other.omni");
-        let other_db = Omnigraph::init(other_graph.to_str().unwrap(), TEST_SCHEMA)
-            .await
-            .unwrap();
+        let other_db = Arc::new(
+            Omnigraph::init(other_graph.to_str().unwrap(), TEST_SCHEMA)
+                .await
+                .unwrap(),
+        );
         let wrong_store = check_maintenance_authority(
             &other_db,
             &cluster,
@@ -1527,9 +1861,11 @@ node Person {
         let cluster = tempfile::tempdir().unwrap();
         let state_cas = write_cluster_state(&cluster);
         let graph = cluster.path().join("graphs/knowledge.omni");
-        let db = Omnigraph::init(graph.to_str().unwrap(), TEST_SCHEMA)
-            .await
-            .unwrap();
+        let db = Arc::new(
+            Omnigraph::init(graph.to_str().unwrap(), TEST_SCHEMA)
+                .await
+                .unwrap(),
+        );
 
         let disabled = check_block_authority(
             &db,
@@ -1652,9 +1988,11 @@ node Person {
         let cluster = tempfile::tempdir().unwrap();
         let state_cas = write_cluster_state(&cluster);
         let graph = cluster.path().join("graphs/knowledge.omni");
-        let db = Omnigraph::init(graph.to_str().unwrap(), TEST_SCHEMA)
-            .await
-            .unwrap();
+        let db = Arc::new(
+            Omnigraph::init(graph.to_str().unwrap(), TEST_SCHEMA)
+                .await
+                .unwrap(),
+        );
         db.branch_create("feature").await.unwrap();
 
         assert!(matches!(
@@ -1782,7 +2120,7 @@ rules:
             .await
             .unwrap();
         let policy = PolicyEngine::load_graph(&policy_path, graph.to_str().unwrap()).unwrap();
-        let db = db.with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>);
+        let db = Arc::new(db.with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>));
 
         let denied_maintenance = check_maintenance_authority(
             &db,
@@ -1851,9 +2189,11 @@ rules:
         let cluster = tempfile::tempdir().unwrap();
         let state_cas = write_cluster_state(&cluster);
         let graph = cluster.path().join("graphs/knowledge.omni");
-        let db = Omnigraph::init(graph.to_str().unwrap(), TEST_SCHEMA)
-            .await
-            .unwrap();
+        let db = Arc::new(
+            Omnigraph::init(graph.to_str().unwrap(), TEST_SCHEMA)
+                .await
+                .unwrap(),
+        );
         apply_profile(
             &db,
             &cluster,
@@ -1926,8 +2266,9 @@ rules:
             }])
             .await
             .unwrap();
+        db.refresh_coordinator_only().await.unwrap();
 
-        let error = apply_profile(
+        let _drain_error = apply_profile(
             &db,
             &cluster,
             &state_cas,
@@ -1940,39 +2281,51 @@ rules:
         )
         .await
         .unwrap_err();
-        assert!(matches!(
-            error,
-            OmniError::StreamingDisablePending { ref undrained_tables }
-                if undrained_tables == &["node:Person".to_string()]
-        ));
 
         let snapshot = ManifestCoordinator::open(db.uri())
             .await
             .unwrap()
             .snapshot();
-        assert_eq!(snapshot.stream_profile().mode(), StreamProfileMode::Enabled);
-        assert_eq!(snapshot.stream_profile().profile_revision, 2);
+        assert_eq!(
+            snapshot.stream_profile().mode(),
+            StreamProfileMode::Disabling
+        );
+        assert_eq!(snapshot.stream_profile().profile_revision, 3);
         assert_eq!(
             snapshot.stream_profile().profile_receipt_chain.record_count,
             1
         );
+        let StreamProfileState::Disabling { disable_plan } = &snapshot.stream_profile().state
+        else {
+            unreachable!("mode checked above")
+        };
+        assert_eq!(disable_plan.operation_id, "disable-undrained");
+        assert_eq!(disable_plan.actor, "operator:alice");
 
-        let sealed = crate::db::manifest::stream::test_sealed_lifecycle_from(&lifecycle).unwrap();
+        let current_lifecycle = snapshot
+            .stream_lifecycle(table.identity)
+            .expect("disable retains its manifest-derived lane")
+            .clone();
+        let sealed =
+            crate::db::manifest::stream::test_sealed_lifecycle_from(&current_lifecycle).unwrap();
         let mut coordinator = ManifestCoordinator::open(db.uri()).await.unwrap();
         coordinator
             .commit_changes(&[ManifestChange::SetStreamLifecycle {
-                expected: Some(lifecycle),
+                expected: Some(current_lifecycle),
                 next: sealed.clone(),
             }])
             .await
             .unwrap();
+        db.refresh_coordinator_only().await.unwrap();
 
+        // A replacement apply reconstructs and completes the stored operation;
+        // it does not mint a second disable plan or relabel the actor.
         let disabled = apply_profile(
             &db,
             &cluster,
             &state_cas,
-            2,
-            "disable-at-sealed-cut",
+            3,
+            "disable-undrained",
             AuthorityOperationClass::StreamProfileDisable,
             "stream-declaration-disabled-v1",
             &format!("sha256:{}", "b".repeat(64)),
@@ -2041,9 +2394,11 @@ rules:
         let cluster = tempfile::tempdir().unwrap();
         let state_cas = write_cluster_state(&cluster);
         let graph = cluster.path().join("graphs/knowledge.omni");
-        let db = Omnigraph::init(graph.to_str().unwrap(), TEST_SCHEMA)
-            .await
-            .unwrap();
+        let db = Arc::new(
+            Omnigraph::init(graph.to_str().unwrap(), TEST_SCHEMA)
+                .await
+                .unwrap(),
+        );
         apply_profile(
             &db,
             &cluster,

@@ -320,9 +320,9 @@ impl StreamFoldDrivers {
     }
 
     async fn shutdown_targets(targets: &[StreamFoldDriverTarget]) -> Result<()> {
-        // Each engine enforces the same bounded shutdown deadline. Join every
-        // graph concurrently so the serving-process deadline remains bounded
-        // once, rather than once per graph.
+        // Each engine enforces the same bounded, cancellation-safe stream
+        // runtime handoff. Join every graph concurrently so the serving-process
+        // deadline remains bounded once, rather than once per graph.
         let outcomes = futures::future::join_all(targets.iter().map(|target| async move {
             (
                 Arc::clone(&target.graph_id),
@@ -342,7 +342,7 @@ impl StreamFoldDrivers {
             Ok(())
         } else {
             bail!(
-                "resident stream fold driver shutdown failed: {}",
+                "resident stream runtime shutdown failed: {}",
                 failures.join("; ")
             )
         }
