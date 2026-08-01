@@ -2516,7 +2516,6 @@ impl TableStore {
     /// `stage_append`).
     ///
     /// MR-793 Phase 2: introduces this for the schema_apply rewrite path.
-    /// Lance API verified in `.context/mr-793-design.md` Appendix A.1.
     pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
         // `enable_stable_row_ids: true` is defensive — empirically Lance 6.0.1
         // preserves the source dataset's flag through `Operation::Overwrite`

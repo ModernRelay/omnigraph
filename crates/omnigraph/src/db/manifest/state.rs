@@ -152,10 +152,21 @@ pub(super) fn manifest_schema() -> SchemaRef {
     // `object_id` is the merge-insert join key in the publisher; marking it as
     // Lance's unenforced primary key engages row-level CAS at commit time, so
     // two concurrent writers that try to land the same `object_id` row are
-    // detected by Lance via bloom-filter intersection (see
-    // `.context/merge-insert-cas-granularity.md`). Without this metadata,
-    // Lance's conflict resolver would silently rebase both writers' new
-    // fragments and admit duplicate rows.
+    // detected by Lance via bloom-filter intersection.
+    //
+    // This annotation is load-bearing, not defensive. Lance builds the
+    // key-existence filter ONLY when the merge-insert ON columns carry it.
+    // Without it, two concurrent `execute_reader()` calls inserting the same
+    // key into disjoint fragments BOTH succeed silently, and the conflict
+    // resolver rebases both writers' new fragments into duplicate rows under
+    // one key — reopening the TOCTOU window between `load_publish_state` and
+    // the merge-insert commit.
+    //
+    // Row-level CAS covers only rows the publisher is emitting, so it is one
+    // of three layers: this annotation, the publisher's pre-check of
+    // `expected_table_versions` (which covers tables it is NOT writing), and
+    // `conflict_retries(0)` so the caller-level retry re-reads authority
+    // rather than letting Lance auto-rebase onto unfamiliar manifest state.
     let object_id_metadata: HashMap<String, String> =
         [("lance-schema:unenforced-primary-key", "true")]
             .into_iter()
