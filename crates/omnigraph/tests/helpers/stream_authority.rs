@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use omnigraph::db::Omnigraph;
+use omnigraph::db::{Omnigraph, StreamAuthorityRetirementPlan, StreamAuthorityRetirementResult};
 use omnigraph::error::Result;
 use omnigraph_control_authority::{
     AuthorityOperationClass, OfflineAuthorityRequest, RuntimeBindingRequest, StateLockAcquire,
@@ -157,6 +157,87 @@ pub async fn rebind_stream_table_offline(
         expected_lifecycle_revision,
     ))
     .await
+}
+
+pub async fn plan_stream_authority_retirement(
+    db: &Omnigraph,
+    cluster_uri: &str,
+) -> StreamAuthorityRetirementPlan {
+    let cluster_uri = cluster_uri.trim_end_matches('/');
+    let status = db.stream_status().await.unwrap();
+    let state_cas = write_cluster_state(cluster_uri).await;
+    let storage = storage_handle_for_uri(cluster_uri).unwrap();
+    let lock_uri = format!("{cluster_uri}/__cluster/lock.json");
+    let lock = match acquire_state_lock(&storage, &lock_uri, "stream-retire-for-rebuild")
+        .await
+        .unwrap()
+    {
+        StateLockAcquire::Acquired(lock) => lock,
+        StateLockAcquire::Held => panic!("fresh retirement plan lock is already held"),
+    };
+    let guard = validate_offline_guard(
+        &lock,
+        OfflineAuthorityRequest {
+            graph_id: GRAPH_ID,
+            graph_store_uri: db.uri(),
+            expected_state_cas: &state_cas,
+            state_revision: 1,
+            declaration_revision: STREAM_DECLARATION_REVISION,
+            declaration_digest: STREAM_DECLARATION_DIGEST,
+            expected_profile_revision: status.profile_revision,
+            operation_id: "78787878-7878-4878-8878-787878787878",
+            operation: AuthorityOperationClass::StreamAuthorityRetirement,
+            actor: "operator:memwal-retirement",
+            confirm_stream_offline: true,
+        },
+    )
+    .await
+    .unwrap();
+    let authority = db.check_cluster_retirement_authority(guard).await.unwrap();
+    db.plan_stream_authority_retirement(authority)
+        .await
+        .unwrap()
+}
+
+pub async fn confirm_stream_authority_retirement(
+    db: &Omnigraph,
+    cluster_uri: &str,
+    retirement_id: &str,
+    plan_digest: &str,
+) -> Result<StreamAuthorityRetirementResult> {
+    let cluster_uri = cluster_uri.trim_end_matches('/');
+    let status = db.stream_status().await.unwrap();
+    let state_cas = write_cluster_state(cluster_uri).await;
+    let storage = storage_handle_for_uri(cluster_uri).unwrap();
+    let lock_uri = format!("{cluster_uri}/__cluster/lock.json");
+    let lock = match acquire_state_lock(&storage, &lock_uri, "stream-retire-for-rebuild")
+        .await
+        .unwrap()
+    {
+        StateLockAcquire::Acquired(lock) => lock,
+        StateLockAcquire::Held => panic!("fresh retirement confirm lock is already held"),
+    };
+    let guard = validate_offline_guard(
+        &lock,
+        OfflineAuthorityRequest {
+            graph_id: GRAPH_ID,
+            graph_store_uri: db.uri(),
+            expected_state_cas: &state_cas,
+            state_revision: 1,
+            declaration_revision: STREAM_DECLARATION_REVISION,
+            declaration_digest: STREAM_DECLARATION_DIGEST,
+            expected_profile_revision: status.profile_revision,
+            operation_id: retirement_id,
+            operation: AuthorityOperationClass::StreamAuthorityRetirement,
+            actor: "operator:memwal-retirement",
+            confirm_stream_offline: true,
+        },
+    )
+    .await
+    .unwrap();
+    let authority = db.check_cluster_retirement_authority(guard).await?;
+    db.confirm_stream_authority_retirement(authority, retirement_id, plan_digest)
+        .await
 }
 
 pub async fn bind_checked_stream_runtime(db: Arc<Omnigraph>, cluster_uri: &str) -> Arc<Omnigraph> {

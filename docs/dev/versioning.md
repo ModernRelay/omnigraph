@@ -158,10 +158,9 @@ refreshes publish atomically; a true no-work invocation is effect-free. It
 writes no token row, advances no receipt chain, and accepts no caller operation
 ID. Ambient Optimize remains refused for enrolled tables.
 
-Internal schema **v16 is the currently served format** (unreleased, current
-0.10.0-dev source builds; a later private control-plane strand may supersede it
-before release). It raises the sidecar ceiling to recovery-v18 for the distinct
-hidden `StreamRebind` discriminator. V18 binds the complete prior `SEALED`
+Internal schema v16 was an unreleased 0.10.0-dev format. It raised the sidecar
+ceiling to recovery-v18 for the distinct hidden `StreamRebind` discriminator.
+V18 binds the complete prior `SEALED`
 authority, exact fresh physical enrollment and empty shard, immutable binding
 and fence-only claim receipts, and the exact next `SEALED` row/proof. Only that
 complete outcome may publish. Rebind never opens admission; a separate
@@ -169,17 +168,34 @@ recovery-v15 resume must claim a higher epoch within the fresh binding scope.
 The v14 rebind scaffold and recovery-v17 Optimize envelope retain their exact
 historical meanings and are never reinterpreted.
 
+Internal schema **v17 is the currently served format** (unreleased, current
+0.10.0-dev source builds). It raises the sidecar ceiling to recovery-v19 for
+one active `StreamAuthorityRetirement` discriminator. Under checked
+stopped/offline cluster authority, a read-only plan proves an exact `DISABLED`
+profile, settled recovery, every enrolled lane `SEALED`, base/token parity, and
+at least one current `WITHDRAWN` token. Confirmation appends one immutable,
+actor- and plan-bound retirement receipt and then performs the sole
+lineage-neutral manifest CAS selecting its token pointer and
+`DISABLED → RETIRED`. It moves no graph or branch head, emits no `GraphCommit`
+or `RecoveryAudit`, and has no outgoing transition. A retired source is
+query/status/export-only; export re-proves the frozen logical cut and emits the
+root receipt plus a closed witness binding the canonical selected branch,
+exact Lance branch identifier, graph head, manifest version, and branch-member
+digest (`branch_member_digest`). Authority correction remains
+inactive, and this slice adds no production path that creates `WITHDRAWN`.
+
 Recovery-v13 remains exactly the v11 profile-change protocol. Historical
 recovery-v10 enrollment and recovery-v12 lifecycle-v2 folds retain their old
 wire meanings and are refused under lifecycle-v3 rather than synthesized.
 There is still no public firehose ingress, public production enrollment,
-quiesce, resume/abort, correction/retirement, physical rebind, or streaming or
-maintenance transport surface. The v15 through v18 recovery paths remain
-crate-private and feature-gated.
+quiesce, resume/abort, correction, physical rebind, or streaming or maintenance
+transport surface. Retirement is exposed only by the narrow offline
+`cluster stream retire-for-rebuild plan|confirm` control-plane handshake. The
+v15 through v18 recovery paths remain crate-private and feature-gated.
 
-A v15 graph crosses by export/init/load rebuild into a different root. Because
-`MIN_SUPPORTED == CURRENT == 16`, v16 refuses v15 and a v15 binary refuses
-v16. The genuine v14↔v15 fence remains historical evidence.
+A v16 graph crosses by export/init/load rebuild into a different root. Because
+`MIN_SUPPORTED == CURRENT == 17`, v17 refuses v16 and a v16 binary refuses
+v17. The genuine v15↔v16 fence remains historical evidence.
 
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,

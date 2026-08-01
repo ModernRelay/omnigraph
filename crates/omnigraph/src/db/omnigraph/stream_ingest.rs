@@ -6070,7 +6070,7 @@ async fn lookup_base_stream_metadata(
     Ok(selected.remove(logical_id))
 }
 
-async fn lookup_base_stream_metadata_for_keys(
+pub(super) async fn lookup_base_stream_metadata_for_keys(
     dataset: &lance::Dataset,
     identity: TableIdentity,
     logical_ids: &std::collections::BTreeSet<String>,

@@ -232,6 +232,7 @@ where
     // against the post-apply pins. Runs before the apply's own sidecar
     // exists, so the heal can never observe it.
     db.heal_pending_recovery_sidecars().await?;
+    let _stream_profile_guard = db.write_queue().acquire_stream_profile_shared().await;
 
     // Admission is the outermost process-local gate. Capture every accepted
     // existing table lifetime/ref before taking it, then prove that coverage is
@@ -240,6 +241,13 @@ where
     // avoids acquiring a newly discovered admission lease inside the established
     // admission -> schema order. Adds in *this* apply have no prior lifecycle.
     db.refresh_coordinator_only().await?;
+    if let Some(error) = db
+        .current_canonical_stream_profile()
+        .await?
+        .retired_error()
+    {
+        return Err(error);
+    }
     let mut admission_keys = {
         let snapshot = db.coordinator.read().await.snapshot();
         schema_apply_stream_admission_keys(&snapshot)

@@ -72,7 +72,7 @@ The first Gate A instrument rejected the proposed in-manifest BTREE shape on
 2026-07-15. Exact indexed scan work is flat at fixed catalog width, but the
 complete required cost is not: latest-manifest discovery on uncompacted
 RustFS grows in object reads and bytes, and compacted reads still grow in bytes.
-No heads-format production code ships from this RFC; current internal schema v16
+No heads-format production code ships from this RFC; current internal schema v17
 preserves the journal-fold current-state path while research looks for a
 different substrate/access shape.
 
@@ -657,7 +657,7 @@ coverage and does run against RustFS in CI.
 - Checkpoint retention is deferred.
 - The first in-manifest BTREE candidate is rejected: flat indexed scan work is
   insufficient while latest-manifest/object byte work grows with history.
-- The current development format remains on internal schema v16 without table heads; no
+- The current development format remains on internal schema v17 without table heads; no
   heads-format number or partial implementation is assigned.
 
 ### Gate status

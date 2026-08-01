@@ -26,8 +26,20 @@ const PROFILE_RECEIPT_LOOKUP_DOMAIN: &[u8] = b"omnigraph.stream-profile-receipt-
 const PROFILE_RECEIPT_RECORD_DOMAIN: &[u8] = b"omnigraph.stream-profile-receipt-record.v1\0";
 const PROFILE_RECEIPT_RESULT_DOMAIN: &[u8] = b"omnigraph.stream-profile-receipt-result.v1\0";
 const PROFILE_RECEIPT_CHAIN_DOMAIN: &[u8] = b"omnigraph.stream-profile-receipt-chain.v1\0";
+const AUTHORITY_RETIREMENT_REQUEST_DOMAIN: &[u8] =
+    b"omnigraph.stream-authority-retirement-request.v1\0";
+const AUTHORITY_RETIREMENT_RECEIPT_LOOKUP_DOMAIN: &[u8] =
+    b"omnigraph.stream-authority-retirement-receipt-lookup.v1\0";
+const AUTHORITY_RETIREMENT_RECEIPT_RECORD_DOMAIN: &[u8] =
+    b"omnigraph.stream-authority-retirement-receipt-record.v1\0";
+const AUTHORITY_RETIREMENT_RECEIPT_CHAIN_DOMAIN: &[u8] =
+    b"omnigraph.stream-authority-retirement-receipt-chain.v1\0";
+const AUTHORITY_RETIREMENT_TOKEN_WITNESS_DOMAIN: &[u8] =
+    b"omnigraph.stream-authority-retirement-token-witness.v1\0";
 pub(crate) const PROFILE_MANAGEMENT_RECEIPT_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const PROFILE_MANAGEMENT_RECEIPT_TAG: &str = "PROFILE_MANAGEMENT_RECEIPT_V1";
+pub(crate) const AUTHORITY_RETIREMENT_RECEIPT_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const AUTHORITY_RETIREMENT_RECEIPT_TAG: &str = "AUTHORITY_RETIREMENT_RECEIPT_V1";
 
 /// Fixed-size commitment to immutable profile-management receipt history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +353,7 @@ pub(crate) enum StreamProfileState {
         disable_plan: DisablePlan,
     },
     Retired {
+        authority_retirement_id: String,
         authority_retirement_receipt_id: String,
         authority_retirement_cut_digest: String,
     },
@@ -380,10 +393,12 @@ impl StreamProfileState {
                 Ok(())
             }
             Self::Retired {
+                authority_retirement_id,
                 authority_retirement_receipt_id,
                 authority_retirement_cut_digest,
             } => {
-                validate_profile_text(
+                validate_canonical_uuid("authority retirement id", authority_retirement_id)?;
+                validate_sha256(
                     "authority retirement receipt id",
                     authority_retirement_receipt_id,
                 )?;
@@ -433,6 +448,21 @@ impl StreamProfileEntry {
 
     pub(crate) fn streaming_enabled(&self) -> bool {
         matches!(self.state, StreamProfileState::Enabled { .. })
+    }
+
+    pub(crate) fn retired_error(&self) -> Option<OmniError> {
+        let StreamProfileState::Retired {
+            authority_retirement_id,
+            authority_retirement_cut_digest,
+            ..
+        } = &self.state
+        else {
+            return None;
+        };
+        Some(OmniError::StreamAuthorityRetired {
+            retirement_id: authority_retirement_id.clone(),
+            export_cut_digest: authority_retirement_cut_digest.clone(),
+        })
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -489,6 +519,7 @@ impl StreamProfileEntry {
     pub(crate) fn retired_from_disabled(
         prior: &Self,
         profile_receipt_chain: ReceiptChainRef,
+        authority_retirement_id: impl Into<String>,
         authority_retirement_receipt_id: impl Into<String>,
         authority_retirement_cut_digest: impl Into<String>,
     ) -> Result<Self> {
@@ -496,6 +527,7 @@ impl StreamProfileEntry {
             profile_revision: next_revision(prior.profile_revision)?,
             profile_receipt_chain,
             state: StreamProfileState::Retired {
+                authority_retirement_id: authority_retirement_id.into(),
                 authority_retirement_receipt_id: authority_retirement_receipt_id.into(),
                 authority_retirement_cut_digest: authority_retirement_cut_digest.into(),
             },
@@ -956,6 +988,319 @@ impl ProfileManagementReceipt {
             ],
         )
     }
+}
+
+/// Immutable proof that one exact terminal stream-authority cut was retired.
+///
+/// The receipt advances the existing graph-global profile receipt chain. It is
+/// provenance for rebuilding logical rows into a fresh graph identity, never
+/// live sequencing authority in the rebuilt graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuthorityRetirementReceipt {
+    pub(crate) protocol_version: u32,
+    pub(crate) record_id: String,
+    pub(crate) record_lookup_key: String,
+    pub(crate) record_tag: String,
+    pub(crate) graph_identity_digest: String,
+    pub(crate) chain_ordinal: u64,
+    pub(crate) predecessor_record_id: Option<String>,
+    pub(crate) prior_chain_digest: String,
+    pub(crate) resulting_chain_digest: String,
+    pub(crate) retirement_id: String,
+    pub(crate) plan_digest: String,
+    pub(crate) operation_request_digest: String,
+    pub(crate) actor: String,
+    pub(crate) source_internal_schema_version: u32,
+    pub(crate) source_manifest_version: u64,
+    pub(crate) live_branch_heads_digest: String,
+    pub(crate) source_profile_revision: u64,
+    pub(crate) lifecycle_and_sealed_proof_digest: String,
+    pub(crate) pre_retirement_token_head: super::CurrentHeadWitness,
+    pub(crate) pre_retirement_token_witness_digest: String,
+    pub(crate) present_token_count: u64,
+    pub(crate) withdrawn_token_count: u64,
+    pub(crate) export_cut_digest: String,
+    pub(crate) retired_at: i64,
+}
+
+impl AuthorityRetirementReceipt {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        graph_identity_digest: impl Into<String>,
+        prior_chain: &ReceiptChainRef,
+        retirement_id: impl Into<String>,
+        plan_digest: impl Into<String>,
+        actor: impl Into<String>,
+        source_internal_schema_version: u32,
+        source_manifest_version: u64,
+        live_branch_heads_digest: impl Into<String>,
+        source_profile_revision: u64,
+        lifecycle_and_sealed_proof_digest: impl Into<String>,
+        pre_retirement_token_head: super::CurrentHeadWitness,
+        pre_retirement_token_witness_digest: impl Into<String>,
+        present_token_count: u64,
+        withdrawn_token_count: u64,
+        export_cut_digest: impl Into<String>,
+        retired_at: i64,
+    ) -> Result<Self> {
+        prior_chain.validate()?;
+        let graph_identity_digest = graph_identity_digest.into();
+        let retirement_id = retirement_id.into();
+        let plan_digest = plan_digest.into();
+        let actor = actor.into();
+        let mut value = Self {
+            protocol_version: AUTHORITY_RETIREMENT_RECEIPT_PROTOCOL_VERSION,
+            record_id: String::new(),
+            record_lookup_key: Self::lookup_key_for(&graph_identity_digest, &retirement_id)?,
+            record_tag: AUTHORITY_RETIREMENT_RECEIPT_TAG.to_string(),
+            graph_identity_digest,
+            chain_ordinal: prior_chain
+                .record_count
+                .checked_add(1)
+                .ok_or_else(|| profile_error("profile receipt-chain count overflow"))?,
+            predecessor_record_id: prior_chain.head_record_id.clone(),
+            prior_chain_digest: prior_chain.chain_digest.clone(),
+            resulting_chain_digest: String::new(),
+            retirement_id,
+            operation_request_digest: stream_authority_retirement_request_digest(
+                &plan_digest,
+                &actor,
+            )?,
+            plan_digest,
+            actor,
+            source_internal_schema_version,
+            source_manifest_version,
+            live_branch_heads_digest: live_branch_heads_digest.into(),
+            source_profile_revision,
+            lifecycle_and_sealed_proof_digest: lifecycle_and_sealed_proof_digest.into(),
+            pre_retirement_token_head,
+            pre_retirement_token_witness_digest: pre_retirement_token_witness_digest.into(),
+            present_token_count,
+            withdrawn_token_count,
+            export_cut_digest: export_cut_digest.into(),
+            retired_at,
+        };
+        value.record_id = value.compute_record_id();
+        value.resulting_chain_digest = value.compute_resulting_chain_digest();
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(crate) fn lookup_key_for(
+        graph_identity_digest: &str,
+        retirement_id: &str,
+    ) -> Result<String> {
+        validate_sha256(
+            "authority-retirement graph identity digest",
+            graph_identity_digest,
+        )?;
+        validate_canonical_uuid("authority-retirement id", retirement_id)?;
+        Ok(format!(
+            "authority-retirement-v1:{}",
+            hash_fields(
+                AUTHORITY_RETIREMENT_RECEIPT_LOOKUP_DOMAIN,
+                &[graph_identity_digest.as_bytes(), retirement_id.as_bytes()],
+            )
+        ))
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.protocol_version != AUTHORITY_RETIREMENT_RECEIPT_PROTOCOL_VERSION {
+            return Err(profile_error(format!(
+                "unsupported authority-retirement receipt protocol {}, expected {}",
+                self.protocol_version, AUTHORITY_RETIREMENT_RECEIPT_PROTOCOL_VERSION
+            )));
+        }
+        if self.record_tag != AUTHORITY_RETIREMENT_RECEIPT_TAG {
+            return Err(profile_error(format!(
+                "authority-retirement receipt tag must be '{AUTHORITY_RETIREMENT_RECEIPT_TAG}'"
+            )));
+        }
+        validate_sha256("authority-retirement record id", &self.record_id)?;
+        validate_sha256(
+            "authority-retirement graph identity digest",
+            &self.graph_identity_digest,
+        )?;
+        validate_canonical_uuid("authority-retirement id", &self.retirement_id)?;
+        validate_sha256("authority-retirement plan digest", &self.plan_digest)?;
+        validate_sha256(
+            "authority-retirement operation request digest",
+            &self.operation_request_digest,
+        )?;
+        validate_profile_text("authority-retirement actor", &self.actor)?;
+        if self.source_internal_schema_version == 0
+            || self.source_manifest_version == 0
+            || self.source_profile_revision == 0
+            || self.chain_ordinal == 0
+        {
+            return Err(profile_error(
+                "authority-retirement format, manifest, profile, and chain revisions must be positive",
+            ));
+        }
+        if self.withdrawn_token_count == 0 {
+            return Err(profile_error(
+                "authority retirement requires at least one current WITHDRAWN token",
+            ));
+        }
+        self.pre_retirement_token_head.validate()?;
+        if self.pre_retirement_token_head.branch_identifier
+            != lance::dataset::refs::BranchIdentifier::main()
+            || self.pre_retirement_token_head.manifest_e_tag.is_some()
+            || self.pre_retirement_token_witness_digest
+                != stream_authority_retirement_token_witness_digest(
+                    &self.pre_retirement_token_head,
+                    self.present_token_count,
+                    self.withdrawn_token_count,
+                )?
+        {
+            return Err(profile_error(
+                "authority-retirement token proof does not bind the exact canonical prior head and disposition counts",
+            ));
+        }
+        for (name, digest) in [
+            ("live branch-heads", &self.live_branch_heads_digest),
+            (
+                "lifecycle and SEALED proof",
+                &self.lifecycle_and_sealed_proof_digest,
+            ),
+            (
+                "pre-retirement token witness",
+                &self.pre_retirement_token_witness_digest,
+            ),
+            ("export cut", &self.export_cut_digest),
+            ("prior chain", &self.prior_chain_digest),
+            ("resulting chain", &self.resulting_chain_digest),
+        ] {
+            validate_sha256(&format!("authority-retirement {name} digest"), digest)?;
+        }
+        match (self.chain_ordinal, self.predecessor_record_id.as_deref()) {
+            (1, None) => {}
+            (1, Some(_)) => {
+                return Err(profile_error(
+                    "first authority-retirement receipt cannot have a predecessor",
+                ));
+            }
+            (_, Some(predecessor)) => {
+                validate_sha256("authority-retirement predecessor id", predecessor)?;
+            }
+            (_, None) => {
+                return Err(profile_error(
+                    "non-first authority-retirement receipt requires a predecessor",
+                ));
+            }
+        }
+        if self.retired_at <= 0 {
+            return Err(profile_error(
+                "authority-retirement retired_at must be a positive timestamp",
+            ));
+        }
+        if self.record_lookup_key
+            != Self::lookup_key_for(&self.graph_identity_digest, &self.retirement_id)?
+            || self.operation_request_digest
+                != stream_authority_retirement_request_digest(&self.plan_digest, &self.actor)?
+            || self.record_id != self.compute_record_id()
+            || self.resulting_chain_digest != self.compute_resulting_chain_digest()
+        {
+            return Err(profile_error(
+                "authority-retirement receipt differs from its canonical identity or chain commitment",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn next_chain_ref(&self) -> Result<ReceiptChainRef> {
+        self.validate()?;
+        Ok(ReceiptChainRef {
+            head_record_id: Some(self.record_id.clone()),
+            record_count: self.chain_ordinal,
+            chain_digest: self.resulting_chain_digest.clone(),
+        })
+    }
+
+    fn compute_record_id(&self) -> String {
+        let predecessor = self.predecessor_record_id.as_deref().unwrap_or("");
+        hash_fields(
+            AUTHORITY_RETIREMENT_RECEIPT_RECORD_DOMAIN,
+            &[
+                self.record_tag.as_bytes(),
+                self.graph_identity_digest.as_bytes(),
+                &self.chain_ordinal.to_be_bytes(),
+                predecessor.as_bytes(),
+                self.prior_chain_digest.as_bytes(),
+                self.retirement_id.as_bytes(),
+                self.plan_digest.as_bytes(),
+                self.operation_request_digest.as_bytes(),
+                self.actor.as_bytes(),
+                &self.source_internal_schema_version.to_be_bytes(),
+                &self.source_manifest_version.to_be_bytes(),
+                self.live_branch_heads_digest.as_bytes(),
+                &self.source_profile_revision.to_be_bytes(),
+                self.lifecycle_and_sealed_proof_digest.as_bytes(),
+                &self.pre_retirement_token_head.table_version.to_be_bytes(),
+                self.pre_retirement_token_head.transaction_uuid.as_bytes(),
+                self.pre_retirement_token_witness_digest.as_bytes(),
+                &self.present_token_count.to_be_bytes(),
+                &self.withdrawn_token_count.to_be_bytes(),
+                self.export_cut_digest.as_bytes(),
+                &self.retired_at.to_be_bytes(),
+            ],
+        )
+    }
+
+    fn compute_resulting_chain_digest(&self) -> String {
+        hash_fields(
+            AUTHORITY_RETIREMENT_RECEIPT_CHAIN_DOMAIN,
+            &[
+                self.prior_chain_digest.as_bytes(),
+                &self.chain_ordinal.to_be_bytes(),
+                self.record_id.as_bytes(),
+            ],
+        )
+    }
+}
+
+pub(crate) fn stream_authority_retirement_request_digest(
+    plan_digest: &str,
+    actor: &str,
+) -> Result<String> {
+    validate_sha256("authority-retirement plan digest", plan_digest)?;
+    validate_profile_text("authority-retirement actor", actor)?;
+    Ok(hash_fields(
+        AUTHORITY_RETIREMENT_REQUEST_DOMAIN,
+        &[
+            &AUTHORITY_RETIREMENT_RECEIPT_PROTOCOL_VERSION.to_be_bytes(),
+            plan_digest.as_bytes(),
+            actor.as_bytes(),
+            b"CONFIRM",
+        ],
+    ))
+}
+
+pub(crate) fn stream_authority_retirement_token_witness_digest(
+    witness: &super::CurrentHeadWitness,
+    present_token_count: u64,
+    withdrawn_token_count: u64,
+) -> Result<String> {
+    witness.validate()?;
+    if witness.manifest_e_tag.is_some() {
+        return Err(profile_error(
+            "authority-retirement token witness must carry e-tag None",
+        ));
+    }
+    let witness_bytes = serde_json::to_vec(witness).map_err(|error| {
+        profile_error(format!(
+            "failed to encode authority-retirement token witness: {error}"
+        ))
+    })?;
+    Ok(hash_fields(
+        AUTHORITY_RETIREMENT_TOKEN_WITNESS_DOMAIN,
+        &[
+            &witness_bytes,
+            &present_token_count.to_be_bytes(),
+            &withdrawn_token_count.to_be_bytes(),
+        ],
+    ))
 }
 
 pub(crate) fn stream_profile_graph_identity_digest(
@@ -1511,7 +1856,8 @@ mod tests {
         let retired = StreamProfileEntry::retired_from_disabled(
             &genesis,
             advanced_chain(&genesis.profile_receipt_chain),
-            "retirement-1",
+            "19191919-1919-4919-8919-191919191919",
+            DIGEST_B,
             DIGEST_A,
         )
         .unwrap();
@@ -1540,6 +1886,81 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn authority_retirement_receipt_is_exact_chained_provenance() {
+        let prior = StreamProfileEntry::genesis();
+        let token_head = crate::db::manifest::CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 4,
+            transaction_uuid: "18181818-1818-4818-8818-181818181818".to_string(),
+            manifest_e_tag: None,
+        };
+        let token_digest =
+            stream_authority_retirement_token_witness_digest(&token_head, 7, 2).unwrap();
+        let receipt = AuthorityRetirementReceipt::new(
+            DIGEST_A,
+            &prior.profile_receipt_chain,
+            "19191919-1919-4919-8919-191919191919",
+            DIGEST_B,
+            "operator:alice",
+            17,
+            9,
+            DIGEST_A,
+            prior.profile_revision,
+            DIGEST_B,
+            token_head,
+            token_digest,
+            7,
+            2,
+            DIGEST_B,
+            1_700_000_000_000_000,
+        )
+        .unwrap();
+        receipt.validate().unwrap();
+        let next = StreamProfileEntry::retired_from_disabled(
+            &prior,
+            receipt.next_chain_ref().unwrap(),
+            receipt.retirement_id.clone(),
+            receipt.record_id.clone(),
+            receipt.export_cut_digest.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            next.retired_error().unwrap().to_string(),
+            format!(
+                "stream authority retirement '{}' fixed this graph at export cut {}; the source is read/export-only",
+                receipt.retirement_id, receipt.export_cut_digest
+            )
+        );
+
+        let mut unknown = serde_json::to_value(&receipt).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("future".to_string(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<AuthorityRetirementReceipt>(unknown).is_err(),
+            "retirement provenance must deny unknown fields"
+        );
+
+        let mut forged = receipt.clone();
+        forged.withdrawn_token_count += 1;
+        assert!(forged.validate().is_err());
+    }
+
+    #[test]
+    fn authority_retirement_token_witness_digest_binds_counts() {
+        let witness = super::super::CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 7,
+            transaction_uuid: "17171717-1717-4717-8717-171717171717".to_string(),
+            manifest_e_tag: None,
+        };
+        let first = stream_authority_retirement_token_witness_digest(&witness, 2, 1).unwrap();
+        let second = stream_authority_retirement_token_witness_digest(&witness, 2, 2).unwrap();
+        assert_ne!(first, second);
     }
 
     #[test]

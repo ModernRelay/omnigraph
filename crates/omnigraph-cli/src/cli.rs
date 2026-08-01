@@ -24,9 +24,10 @@ control — manage or inspect a cluster (cluster via --config; policy & queries 
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
 See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
-    /// Actor id for direct-engine writes; overrides `cli.actor`. No effect on
-    /// remote writes (the server resolves the actor from the bearer token).
-    /// With a policy configured but no actor set, the write is denied — see
+    /// Actor id for direct-engine writes and actor-bound cluster operations;
+    /// overrides `operator.actor`. No effect on remote writes (the server
+    /// resolves the actor from the bearer token). With a policy configured
+    /// but no actor set, the operation is denied — see
     /// docs/user/operations/policy.md.
     #[arg(long = "as", global = true, value_name = "ACTOR")]
     pub(crate) as_actor: Option<String>,
@@ -38,9 +39,10 @@ pub(crate) struct Cli {
     pub(crate) server: Option<String>,
 
     /// Select a graph within a multi-graph scope: on a `--server` it appends
-    /// `/graphs/<id>` to the server url; on a `--cluster` it picks which
-    /// cluster graph to maintain. Rejected on a single-graph address (a
-    /// positional URI / `--store`).
+    /// `/graphs/<id>` to the server url; on `--cluster`, or the offline
+    /// `cluster stream` command's `--config`, it picks which cluster graph to
+    /// maintain. Rejected on a single-graph address (a positional URI /
+    /// `--store`).
     #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
 
@@ -100,7 +102,12 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
         /// Inline ad-hoc GQ source — alternative to `--query <path>`.
-        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
+        #[arg(
+            short = 'e',
+            long = "query-string",
+            value_name = "GQ",
+            conflicts_with = "query"
+        )]
         query_string: Option<String>,
         #[command(flatten)]
         params: ParamsArgs,
@@ -128,7 +135,12 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
         /// Inline ad-hoc GQ source — alternative to `--query <path>`.
-        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
+        #[arg(
+            short = 'e',
+            long = "query-string",
+            value_name = "GQ",
+            conflicts_with = "query"
+        )]
         query_string: Option<String>,
         #[command(flatten)]
         params: ParamsArgs,
@@ -459,6 +471,55 @@ pub(crate) enum ClusterCommand {
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage the experimental cluster-owned streaming profile offline.
+    Stream {
+        #[command(subcommand)]
+        command: ClusterStreamCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ClusterStreamCommand {
+    /// Irreversibly freeze a terminal-authority graph for logical rebuild.
+    #[command(name = "retire-for-rebuild")]
+    RetireForRebuild {
+        #[command(subcommand)]
+        command: StreamRetireForRebuildCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum StreamRetireForRebuildCommand {
+    /// Prove and print the exact frozen cut that would be retired.
+    Plan {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Attest that every writer-capable process for the graph is stopped.
+        #[arg(long)]
+        confirm_stream_offline: bool,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Confirm the exact plan and permanently make the source read/export-only.
+    Confirm {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// New UUID occurrence key for this irreversible retirement.
+        #[arg(long)]
+        retirement_id: String,
+        /// Exact sha256 plan digest printed by `plan`.
+        #[arg(long)]
+        expected_plan_digest: String,
+        /// Attest that every writer-capable process for the graph is stopped.
+        #[arg(long)]
+        confirm_stream_offline: bool,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,

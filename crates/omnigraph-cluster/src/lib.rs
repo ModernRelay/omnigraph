@@ -25,6 +25,7 @@ mod diff;
 mod serve;
 mod store;
 mod stream_policy;
+mod stream_retirement;
 mod sweep;
 mod types;
 use config::{
@@ -48,6 +49,9 @@ pub use omnigraph_control_authority::{
 };
 use store::ClusterStore;
 use stream_policy::stream_profile_policy_checker;
+pub use stream_retirement::{
+    confirm_stream_authority_retirement_config_dir, plan_stream_authority_retirement_config_dir,
+};
 use sweep::{
     mark_approvals_consumed, record_approval_consumed, sweep_recovery_sidecars,
     tombstone_graph_subtree, warn_pending_recovery_sidecars,

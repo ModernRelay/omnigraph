@@ -187,7 +187,11 @@ pub(crate) fn print_cluster_plan_human(output: &PlanOutput) {
             output.approvals_required.len()
         );
         for change in &output.changes {
-            let bindings = if change.binding_change { " [bindings]" } else { "" };
+            let bindings = if change.binding_change {
+                " [bindings]"
+            } else {
+                ""
+            };
             println!("  {:?} {}{bindings}", change.operation, change.resource);
             if let Some(migration) = &change.migration {
                 if !migration.supported {
@@ -228,14 +232,20 @@ pub(crate) fn print_cluster_apply_human(output: &ApplyOutput) {
             "  state: revision {}, converged: {}, written: {}",
             state.state_revision, output.converged, output.state_written
         );
-        println!("  note: cluster-booted servers (--cluster) serve this on their next restart; omnigraph.yaml deployments are unaffected");
+        println!(
+            "  note: cluster-booted servers (--cluster) serve this on their next restart; omnigraph.yaml deployments are unaffected"
+        );
     }
     print_cluster_diagnostics(&output.diagnostics);
 }
 
 pub(crate) fn print_cluster_apply_changes(changes: &[omnigraph_cluster::PlanChange]) {
     for change in changes {
-        let bindings = if change.binding_change { " [bindings]" } else { "" };
+        let bindings = if change.binding_change {
+            " [bindings]"
+        } else {
+            ""
+        };
         match (&change.disposition, change.reason.as_deref()) {
             (Some(disposition), Some(reason)) => println!(
                 "  {:?} {}{bindings} [{disposition:?}: {reason}]",
@@ -389,6 +399,69 @@ pub(crate) fn finish_cluster_apply(output: &ApplyOutput, json: bool) -> Result<(
         print_json(output)?;
     } else {
         print_cluster_apply_human(output);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_stream_authority_retirement_plan(
+    output: &StreamAuthorityRetirementPlanOutput,
+    json: bool,
+) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else if let Some(plan) = output.plan.as_ref() {
+        println!("stream authority retirement plan for {}", output.graph_id);
+        println!("  plan digest: {}", plan.plan_digest);
+        println!("  source manifest: {}", plan.source_manifest_version);
+        println!(
+            "  source profile revision: {}",
+            plan.source_profile_revision
+        );
+        println!("  present tokens: {}", plan.present_token_count);
+        println!("  withdrawn tokens: {}", plan.withdrawn_token_count);
+        println!("  export cut: {}", plan.export_cut_digest);
+        println!("  no graph state changed; confirm this exact digest to retire");
+        print_cluster_diagnostics(&output.diagnostics);
+    } else {
+        println!(
+            "stream authority retirement plan failed for {}",
+            output.graph_id
+        );
+        print_cluster_diagnostics(&output.diagnostics);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_stream_authority_retirement_confirm(
+    output: &StreamAuthorityRetirementConfirmOutput,
+    json: bool,
+) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else if let Some(result) = output.result.as_ref() {
+        println!("stream authority retired for {}", output.graph_id);
+        println!("  retirement id: {}", result.retirement_id);
+        println!("  plan digest: {}", result.plan_digest);
+        println!("  export cut: {}", result.export_cut_digest);
+        println!("  profile revision: {}", result.profile_revision);
+        println!(
+            "  source is permanently read/query/status/export-only; rebuild into a fresh graph"
+        );
+        print_cluster_diagnostics(&output.diagnostics);
+    } else {
+        println!(
+            "stream authority retirement confirmation failed for {}",
+            output.graph_id
+        );
+        print_cluster_diagnostics(&output.diagnostics);
     }
     if !output.ok {
         io::stdout().flush()?;
@@ -686,7 +759,9 @@ pub(crate) fn render_prop_type(prop_type: &omnigraph_compiler::PropType) -> Stri
     }
 }
 
-pub(crate) fn render_constraint(constraint: &omnigraph_compiler::schema::ast::Constraint) -> String {
+pub(crate) fn render_constraint(
+    constraint: &omnigraph_compiler::schema::ast::Constraint,
+) -> String {
     match constraint {
         omnigraph_compiler::schema::ast::Constraint::Key(columns) => {
             format!("@key({})", columns.join(", "))
@@ -706,7 +781,9 @@ pub(crate) fn render_constraint(constraint: &omnigraph_compiler::schema::ast::Co
     }
 }
 
-pub(crate) fn render_annotations(annotations: &[omnigraph_compiler::schema::ast::Annotation]) -> String {
+pub(crate) fn render_annotations(
+    annotations: &[omnigraph_compiler::schema::ast::Annotation],
+) -> String {
     annotations
         .iter()
         .map(|annotation| {
@@ -765,10 +842,7 @@ pub(crate) fn print_snapshot_human(
     }
 }
 
-pub(crate) fn print_read_output(
-    output: &ReadOutput,
-    format: ReadOutputFormat,
-) -> Result<()> {
+pub(crate) fn print_read_output(output: &ReadOutput, format: ReadOutputFormat) -> Result<()> {
     println!(
         "{}",
         render_read(output, format, &resolve_table_render_options())?
@@ -822,7 +896,11 @@ pub(crate) fn print_commit_human(commit: &CommitOutput) {
     println!("created_at: {}", commit.created_at);
 }
 
-pub(crate) fn print_policy_explain(decision: &PolicyDecision, actor_id: &str, request: &PolicyRequest) {
+pub(crate) fn print_policy_explain(
+    decision: &PolicyDecision,
+    actor_id: &str,
+    request: &PolicyRequest,
+) {
     println!(
         "decision: {}",
         if decision.allowed { "allow" } else { "deny" }

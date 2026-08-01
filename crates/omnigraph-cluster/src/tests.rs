@@ -4697,3 +4697,71 @@ policies: {}
             "import→apply must flip the pre-existing graph: {out:?}"
         );
     }
+
+    #[tokio::test]
+    async fn authority_retirement_preflight_requires_actor_confirmation_and_declared_graph() {
+        let dir = fixture();
+        let missing_authority = plan_stream_authority_retirement_config_dir(
+            dir.path(),
+            "knowledge",
+            StreamAuthorityRetirementOptions::default(),
+        )
+        .await;
+        assert!(!missing_authority.ok);
+        assert!(missing_authority.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "stream_authority_retirement_actor_required"
+        }));
+        assert!(missing_authority.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "streaming_offline_confirmation_required"
+        }));
+        assert!(
+            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
+            "preflight refusal must happen before lock acquisition"
+        );
+
+        let unknown_graph = plan_stream_authority_retirement_config_dir(
+            dir.path(),
+            "other",
+            StreamAuthorityRetirementOptions {
+                actor: Some("stream-operator".to_string()),
+                confirm_stream_offline: true,
+            },
+        )
+        .await;
+        assert!(!unknown_graph.ok);
+        assert!(unknown_graph.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "stream_authority_retirement_graph_not_declared"
+                && diagnostic.path == "graphs.other"
+        }));
+        assert!(
+            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
+            "unknown graph refusal must happen before lock acquisition"
+        );
+
+        // Once config/state/actor/offline authority are valid, the command
+        // must reach the engine under the dedicated lock. A fresh disabled,
+        // unenrolled graph is intentionally not retireable, so the exact
+        // engine precondition gives this test a harmless terminal outcome.
+        write_streaming_cluster(dir.path(), Some(false));
+        init_derived_graph(dir.path()).await;
+        let import = import_config_dir(dir.path()).await;
+        assert!(import.ok, "{import:?}");
+        let engine_refusal = plan_stream_authority_retirement_config_dir(
+            dir.path(),
+            "knowledge",
+            StreamAuthorityRetirementOptions {
+                actor: Some("stream-operator".to_string()),
+                confirm_stream_offline: true,
+            },
+        )
+        .await;
+        assert!(!engine_refusal.ok);
+        assert!(engine_refusal.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "stream_authority_retirement_plan_failed"
+                && diagnostic.message.contains("at least one current WITHDRAWN token")
+        }));
+        assert!(
+            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
+            "engine refusal must release the dedicated retirement lock"
+        );
+    }

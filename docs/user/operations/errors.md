@@ -37,6 +37,19 @@
   HTTP returns **413** with `resource_limit.{resource,limit,actual}`.
   Reshape the input; it is not partial success.
 - `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id`. Resolve the sidecar through a read-write reopen/server restart before retrying; this is intentionally not an ordinary OCC retry.
+- `StreamExportBlocked { withdrawn_token_count }` — ordinary export found
+  current `WITHDRAWN` sequencing authority that a row-only artifact cannot
+  preserve. Correct it to `PRESENT` when correction is available, or use the
+  stopped/offline `cluster stream retire-for-rebuild` handshake.
+- `StreamRetirementPlanChanged` — graph/profile/lifecycle/token authority moved
+  between retirement plan and confirm. No retirement effect is accepted; rerun
+  the plan and review the new digest.
+- `StreamRetirementIdempotencyConflict { retirement_id }` — the supplied
+  retirement UUID already names a different plan or authenticated actor. Reuse
+  an ID only for an exact retry of the same confirmation.
+- `StreamAuthorityRetired { retirement_id, export_cut_digest }` — the source is
+  permanently read/query/status/export-only at the recorded cut. Rebuild its
+  receipt-bearing export into a fresh graph; there is no transition back.
 
 For RFC-023 Mutation/Load keyed writes, `KeyConflict` is returned only after
 the writer proves that none of its planned table effects landed, finalizes the

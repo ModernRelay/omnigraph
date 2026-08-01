@@ -133,8 +133,23 @@ async fn ensure_indices_for_branch(
     // between this entry barrier and the first table-HEAD effect.
     db.heal_pending_recovery_sidecars_for_write(&[branch])
         .await?;
+    // Join the graph-global profile window before planning can stage durable
+    // Lance index artifacts. Retirement takes this gate exclusively and must
+    // drain the complete physical writer, not merely its final HEAD publish.
+    let _stream_profile_guard = db.write_queue().acquire_stream_profile_shared().await;
+    if let Some(error) = db
+        .current_canonical_stream_profile()
+        .await?
+        .retired_error()
+    {
+        return Err(error);
+    }
     db.ensure_schema_apply_idle("ensure_indices").await?;
     let txn = db.open_write_txn(branch).await?;
+    if mode.is_sealed_maintenance() {
+        db.ensure_streaming_sealed_maintenance_runtime_authorized()
+            .await?;
+    }
     let snapshot = txn.base.clone();
     let mut pending_by_table = HashMap::<String, Vec<PendingIndex>>::new();
     let active_branch = txn.branch.clone();
@@ -300,15 +315,10 @@ async fn ensure_indices_for_branch(
             )
         })
         .collect::<Vec<_>>();
-    let _stream_profile_guard = if mode.is_sealed_maintenance() {
-        Some(db.write_queue().acquire_stream_profile_shared().await)
-    } else {
-        None
-    };
     if mode.is_sealed_maintenance() {
-        // The early preflight in `ensure_indices_sealed_as` avoids expensive
-        // staging on an unbound handle. Recheck under the retained profile gate
-        // so a concurrent profile transition cannot authorize the effects.
+        // Recheck under the retained profile gate and immediately before the
+        // lower writer domains so stale checked runtime cannot authorize the
+        // effects.
         db.ensure_streaming_sealed_maintenance_runtime_authorized()
             .await?;
     }

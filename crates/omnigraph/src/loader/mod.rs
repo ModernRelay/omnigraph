@@ -55,6 +55,30 @@ pub struct IngestResult {
     pub tables: Vec<IngestTableResult>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportProvenanceEnvelope {
+    _omnigraph_export_provenance: StreamAuthorityRetirementProvenance,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamAuthorityRetirementProvenance {
+    kind: String,
+    receipt: crate::db::manifest::AuthorityRetirementReceipt,
+    branch_member: StreamAuthorityRetirementBranchMemberProvenance,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamAuthorityRetirementBranchMemberProvenance {
+    branch: String,
+    branch_identifier: lance::dataset::refs::BranchIdentifier,
+    graph_head: Option<String>,
+    manifest_version: u64,
+    branch_member_digest: String,
+}
+
 /// Load mode for data ingestion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -412,6 +436,8 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let mut edge_rows: HashMap<String, Vec<(String, String, JsonValue)>> = HashMap::new();
     let mut keyed_input_budget: HashMap<String, (usize, u64)> = HashMap::new();
     let bounded_keyed_input = matches!(mode, LoadMode::Append | LoadMode::Merge);
+    let mut saw_export_provenance = false;
+    let mut saw_logical_record = false;
 
     // Parse a stream of JSON values. Accepts both compact JSONL (one object
     // per line) and pretty-printed JSON where a single object spans multiple
@@ -425,6 +451,54 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let mut value: JsonValue = parsed.map_err(|e| {
             OmniError::manifest(format!("invalid JSON at record {}: {}", record_num, e))
         })?;
+
+        if value.get("_omnigraph_export_provenance").is_some() {
+            if saw_export_provenance || saw_logical_record {
+                return Err(OmniError::manifest(format!(
+                    "record {record_num}: export provenance must appear exactly once before logical rows"
+                )));
+            }
+            let envelope: ExportProvenanceEnvelope =
+                serde_json::from_value(value).map_err(|e| {
+                    OmniError::manifest(format!(
+                        "record {record_num}: invalid stream-authority retirement provenance: {e}"
+                    ))
+                })?;
+            if envelope._omnigraph_export_provenance.kind != "STREAM_AUTHORITY_RETIREMENT" {
+                return Err(OmniError::manifest(format!(
+                    "record {record_num}: unsupported export provenance kind '{}'",
+                    envelope._omnigraph_export_provenance.kind
+                )));
+            }
+            let provenance = envelope._omnigraph_export_provenance;
+            provenance.receipt.validate()?;
+            let member = provenance.branch_member;
+            let normalized = Omnigraph::normalize_branch_name(&member.branch)?;
+            let canonical = normalized.as_deref().unwrap_or("main");
+            let digest_hex = member
+                .branch_member_digest
+                .strip_prefix("sha256:")
+                .unwrap_or_default();
+            if canonical != member.branch
+                || member.manifest_version == 0
+                || digest_hex.len() != 64
+                || !digest_hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || (member.branch == "main"
+                    && member.branch_identifier != lance::dataset::refs::BranchIdentifier::main())
+                || (member.branch != "main"
+                    && member.branch_identifier == lance::dataset::refs::BranchIdentifier::main())
+            {
+                return Err(OmniError::manifest(format!(
+                    "record {record_num}: invalid frozen branch-member provenance"
+                )));
+            }
+            let _ = member.graph_head;
+            saw_export_provenance = true;
+            continue;
+        }
+        saw_logical_record = true;
 
         if let Some(type_name) = value
             .get("type")
@@ -2539,6 +2613,54 @@ edge WorksAt: Person -> Company
 {"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 "#;
 
+    fn retirement_provenance_line() -> String {
+        let token_head = crate::db::manifest::CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 5,
+            transaction_uuid: "18181818-1818-4818-8818-181818181818".to_string(),
+            manifest_e_tag: None,
+        };
+        let token_witness = crate::db::manifest::stream_authority_retirement_token_witness_digest(
+            &token_head,
+            3,
+            1,
+        )
+        .unwrap();
+        let receipt = crate::db::manifest::AuthorityRetirementReceipt::new(
+            format!("sha256:{}", "1".repeat(64)),
+            &crate::db::manifest::stream_profile::ReceiptChainRef::genesis(),
+            "11111111-1111-4111-8111-111111111111",
+            format!("sha256:{}", "2".repeat(64)),
+            "operator:alice",
+            crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
+            7,
+            format!("sha256:{}", "3".repeat(64)),
+            2,
+            format!("sha256:{}", "4".repeat(64)),
+            token_head,
+            token_witness,
+            3,
+            1,
+            format!("sha256:{}", "6".repeat(64)),
+            1_700_000_000_000_000,
+        )
+        .unwrap();
+        serde_json::json!({
+            "_omnigraph_export_provenance": {
+                "kind": "STREAM_AUTHORITY_RETIREMENT",
+                "receipt": receipt,
+                "branch_member": {
+                    "branch": "main",
+                    "branch_identifier": lance::dataset::refs::BranchIdentifier::main(),
+                    "graph_head": "01H00000000000000000000000",
+                    "manifest_version": 7,
+                    "branch_member_digest": format!("sha256:{}", "7".repeat(64)),
+                },
+            }
+        })
+        .to_string()
+    }
+
     #[test]
     fn strict_json_conversion_rejects_nullable_wrong_types_and_list_items() {
         let wrong_scalar = vec![serde_json::json!({"score": "not-an-int"})];
@@ -2669,6 +2791,35 @@ edge WorksAt: Person -> Company
         assert_eq!(result.nodes_loaded["Company"], 1);
         assert_eq!(result.edges_loaded["Knows"], 1);
         assert_eq!(result.edges_loaded["WorksAt"], 1);
+    }
+
+    #[tokio::test]
+    async fn retired_export_provenance_is_validated_then_discarded_on_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let input = format!("{}\n{}", retirement_provenance_line(), TEST_DATA);
+
+        let result = load_jsonl(&mut db, &input, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        assert_eq!(result.nodes_loaded["Person"], 2);
+        assert_eq!(db.stream_status().await.unwrap().profile_mode, "DISABLED");
+        let snapshot = db.snapshot().await;
+        assert_eq!(snapshot.stream_lifecycles().count(), 0);
+        let tokens = snapshot.open_stream_token_authority().await.unwrap();
+        assert_eq!(tokens.count_rows(None).await.unwrap(), 0);
+
+        let misplaced = format!("{}{}\n", TEST_DATA, retirement_provenance_line());
+        let error = load_jsonl(&mut db, &misplaced, LoadMode::Overwrite)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("export provenance must appear exactly once before logical rows"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

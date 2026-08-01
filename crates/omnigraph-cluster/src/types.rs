@@ -20,7 +20,11 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    pub(crate) fn error(code: impl Into<String>, path: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn error(
+        code: impl Into<String>,
+        path: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             code: code.into(),
             severity: DiagnosticSeverity::Error,
@@ -263,6 +267,45 @@ pub struct ForceUnlockOutput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Shared stopped-writer inputs for both halves of the authority-retirement
+/// handshake. Keeping actor/confirmation optional here lets direct library
+/// callers receive the same structured diagnostics as the CLI.
+#[derive(Debug, Clone, Default)]
+pub struct StreamAuthorityRetirementOptions {
+    pub actor: Option<String>,
+    pub confirm_stream_offline: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamAuthorityRetirementPlanOutput {
+    pub ok: bool,
+    pub config_dir: String,
+    pub graph_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    pub state_observations: StateObservations,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<omnigraph::db::StreamAuthorityRetirementPlan>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamAuthorityRetirementConfirmOutput {
+    pub ok: bool,
+    pub config_dir: String,
+    pub graph_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    pub state_observations: StateObservations,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<omnigraph::db::StreamAuthorityRetirementResult>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 /// Output of config-only `cluster apply`. "Applied" means recorded in the
 /// local cluster catalog (`__cluster/`); nothing applied here serves traffic —
 /// the server still boots from `omnigraph.yaml` until the server-boot stage.
@@ -488,13 +531,13 @@ impl EmbeddingProviderConfig {
         }
 
         match self.api_key.as_deref() {
-            Some(api_key) if secret_ref_name(api_key).is_err() => diagnostics.push(
-                Diagnostic::error(
+            Some(api_key) if secret_ref_name(api_key).is_err() => {
+                diagnostics.push(Diagnostic::error(
                     "embedding_api_key_inline",
                     format!("{path}.api_key"),
                     "embedding api_key must be a ${NAME} env reference, not an inline secret",
-                ),
-            ),
+                ))
+            }
             Some(_) => {}
             None => diagnostics.push(Diagnostic::error(
                 "embedding_api_key_required",
@@ -532,7 +575,10 @@ fn secret_ref_name(value: &str) -> Result<&str, String> {
         .and_then(|s| s.strip_suffix('}'))
         .filter(|name| !name.trim().is_empty())
         .ok_or_else(|| {
-            format!("embedding api_key must be a ${{NAME}} env reference, got '{}'", value.trim())
+            format!(
+                "embedding api_key must be a ${{NAME}} env reference, got '{}'",
+                value.trim()
+            )
         })
 }
 
