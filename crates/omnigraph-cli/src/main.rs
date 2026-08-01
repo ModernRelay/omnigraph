@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{

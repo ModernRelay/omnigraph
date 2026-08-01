@@ -1208,11 +1208,13 @@ v14/recovery-v16 checked `SEALED` EnsureIndices,
 v15/recovery-v17 checked `SEALED` Optimize, v16/recovery-v18 checked offline
 physical rebind, v17/recovery-v19 stopped/offline authority retirement and
 receipt-bearing export, and v18/recovery-v20 stopped/offline exact `DataBlock`
-inspection/correction implemented; managed reclamation is optional later
-work; the remaining F3 authority-repair work keeps v14's older incomplete
-scaffolds frozen before public enrollment, quiesce,
-exclusive-cut physical
-status, row admission, and transport-parity evidence; F5's next strict strand
+inspection/correction implemented; hidden F4 caller-shaped ingress/prepare and
+format-neutral F5a automatic `OPEN`-lane folding are also implemented over the
+unchanged recovery-v14 adapter; managed reclamation is optional later work;
+no active producer creates reserved `AuthorityBlock`, so its repair remains
+fail-closed rather than blocking public enrollment, quiesce, exclusive-cut
+physical status, row admission, and transport-parity evidence; F5b's next
+strict strand
 adds one measured, bounded deterministic NDJSON object per fold, current
 `DEAD_LETTERED` authority per losing key, correction through a fresh ordinary
 `Admission`, and extends same-format retirement to `DEAD_LETTERED`; dead-letter
@@ -1286,8 +1288,12 @@ Live design questions, each owned by an RFC or a known gap — not a wishlist:
    activates the terminal `WITHDRAWN` retirement/export exit as a distinct,
    lineage-neutral shape. V18/recovery-v20 activates exact `DataBlock`
    correction as another distinct shape; the frozen v14 scaffold still does
-   not gain a new meaning, and `AuthorityBlock` repair remains later work.
-   F5's next planned strict strand adds only the settled terminal shape: one
+   not gain a new meaning. Hidden F4 caller-shaped ingress/prepare and
+   format-neutral F5a automatic `OPEN`-lane scheduling reuse those current
+   formats; ordinary `DRAINING` continuation and public driver status remain
+   later. No active producer creates `AuthorityBlock`, so its repair stays
+   fail-closed. F5b's next planned strict strand adds only the settled terminal
+   shape: one
    bounded deterministic object per fold, current `DEAD_LETTERED` token
    authority, correction through a fresh ordinary `Admission`, and extends
    same-format retirement to `DEAD_LETTERED`. It

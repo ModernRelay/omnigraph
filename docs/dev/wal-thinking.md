@@ -658,9 +658,13 @@ storage claim, but do not block the selected unbounded retain-all profile. The
 private B2a structural/provider/history gate is implemented; the B2-common
 token and attribution core, checked profile authority, and hidden
 v12/lifecycle-v3/recovery-v14 empty/non-empty quiesce path are implemented.
-Production lifecycle exits, correction, and product contracts must still close
-before any public row acknowledgement. The `WITHDRAWN` retirement/export exit
-is already active. F5's next strict strand is
+Hidden F4 caller-shaped ingress/prepare and the format-neutral F5a automatic
+`OPEN`-lane supervisor are implemented over that same adapter: an
+invocation-owned timer/cap wake, passive no-effect filtering, cold discovery,
+finite node-before-edge round-robin cohorts, and server-owned bounded shutdown
+add no persisted grammar. Production lifecycle exits and product contracts
+must still close before any public row acknowledgement. The `WITHDRAWN`
+retirement/export exit is already active. F5b's next strict strand is
 the minimal terminal shape: one bounded deterministic object for the fold,
 current `DEAD_LETTERED` authority per losing key, correction through a fresh
 ordinary `Admission`, and extension of same-format retirement to
@@ -704,7 +708,10 @@ The plan is:
    v17/recovery-v19 terminal retirement/export; and v18/recovery-v20 exact
    DataBlock correction. Keep every v14 scaffold frozen and keep product row/lifecycle
    surfaces absent until their crash matrices are green;
-8. implement F5 with one measured, bounded deterministic dead-letter object,
+8. preserve hidden F4 ingress/prepare and format-neutral F5a automatic
+   `OPEN`-lane folding; complete ordinary `DRAINING` continuation and public
+   driver status with their served lifecycle owner, then implement F5b with one
+   measured, bounded deterministic dead-letter object,
    current terminal token authority, ordinary corrected successors, and
    extension of same-format retirement to `DEAD_LETTERED`; keep inspection/export plus block and authority
    repair cluster/offline-only and add no special replay/history subsystem;
@@ -729,5 +736,9 @@ narrow cluster-only DataBlock correction is active.
 The selected first storage posture is the implemented private B2a unbounded
 retain-all gate: no OmniGraph MemWAL GC and no file/byte limit. Two negative RC.1 reclamation guards remain
 checked in as rationale for that no-deletion rule. Checked profile control
-exists, but no production enrollment, enrolled-lane drain, or public stream
-path exists; the implemented drain remains crate-private behind test seams.
+exists, and hidden F4/F5a now exercise caller-shaped ingress plus server-owned
+automatic `OPEN`-lane folding, but no production enrollment, ordinary
+automatic `DRAINING` continuation, public driver status, or public stream path
+exists; the implemented drain remains crate-private behind test seams. No
+active producer creates `AuthorityBlock`, so its repair remains a fail-closed
+future shape rather than a current activation prerequisite.

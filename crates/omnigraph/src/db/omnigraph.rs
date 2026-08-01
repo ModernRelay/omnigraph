@@ -39,6 +39,7 @@ mod optimize;
 mod repair;
 mod schema_apply;
 mod stream_correction;
+mod stream_driver;
 mod stream_enrollment;
 mod stream_ingest;
 pub(crate) mod stream_lifecycle;
@@ -300,6 +301,10 @@ pub struct Omnigraph {
     /// transport owners, not Lance generation state.
     #[allow(dead_code)]
     stream_requests: Arc<stream_request::StreamRequestRegistry>,
+    /// Root-scoped owner for the hidden resident fold supervisor. Every
+    /// independently opened handle for the same graph shares its trigger and
+    /// task state, so at most one automatic fold loop can run in-process.
+    stream_fold_driver: Arc<stream_driver::StreamFoldDriverRegistry>,
     /// Non-cloneable checked authority retained for the lifetime of the sole
     /// cluster-served writer handle. Ambient embedded/direct handles leave
     /// this unset and therefore fail closed while the profile is enabled.
@@ -467,6 +472,8 @@ impl Omnigraph {
         .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
         let stream_requests =
             stream_request::StreamRequestRegistry::for_root(&write_queue_identity);
+        let stream_fold_driver =
+            stream_driver::StreamFoldDriverRegistry::for_root(&write_queue_identity);
 
         // Preflight before parse or write. Strict init refuses any schema
         // artifact; force may recover orphan schema files but still refuses an
@@ -601,6 +608,7 @@ impl Omnigraph {
             write_queue,
             stream_workers,
             stream_requests,
+            stream_fold_driver,
             stream_runtime_authority: None,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
@@ -662,6 +670,8 @@ impl Omnigraph {
         .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
         let stream_requests =
             stream_request::StreamRequestRegistry::for_root(&write_queue_identity);
+        let stream_fold_driver =
+            stream_driver::StreamFoldDriverRegistry::for_root(&write_queue_identity);
         // Refuse a `__manifest` this binary cannot serve before the coordinator
         // reads any branch state — newer than CURRENT (an old binary must not
         // silently misread a newer graph) or below MIN_SUPPORTED (an older
@@ -837,6 +847,7 @@ impl Omnigraph {
             write_queue,
             stream_workers,
             stream_requests,
+            stream_fold_driver,
             stream_runtime_authority: None,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,

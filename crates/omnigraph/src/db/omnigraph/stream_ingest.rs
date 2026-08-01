@@ -71,7 +71,8 @@ use crate::table_store::mem_wal::{
     ConfirmedStreamTokenOverlayRow, CurrentGenerationProjectionSource, DurableBatchAck,
     IdleAuthorityCheck, IdleAuthorityFailure, MemWalWorkerError, OpenedMemWalWorker,
     PassiveB1PhysicalState, PassiveQuiesceDisposition, PreparedPut, PreparedPutFailure,
-    QueuedBatchPermit, QuiesceCut, SealedGenerationCut, StreamWorkerKey, WorkerOpenFailure,
+    QueuedBatchPermit, QuiesceCut, ResidentFoldReadiness, SealedGenerationCut,
+    StreamFoldTrigger, StreamWorkerKey, WorkerOpenFailure,
     b1_input_accounting, b1_logical_batch_bytes, capture_current_head_witness,
     reconstruct_b1_writer_config, scan_flushed_generation_projection,
     validate_b1_lifecycle_current_binding_physical_state,
@@ -234,6 +235,7 @@ pub(super) struct StreamAuthorityCapture {
     pub(super) full_path: String,
     pub(super) head: SnapshotHandle,
     pub(super) details: MemWalIndexDetails,
+    pub(super) passive_state: PassiveB1PhysicalState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +374,80 @@ enum FoldLifecycleMode {
     Draining { drain_id: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResidentFoldOutcome {
+    Published,
+    Idle,
+    Inactive,
+}
+
+fn published_fold_coverage(capture: &StreamAuthorityCapture) -> Result<Option<u64>> {
+    let Some(summary) = capture.lifecycle.last_fold_summary.as_ref() else {
+        return Ok(None);
+    };
+    let Some(merged) = exact_merged_generation(&capture.details, capture.shard_id)? else {
+        return Ok(None);
+    };
+    let cut = &summary.exact_generation_cut;
+    Ok((summary.outcome == LastFoldOutcome::Published
+        && cut.shard_id == capture.shard_id.to_string()
+        && cut.generation == merged.generation
+        && cut.replay_after_wal_entry_position
+            >= capture.lifecycle.authenticated_wal_tail.position)
+        .then_some(cut.replay_after_wal_entry_position))
+}
+
+async fn cold_stream_capture_has_unmerged_rows(
+    capture: &StreamAuthorityCapture,
+) -> Result<bool> {
+    if matches!(
+        &capture.passive_state,
+        PassiveB1PhysicalState::FoldOnlyFlushed(_)
+    ) {
+        return Ok(true);
+    }
+
+    // Claims authenticate the full active-generation LWW projection. A fold
+    // deliberately preserves that authenticated tail, so only a matching
+    // visible fold summary proves that projection has already crossed the
+    // graph visibility boundary.
+    let covered_cursor = published_fold_coverage(capture)?;
+    if capture.lifecycle.authenticated_wal_tail.segment_count > 0 && covered_cursor.is_none() {
+        let empty_digest = lifecycle_generation_lww_projection_digest(
+            &capture.lifecycle,
+            &capture.txn.authority.schema_ir_hash,
+            Arc::new(ArrowSchema::from(capture.head.dataset().schema())),
+            &[],
+        )?;
+        if capture
+            .lifecycle
+            .authenticated_wal_tail
+            .lww_projection_digest
+            != empty_digest
+        {
+            return Ok(true);
+        }
+    }
+
+    // Retain-all means a published generation's WAL remains present forever.
+    // Probe only beyond both authenticated authority and the latest exact
+    // visible cut, otherwise restart would rediscover and refold old rows.
+    let probe_after = capture
+        .lifecycle
+        .authenticated_wal_tail
+        .position
+        .max(covered_cursor.unwrap_or(0));
+    let probe_position = probe_after
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("stream fold WAL probe cursor overflow"))?;
+    let tailer = claim_wal_tailer(capture).await?;
+    Ok(tailer
+        .read_entry(probe_position)
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?
+        .is_some())
+}
+
 impl Omnigraph {
     /// Admit one already-normalized, non-empty physical batch through the
     /// feature-gated B1 substrate seam. Synthetic trusted envelopes make these
@@ -392,7 +468,7 @@ impl Omnigraph {
         // admission and detached worker completion prevents a concurrent
         // disable from waiting on our admission lease while a cold claim waits
         // behind the disable's profile-exclusive lease.
-        let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+        let profile_guard = self.write_queue().acquire_stream_profile_shared().await;
         // Refuse an oversized caller buffer synchronously before recovery IO,
         // authority capture, detached ownership, or a cold epoch claim.
         validate_stream_input_bounds(table_key, &batch)?;
@@ -428,16 +504,24 @@ impl Omnigraph {
         // Inflight and Arrow budgets are acquired before any same-key queue or
         // shared-admission wait. The returned token is already inside that
         // bounded corridor and moves into the detached prepare closure.
-        let (mut queued, put_authority) = self
+        let reserved = self
             .stream_workers
             .reserve_put_input(key, table_key, &batch, move || async move {
                 let shared = authority_db
                     .write_queue()
                     .acquire_stream_shared(&authority_key)
                     .await;
-                CheckedStreamAuthority::from_shared_admission(shared)
+                CheckedStreamAuthority::from_shared_admission_with_profile(shared, profile_guard)
             })
-            .await?;
+            .await;
+        let (mut queued, put_authority) = match reserved {
+            Ok(reserved) => reserved,
+            Err(error @ OmniError::FoldRequired { .. }) => {
+                self.notify_stream_fold_pressure(key.identity);
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
 
         // The provisional capture exists only to choose the immutable
         // admission domain. A fold can publish while this caller is waiting for
@@ -865,7 +949,7 @@ impl Omnigraph {
         let authority_db = Arc::clone(self);
         let authority_key = admission_key.clone();
         let first_row = batch.slice(0, 1);
-        let (mut queued, put_authority) = self
+        let reserved = self
             .stream_workers
             .reserve_b2_put_input(
                 key,
@@ -883,7 +967,15 @@ impl Omnigraph {
                     )
                 },
             )
-            .await?;
+            .await;
+        let (mut queued, put_authority) = match reserved {
+            Ok(reserved) => reserved,
+            Err(error @ OmniError::FoldRequired { .. }) => {
+                self.notify_stream_fold_pressure(key.identity);
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         drop(first_row);
 
         let prepared = self
@@ -1339,6 +1431,13 @@ impl Omnigraph {
         match outcome {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
+                if !worker_put_attempted && matches!(&error, OmniError::FoldRequired { .. }) {
+                    // Prefix/token capacity can refuse before the detached
+                    // worker owns the request. Once worker ownership begins,
+                    // its callback is the sole trigger so cancellation safety
+                    // does not also create a redundant no-op round here.
+                    self.notify_stream_fold_pressure(key.identity);
+                }
                 let binding = if worker_put_attempted {
                     // A cold prepare can durably advance the shard epoch and
                     // then refuse effect-free (most notably when replay makes
@@ -1429,6 +1528,16 @@ impl Omnigraph {
         let admitted_batch = batch.clone();
         let idle_authority =
             self.stream_idle_authority_check(key, admission_key, table_key.clone());
+        let trigger_db = Arc::downgrade(self);
+        let fold_trigger: StreamFoldTrigger = Arc::new(move |urgent| {
+            if let Some(db) = trigger_db.upgrade() {
+                if urgent {
+                    db.notify_stream_fold_pressure(key.identity);
+                } else {
+                    db.notify_stream_fold_pending(key.identity);
+                }
+            }
+        });
         let db = Arc::clone(self);
         let prepare_table_key = table_key.clone();
         let prepare = Box::new(move |warm_writer: Option<Arc<ShardWriter>>| {
@@ -1555,6 +1664,7 @@ impl Omnigraph {
                 queued,
                 prepare,
                 idle_authority,
+                fold_trigger,
             )
             .await
     }
@@ -1568,18 +1678,52 @@ impl Omnigraph {
     pub(crate) async fn stream_fold_phase_b1(self: &Arc<Self>, table_key: &str) -> Result<()> {
         let db = Arc::clone(self);
         let table_key = table_key.to_string();
-        crate::instrumentation::spawn_with_query_io_probes(async move {
-            db.stream_fold_phase_b1_background(table_key).await
+        match crate::instrumentation::spawn_with_query_io_probes(async move {
+            db.stream_fold_phase_b1_background(table_key, None).await
         })
         .await
-        .map_err(|error| OmniError::Lance(format!("stream fold task failed: {error}")))?
+        .map_err(|error| OmniError::Lance(format!("stream fold task failed: {error}")))??
+        {
+            ResidentFoldOutcome::Published => Ok(()),
+            ResidentFoldOutcome::Idle | ResidentFoldOutcome::Inactive => Err(
+                OmniError::manifest_internal("explicit stream fold returned no fold outcome"),
+            ),
+        }
     }
 
-    async fn stream_fold_phase_b1_background(self: Arc<Self>, table_key: String) -> Result<()> {
+    pub(super) async fn stream_fold_from_resident_driver(
+        self: &Arc<Self>,
+        expected_identity: TableIdentity,
+        table_key: &str,
+    ) -> Result<ResidentFoldOutcome> {
+        let db = Arc::clone(self);
+        let table_key = table_key.to_string();
+        crate::instrumentation::spawn_with_query_io_probes(async move {
+            db.stream_fold_phase_b1_background(table_key, Some(expected_identity))
+                .await
+        })
+        .await
+        .map_err(|error| OmniError::Lance(format!("stream fold driver task failed: {error}")))?
+    }
+
+    async fn stream_fold_phase_b1_background(
+        self: Arc<Self>,
+        table_key: String,
+        resident_identity: Option<TableIdentity>,
+    ) -> Result<ResidentFoldOutcome> {
         let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+        if resident_identity.is_some() {
+            self.ensure_streaming_ingest_runtime_authorized().await?;
+        }
         let provisional = self
             .capture_stream_authority(&table_key, "stream fold")
             .await?;
+        if resident_identity.is_some_and(|identity| identity != provisional.entry.identity)
+            || (resident_identity.is_some()
+                && provisional.lifecycle.lifecycle != StreamLifecycle::Open)
+        {
+            return Ok(ResidentFoldOutcome::Inactive);
+        }
         let key = provisional.worker_key;
         let admission_key = provisional.admission_key.clone();
 
@@ -1590,9 +1734,31 @@ impl Omnigraph {
         let before_cut = self
             .capture_stream_authority(&table_key, "stream fold")
             .await?;
+        if resident_identity.is_some_and(|identity| {
+            identity != before_cut.entry.identity
+                || before_cut.lifecycle.lifecycle != StreamLifecycle::Open
+        }) {
+            return Ok(ResidentFoldOutcome::Inactive);
+        }
         self.ensure_no_relevant_stream_sidecar_except_exact_claim(&before_cut, "stream fold")
             .await?;
         ensure_same_binding(key, &before_cut, "stream fold pre-cut authority")?;
+        if resident_identity.is_some() {
+            match self.stream_workers.resident_fold_readiness(key).await {
+                ResidentFoldReadiness::Ready => {}
+                ResidentFoldReadiness::Idle => return Ok(ResidentFoldOutcome::Idle),
+                ResidentFoldReadiness::Missing => {
+                    if !cold_stream_capture_has_unmerged_rows(&before_cut).await? {
+                        return Ok(ResidentFoldOutcome::Idle);
+                    }
+                }
+                ResidentFoldReadiness::Busy => {
+                    return Err(OmniError::Lance(format!(
+                        "stream fold readiness for {table_key} is changing; retry the finite driver round"
+                    )));
+                }
+            }
+        }
 
         let opener_db = Arc::clone(&self);
         let opener_capture = before_cut.clone();
@@ -1643,7 +1809,7 @@ impl Omnigraph {
             ))
             .await
             {
-                Ok(FoldAttempt::Published) => return Ok(()),
+                Ok(FoldAttempt::Published) => return Ok(ResidentFoldOutcome::Published),
                 Ok(FoldAttempt::EffectFree(error)) if attempt + 1 < B1_MAX_FOLD_ATTEMPTS => {
                     last_effect_free_error = Some(error);
                 }
@@ -5708,7 +5874,7 @@ impl Omnigraph {
         // one fixed-size commitment. Ordinary authority capture needs only the
         // current index/shard; old shard prefixes are inert and their complete
         // inventory is checked at cold-open, rebind, and recovery boundaries.
-        validate_b1_lifecycle_current_binding_physical_state(
+        let passive_state = validate_b1_lifecycle_current_binding_physical_state(
             head.dataset(),
             &lifecycle,
             retained_shard_inventory.as_ref(),
@@ -5741,6 +5907,7 @@ impl Omnigraph {
             full_path,
             head,
             details,
+            passive_state,
         })
     }
 

@@ -219,6 +219,8 @@ const STREAM_ENROLLMENT_V14_REBIND_V18: WriteProtocol =
     WriteProtocol::Composed("StreamEnrollmentV2 recovery v14 + physical rebind recovery v18");
 const STREAM_LIFECYCLE_V14_V15_V18: WriteProtocol =
     WriteProtocol::Composed("private firehose lifecycle recovery v14 + resume v15 + rebind v18");
+const STREAM_FOLD_DRIVER_V14: WriteProtocol =
+    WriteProtocol::Composed("hidden resident stream fold driver + recovery v14");
 /// RFC-026 checked profile authority: ENABLED/DISABLED terminal transitions
 /// pair one immutable token-ledger receipt with one profile/lineage publish
 /// under recovery-v13. Disable additionally persists the admission-cutoff
@@ -290,6 +292,10 @@ write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],
     "db/omnigraph/stream_profile.rs" => WriteProtocol::Composed("control-plane-required refusal") => ["set_streaming_enabled_as"],
     "db/omnigraph/stream_profile.rs" => STREAM_PROFILE_V13 => ["set_streaming_profile_checked"],
+    "db/omnigraph/stream_driver.rs" => STREAM_FOLD_DRIVER_V14 => [
+        "start_stream_fold_driver",
+        "shutdown_stream_fold_driver",
+    ],
     "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup"],
     "db/omnigraph.rs" => WriteProtocol::NativeRefControl => ["branch_create", "branch_create_as", "branch_create_from", "branch_create_from_as", "branch_delete", "branch_delete_as"],
 }
@@ -915,7 +921,7 @@ durable_calls! {
     ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
     ("db/omnigraph/stream_enrollment.rs", ".dataset()", 7, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/stream_enrollment.rs", ".into_dataset()", 1, STREAM_ENROLLMENT_V14),
-    ("db/omnigraph/stream_ingest.rs", ".dataset()", 39, STREAM_LIFECYCLE_V14_V15_V18),
+    ("db/omnigraph/stream_ingest.rs", ".dataset()", 40, STREAM_LIFECYCLE_V14_V15_V18),
     ("db/omnigraph/stream_rebind.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/stream_retirement.rs", ".dataset()", 3, STREAM_RETIREMENT_V19),
     ("db/omnigraph/stream_correction.rs", ".dataset()", 7, STREAM_CORRECTION_V20),

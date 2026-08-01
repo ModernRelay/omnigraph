@@ -1705,6 +1705,19 @@ async fn visible_rows(db: &Omnigraph) -> Vec<(String, i32)> {
     rows
 }
 
+async fn wait_for_visible_rows(db: &Omnigraph, expected: &[(String, i32)]) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if visible_rows(db).await == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("resident stream fold driver did not publish the expected rows");
+}
+
 #[tokio::test]
 #[serial]
 async fn admission_rejects_empty_and_non_exact_physical_batches_without_visibility() {
@@ -1858,6 +1871,140 @@ async fn durable_put_is_graph_content_invisible_until_one_explicit_fold() {
             .table_version,
         table_version_before + 1
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn resident_driver_empty_startup_is_effect_free_and_timer_folds_once() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let manifest_before = before.version();
+    let table_before = before.entry(TABLE).unwrap().table_version;
+
+    db.start_stream_fold_driver()
+        .await
+        .expect("checked served runtime starts the hidden fold driver");
+    let ambient = reopen_enrolled(&dir).await;
+    let error = ambient
+        .shutdown_stream_fold_driver()
+        .await
+        .expect_err("an ambient same-root handle must not stop the server-owned driver");
+    assert!(
+        matches!(error, OmniError::StreamingAuthorityMismatch { .. }),
+        "{error:?}"
+    );
+    let status: serde_json::Value = serde_json::from_str(
+        &db.failpoint_stream_fold_driver_status_for_test(),
+    )
+    .unwrap();
+    assert_eq!(status["running"], true);
+    drop(ambient);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let after_empty_start = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(after_empty_start.version(), manifest_before);
+    assert_eq!(after_empty_start.entry(TABLE).unwrap().table_version, table_before);
+
+    let batch = physical_batch(&db, &[("automatic".to_string(), 10)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
+        .await
+        .expect("durable put arms the resident timer");
+    wait_for_visible_rows(&db, &[("automatic".to_string(), 10)]).await;
+    let published = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let published_manifest = published.version();
+    let published_table = published.entry(TABLE).unwrap().table_version;
+
+    tokio::time::sleep(Duration::from_millis(1_250)).await;
+    let after_retained_wal = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(after_retained_wal.version(), published_manifest);
+    assert_eq!(after_retained_wal.entry(TABLE).unwrap().table_version, published_table);
+    db.shutdown_stream_fold_driver()
+        .await
+        .expect("resident driver joins after its finite round");
+}
+
+#[tokio::test]
+#[serial]
+async fn resident_driver_requires_the_exact_checked_served_runtime() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled().await;
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+
+    let error = db
+        .start_stream_fold_driver()
+        .await
+        .expect_err("ambient enabled handle must not mint fold authority");
+    assert!(
+        matches!(error, OmniError::StreamingRequiresClusterRuntime { .. }),
+        "{error:?}"
+    );
+    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(after.version(), before.version());
+    assert_eq!(
+        after.entry(TABLE).unwrap().table_version,
+        before.entry(TABLE).unwrap().table_version
+    );
+    let status: serde_json::Value = serde_json::from_str(
+        &db.failpoint_stream_fold_driver_status_for_test(),
+    )
+    .unwrap();
+    assert_eq!(status["running"], false);
+    assert_eq!(status["pending_tables"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn resident_driver_restart_discovers_unpublished_wal_but_not_published_retained_wal() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let batch = physical_batch(&db, &[("cold-discovery".to_string(), 11)]).await;
+    let error = {
+        let _after_watcher =
+            ScopedFailPoint::new(names::STREAM_B1_AFTER_WATCHER_SUCCESS, "return");
+        db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
+            .await
+            .expect_err("fixture leaves a durable ambiguous generation unpublished")
+    };
+    assert!(matches!(error, OmniError::AckUnknown { .. }), "{error:?}");
+    assert!(visible_rows(&db).await.is_empty());
+    drop(db);
+
+    let cluster_uri = dir.cluster_uri();
+    let reopened = reopen_enrolled(&dir).await;
+    let reopened = helpers::stream_authority::bind_checked_stream_runtime(reopened, &cluster_uri)
+        .await;
+    reopened
+        .start_stream_fold_driver()
+        .await
+        .expect("startup discovery arms the cold OPEN lane");
+    wait_for_visible_rows(&reopened, &[("cold-discovery".to_string(), 11)]).await;
+    reopened
+        .shutdown_stream_fold_driver()
+        .await
+        .expect("first cold driver joins");
+    let published = reopened
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let published_manifest = published.version();
+    let published_table = published.entry(TABLE).unwrap().table_version;
+    drop(reopened);
+
+    let reopened = reopen_enrolled(&dir).await;
+    let reopened = helpers::stream_authority::bind_checked_stream_runtime(reopened, &cluster_uri)
+        .await;
+    reopened
+        .start_stream_fold_driver()
+        .await
+        .expect("published retained WAL is still discoverable but already covered");
+    tokio::time::sleep(Duration::from_millis(1_250)).await;
+    let unchanged = reopened
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert_eq!(unchanged.version(), published_manifest);
+    assert_eq!(unchanged.entry(TABLE).unwrap().table_version, published_table);
+    reopened.shutdown_stream_fold_driver().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4354,9 +4501,13 @@ async fn fold_resolves_same_id_last_write_wins_before_staging() {
 
 #[tokio::test]
 #[serial]
-async fn whole_generation_row_and_byte_caps_refuse_before_a_second_put_effect() {
+async fn whole_generation_caps_refuse_then_the_resident_driver_folds_for_retry() {
     let _scenario = FailScenario::setup();
-    let (_dir, db) = init_enrolled().await;
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
     let full = (0..8_192)
         .map(|row| (format!("p{row:04}"), row))
         .collect::<Vec<_>>();
@@ -4365,19 +4516,44 @@ async fn whole_generation_row_and_byte_caps_refuse_before_a_second_put_effect() 
         .await
         .expect("the exact row cap is admissible");
 
-    let over = physical_batch(&db, &[("over".to_string(), 9_999)]).await;
-    let error = db
-        .failpoint_stream_b1_for_test(TABLE, Some(over), 8_192)
+    let error = b2_put_score(
+        &db,
+        &incarnation,
+        "over",
+        9_999,
+        8_192,
+        "98989898-9898-4898-8898-989898989898",
+        None,
+        "agent:cap-retry",
+    )
         .await
-        .expect_err("one row beyond the complete-generation cap must be effect-free");
+        .expect_err("the real B2 reserve path must refuse one row beyond the generation cap");
     assert!(matches!(error, OmniError::FoldRequired { .. }), "{error:?}");
+    assert!(visible_rows(&db).await.is_empty());
 
-    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+    db.start_stream_fold_driver()
         .await
-        .unwrap();
-    let visible = visible_rows(&db).await;
-    assert_eq!(visible.len(), 8_192);
-    assert!(!visible.iter().any(|(id, _)| id == "over"));
+        .expect("cap pressure retained before startup must wake the driver");
+    wait_for_visible_rows(&db, &full).await;
+
+    b2_put_score(
+        &db,
+        &incarnation,
+        "over",
+        9_999,
+        8_192,
+        "98989898-9898-4898-8898-989898989898",
+        None,
+        "agent:cap-retry",
+    )
+        .await
+        .expect("producer retry succeeds after the automatic cap fold");
+    let mut expected = full;
+    expected.push(("over".to_string(), 9_999));
+    expected.sort();
+    wait_for_visible_rows(&db, &expected).await;
+    db.shutdown_stream_fold_driver().await.unwrap();
+    drop(db);
 
     // The root memory permit must not turn this same-generation byte crossing
     // into a generic ResourceLimitExceeded before the worker can classify it.
@@ -5507,9 +5683,56 @@ async fn post_watcher_epoch_loss_is_ack_unknown_not_a_clean_ack() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn cancelling_request_after_invocation_does_not_cancel_durable_worker_ownership() {
+async fn cancelling_request_before_invocation_keeps_shutdown_joined_to_the_detached_owner() {
     let _scenario = FailScenario::setup();
-    let (_dir, db) = init_enrolled().await;
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    db.start_stream_fold_driver().await.unwrap();
+    let batch = physical_batch(&db, &[("pre-invocation-cancel".to_string(), 16)]).await;
+    let before_prepare = helpers::failpoint::Rendezvous::park_first(
+        names::STREAM_B1_AFTER_INPUT_QUEUE_BEFORE_PREPARE,
+    );
+
+    let put_db = Arc::clone(&db);
+    let put = tokio::spawn(async move {
+        put_db
+            .failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
+            .await
+    });
+    before_prepare.wait_until_reached().await;
+    put.abort();
+    assert!(put.await.unwrap_err().is_cancelled());
+
+    let shutdown_db = Arc::clone(&db);
+    let mut shutdown = tokio::spawn(async move { shutdown_db.shutdown_stream_fold_driver().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown must remain joined to detached work that has not invoked Lance yet"
+    );
+
+    before_prepare.release();
+    tokio::time::timeout(Duration::from_secs(20), shutdown)
+        .await
+        .expect("shutdown must settle after the detached owner and its automatic fold")
+        .unwrap()
+        .expect("detached pre-invocation cancellation remains foldable");
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("pre-invocation-cancel".to_string(), 16)]
+    );
+    let status: serde_json::Value =
+        serde_json::from_str(&db.failpoint_stream_fold_driver_status_for_test()).unwrap();
+    assert_eq!(status["running"], false);
+    assert_eq!(status["pending_tables"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn cancelling_request_after_invocation_preserves_worker_and_fold_trigger_ownership() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    db.start_stream_fold_driver().await.unwrap();
     let batch = physical_batch(&db, &[("cancelled-caller".to_string(), 17)]).await;
     let after_watcher =
         helpers::failpoint::Rendezvous::park_first(names::STREAM_B1_AFTER_WATCHER_SUCCESS);
@@ -5524,25 +5747,17 @@ async fn cancelling_request_after_invocation_does_not_cancel_durable_worker_owne
     put.abort();
     assert!(put.await.unwrap_err().is_cancelled());
 
-    let fold_db = Arc::clone(&db);
-    let mut fold =
-        tokio::spawn(async move { fold_db.failpoint_stream_b1_for_test(TABLE, None, 0).await });
-    let early = tokio::time::timeout(Duration::from_millis(200), &mut fold).await;
+    tokio::time::sleep(Duration::from_millis(1_250)).await;
     assert!(
-        early.is_err(),
-        "exclusive fold must remain blocked while the detached owner still holds the post-watcher fence boundary"
+        visible_rows(&db).await.is_empty(),
+        "automatic exclusive fold must remain blocked while the detached owner still holds the post-watcher fence boundary"
     );
 
     after_watcher.release();
-    tokio::time::timeout(Duration::from_secs(20), fold)
+    wait_for_visible_rows(&db, &[("cancelled-caller".to_string(), 17)]).await;
+    db.shutdown_stream_fold_driver()
         .await
-        .expect("fold must wait for the detached fence/ack owner, not hang")
-        .unwrap()
-        .expect("watcher-success residue must reopen fold-only and publish once");
-    assert_eq!(
-        visible_rows(&db).await,
-        vec![("cancelled-caller".to_string(), 17)]
-    );
+        .expect("automatic fold waits for the detached fence/ack owner and joins");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
