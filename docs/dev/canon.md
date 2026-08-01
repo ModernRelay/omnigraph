@@ -496,7 +496,7 @@ writer describes its physical effects to the shared coordinator:
 | StreamSealedEnsureIndices *(hidden narrow maintenance capability)* | v16 (`protocol_v8` plan + `protocol_v16` authority) | under `stream_manage` and the exact checked served runtime, one canonical-main call applies the established recovery-v8 CreateIndex plan only while every enrolled productive table is exactly `SEALED`. The sole manifest CAS publishes every productive table pointer with refreshed lifecycle HEAD witness, empty proof, and revision. It writes no token row or management receipt, accepts no caller operation ID, and a true no-work retry is effect-free. This payload owns neither Optimize nor physical rebind |
 | StreamSealedOptimize *(hidden narrow maintenance capability)* | v17 (bounded Optimize pins + `protocol_v17` authority) | under `stream_manage` and the exact checked served runtime, one canonical-main call applies the established Optimize plan only while every enrolled productive table is exactly `SEALED`. Recovery records each achieved table HEAD, then the sole manifest CAS publishes the productive pointer set with refreshed lifecycle HEAD witness, empty proof, and revision. It writes no token row or management receipt, accepts no caller operation ID, and a true no-work retry is effect-free |
 | StreamRebind *(hidden physical rebind capability)* | v18 (`protocol_v18` authority) | under `stream_manage`, an exact terminal `DISABLED` profile, and checked stopped/offline maintenance authority, one canonical-main `SEALED` lane creates a fresh enrollment plus empty shard namespace, appends immutable binding and fence-only claim receipts, and atomically publishes the fresh binding with a new exact `SEALED` proof. It retains prior binding/claim history, admits no writer or put, and requires a separate recovery-v15 resume to open the new scope |
-| StreamAuthorityRetirement *(terminal rebuild exit)* | v19 (`protocol_v19` authority) | under the state lock and checked stopped/offline cluster authority, a read-only plan proves an exact `DISABLED`, all-`SEALED`, recovery-clear graph cut with base/token parity and at least one current `WITHDRAWN` token. Actor- and plan-bound confirmation appends one immutable receipt and then selects its token witness with `DISABLED → RETIRED` in a lineage-neutral manifest CAS. It moves no graph head and emits no `RecoveryAudit`; the receipt/profile chain is the audit record. The source becomes query/status/export-only and retired export re-proves the cut and carries the root receipt plus a closed selected-branch-member witness as provenance |
+| StreamAuthorityRetirement *(terminal rebuild exit)* | v19 (`protocol_v19` authority) | under the state lock and checked stopped/offline cluster authority, a read-only plan proves an exact `DISABLED`, all-`SEALED`, recovery-clear graph cut with base/token parity and at least one current `WITHDRAWN` token. Actor- and plan-bound confirmation appends one immutable receipt and then selects its token witness with `DISABLED → RETIRED` in a lineage-neutral manifest CAS. It moves no graph head and emits no `RecoveryAudit`; the receipt/profile chain is the audit record. The source becomes query/status/export-only and retired export re-proves the cut and carries the root receipt, a recomputable selected-branch-member witness, and the ordered proof needed to recover the receipt-bound cut |
 
 First-touch tables (a branch's first write to a table) follow
 **sidecar-before-ref** ordering: the recovery intent that names the
@@ -842,7 +842,8 @@ V16/recovery-v18 separately adds checked offline physical rebind from one exact
 v17/recovery-v19 adds the cluster-only, stopped/offline terminal exit for an
 exact `DISABLED`, all-`SEALED` cut with current `WITHDRAWN` authority. It
 publishes `RETIRED`, keeps graph lineage fixed, and makes export carrying the
-root receipt plus a closed selected-branch-member witness the only rebuild
+root receipt plus a recomputable selected-branch-member witness and its exact
+ordered cut-membership proof the only rebuild
 route from that source. Historical v10 enrollment, v12
 lifecycle-v2 folds, and the older v14 resume/maintenance/retirement/rebind
 scaffolds are refused rather than reinterpreted. Older formats cross through
@@ -1158,7 +1159,8 @@ claim/quiesce/fold authority. Embedded `Omnigraph::stream_status` projects
 durable manifest authority read-only. V17/recovery-v19 adds only the narrow
 offline retirement/export exit: plan/confirm freezes a verified `WITHDRAWN` cut
 as `RETIRED`, and retired export carries the selected root receipt plus a
-closed selected-branch-member witness. Explicit
+recomputable selected-branch-member witness and ordered cut-membership proof.
+Explicit
 production enrollment/quiesce, correction, exclusive-cut physical status,
 public row admission, and HTTP/OpenAPI parity remain inactive. The
 retain-all profile adds no storage admission watermark. Managed reclamation

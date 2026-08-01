@@ -177,11 +177,19 @@ actor- and plan-bound receipt chain. Cluster and CLI tests own actor/offline/
 declared-graph preflight plus the exact `--graph`/`--config` command scope.
 `crossversion_upgrade.rs` owns the genuine v16↔v17 refusal/rebuild fence.
 
-The retired-export cells pin `branch_member` as a closed five-field witness:
-canonical branch, exact Lance branch identifier, optional graph head, manifest
-version, and `branch_member_digest`. Main and named-branch exports retain the
-same root receipt but must carry their own exact member witness; load validates
-the witness as provenance and imports no live stream authority.
+The retired-export cells pin `branch_member` as a closed selected-member
+witness: canonical branch, exact Lance branch identifier, optional graph head,
+manifest version, `table_witness_digest`, and a recomputable
+`branch_member_digest`. Main and named-branch exports retain the same root
+receipt and exact `ordered_branch_member_digests`, but select their own member
+with `selected_member_index`. Load recomputes the selected member digest from
+the witness, checks that exact slot, and combines the ordered digests with
+`source_schema_ir_hash` to recompute the receipt's `export_cut_digest`. The
+source schema hash is proof input for the frozen source cut, not a requirement
+that it equal the fresh target graph identity; ordinary loader schema and row
+validation enforce target compatibility. The rebuild imports no live stream
+authority. Focused tamper cases cover the graph head, manifest version, table
+and member digests, selected index, sibling digest, and source schema hash.
 
 This evidence activates only the stopped/offline retirement/export exit.
 Authority correction, a production path that creates `WITHDRAWN`, public

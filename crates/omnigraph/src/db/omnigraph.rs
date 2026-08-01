@@ -60,6 +60,12 @@ pub use stream_profile::{
     CheckedClusterRetirementAuthority, CheckedClusterStreamRuntimeAuthority,
     StreamingProfileResult,
 };
+pub(crate) use stream_retirement::StreamAuthorityRetirementExportProvenance;
+#[cfg(test)]
+pub(crate) use stream_retirement::{
+    StreamAuthorityRetirementExportMember, retirement_export_cut_digest,
+    retirement_live_branch_heads_digest,
+};
 pub use stream_retirement::{StreamAuthorityRetirementPlan, StreamAuthorityRetirementResult};
 pub use stream_status::{StreamStatus, StreamTableStatus};
 pub use table_ops::PendingIndex;

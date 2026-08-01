@@ -1119,8 +1119,15 @@ rebind and items 6 onward remain future work.
    pointer advance. Each later branch export is permitted only for a member of
    that frozen map. Its JSONL provenance pairs the unchanged root receipt with
    a closed `branch_member` witness containing the canonical branch name, exact
-   Lance branch identifier, graph head, manifest version, and
-   `branch_member_digest` for the selected frozen snapshot.
+   Lance branch identifier, graph head, manifest version,
+   `table_witness_digest`, and a recomputable `branch_member_digest`. The same
+   row carries `source_schema_ir_hash`, the exact
+   `ordered_branch_member_digests`, and `selected_member_index`. A fresh loader
+   recomputes the selected member digest and its exact slot, then recomputes the
+   receipt's `export_cut_digest` from the source schema hash and ordered member
+   digests. The source schema hash is proof input for the retired source cut;
+   it is not required to equal the fresh target graph identity, whose schema
+   compatibility remains ordinary loader validation.
 
    Once selected, Mutation/Load/delete and `_as`, SchemaApply, BranchMerge,
    branch create/delete and every profile transition/refinement,
@@ -1134,7 +1141,8 @@ rebind and items 6 onward remain future work.
    match, and the receipt-bearing token pointer without reapplying the ordinary
    terminal-token rejection. It emits one
    `_omnigraph_export_provenance` row before the logical rows containing the
-   root receipt and the selected branch's closed `branch_member` witness.
+   root receipt and the selected branch's closed, cut-membership-proved
+   `branch_member` witness.
    The receipt is provenance, not live token authority: init/load creates a
    fresh graph identity and any later enrollment creates a fresh stream
    incarnation, so a delayed old-incarnation request remains effect-free
@@ -1800,8 +1808,9 @@ remains required before authority correction or public ingress can make
   enrollment, receipt, or dead-letter authority. The source token rows, receipt
   ledger, WAL/dead-letter artifacts, and base versions remain byte-for-byte
   authoritative and retained. A two-live-branch cell proves each export keeps
-  the same root receipt while emitting a distinct, self-consistent
-  `branch_member` witness for the selected frozen branch. Any later enrollment
+  the same root receipt and ordered member-digest proof while emitting a
+  distinct, recomputable `branch_member` witness and selected index for the
+  chosen frozen branch. Any later enrollment
   of the fresh
   graph mints a new stream incarnation; an old-incarnation request is effect-free
   `StreamBindingChanged`.

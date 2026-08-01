@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow_array::{Array, StringArray};
 use datafusion::prelude::col;
 use futures::TryStreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedMutexGuard, OwnedRwLockWriteGuard};
 
@@ -50,6 +50,9 @@ const LIFECYCLE_PROOF_DOMAIN: &[u8] = b"omnigraph.stream-authority-retirement-li
 const EXPORT_CUT_DOMAIN: &[u8] = b"omnigraph.stream-authority-retirement-export-cut.v1\0";
 const EXPORT_BRANCH_MEMBER_DOMAIN: &[u8] =
     b"omnigraph.stream-authority-retirement-export-branch-member.v1\0";
+const EXPORT_TABLE_WITNESS_DOMAIN: &[u8] =
+    b"omnigraph.stream-authority-retirement-export-table-witness.v1\0";
+const EXPORT_PROVENANCE_KIND: &str = "STREAM_AUTHORITY_RETIREMENT";
 
 /// Complete in-process writer envelope retained through retirement planning or
 /// publication. The durable cluster lock remains the cross-process fence.
@@ -92,13 +95,142 @@ pub struct StreamAuthorityRetirementResult {
 
 /// Exact frozen branch member named by one retired export. The receipt binds
 /// the complete root cut; this witness identifies the selected member of it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StreamAuthorityRetirementExportMember {
     pub(crate) branch: String,
     pub(crate) branch_identifier: lance::dataset::refs::BranchIdentifier,
     pub(crate) graph_head: Option<String>,
     pub(crate) manifest_version: u64,
+    pub(crate) table_witness_digest: String,
     pub(crate) branch_member_digest: String,
+}
+
+/// Closed import proof for one selected member of the receipt-bound frozen
+/// branch set. The ordered digest vector is the exact preimage of the flat
+/// root cut; the selected member carries the otherwise source-only table-cut
+/// commitment needed to recompute its leaf.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StreamAuthorityRetirementExportProvenance {
+    pub(crate) kind: String,
+    pub(crate) receipt: AuthorityRetirementReceipt,
+    /// Exact source-identity hash committed by the cut root. A rebuild mints a
+    /// fresh graph identity, so this authenticates the source proof and is not
+    /// compared with the target's accepted-IR hash.
+    pub(crate) source_schema_ir_hash: String,
+    pub(crate) ordered_branch_member_digests: Vec<String>,
+    pub(crate) selected_member_index: u64,
+    pub(crate) branch_member: StreamAuthorityRetirementExportMember,
+}
+
+impl StreamAuthorityRetirementExportMember {
+    pub(crate) fn from_table_witness(
+        branch: impl Into<String>,
+        branch_identifier: lance::dataset::refs::BranchIdentifier,
+        graph_head: Option<String>,
+        manifest_version: u64,
+        table_witness_digest: impl Into<String>,
+    ) -> Result<Self> {
+        let branch = branch.into();
+        let table_witness_digest = table_witness_digest.into();
+        validate_retirement_export_member_fields(
+            &branch,
+            &branch_identifier,
+            graph_head.as_deref(),
+            manifest_version,
+            &table_witness_digest,
+        )?;
+        let branch_member_digest = retirement_branch_member_digest_from_witness(
+            &branch,
+            &branch_identifier,
+            graph_head.as_deref(),
+            manifest_version,
+            &table_witness_digest,
+        )?;
+        Ok(Self {
+            branch,
+            branch_identifier,
+            graph_head,
+            manifest_version,
+            table_witness_digest,
+            branch_member_digest,
+        })
+    }
+
+    fn recompute_digest(&self) -> Result<String> {
+        validate_retirement_export_member_fields(
+            &self.branch,
+            &self.branch_identifier,
+            self.graph_head.as_deref(),
+            self.manifest_version,
+            &self.table_witness_digest,
+        )?;
+        validate_canonical_retirement_digest("frozen branch-member", &self.branch_member_digest)?;
+        retirement_branch_member_digest_from_witness(
+            &self.branch,
+            &self.branch_identifier,
+            self.graph_head.as_deref(),
+            self.manifest_version,
+            &self.table_witness_digest,
+        )
+    }
+}
+
+impl StreamAuthorityRetirementExportProvenance {
+    pub(crate) fn validate_for_rebuild(&self) -> Result<()> {
+        if self.kind != EXPORT_PROVENANCE_KIND {
+            return Err(OmniError::manifest(format!(
+                "unsupported export provenance kind '{}'",
+                self.kind
+            )));
+        }
+        self.receipt.validate()?;
+        validate_canonical_retirement_digest(
+            "retirement export source schema",
+            &self.source_schema_ir_hash,
+        )?;
+        if self.ordered_branch_member_digests.is_empty() {
+            return Err(OmniError::manifest(
+                "retirement export cut proof must contain at least the main branch member",
+            ));
+        }
+        for digest in &self.ordered_branch_member_digests {
+            validate_canonical_retirement_digest("retirement export cut member", digest)?;
+        }
+        let selected_index = usize::try_from(self.selected_member_index).map_err(|_| {
+            OmniError::manifest("retirement export selected member index exceeds this platform")
+        })?;
+        let selected_digest = self
+            .ordered_branch_member_digests
+            .get(selected_index)
+            .ok_or_else(|| {
+                OmniError::manifest(
+                    "retirement export selected member index is outside the receipt-bound cut",
+                )
+            })?;
+        let recomputed_member_digest = self.branch_member.recompute_digest()?;
+        if recomputed_member_digest != self.branch_member.branch_member_digest {
+            return Err(OmniError::manifest(
+                "retirement export branch-member witness/digest mismatch",
+            ));
+        }
+        if selected_digest != &recomputed_member_digest {
+            return Err(OmniError::manifest(
+                "retirement export branch member is not selected by the receipt-bound cut proof",
+            ));
+        }
+        let recomputed_cut = retirement_export_cut_digest(
+            &self.source_schema_ir_hash,
+            &self.ordered_branch_member_digests,
+        )?;
+        if recomputed_cut != self.receipt.export_cut_digest {
+            return Err(OmniError::manifest(
+                "retirement export branch member is not in the receipt-bound export cut",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Omnigraph {
@@ -798,6 +930,23 @@ impl Omnigraph {
         &self,
         frozen_main_manifest_version: Option<u64>,
     ) -> Result<(String, String)> {
+        let (schema_ir_hash, members) = self
+            .capture_retirement_logical_cut_members_with_main_version(frozen_main_manifest_version)
+            .await?;
+        let live_branch_heads_digest = retirement_live_branch_heads_digest(&members)?;
+        let ordered_branch_member_digests = members
+            .iter()
+            .map(|member| member.branch_member_digest.clone())
+            .collect::<Vec<_>>();
+        let export_cut_digest =
+            retirement_export_cut_digest(&schema_ir_hash, &ordered_branch_member_digests)?;
+        Ok((live_branch_heads_digest, export_cut_digest))
+    }
+
+    async fn capture_retirement_logical_cut_members_with_main_version(
+        &self,
+        frozen_main_manifest_version: Option<u64>,
+    ) -> Result<(String, Vec<StreamAuthorityRetirementExportMember>)> {
         let mut branches = self
             .open_coordinator_for_branch(None)
             .await?
@@ -805,17 +954,11 @@ impl Omnigraph {
             .await?;
         branches.sort();
         branches.dedup();
-        let mut heads = Sha256::new();
-        heads.update(BRANCH_HEADS_DOMAIN);
-        hash_u64(&mut heads, branches.len() as u64);
-        let mut cut = Sha256::new();
-        cut.update(EXPORT_CUT_DOMAIN);
-        let schema_hash =
+        let schema_ir_hash =
             super::read_schema_state_identity(self.root_uri(), self.storage_adapter())
                 .await?
                 .schema_ir_hash;
-        hash_field(&mut cut, schema_hash.as_bytes());
-        hash_u64(&mut cut, branches.len() as u64);
+        let mut members = Vec::with_capacity(branches.len());
         for branch in branches {
             let selected = if branch == "main" {
                 self.open_coordinator_for_branch(None).await?
@@ -823,39 +966,31 @@ impl Omnigraph {
                 self.open_coordinator_for_branch(Some(&branch)).await?
             };
             let branch_identifier = selected.branch_identifier().await?;
-            let identifier = serde_json::to_vec(&branch_identifier).map_err(|error| {
-                OmniError::manifest_internal(format!(
-                    "failed to encode retirement branch identity: {error}"
-                ))
-            })?;
             let graph_head = selected.exact_graph_head();
-            hash_field(&mut heads, branch.as_bytes());
-            hash_field(&mut heads, &identifier);
-            hash_field(&mut heads, graph_head.as_deref().unwrap_or("").as_bytes());
             let branch_snapshot = selected.snapshot();
             let frozen_manifest_version = if branch == "main" {
                 frozen_main_manifest_version.unwrap_or_else(|| branch_snapshot.version())
             } else {
                 branch_snapshot.version()
             };
-            let member_digest = retirement_branch_member_digest(
-                &branch,
-                &branch_identifier,
-                graph_head.as_deref(),
+            let table_witness_digest = retirement_table_witness_digest(&branch_snapshot)?;
+            members.push(StreamAuthorityRetirementExportMember::from_table_witness(
+                branch,
+                branch_identifier,
+                graph_head,
                 frozen_manifest_version,
-                &branch_snapshot,
-            )?;
-            hash_field(&mut cut, member_digest.as_bytes());
+                table_witness_digest,
+            )?);
         }
-        Ok((finish_digest(heads), finish_digest(cut)))
+        Ok((schema_ir_hash, members))
     }
 
-    pub(super) async fn capture_retirement_export_member(
+    pub(super) async fn capture_retirement_export_provenance(
         &self,
         branch: &str,
         expected_snapshot: &crate::db::Snapshot,
-        frozen_main_manifest_version: u64,
-    ) -> Result<StreamAuthorityRetirementExportMember> {
+        receipt: AuthorityRetirementReceipt,
+    ) -> Result<StreamAuthorityRetirementExportProvenance> {
         let normalized = Self::normalize_branch_name(branch)?;
         let canonical_branch = normalized.as_deref().unwrap_or("main").to_string();
         let selected = self
@@ -867,37 +1002,137 @@ impl Omnigraph {
                 "retired export branch moved after its frozen read view was captured",
             ));
         }
-        let branch_identifier = selected.branch_identifier().await?;
-        let graph_head = selected.exact_graph_head();
-        let manifest_version = if canonical_branch == "main" {
-            frozen_main_manifest_version
-        } else {
-            snapshot.version()
+        let (source_schema_ir_hash, members) = self
+            .capture_retirement_logical_cut_members_with_main_version(Some(
+                receipt.source_manifest_version,
+            ))
+            .await?;
+        let live_branch_heads_digest = retirement_live_branch_heads_digest(&members)?;
+        let ordered_branch_member_digests = members
+            .iter()
+            .map(|member| member.branch_member_digest.clone())
+            .collect::<Vec<_>>();
+        let export_cut_digest =
+            retirement_export_cut_digest(&source_schema_ir_hash, &ordered_branch_member_digests)?;
+        if live_branch_heads_digest != receipt.live_branch_heads_digest
+            || export_cut_digest != receipt.export_cut_digest
+        {
+            return Err(OmniError::manifest_internal(
+                "retired export proof differs from its selected authority-retirement receipt",
+            ));
+        }
+        let selected_member_index = members
+            .iter()
+            .position(|member| member.branch == canonical_branch)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "retired export selected branch is absent from the receipt-bound cut",
+                )
+            })?;
+        let branch_member = members[selected_member_index].clone();
+        let selected_member_index = u64::try_from(selected_member_index).map_err(|_| {
+            OmniError::manifest_internal("retired export selected member index exceeds u64")
+        })?;
+        let provenance = StreamAuthorityRetirementExportProvenance {
+            kind: EXPORT_PROVENANCE_KIND.to_string(),
+            receipt,
+            source_schema_ir_hash,
+            ordered_branch_member_digests,
+            selected_member_index,
+            branch_member,
         };
-        let branch_member_digest = retirement_branch_member_digest(
-            &canonical_branch,
-            &branch_identifier,
-            graph_head.as_deref(),
-            manifest_version,
-            &snapshot,
-        )?;
-        Ok(StreamAuthorityRetirementExportMember {
-            branch: canonical_branch,
-            branch_identifier,
-            graph_head,
-            manifest_version,
-            branch_member_digest,
-        })
+        provenance.validate_for_rebuild()?;
+        Ok(provenance)
     }
 }
 
-fn retirement_branch_member_digest(
+fn validate_canonical_retirement_digest(field: &str, value: &str) -> Result<()> {
+    let Some(digest) = value.strip_prefix("sha256:") else {
+        return Err(OmniError::manifest(format!(
+            "{field} digest must use canonical sha256:<lowercase-hex> form"
+        )));
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(OmniError::manifest(format!(
+            "{field} digest must contain exactly 64 lowercase hexadecimal digits"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_retirement_export_member_fields(
+    branch: &str,
+    branch_identifier: &lance::dataset::refs::BranchIdentifier,
+    graph_head: Option<&str>,
+    manifest_version: u64,
+    table_witness_digest: &str,
+) -> Result<()> {
+    let normalized = Omnigraph::normalize_branch_name(branch)?;
+    let canonical = normalized.as_deref().unwrap_or("main");
+    if canonical != branch
+        || manifest_version == 0
+        || graph_head.is_some_and(|head| head.is_empty() || head.trim() != head)
+        || (branch == "main"
+            && branch_identifier != &lance::dataset::refs::BranchIdentifier::main())
+        || (branch != "main"
+            && branch_identifier == &lance::dataset::refs::BranchIdentifier::main())
+    {
+        return Err(OmniError::manifest(
+            "invalid frozen retirement export branch-member fields",
+        ));
+    }
+    validate_canonical_retirement_digest("retirement export table witness", table_witness_digest)
+}
+
+fn retirement_table_witness_digest(snapshot: &crate::db::Snapshot) -> Result<String> {
+    let mut table_witness = Sha256::new();
+    table_witness.update(EXPORT_TABLE_WITNESS_DOMAIN);
+    let mut entries = snapshot.entries().collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.identity
+            .cmp(&right.identity)
+            .then_with(|| left.table_key.cmp(&right.table_key))
+    });
+    hash_u64(&mut table_witness, entries.len() as u64);
+    for entry in entries {
+        hash_u64(&mut table_witness, entry.identity.stable_table_id);
+        hash_u64(&mut table_witness, entry.identity.table_incarnation_id);
+        hash_field(&mut table_witness, entry.table_key.as_bytes());
+        hash_field(&mut table_witness, entry.table_path.as_bytes());
+        hash_u64(&mut table_witness, entry.table_version);
+        hash_field(
+            &mut table_witness,
+            entry.table_branch.as_deref().unwrap_or("").as_bytes(),
+        );
+        hash_u64(&mut table_witness, entry.row_count);
+        let metadata = serde_json::to_vec(&entry.version_metadata).map_err(|error| {
+            OmniError::manifest_internal(format!(
+                "failed to encode retirement table witness: {error}"
+            ))
+        })?;
+        hash_field(&mut table_witness, &metadata);
+    }
+    Ok(finish_digest(table_witness))
+}
+
+fn retirement_branch_member_digest_from_witness(
     branch: &str,
     branch_identifier: &lance::dataset::refs::BranchIdentifier,
     graph_head: Option<&str>,
     frozen_manifest_version: u64,
-    snapshot: &crate::db::Snapshot,
+    table_witness_digest: &str,
 ) -> Result<String> {
+    validate_retirement_export_member_fields(
+        branch,
+        branch_identifier,
+        graph_head,
+        frozen_manifest_version,
+        table_witness_digest,
+    )?;
     let identifier = serde_json::to_vec(branch_identifier).map_err(|error| {
         OmniError::manifest_internal(format!(
             "failed to encode retirement branch identity: {error}"
@@ -910,32 +1145,57 @@ fn retirement_branch_member_digest(
     hash_u32(&mut member, u32::from(graph_head.is_some()));
     hash_field(&mut member, graph_head.unwrap_or("").as_bytes());
     hash_u64(&mut member, frozen_manifest_version);
-    let mut entries = snapshot.entries().collect::<Vec<_>>();
-    entries.sort_by(|left, right| {
-        left.identity
-            .cmp(&right.identity)
-            .then_with(|| left.table_key.cmp(&right.table_key))
-    });
-    hash_u64(&mut member, entries.len() as u64);
-    for entry in entries {
-        hash_u64(&mut member, entry.identity.stable_table_id);
-        hash_u64(&mut member, entry.identity.table_incarnation_id);
-        hash_field(&mut member, entry.table_key.as_bytes());
-        hash_field(&mut member, entry.table_path.as_bytes());
-        hash_u64(&mut member, entry.table_version);
-        hash_field(
-            &mut member,
-            entry.table_branch.as_deref().unwrap_or("").as_bytes(),
-        );
-        hash_u64(&mut member, entry.row_count);
-        let metadata = serde_json::to_vec(&entry.version_metadata).map_err(|error| {
+    hash_field(&mut member, table_witness_digest.as_bytes());
+    Ok(finish_digest(member))
+}
+
+pub(crate) fn retirement_live_branch_heads_digest(
+    members: &[StreamAuthorityRetirementExportMember],
+) -> Result<String> {
+    let mut heads = Sha256::new();
+    heads.update(BRANCH_HEADS_DOMAIN);
+    hash_u64(&mut heads, members.len() as u64);
+    for member in members {
+        let recomputed = member.recompute_digest()?;
+        if recomputed != member.branch_member_digest {
+            return Err(OmniError::manifest(
+                "retirement export branch-member witness/digest mismatch",
+            ));
+        }
+        let identifier = serde_json::to_vec(&member.branch_identifier).map_err(|error| {
             OmniError::manifest_internal(format!(
-                "failed to encode retirement table witness: {error}"
+                "failed to encode retirement branch identity: {error}"
             ))
         })?;
-        hash_field(&mut member, &metadata);
+        hash_field(&mut heads, member.branch.as_bytes());
+        hash_field(&mut heads, &identifier);
+        hash_field(
+            &mut heads,
+            member.graph_head.as_deref().unwrap_or("").as_bytes(),
+        );
     }
-    Ok(finish_digest(member))
+    Ok(finish_digest(heads))
+}
+
+pub(crate) fn retirement_export_cut_digest(
+    source_schema_ir_hash: &str,
+    ordered_branch_member_digests: &[String],
+) -> Result<String> {
+    validate_canonical_retirement_digest("retirement export source schema", source_schema_ir_hash)?;
+    if ordered_branch_member_digests.is_empty() {
+        return Err(OmniError::manifest(
+            "retirement export cut proof must contain at least the main branch member",
+        ));
+    }
+    let mut cut = Sha256::new();
+    cut.update(EXPORT_CUT_DOMAIN);
+    hash_field(&mut cut, source_schema_ir_hash.as_bytes());
+    hash_u64(&mut cut, ordered_branch_member_digests.len() as u64);
+    for digest in ordered_branch_member_digests {
+        validate_canonical_retirement_digest("retirement export cut member", digest)?;
+        hash_field(&mut cut, digest.as_bytes());
+    }
+    Ok(finish_digest(cut))
 }
 
 async fn validate_current_token_base_parity_and_counts(

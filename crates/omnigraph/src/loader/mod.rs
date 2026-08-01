@@ -20,7 +20,7 @@ use omnigraph_compiler::types::PropType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::db::Omnigraph;
+use crate::db::{Omnigraph, StreamAuthorityRetirementExportProvenance};
 use crate::error::{OmniError, Result};
 use crate::exec::staging::{MutationStaging, PendingMode};
 use crate::storage_layer::KEYED_WRITE_MAX_BYTES;
@@ -58,25 +58,7 @@ pub struct IngestResult {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExportProvenanceEnvelope {
-    _omnigraph_export_provenance: StreamAuthorityRetirementProvenance,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StreamAuthorityRetirementProvenance {
-    kind: String,
-    receipt: crate::db::manifest::AuthorityRetirementReceipt,
-    branch_member: StreamAuthorityRetirementBranchMemberProvenance,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StreamAuthorityRetirementBranchMemberProvenance {
-    branch: String,
-    branch_identifier: lance::dataset::refs::BranchIdentifier,
-    graph_head: Option<String>,
-    manifest_version: u64,
-    branch_member_digest: String,
+    _omnigraph_export_provenance: StreamAuthorityRetirementExportProvenance,
 }
 
 /// Load mode for data ingestion.
@@ -464,37 +446,12 @@ async fn load_jsonl_reader_once<R: BufRead>(
                         "record {record_num}: invalid stream-authority retirement provenance: {e}"
                     ))
                 })?;
-            if envelope._omnigraph_export_provenance.kind != "STREAM_AUTHORITY_RETIREMENT" {
-                return Err(OmniError::manifest(format!(
-                    "record {record_num}: unsupported export provenance kind '{}'",
-                    envelope._omnigraph_export_provenance.kind
-                )));
-            }
             let provenance = envelope._omnigraph_export_provenance;
-            provenance.receipt.validate()?;
-            let member = provenance.branch_member;
-            let normalized = Omnigraph::normalize_branch_name(&member.branch)?;
-            let canonical = normalized.as_deref().unwrap_or("main");
-            let digest_hex = member
-                .branch_member_digest
-                .strip_prefix("sha256:")
-                .unwrap_or_default();
-            if canonical != member.branch
-                || member.manifest_version == 0
-                || digest_hex.len() != 64
-                || !digest_hex
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                || (member.branch == "main"
-                    && member.branch_identifier != lance::dataset::refs::BranchIdentifier::main())
-                || (member.branch != "main"
-                    && member.branch_identifier == lance::dataset::refs::BranchIdentifier::main())
-            {
-                return Err(OmniError::manifest(format!(
-                    "record {record_num}: invalid frozen branch-member provenance"
-                )));
-            }
-            let _ = member.graph_head;
+            provenance.validate_for_rebuild().map_err(|error| {
+                OmniError::manifest(format!(
+                    "record {record_num}: invalid stream-authority retirement provenance: {error}"
+                ))
+            })?;
             saw_export_provenance = true;
             continue;
         }
@@ -2613,7 +2570,41 @@ edge WorksAt: Person -> Company
 {"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 "#;
 
-    fn retirement_provenance_line() -> String {
+    fn retirement_digest(digit: char) -> String {
+        format!("sha256:{}", digit.to_string().repeat(64))
+    }
+
+    fn retirement_provenance_line(source_schema_ir_hash: &str) -> String {
+        let main_identifier = lance::dataset::refs::BranchIdentifier::main();
+        let archive_identifier = lance::dataset::refs::BranchIdentifier::new(&main_identifier, 3);
+        let archive_member = crate::db::StreamAuthorityRetirementExportMember::from_table_witness(
+            "archive",
+            archive_identifier,
+            Some("01H00000000000000000000002".to_string()),
+            4,
+            retirement_digest('8'),
+        )
+        .unwrap();
+        let main_member = crate::db::StreamAuthorityRetirementExportMember::from_table_witness(
+            "main",
+            main_identifier,
+            Some("01H00000000000000000000000".to_string()),
+            7,
+            retirement_digest('7'),
+        )
+        .unwrap();
+        let members = vec![archive_member, main_member.clone()];
+        let live_branch_heads_digest =
+            crate::db::retirement_live_branch_heads_digest(&members).unwrap();
+        let ordered_branch_member_digests = members
+            .iter()
+            .map(|member| member.branch_member_digest.clone())
+            .collect::<Vec<_>>();
+        let export_cut_digest = crate::db::retirement_export_cut_digest(
+            source_schema_ir_hash,
+            &ordered_branch_member_digests,
+        )
+        .unwrap();
         let token_head = crate::db::manifest::CurrentHeadWitness {
             branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
             table_version: 5,
@@ -2627,36 +2618,34 @@ edge WorksAt: Person -> Company
         )
         .unwrap();
         let receipt = crate::db::manifest::AuthorityRetirementReceipt::new(
-            format!("sha256:{}", "1".repeat(64)),
+            retirement_digest('1'),
             &crate::db::manifest::stream_profile::ReceiptChainRef::genesis(),
             "11111111-1111-4111-8111-111111111111",
-            format!("sha256:{}", "2".repeat(64)),
+            retirement_digest('2'),
             "operator:alice",
             crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
             7,
-            format!("sha256:{}", "3".repeat(64)),
+            live_branch_heads_digest,
             2,
-            format!("sha256:{}", "4".repeat(64)),
+            retirement_digest('4'),
             token_head,
             token_witness,
             3,
             1,
-            format!("sha256:{}", "6".repeat(64)),
+            export_cut_digest,
             1_700_000_000_000_000,
         )
         .unwrap();
+        let provenance = crate::db::StreamAuthorityRetirementExportProvenance {
+            kind: "STREAM_AUTHORITY_RETIREMENT".to_string(),
+            receipt,
+            source_schema_ir_hash: source_schema_ir_hash.to_string(),
+            ordered_branch_member_digests,
+            selected_member_index: 1,
+            branch_member: main_member,
+        };
         serde_json::json!({
-            "_omnigraph_export_provenance": {
-                "kind": "STREAM_AUTHORITY_RETIREMENT",
-                "receipt": receipt,
-                "branch_member": {
-                    "branch": "main",
-                    "branch_identifier": lance::dataset::refs::BranchIdentifier::main(),
-                    "graph_head": "01H00000000000000000000000",
-                    "manifest_version": 7,
-                    "branch_member_digest": format!("sha256:{}", "7".repeat(64)),
-                },
-            }
+            "_omnigraph_export_provenance": provenance,
         })
         .to_string()
     }
@@ -2798,7 +2787,11 @@ edge WorksAt: Person -> Company
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        let input = format!("{}\n{}", retirement_provenance_line(), TEST_DATA);
+        let txn = db.open_write_txn(None).await.unwrap();
+        let schema_ir_hash = txn.authority.schema_ir_hash.clone();
+        drop(txn);
+        let provenance_line = retirement_provenance_line(&schema_ir_hash);
+        let input = format!("{}\n{}", provenance_line, TEST_DATA);
 
         let result = load_jsonl(&mut db, &input, LoadMode::Overwrite)
             .await
@@ -2810,7 +2803,105 @@ edge WorksAt: Person -> Company
         let tokens = snapshot.open_stream_token_authority().await.unwrap();
         assert_eq!(tokens.count_rows(None).await.unwrap(), 0);
 
-        let misplaced = format!("{}{}\n", TEST_DATA, retirement_provenance_line());
+        let valid: JsonValue = serde_json::from_str(&provenance_line).unwrap();
+        let mut tampered_cases = Vec::new();
+
+        let mut graph_head = valid.clone();
+        graph_head["_omnigraph_export_provenance"]["branch_member"]["graph_head"] =
+            JsonValue::String("01H00000000000000000000001".to_string());
+        tampered_cases.push((
+            "graph head",
+            graph_head,
+            "branch-member witness/digest mismatch",
+        ));
+
+        let mut branch_identity = valid.clone();
+        branch_identity["_omnigraph_export_provenance"]["branch_member"]["branch"] =
+            JsonValue::String("archive".to_string());
+        branch_identity["_omnigraph_export_provenance"]["branch_member"]["branch_identifier"] =
+            serde_json::to_value(lance::dataset::refs::BranchIdentifier::new(
+                &lance::dataset::refs::BranchIdentifier::main(),
+                5,
+            ))
+            .unwrap();
+        tampered_cases.push((
+            "branch identity",
+            branch_identity,
+            "branch-member witness/digest mismatch",
+        ));
+
+        let mut manifest_version = valid.clone();
+        manifest_version["_omnigraph_export_provenance"]["branch_member"]["manifest_version"] =
+            JsonValue::from(8);
+        tampered_cases.push((
+            "manifest version",
+            manifest_version,
+            "branch-member witness/digest mismatch",
+        ));
+
+        let mut table_witness = valid.clone();
+        table_witness["_omnigraph_export_provenance"]["branch_member"]["table_witness_digest"] =
+            JsonValue::String(retirement_digest('9'));
+        tampered_cases.push((
+            "table witness",
+            table_witness,
+            "branch-member witness/digest mismatch",
+        ));
+
+        let mut member_digest = valid.clone();
+        member_digest["_omnigraph_export_provenance"]["branch_member"]["branch_member_digest"] =
+            JsonValue::String(retirement_digest('9'));
+        tampered_cases.push((
+            "member digest",
+            member_digest,
+            "branch-member witness/digest mismatch",
+        ));
+
+        let mut selected_sibling = valid.clone();
+        selected_sibling["_omnigraph_export_provenance"]["selected_member_index"] =
+            JsonValue::from(0);
+        tampered_cases.push((
+            "selected sibling",
+            selected_sibling,
+            "is not selected by the receipt-bound cut proof",
+        ));
+
+        let mut selected_outside = valid.clone();
+        selected_outside["_omnigraph_export_provenance"]["selected_member_index"] =
+            JsonValue::from(2);
+        tampered_cases.push((
+            "selected index outside cut",
+            selected_outside,
+            "selected member index is outside the receipt-bound cut",
+        ));
+
+        let mut sibling_digest = valid.clone();
+        sibling_digest["_omnigraph_export_provenance"]["ordered_branch_member_digests"][0] =
+            JsonValue::String(retirement_digest('a'));
+        tampered_cases.push((
+            "sibling digest",
+            sibling_digest,
+            "is not in the receipt-bound export cut",
+        ));
+
+        let mut schema_hash = valid;
+        schema_hash["_omnigraph_export_provenance"]["source_schema_ir_hash"] =
+            JsonValue::String(retirement_digest('b'));
+        tampered_cases.push((
+            "source schema hash",
+            schema_hash,
+            "is not in the receipt-bound export cut",
+        ));
+
+        for (case, tampered, expected) in tampered_cases {
+            let tampered_input = format!("{}\n{}", tampered, TEST_DATA);
+            let error = load_jsonl(&mut db, &tampered_input, LoadMode::Overwrite)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{case}: {error}");
+        }
+
+        let misplaced = format!("{}{}\n", TEST_DATA, provenance_line);
         let error = load_jsonl(&mut db, &misplaced, LoadMode::Overwrite)
             .await
             .unwrap_err();

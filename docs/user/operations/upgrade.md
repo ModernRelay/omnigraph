@@ -189,11 +189,18 @@ read/query/status/export-only; there is no transition back. Export re-proves the
 frozen cut and writes one `_omnigraph_export_provenance` row before the
 logical rows. The row pairs the root-wide receipt with a `branch_member`
 witness containing the canonical selected branch, its exact Lance branch
-identifier, graph head, manifest version, and `branch_member_digest`. Loading
-the JSONL
-into a fresh v17 graph validates that closed provenance but imports no
-lifecycle, WAL, token, receipt-chain, or sequencing authority. Keep the retired
-source root for audit and rollback evidence.
+identifier, graph head, manifest version, `table_witness_digest`, and a
+recomputable `branch_member_digest`. It also carries
+`source_schema_ir_hash`, the exact `ordered_branch_member_digests`, and
+`selected_member_index`. Loading the JSONL into a fresh v17 graph recomputes
+the selected member digest, proves that it occupies the selected slot, and
+recomputes the receipt's `export_cut_digest` from the source schema hash and
+ordered member digests. `source_schema_ir_hash` describes the retired source
+cut; it is not required to equal the fresh target's graph identity. Ordinary
+loader schema and row validation separately enforce compatibility with the
+target schema. The rebuild imports no lifecycle, WAL, token, receipt-chain, or
+sequencing authority. Keep the retired source root for audit and rollback
+evidence.
 
 This slice does not activate authority correction or any production path that
 creates `WITHDRAWN`; it installs the terminal exit before such a path can ship.

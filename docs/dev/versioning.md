@@ -179,10 +179,16 @@ lineage-neutral manifest CAS selecting its token pointer and
 `DISABLED → RETIRED`. It moves no graph or branch head, emits no `GraphCommit`
 or `RecoveryAudit`, and has no outgoing transition. A retired source is
 query/status/export-only; export re-proves the frozen logical cut and emits the
-root receipt plus a closed witness binding the canonical selected branch,
-exact Lance branch identifier, graph head, manifest version, and branch-member
-digest (`branch_member_digest`). Authority correction remains
-inactive, and this slice adds no production path that creates `WITHDRAWN`.
+root receipt plus a selected `branch_member` witness binding the canonical
+branch, exact Lance branch identifier, graph head, manifest version,
+`table_witness_digest`, and a recomputable `branch_member_digest`. The export's
+`source_schema_ir_hash`, exact `ordered_branch_member_digests`, and
+`selected_member_index` let load prove the selected member's exact slot and
+recompute the receipt's `export_cut_digest`. The source schema hash commits the
+retired source cut; it need not equal the fresh target graph identity, whose
+schema compatibility remains ordinary loader validation. Authority correction
+remains inactive, and this slice adds no production path that creates
+`WITHDRAWN`.
 
 Recovery-v13 remains exactly the v11 profile-change protocol. Historical
 recovery-v10 enrollment and recovery-v12 lifecycle-v2 folds retain their old

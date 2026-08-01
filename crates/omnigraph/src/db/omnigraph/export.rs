@@ -48,22 +48,14 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
     let retirement_provenance = db.export_stream_authority_preflight().await?;
     let (resolved, catalog) = db.capture_read_view(ReadTarget::branch(branch)).await?;
     if let Some(receipt) = retirement_provenance {
-        let branch_member = db
-            .capture_retirement_export_member(
-                branch,
-                &resolved.snapshot,
-                receipt.source_manifest_version,
-            )
+        let provenance = db
+            .capture_retirement_export_provenance(branch, &resolved.snapshot, receipt)
             .await?;
         write_export_jsonl_row(
             writer,
             "_omnigraph_export_provenance",
             &serde_json::json!({
-                "_omnigraph_export_provenance": {
-                    "kind": "STREAM_AUTHORITY_RETIREMENT",
-                    "receipt": receipt,
-                    "branch_member": branch_member,
-                }
+                "_omnigraph_export_provenance": provenance,
             }),
         )?;
     }

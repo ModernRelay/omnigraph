@@ -2990,11 +2990,19 @@ token/profile pointer advance, avoiding a circular digest while allowing the
 post-CAS manifest to reverify the cut. Each later branch export is permitted
 only for a member of that frozen map. Its JSONL provenance pairs the unchanged
 root receipt with a closed `branch_member` witness containing the canonical
-branch name, exact Lance branch identifier, graph head, manifest version, and
-`branch_member_digest` for the selected frozen snapshot.
-The witness digest is a domain-separated hash of the exact pre-retirement
-`CurrentHeadWitness` plus the bounded disposition counts, never token-row
-bytes. V17 requires `withdrawn_token_count > 0` and has no `DEAD_LETTERED`
+branch name, exact Lance branch identifier, graph head, manifest version,
+`table_witness_digest`, and a recomputable `branch_member_digest`. It also
+carries `source_schema_ir_hash`, the exact
+`ordered_branch_member_digests`, and `selected_member_index`. The loader
+recomputes the selected member digest, proves that it occupies the selected
+slot, and recomputes the receipt's `export_cut_digest` from the source schema
+hash and ordered member digests. `source_schema_ir_hash` is a commitment input
+for the retired source cut, not a requirement that it equal the fresh target
+graph identity; ordinary loader schema and row validation enforce target
+compatibility. The receipt's pre-retirement token witness digest is a
+domain-separated hash of the exact pre-retirement `CurrentHeadWitness` plus
+the bounded disposition counts, never token-row bytes. V17 requires
+`withdrawn_token_count > 0` and has no `DEAD_LETTERED`
 vocabulary. Receipt lookup under root-wide occurrence `(graph identity,
 AUTHORITY_RETIREMENT, retirement_id)` precedes current-profile comparison, so
 a lost terminal response returns the recorded result and
@@ -3009,8 +3017,9 @@ branch-ref, profile, lifecycle, recovery, maintenance, writer-claim/fold,
 correction, enrollment, or rebind writer refuses before body admission or
 effect with
 `StreamAuthorityRetired { retirement_id, export_cut_digest }`. Export emits
-the exact selected root receipt plus a closed witness for the selected frozen
-branch member beside each logical artifact. `RETIRED` export
+the exact selected root receipt plus a recomputable, cut-membership-proved
+witness for the selected frozen branch member beside each logical artifact.
+`RETIRED` export
 verifies the profile mode, retirement receipt ID, profile-chain commitment, and
 logical-cut match; it trusts that committed cut proof and does not rerun or
 override it with the ordinary terminal-token refusal. The receipt is
@@ -4467,8 +4476,8 @@ lineage-neutral `DISABLED → RETIRED` manifest publication that selects its exa
 token witness. It moves no graph or branch head, creates no `GraphCommit` or
 `RecoveryAudit`, and leaves the source query/status/export-only. Retired export
 re-proves the receipt/profile/logical cut and emits the selected root receipt
-plus the closed selected-branch-member witness as provenance before logical
-rows.
+plus the recomputable selected-member witness and ordered membership proof as
+provenance before logical rows.
 Recovery-v13 `StreamProfileChange` remains active with its exact old meaning.
 Historical recovery-v10 enrollment, recovery-v12 lifecycle-v2 folds, and the
 incomplete v14 sealed-maintenance/resume/retirement/rebind scaffolds are refused
@@ -4604,7 +4613,8 @@ base/token parity, and at least one current `WITHDRAWN` token. Actor-bound
 confirmation appends the immutable retirement receipt and selects it with
 `RETIRED` in one lineage-neutral manifest CAS. The source then permits only
 read/query/status/export, and export includes the selected root receipt plus a
-closed witness for the selected frozen branch member. The frozen recovery-v14
+recomputable selected-member witness and the ordered proof needed to recover
+the receipt-bound cut. The frozen recovery-v14
 retirement scaffold is not reinterpreted.
 The genuine v16↔v17 gate proves both-direction refusal and clean
 export/init/load rebuild. Authority correction and every production route that
@@ -5368,8 +5378,9 @@ required before correction or public ingress can make `WITHDRAWN` reachable.
   enrollment, receipt, or dead-letter authority. The source token rows, receipt
   ledger, WAL/dead-letter artifacts, and base versions remain byte-for-byte
   authoritative and retained. A two-live-branch cell proves each export keeps
-  the same root receipt while emitting a distinct, self-consistent
-  `branch_member` witness for the selected frozen branch. Any later enrollment
+  the same root receipt and ordered member-digest proof while emitting a
+  distinct, recomputable `branch_member` witness and selected index for the
+  chosen frozen branch. Any later enrollment
   of the fresh
   graph mints a new stream incarnation; an old-incarnation request is effect-free
   `StreamBindingChanged`.

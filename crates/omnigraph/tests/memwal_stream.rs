@@ -621,11 +621,13 @@ async fn stream_lane(db: &Omnigraph) -> StreamTableStatus {
 async fn authority_retirement_unblocks_exact_provenance_rebuild_and_freezes_source() {
     let _scenario = FailScenario::setup();
     let fixture = prepare_authority_retirement_fixture().await;
-    let main_export = confirm_retirement_and_export_frozen_cut(&fixture).await;
+    let (main_export, archive_export) = confirm_retirement_and_export_frozen_cut(&fixture).await;
     assert_retired_source_refuses_writers(&fixture).await;
     assert_retired_schema_staging_remains_untouched(&fixture).await;
     assert_retirement_confirmation_is_idempotent(&fixture).await;
     assert_retired_export_rebuilds_without_authority(&main_export).await;
+    assert_retired_export_rebuilds_without_authority(&archive_export).await;
+    assert_retired_export_rejects_tampered_member(&main_export).await;
     assert_retired_named_branch_healer_refuses_orphan_discard(&fixture).await;
 }
 
@@ -693,7 +695,9 @@ async fn prepare_authority_retirement_fixture() -> AuthorityRetirementFixture {
 }
 
 #[inline(never)]
-async fn confirm_retirement_and_export_frozen_cut(fixture: &AuthorityRetirementFixture) -> String {
+async fn confirm_retirement_and_export_frozen_cut(
+    fixture: &AuthorityRetirementFixture,
+) -> (String, String) {
     let AuthorityRetirementFixture {
         db,
         cluster_uri,
@@ -745,8 +749,31 @@ async fn confirm_retirement_and_export_frozen_cut(fixture: &AuthorityRetirementF
         provenance["_omnigraph_export_provenance"]["receipt"]["export_cut_digest"],
         archive_provenance["_omnigraph_export_provenance"]["receipt"]["export_cut_digest"]
     );
+    assert_eq!(
+        provenance["_omnigraph_export_provenance"]["source_schema_ir_hash"],
+        archive_provenance["_omnigraph_export_provenance"]["source_schema_ir_hash"]
+    );
+    assert_eq!(
+        provenance["_omnigraph_export_provenance"]["ordered_branch_member_digests"],
+        archive_provenance["_omnigraph_export_provenance"]["ordered_branch_member_digests"],
+        "every branch export must carry the same complete receipt-cut preimage"
+    );
+    assert_ne!(
+        provenance["_omnigraph_export_provenance"]["selected_member_index"],
+        archive_provenance["_omnigraph_export_provenance"]["selected_member_index"],
+        "main and archive must select their own member of the shared cut proof"
+    );
+    for proof in [&provenance, &archive_provenance] {
+        let proof = &proof["_omnigraph_export_provenance"];
+        let selected_index = proof["selected_member_index"].as_u64().unwrap() as usize;
+        assert_eq!(
+            proof["branch_member"]["branch_member_digest"],
+            proof["ordered_branch_member_digests"][selected_index],
+            "the selected leaf must be present at its claimed cut-proof index"
+        );
+    }
 
-    main_export
+    (main_export, archive_export)
 }
 
 #[inline(never)]
@@ -891,6 +918,35 @@ async fn assert_retired_export_rebuilds_without_authority(main_export: &str) {
             .map(|line| format!("{line}\n"))
             .collect::<String>(),
         "rebuild imports logical rows but no retirement provenance or sequencing authority"
+    );
+}
+
+#[inline(never)]
+async fn assert_retired_export_rejects_tampered_member(main_export: &str) {
+    let mut lines = main_export.lines();
+    let mut provenance: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    let version = provenance["_omnigraph_export_provenance"]["branch_member"]["manifest_version"]
+        .as_u64()
+        .unwrap();
+    provenance["_omnigraph_export_provenance"]["branch_member"]["manifest_version"] =
+        serde_json::Value::from(version + 1);
+    let tampered_export = std::iter::once(provenance.to_string())
+        .chain(lines.map(str::to_string))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+
+    let rebuilt_dir = tempfile::tempdir().unwrap();
+    let rebuilt = Omnigraph::init(rebuilt_dir.path().to_str().unwrap(), STREAM_SCHEMA)
+        .await
+        .unwrap();
+    let error = load_jsonl(&rebuilt, &tampered_export, LoadMode::Overwrite)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("retirement export branch-member witness/digest mismatch"),
+        "{error}"
     );
 }
 

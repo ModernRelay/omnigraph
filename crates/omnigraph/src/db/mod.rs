@@ -20,7 +20,14 @@ pub use omnigraph::{
     StreamTableStatus, StreamingProfileResult, TableCleanupStats, TableOptimizeStats,
     TableRepairStats,
 };
-pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
+pub(crate) use omnigraph::{
+    DeferredTableFork, StreamAuthorityRetirementExportProvenance, WriteAuthorityToken, WriteTxn,
+};
+#[cfg(test)]
+pub(crate) use omnigraph::{
+    StreamAuthorityRetirementExportMember, retirement_export_cut_digest,
+    retirement_live_branch_heads_digest,
+};
 
 use crate::error::{OmniError, Result};
 

@@ -761,11 +761,16 @@ no graph or branch head, writes no `GraphCommit` or `RecoveryAudit`, and has no
 outgoing transition. A retired source refuses all mutation and maintenance but
 continues query/status/export. Export re-proves the receipt/profile/logical cut
 and emits `_omnigraph_export_provenance` with the selected root receipt plus a
-closed `branch_member` witness before logical rows. The witness binds the
+selected `branch_member` witness before logical rows. The witness binds the
 canonical branch, exact Lance branch identifier, graph head, manifest version,
-and `branch_member_digest`. This exit discards sequencing authority only by
-rebuilding into a fresh
-graph identity; it never rewrites a `WITHDRAWN` token as `PRESENT`.
+`table_witness_digest`, and a recomputable `branch_member_digest`. The export's
+`source_schema_ir_hash`, exact `ordered_branch_member_digests`, and
+`selected_member_index` let load verify the selected slot and recompute the
+receipt's `export_cut_digest`. The source schema hash is proof input for the
+retired source cut, not an identity that must equal the fresh target; ordinary
+loader validation enforces target schema compatibility. This exit discards
+sequencing authority only by rebuilding into a fresh graph identity; it never
+rewrites a `WITHDRAWN` token as `PRESENT`.
 
 Rebind does not make ordinary writer admission proportional to retained
 binding history. The manifest-selected `BindingReceipt` authenticates the

@@ -372,7 +372,7 @@ Throughout the docs, capabilities are split into:
 
 - `omnigraph-compiler` — schema and query grammars, catalog, IR, lowering, type checker, lint, migration planner, OpenAI-style embedding client.
 - `omnigraph-storage` — the shared local/S3 control-object storage implementation and concrete backend handle used below the engine/cluster split.
-- `omnigraph-control-authority` — persisted cluster-lock ownership below the engine/cluster split; depends only on `omnigraph-storage`. It now owns opaque checked stopped/offline profile and served-runtime authority; retired export authority remains a later lifecycle slice.
+- `omnigraph-control-authority` — persisted cluster-lock ownership below the engine/cluster split; depends only on `omnigraph-storage`. It owns the opaque checked stopped/offline authority used by profile changes and terminal retirement, plus served-runtime authority. Retired export is authenticated separately by the engine's selected immutable receipt and cut-membership proof.
 - `omnigraph` (engine, published as `omnigraph-engine` on crates.io since v0.2.2) — the Lance-backed runtime: manifest, commit graph, snapshot, exec (incl. per-query `MutationStaging` accumulator), merge, loader, Gemini embedding client.
 - `omnigraph-policy` — Cedar policy compilation and engine-facing enforcement.
 - `omnigraph-api-types` — shared HTTP wire DTOs used by the server and CLI.
