@@ -19,8 +19,8 @@ use omnigraph::error::OmniError;
 // it is registry-only (error-type agnostic) and lives in the lowest crate.
 use omnigraph::failpoints::ScopedFailPoint;
 use omnigraph_cluster::{
-    ApplyOptions, apply_config_dir, apply_config_dir_with_options, approve_config_dir,
-    validate_config_dir,
+    ApplyDisposition, ApplyOptions, apply_config_dir, apply_config_dir_with_options,
+    approve_config_dir, validate_config_dir,
 };
 use serial_test::serial;
 use tempfile::tempdir;
@@ -756,8 +756,13 @@ async fn delete_crash_after_removal_rolls_forward() {
 async fn delete_blocked_when_graph_root_is_unreadable() {
     let dir = fixture();
     let approval_id = seed_approved_delete_with_root(dir.path(), false).await;
+    let fake_schema = dir.path().join("graphs/old.omni/_schema.pg");
+    let fake_schema_before = fs::read(&fake_schema).unwrap();
 
     let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(!out.converged, "{out:?}");
+    assert!(out.state_written, "the blocked disposition must be durable");
     assert!(
         out.diagnostics
             .iter()
@@ -765,10 +770,31 @@ async fn delete_blocked_when_graph_root_is_unreadable() {
         "{:?}",
         out.diagnostics
     );
-    // The root is preserved, the approval unconsumed, and nothing was armed:
-    // the delete never started.
+    let graph_change = out
+        .changes
+        .iter()
+        .find(|change| change.resource == "graph.old")
+        .unwrap();
+    assert_eq!(graph_change.disposition, Some(ApplyDisposition::Blocked));
+    assert_eq!(
+        graph_change.reason.as_deref(),
+        Some("streaming_profile_must_disable_first")
+    );
+    // The exact root is preserved, the approval is unconsumed, and nothing
+    // was armed: only the blocked status is durably recorded; the delete never
+    // started and no tombstone was published.
     assert!(dir.path().join("graphs/old.omni").exists());
+    assert_eq!(fs::read(&fake_schema).unwrap(), fake_schema_before);
     assert!(recovery_sidecars(dir.path()).is_empty());
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(state_path(dir.path())).unwrap()).unwrap();
+    assert_eq!(state["resource_statuses"]["graph.old"]["status"], "blocked");
+    assert_eq!(
+        state["resource_statuses"]["graph.old"]["conditions"][0],
+        "streaming_profile_must_disable_first"
+    );
+    assert!(state["observations"].get("graph.old").is_none());
+    assert!(state["approval_records"].get(&approval_id).is_none());
     let artifact: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(
             dir.path()

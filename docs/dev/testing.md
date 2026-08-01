@@ -20,8 +20,10 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 The workflow has one conservative text-only classifier: only known top-level
 documentation files and documentation formats below `docs/` may skip the
 post-merge heavy jobs. A Markdown/text fixture under `crates/` is source, not
-documentation. There is no dedicated firehose artifact, dependency-key, or
-compile harness.
+documentation. There is no dedicated firehose artifact or dependency-key
+harness. Code pull requests run a reporting-only
+`cargo check --workspace --locked` with default features; the heavy test graphs
+remain post-merge, tag-, or dispatch-time owners.
 
 When changing `.github/workflows/ci.yml`, validate its syntax and the remaining
 shell owners:
