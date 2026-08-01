@@ -268,6 +268,90 @@ pub struct AppState {
     /// resource. Loaded from the cluster-scoped policy binding when
     /// configured. Per-graph policies live on each `GraphHandle.policy`.
     server_policy: Option<Arc<PolicyEngine>>,
+    /// Dormant resident-fold targets selected only by the checked cluster
+    /// runtime path. `serve` starts them after the listener is bound; ordinary
+    /// `AppState` construction (including router tests) never creates a
+    /// background task.
+    stream_fold_drivers: StreamFoldDrivers,
+}
+
+#[derive(Clone)]
+struct StreamFoldDriverTarget {
+    graph_id: Arc<str>,
+    engine: Arc<Omnigraph>,
+}
+
+#[derive(Clone, Default)]
+struct StreamFoldDrivers {
+    targets: Arc<[StreamFoldDriverTarget]>,
+}
+
+impl StreamFoldDrivers {
+    fn new(targets: Vec<StreamFoldDriverTarget>) -> Self {
+        Self {
+            targets: targets.into(),
+        }
+    }
+
+    async fn start_all(&self) -> Result<()> {
+        for (index, target) in self.targets.iter().enumerate() {
+            if let Err(start_error) = target.engine.start_stream_fold_driver().await {
+                // Include the failing target in cleanup. The engine shutdown
+                // bridge is safe before start and closes any future partial
+                // start implementation without weakening this boundary.
+                let cleanup_result = Self::shutdown_targets(&self.targets[..=index]).await;
+                return match cleanup_result {
+                    Ok(()) => Err(eyre!(
+                        "start resident stream fold driver for graph '{}': {start_error}",
+                        target.graph_id
+                    )),
+                    Err(cleanup_error) => Err(eyre!(
+                        "start resident stream fold driver for graph '{}': {start_error}; cleanup after partial startup also failed: {cleanup_error}",
+                        target.graph_id
+                    )),
+                };
+            }
+        }
+        Ok(())
+    }
+
+    async fn shutdown_all(&self) -> Result<()> {
+        Self::shutdown_targets(&self.targets).await
+    }
+
+    async fn shutdown_targets(targets: &[StreamFoldDriverTarget]) -> Result<()> {
+        // Each engine enforces the same bounded shutdown deadline. Join every
+        // graph concurrently so the serving-process deadline remains bounded
+        // once, rather than once per graph.
+        let outcomes = futures::future::join_all(targets.iter().map(|target| async move {
+            (
+                Arc::clone(&target.graph_id),
+                target.engine.shutdown_stream_fold_driver().await,
+            )
+        }))
+        .await;
+        let failures = outcomes
+            .into_iter()
+            .filter_map(|(graph_id, outcome)| {
+                outcome
+                    .err()
+                    .map(|error| format!("graph '{graph_id}': {error}"))
+            })
+            .collect::<Vec<_>>();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "resident stream fold driver shutdown failed: {}",
+                failures.join("; ")
+            )
+        }
+    }
+}
+
+struct OpenedGraph {
+    handle: Arc<GraphHandle>,
+    stream_fold_driver: Option<StreamFoldDriverTarget>,
 }
 
 struct ExportStreamWriter {
@@ -547,6 +631,7 @@ impl AppState {
             workload,
             bearer_tokens,
             server_policy: None,
+            stream_fold_drivers: StreamFoldDrivers::default(),
         }
     }
 
@@ -573,6 +658,7 @@ impl AppState {
             workload: Arc::new(workload),
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
+            stream_fold_drivers: StreamFoldDrivers::default(),
         })
     }
 
@@ -1339,10 +1425,31 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     };
 
     let listener = TcpListener::bind(&bind).await?;
-    axum::serve(listener, build_app(state))
+
+    // The registry and listener are both authoritative before any resident
+    // task starts. A graph discarded by strict startup, URI collision, or a
+    // bind failure therefore cannot retain its runtime-authority guard in a
+    // background task.
+    state.stream_fold_drivers.start_all().await?;
+    let stream_fold_drivers = state.stream_fold_drivers.clone();
+    let serve_result = axum::serve(listener, build_app(state))
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
+        .await;
+    // On graceful shutdown, Axum has stopped admission and settled every
+    // in-flight request before the driver stop is requested. A detached write
+    // therefore cannot create a new fold trigger after the driver observes an
+    // empty pending map. A server error takes this same best-effort cleanup
+    // path before its error is returned.
+    let driver_shutdown_result = stream_fold_drivers.shutdown_all().await;
+
+    match (serve_result, driver_shutdown_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(server_error), Ok(())) => Err(server_error.into()),
+        (Ok(()), Err(shutdown_error)) => Err(shutdown_error),
+        (Err(server_error), Err(shutdown_error)) => Err(eyre!(
+            "HTTP server failed: {server_error}; resident stream fold driver shutdown also failed: {shutdown_error}"
+        )),
+    }
 }
 
 /// Load a graph-scoped policy bundle from either source kind.
@@ -1394,10 +1501,14 @@ pub async fn open_multi_graph_state(
         .collect::<Vec<_>>()
         .await;
     let mut handles = Vec::new();
+    let mut stream_fold_drivers = Vec::new();
     let mut failed = 0usize;
     for result in results {
         match result {
-            Ok(handle) => handles.push(handle),
+            Ok(opened) => {
+                handles.push(opened.handle);
+                stream_fold_drivers.extend(opened.stream_fold_driver);
+            }
             Err((graph_id, err)) => {
                 failed += 1;
                 warn!(
@@ -1424,14 +1535,16 @@ pub async fn open_multi_graph_state(
     }
 
     let workload = workload::WorkloadController::from_env();
-    let state = AppState::new_multi(handles, tokens, server_policy, workload, Some(config_path))
-        .map_err(|err| color_eyre::eyre::eyre!("multi-graph registry: {err}"))?;
+    let mut state =
+        AppState::new_multi(handles, tokens, server_policy, workload, Some(config_path))
+            .map_err(|err| color_eyre::eyre::eyre!("multi-graph registry: {err}"))?;
+    state.stream_fold_drivers = StreamFoldDrivers::new(stream_fold_drivers);
     Ok(state)
 }
 
 /// Open one graph and wrap it in a `GraphHandle`. Used at startup by
 /// `open_multi_graph_state`.
-async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> {
+async fn open_single_graph(cfg: GraphStartupConfig) -> Result<OpenedGraph> {
     let graph_id = GraphId::try_from(cfg.graph_id.clone())
         .map_err(|err| color_eyre::eyre::eyre!("graph id '{}': {err}", cfg.graph_id))?;
     let uri = normalize_root_uri(&cfg.uri)
@@ -1440,6 +1553,7 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
     let db = Omnigraph::open(&uri)
         .await
         .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, uri))?;
+    let has_checked_stream_runtime = cfg.stream_runtime_authority.is_some();
     let db = if let Some(binding) = cfg.stream_runtime_authority {
         let operation_id = format!(
             "serve:{}:state-{}",
@@ -1504,13 +1618,22 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
         None => (None, db),
     };
 
-    Ok(Arc::new(GraphHandle {
-        key: GraphKey::cluster(graph_id),
-        uri,
-        engine: Arc::new(db),
-        policy: policy_arc,
-        queries,
-    }))
+    let driver_graph_id: Arc<str> = Arc::from(graph_id.as_str());
+    let engine = Arc::new(db);
+    let stream_fold_driver = has_checked_stream_runtime.then(|| StreamFoldDriverTarget {
+        graph_id: driver_graph_id,
+        engine: Arc::clone(&engine),
+    });
+    Ok(OpenedGraph {
+        handle: Arc::new(GraphHandle {
+            key: GraphKey::cluster(graph_id),
+            uri,
+            engine,
+            policy: policy_arc,
+            queries,
+        }),
+        stream_fold_driver,
+    })
 }
 
 async fn shutdown_signal() {

@@ -1814,6 +1814,23 @@ pub(crate) type IdleAuthorityFuture =
 pub(crate) type IdleAuthorityCheck =
     Arc<dyn Fn(Arc<ShardWriter>) -> IdleAuthorityFuture + Send + Sync + 'static>;
 
+/// Infallible handoff from the detached physical owner to the root fold
+/// supervisor. `true` means the current generation is already fold-only or a
+/// new append hit its cap; `false` starts the normal max-staleness cadence.
+pub(crate) type StreamFoldTrigger = Arc<dyn Fn(bool) + Send + Sync + 'static>;
+
+/// Side-effect-free view of one resident worker while the caller owns that
+/// table's exclusive stream-admission lease. `Missing` means the caller must
+/// use the durable lifecycle/WAL probe; it must not create a worker merely to
+/// decide whether a fold is ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResidentFoldReadiness {
+    Missing,
+    Idle,
+    Ready,
+    Busy,
+}
+
 pub(crate) struct IdleAuthorityFailure {
     error: OmniError,
     authority: CheckedStreamAuthority,
@@ -2476,6 +2493,41 @@ impl MemWalWorkerRegistry {
         match &*state {
             RegistrySlotState::Active(worker) => Some(Arc::clone(worker)),
             _ => None,
+        }
+    }
+
+    pub(crate) async fn resident_fold_readiness(
+        &self,
+        key: StreamWorkerKey,
+    ) -> ResidentFoldReadiness {
+        let slot = self
+            .slots
+            .lock()
+            .expect("MemWAL worker registry poisoned")
+            .get(&key)
+            .cloned();
+        let Some(slot) = slot else {
+            return ResidentFoldReadiness::Missing;
+        };
+        let worker = {
+            let state = slot.state.lock().await;
+            match &*state {
+                RegistrySlotState::Vacant => return ResidentFoldReadiness::Missing,
+                RegistrySlotState::Opening(_) | RegistrySlotState::Retiring(_) => {
+                    return ResidentFoldReadiness::Busy;
+                }
+                RegistrySlotState::Active(worker) => Arc::clone(worker),
+            }
+        };
+        let mode = worker.mode.lock().await;
+        match &*mode {
+            WorkerMode::Admit(accounting) if *accounting == GenerationAccounting::default() => {
+                ResidentFoldReadiness::Idle
+            }
+            WorkerMode::Admit(_) | WorkerMode::FoldReplay(_) | WorkerMode::FoldFlushed(_) => {
+                ResidentFoldReadiness::Ready
+            }
+            WorkerMode::Retiring => ResidentFoldReadiness::Busy,
         }
     }
 
@@ -3240,6 +3292,7 @@ impl MemWalWorkerRegistry {
         mut queued: QueuedBatchPermit,
         prepare: PreparePut,
         idle_authority: IdleAuthorityCheck,
+        fold_trigger: StreamFoldTrigger,
     ) -> OmniResult<DurableBatchAck> {
         if queued.key != key {
             return Err(OmniError::manifest_internal(format!(
@@ -3263,6 +3316,7 @@ impl MemWalWorkerRegistry {
                     queued,
                     prepare,
                     idle_authority,
+                    fold_trigger,
                 )
                 .await
         })
@@ -3281,6 +3335,7 @@ impl MemWalWorkerRegistry {
         queued: QueuedBatchPermit,
         prepare: PreparePut,
         idle_authority: IdleAuthorityCheck,
+        fold_trigger: StreamFoldTrigger,
     ) -> OmniResult<DurableBatchAck> {
         crate::failpoints::maybe_fail(
             crate::failpoints::names::STREAM_B1_AFTER_INPUT_QUEUE_BEFORE_PREPARE,
@@ -3372,6 +3427,9 @@ impl MemWalWorkerRegistry {
                     }
                     opening.notify_waiters();
                     if let Some(error) = cold_refusal {
+                        if matches!(&error, OmniError::FoldRequired { .. }) {
+                            fold_trigger(true);
+                        }
                         // Account the replay first, then free this opener's
                         // caller buffer and queue position. Already-charged
                         // callers observe the fold-only worker and drain;
@@ -3515,6 +3573,7 @@ impl MemWalWorkerRegistry {
             confirmed_token_updates,
             authority,
             queued,
+            fold_trigger,
         )
         .await
     }
@@ -3528,6 +3587,7 @@ impl MemWalWorkerRegistry {
         confirmed_token_updates: ConfirmedStreamTokenOverlay,
         authority: CheckedStreamAuthority,
         queued: QueuedBatchPermit,
+        fold_trigger: StreamFoldTrigger,
     ) -> OmniResult<DurableBatchAck> {
         // Any prepared use—not only a successful append—extends the idle
         // deadline. This prevents the single eviction task from racing an
@@ -3556,6 +3616,7 @@ impl MemWalWorkerRegistry {
         let current = match &*mode {
             WorkerMode::Admit(accounting) => *accounting,
             WorkerMode::FoldReplay(replay) => {
+                fold_trigger(true);
                 return Err(OmniError::FoldRequired {
                     table_key: worker.table_key.clone(),
                     rows: replay.accounting.rows,
@@ -3563,6 +3624,7 @@ impl MemWalWorkerRegistry {
                 });
             }
             WorkerMode::FoldFlushed(_) => {
+                fold_trigger(true);
                 return Err(OmniError::FoldRequired {
                     table_key: worker.table_key.clone(),
                     rows: 0,
@@ -3580,6 +3642,7 @@ impl MemWalWorkerRegistry {
             .checked_add(charge)
             .map_err(|error| OmniError::Lance(error.to_string()))?;
         if !reserved.fits() {
+            fold_trigger(true);
             return Err(OmniError::FoldRequired {
                 table_key: worker.table_key.clone(),
                 rows: reserved.rows,
@@ -3592,13 +3655,20 @@ impl MemWalWorkerRegistry {
 
         crate::failpoints::maybe_fail(crate::failpoints::names::STREAM_B1_BEFORE_PUT_INVOKE)?;
         queued.transfer_to_worker(worker, current)?;
-
         // `put_no_wait` is itself background-owned.  The deadline bounds only
         // how long this acknowledgement waits; timing out detaches a
         // continuation which retains admission until the Lance future settles
         // and only then starts the one abort.
         let writer = Arc::clone(&worker.writer);
         let mut invoked = tokio::spawn(async move { writer.put_no_wait(vec![batch]).await });
+        // This callback lives inside the detached owner and fires once the
+        // physical invocation itself has an owner. The eventual readiness
+        // probe distinguishes a durable/ambiguous tail from a no-effect
+        // failure, while caller cancellation cannot erase the trigger.
+        fold_trigger(
+            reserved.rows == B1_MAX_GENERATION_ROWS
+                || reserved.arrow_bytes == B1_MAX_GENERATION_ARROW_BYTES,
+        );
         let (write_result, watcher) = match tokio::time::timeout_at(deadline, &mut invoked).await {
             Ok(Ok(Ok(value))) => value,
             Ok(Ok(Err(error))) => {
