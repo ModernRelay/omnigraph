@@ -16,6 +16,7 @@ use datafusion::prelude::{col, lit};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::refs::BranchIdentifier;
+use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
@@ -35,7 +36,10 @@ use super::stream::{
     ClaimAttemptEffect, ClaimReceipt, ENROLLMENT_RECEIPT_V2_TAG, EnrollmentReceiptV2,
     MANAGEMENT_RECEIPT_TAG, ManagementReceipt,
 };
-use super::stream_profile::{PROFILE_MANAGEMENT_RECEIPT_TAG, ProfileManagementReceipt};
+use super::stream_profile::{
+    AUTHORITY_RETIREMENT_RECEIPT_TAG, AuthorityRetirementReceipt, PROFILE_MANAGEMENT_RECEIPT_TAG,
+    ProfileManagementReceipt,
+};
 use super::stream_token::{
     PayloadDigest, StreamRowOrigin, StreamTerminalCorrection, StreamToken, StreamTokenAuthorityRow,
     StreamTokenDisposition, TrustedContributorId,
@@ -67,6 +71,7 @@ pub(crate) enum LifecycleLedgerRecord {
     ManagementReceipt(ManagementReceipt),
     ClaimAttemptEffect(ClaimAttemptEffect),
     ClaimReceipt(ClaimReceipt),
+    AuthorityRetirementReceipt(AuthorityRetirementReceipt),
 }
 
 impl LifecycleLedgerRecord {
@@ -77,6 +82,7 @@ impl LifecycleLedgerRecord {
             Self::ManagementReceipt(value) => &value.record_id,
             Self::ClaimAttemptEffect(value) => &value.record_id,
             Self::ClaimReceipt(value) => &value.record_id,
+            Self::AuthorityRetirementReceipt(value) => &value.record_id,
         }
     }
 
@@ -87,6 +93,7 @@ impl LifecycleLedgerRecord {
             Self::ManagementReceipt(_) => MANAGEMENT_RECEIPT_TAG,
             Self::ClaimAttemptEffect(_) => CLAIM_ATTEMPT_EFFECT_TAG,
             Self::ClaimReceipt(_) => CLAIM_RECEIPT_TAG,
+            Self::AuthorityRetirementReceipt(_) => AUTHORITY_RETIREMENT_RECEIPT_TAG,
         }
     }
 
@@ -97,6 +104,7 @@ impl LifecycleLedgerRecord {
             Self::ManagementReceipt(value) => &value.record_lookup_key,
             Self::ClaimAttemptEffect(value) => &value.record_lookup_key,
             Self::ClaimReceipt(value) => &value.record_lookup_key,
+            Self::AuthorityRetirementReceipt(value) => &value.record_lookup_key,
         }
     }
 
@@ -107,6 +115,7 @@ impl LifecycleLedgerRecord {
             Self::ManagementReceipt(value) => value.validate(value.to_revision),
             Self::ClaimAttemptEffect(value) => value.validate(),
             Self::ClaimReceipt(value) => value.validate(),
+            Self::AuthorityRetirementReceipt(value) => value.validate(),
         }
     }
 
@@ -118,6 +127,7 @@ impl LifecycleLedgerRecord {
             Self::ManagementReceipt(value) => serde_json::to_string(value),
             Self::ClaimAttemptEffect(value) => serde_json::to_string(value),
             Self::ClaimReceipt(value) => serde_json::to_string(value),
+            Self::AuthorityRetirementReceipt(value) => serde_json::to_string(value),
         }
         .map_err(|error| {
             OmniError::manifest_internal(format!(
@@ -166,6 +176,13 @@ impl LifecycleLedgerRecord {
                 serde_json::from_str(&envelope.record_payload_json).map_err(|error| {
                     OmniError::manifest_internal(format!(
                         "failed to decode lifecycle claim receipt: {error}"
+                    ))
+                })?,
+            ),
+            AUTHORITY_RETIREMENT_RECEIPT_TAG => Self::AuthorityRetirementReceipt(
+                serde_json::from_str(&envelope.record_payload_json).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to decode authority-retirement receipt: {error}"
                     ))
                 })?,
             ),
@@ -759,6 +776,26 @@ pub(crate) fn stream_token_rows_from_batch(
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// Stream every current-token row from one exact manifest-selected authority.
+///
+/// Retirement planning consumes this in bounded batches. The scan deliberately
+/// has no ordering or history walk: its digests bind the selected authority
+/// witness and aggregate counts, not an unbounded vector of terminal keys.
+pub(crate) async fn scan_current_stream_token_batches(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+) -> Result<DatasetRecordBatchStream> {
+    validate_exact_dataset(dataset, authority).await?;
+    let mut scanner = dataset.scan();
+    scanner.filter_expr(col("record_tag").eq(lit(CURRENT_TOKEN_RECORD_TAG)));
+    scanner.batch_size(8_192);
+    scanner.batch_size_bytes(crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES);
+    scanner
+        .try_into_stream()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))
 }
 
 /// Look up one logical graph key from an already exact-pinned token dataset.
@@ -1434,6 +1471,33 @@ pub(crate) async fn lookup_claim_receipt(
     }
 }
 
+/// Receipt-first lookup for the root-wide retirement occurrence. This must run
+/// before comparing the current profile so a retry after the terminal CAS can
+/// return its immutable result.
+pub(crate) async fn lookup_authority_retirement_receipt(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    graph_identity_digest: &str,
+    retirement_id: &str,
+) -> Result<Option<AuthorityRetirementReceipt>> {
+    let lookup_key =
+        AuthorityRetirementReceipt::lookup_key_for(graph_identity_digest, retirement_id)?;
+    match lookup_lifecycle_ledger_record(
+        dataset,
+        authority,
+        AUTHORITY_RETIREMENT_RECEIPT_TAG,
+        &lookup_key,
+    )
+    .await?
+    {
+        Some(LifecycleLedgerRecord::AuthorityRetirementReceipt(value)) => Ok(Some(value)),
+        None => Ok(None),
+        Some(_) => Err(OmniError::manifest_internal(
+            "authority-retirement lookup decoded another lifecycle ledger family",
+        )),
+    }
+}
+
 async fn stage_lifecycle_ledger_envelopes(
     dataset: Dataset,
     authority: &StreamTokenAuthorityEntry,
@@ -1548,6 +1612,21 @@ pub(crate) async fn stage_claim_receipt(
         dataset,
         authority,
         &[LifecycleLedgerRecord::ClaimReceipt(receipt.clone())],
+    )
+    .await
+}
+
+pub(crate) async fn stage_authority_retirement_receipt(
+    dataset: Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    receipt: &AuthorityRetirementReceipt,
+) -> Result<crate::table_store::StagedWrite> {
+    stage_lifecycle_ledger_records(
+        dataset,
+        authority,
+        &[LifecycleLedgerRecord::AuthorityRetirementReceipt(
+            receipt.clone(),
+        )],
     )
     .await
 }
@@ -2317,7 +2396,7 @@ mod tests {
         let claim = ClaimReceipt::new(
             &claim_receipt_chain_genesis(),
             ClaimReceiptPreimage {
-                graph_identity_digest: graph_digest,
+                graph_identity_digest: graph_digest.clone(),
                 identity,
                 claim_id: claim_id.to_string(),
                 lifecycle_operation_id: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string()),
@@ -2361,12 +2440,45 @@ mod tests {
             },
         )
         .unwrap();
+        let pre_retirement_token_head = CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 5,
+            transaction_uuid: "98989898-9898-4898-8898-989898989898".to_string(),
+            manifest_e_tag: None,
+        };
+        let pre_retirement_token_witness_digest =
+            crate::db::manifest::stream_authority_retirement_token_witness_digest(
+                &pre_retirement_token_head,
+                4,
+                1,
+            )
+            .unwrap();
+        let retirement = AuthorityRetirementReceipt::new(
+            graph_digest,
+            &ReceiptChainRef::genesis(),
+            "99999999-9999-4999-8999-999999999999",
+            format!("sha256:{}", "c".repeat(64)),
+            "operator:alice",
+            crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
+            7,
+            format!("sha256:{}", "d".repeat(64)),
+            3,
+            format!("sha256:{}", "e".repeat(64)),
+            pre_retirement_token_head,
+            pre_retirement_token_witness_digest,
+            4,
+            1,
+            format!("sha256:{}", "0".repeat(64)),
+            1_700_000_000_000_005,
+        )
+        .unwrap();
         vec![
             LifecycleLedgerRecord::EnrollmentReceiptV2(enrollment),
             LifecycleLedgerRecord::BindingReceipt(binding),
             LifecycleLedgerRecord::ManagementReceipt(management),
             LifecycleLedgerRecord::ClaimAttemptEffect(attempt),
             LifecycleLedgerRecord::ClaimReceipt(claim),
+            LifecycleLedgerRecord::AuthorityRetirementReceipt(retirement),
         ]
     }
 
@@ -2688,6 +2800,10 @@ mod tests {
             LifecycleLedgerRecord::ClaimReceipt(value) => value.clone(),
             _ => unreachable!(),
         };
+        let retirement = match &records[5] {
+            LifecycleLedgerRecord::AuthorityRetirementReceipt(value) => value.clone(),
+            _ => unreachable!(),
+        };
         assert!(
             lookup_enrollment_receipt_v2(
                 &dataset,
@@ -2800,6 +2916,36 @@ mod tests {
             .await
             .unwrap(),
             Some(LifecycleLedgerRecord::ClaimReceipt(claim))
+        );
+        assert_eq!(
+            lookup_authority_retirement_receipt(
+                &achieved,
+                &next,
+                &retirement.graph_identity_digest,
+                &retirement.retirement_id,
+            )
+            .await
+            .unwrap(),
+            Some(retirement.clone())
+        );
+        assert_eq!(
+            lookup_lifecycle_ledger_record_by_id(
+                &achieved,
+                &next,
+                AUTHORITY_RETIREMENT_RECEIPT_TAG,
+                &retirement.record_id,
+            )
+            .await
+            .unwrap(),
+            Some(LifecycleLedgerRecord::AuthorityRetirementReceipt(
+                retirement.clone()
+            ))
+        );
+        assert!(
+            stage_authority_retirement_receipt(achieved.clone(), &next, &retirement)
+                .await
+                .is_err(),
+            "WhenMatched::Fail must reject rebinding an immutable retirement receipt"
         );
         assert!(
             stage_enrollment_receipt_v2(achieved, &next, &enrollment)

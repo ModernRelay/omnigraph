@@ -753,7 +753,7 @@ Behavior-affecting findings in this audit:
   This result blocks the in-manifest BTREE access shape, not checkpoint rows as
   logical authority or Lance tags as physical pins. RFC-025 is
   research-blocked and no retention format ships. Schema v6 was production
-  truth when the gate ran; current schema v16 likewise carries no retention
+  truth when the gate ran; current schema v17 likewise carries no retention
   state. A successor needs a history-flat current-authority lookup
   or revised evidence-backed operational contract without adding a second
   authority dataset.

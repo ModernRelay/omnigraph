@@ -35,7 +35,7 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
     UploadPart,
 };
-use omnigraph::db::{Omnigraph, ReadTarget, StreamTableStatus};
+use omnigraph::db::{Omnigraph, ReadTarget, StreamAuthorityRetirementPlan, StreamTableStatus};
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
 use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
@@ -45,7 +45,8 @@ use serial_test::serial;
 
 use helpers::memwal::{CurrentMemWalInventory, MemWalObjectKind};
 use helpers::stream_authority::{
-    disable_stream_profile, enable_stream_profile, rebind_stream_table_offline,
+    confirm_stream_authority_retirement, disable_stream_profile, enable_stream_profile,
+    plan_stream_authority_retirement, rebind_stream_table_offline,
 };
 
 const STREAM_SCHEMA: &str = "node Person { score: I32 }\n";
@@ -613,6 +614,412 @@ async fn stream_lane(db: &Omnigraph) -> StreamTableStatus {
     let status = db.stream_status().await.unwrap();
     assert_eq!(status.tables.len(), 1, "fixture owns exactly one lane");
     status.tables.into_iter().next().unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn authority_retirement_unblocks_exact_provenance_rebuild_and_freezes_source() {
+    let _scenario = FailScenario::setup();
+    let fixture = prepare_authority_retirement_fixture().await;
+    let (main_export, archive_export) = confirm_retirement_and_export_frozen_cut(&fixture).await;
+    assert_retired_source_refuses_writers(&fixture).await;
+    assert_retired_schema_staging_remains_untouched(&fixture).await;
+    assert_retirement_confirmation_is_idempotent(&fixture).await;
+    assert_retired_export_rebuilds_without_authority(&main_export).await;
+    assert_retired_export_rebuilds_without_authority(&archive_export).await;
+    assert_retired_export_rejects_tampered_member(&main_export).await;
+    assert_retired_named_branch_healer_refuses_orphan_discard(&fixture).await;
+}
+
+struct AuthorityRetirementFixture {
+    _dir: EnrolledGraphDir,
+    db: Arc<Omnigraph>,
+    cluster_uri: String,
+    plan: StreamAuthorityRetirementPlan,
+}
+
+#[inline(never)]
+async fn prepare_authority_retirement_fixture() -> AuthorityRetirementFixture {
+    let (dir, served, _, _) = init_productive_sealed_lane().await;
+    let enabled_export = served.export_jsonl("main", &[], &[]).await.unwrap_err();
+    assert!(matches!(
+        enabled_export,
+        OmniError::StreamingAuthorityMismatch { ref reason }
+            if reason.contains("exact DISABLED")
+    ));
+    drop(served);
+    let db = reopen_enrolled(&dir).await;
+    let cluster_uri = dir.cluster_uri();
+    disable_stream_profile(&db, &cluster_uri).await;
+    let before_rebind = stream_lane(&db).await;
+    let rebound_enrollment = rebind_stream_table_offline(
+        &db,
+        &cluster_uri,
+        TABLE,
+        "96969696-9696-4696-8696-969696969696",
+        before_rebind.lifecycle_revision,
+    )
+    .await
+    .unwrap();
+    assert_ne!(rebound_enrollment, before_rebind.enrollment_id);
+    db.branch_create("archive").await.unwrap();
+    db.failpoint_withdraw_stream_token_for_retirement_test(
+        TABLE,
+        "ordinary-before-quiesce",
+        "97979797-9797-4797-8797-979797979797",
+    )
+    .await
+    .unwrap();
+
+    let blocked = db.export_jsonl("main", &[], &[]).await.unwrap_err();
+    assert!(matches!(
+        blocked,
+        OmniError::StreamExportBlocked {
+            withdrawn_token_count: 1
+        }
+    ));
+
+    let plan = plan_stream_authority_retirement(&db, &cluster_uri).await;
+    assert_eq!(
+        plan_stream_authority_retirement(&db, &cluster_uri).await,
+        plan,
+        "planning the same stopped-writer cut must be deterministic"
+    );
+
+    AuthorityRetirementFixture {
+        _dir: dir,
+        db,
+        cluster_uri,
+        plan,
+    }
+}
+
+#[inline(never)]
+async fn confirm_retirement_and_export_frozen_cut(
+    fixture: &AuthorityRetirementFixture,
+) -> (String, String) {
+    let AuthorityRetirementFixture {
+        db,
+        cluster_uri,
+        plan,
+        ..
+    } = fixture;
+    let retirement_id = "89898989-8989-4898-8898-898989898989";
+    let confirmed =
+        confirm_stream_authority_retirement(&db, &cluster_uri, retirement_id, &plan.plan_digest)
+            .await
+            .unwrap();
+    assert!(confirmed.changed);
+    assert_eq!(confirmed.retirement_id, retirement_id);
+    assert_eq!(db.stream_status().await.unwrap().profile_mode, "RETIRED");
+
+    let main_export = db.export_jsonl("main", &[], &[]).await.unwrap();
+    assert_eq!(
+        db.export_jsonl("main", &[], &[]).await.unwrap(),
+        main_export
+    );
+    let archive_export = db.export_jsonl("archive", &[], &[]).await.unwrap();
+    assert_eq!(
+        archive_export.lines().skip(1).collect::<Vec<_>>(),
+        main_export.lines().skip(1).collect::<Vec<_>>(),
+        "both frozen branches export the same logical rows"
+    );
+    let provenance: serde_json::Value =
+        serde_json::from_str(main_export.lines().next().unwrap()).unwrap();
+    let archive_provenance: serde_json::Value =
+        serde_json::from_str(archive_export.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        provenance["_omnigraph_export_provenance"]["receipt"]["retirement_id"],
+        retirement_id
+    );
+    assert_eq!(
+        provenance["_omnigraph_export_provenance"]["branch_member"]["branch"],
+        "main"
+    );
+    assert_eq!(
+        archive_provenance["_omnigraph_export_provenance"]["branch_member"]["branch"],
+        "archive"
+    );
+    assert_ne!(
+        provenance["_omnigraph_export_provenance"]["branch_member"],
+        archive_provenance["_omnigraph_export_provenance"]["branch_member"],
+        "each export must identify its exact member of the frozen root cut"
+    );
+    assert_eq!(
+        provenance["_omnigraph_export_provenance"]["receipt"]["export_cut_digest"],
+        archive_provenance["_omnigraph_export_provenance"]["receipt"]["export_cut_digest"]
+    );
+    assert_eq!(
+        provenance["_omnigraph_export_provenance"]["source_schema_ir_hash"],
+        archive_provenance["_omnigraph_export_provenance"]["source_schema_ir_hash"]
+    );
+    assert_eq!(
+        provenance["_omnigraph_export_provenance"]["ordered_branch_member_digests"],
+        archive_provenance["_omnigraph_export_provenance"]["ordered_branch_member_digests"],
+        "every branch export must carry the same complete receipt-cut preimage"
+    );
+    assert_ne!(
+        provenance["_omnigraph_export_provenance"]["selected_member_index"],
+        archive_provenance["_omnigraph_export_provenance"]["selected_member_index"],
+        "main and archive must select their own member of the shared cut proof"
+    );
+    for proof in [&provenance, &archive_provenance] {
+        let proof = &proof["_omnigraph_export_provenance"];
+        let selected_index = proof["selected_member_index"].as_u64().unwrap() as usize;
+        assert_eq!(
+            proof["branch_member"]["branch_member_digest"],
+            proof["ordered_branch_member_digests"][selected_index],
+            "the selected leaf must be present at its claimed cut-proof index"
+        );
+    }
+
+    (main_export, archive_export)
+}
+
+#[inline(never)]
+async fn assert_retired_source_refuses_writers(fixture: &AuthorityRetirementFixture) {
+    let db = &fixture.db;
+    let retirement_id = "89898989-8989-4898-8898-898989898989";
+    db.sync_branch("archive").await.unwrap();
+    let branch_create_error = db.branch_create_from("archive", "late").await.unwrap_err();
+    let branch_delete_error = db.branch_delete("archive").await.unwrap_err();
+    let index_error = db.ensure_indices_on("archive").await.unwrap_err();
+    let schema_error = db.apply_schema(STREAM_SCHEMA).await.unwrap_err();
+    for error in [
+        branch_create_error,
+        branch_delete_error,
+        index_error,
+        schema_error,
+    ] {
+        assert!(matches!(
+            error,
+            OmniError::StreamAuthorityRetired {
+                retirement_id: ref observed,
+                export_cut_digest: ref cut,
+            } if observed == retirement_id && cut == &fixture.plan.export_cut_digest
+        ));
+    }
+
+    let writer_error = db.optimize().await.unwrap_err();
+    assert!(matches!(
+        writer_error,
+        OmniError::StreamAuthorityRetired {
+            retirement_id: ref observed,
+            export_cut_digest: ref cut,
+        } if observed == retirement_id && cut == &fixture.plan.export_cut_digest
+    ));
+}
+
+#[inline(never)]
+async fn assert_retired_schema_staging_remains_untouched(fixture: &AuthorityRetirementFixture) {
+    const CONTRACT_FILES: [(&str, &str); 3] = [
+        ("_schema.pg", "_schema.pg.staging"),
+        ("_schema.ir.json", "_schema.ir.json.staging"),
+        ("__schema_state.json", "__schema_state.json.staging"),
+    ];
+
+    let root = fixture._dir.path();
+    let expected = CONTRACT_FILES
+        .iter()
+        .map(|(live, staging)| {
+            let bytes = std::fs::read(root.join(live)).unwrap();
+            std::fs::write(root.join(staging), &bytes).unwrap();
+            ((*staging).to_string(), bytes)
+        })
+        .collect::<Vec<_>>();
+
+    let reopened = Omnigraph::open(root.to_str().unwrap())
+        .await
+        .expect("mutable reopen may serve a retired graph without reconciling schema staging");
+    assert_eq!(
+        reopened.stream_status().await.unwrap().profile_mode,
+        "RETIRED"
+    );
+    let query = reopened
+        .query(
+            ReadTarget::branch("main"),
+            "query retired_read() { match { $p: Person } return { $p.score } }",
+            "retired_read",
+            &Default::default(),
+        )
+        .await
+        .expect("RETIRED is a writer fence, not a query fence");
+    assert_eq!(query.num_rows(), 1);
+    drop(reopened);
+
+    let refresh_error = fixture.db.refresh().await.unwrap_err();
+    assert!(matches!(
+        refresh_error,
+        OmniError::StreamAuthorityRetired {
+            retirement_id: ref observed,
+            export_cut_digest: ref cut,
+        } if observed == "89898989-8989-4898-8898-898989898989"
+            && cut == &fixture.plan.export_cut_digest
+    ));
+    for (staging, bytes) in expected {
+        assert_eq!(
+            std::fs::read(root.join(&staging)).unwrap(),
+            bytes,
+            "RETIRED cold-open/refresh must not promote, rewrite, or delete {staging}"
+        );
+    }
+}
+
+#[inline(never)]
+async fn assert_retirement_confirmation_is_idempotent(fixture: &AuthorityRetirementFixture) {
+    let AuthorityRetirementFixture {
+        db,
+        cluster_uri,
+        plan,
+        ..
+    } = fixture;
+    let retirement_id = "89898989-8989-4898-8898-898989898989";
+    let retry =
+        confirm_stream_authority_retirement(&db, &cluster_uri, retirement_id, &plan.plan_digest)
+            .await
+            .unwrap();
+    assert!(!retry.changed);
+    assert_eq!(retry.export_cut_digest, plan.export_cut_digest);
+    let different = confirm_stream_authority_retirement(
+        &db,
+        &cluster_uri,
+        "87878787-8787-4878-8878-878787878787",
+        &plan.plan_digest,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        different,
+        OmniError::StreamAuthorityRetired {
+            retirement_id: ref observed,
+            ..
+        } if observed == retirement_id
+    ));
+}
+
+#[inline(never)]
+async fn assert_retired_export_rebuilds_without_authority(main_export: &str) {
+    let rebuilt_dir = tempfile::tempdir().unwrap();
+    let rebuilt = Omnigraph::init(rebuilt_dir.path().to_str().unwrap(), STREAM_SCHEMA)
+        .await
+        .unwrap();
+    load_jsonl(&rebuilt, &main_export, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let rebuilt_status = rebuilt.stream_status().await.unwrap();
+    assert_eq!(rebuilt_status.profile_mode, "DISABLED");
+    assert!(rebuilt_status.tables.is_empty());
+    let rebuilt_export = rebuilt.export_jsonl("main", &[], &[]).await.unwrap();
+    assert_eq!(
+        rebuilt_export,
+        main_export
+            .lines()
+            .skip(1)
+            .map(|line| format!("{line}\n"))
+            .collect::<String>(),
+        "rebuild imports logical rows but no retirement provenance or sequencing authority"
+    );
+}
+
+#[inline(never)]
+async fn assert_retired_export_rejects_tampered_member(main_export: &str) {
+    let mut lines = main_export.lines();
+    let mut provenance: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    let version = provenance["_omnigraph_export_provenance"]["branch_member"]["manifest_version"]
+        .as_u64()
+        .unwrap();
+    provenance["_omnigraph_export_provenance"]["branch_member"]["manifest_version"] =
+        serde_json::Value::from(version + 1);
+    let tampered_export = std::iter::once(provenance.to_string())
+        .chain(lines.map(str::to_string))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+
+    let rebuilt_dir = tempfile::tempdir().unwrap();
+    let rebuilt = Omnigraph::init(rebuilt_dir.path().to_str().unwrap(), STREAM_SCHEMA)
+        .await
+        .unwrap();
+    let error = load_jsonl(&rebuilt, &tampered_export, LoadMode::Overwrite)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("retirement export branch-member witness/digest mismatch"),
+        "{error}"
+    );
+}
+
+#[inline(never)]
+async fn assert_retired_named_branch_healer_refuses_orphan_discard(
+    fixture: &AuthorityRetirementFixture,
+) {
+    const OPERATION_ID: &str = "01H000000000000000000000RF";
+
+    let snapshot = fixture
+        .db
+        .snapshot_of(ReadTarget::branch("archive"))
+        .await
+        .unwrap();
+    let entry = snapshot.entry(TABLE).unwrap();
+    let lane = stream_lane(&fixture.db).await;
+    let identity = serde_json::json!({
+        "stable_table_id": lane.stable_table_id,
+        "table_incarnation_id": lane.table_incarnation_id,
+    });
+    let table_path = format!(
+        "{}/{}",
+        fixture.db.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let sidecar = serde_json::json!({
+        "schema_version": 1,
+        "operation_id": OPERATION_ID,
+        "started_at": "0",
+        "branch": "missing-after-retirement",
+        "actor_id": null,
+        "writer_kind": "Mutation",
+        "tables": [{
+            "identity": identity,
+            "table_key": TABLE,
+            "table_path": table_path,
+            "expected_version": 999,
+            "post_commit_pin": 1000,
+            "table_branch": "missing-after-retirement"
+        }]
+    });
+    let recovery_dir = fixture._dir.path().join("__recovery");
+    std::fs::create_dir_all(&recovery_dir).unwrap();
+    let sidecar_path = recovery_dir.join(format!("{OPERATION_ID}.json"));
+    std::fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar).unwrap()).unwrap();
+    let audit_before = helpers::recovery::recovery_audit_kinds(fixture._dir.path()).await;
+
+    let error = fixture
+        .db
+        .load(
+            "archive",
+            r#"{"type":"Person","data":{"score":99}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OmniError::StreamAuthorityRetired {
+            retirement_id: ref observed,
+            export_cut_digest: ref cut,
+        } if observed == "89898989-8989-4898-8898-898989898989"
+            && cut == &fixture.plan.export_cut_digest
+    ));
+    assert!(
+        sidecar_path.exists(),
+        "canonical-main RETIRED must fence orphan-sidecar deletion from an archive-bound handle"
+    );
+    assert_eq!(
+        helpers::recovery::recovery_audit_kinds(fixture._dir.path()).await,
+        audit_before,
+        "canonical-main RETIRED must fence orphan-discard audit publication"
+    );
 }
 
 fn epoch_floor(lane: &StreamTableStatus) -> u64 {

@@ -13,13 +13,21 @@ pub(crate) use omnigraph::ensure_public_branch_ref;
 pub(crate) use omnigraph::stream_lifecycle::build_sealed_maintenance_successor;
 pub use omnigraph::{
     CheckedClusterApplyAuthority, CheckedClusterMaintenanceAuthority,
-    CheckedClusterStreamRuntimeAuthority, CleanupPolicyOptions,
+    CheckedClusterRetirementAuthority, CheckedClusterStreamRuntimeAuthority, CleanupPolicyOptions,
     InitOptions, MergeOutcome, Omnigraph, OpenMode, PendingIndex, RepairAction,
     RepairClassification, RepairOptions, RepairStats, SchemaApplyOptions, SchemaApplyResult,
-    SkipReason, StreamStatus, StreamTableStatus, StreamingProfileResult, TableCleanupStats,
-    TableOptimizeStats, TableRepairStats,
+    SkipReason, StreamAuthorityRetirementPlan, StreamAuthorityRetirementResult, StreamStatus,
+    StreamTableStatus, StreamingProfileResult, TableCleanupStats, TableOptimizeStats,
+    TableRepairStats,
 };
-pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
+pub(crate) use omnigraph::{
+    DeferredTableFork, StreamAuthorityRetirementExportProvenance, WriteAuthorityToken, WriteTxn,
+};
+#[cfg(test)]
+pub(crate) use omnigraph::{
+    StreamAuthorityRetirementExportMember, retirement_export_cut_digest,
+    retirement_live_branch_heads_digest,
+};
 
 use crate::error::{OmniError, Result};
 

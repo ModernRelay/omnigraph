@@ -72,6 +72,10 @@ use super::{
 mod stream_rebind_v18;
 pub(crate) use stream_rebind_v18::*;
 
+#[path = "recovery/stream_retirement_v19.rs"]
+mod stream_retirement_v19;
+pub(crate) use stream_retirement_v19::*;
+
 /// System actor identifier for recovery-owned lineage: legacy recovery,
 /// exact-protocol rollback, schema-v6 EnsureIndices rollback, and orphan
 /// discard. A v3/v4 roll-forward
@@ -458,7 +462,13 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// authority, exact retained-object inventory, fresh MemWAL replacement and
 /// initial fence, terminal ledger transaction, and sole fresh SEALED publish.
 /// The frozen v14 scaffold and v17 Optimize envelope keep their old meanings.
-pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 18;
+///
+/// v18 → v19: RFC-026 F3e terminal stream-authority retirement. V19 owns
+/// one exact immutable retirement-receipt transaction followed by the sole
+/// lineage-neutral `DISABLED -> RETIRED` manifest publication. It never moves
+/// a graph head, creates a GraphCommit, or appends a RecoveryAudit row. The
+/// frozen v14 retirement scaffold keeps its old fail-closed meaning.
+pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 19;
 
 /// The only recovery generation emitted by the manifest-v5 write paths.
 pub(crate) const IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION: u32 = 9;
@@ -497,6 +507,9 @@ pub(crate) const STREAM_SEALED_OPTIMIZE_SIDECAR_SCHEMA_VERSION: u32 = 17;
 
 /// Exact offline SEALED physical-rebind generation.
 pub(crate) const STREAM_REBIND_SIDECAR_SCHEMA_VERSION: u32 = 18;
+
+/// Exact offline root-wide authority-retirement generation.
+pub(crate) const STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION: u32 = 19;
 
 /// Schema v11 is the first sidecar allowed to describe data-bearing MemWAL
 /// state, which is bound to stream-config v2 rather than Phase A's config-v1.
@@ -2027,6 +2040,10 @@ pub(crate) struct RecoverySidecar {
     /// Exact RFC-026 offline physical-rebind envelope (schema v18 only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v18: Option<Box<RecoveryProtocolV18>>,
+    /// Exact RFC-026 offline root-wide authority-retirement envelope (schema
+    /// v19 only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_v19: Option<Box<RecoveryProtocolV19>>,
     /// EnsureIndices-only fixed rollback identity. It does not make the
     /// physical index effects exact; it only makes compensation retry-safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2553,6 +2570,14 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             STREAM_REBIND_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
         )));
     }
+    if sidecar.protocol_v19.is_some()
+        && sidecar.schema_version != STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION
+    {
+        return Err(malformed(format!(
+            "protocol_v19 requires schema-v{}, found schema-v{}",
+            STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
+        )));
+    }
 
     if sidecar.schema_version < EXACT_EFFECT_IDENTITY_SCHEMA_VERSION {
         if sidecar.protocol_v3.is_some()
@@ -2568,6 +2593,7 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             || sidecar.protocol_v16.is_some()
             || sidecar.protocol_v17.is_some()
             || sidecar.protocol_v18.is_some()
+            || sidecar.protocol_v19.is_some()
         {
             return Err(malformed(
                 "an exact-effect protocol is present on a pre-v3 sidecar".to_string(),
@@ -2610,6 +2636,10 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
 
     if sidecar.schema_version == STREAM_REBIND_SIDECAR_SCHEMA_VERSION {
         return validate_stream_protocol_v18_shape(sidecar_uri, sidecar);
+    }
+
+    if sidecar.schema_version == STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION {
+        return validate_stream_protocol_v19_shape(sidecar_uri, sidecar);
     }
 
     if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
@@ -7914,6 +7944,13 @@ struct HealOneSidecarOutcome {
     unresolved: Option<UnresolvedRecoveryIntent>,
 }
 
+fn sidecar_requires_exclusive_profile_gate(writer_kind: SidecarKind) -> bool {
+    matches!(
+        writer_kind,
+        SidecarKind::StreamProfileChange | SidecarKind::StreamAuthorityRetirement
+    )
+}
+
 /// Own one discovered sidecar from gate acquisition through its under-gate
 /// reread and terminal classification. Ownership is deliberate: recovery-v18
 /// can run this future from a fresh task without letting cancellation release
@@ -7929,9 +7966,8 @@ fn heal_one_sidecar_roll_forward(
     Box::pin(async move {
         let mut _shared_profile_guard = None;
         let mut _exclusive_profile_guard = None;
-        if sidecar.writer_kind == SidecarKind::StreamProfileChange {
-            _exclusive_profile_guard =
-                Some(write_queue.acquire_stream_profile_exclusive().await);
+        if sidecar_requires_exclusive_profile_gate(sidecar.writer_kind) {
+            _exclusive_profile_guard = Some(write_queue.acquire_stream_profile_exclusive().await);
         } else {
             _shared_profile_guard = Some(write_queue.acquire_stream_profile_shared().await);
         }
@@ -7993,11 +8029,24 @@ fn heal_one_sidecar_roll_forward(
         );
         Box::pin(main_coord.refresh()).await?;
 
+        // RETIRED lives on canonical main and freezes the entire graph. A
+        // named branch may still carry its older copied DISABLED profile, so
+        // never use the branch snapshot as the terminal writer fence. The
+        // exact v19 retirement continuation is the sole exception: after its
+        // manifest CAS is visible it may verify the immutable receipt and
+        // remove its own sidecar.
+        let main_snapshot = main_coord.snapshot();
+        if sidecar.schema_version != STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION {
+            if let Some(error) = main_snapshot.stream_profile().retired_error() {
+                return Err(error);
+            }
+        }
+
         let schema_state_recovery = if is_schema_apply {
             crate::db::schema_state::recover_schema_state_files(
                 &root_uri,
                 std::sync::Arc::clone(&storage),
-                &main_coord.snapshot(),
+                &main_snapshot,
             )
             .await?
         } else {
@@ -8026,7 +8075,7 @@ fn heal_one_sidecar_roll_forward(
                 branch_coord.refresh().await?;
                 branch_coord.snapshot()
             }
-            None => main_coord.snapshot(),
+            None => main_snapshot,
         };
         if process_sidecar(
             &root_uri,
@@ -8289,13 +8338,24 @@ pub(crate) async fn recover_manifest_drift(
             continue;
         };
 
+        // Refresh canonical main before any schema-file reconciliation,
+        // orphan-sidecar audit publication, or table/manifest recovery. A
+        // named branch snapshot can retain a stale pre-retirement profile and
+        // therefore cannot authorize root-wide effects after RETIRED.
+        coordinator.refresh().await?;
+        let main_snapshot = coordinator.snapshot();
+        if sidecar.schema_version != STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION {
+            if let Some(error) = main_snapshot.stream_profile().retired_error() {
+                return Err(error);
+            }
+        }
+
         let branch_snapshot = match sidecar.branch.as_deref() {
             Some(b) => {
                 // Orphan check against the manifest's branch list (the
                 // authority) BEFORE opening — same classification as the
                 // write-entry heal: a deferred sidecar whose branch was
                 // deleted would otherwise fail every ReadWrite open.
-                coordinator.refresh().await?;
                 if !coordinator
                     .all_branches()
                     .await?
@@ -8311,10 +8371,7 @@ pub(crate) async fn recover_manifest_drift(
                 branch_coord.refresh().await?;
                 branch_coord.snapshot()
             }
-            None => {
-                coordinator.refresh().await?;
-                coordinator.snapshot()
-            }
+            None => main_snapshot,
         };
         // `process_sidecar` is a large closed dispatcher. Box its state at the
         // full-sweep boundary so adding an unreachable protocol branch cannot
@@ -13707,6 +13764,19 @@ async fn process_sidecar_inner(
     // stale-sidecar audit recovery). `false` = the sidecar was deferred
     // untouched -- callers must not treat that as a completed heal (no
     // schema reload / cache invalidation is warranted).
+    // Retirement recovery is the sole writer allowed to complete after the
+    // terminal profile is visible. Keep this dedicated dispatch ahead of the
+    // global RETIRED writer fence so a lost manifest acknowledgement can
+    // verify its exact receipt effect and finish sidecar cleanup.
+    if sidecar.schema_version == STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION {
+        return process_stream_authority_retirement_sidecar_v19(
+            root_uri, storage, snapshot, sidecar,
+        )
+        .await;
+    }
+    if let Some(error) = snapshot.stream_profile().retired_error() {
+        return Err(error);
+    }
     if sidecar.schema_version == STREAM_ENROLLMENT_SIDECAR_SCHEMA_VERSION {
         return Err(OmniError::recovery_required(
             sidecar.operation_id.clone(),
@@ -18603,6 +18673,7 @@ fn new_unvalidated_sidecar(
         protocol_v16: None,
         protocol_v17: None,
         protocol_v18: None,
+        protocol_v19: None,
         ensure_indices_rollback_v6: None,
     }
 }
@@ -20433,6 +20504,7 @@ pub(crate) fn new_ensure_indices_sidecar_v9(
         protocol_v16: None,
         protocol_v17: None,
         protocol_v18: None,
+        protocol_v19: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-ensure-indices-v9-sidecar>", &sidecar)?;
@@ -20793,6 +20865,7 @@ pub(crate) fn new_occ_sidecar_v9(
         protocol_v16: None,
         protocol_v17: None,
         protocol_v18: None,
+        protocol_v19: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-occ-sidecar>", &sidecar)?;
@@ -20987,6 +21060,7 @@ pub(crate) fn new_schema_apply_sidecar_v9(
         protocol_v16: None,
         protocol_v17: None,
         protocol_v18: None,
+        protocol_v19: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-schema-apply-v9-sidecar>", &sidecar)?;
@@ -21162,6 +21236,7 @@ pub(crate) fn new_branch_merge_sidecar_v9(
         protocol_v16: None,
         protocol_v17: None,
         protocol_v18: None,
+        protocol_v19: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-branch-merge-sidecar>", &sidecar)?;
@@ -29679,9 +29754,8 @@ query delete_person($name: String) {
         let mut forged_prior_chain = protocol.prior_lifecycle.binding_receipt_chain.clone();
         forged_prior_chain.record_count += 1;
         let mut forged_terminal_shards = protocol.rebind_plan.expected_terminal_shards();
-        forged_terminal_shards.push(
-            ShardId::parse_str("b0b0b0b0-b0b0-40b0-80b0-b0b0b0b0b0b0").unwrap(),
-        );
+        forged_terminal_shards
+            .push(ShardId::parse_str("b0b0b0b0-b0b0-40b0-80b0-b0b0b0b0b0b0").unwrap());
         forged_terminal_shards.sort_unstable();
         protocol.planned_binding_receipt = BindingReceipt::new_with_retained_shards(
             original_planned_receipt.graph_identity_digest,
@@ -29745,12 +29819,10 @@ query delete_person($name: String) {
             "v18 must reject an exact next planned receipt beyond the fixed traversal bound"
         );
 
-        let RecoveryProtocolV18::StreamRebind(protocol) =
-            armed.protocol_v18.as_deref().unwrap();
+        let RecoveryProtocolV18::StreamRebind(protocol) = armed.protocol_v18.as_deref().unwrap();
         let prior_rebound_receipt = protocol.planned_binding_receipt.clone();
         let prior_rebound_binding = prior_rebound_receipt.physical_binding.clone();
-        let prior_rebound_shard =
-            ShardId::parse_str(&prior_rebound_binding.shard_ids[0]).unwrap();
+        let prior_rebound_shard = ShardId::parse_str(&prior_rebound_binding.shard_ids[0]).unwrap();
         let foreign_retained_shard =
             ShardId::parse_str("b1b1b1b1-b1b1-41b1-81b1-b1b1b1b1b1b1").unwrap();
         let mut forged_retained_shards = vec![prior_rebound_shard, foreign_retained_shard];
@@ -29791,9 +29863,7 @@ query delete_person($name: String) {
             )
             .unwrap_err()
             .to_string()
-            .contains(
-                "retained-shard plan does not match the selected prior binding receipt"
-            ),
+            .contains("retained-shard plan does not match the selected prior binding receipt"),
             "v18 must reject a self-consistent terminal inventory whose retained prefix differs from selected prior receipt authority"
         );
 

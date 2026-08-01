@@ -44,7 +44,21 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
     table_keys: &[String],
     writer: &mut W,
 ) -> Result<()> {
+    let _profile_gate = db.write_queue().acquire_stream_profile_shared().await;
+    let retirement_provenance = db.export_stream_authority_preflight().await?;
     let (resolved, catalog) = db.capture_read_view(ReadTarget::branch(branch)).await?;
+    if let Some(receipt) = retirement_provenance {
+        let provenance = db
+            .capture_retirement_export_provenance(branch, &resolved.snapshot, receipt)
+            .await?;
+        write_export_jsonl_row(
+            writer,
+            "_omnigraph_export_provenance",
+            &serde_json::json!({
+                "_omnigraph_export_provenance": provenance,
+            }),
+        )?;
+    }
     export_snapshot_jsonl_to_writer(
         db,
         &resolved.snapshot,

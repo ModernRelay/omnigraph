@@ -102,10 +102,13 @@ use crate::error::{OmniError, Result};
 ///   v15/recovery-v17 `StreamSealedOptimize` format remains frozen and is never
 ///   reinterpreted as carrying rebind's fresh binding, shard, receipt, and
 ///   `SEALED` proof authority.
+/// - v17 — RFC-026 F3e adds recovery-v19 for irreversible root-wide stream
+///   authority retirement. The v16/recovery-v18 physical-rebind format and the
+///   frozen recovery-v14 retirement scaffold keep their old meanings.
 ///
-/// v1–v15 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
+/// v1–v16 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
 /// is kept for provenance and to document what each stamp value meant.
-pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 16;
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 17;
 
 /// The oldest on-disk internal-schema stamp this binary will open. With no
 /// in-place migration, this equals `INTERNAL_MANIFEST_SCHEMA_VERSION`: a graph
@@ -124,7 +127,7 @@ pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_
 /// stamped each version (verify with
 /// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
 /// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5–v8 unreleased,
-/// v9 0.9.x, v10–v16 unreleased. V10–v16 are source-only development
+/// v9 0.9.x, v10–v17 unreleased. V10–v17 are source-only development
 /// formats; release preparation designates whichever later strand actually
 /// ships instead of relabeling superseded stamps.
 ///
@@ -136,9 +139,9 @@ pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_
 /// line (0.9.x–0.12.x); those releases do not exist and naming them here would
 /// send an operator hunting for a binary that was never published. V10 and v11
 /// remain 0.10.0-dev permanently because each was superseded before release.
-/// V16 is currently written only by 0.10.0-dev source builds. If it is the
+/// V17 is currently written only by 0.10.0-dev source builds. If it is the
 /// format that ships, the 0.10.0 release-prep commit flips only its entry to
-/// the published line; superseded v15 stays dev.
+/// the published line; superseded v16 stays dev.
 pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
     match stamp {
         1 => "0.3.1 or earlier",
@@ -153,13 +156,13 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         // The published line whose binaries serve v9 — the string the gated
         // v9↔v10 crossversion fence asserts inside the v10 refusal message.
         9 => "0.9.x",
-        // Unreachable in refusals while CURRENT == 16 (the sub-floor path
-        // consults 1–15 only; the ceiling path never consults the map). It
+        // Unreachable in refusals while CURRENT == 17 (the sub-floor path
+        // consults 1–16 only; the ceiling path never consults the map). It
         // exists for the table's honesty and the next bump. Release-prep for
         // 0.10.0 release prep MUST split this arm and flip only the stamp that
         // actually ships. Every superseded source-only stamp stays
         // "0.10.0-dev" permanently.
-        10..=16 => "0.10.0-dev",
+        10..=17 => "0.10.0-dev",
         // Worded to read naturally after "created by omnigraph " if a future
         // bump ever leaves a gap.
         _ => "an unrecognized older release",
@@ -239,12 +242,12 @@ mod tests {
     use super::*;
 
     /// The guard accepts exactly the single served version and refuses anything
-    /// below the floor or above the ceiling. With `MIN == CURRENT == 16` the
-    /// live range is exactly `[16, 16]`.
+    /// below the floor or above the ceiling. With `MIN == CURRENT == 17` the
+    /// live range is exactly `[17, 17]`.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
-        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 16);
-        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 16);
+        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 17);
+        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 17);
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
             assert!(
                 refuse_if_stamp_unsupported(stamp).is_ok(),
@@ -283,6 +286,7 @@ mod tests {
         assert_eq!(release_for_internal_schema_version(14), "0.10.0-dev");
         assert_eq!(release_for_internal_schema_version(15), "0.10.0-dev");
         assert_eq!(release_for_internal_schema_version(16), "0.10.0-dev");
+        assert_eq!(release_for_internal_schema_version(17), "0.10.0-dev");
         assert_eq!(
             release_for_internal_schema_version(99),
             "an unrecognized older release"
@@ -400,5 +404,19 @@ mod tests {
             "got: {v15_err}"
         );
         assert!(v15_err.contains("omnigraph export"), "got: {v15_err}");
+
+        // V16 is the immediate predecessor used by the v16↔v17 format fence.
+        // Keep its source-build release wording local and unskippable so
+        // release preparation cannot relabel it with v17.
+        let v16_err = refuse_if_stamp_unsupported(16).unwrap_err().to_string();
+        assert!(
+            v16_err.contains("created by omnigraph 0.10.0-dev"),
+            "got: {v16_err}"
+        );
+        assert!(
+            v16_err.contains("with an omnigraph 0.10.0-dev binary"),
+            "got: {v16_err}"
+        );
+        assert!(v16_err.contains("omnigraph export"), "got: {v16_err}");
     }
 }

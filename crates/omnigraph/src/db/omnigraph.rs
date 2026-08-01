@@ -45,6 +45,7 @@ mod stream_ndjson;
 mod stream_profile;
 mod stream_rebind;
 mod stream_request;
+mod stream_retirement;
 mod stream_status;
 mod table_ops;
 
@@ -56,8 +57,16 @@ pub use schema_apply::SchemaApplyOptions;
 #[doc(hidden)]
 pub use stream_profile::{
     CheckedClusterApplyAuthority, CheckedClusterMaintenanceAuthority,
-    CheckedClusterStreamRuntimeAuthority, StreamingProfileResult,
+    CheckedClusterRetirementAuthority, CheckedClusterStreamRuntimeAuthority,
+    StreamingProfileResult,
 };
+pub(crate) use stream_retirement::StreamAuthorityRetirementExportProvenance;
+#[cfg(test)]
+pub(crate) use stream_retirement::{
+    StreamAuthorityRetirementExportMember, retirement_export_cut_digest,
+    retirement_live_branch_heads_digest,
+};
+pub use stream_retirement::{StreamAuthorityRetirementPlan, StreamAuthorityRetirementResult};
 pub use stream_status::{StreamStatus, StreamTableStatus};
 pub use table_ops::PendingIndex;
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
@@ -738,14 +747,24 @@ impl Omnigraph {
         // SchemaApply manifest outcome cannot be served with the old schema
         // contract merely because promotion is pending.
         if matches!(mode, OpenMode::ReadWrite) {
+            // RETIRED is a terminal, root-wide writer fence. Mutable open may
+            // still construct a handle for reads/status/exact export, and may
+            // finish the exact v19 retirement sidecar after a lost
+            // acknowledgement, but it must not promote or delete schema
+            // staging residue. `recover_manifest_drift` applies the same
+            // canonical-main fence before every non-v19 sidecar effect.
+            let retired = coordinator.snapshot().stream_profile().retired_error();
             // Schema staging is itself mutable recovery state. Hold the shared
             // schema gate across BOTH its file pre-pass and the complete Full
             // sidecar sweep, so `schema_state_recovery` cannot go stale in a
             // release/reacquire gap. The sweep adds branch → sorted table gates
             // per sidecar under this outer guard.
-            let schema_state_recovery =
+            let schema_state_recovery = if retired.is_some() {
+                crate::db::schema_state::SchemaStateRecovery::Noop
+            } else {
                 recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot())
-                    .await?;
+                    .await?
+            };
             // Recovery sweep: close the Phase B → Phase C residual on
             // any sidecar left over from a crashed writer. Long-running
             // processes additionally converge in-process: the staged-
@@ -1890,6 +1909,14 @@ impl Omnigraph {
         // The heal also takes the locks itself (schema → branch → tables →
         // coordinator), so it must run after this guard is released.
         {
+            let _profile = self.write_queue.acquire_stream_profile_shared().await;
+            if let Some(error) = self
+                .current_canonical_stream_profile()
+                .await?
+                .retired_error()
+            {
+                return Err(error);
+            }
             // Hold the schema-apply serialization key across the
             // list-then-reconcile pair: without it, a live apply can
             // write its sidecar + staging between the empty check and
@@ -3033,6 +3060,14 @@ impl Omnigraph {
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
         )?;
+        let _stream_profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+        if let Some(error) = self
+            .current_canonical_stream_profile()
+            .await?
+            .retired_error()
+        {
+            return Err(error);
+        }
         let admission_keys = self.capture_branch_control_stream_admission_keys().await?;
         let _stream_admission_guards = self
             .write_queue()
@@ -3165,6 +3200,21 @@ impl Omnigraph {
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
         )?;
+        // Loader composition already retains this outermost gate. Direct
+        // branch control must acquire it here so terminal authority retirement
+        // can drain every graph writer before fixing the export cut.
+        let _stream_profile_guard = if heal_recovery {
+            Some(self.write_queue().acquire_stream_profile_shared().await)
+        } else {
+            None
+        };
+        if let Some(error) = self
+            .current_canonical_stream_profile()
+            .await?
+            .retired_error()
+        {
+            return Err(error);
+        }
         let admission_keys = self.capture_branch_control_stream_admission_keys().await?;
         let _stream_admission_guards = self
             .write_queue()
@@ -3250,6 +3300,14 @@ impl Omnigraph {
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
         )?;
+        let _stream_profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+        if let Some(error) = self
+            .current_canonical_stream_profile()
+            .await?
+            .retired_error()
+        {
+            return Err(error);
+        }
         let admission_keys = self.capture_branch_control_stream_admission_keys().await?;
         let _stream_admission_guards = self
             .write_queue()

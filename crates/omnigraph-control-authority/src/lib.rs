@@ -246,6 +246,13 @@ pub enum AuthorityOperationClass {
     /// request's expected profile revision before minting its narrower checked
     /// maintenance capability.
     StreamMaintenance,
+    /// Irreversible, graph-wide stream-authority retirement for rebuild.
+    ///
+    /// This is deliberately distinct from ordinary offline maintenance.  A
+    /// retirement confirmation must be able to cross the checked boundary
+    /// after its exact receipt has already made the profile `RETIRED`, while
+    /// rebind/schema maintenance must remain `DISABLED`-only.
+    StreamAuthorityRetirement,
     StreamRuntime,
 }
 
@@ -254,10 +261,25 @@ impl AuthorityOperationClass {
         match self {
             Self::StreamProfileEnable => Some(true),
             Self::StreamProfileDisable => Some(false),
-            Self::StreamMaintenance | Self::StreamRuntime => None,
+            Self::StreamMaintenance | Self::StreamAuthorityRetirement | Self::StreamRuntime => None,
+        }
+    }
+
+    fn offline_lock_operation(self) -> Option<&'static str> {
+        match self {
+            Self::StreamProfileEnable | Self::StreamProfileDisable | Self::StreamMaintenance => {
+                Some("apply")
+            }
+            Self::StreamAuthorityRetirement => Some(STREAM_AUTHORITY_RETIREMENT_LOCK_OPERATION),
+            Self::StreamRuntime => None,
         }
     }
 }
+
+/// Persisted cluster-lock operation used by both halves of the irreversible
+/// retirement handshake.  Exporting the spelling keeps the cluster command
+/// and the lower authority validator on one exact contract.
+pub const STREAM_AUTHORITY_RETIREMENT_LOCK_OPERATION: &str = "stream-retire-for-rebuild";
 
 /// Facts supplied by cluster apply after it has validated desired
 /// configuration and read the current state under the persisted lock.
@@ -347,37 +369,43 @@ impl ValidatedOfflineGuard<'_> {
 /// Validate and mint one offline streaming authority under the actual state
 /// lock.
 ///
-/// Profile changes and maintenance deliberately share the same concrete
-/// stopped-process proof. Their engine capabilities remain distinct: this
-/// lower guard cannot turn maintenance into a profile change, or vice versa.
+/// Profile changes, maintenance, and authority retirement deliberately share
+/// the same concrete stopped-process proof. Their engine capabilities remain
+/// distinct: this lower guard cannot turn one operation class into another.
 pub async fn validate_offline_guard<'lock>(
     lock: &'lock StateLockGuard,
     request: OfflineAuthorityRequest<'_>,
 ) -> Result<ValidatedOfflineGuard<'lock>, AuthorityError> {
-    if lock.operation() != "apply" {
+    let Some(required_lock_operation) = request.operation.offline_lock_operation() else {
         return Err(invalid_binding(
-            "offline streaming authority requires the cluster apply lock",
+            "offline guard operation must be a streaming profile transition, stream maintenance, or stream-authority retirement",
         ));
+    };
+    if lock.operation() != required_lock_operation {
+        return Err(invalid_binding(format!(
+            "offline streaming authority for {:?} requires the '{required_lock_operation}' cluster lock",
+            request.operation
+        )));
     }
     if !request.confirm_stream_offline {
-        let message = if request.operation == AuthorityOperationClass::StreamMaintenance {
-            "streaming maintenance requires explicit confirm_stream_offline"
-        } else {
-            "streaming profile changes require explicit confirm_stream_offline"
+        let message = match request.operation {
+            AuthorityOperationClass::StreamMaintenance => {
+                "streaming maintenance requires explicit confirm_stream_offline"
+            }
+            AuthorityOperationClass::StreamAuthorityRetirement => {
+                "stream-authority retirement requires explicit confirm_stream_offline"
+            }
+            AuthorityOperationClass::StreamProfileEnable
+            | AuthorityOperationClass::StreamProfileDisable => {
+                "streaming profile changes require explicit confirm_stream_offline"
+            }
+            AuthorityOperationClass::StreamRuntime => unreachable!(
+                "runtime operation was rejected before offline confirmation validation"
+            ),
         };
         return Err(invalid_binding(message));
     }
-    if !matches!(
-        request.operation,
-        AuthorityOperationClass::StreamProfileEnable
-            | AuthorityOperationClass::StreamProfileDisable
-            | AuthorityOperationClass::StreamMaintenance
-    ) {
-        return Err(invalid_binding(
-            "offline guard operation must be a streaming profile transition or stream maintenance",
-        ));
-    }
-    validate_held_apply_lock(lock).await?;
+    validate_held_offline_lock(lock, required_lock_operation).await?;
     validate_common_request(
         request.graph_id,
         request.graph_store_uri,
@@ -416,13 +444,16 @@ pub async fn validate_offline_guard<'lock>(
     })
 }
 
-async fn validate_held_apply_lock(lock: &StateLockGuard) -> Result<(), AuthorityError> {
+async fn validate_held_offline_lock(
+    lock: &StateLockGuard,
+    required_operation: &str,
+) -> Result<(), AuthorityError> {
     let persisted = lock.adapter.read_text(lock.uri()).await?;
     let persisted = StateLockFile::parse(&persisted)?;
-    if persisted.lock_id() != lock.lock_id() || persisted.operation() != "apply" {
-        return Err(invalid_binding(
-            "cluster apply lock changed before offline authority validation",
-        ));
+    if persisted.lock_id() != lock.lock_id() || persisted.operation() != required_operation {
+        return Err(invalid_binding(format!(
+            "cluster '{required_operation}' lock changed before offline authority validation"
+        )));
     }
     Ok(())
 }
@@ -1127,6 +1158,119 @@ mod tests {
             dir.path().join(CLUSTER_LOCK_FILE).exists(),
             "a stale guard must not delete the replacement owner's lock"
         );
+    }
+
+    #[tokio::test]
+    async fn retirement_guard_requires_its_distinct_lock_and_offline_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = format!("file://{}", dir.path().display());
+        let state_cas = write_state(
+            &dir,
+            serde_json::json!({
+                "version": 1,
+                "state_revision": 9,
+                "applied_revision": {
+                    "config_digest": "retirement-config",
+                    "resources": {
+                        "graph.knowledge": { "digest": "graph-digest" }
+                    }
+                }
+            }),
+        );
+        let storage = storage_handle_for_uri(&root).unwrap();
+        let lock_uri = format!("{root}/{CLUSTER_LOCK_FILE}");
+        let graph_store = format!("{}/graphs/knowledge.omni", dir.path().display());
+
+        let apply_lock = match acquire_state_lock(&storage, &lock_uri, "apply")
+            .await
+            .unwrap()
+        {
+            StateLockAcquire::Acquired(lock) => lock,
+            StateLockAcquire::Held => panic!("fresh apply lock unexpectedly held"),
+        };
+        let wrong_lock = validate_offline_guard(
+            &apply_lock,
+            OfflineAuthorityRequest {
+                graph_id: "knowledge",
+                graph_store_uri: &graph_store,
+                expected_state_cas: &state_cas,
+                state_revision: 9,
+                declaration_revision: "retirement-control-v1",
+                declaration_digest: "retirement-control",
+                expected_profile_revision: 4,
+                operation_id: "retirement-operation",
+                operation: AuthorityOperationClass::StreamAuthorityRetirement,
+                actor: "operator",
+                confirm_stream_offline: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            wrong_lock
+                .to_string()
+                .contains(STREAM_AUTHORITY_RETIREMENT_LOCK_OPERATION)
+        );
+        drop(apply_lock);
+
+        let retirement_lock = match acquire_state_lock(
+            &storage,
+            &lock_uri,
+            STREAM_AUTHORITY_RETIREMENT_LOCK_OPERATION,
+        )
+        .await
+        .unwrap()
+        {
+            StateLockAcquire::Acquired(lock) => lock,
+            StateLockAcquire::Held => panic!("fresh retirement lock unexpectedly held"),
+        };
+        let missing_confirmation = validate_offline_guard(
+            &retirement_lock,
+            OfflineAuthorityRequest {
+                graph_id: "knowledge",
+                graph_store_uri: &graph_store,
+                expected_state_cas: &state_cas,
+                state_revision: 9,
+                declaration_revision: "retirement-control-v1",
+                declaration_digest: "retirement-control",
+                expected_profile_revision: 4,
+                operation_id: "retirement-operation",
+                operation: AuthorityOperationClass::StreamAuthorityRetirement,
+                actor: "operator",
+                confirm_stream_offline: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            missing_confirmation
+                .to_string()
+                .contains("confirm_stream_offline")
+        );
+
+        let guard = validate_offline_guard(
+            &retirement_lock,
+            OfflineAuthorityRequest {
+                graph_id: "knowledge",
+                graph_store_uri: &graph_store,
+                expected_state_cas: &state_cas,
+                state_revision: 9,
+                declaration_revision: "retirement-control-v1",
+                declaration_digest: "retirement-control",
+                expected_profile_revision: 4,
+                operation_id: "retirement-operation",
+                operation: AuthorityOperationClass::StreamAuthorityRetirement,
+                actor: "operator",
+                confirm_stream_offline: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            guard.operation(),
+            AuthorityOperationClass::StreamAuthorityRetirement
+        );
+        assert_eq!(guard.operation().requested_streaming_enabled(), None);
     }
 
     #[tokio::test]

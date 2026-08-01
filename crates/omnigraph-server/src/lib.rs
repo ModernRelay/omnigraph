@@ -918,7 +918,12 @@ impl ApiError {
             | OmniError::StreamingRequiresClusterRuntime { .. }
             | OmniError::StreamingContentOperationUnsupported { .. }
             | OmniError::StreamingAuthorityMismatch { .. }
-            | OmniError::StreamAuthorityRetired) => Self::conflict(err.to_string()),
+            | OmniError::StreamAuthorityRetired { .. }
+            | OmniError::StreamExportBlocked { .. }
+            | OmniError::StreamRetirementPlanChanged
+            | OmniError::StreamRetirementIdempotencyConflict { .. }) => {
+                Self::conflict(err.to_string())
+            }
             err @ (OmniError::StreamLifecycleChanged { .. }
             | OmniError::StreamLifecycleIdempotencyConflict { .. }
             | OmniError::StreamBindingChanged { .. }

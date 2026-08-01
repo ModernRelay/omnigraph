@@ -480,10 +480,13 @@ hidden enrollment, claim, ordinary/drain-fold, and terminal receipt authority.
 V13/recovery-v15 adds private resume and guarded drain-abort.
 V14/recovery-v16 adds the checked-runtime `SEALED` EnsureIndices bridge;
 v15/recovery-v17 adds the distinct checked-runtime `SEALED` Optimize bridge.
-Neither maintenance owner adds a token receipt or caller operation ID. Current
-v16/recovery-v18 adds the separate private physical-rebind owner for an exact
-`SEALED` lane. Public ingress/enrollment/lifecycle control, correction,
-retirement, rebind, and public maintenance surfaces remain inactive.
+Neither maintenance owner adds a token receipt or caller operation ID.
+V16/recovery-v18 adds the separate private physical-rebind owner for an exact
+`SEALED` lane. Current v17/recovery-v19 adds the narrow stopped/offline,
+cluster-only authority-retirement and receipt-bearing export exit. Public
+ingress/enrollment/lifecycle control, correction, rebind, and public
+maintenance surfaces remain inactive; retirement is the sole narrow CLI
+exception.
 None of the later formats reinterprets or
 backfills v5 in place. A v5
 graph was never served with a

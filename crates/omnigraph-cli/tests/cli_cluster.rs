@@ -1,4 +1,4 @@
-//! Cluster command surface: validate/plan/apply/approve/status/sync/force-unlock.
+//! Cluster command surface: validate/plan/apply/approve/status/sync/force-unlock/stream retirement.
 //! Moved verbatim from tests/cli.rs in the modularization.
 
 use std::fs;
@@ -8,7 +8,6 @@ use tempfile::tempdir;
 mod support;
 
 use support::*;
-
 
 #[test]
 fn cluster_validate_config_success() {
@@ -897,12 +896,17 @@ graphs:
     let (a, b) = (validate(baseline.path()), validate(with_config.path()));
     // Compare the path-free invariants (paths embed each tempdir).
     for key in ["ok", "diagnostics", "resource_digests", "dependencies"] {
-        assert_eq!(a[key], b[key], "conflicting omnigraph.yaml leaked into cluster validate ({key})");
+        assert_eq!(
+            a[key], b[key],
+            "conflicting omnigraph.yaml leaked into cluster validate ({key})"
+        );
     }
     let leaked = b.to_string();
-    assert!(!leaked.contains("phantom") && !leaked.contains("9999"), "{leaked}");
+    assert!(
+        !leaked.contains("phantom") && !leaked.contains("9999"),
+        "{leaked}"
+    );
 }
-
 
 // ── RFC-010 Slice 3: cluster-managed maintenance addressing + init signpost ──
 
@@ -1139,4 +1143,74 @@ fn optimize_by_cluster_works_when_catalog_payloads_are_degraded() {
         parse_stdout_json(&out)["tables"].as_array().is_some(),
         "optimize should resolve via the ledger despite degraded catalog payloads"
     );
+}
+
+#[test]
+fn cluster_stream_retirement_requires_graph_and_accepts_only_config_scope() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let missing_graph = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-cluster-test")
+            .arg("cluster")
+            .arg("stream")
+            .arg("retire-for-rebuild")
+            .arg("plan")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--confirm-stream-offline"),
+    );
+    let stderr = String::from_utf8_lossy(&missing_graph.stderr);
+    assert!(stderr.contains("requires --graph"), "{stderr}");
+
+    let wrong_cluster_scope = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-cluster-test")
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("--cluster")
+            .arg(temp.path())
+            .arg("cluster")
+            .arg("stream")
+            .arg("retire-for-rebuild")
+            .arg("plan")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--confirm-stream-offline"),
+    );
+    let stderr = String::from_utf8_lossy(&wrong_cluster_scope.stderr);
+    assert!(stderr.contains("--cluster"), "{stderr}");
+    assert!(stderr.contains("does not apply"), "{stderr}");
+}
+
+#[test]
+fn cluster_stream_retirement_reports_structured_offline_preflight_errors() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let output = output_failure(
+        cli()
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("cluster")
+            .arg("stream")
+            .arg("retire-for-rebuild")
+            .arg("plan")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    let json = parse_stdout_json(&output);
+    let codes = json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| diagnostic["code"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(codes.contains(&"stream_authority_retirement_actor_required"));
+    assert!(codes.contains(&"streaming_offline_confirmation_required"));
+    assert!(!temp.path().join("__cluster/lock.json").exists());
 }

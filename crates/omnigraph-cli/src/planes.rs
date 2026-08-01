@@ -12,7 +12,10 @@
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
-use crate::cli::{Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand, SchemaCommand};
+use crate::cli::{
+    Cli, ClusterCommand, ClusterStreamCommand, Command, GraphsCommand, QueriesCommand,
+    SchemaCommand, StreamRetireForRebuildCommand,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Plane {
@@ -70,7 +73,6 @@ impl Capability {
             Capability::Local => "local",
         }
     }
-
 }
 
 /// The global scope-addressing flags, exhaustively. Adding a flag forces a
@@ -117,7 +119,9 @@ impl ScopeFlag {
             ScopeFlag::Cluster => "--cluster addresses a cluster-scoped command",
             ScopeFlag::Graph => "--graph selects a graph within a server or cluster scope",
             ScopeFlag::Store => "--store addresses a single graph's storage directly",
-            ScopeFlag::As => "--as sets the actor for a direct-engine or cluster write",
+            ScopeFlag::As => {
+                "--as sets the actor for a direct-engine or actor-bound cluster operation"
+            }
             ScopeFlag::Profile => "--profile selects a scope bundle",
         }
     }
@@ -141,6 +145,7 @@ impl ScopeFlag {
 fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool {
     use Capability::*;
     let cluster_ok = accepts_cluster_addressing(cmd);
+    let graph_ok = accepts_graph_selector(cmd);
     match flag {
         // Served-graph addressing; `served` is the registry scope (the bare
         // server), which still needs a server to talk to.
@@ -152,7 +157,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // would corrupt the registry URL.
         ScopeFlag::Graph => match capability {
             Any => true,
-            Direct | Control => cluster_ok,
+            Direct | Control => graph_ok,
             Served | Local => false,
         },
         // `direct` refines per command: the maintenance verbs (optimize/
@@ -168,15 +173,17 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // writes; served writes resolve the actor from the bearer token
         // (rejected downstream with its own message), and `direct`
         // maintenance verbs record no actor. `control` refines per command:
-        // only `cluster apply`/`cluster approve` attribute an actor — the
-        // read-only control verbs (status/plan/validate, policy, queries)
-        // never read it.
+        // `cluster apply`/`approve` and the actor-bound retirement handshake
+        // attribute an actor — the other read-only control verbs
+        // (status/plan/validate, policy, queries) never read it.
         ScopeFlag::As => match capability {
             Any => true,
             Control => matches!(
                 cmd,
                 Command::Cluster {
-                    command: ClusterCommand::Apply { .. } | ClusterCommand::Approve { .. },
+                    command: ClusterCommand::Apply { .. }
+                        | ClusterCommand::Approve { .. }
+                        | ClusterCommand::Stream { .. },
                 }
             ),
             Served | Direct | Local => false,
@@ -290,7 +297,21 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Optimize { .. } => "optimize",
         Command::Repair { .. } => "repair",
         Command::Cleanup { .. } => "cleanup",
-        Command::Cluster { .. } => "cluster",
+        Command::Cluster { command } => match command {
+            ClusterCommand::Stream {
+                command:
+                    ClusterStreamCommand::RetireForRebuild {
+                        command: StreamRetireForRebuildCommand::Plan { .. },
+                    },
+            } => "cluster stream retire-for-rebuild plan",
+            ClusterCommand::Stream {
+                command:
+                    ClusterStreamCommand::RetireForRebuild {
+                        command: StreamRetireForRebuildCommand::Confirm { .. },
+                    },
+            } => "cluster stream retire-for-rebuild confirm",
+            _ => "cluster",
+        },
         Command::Graphs { command } => match command {
             GraphsCommand::List { .. } => "graphs list",
         },
@@ -319,6 +340,20 @@ pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
             | Command::Policy { .. }
             | Command::Queries { .. }
     )
+}
+
+/// Commands that consume the global `--graph` selector. Most of these also
+/// consume global `--cluster`, but the nested `cluster stream` family is the
+/// intentional exception: it gets its cluster root from `--config` while
+/// selecting one graph from that cluster with `--graph`.
+fn accepts_graph_selector(cmd: &Command) -> bool {
+    accepts_cluster_addressing(cmd)
+        || matches!(
+            cmd,
+            Command::Cluster {
+                command: ClusterCommand::Stream { .. },
+            }
+        )
 }
 
 /// Reject a scope-addressing flag (`--server`/`--cluster`/`--graph`) on a verb
@@ -410,16 +445,25 @@ mod tests {
     fn scope_flag_matrix_matches_capabilities() {
         // The full flag × capability contract in one place. Rows cover every
         // capability, both cluster_ok refinements of `direct` (optimize vs
-        // init) and of `control` (queries vs cluster). `served` is the
-        // registry scope: server addressing only — --graph/--store/--as are
-        // rejected (--graph used to corrupt the registry URL to
-        // /graphs/<id>/graphs).
+        // init) and of `control` (queries vs cluster), plus the graph-only
+        // retirement selector. `served` is the registry scope: server
+        // addressing only — --graph/--store/--as are rejected (--graph used
+        // to corrupt the registry URL to /graphs/<id>/graphs).
         let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
         // (command, [server, cluster, graph, store, as, profile])
         let rows = [
-            (parse(&["omnigraph", "query", "q"]), [true, false, true, true, true, true]),
-            (parse(&["omnigraph", "graphs", "list"]), [true, false, false, false, false, true]),
-            (parse(&["omnigraph", "optimize", "g.omni"]), [false, true, true, true, false, true]),
+            (
+                parse(&["omnigraph", "query", "q"]),
+                [true, false, true, true, true, true],
+            ),
+            (
+                parse(&["omnigraph", "graphs", "list"]),
+                [true, false, false, false, false, true],
+            ),
+            (
+                parse(&["omnigraph", "optimize", "g.omni"]),
+                [false, true, true, true, false, true],
+            ),
             // `init` addresses its target positionally and never resolves a
             // scope — --store and --profile are rejected, not silently
             // ignored (unlike the other direct verbs).
@@ -427,10 +471,14 @@ mod tests {
                 parse(&["omnigraph", "init", "--schema", "s.pg", "g.omni"]),
                 [false, false, false, false, false, false],
             ),
-            // Read-only control verbs never read the actor; only
-            // `cluster apply`/`approve` do. The `cluster` family addresses
-            // its config with --config and never resolves a profile scope.
-            (parse(&["omnigraph", "queries", "list"]), [false, true, true, false, false, true]),
+            // Read-only control verbs never read the actor; `cluster
+            // apply`/`approve` and retirement do. The `cluster` family
+            // addresses its config with --config and never resolves a profile
+            // scope. Retirement is the one member that also selects a graph.
+            (
+                parse(&["omnigraph", "queries", "list"]),
+                [false, true, true, false, false, true],
+            ),
             (
                 parse(&["omnigraph", "cluster", "status", "--config", "."]),
                 [false, false, false, false, false, false],
@@ -439,7 +487,22 @@ mod tests {
                 parse(&["omnigraph", "cluster", "apply", "--config", "."]),
                 [false, false, false, false, true, false],
             ),
-            (parse(&["omnigraph", "version"]), [false, false, false, false, false, false]),
+            (
+                parse(&[
+                    "omnigraph",
+                    "cluster",
+                    "stream",
+                    "retire-for-rebuild",
+                    "plan",
+                    "--config",
+                    ".",
+                ]),
+                [false, false, true, false, true, false],
+            ),
+            (
+                parse(&["omnigraph", "version"]),
+                [false, false, false, false, false, false],
+            ),
         ];
         for (cmd, expected) in &rows {
             let capability = command_capability(cmd);
@@ -456,16 +519,44 @@ mod tests {
 
     #[test]
     fn command_capability_classifies_representative_verbs() {
-        let cap = |args: &[&str]| {
-            command_capability(&Cli::try_parse_from(args).unwrap().command)
-        };
+        let cap = |args: &[&str]| command_capability(&Cli::try_parse_from(args).unwrap().command);
         // The one Data→Served refinement — if the `graphs` guard were deleted,
         // every other assertion here would still pass.
         assert_eq!(cap(&["omnigraph", "graphs", "list"]), Capability::Served);
         assert_eq!(cap(&["omnigraph", "alias", "who"]), Capability::Local);
-        assert_eq!(cap(&["omnigraph", "optimize", "graph.omni"]), Capability::Direct);
-        assert_eq!(cap(&["omnigraph", "schema", "plan", "--schema", "s.pg", "graph.omni"]), Capability::Direct);
-        assert_eq!(cap(&["omnigraph", "cluster", "status", "--config", "."]), Capability::Control);
+        assert_eq!(
+            cap(&["omnigraph", "optimize", "graph.omni"]),
+            Capability::Direct
+        );
+        assert_eq!(
+            cap(&[
+                "omnigraph",
+                "schema",
+                "plan",
+                "--schema",
+                "s.pg",
+                "graph.omni"
+            ]),
+            Capability::Direct
+        );
+        assert_eq!(
+            cap(&["omnigraph", "cluster", "status", "--config", "."]),
+            Capability::Control
+        );
+        assert_eq!(
+            cap(&[
+                "omnigraph",
+                "cluster",
+                "stream",
+                "retire-for-rebuild",
+                "confirm",
+                "--retirement-id",
+                "00000000-0000-4000-8000-000000000001",
+                "--expected-plan-digest",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ]),
+            Capability::Control
+        );
         assert_eq!(cap(&["omnigraph", "version"]), Capability::Local);
         // `queries`/`policy` tooling reads cluster state now (control plane).
         assert_eq!(cap(&["omnigraph", "queries", "list"]), Capability::Control);

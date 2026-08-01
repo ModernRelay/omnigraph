@@ -19,7 +19,7 @@ authority.
 - No `omnigraph run *` CLI subcommands and no `/runs/*` HTTP endpoints.
 - No `__run__<id>` staging branches; `__run__*` is no longer a reserved
   name. The branch-name guard was removed in MR-770. Historically, the v2→v3
-  in-place migration swept stale `__run__*` entries; the current v16 strand is
+  in-place migration swept stale `__run__*` entries; the current v17 strand is
   strict single-version, so older graphs are refused and rebuilt by
   export/init/load rather than migrated on open. (Inert `_graph_runs.lance`
   bytes in an old export source remain irrelevant to the rebuilt graph.)
@@ -558,14 +558,16 @@ activates recovery-v14 enrollment, writer-claim, ordinary/drain-fold, and
 terminal-management effects. V13 adds recovery-v15 for private,
 revision-fenced resume and guarded drain-abort. V14 adds recovery-v16 for the
 narrow checked-runtime `SEALED` EnsureIndices bridge; v15 adds the distinct
-recovery-v17 `SEALED` Optimize bridge; current v16 adds recovery-v18 private
-physical rebind for an exact `SEALED` lane. The hidden one-lane core can
+  recovery-v17 `SEALED` Optimize bridge; v16 adds recovery-v18 private physical
+rebind for an exact `SEALED` lane; current v17 adds recovery-v19 terminal
+stream-authority retirement. The hidden one-lane core can
 quiesce an enrolled lane `OPEN → DRAINING → SEALED`, including empty and non-empty lanes, but no
 supported production surface can invoke it. The Cedar vocabulary,
 manifest-only status, and checked stopped/offline and runtime ownership exist;
 there is no accepted-schema declaration, production enrollment/quiesce/resume/rebind,
-public ingest, correction/retirement, or HTTP/CLI/OpenAPI streaming, rebind,
-or maintenance surface.
+public ingest, correction, or HTTP/OpenAPI streaming, rebind, or maintenance
+surface. The only supported retirement surface is the narrow offline cluster
+plan/confirm handshake described below.
 
 Lifecycle-v3 enrollment owns the physical binding:
 
@@ -747,6 +749,29 @@ writer or put, and does not synthesize `OPEN`; a distinct recovery-v15 resume
 must claim a higher epoch inside the fresh binding scope. No public or
 production lifecycle/rebind surface invokes this owner.
 
+Recovery-v19 `StreamAuthorityRetirement` owns the terminal rebuild exit. The
+cluster-only `stream retire-for-rebuild plan|confirm` handshake holds the real
+state lock and checked stopped/offline authority. Planning is read-only and
+requires the exact `DISABLED` profile, settled graph and cluster recovery, every
+enrolled lane `SEALED`, complete base/token parity, and at least one current
+`WITHDRAWN` token. Confirmation is actor- and plan-digest-bound: it appends one
+immutable receipt to `_stream_tokens.lance`, then the sole manifest CAS selects
+that exact token witness and `DISABLED → RETIRED` profile. The operation moves
+no graph or branch head, writes no `GraphCommit` or `RecoveryAudit`, and has no
+outgoing transition. A retired source refuses all mutation and maintenance but
+continues query/status/export. Export re-proves the receipt/profile/logical cut
+and emits `_omnigraph_export_provenance` with the selected root receipt plus a
+selected `branch_member` witness before logical rows. The witness binds the
+canonical branch, exact Lance branch identifier, graph head, manifest version,
+`table_witness_digest`, and a recomputable `branch_member_digest`. The export's
+`source_schema_ir_hash`, exact `ordered_branch_member_digests`, and
+`selected_member_index` let load verify the selected slot and recompute the
+receipt's `export_cut_digest`. The source schema hash is proof input for the
+retired source cut, not an identity that must equal the fresh target; ordinary
+loader validation enforces target schema compatibility. This exit discards
+sequencing authority only by rebuilding into a fresh graph identity; it never
+rewrites a `WITHDRAWN` token as `PRESENT`.
+
 Rebind does not make ordinary writer admission proportional to retained
 binding history. The manifest-selected `BindingReceipt` authenticates the
 complete retained-prefix set with one fixed-size count/digest commitment;
@@ -846,8 +871,10 @@ The remaining product contract is still inactive. `@stream` eligibility,
 request-idempotent public enrollment, authoritative status, revisioned
 `OPEN -> DRAINING -> SEALED -> OPEN` management, bounded terminal receipts,
 `REPLACE`/`WITHDRAW` correction, authorization, and wire/SDK/CLI parity have no
-production caller yet. State-v2 reserves and validates their durable slots; it
-does not imply that their transitions are implemented. The B2b
+production caller yet. The retirement handshake does not activate any of those
+surfaces or a production path that creates `WITHDRAWN`. State-v2 reserves and
+validates their durable slots; it does not imply that their transitions are
+implemented. The B2b
 managed-reclamation profile requires Lance-owned durable reclamation with whole-cut proof,
 attempt/receipt recovery, bounded history checkpointing, strong PUT/DELETE
 inventory plus multipart accounting/abort or durable accounting, a post-success
@@ -1364,14 +1391,17 @@ structured `resource_limit` details. It never reports partial success.
 `_graph_commits.lance`). Ordinary commit/actor history is queried via
 `omnigraph commit list`. Crash-recovery actions additionally live in the internal
 `_graph_commit_recoveries.lance` table described above; that exact recovery log
-does not yet have a public CLI query.
+does not yet have a public CLI query. Recovery-v19 authority retirement is the
+intentional lineage-neutral exception: its selected immutable receipt/profile
+chain is the audit record, so it appends neither graph lineage nor
+`RecoveryAudit`.
 
 ## Storage versioning (no in-place migration)
 
 `db/manifest/migrations.rs` is the single place the on-disk `__manifest` shape is
 reconciled with what the binary expects. Storage is **strict-single-version** (the
 strand model): this binary reads exactly ONE internal-schema version
-(`MIN_SUPPORTED == CURRENT == 14`), so there is no in-place migration.
+(`MIN_SUPPORTED == CURRENT == 17`), so there is no in-place migration.
 
 - **Graph creation** stamps `omnigraph:internal_schema_version` at CURRENT, so a
   fresh graph always opens.
@@ -1423,13 +1453,15 @@ recovery-v14 enrollment, claim, ordinary/drain fold, and terminal management
 receipts. V13 activates recovery-v15 private resume and guarded
 drain-abort without reinterpreting v14's incomplete scaffold. V14 activates
 recovery-v16 private SEALED EnsureIndices; v15 activates the distinct
-recovery-v17 private SEALED Optimize path without reinterpreting the v14
-maintenance scaffold; current v16 activates recovery-v18 private physical
-rebind without reinterpreting v14's three-field rebind scaffold. These hidden
-seams are not supported production lifecycle APIs. Historical v10 enrollment,
-v12 fold, and v14 resume/maintenance sidecars are refused, not reinterpreted. Public
-ingress/enrollment/quiesce/resume/abort/rebind, correction/retirement, and
-public integration remain inactive.
+  recovery-v17 private SEALED Optimize path without reinterpreting the v14
+  maintenance scaffold; v16 activates recovery-v18 private physical rebind
+  without reinterpreting v14's three-field rebind scaffold. Current v17
+  activates recovery-v19 root-wide authority retirement and receipt-bearing
+  export/rebuild. The older hidden seams are not supported production lifecycle
+  APIs. Historical v10 enrollment, v12 fold, and v14 resume/maintenance/
+  retirement sidecars are refused, not reinterpreted. Public ingress,
+  enrollment/quiesce/resume/abort/rebind, correction, and public integration
+  remain inactive.
 
 The stamp history (v1 PK-less, v2 unenforced-PK, v3 `__run__*` sweep, v4 lineage
 in `__manifest` with the commit-graph tables retired, v5 stable table identity,
@@ -1440,9 +1472,10 @@ stream-config v3/state-v2 plus manifest-selected token authority and
 recovery-v12, v10 graph-profile enablement, v11 checked profile-v2 plus
 recovery-v13 profile receipts, v12 lifecycle-v3 plus recovery-v14, v13
 private resume/guarded drain-abort plus recovery-v15, v14 private SEALED
-EnsureIndices plus recovery-v16, and v15 private SEALED Optimize plus
-recovery-v17, and v16 private physical rebind plus recovery-v18) is
-recorded on the `INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v16 is
+  EnsureIndices plus recovery-v16, v15 private SEALED Optimize plus
+  recovery-v17, v16 private physical rebind plus recovery-v18, and v17
+  authority retirement plus recovery-v19) is recorded on the
+`INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v17 is
 served. An
 earlier-stamped graph is rebuilt via export/import, not migrated in place.
 

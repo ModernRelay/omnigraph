@@ -1854,6 +1854,12 @@ struct MemWalWorker {
     usage: Mutex<WorkerUsage>,
     last_used: Mutex<std::time::Instant>,
     idle_task_armed: AtomicBool,
+    /// Wakes the one idle owner as soon as this worker leaves `Active`.
+    ///
+    /// The idle owner retains its graph-scoped authority factory, so letting
+    /// it sleep until the normal idle deadline would also retain the checked
+    /// runtime after quiescence has retired the worker.
+    idle_retirement: tokio::sync::Notify,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1903,6 +1909,7 @@ impl MemWalWorker {
             usage: Mutex::new(usage),
             last_used: Mutex::new(std::time::Instant::now()),
             idle_task_armed: AtomicBool::new(false),
+            idle_retirement: tokio::sync::Notify::new(),
         }
     }
 
@@ -1931,6 +1938,7 @@ impl MemWalWorker {
             }),
             last_used: Mutex::new(std::time::Instant::now()),
             idle_task_armed: AtomicBool::new(false),
+            idle_retirement: tokio::sync::Notify::new(),
         }
     }
 
@@ -3859,6 +3867,11 @@ impl MemWalWorkerRegistry {
         let (sender, receiver) = watch::channel(None);
         let handle = RetirementHandle { receiver };
         *state = RegistrySlotState::Retiring(handle.clone());
+        // Do not retain the graph-scoped idle authority factory until the
+        // ordinary idle deadline after the slot has left Active. `notify_one`
+        // keeps a permit when the spawned idle task has not started polling
+        // yet, closing the install-then-immediate-quiesce race.
+        worker.idle_retirement.notify_one();
         let writer = Arc::clone(&worker.writer);
         tokio::spawn(async move {
             let mut error = match crate::failpoints::maybe_fail(
@@ -4096,10 +4109,13 @@ impl MemWalWorkerRegistry {
                     .last_used
                     .lock()
                     .expect("MemWAL worker idle clock poisoned");
-                tokio::time::sleep_until(tokio::time::Instant::from_std(
-                    last_used + registry.limits.idle_timeout,
-                ))
-                .await;
+                tokio::select! {
+                    biased;
+                    _ = worker.idle_retirement.notified() => break,
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                        last_used + registry.limits.idle_timeout,
+                    )) => {}
+                }
 
                 let is_same_active = {
                     let state = slot.state.lock().await;
@@ -4133,7 +4149,12 @@ impl MemWalWorkerRegistry {
                     continue;
                 }
 
-                match authority_check(Arc::clone(&worker.writer)).await {
+                let authority = tokio::select! {
+                    biased;
+                    _ = worker.idle_retirement.notified() => break,
+                    authority = authority_check(Arc::clone(&worker.writer)) => authority,
+                };
+                match authority {
                     Ok(authority) => match registry.evict_idle(worker.key, authority).await {
                         Ok(true) => break,
                         Ok(false) => continue,
@@ -4143,7 +4164,11 @@ impl MemWalWorkerRegistry {
                                 error = %error,
                                 "idle MemWAL eviction could not start; retrying"
                             );
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            tokio::select! {
+                                biased;
+                                _ = worker.idle_retirement.notified() => break,
+                                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                            }
                         }
                     },
                     Err(failure) => {
@@ -6160,6 +6185,76 @@ mod tests {
         let other_identity = TableIdentity::new(63, 65).unwrap();
         registry.reserve_resident(other_identity).unwrap();
         registry.release_resident_reservation(other_identity);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiesce_releases_idle_owner_before_the_idle_deadline() {
+        let fixture = enrolled_worker_fixture("quiesce-wakes-idle-owner").await;
+        let mut bounded = limits();
+        bounded.idle_timeout = Duration::from_secs(30);
+        let registry = MemWalWorkerRegistry::for_root(
+            &format!("memory://quiesce-wakes-idle-owner/{}", ShardId::new_v4()),
+            bounded,
+        )
+        .unwrap();
+        let opened = claim_opened_worker(
+            &fixture.dataset,
+            &fixture.uri,
+            &fixture.details,
+            &fixture.plan,
+            fixture.initial_epoch,
+        )
+        .await;
+        let worker = install_cached_worker(&registry, fixture.key, opened).await;
+        let slot = registry.slot(fixture.key);
+
+        // This token models the checked graph runtime captured by the real
+        // idle-authority factory. Its only strong owner after arming is the
+        // spawned idle task.
+        let retained_runtime = Arc::new(());
+        let runtime_probe = Arc::downgrade(&retained_runtime);
+        let idle_authority: IdleAuthorityCheck = Arc::new(move |_writer| {
+            let retained_runtime = Arc::clone(&retained_runtime);
+            Box::pin(async move {
+                let _retained_runtime = retained_runtime;
+                std::future::pending::<Result<CheckedStreamAuthority, IdleAuthorityFailure>>().await
+            })
+        });
+        registry.ensure_idle_task(&slot, &worker, idle_authority);
+        tokio::task::yield_now().await;
+        assert!(
+            runtime_probe.upgrade().is_some(),
+            "the armed idle owner must retain its authority factory"
+        );
+
+        let admission = Arc::new(tokio::sync::RwLock::new(()));
+        let exclusive = Arc::clone(&admission).write_owned().await;
+        let opener = fresh_worker_opener(
+            fixture.dataset.clone(),
+            fixture.uri.clone(),
+            fixture.details.clone(),
+            fixture.plan.enrollment_id,
+            fixture.plan.shard_id,
+            fixture.initial_epoch,
+        );
+        let cut = registry
+            .quiesce_cut(
+                fixture.key,
+                "node:Test".to_string(),
+                CheckedExclusiveStreamAuthority::from_exclusive_admission(exclusive),
+                opener,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while runtime_probe.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("quiesce must wake and release the idle owner before its 30-second deadline");
+        drop(cut);
     }
 
     async fn assert_ordinary_seal_still_refuses_empty(fixture: &EnrolledWorkerFixture) {

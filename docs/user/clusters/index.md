@@ -206,6 +206,36 @@ lane in this release. Only the no-lane case restores the direct physical lane.
 Already-`SEALED` enrollments remain fenced, so use the strict export/init/load
 rebuild to return an enrolled graph to that non-streaming lane.
 
+### Terminal authority retirement: plan → confirm → rebuild
+
+If a v17 graph has current `WITHDRAWN` sequencing authority, ordinary export
+refuses rather than silently discarding it. After stopping every writer and
+reaching exact `DISABLED` with every enrolled lane `SEALED`, use the separate
+cluster-only retirement handshake:
+
+```bash
+omnigraph --graph knowledge --as andrew \
+  cluster stream retire-for-rebuild plan \
+  --config company-brain --confirm-stream-offline --json
+
+omnigraph --graph knowledge --as andrew \
+  cluster stream retire-for-rebuild confirm \
+  --config company-brain \
+  --retirement-id <uuid> \
+  --expected-plan-digest <sha256:...> \
+  --confirm-stream-offline --json
+```
+
+The plan is read-only and also proves the state lock, applied graph mapping,
+settled recovery, base/token parity, and exact frozen graph cut. Confirmation
+is irreversible: it records one actor- and plan-bound receipt and makes the
+source permanently read/query/status/export-only. Export then includes that
+root receipt and a closed witness naming the selected frozen branch member as
+provenance for loading logical rows into a fresh graph identity; it does not
+transfer live sequencing authority. A graph with only `PRESENT`
+tokens uses ordinary export. See the [upgrade guide](../operations/upgrade.md)
+for the full procedure.
+
 ## 3. Inspect: status, refresh, drift
 
 ```bash

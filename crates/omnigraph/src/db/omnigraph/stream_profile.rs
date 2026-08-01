@@ -59,6 +59,32 @@ pub struct CheckedClusterMaintenanceAuthority<'lock> {
     guard: ValidatedOfflineGuard<'lock>,
 }
 
+/// Engine-checked stopped-writer authority for one root-wide retirement
+/// occurrence. Unlike ordinary maintenance, this capability may reach an
+/// already-RETIRED graph so confirmation can perform receipt-first replay.
+#[doc(hidden)]
+pub struct CheckedClusterRetirementAuthority<'lock> {
+    pub(super) guard: ValidatedOfflineGuard<'lock>,
+}
+
+impl CheckedClusterRetirementAuthority<'_> {
+    pub(super) fn operation_id(&self) -> &str {
+        self.guard.operation_id()
+    }
+
+    pub(super) fn actor(&self) -> &str {
+        self.guard.actor()
+    }
+
+    pub(super) fn expected_profile_revision(&self) -> u64 {
+        self.guard.expected_profile_revision()
+    }
+
+    pub(super) fn graph_store_uri(&self) -> &str {
+        self.guard.graph_store_uri()
+    }
+}
+
 impl CheckedClusterMaintenanceAuthority<'_> {
     pub(crate) fn operation_id(&self) -> &str {
         self.guard.operation_id()
@@ -237,7 +263,9 @@ fn validate_runtime_profile_binding(
     } = &profile.state
     else {
         return Err(match profile.mode() {
-            StreamProfileMode::Retired => OmniError::StreamAuthorityRetired,
+            StreamProfileMode::Retired => profile
+                .retired_error()
+                .expect("RETIRED profile carries retirement provenance"),
             mode => OmniError::StreamingRequiresClusterRuntime {
                 mode: mode.as_str().to_string(),
             },
@@ -269,6 +297,9 @@ fn validate_offline_maintenance_profile_binding(
     profile: &StreamProfileEntry,
     guard: &ValidatedOfflineGuard<'_>,
 ) -> Result<()> {
+    if let Some(error) = profile.retired_error() {
+        return Err(error);
+    }
     if profile.mode() != StreamProfileMode::Disabled {
         return Err(OmniError::StreamingAuthorityMismatch {
             reason: format!(
@@ -362,6 +393,54 @@ impl Omnigraph {
         Ok(CheckedClusterMaintenanceAuthority { guard })
     }
 
+    /// Consume the dedicated offline guard used only by authority retirement.
+    /// A RETIRED profile is admitted here solely so `confirm` can look up the
+    /// immutable receipt before comparing current state.
+    #[doc(hidden)]
+    pub async fn check_cluster_retirement_authority<'lock>(
+        &self,
+        guard: ValidatedOfflineGuard<'lock>,
+    ) -> Result<CheckedClusterRetirementAuthority<'lock>> {
+        if guard.graph_store_uri() != self.uri() {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: format!(
+                    "validated retirement store '{}' does not match opened graph '{}'",
+                    guard.graph_store_uri(),
+                    self.uri()
+                ),
+            });
+        }
+        if guard.operation() != AuthorityOperationClass::StreamAuthorityRetirement {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: "offline authority is not a stream-authority retirement operation"
+                    .to_string(),
+            });
+        }
+        self.enforce(
+            omnigraph_policy::PolicyAction::StreamManage,
+            &omnigraph_policy::ResourceScope::Graph,
+            Some(guard.actor()),
+        )?;
+
+        let _profile_gate = self.write_queue().acquire_stream_profile_shared().await;
+        let profile = self.current_canonical_stream_profile().await?;
+        if !matches!(
+            profile.mode(),
+            StreamProfileMode::Disabled | StreamProfileMode::Retired
+        ) || profile.profile_revision != guard.expected_profile_revision()
+        {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: format!(
+                    "offline authority retirement expected DISABLED or RETIRED profile revision {}, graph is {} revision {}",
+                    guard.expected_profile_revision(),
+                    profile.mode().as_str(),
+                    profile.profile_revision
+                ),
+            });
+        }
+        Ok(CheckedClusterRetirementAuthority { guard })
+    }
+
     /// Attach the one checked serving-runtime authority to this engine handle.
     ///
     /// Startup validates the live graph profile after the lower layer rereads
@@ -413,7 +492,9 @@ impl Omnigraph {
             StreamProfileMode::Disabling => Err(OmniError::StreamingRequiresClusterRuntime {
                 mode: profile.mode().as_str().to_string(),
             }),
-            StreamProfileMode::Retired => Err(OmniError::StreamAuthorityRetired),
+            StreamProfileMode::Retired => Err(profile
+                .retired_error()
+                .expect("RETIRED profile carries retirement provenance")),
         }
     }
 
@@ -440,7 +521,9 @@ impl Omnigraph {
                     mode: mode.as_str().to_string(),
                 })
             }
-            StreamProfileMode::Retired => Err(OmniError::StreamAuthorityRetired),
+            StreamProfileMode::Retired => Err(profile
+                .retired_error()
+                .expect("RETIRED profile carries retirement provenance")),
         }
     }
 
@@ -464,7 +547,9 @@ impl Omnigraph {
         let profile = self.current_canonical_stream_profile().await?;
         match profile.mode() {
             StreamProfileMode::Disabled => Ok(()),
-            StreamProfileMode::Retired => Err(OmniError::StreamAuthorityRetired),
+            StreamProfileMode::Retired => Err(profile
+                .retired_error()
+                .expect("RETIRED profile carries retirement provenance")),
             mode @ (StreamProfileMode::Enabled | StreamProfileMode::Disabling) => {
                 Err(OmniError::StreamingContentOperationUnsupported {
                     operation: "branch_merge".to_string(),
@@ -878,7 +963,9 @@ impl Omnigraph {
                 ));
             }
             (_, StreamProfileMode::Retired) => {
-                return Err(OmniError::StreamAuthorityRetired);
+                return Err(expected
+                    .retired_error()
+                    .expect("RETIRED profile carries retirement provenance"));
             }
             (StreamProfileMode::Enabled, StreamProfileMode::Disabled)
             | (StreamProfileMode::Disabled, StreamProfileMode::Enabled) => {}

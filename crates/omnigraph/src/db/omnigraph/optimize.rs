@@ -282,11 +282,18 @@ async fn optimize_all_tables_with_mode(
     // before a physical maintenance effect instead of acquiring a late lease.
     let admission_txn = db.open_write_txn(None).await?;
     let stream_admission_keys = Omnigraph::stream_admission_keys_for_snapshot(&admission_txn.base);
-    let _stream_profile_guard = if mode.is_sealed_maintenance() {
-        Some(db.write_queue().acquire_stream_profile_shared().await)
-    } else {
-        None
-    };
+    // Every physical writer joins the root profile window, even when no lane
+    // is enrolled in the table it happens to touch. RETIRED is graph-global,
+    // and retirement must be able to drain ambient maintenance before fixing
+    // its exact logical cut.
+    let _stream_profile_guard = db.write_queue().acquire_stream_profile_shared().await;
+    if let Some(error) = db
+        .current_canonical_stream_profile()
+        .await?
+        .retired_error()
+    {
+        return Err(error);
+    }
     if mode.is_sealed_maintenance() {
         // The entry preflight avoids doing ordinary recovery/schema work on an
         // unbound handle. Recheck while retaining the profile gate so the
@@ -1299,6 +1306,15 @@ pub async fn cleanup_all_tables(
         ));
     }
     crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES)?;
+
+    let _stream_profile_guard = db.write_queue().acquire_stream_profile_shared().await;
+    if let Some(error) = db
+        .current_canonical_stream_profile()
+        .await?
+        .retired_error()
+    {
+        return Err(error);
+    }
 
     // Cleanup can destroy the exact versions and transaction history used by
     // stream enrollment/recovery classification. Conservatively close every

@@ -17,7 +17,7 @@ message that **names the release line that wrote it** and the exact commands —
 so you can fetch the right old binary without guessing:
 
 ```
-__manifest is stamped at internal schema v4, but this omnigraph reads only v13.
+__manifest is stamped at internal schema v4, but this omnigraph reads only v17.
 This graph was created by omnigraph 0.8.x. Rebuild it: with an omnigraph
 0.8.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
 binary run `omnigraph init --schema <schema.pg> <new-graph>` and `omnigraph load
@@ -44,14 +44,15 @@ from that line (the latest is safest):
 | internal schema v13 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
 | internal schema v14 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
 | internal schema v15 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v16 | unreleased (current 0.10.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
+| internal schema v16 | unreleased (earlier 0.10.0-dev source builds) | final v16 source build at merge `ac59c4f6d1d83acc8118c410c39de2bed91f9c15` |
+| internal schema v17 | unreleased (current 0.10.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
 
 **Stamps v5–v8 never shipped.** The storage format advanced five times inside
 the single 0.8.1 → 0.9.0 development window, so the only graphs carrying those
 stamps came from source builds off `main`; no published binary reads them and
 the refusal message names them `0.9.0-dev`. If you have one, export it with a
 build of the commit that created it, then load into a fresh current-format
-graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10–v16 are
+graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10–v17 are
 pre-release formats written by matching 0.10.0-dev source builds. The final
 0.10.0 format may use a later stamp.
 
@@ -123,6 +124,86 @@ complete. Do not use force-init to turn the old root into the new format.
   `append`/`merge` writes copy external payloads instead, as described below.
 - **Server deployments**: take the graph out of the serving set, rebuild it offline
   with the CLI, then point the cluster at the rebuilt graph (`cluster apply`).
+
+## Migrating from internal schema v16 to v17
+
+Internal schema v17 adds recovery-v19 for the terminal stream-authority
+retirement/export exit. It does not reinterpret the frozen recovery-v14
+retirement scaffold. Recovery-v19 appends one immutable retirement receipt and
+then selects that exact token witness with `DISABLED → RETIRED`; the operation
+moves no graph or branch head and creates no graph commit or recovery-audit row.
+
+For a clean v16 graph, use the final v16 source build at merge
+`ac59c4f6d1d83acc8118c410c39de2bed91f9c15`:
+
+1. Gracefully stop every writer-capable process for the graph.
+2. Explicitly disable its streaming profile.
+3. Verify that it is clean, disabled, and unenrolled. Ordinary v16 export
+   transfers logical rows, vectors, blobs, and ordinary properties—not private
+   lifecycle, WAL, token, receipt, maintenance, rebind, or retirement authority.
+4. Export the visible logical graph.
+
+Then use the v17 binary to initialize a **different** root, load the export,
+apply cluster configuration, and restart serving. Verify row/vector/blob
+fidelity and the v17 stamp before cutover. Keep the v16 root unchanged through
+the rollback window. A v17 binary refuses v16, and a v16 binary refuses v17.
+
+The v17 retirement command cannot upgrade a v16 root: strict version refusal
+prevents a v17 binary from opening it. If the v16 source is enrolled or carries
+private stream authority, keep it intact; a logical-row rebuild is not an
+authority-preserving migration.
+
+### Rebuilding a v17 graph blocked by `WITHDRAWN` authority
+
+Ordinary v17 export refuses while any current token is `WITHDRAWN`, because a
+row-only rebuild would discard per-key sequencing authority. The explicit exit
+is available only on that same v17 source format. It is intentionally narrow:
+the graph must be cluster-managed, `state.lock: true`, stopped/offline,
+`DISABLED`, free of pending cluster and graph recovery, and every enrolled lane
+must be exactly `SEALED`. The plan also proves base/token parity and requires at
+least one current `WITHDRAWN` token; a fully `PRESENT` graph uses ordinary
+export.
+
+Run the read-only plan and save its JSON output:
+
+```bash
+omnigraph --graph <graph-id> --as <actor> \
+  cluster stream retire-for-rebuild plan \
+  --config <cluster-dir> --confirm-stream-offline --json
+```
+
+After reviewing the exact plan digest, confirm it with a new canonical UUID:
+
+```bash
+omnigraph --graph <graph-id> --as <actor> \
+  cluster stream retire-for-rebuild confirm \
+  --config <cluster-dir> \
+  --retirement-id <uuid> \
+  --expected-plan-digest <sha256:...> \
+  --confirm-stream-offline --json
+```
+
+Confirmation is irreversible. Any change since planning fails effect-free and
+requires a new plan. Once `RETIRED`, the source is permanently
+read/query/status/export-only; there is no transition back. Export re-proves the
+frozen cut and writes one `_omnigraph_export_provenance` row before the
+logical rows. The row pairs the root-wide receipt with a `branch_member`
+witness containing the canonical selected branch, its exact Lance branch
+identifier, graph head, manifest version, `table_witness_digest`, and a
+recomputable `branch_member_digest`. It also carries
+`source_schema_ir_hash`, the exact `ordered_branch_member_digests`, and
+`selected_member_index`. Loading the JSONL into a fresh v17 graph recomputes
+the selected member digest, proves that it occupies the selected slot, and
+recomputes the receipt's `export_cut_digest` from the source schema hash and
+ordered member digests. `source_schema_ir_hash` describes the retired source
+cut; it is not required to equal the fresh target's graph identity. Ordinary
+loader schema and row validation separately enforce compatibility with the
+target schema. The rebuild imports no lifecycle, WAL, token, receipt-chain, or
+sequencing authority. Keep the retired source root for audit and rollback
+evidence.
+
+This slice does not activate authority correction or any production path that
+creates `WITHDRAWN`; it installs the terminal exit before such a path can ship.
 
 ## Migrating from internal schema v15 to v16
 

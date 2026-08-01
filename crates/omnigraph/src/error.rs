@@ -199,8 +199,27 @@ pub enum OmniError {
     /// RETIRED is an irreversible read/export-only disposition. F2 decodes it
     /// fail-closed; the later retirement slice owns the sole transition into
     /// it and no transition out.
-    #[error("stream authority is retired; this graph is read/export-only")]
-    StreamAuthorityRetired,
+    #[error(
+        "stream authority retirement '{retirement_id}' fixed this graph at export cut {export_cut_digest}; the source is read/export-only"
+    )]
+    StreamAuthorityRetired {
+        retirement_id: String,
+        export_cut_digest: String,
+    },
+    /// Ordinary export cannot discard terminal sequencing authority. The
+    /// stopped-writer retirement/rebuild command is the explicit exit.
+    #[error(
+        "stream export is blocked by {withdrawn_token_count} current WITHDRAWN token(s); retire authority for rebuild or correct them to PRESENT"
+    )]
+    StreamExportBlocked { withdrawn_token_count: u64 },
+    /// The exact root-wide retirement plan moved between plan and confirm.
+    /// No token-ledger or manifest effect was allowed.
+    #[error("stream retirement plan changed before confirmation; rerun the plan command")]
+    StreamRetirementPlanChanged,
+    /// A root-wide retirement occurrence ID was already bound to another
+    /// canonical plan or authenticated actor.
+    #[error("stream authority retirement idempotency conflict for retirement '{retirement_id}'")]
+    StreamRetirementIdempotencyConflict { retirement_id: String },
     /// RFC-026 rejected a stream append before invoking Lance because the one
     /// active generation is at its hard whole-generation ceiling. The caller
     /// must fold the durable generation before retrying; no row from this call
@@ -438,10 +457,7 @@ impl OmniError {
         )
     }
 
-    pub fn recovery_required(
-        operation_id: impl Into<String>,
-        reason: impl Into<String>,
-    ) -> Self {
+    pub fn recovery_required(operation_id: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::RecoveryRequired {
             operation_id: operation_id.into(),
             reason: reason.into(),
