@@ -1543,9 +1543,14 @@ fn checked_offline_disable_corrects_adopted_open_after_fold_data_block_and_conve
         drop(served);
 
         let offline = reopen_enrolled(&dir).await;
-        let disable_error = try_disable_stream_profile(&offline, &cluster_uri)
-            .await
-            .expect_err("disable adoption must park on the uniqueness DataBlock");
+        let disable_error = {
+            let _overflow = force_dead_letter_object_overflow_once();
+            try_disable_stream_profile(&offline, &cluster_uri)
+                .await
+                .expect_err(
+                    "disable adoption must park when the conflict's dead-letter object overflows",
+                )
+        };
         let blocked = stream_lane(&offline).await;
         let block_token = blocked
             .strict_block_token
@@ -2055,6 +2060,10 @@ fn stream_data_block_token(error: &OmniError) -> &str {
         OmniError::StreamDataBlocked { block_token } => block_token,
         other => panic!("expected typed stream DataBlock error, got {other:?}"),
     }
+}
+
+fn force_dead_letter_object_overflow_once() -> ScopedFailPoint {
+    ScopedFailPoint::new(names::STREAM_DEAD_LETTER_FORCE_OBJECT_LIMIT, "1*return")
 }
 
 #[tokio::test]
@@ -3337,7 +3346,7 @@ async fn sealed_optimize_partial_armed_effect_restores_with_matching_lifecycle_p
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure() {
+async fn quiesce_persists_a_stable_data_block_when_dead_letter_object_overflows() {
     let _scenario = FailScenario::setup();
     let cluster = tempfile::tempdir().unwrap();
     let graph = cluster.path().join("graphs/knowledge.omni");
@@ -3372,15 +3381,17 @@ async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure
     let drain_id = "96969696-9696-4696-8696-969696969696";
     let actor = "operator:strict-data-block";
 
-    let first_error = db
-        .failpoint_stream_quiesce_for_test(TABLE, drain_id, before_lane.lifecycle_revision, actor)
-        .await
-        .expect_err("a permanent drain validator failure must publish a strict data block");
+    let first_error = {
+        let _overflow = force_dead_letter_object_overflow_once();
+        db.failpoint_stream_quiesce_for_test(TABLE, drain_id, before_lane.lifecycle_revision, actor)
+            .await
+            .expect_err("dead-letter object overflow must publish a strict data block")
+    };
     let blocked = stream_lane(&db).await;
     let block_token = blocked
         .strict_block_token
         .clone()
-        .expect("DRAINING validation failure must expose its durable block token");
+        .expect("DRAINING dead-letter object overflow must expose its durable block token");
     assert_eq!(stream_data_block_token(&first_error), block_token);
     assert_eq!(blocked.lifecycle, "DRAINING");
     assert_eq!(blocked.drain_id.as_deref(), Some(drain_id));
@@ -3460,7 +3471,7 @@ async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure
     assert_no_recovery_sidecars(&dir);
 }
 
-async fn prepare_unique_data_block(
+async fn prepare_unique_conflict_data_block_via_object_overflow(
     logical_id: &str,
     drain_id: &str,
     actor: &str,
@@ -3515,10 +3526,14 @@ async fn prepare_unique_data_block(
         .await
         .expect("base-dependent uniqueness remains fold-time work");
     let open_revision = stream_lane(&db).await.lifecycle_revision;
-    let error = db
-        .failpoint_stream_quiesce_for_test(TABLE, drain_id, open_revision, actor)
-        .await
-        .expect_err("the uniqueness conflict must publish a strict DataBlock");
+    let error = {
+        let _overflow = force_dead_letter_object_overflow_once();
+        db.failpoint_stream_quiesce_for_test(TABLE, drain_id, open_revision, actor)
+            .await
+            .expect_err(
+                "the uniqueness conflict must publish a DataBlock when its dead-letter object overflows",
+            )
+    };
     let blocked = stream_lane(&db).await;
     assert_eq!(
         stream_data_block_token(&error),
@@ -3536,7 +3551,8 @@ async fn data_block_show_and_replace_unstrand_the_exact_drain() {
     let drain_id = "a1a1a1a1-a1a1-41a1-81a1-a1a1a1a1a1a1";
     let actor = "operator:data-block-replace";
     let (dir, db, blocked, open_revision) =
-        prepare_unique_data_block(logical_id, drain_id, actor, false).await;
+        prepare_unique_conflict_data_block_via_object_overflow(logical_id, drain_id, actor, false)
+            .await;
     let block_token = blocked.strict_block_token.clone().unwrap();
 
     drop(db);
@@ -3657,7 +3673,13 @@ async fn correction_id_reuse_on_a_later_block_is_effect_free() {
     let first_drain_id = "a4a4a4a4-a4a4-44a4-84a4-a4a4a4a4a4a4";
     let correction_id = "b5b5b5b5-b5b5-45b5-85b5-b5b5b5b5b5b5";
     let (dir, db, first_blocked, first_open_revision) =
-        prepare_unique_data_block(first_logical_id, first_drain_id, actor, false).await;
+        prepare_unique_conflict_data_block_via_object_overflow(
+            first_logical_id,
+            first_drain_id,
+            actor,
+            false,
+        )
+        .await;
     let first_block_token = first_blocked.strict_block_token.clone().unwrap();
     let first_page = db
         .failpoint_show_stream_data_block_for_test(TABLE, &first_block_token, None)
@@ -3706,15 +3728,19 @@ async fn correction_id_reuse_on_a_later_block_is_effect_free() {
         .await
         .expect("the later conflicting generation must become durable");
     let second_drain_id = "e8e8e8e8-e8e8-48e8-88e8-e8e8e8e8e8e8";
-    let block_error = db
-        .failpoint_stream_quiesce_for_test(
+    let block_error = {
+        let _overflow = force_dead_letter_object_overflow_once();
+        db.failpoint_stream_quiesce_for_test(
             TABLE,
             second_drain_id,
             reopened.lifecycle_revision,
             actor,
         )
         .await
-        .expect_err("the later uniqueness conflict must publish another DataBlock");
+        .expect_err(
+            "the later uniqueness conflict must publish another DataBlock when its dead-letter object overflows",
+        )
+    };
     let second_blocked = stream_lane(&db).await;
     let second_block_token = second_blocked.strict_block_token.clone().unwrap();
     assert_eq!(stream_data_block_token(&block_error), second_block_token);
@@ -3777,7 +3803,8 @@ async fn data_block_withdraw_uses_a_marker_only_base_effect_and_unstrands_the_dr
     let drain_id = "d4d4d4d4-d4d4-44d4-84d4-d4d4d4d4d4d4";
     let actor = "operator:data-block-withdraw";
     let (dir, db, blocked, _open_revision) =
-        prepare_unique_data_block(logical_id, drain_id, actor, true).await;
+        prepare_unique_conflict_data_block_via_object_overflow(logical_id, drain_id, actor, true)
+            .await;
     let cluster_uri = dir.cluster_uri();
     let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
     let blocked_manifest_version = db
@@ -3877,8 +3904,13 @@ async fn assert_data_block_correction_recovery_boundary(
     boundary: DataBlockCorrectionRecoveryBoundary,
 ) {
     let actor = "operator:data-block-recovery";
-    let (dir, db, blocked, open_revision) =
-        prepare_unique_data_block(boundary.logical_id, boundary.drain_id, actor, false).await;
+    let (dir, db, blocked, open_revision) = prepare_unique_conflict_data_block_via_object_overflow(
+        boundary.logical_id,
+        boundary.drain_id,
+        actor,
+        false,
+    )
+    .await;
     let block_token = blocked.strict_block_token.clone().unwrap();
     let page = db
         .failpoint_show_stream_data_block_for_test(TABLE, &block_token, None)
@@ -3978,45 +4010,47 @@ async fn assert_data_block_correction_recovery_boundary(
     assert_no_recovery_sidecars(&dir);
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn data_block_correction_recovery_closes_each_two_participant_crash_cell() {
-    let _scenario = FailScenario::setup();
-    let boundaries = [
-        DataBlockCorrectionRecoveryBoundary {
-            failpoint: names::STREAM_FOLD_POST_SIDECAR_PRE_BASE_COMMIT,
-            logical_id: "correction-arm-only",
-            drain_id: "11111111-1111-4111-8111-111111111111",
-            correction_id: "21111111-1111-4111-8111-111111111111",
-            write_id: "31111111-1111-4111-8111-111111111111",
-            recovery_publishes: false,
-        },
-        DataBlockCorrectionRecoveryBoundary {
-            failpoint: names::STREAM_FOLD_POST_BASE_COMMIT_PRE_TOKEN_COMMIT,
-            logical_id: "correction-base-only",
-            drain_id: "12222222-2222-4222-8222-222222222222",
-            correction_id: "22222222-2222-4222-8222-222222222222",
-            write_id: "32222222-2222-4222-8222-222222222222",
-            recovery_publishes: true,
-        },
-        DataBlockCorrectionRecoveryBoundary {
-            failpoint: names::STREAM_FOLD_POST_TOKEN_COMMIT_PRE_CONFIRM,
-            logical_id: "correction-both-effects",
-            drain_id: "13333333-3333-4333-8333-333333333333",
-            correction_id: "23333333-3333-4333-8333-333333333333",
-            write_id: "33333333-3333-4333-8333-333333333333",
-            recovery_publishes: true,
-        },
-    ];
+fn data_block_correction_recovery_closes_each_two_participant_crash_cell() {
+    on_big_stack(|| async {
+        let _scenario = FailScenario::setup();
+        let boundaries = [
+            DataBlockCorrectionRecoveryBoundary {
+                failpoint: names::STREAM_FOLD_POST_SIDECAR_PRE_BASE_COMMIT,
+                logical_id: "correction-arm-only",
+                drain_id: "11111111-1111-4111-8111-111111111111",
+                correction_id: "21111111-1111-4111-8111-111111111111",
+                write_id: "31111111-1111-4111-8111-111111111111",
+                recovery_publishes: false,
+            },
+            DataBlockCorrectionRecoveryBoundary {
+                failpoint: names::STREAM_FOLD_POST_BASE_COMMIT_PRE_TOKEN_COMMIT,
+                logical_id: "correction-base-only",
+                drain_id: "12222222-2222-4222-8222-222222222222",
+                correction_id: "22222222-2222-4222-8222-222222222222",
+                write_id: "32222222-2222-4222-8222-222222222222",
+                recovery_publishes: true,
+            },
+            DataBlockCorrectionRecoveryBoundary {
+                failpoint: names::STREAM_FOLD_POST_TOKEN_COMMIT_PRE_CONFIRM,
+                logical_id: "correction-both-effects",
+                drain_id: "13333333-3333-4333-8333-333333333333",
+                correction_id: "23333333-3333-4333-8333-333333333333",
+                write_id: "33333333-3333-4333-8333-333333333333",
+                recovery_publishes: true,
+            },
+        ];
 
-    for boundary in boundaries {
-        Box::pin(assert_data_block_correction_recovery_boundary(boundary)).await;
-    }
+        for boundary in boundaries {
+            Box::pin(assert_data_block_correction_recovery_boundary(boundary)).await;
+        }
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn quiesce_persists_a_stable_data_block_for_fresh_source_min_cardinality() {
+async fn quiesce_persists_a_stable_data_block_when_min_cardinality_dead_letter_object_overflows() {
     let _scenario = FailScenario::setup();
     let cluster = tempfile::tempdir().unwrap();
     let graph = cluster.path().join("graphs/knowledge.omni");
@@ -4055,15 +4089,19 @@ async fn quiesce_persists_a_stable_data_block_for_fresh_source_min_cardinality()
     let drain_id = "97979797-9797-4797-8797-979797979797";
     let actor = "operator:min-card-data-block";
 
-    let first_error = db
-        .failpoint_stream_quiesce_for_test(
+    let first_error = {
+        let _overflow = force_dead_letter_object_overflow_once();
+        db.failpoint_stream_quiesce_for_test(
             MIN_CARD_EDGE_TABLE,
             drain_id,
             before_lane.lifecycle_revision,
             actor,
         )
         .await
-        .expect_err("the under-min fresh source must publish a strict DataBlock");
+        .expect_err(
+            "the under-min fresh source must publish a DataBlock when its dead-letter object overflows",
+        )
+    };
     let blocked = stream_lane(&db).await;
     let block_token = blocked
         .strict_block_token

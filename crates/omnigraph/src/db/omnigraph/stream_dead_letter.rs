@@ -176,11 +176,20 @@ pub(crate) fn prepare_stream_dead_letter_object(
     fold_operation_id: &str,
     candidates: &[StreamDeadLetterObjectCandidate<'_>],
 ) -> Result<PreparedStreamDeadLetterObject> {
-    prepare_stream_dead_letter_object_with_limit(
-        fold_operation_id,
-        candidates,
-        STREAM_DEAD_LETTER_OBJECT_MAX_ENCODED_BYTES,
+    // The test-only failpoint changes only the size of the existing envelope;
+    // it does not inject a synthetic terminal outcome. This keeps integration
+    // fixtures on the production overflow -> DataBlock classification path
+    // without allocating a 64-MiB candidate.
+    let encoded_byte_limit = if crate::failpoints::maybe_fail(
+        crate::failpoints::names::STREAM_DEAD_LETTER_FORCE_OBJECT_LIMIT,
     )
+    .is_err()
+    {
+        1
+    } else {
+        STREAM_DEAD_LETTER_OBJECT_MAX_ENCODED_BYTES
+    };
+    prepare_stream_dead_letter_object_with_limit(fold_operation_id, candidates, encoded_byte_limit)
 }
 
 fn prepare_stream_dead_letter_object_with_limit(

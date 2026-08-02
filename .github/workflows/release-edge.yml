@@ -45,10 +45,14 @@ jobs:
             asset_name: omnigraph-linux-arm64
           - runner: macos-14
             asset_name: omnigraph-macos-arm64
+            # OmniGraph's release text exceeds arm64's +/-128 MiB direct-branch
+            # range. Use long calls instead of relying on ld branch islands.
+            rustflags: -C code-model=large
           - runner: windows-latest
             asset_name: omnigraph-windows-x86_64
     env:
       CARGO_TERM_COLOR: always
+      RUSTFLAGS: ${{ matrix.rustflags || '' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v5.0.1

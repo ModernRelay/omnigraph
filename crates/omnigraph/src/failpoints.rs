@@ -258,6 +258,10 @@ pub mod names {
     /// occurrence effect-free or reconstruct the exact object on retry.
     pub const STREAM_DEAD_LETTER_POST_SIDECAR_PRE_OBJECT: &str =
         "stream_dead_letter.post_sidecar_pre_object";
+    /// Force the bounded dead-letter encoder to use a one-byte envelope. This
+    /// lets tests reach the real envelope-overflow DataBlock path without
+    /// retaining a 64-MiB logical generation solely as fixture data.
+    pub const STREAM_DEAD_LETTER_FORCE_OBJECT_LIMIT: &str = "stream_dead_letter.force_object_limit";
     /// The descriptor-selected immutable object is exact and durable, while
     /// neither Lance participant has been invoked. The object is inert until
     /// the sole manifest publication selects its terminal token rows.
