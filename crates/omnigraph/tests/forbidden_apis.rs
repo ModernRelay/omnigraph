@@ -1176,6 +1176,42 @@ fn cfg_requires_test(attributes: &[Attribute]) -> bool {
     })
 }
 
+fn cfg_has_exact_feature(attributes: &[Attribute], expected: &str) -> bool {
+    attributes.iter().any(|attribute| {
+        if !attribute.path().is_ident("cfg") {
+            return false;
+        }
+        let mut matched = false;
+        attribute
+            .parse_nested_meta(|meta| {
+                if meta.path.is_ident("feature") {
+                    let value = meta.value()?;
+                    let feature: syn::LitStr = value.parse()?;
+                    matched |= feature.value() == expected;
+                }
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("failed to parse cfg attribute: {error}"));
+        matched
+    })
+}
+
+fn has_doc_hidden(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        if !attribute.path().is_ident("doc") {
+            return false;
+        }
+        let mut hidden = false;
+        attribute
+            .parse_nested_meta(|meta| {
+                hidden |= meta.path.is_ident("hidden");
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("failed to parse doc attribute: {error}"));
+        hidden
+    })
+}
+
 fn final_path_ident(expr: &Expr) -> Option<String> {
     let Expr::Path(path) = expr else {
         return None;
@@ -2153,6 +2189,70 @@ fn public_graph_surfaces(src: &Path) -> BTreeSet<(String, String)> {
         }
     }
     surfaces
+}
+
+#[test]
+fn stream_driver_runtime_status_remains_advisory_and_failpoints_only() {
+    let path = engine_src_root().join("db/omnigraph/stream_driver.rs");
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let ast = parse_rust_source(&contents, "db/omnigraph/stream_driver.rs");
+    let mut bridge_count = 0;
+
+    for item in &ast.items {
+        match item {
+            Item::Struct(item) if item.ident.to_string().starts_with("StreamFoldDriver") => {
+                assert!(
+                    !matches!(item.vis, Visibility::Public(_)),
+                    "process-local driver status types must not become a public SDK contract: {}",
+                    item.ident
+                );
+            }
+            Item::Enum(item) if item.ident.to_string().starts_with("StreamFoldDriver") => {
+                assert!(
+                    !matches!(item.vis, Visibility::Public(_)),
+                    "process-local driver status types must not become a public SDK contract: {}",
+                    item.ident
+                );
+            }
+            Item::Impl(item) if item.trait_.is_none() && is_omnigraph_type(&item.self_ty) => {
+                for member in &item.items {
+                    let syn::ImplItem::Fn(function) = member else {
+                        continue;
+                    };
+                    let name = function.sig.ident.to_string();
+                    if !matches!(function.vis, Visibility::Public(_))
+                        || function.sig.asyncness.is_some()
+                    {
+                        continue;
+                    }
+                    bridge_count += 1;
+                    assert_eq!(
+                        name, "failpoint_stream_fold_driver_status_for_test",
+                        "a second driver-status surface would require an explicit public contract"
+                    );
+                    assert!(
+                        cfg_has_exact_feature(&function.attrs, "failpoints"),
+                        "the process-local status bridge must compile only with failpoints"
+                    );
+                    assert!(
+                        has_doc_hidden(&function.attrs),
+                        "the failpoint status bridge must stay hidden from generated SDK docs"
+                    );
+                    assert!(matches!(
+                        &function.sig.output,
+                        syn::ReturnType::Type(_, output) if is_named_type(output, "String")
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        bridge_count, 1,
+        "exactly one failpoints-only JSON bridge may expose process-local driver status"
+    );
 }
 
 fn low_level_async_surfaces(src: &Path, owner: &str) -> BTreeSet<(String, String, String)> {

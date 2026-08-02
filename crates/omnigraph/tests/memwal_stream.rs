@@ -2298,6 +2298,39 @@ async fn wait_for_visible_rows(db: &Omnigraph, expected: &[(String, i32)]) {
     .expect("resident stream fold driver did not publish the expected rows");
 }
 
+fn stream_fold_driver_status(db: &Omnigraph) -> serde_json::Value {
+    serde_json::from_str(&db.failpoint_stream_fold_driver_status_for_test())
+        .expect("stream fold driver status must be valid JSON")
+}
+
+fn assert_process_local_driver_state(status: &serde_json::Value, expected_state: &str) {
+    assert_eq!(status["scope"], "process_local_advisory");
+    assert_eq!(status["authoritative"], false);
+    assert_eq!(status["state"], expected_state);
+    assert!(
+        status["pending_triggers"].is_array(),
+        "process-local pending triggers remain advisory diagnostics: {status}"
+    );
+}
+
+async fn wait_for_published_open_fold(db: &Omnigraph, minimum_count: u64) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let status = stream_fold_driver_status(db);
+            if status["published_open_folds"]
+                .as_u64()
+                .is_some_and(|count| count >= minimum_count)
+                && status["last_completion"]["outcome"] == "published_open_fold"
+            {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("resident driver status did not observe the published OPEN fold")
+}
+
 async fn wait_for_stream_lifecycle(db: &Omnigraph, expected: &str) -> StreamTableStatus {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -2467,6 +2500,264 @@ async fn durable_put_is_graph_content_invisible_until_one_explicit_fold() {
     );
 }
 
+struct F6aCandidateRuntimeFixture {
+    dir: EnrolledGraphDir,
+    stream_incarnation_id: String,
+}
+
+#[inline(never)]
+async fn f6a_publish_mixed_candidate_cut() -> F6aCandidateRuntimeFixture {
+    let cluster = tempfile::tempdir().unwrap();
+    let graph = cluster.path().join("graphs/knowledge.omni");
+    let db = Arc::new(
+        Omnigraph::init(graph.to_str().unwrap(), UNIQUE_STREAM_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    load_jsonl(
+        &db,
+        r#"{"type":"Person","data":{"id":"existing","score":7}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("seed the exact committed uniqueness winner before enabling streaming");
+    assert_eq!(visible_rows(&db).await, vec![("existing".to_string(), 7)]);
+
+    let dir = EnrolledGraphDir {
+        _cluster: cluster,
+        graph,
+    };
+    let cluster_uri = dir.cluster_uri();
+    enable_stream_profile(&db, &cluster_uri).await;
+    let served = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    served
+        .start_stream_fold_driver()
+        .await
+        .expect("the checked serving runtime starts its resident fold driver");
+    let started = stream_fold_driver_status(&served);
+    assert_process_local_driver_state(&started, "running");
+    assert_eq!(started["pending_triggers"].as_array().unwrap().len(), 0);
+    assert_eq!(started["published_open_folds"], 0);
+    assert_eq!(started["last_completion"], serde_json::Value::Null);
+    assert_eq!(started["last_error"], serde_json::Value::Null);
+
+    let enrollment_request_id = "f6a00000-0000-4000-8000-000000000001";
+    let (challenge, witness, incarnation) =
+        prepare_stream_ingest(&served, enrollment_request_id, None, "agent:f6a-candidate")
+            .await
+            .expect("bodyless prepare returns compare evidence for the absent lane");
+    assert_eq!(challenge, "witness_required");
+    assert!(incarnation.is_none());
+    let witness = witness.expect("the bodyless prepare challenge carries an exact witness");
+    let (prepared, next_witness, incarnation) = prepare_stream_ingest(
+        &served,
+        enrollment_request_id,
+        Some(&witness),
+        "agent:f6a-candidate",
+    )
+    .await
+    .expect("echoing the exact witness lazily enrolls one OPEN lane");
+    assert_eq!(prepared, "enrolled");
+    assert!(next_witness.is_none());
+    let incarnation = incarnation.expect("lazy enrollment returns its durable incarnation");
+
+    let body = [
+        ndjson_score_line(
+            &incarnation,
+            "loser",
+            7,
+            "f6a10000-0000-4000-8000-000000000001",
+            None,
+        ),
+        ndjson_score_line(
+            &incarnation,
+            "winner",
+            9,
+            "f6a10000-0000-4000-8000-000000000002",
+            None,
+        ),
+    ]
+    .concat();
+    let outcomes = parse_ndjson_outcomes(
+        served
+            .failpoint_stream_ingest_ndjson_as_for_test(TABLE, vec![body], "agent:f6a-candidate")
+            .await
+            .expect("the mixed candidate batch crosses the durable NDJSON boundary"),
+    );
+    assert_eq!(outcomes.len(), 2);
+    for (ordinal, outcome) in outcomes.iter().enumerate() {
+        assert_eq!(outcome["ordinal"], ordinal as u64);
+        assert_eq!(outcome["status"], "durable");
+        assert!(outcome["stream_token"].as_str().is_some());
+    }
+    assert_ne!(outcomes[0]["stream_token"], outcomes[1]["stream_token"]);
+    let acknowledged = stream_fold_driver_status(&served);
+    assert_process_local_driver_state(&acknowledged, "running");
+
+    wait_for_visible_rows(
+        &served,
+        &[("existing".to_string(), 7), ("winner".to_string(), 9)],
+    )
+    .await;
+    let completed = wait_for_published_open_fold(&served, 1).await;
+    assert_process_local_driver_state(&completed, "running");
+    assert_eq!(completed["published_open_folds"], 1);
+    assert!(completed["pending_triggers"].as_array().unwrap().is_empty());
+    assert_eq!(
+        completed["last_completion"]["outcome"],
+        "published_open_fold"
+    );
+    assert!(
+        completed["last_completion"]["event_sequence"]
+            .as_u64()
+            .is_some_and(|sequence| sequence > 0)
+    );
+    assert_eq!(completed["last_error"], serde_json::Value::Null);
+
+    served
+        .shutdown_stream_fold_driver()
+        .await
+        .expect("the first resident driver joins after publishing its finite cut");
+    let stopped = stream_fold_driver_status(&served);
+    assert_process_local_driver_state(&stopped, "stopped");
+    assert!(stopped["pending_triggers"].as_array().unwrap().is_empty());
+    assert_eq!(stopped["last_error"], serde_json::Value::Null);
+    drop(served);
+    assert_no_recovery_sidecars(&dir);
+
+    F6aCandidateRuntimeFixture {
+        dir,
+        stream_incarnation_id: incarnation,
+    }
+}
+
+#[inline(never)]
+async fn f6a_inspect_terminal_candidate(fixture: &F6aCandidateRuntimeFixture) -> String {
+    let offline = reopen_enrolled(&fixture.dir).await;
+    let cluster_uri = fixture.dir.cluster_uri();
+    let list = helpers::stream_authority::list_stream_dead_letters(&offline, &cluster_uri, None)
+        .await
+        .expect("offline inspection lists the selected terminal occurrence");
+    assert_eq!(list.entries.len(), 1);
+    assert!(list.next_cursor.is_none());
+    let terminal = &list.entries[0];
+    assert_eq!(terminal.table_key, TABLE);
+    assert_eq!(terminal.logical_id, "loser");
+    assert_eq!(terminal.reason_code, "UNIQUE_VIOLATION");
+    let occurrence_token = terminal.occurrence_token.clone();
+
+    let exported =
+        helpers::stream_authority::export_stream_dead_letter_payloads(&offline, &cluster_uri, None)
+            .await
+            .expect("offline inspection verifies and exports the selected terminal payload");
+    assert_eq!(exported.entries.len(), 1);
+    assert!(exported.next_cursor.is_none());
+    assert_eq!(exported.entries[0].authority, list.entries[0]);
+    assert_eq!(exported.entries[0].payload["id"], "loser");
+    assert_eq!(exported.entries[0].payload["score"], 7);
+    assert_no_recovery_sidecars(&fixture.dir);
+    occurrence_token
+}
+
+#[inline(never)]
+async fn f6a_publish_correction_and_disable(
+    fixture: &F6aCandidateRuntimeFixture,
+    terminal_token: &str,
+) {
+    let cluster_uri = fixture.dir.cluster_uri();
+    let reopened = reopen_enrolled(&fixture.dir).await;
+    let served =
+        helpers::stream_authority::bind_checked_stream_runtime(reopened, &cluster_uri).await;
+    served
+        .start_stream_fold_driver()
+        .await
+        .expect("the rebound checked runtime starts the resident driver");
+    let restarted = stream_fold_driver_status(&served);
+    assert_process_local_driver_state(&restarted, "running");
+
+    let outcomes = parse_ndjson_outcomes(
+        served
+            .failpoint_stream_ingest_ndjson_as_for_test(
+                TABLE,
+                vec![ndjson_score_line(
+                    &fixture.stream_incarnation_id,
+                    "loser",
+                    8,
+                    "f6a20000-0000-4000-8000-000000000001",
+                    Some(terminal_token),
+                )],
+                "agent:f6a-candidate",
+            )
+            .await
+            .expect("the terminal token authorizes one corrected ordinary successor"),
+    );
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["ordinal"], 0);
+    assert_eq!(outcomes[0]["status"], "durable");
+    assert!(outcomes[0]["stream_token"].as_str().is_some());
+    assert_ne!(outcomes[0]["stream_token"], terminal_token);
+
+    wait_for_visible_rows(
+        &served,
+        &[
+            ("existing".to_string(), 7),
+            ("loser".to_string(), 8),
+            ("winner".to_string(), 9),
+        ],
+    )
+    .await;
+    let completed = wait_for_published_open_fold(&served, 1).await;
+    assert_process_local_driver_state(&completed, "running");
+    assert!(completed["pending_triggers"].as_array().unwrap().is_empty());
+    assert_eq!(
+        completed["last_completion"]["outcome"],
+        "published_open_fold"
+    );
+    assert_eq!(completed["last_error"], serde_json::Value::Null);
+
+    served
+        .shutdown_stream_fold_driver()
+        .await
+        .expect("the corrected-cut driver joins before offline handoff");
+    let stopped = stream_fold_driver_status(&served);
+    assert_process_local_driver_state(&stopped, "stopped");
+    assert!(stopped["pending_triggers"].as_array().unwrap().is_empty());
+    drop(served);
+
+    let offline = reopen_enrolled(&fixture.dir).await;
+    let list = helpers::stream_authority::list_stream_dead_letters(&offline, &cluster_uri, None)
+        .await
+        .expect("a PRESENT correction removes the terminal token from the current list");
+    assert!(list.entries.is_empty());
+    assert!(list.next_cursor.is_none());
+    assert_offline_stream_profile_authority_available(&offline, &cluster_uri).await;
+    disable_stream_profile(&offline, &cluster_uri).await;
+    let terminal = offline.stream_status().await.unwrap();
+    assert_eq!(terminal.profile_mode, "DISABLED");
+    assert_eq!(terminal.tables.len(), 1);
+    assert_eq!(terminal.tables[0].lifecycle, "SEALED");
+    assert_eq!(
+        visible_rows(&offline).await,
+        vec![
+            ("existing".to_string(), 7),
+            ("loser".to_string(), 8),
+            ("winner".to_string(), 9),
+        ]
+    );
+    assert_no_recovery_sidecars(&fixture.dir);
+}
+
+#[test]
+#[serial]
+fn candidate_runtime_composes_lazy_prepare_mixed_fold_terminal_correction_and_disable() {
+    on_big_stack(|| async {
+        let _scenario = FailScenario::setup();
+        let fixture = f6a_publish_mixed_candidate_cut().await;
+        let terminal_token = f6a_inspect_terminal_candidate(&fixture).await;
+        f6a_publish_correction_and_disable(&fixture, &terminal_token).await;
+    });
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn resident_driver_empty_startup_is_effect_free_and_timer_folds_once() {
@@ -2488,9 +2779,8 @@ async fn resident_driver_empty_startup_is_effect_free_and_timer_folds_once() {
         matches!(error, OmniError::StreamingAuthorityMismatch { .. }),
         "{error:?}"
     );
-    let status: serde_json::Value =
-        serde_json::from_str(&db.failpoint_stream_fold_driver_status_for_test()).unwrap();
-    assert_eq!(status["running"], true);
+    let status = stream_fold_driver_status(&db);
+    assert_process_local_driver_state(&status, "running");
     drop(ambient);
     tokio::time::sleep(Duration::from_millis(250)).await;
     let after_empty_start = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
@@ -2542,10 +2832,9 @@ async fn resident_driver_requires_the_exact_checked_served_runtime() {
         after.entry(TABLE).unwrap().table_version,
         before.entry(TABLE).unwrap().table_version
     );
-    let status: serde_json::Value =
-        serde_json::from_str(&db.failpoint_stream_fold_driver_status_for_test()).unwrap();
-    assert_eq!(status["running"], false);
-    assert_eq!(status["pending_tables"], 0);
+    let status = stream_fold_driver_status(&db);
+    assert_process_local_driver_state(&status, "stopped");
+    assert!(status["pending_triggers"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6374,10 +6663,9 @@ async fn cancelling_request_before_invocation_keeps_shutdown_joined_to_the_detac
         visible_rows(&db).await,
         vec![("pre-invocation-cancel".to_string(), 16)]
     );
-    let status: serde_json::Value =
-        serde_json::from_str(&db.failpoint_stream_fold_driver_status_for_test()).unwrap();
-    assert_eq!(status["running"], false);
-    assert_eq!(status["pending_tables"], 0);
+    let status = stream_fold_driver_status(&db);
+    assert_process_local_driver_state(&status, "stopped");
+    assert!(status["pending_triggers"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

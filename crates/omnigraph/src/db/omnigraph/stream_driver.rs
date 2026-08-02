@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use futures::FutureExt;
+use serde::Serialize;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -35,6 +36,10 @@ const STREAM_FOLD_RETRY_MAX: Duration = Duration::from_secs(5);
 const STREAM_FOLD_IDLE_WAIT: Duration = Duration::from_secs(60);
 const STREAM_FOLD_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PendingFold {
     sequence: u64,
@@ -42,12 +47,143 @@ struct PendingFold {
     failures: u32,
 }
 
-#[derive(Debug, Default)]
+/// Process-local supervisor state is operational evidence only. It must never
+/// be used as lifecycle, recovery, or MemWAL authority.
+#[cfg(any(test, feature = "failpoints"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StreamFoldDriverSnapshotScope {
+    ProcessLocalAdvisory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StreamFoldDriverRunState {
+    Stopped,
+    Running,
+    Stopping,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StreamFoldCompletionOutcome {
+    PublishedOpenFold,
+    Idle,
+    Inactive,
+    Sealed,
+    NoLongerEligible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StreamFoldDriverErrorKind {
+    RetryScheduled,
+    StaleAttemptFailed,
+    DataBlocked,
+    TriggerSequenceOverflow,
+    UnexpectedStop,
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct StreamFoldPendingTriggerSnapshot {
+    table_identity: TableIdentity,
+    trigger_sequence: u64,
+    consecutive_failures: u32,
+    due_in_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct StreamFoldCompletionEvent {
+    event_sequence: u64,
+    table_identity: TableIdentity,
+    trigger_sequence: u64,
+    outcome: StreamFoldCompletionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct StreamFoldDriverErrorEvent {
+    event_sequence: u64,
+    kind: StreamFoldDriverErrorKind,
+    table_identity: Option<TableIdentity>,
+    trigger_sequence: Option<u64>,
+    retry_in_ms: Option<u64>,
+    message: String,
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct StreamFoldDriverSnapshot {
+    scope: StreamFoldDriverSnapshotScope,
+    authoritative: bool,
+    state: StreamFoldDriverRunState,
+    pending_triggers: Vec<StreamFoldPendingTriggerSnapshot>,
+    published_open_folds: u64,
+    last_completion: Option<StreamFoldCompletionEvent>,
+    last_error: Option<StreamFoldDriverErrorEvent>,
+}
+
+#[derive(Debug)]
 struct DriverHealth {
-    running: bool,
-    unexpected_stop: bool,
-    published_folds: u64,
-    last_error: Option<String>,
+    run_state: StreamFoldDriverRunState,
+    published_open_folds: u64,
+    latest_event_sequence: u64,
+    last_completion: Option<StreamFoldCompletionEvent>,
+    last_error: Option<StreamFoldDriverErrorEvent>,
+}
+
+impl Default for DriverHealth {
+    fn default() -> Self {
+        Self {
+            run_state: StreamFoldDriverRunState::Stopped,
+            published_open_folds: 0,
+            latest_event_sequence: 0,
+            last_completion: None,
+            last_error: None,
+        }
+    }
+}
+
+impl DriverHealth {
+    fn next_event_sequence(&mut self) -> u64 {
+        self.latest_event_sequence = self.latest_event_sequence.saturating_add(1);
+        self.latest_event_sequence
+    }
+
+    fn record_completion(
+        &mut self,
+        table_identity: TableIdentity,
+        trigger_sequence: u64,
+        outcome: StreamFoldCompletionOutcome,
+    ) {
+        let event_sequence = self.next_event_sequence();
+        self.last_completion = Some(StreamFoldCompletionEvent {
+            event_sequence,
+            table_identity,
+            trigger_sequence,
+            outcome,
+        });
+    }
+
+    fn record_error(
+        &mut self,
+        kind: StreamFoldDriverErrorKind,
+        table_identity: Option<TableIdentity>,
+        trigger_sequence: Option<u64>,
+        retry_in: Option<Duration>,
+        message: String,
+    ) {
+        let event_sequence = self.next_event_sequence();
+        self.last_error = Some(StreamFoldDriverErrorEvent {
+            event_sequence,
+            kind,
+            table_identity,
+            trigger_sequence,
+            retry_in_ms: retry_in.map(duration_millis_saturating),
+            message,
+        });
+    }
 }
 
 #[derive(Debug, Default)]
@@ -96,7 +232,7 @@ impl StreamFoldDriverRegistry {
             .shared
             .lock()
             .expect("stream fold driver state poisoned");
-        let overflow = {
+        let (overflow, trigger_sequence) = {
             let pending = shared.pending.entry(identity).or_insert(PendingFold {
                 sequence: 0,
                 due_at: if urgent {
@@ -116,13 +252,18 @@ impl StreamFoldDriverRegistry {
             if urgent {
                 pending.due_at = now;
             }
-            overflow
+            (overflow, pending.sequence)
         };
         if overflow {
-            shared.health.unexpected_stop = true;
-            shared.health.last_error = Some(format!(
-                "stream fold trigger sequence overflow for table identity {identity}"
-            ));
+            let message =
+                format!("stream fold trigger sequence overflow for table identity {identity}");
+            shared.health.record_error(
+                StreamFoldDriverErrorKind::TriggerSequenceOverflow,
+                Some(identity),
+                Some(trigger_sequence),
+                None,
+                message,
+            );
             tracing::error!(
                 table_identity = %identity,
                 "stream fold trigger sequence overflow"
@@ -164,15 +305,23 @@ impl StreamFoldDriverRegistry {
             .unwrap_or(STREAM_FOLD_IDLE_WAIT)
     }
 
-    fn complete(&self, identity: TableIdentity, observed_sequence: u64, published: bool) {
+    fn complete(
+        &self,
+        identity: TableIdentity,
+        observed_sequence: u64,
+        outcome: StreamFoldCompletionOutcome,
+    ) {
         let mut shared = self
             .shared
             .lock()
             .expect("stream fold driver state poisoned");
-        if published {
-            shared.health.published_folds = shared.health.published_folds.saturating_add(1);
-            shared.health.last_error = None;
+        if outcome == StreamFoldCompletionOutcome::PublishedOpenFold {
+            shared.health.published_open_folds =
+                shared.health.published_open_folds.saturating_add(1);
         }
+        shared
+            .health
+            .record_completion(identity, observed_sequence, outcome);
         let remove = shared
             .pending
             .get(&identity)
@@ -199,7 +348,13 @@ impl StreamFoldDriverRegistry {
         {
             shared.pending.remove(&identity);
         }
-        shared.health.last_error = Some(error.to_string());
+        shared.health.record_error(
+            StreamFoldDriverErrorKind::DataBlocked,
+            Some(identity),
+            Some(observed_sequence),
+            None,
+            error.to_string(),
+        );
         tracing::warn!(
             table_identity = %identity,
             error = %error,
@@ -236,7 +391,18 @@ impl StreamFoldDriverRegistry {
                 Some(retry_in)
             }
         };
-        shared.health.last_error = Some(error.to_string());
+        let error_kind = if retry_in.is_some() {
+            StreamFoldDriverErrorKind::RetryScheduled
+        } else {
+            StreamFoldDriverErrorKind::StaleAttemptFailed
+        };
+        shared.health.record_error(
+            error_kind,
+            Some(identity),
+            Some(observed_sequence),
+            retry_in,
+            error.to_string(),
+        );
         if let Some(retry_in) = retry_in {
             tracing::error!(
                 table_identity = %identity,
@@ -253,17 +419,34 @@ impl StreamFoldDriverRegistry {
         }
     }
 
-    fn mark_running(&self, running: bool) {
+    fn mark_running(&self) {
         let mut shared = self
             .shared
             .lock()
             .expect("stream fold driver state poisoned");
-        shared.health.running = running;
-        if running {
-            // A deliberate restart is the acknowledgement boundary for a
-            // prior unexpected task stop. Transient attempt failures remain in
-            // `last_error` until a successful publish.
-            shared.health.unexpected_stop = false;
+        // A deliberate restart is the acknowledgement boundary for a prior
+        // failed task. Historical errors remain visible and are ordered
+        // against later completions by their event sequence.
+        shared.health.run_state = StreamFoldDriverRunState::Running;
+    }
+
+    fn mark_stopping(&self) {
+        let mut shared = self
+            .shared
+            .lock()
+            .expect("stream fold driver state poisoned");
+        if shared.health.run_state != StreamFoldDriverRunState::Failed {
+            shared.health.run_state = StreamFoldDriverRunState::Stopping;
+        }
+    }
+
+    fn mark_stopped(&self) {
+        let mut shared = self
+            .shared
+            .lock()
+            .expect("stream fold driver state poisoned");
+        if shared.health.run_state != StreamFoldDriverRunState::Failed {
+            shared.health.run_state = StreamFoldDriverRunState::Stopped;
         }
     }
 
@@ -272,9 +455,14 @@ impl StreamFoldDriverRegistry {
             .shared
             .lock()
             .expect("stream fold driver state poisoned");
-        shared.health.running = false;
-        shared.health.unexpected_stop = true;
-        shared.health.last_error = Some(message.clone());
+        shared.health.run_state = StreamFoldDriverRunState::Failed;
+        shared.health.record_error(
+            StreamFoldDriverErrorKind::UnexpectedStop,
+            None,
+            None,
+            None,
+            message.clone(),
+        );
         tracing::error!(error = %message, "stream fold driver stopped unexpectedly");
     }
 
@@ -331,11 +519,16 @@ impl StreamFoldDriverRegistry {
             return self.existing_task_start_result();
         }
         if let Some(finished) = task_slot.take() {
-            finished.await.map_err(|error| {
-                OmniError::manifest_internal(format!(
-                    "prior stream fold driver task failed to join: {error}"
-                ))
-            })??;
+            match finished.await {
+                Ok(outcome) => outcome?,
+                Err(join_error) => {
+                    let error = OmniError::manifest_internal(format!(
+                        "prior stream fold driver task failed to join: {join_error}"
+                    ));
+                    self.mark_unexpected_stop(error.to_string());
+                    return Err(error);
+                }
+            }
         }
 
         // Make cold-start discovery part of server startup, rather than the
@@ -344,7 +537,7 @@ impl StreamFoldDriverRegistry {
         // startup instead of briefly serving beside an already-dead supervisor.
         let initial = db.stream_driver_eligible_identities().await?;
         self.stop.store(false, Ordering::Release);
-        self.mark_running(true);
+        self.mark_running();
         for identity in initial {
             self.notify(identity, true);
         }
@@ -356,7 +549,7 @@ impl StreamFoldDriverRegistry {
                 .await;
             match outcome {
                 Ok(Ok(())) => {
-                    driver.mark_running(false);
+                    driver.mark_stopped();
                     Ok(())
                 }
                 Ok(Err(error)) => {
@@ -380,6 +573,7 @@ impl StreamFoldDriverRegistry {
         // pre-lock stop request and leave shutdown joining a live idle task.
         let mut task_slot = self.task.lock().await;
         self.stop.store(true, Ordering::Release);
+        self.mark_stopping();
         // `notify_one` retains a permit when the task is between its stop check
         // and construction of the wait future. `notify_waiters` would lose
         // that race and leave an idle driver asleep past the shutdown bound.
@@ -389,34 +583,65 @@ impl StreamFoldDriverRegistry {
         // first owner is still being joined would allow a concurrent start to
         // install a second task.
         let Some(task) = task_slot.as_mut() else {
-            self.mark_running(false);
+            self.mark_stopped();
             return Ok(());
         };
         let joined = task.await;
         task_slot.take();
-        joined
-            .map_err(|error| {
-                OmniError::manifest_internal(format!(
-                    "stream fold driver task failed during shutdown: {error}"
-                ))
-            })
-            .and_then(|outcome| outcome)
+        let outcome = match joined {
+            Ok(outcome) => outcome,
+            Err(join_error) => {
+                let error = OmniError::manifest_internal(format!(
+                    "stream fold driver task failed during shutdown: {join_error}"
+                ));
+                self.mark_unexpected_stop(error.to_string());
+                Err(error)
+            }
+        };
+        if outcome.is_ok() {
+            self.mark_stopped();
+        }
+        outcome
     }
 
-    #[cfg(feature = "failpoints")]
-    fn status_json(&self) -> String {
+    /// Capture process-local advisory state without consulting the task lock,
+    /// manifest, MemWAL, or any other authority-bearing source.
+    #[cfg(any(test, feature = "failpoints"))]
+    fn snapshot(&self) -> StreamFoldDriverSnapshot {
+        let now = Instant::now();
         let shared = self
             .shared
             .lock()
             .expect("stream fold driver state poisoned");
-        serde_json::json!({
-            "running": shared.health.running,
-            "unexpected_stop": shared.health.unexpected_stop,
-            "pending_tables": shared.pending.len(),
-            "published_folds": shared.health.published_folds,
-            "last_error": shared.health.last_error,
-        })
-        .to_string()
+        let pending_triggers = shared
+            .pending
+            .iter()
+            .map(
+                |(table_identity, pending)| StreamFoldPendingTriggerSnapshot {
+                    table_identity: *table_identity,
+                    trigger_sequence: pending.sequence,
+                    consecutive_failures: pending.failures,
+                    due_in_ms: duration_millis_saturating(
+                        pending.due_at.saturating_duration_since(now),
+                    ),
+                },
+            )
+            .collect();
+        StreamFoldDriverSnapshot {
+            scope: StreamFoldDriverSnapshotScope::ProcessLocalAdvisory,
+            authoritative: false,
+            state: shared.health.run_state,
+            pending_triggers,
+            published_open_folds: shared.health.published_open_folds,
+            last_completion: shared.health.last_completion.clone(),
+            last_error: shared.health.last_error.clone(),
+        }
+    }
+
+    #[cfg(feature = "failpoints")]
+    fn status_json(&self) -> String {
+        serde_json::to_string(&self.snapshot())
+            .expect("stream fold driver advisory snapshot must serialize")
     }
 }
 
@@ -502,7 +727,11 @@ async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegist
             .collect::<std::collections::BTreeSet<_>>();
         for (identity, sequence) in &due {
             if !active.contains(identity) {
-                driver.complete(*identity, *sequence, false);
+                driver.complete(
+                    *identity,
+                    *sequence,
+                    StreamFoldCompletionOutcome::NoLongerEligible,
+                );
             }
         }
 
@@ -529,12 +758,21 @@ async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegist
                         .stream_fold_from_resident_driver(candidate.identity, &candidate.table_key)
                         .await
                     {
-                        Ok(ResidentFoldOutcome::Published) => {
-                            driver.complete(candidate.identity, candidate.observed_sequence, true)
-                        }
-                        Ok(ResidentFoldOutcome::Idle | ResidentFoldOutcome::Inactive) => {
-                            driver.complete(candidate.identity, candidate.observed_sequence, false)
-                        }
+                        Ok(ResidentFoldOutcome::Published) => driver.complete(
+                            candidate.identity,
+                            candidate.observed_sequence,
+                            StreamFoldCompletionOutcome::PublishedOpenFold,
+                        ),
+                        Ok(ResidentFoldOutcome::Idle) => driver.complete(
+                            candidate.identity,
+                            candidate.observed_sequence,
+                            StreamFoldCompletionOutcome::Idle,
+                        ),
+                        Ok(ResidentFoldOutcome::Inactive) => driver.complete(
+                            candidate.identity,
+                            candidate.observed_sequence,
+                            StreamFoldCompletionOutcome::Inactive,
+                        ),
                         Err(error @ OmniError::StreamDataBlocked { .. }) => {
                             driver.blocked(candidate.identity, candidate.observed_sequence, &error)
                         }
@@ -554,9 +792,16 @@ async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegist
                         )
                         .await
                     {
-                        Ok(ResidentQuiesceOutcome::Sealed | ResidentQuiesceOutcome::Inactive) => {
-                            driver.complete(candidate.identity, candidate.observed_sequence, false)
-                        }
+                        Ok(ResidentQuiesceOutcome::Sealed) => driver.complete(
+                            candidate.identity,
+                            candidate.observed_sequence,
+                            StreamFoldCompletionOutcome::Sealed,
+                        ),
+                        Ok(ResidentQuiesceOutcome::Inactive) => driver.complete(
+                            candidate.identity,
+                            candidate.observed_sequence,
+                            StreamFoldCompletionOutcome::Inactive,
+                        ),
                         Err(error @ OmniError::StreamDataBlocked { .. }) => {
                             driver.blocked(candidate.identity, candidate.observed_sequence, &error)
                         }
@@ -787,6 +1032,8 @@ impl Omnigraph {
 
     #[cfg(feature = "failpoints")]
     #[doc(hidden)]
+    /// Test-only process-local advisory evidence. Durable status and recovery
+    /// decisions must continue to use the manifest-selected stream authority.
     pub fn failpoint_stream_fold_driver_status_for_test(&self) -> String {
         self.stream_fold_driver.status_json()
     }
@@ -854,13 +1101,168 @@ mod tests {
         driver.notify(table, false);
         let observed_sequence = driver.shared.lock().unwrap().pending[&table].sequence;
         driver.notify(table, true);
-        driver.complete(table, observed_sequence, true);
+        driver.complete(
+            table,
+            observed_sequence,
+            StreamFoldCompletionOutcome::PublishedOpenFold,
+        );
 
         let shared = driver.shared.lock().unwrap();
         let pending = shared.pending[&table];
         assert!(pending.sequence > observed_sequence);
         assert!(pending.due_at <= Instant::now());
         assert_eq!(pending.failures, 0);
+    }
+
+    #[test]
+    fn advisory_snapshot_is_explicit_and_orders_pending_triggers_by_identity() {
+        let driver = driver();
+        driver.notify(identity(12), false);
+        driver.notify(identity(11), false);
+
+        let snapshot = driver.snapshot();
+        assert_eq!(
+            snapshot.scope,
+            StreamFoldDriverSnapshotScope::ProcessLocalAdvisory
+        );
+        assert!(!snapshot.authoritative);
+        assert_eq!(snapshot.state, StreamFoldDriverRunState::Stopped);
+        assert_eq!(
+            snapshot
+                .pending_triggers
+                .iter()
+                .map(|trigger| trigger.table_identity)
+                .collect::<Vec<_>>(),
+            vec![identity(11), identity(12)]
+        );
+        assert!(
+            snapshot
+                .pending_triggers
+                .iter()
+                .all(|trigger| trigger.trigger_sequence == 1
+                    && trigger.consecutive_failures == 0
+                    && trigger.due_in_ms <= duration_millis_saturating(STREAM_FOLD_MAX_STALENESS))
+        );
+
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["scope"], "process_local_advisory");
+        assert_eq!(json["authoritative"], false);
+        assert_eq!(json["state"], "stopped");
+        assert_eq!(json["pending_triggers"].as_array().unwrap().len(), 2);
+        assert!(json.get("pending_tables").is_none());
+        assert!(json.get("published_folds").is_none());
+    }
+
+    #[test]
+    fn retry_then_publish_preserves_error_history_and_sequences_events() {
+        let driver = driver();
+        let table = identity(13);
+        driver.mark_running();
+        driver.notify(table, true);
+        let observed_sequence = driver.shared.lock().unwrap().pending[&table].sequence;
+        driver.failed(
+            table,
+            observed_sequence,
+            &OmniError::manifest("transient fold failure"),
+        );
+
+        let failed = driver.snapshot();
+        assert_eq!(failed.state, StreamFoldDriverRunState::Running);
+        assert_eq!(failed.pending_triggers.len(), 1);
+        assert_eq!(failed.pending_triggers[0].consecutive_failures, 1);
+        assert!(
+            failed.pending_triggers[0].due_in_ms
+                <= duration_millis_saturating(STREAM_FOLD_RETRY_BASE)
+        );
+        let error = failed.last_error.as_ref().unwrap();
+        assert_eq!(error.event_sequence, 1);
+        assert_eq!(error.kind, StreamFoldDriverErrorKind::RetryScheduled);
+        assert_eq!(error.table_identity, Some(table));
+        assert_eq!(error.trigger_sequence, Some(observed_sequence));
+        assert_eq!(
+            error.retry_in_ms,
+            Some(duration_millis_saturating(STREAM_FOLD_RETRY_BASE))
+        );
+        assert!(failed.last_completion.is_none());
+
+        driver.complete(
+            table,
+            observed_sequence,
+            StreamFoldCompletionOutcome::PublishedOpenFold,
+        );
+        let published = driver.snapshot();
+        assert!(published.pending_triggers.is_empty());
+        assert_eq!(published.published_open_folds, 1);
+        let completion = published.last_completion.as_ref().unwrap();
+        assert_eq!(completion.event_sequence, 2);
+        assert_eq!(completion.table_identity, table);
+        assert_eq!(completion.trigger_sequence, observed_sequence);
+        assert_eq!(
+            completion.outcome,
+            StreamFoldCompletionOutcome::PublishedOpenFold
+        );
+        assert_eq!(
+            published.last_error, failed.last_error,
+            "a later success must not erase historical failure evidence"
+        );
+    }
+
+    #[test]
+    fn advisory_run_state_tracks_stopping_and_preserves_failure() {
+        let driver = driver();
+        assert_eq!(driver.snapshot().state, StreamFoldDriverRunState::Stopped);
+
+        driver.mark_running();
+        assert_eq!(driver.snapshot().state, StreamFoldDriverRunState::Running);
+        driver.mark_stopping();
+        assert_eq!(driver.snapshot().state, StreamFoldDriverRunState::Stopping);
+        driver.mark_stopped();
+        assert_eq!(driver.snapshot().state, StreamFoldDriverRunState::Stopped);
+
+        driver.mark_unexpected_stop("driver task exited".to_string());
+        assert_eq!(driver.snapshot().state, StreamFoldDriverRunState::Failed);
+        assert_eq!(
+            driver.snapshot().last_error.unwrap().kind,
+            StreamFoldDriverErrorKind::UnexpectedStop
+        );
+        driver.mark_stopping();
+        driver.mark_stopped();
+        assert_eq!(
+            driver.snapshot().state,
+            StreamFoldDriverRunState::Failed,
+            "shutdown must not hide a prior failed task"
+        );
+
+        driver.mark_running();
+        assert_eq!(driver.snapshot().state, StreamFoldDriverRunState::Running);
+    }
+
+    #[test]
+    fn trigger_sequence_overflow_is_reported_without_falsifying_run_state() {
+        let driver = driver();
+        let table = identity(14);
+        driver.mark_running();
+        driver.shared.lock().unwrap().pending.insert(
+            table,
+            PendingFold {
+                sequence: u64::MAX,
+                due_at: Instant::now(),
+                failures: 0,
+            },
+        );
+
+        driver.notify(table, true);
+
+        let snapshot = driver.snapshot();
+        assert_eq!(snapshot.state, StreamFoldDriverRunState::Running);
+        assert_eq!(snapshot.pending_triggers[0].trigger_sequence, u64::MAX);
+        let error = snapshot.last_error.unwrap();
+        assert_eq!(
+            error.kind,
+            StreamFoldDriverErrorKind::TriggerSequenceOverflow
+        );
+        assert_eq!(error.table_identity, Some(table));
+        assert_eq!(error.trigger_sequence, Some(u64::MAX));
     }
 
     #[test]
@@ -928,5 +1330,9 @@ mod tests {
         assert!(pending.sequence > observed_sequence);
         assert!(pending.due_at <= Instant::now());
         assert_eq!(pending.failures, 0);
+        assert_eq!(
+            shared.health.last_error.as_ref().unwrap().kind,
+            StreamFoldDriverErrorKind::StaleAttemptFailed
+        );
     }
 }

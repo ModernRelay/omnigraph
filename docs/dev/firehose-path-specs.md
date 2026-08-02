@@ -20,8 +20,10 @@ The format-neutral F4, F5a, and F5b0 hidden-path slices are also implemented:
 caller-shaped ingest/prepare, automatic `OPEN` folding, exact-`ENABLED`
 goal-`SEALED` drain continuation, and the checked offline `DISABLING` loop.
 F5b adds stopped/offline selected-token dead-letter list/export but no public
-HTTP, SDK, remote CLI, or OpenAPI row surface. F6 remains the measurement and
-guardrail slice.
+HTTP, SDK, remote CLI, or OpenAPI row surface. The first F6 acceptance slice,
+F6a, adds only a failpoints-only process-local advisory driver snapshot and one
+hidden in-process candidate-runtime composition. F6b remains the measurement
+and full guardrail slice; F7 remains forbidden until all of F6 passes.
 **Design authority:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) — this
 file never overrides it. Where they disagree, the RFC wins and this file is
 wrong. §4.7 records the selected experimental profile; §4.3/§4.6 record the
@@ -117,6 +119,7 @@ reachable.
 | Format-neutral automatic `OPEN`-lane fold supervisor over the existing recovery-v14 fold adapter | engine private server bridge | F5a |
 | Format-neutral resident goal-`SEALED` continuation plus checked offline `DISABLING` drain loop | engine private server bridge + existing cluster apply | F5b0 |
 | Deterministic mixed/all-diverted terminal fold, one bounded object, token-schema-v3 `DEAD_LETTERED`, exact retry/ordinary successor, selected-token list/export, and extended retirement | engine/manifest recovery + stopped/offline cluster control | F5b |
+| Typed failpoints-only process-local advisory driver snapshot plus one hidden in-process composed candidate-runtime acceptance | engine private test seams | F6a |
 
 Internal schema is **v19**, token schema is **v3**, profile protocol is **v2**, and lifecycle protocol
 is **v3**. Recovery-v13 remains exactly `StreamProfileChange`: it owns the exact
@@ -226,9 +229,12 @@ and carries its receipt into the rebuild artifact. No active writer can produce
 the reserved `AuthorityBlock` evidence shape, so its repair stays fail-closed
 until a reachable producer and finalized evidence grammar exist. Stopped/offline
 `cluster stream dead-letter list|export` inspects only selected current-token
-authority; it is not an import or replay surface. Public driver status and
-every served SDK/HTTP/OpenAPI streaming surface remain inactive. F6 owns the
-remaining measurement and guardrail acceptance.
+authority; it is not an import or replay surface. A typed failpoints-only
+snapshot now exposes process-local driver scheduling evidence to tests; it is
+explicitly advisory, and its pending triggers are not a durable backlog.
+Public durable `StreamStatus` remains manifest-only, and public driver status
+plus every served SDK/HTTP/OpenAPI streaming surface remain inactive. F6b owns
+the remaining measurement and guardrail acceptance.
 
 ---
 
@@ -251,8 +257,9 @@ remaining measurement and guardrail acceptance.
 | ~~F5a~~ | Hidden automatic `OPEN`-lane timer/cap fold supervisor, cold discovery, finite node-before-edge round-robin cohorts, and bounded server shutdown ownership | no format change; reuses recovery-v14 | implemented and server-owned; public status remains closed |
 | ~~F5b0 operational cut~~ | Resident exact-`ENABLED` goal-`SEALED` continuation plus deterministic checked offline `DISABLING` convergence, `OPEN_AFTER_FOLD` adoption, and loud `DataBlock` park/resume | no format change; reuses recovery-v13/v14 and existing cluster controls | implemented; no public API |
 | ~~F5b~~ | Minimal `DEAD_LETTERED` authority, one object, ordinary-ingest correction, selected-token inspection/export, and retirement | internal v19 + token schema v3 + recovery v21 | implemented behind the hidden row seam; no public HTTP/SDK/OpenAPI |
-| **F6** | Guardrails + acceptance evidence | — | next |
-| **F7** | Served SDK / HTTP / remote CLI / OpenAPI activation | — | only after F6 passes |
+| ~~F6a~~ | Typed failpoints-only process-local advisory driver snapshot plus one hidden in-process candidate-runtime composition | no format or recovery change | implemented; public durable status remains manifest-only |
+| **F6b** | Measurements, long-history lookup/RSS/latency evidence, and the remaining guardrail/composition matrix | — | next |
+| **F7** | Served SDK / HTTP / remote CLI / OpenAPI activation | — | only after all F6 cells pass |
 
 These are dependency milestones, not mandates for giant PRs. Keep each PR
 reviewable behind the hidden seam: the next lifecycle tranche may land receipts,
@@ -1708,7 +1715,7 @@ in this profile (§4.7 P5).
 
 **F5b implemented (hidden row path, narrow offline inspection):** internal
 schema v19/token schema v3/recovery-v21 implements the following terminal
-protocol. It adds no HTTP, SDK, remote CLI, or OpenAPI row surface; F6 owns the
+protocol. It adds no HTTP, SDK, remote CLI, or OpenAPI row surface; F6b owns the
 remaining measurement and guardrail acceptance.
 
 Fold-time outcomes remain split by semantics:
@@ -1734,7 +1741,7 @@ are not separately exported or replayed.
 2. **One bounded object per fold.** The driver deterministically orders the
    terminal candidates and canonically encodes one NDJSON object under the
    reserved graph-relative prefix. The implementation pins an encoded-byte
-   envelope; F6 owns representative peak-RSS measurement. Exceeding it installs
+   envelope; F6b owns representative peak-RSS measurement. Exceeding it installs
    `DataBlock` before any object or Lance effect. There is no chunked fallback,
    chunk manifest, multipart protocol, or object-sized uncharged buffer.
 
@@ -1797,6 +1804,28 @@ per-record principals, provenance chains, and public history are out of scope.
 
 ## 7. F6 — guardrails and acceptance evidence
 
+### Implemented F6a subset
+
+F6a is a deliberately in-process acceptance cut, not completion of F6. It adds
+one typed, failpoints-only snapshot of the resident fold driver. The snapshot
+reports process-local run state, pending trigger/backoff scheduling, and last
+completion/error evidence as explicitly non-authoritative diagnostics. Pending
+triggers are scheduling hints, not a durable WAL backlog, and a stopped driver
+does not prove that checked stopped/offline authority is available. The public
+durable `Omnigraph::stream_status` projection remains manifest-only.
+
+One hidden candidate-runtime test now composes bodyless prepare, ordered NDJSON
+admission, automatic mixed visible/dead-letter folding, stopped/offline
+selected-token list/export, an ordinary corrected successor, driver restart,
+clean shutdown ownership, and checked offline disable. It proves those already
+implemented mechanisms work together without changing manifest, token, or
+recovery grammar or adding an SDK, HTTP, CLI, or OpenAPI contract.
+
+This cell does not prove OS-process forced termination, the full node+edge
+fairness matrix, long-history token lookup, RSS/latency/object measurements,
+or maintenance/rebind/resume composition. Those remain F6b work, so F6 is not
+complete and F7 remains forbidden.
+
 ### 7.1 Operational guardrails
 
 - **Deployment**: main-only, unsharded, one resident writer, one externally
@@ -1829,7 +1858,9 @@ per-record principals, provenance chains, and public history are out of scope.
   never resumes. Lossless terminal-authority transfer still needs a future
   stream-aware export/import format. Export never silently omits an
   acknowledged WAL/dead-letter cut.
-- **Status**: expose driver health, last success/error, pending trigger/backoff,
+- **Status**: F6a exposes only the typed failpoints-only process-local advisory
+  driver snapshot described above. Before F7, the complete operational surface
+  must expose driver health, last completion/error, pending trigger/backoff,
   token-ledger index coverage/uncovered-tail age and lookup-cost warning,
   lifecycle revision, exact generation/merge cut, advisory backlog,
   `StrictBlock`, relevant recovery, last fold, visible/diverted counts, and a
@@ -1839,7 +1870,8 @@ per-record principals, provenance chains, and public history are out of scope.
   non-authoritative; cluster-only list/export revalidates each current terminal
   row.
 - **Shutdown**: the F5 supervisor protocol is wired into multi-graph server
-  shutdown and tested under graceful and forced termination.
+  shutdown. F6a composes clean in-process shutdown ownership; forced
+  OS-process termination remains an F6b acceptance cell.
 
 ### 7.2 Correctness evidence
 
@@ -1866,12 +1898,13 @@ public ingress activates; `AuthorityBlock` repair remains separate.
   token-HEAD, dead-letter-listing, or generic `allow_sealed` bypass.
 - Genuine predecessor-binary format refusal/rebuild tests for every bundled
   strand, including populated dead-letter authority.
-- One hidden candidate-runtime cluster test:
-  ordered NDJSON acknowledgement → automatic node/edge fold → visible or
-  dead-lettered terminal state → cluster-only list/export → ordinary corrected
-  successor → restart and forced
-  shutdown → offline disable to terminal `DISABLED` → offline
-  maintenance/rebind → enable → restart → resume. The test uses
+- One hidden candidate-runtime cluster test. F6a covers the in-process prefix:
+  ordered NDJSON acknowledgement → automatic mixed fold → visible and
+  dead-lettered terminal state → stopped/offline list/export → ordinary
+  corrected successor → driver restart → clean shutdown ownership → offline
+  disable to terminal `DISABLED`. F6b must extend the matrix through automatic
+  node+edge fairness, forced OS-process shutdown, offline maintenance/rebind,
+  enable, process restart, and resume. The full test uses
   sequential OS processes and proves the server has joined every writer owner
   before the cluster-state-locked apply process mutates profile or binding; a
   negative deployment-contract cell documents that process-local gates do not
@@ -2221,7 +2254,8 @@ authority bridge required for maintenance while narrowing the profile flip to
 cluster control. F4+F5a build the caller-shaped lane and automatic `OPEN`
 progress owner while it remains hidden; F5b0 closes goal-`SEALED` resident
 continuation and the offline disable loop without a format change; F5b adds
-the terminal disposition. F6 then proves correctness, bounded ownership,
+the terminal disposition. F6a proves the first in-process composition and
+advisory driver diagnostics; F6b then closes correctness, bounded ownership,
 sustainable CI, and the performance premise. F7 alone activates the surface.
 
 This ordering makes every intermediate merge safe:
@@ -2233,6 +2267,8 @@ This ordering makes every intermediate merge safe:
 - after F5b0, goal-`SEALED` drains and checked offline disable converge, but
   terminal data conflicts still have no dead-letter disposition;
 - after F5b, the hidden seam also has that terminal disposition;
+- after F6a, one hidden in-process candidate-runtime composition passes and
+  tests can inspect typed advisory driver scheduling state, but F6 remains open;
 - after F6, all gates are proved but no compatibility surface is committed;
 - F7 exposes the served SDK, HTTP, remote CLI, and OpenAPI together while
   direct mutation remains a typed refusal.
@@ -2252,7 +2288,7 @@ lands a production writer or claims an SLO before F6.
 | Empty lane | Dedicated fence/tail/empty-proof path with an incremental authenticated WAL-segment cursor/chain; never scan from genesis or invent/seal an empty generation |
 | Lifecycle format | Internal v12/lifecycle-v3 + recovery-v14 activates hidden enrollment, claim, ordinary/drain fold, and terminal lifecycle receipt with fixed-size ledger-chain/current authority. Dormant v14 scaffold meanings are immutable: F3 uses them only if exact, otherwise takes a new pre-release strand. F5a and F5b0 change no format; F5b requires a new terminal-authority/object strand. The release gate records the final strand count |
 | Maintenance | Explicit lifecycle-aware integration per writer; no generic `SEALED` bypass |
-| Public ordering | Hidden F4/F5a/F5b0 → format-bearing F5b → evidence F6 → atomic served/remote activation F7 |
+| Public ordering | Hidden F4/F5a/F5b0 → format-bearing F5b → acceptance F6a → measurements/full matrix F6b → atomic served/remote activation F7 |
 | Dead letter | One terminal LWW candidate per losing key; one deterministic, conditionally created NDJSON object under a measured byte/RSS cap; one current `DEAD_LETTERED` token per losing key; ordinary-ingest correction; pre-effect `DataBlock` on expansion |
 | Process topology | One externally enforced writer process; profile apply requires stop → cluster-state-locked offline owner → restart; schema/rebind additionally requires terminal `DISABLED` before its checked offline authority, with no claim that process-local locks detect foreign processes |
 | Capability placement | `omnigraph-storage` plus `omnigraph-control-authority` resolve the engine/storage/cluster-lock dependency without a cycle; opaque stopped/offline and runtime guards preserve one storage path and expose no forgeable mint |
