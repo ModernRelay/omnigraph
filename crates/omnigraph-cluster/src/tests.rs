@@ -4335,6 +4335,7 @@ graphs:
 
     #[cfg(feature = "failpoints")]
     #[test]
+    #[serial_test::serial]
     fn blocked_disable_persists_exact_disabling_correction_authority() {
         on_big_stack(blocked_disable_persists_exact_disabling_correction_authority_body);
     }
@@ -4437,7 +4438,9 @@ query seed($name: String, $age: I32) {
     async fn blocked_disable_persists_exact_disabling_correction_authority_body() {
         let _scenario = fail::FailScenario::setup();
         let dir = fixture();
-        let graph_root = prepare_blocked_disable_data_block(dir.path()).await;
+        // Heap-bound the setup future: inlining its state into this already-large
+        // test future exceeds rustc's default layout-query recursion limit on Linux.
+        let graph_root = Box::pin(prepare_blocked_disable_data_block(dir.path())).await;
         let _dead_letter_object_overflow = omnigraph::failpoints::ScopedFailPoint::new(
             omnigraph::failpoints::names::STREAM_DEAD_LETTER_FORCE_OBJECT_LIMIT,
             "1*return",
@@ -5156,6 +5159,7 @@ policies: {}
 
     #[cfg(feature = "failpoints")]
     #[test]
+    #[serial_test::serial]
     fn authority_retirement_confirm_converges_applied_state_to_retired() {
         on_big_stack(|| async {
         let _scenario = fail::FailScenario::setup();
@@ -5567,6 +5571,7 @@ policies: {}
 
     #[cfg(feature = "failpoints")]
     #[tokio::test]
+    #[serial_test::serial]
     async fn stream_block_authority_and_shape_refusals_precede_recovery() {
         let _scenario = fail::FailScenario::setup();
 

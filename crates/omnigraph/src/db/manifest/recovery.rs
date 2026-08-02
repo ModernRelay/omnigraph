@@ -27339,7 +27339,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("more than one row per planned key"),
+                .contains("more than one row per queried key"),
             "{error:?}"
         );
     }

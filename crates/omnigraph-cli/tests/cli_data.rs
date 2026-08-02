@@ -173,15 +173,15 @@ fn optimize_with_server_flag_errors_wrong_plane() {
 
 #[test]
 fn optimize_with_as_flag_errors() {
-    // `--as` attributes an actor on a direct-engine or cluster write; the
-    // Direct maintenance verbs record no actor, so the flag is rejected
-    // loudly (was: silently ignored).
+    // `--as` attributes an actor on a direct-engine or actor-bound cluster
+    // operation; the Direct maintenance verbs record no actor, so the flag is
+    // rejected loudly (was: silently ignored).
     let output = output_failure(cli().arg("optimize").arg("--as").arg("act-op"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("`optimize` is a direct (storage-native) command")
             && stderr.contains(
-                "--as sets the actor for a direct-engine or cluster write and does not apply"
+                "--as sets the actor for a direct-engine or actor-bound cluster operation and does not apply"
             ),
         "expected the addressing-guard --as rejection; got: {stderr}"
     );

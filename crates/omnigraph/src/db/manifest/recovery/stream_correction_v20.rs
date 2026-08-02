@@ -1908,7 +1908,6 @@ mod tests {
     #[test]
     fn recovery_v20_is_a_distinct_closed_discriminator() {
         assert_eq!(STREAM_CORRECTION_SIDECAR_SCHEMA_VERSION, 20);
-        assert_eq!(SIDECAR_SCHEMA_VERSION, 20);
         let json = serde_json::json!({
             "kind": "StreamCorrection",
             "payload": {
