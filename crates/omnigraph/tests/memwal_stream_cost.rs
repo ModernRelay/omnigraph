@@ -462,7 +462,7 @@ async fn initialize_history(
     compact_before_enrollment: bool,
 ) -> String {
     let uri = helpers::stream_authority::graph_uri(cluster_uri);
-    let db = Omnigraph::init(&uri, STREAM_SCHEMA).await.unwrap();
+    let db = Arc::new(Omnigraph::init(&uri, STREAM_SCHEMA).await.unwrap());
     for tick in 0..depth {
         db.mutate(
             "main",
@@ -487,7 +487,7 @@ async fn initialize_history(
 
 async fn init_enrolled(cluster_uri: &str, schema: &str) -> String {
     let uri = helpers::stream_authority::graph_uri(cluster_uri);
-    let db = Omnigraph::init(&uri, schema).await.unwrap();
+    let db = Arc::new(Omnigraph::init(&uri, schema).await.unwrap());
     db.failpoint_enroll_stream_table_for_test(TABLE)
         .await
         .unwrap();

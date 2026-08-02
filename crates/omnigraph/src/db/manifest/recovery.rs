@@ -5063,6 +5063,11 @@ where
                             "DisableDrainAdoption result commitment cannot be derived: {error}"
                         ))
                     })?;
+            // Recovery-v14 registered this discriminator before its live
+            // producer. F5b0 derives canonical request and occurrence values,
+            // but this validator deliberately preserves v14's accepted
+            // historical meaning. Tightening those commitments belongs to a
+            // new recovery strand, not a reinterpretation of v14.
             if protocol.prior_lifecycle.lifecycle != StreamLifecycle::Draining
                 || protocol.next_lifecycle.lifecycle != StreamLifecycle::Draining
                 || prior_drain.goal != DrainGoal::OpenAfterFold
@@ -24318,21 +24323,41 @@ mod tests {
         };
         profile.validate().unwrap();
 
+        let adoption_id = crate::db::manifest::stream::stream_disable_drain_adoption_id(
+            "disable-operation",
+            identity,
+            "66666666-6666-4666-8666-666666666666",
+            profile.profile_revision,
+        )
+        .unwrap();
+        let adoption_operation_id =
+            crate::db::manifest::stream::stream_disable_drain_adoption_operation_id(
+                "disable-operation",
+                identity,
+                "66666666-6666-4666-8666-666666666666",
+                profile.profile_revision,
+            )
+            .unwrap();
+        let adoption_request =
+            crate::db::manifest::stream::stream_disable_drain_adoption_request_payload(
+                "disable-operation",
+                identity,
+                "66666666-6666-4666-8666-666666666666",
+                profile.profile_revision,
+            )
+            .unwrap();
         let receipt = ManagementReceipt::new(
             stream_graph_identity_digest("domain-a").unwrap(),
             identity,
             prior.enrollment_receipt.stream_incarnation_id.clone(),
             prior.binding_scope_id.clone(),
             &prior.management_receipt_chain,
-            "88888888-8888-4888-8888-888888888888",
-            "DISABLE_DRAIN_ADOPTION",
+            adoption_operation_id,
+            crate::db::manifest::stream::STREAM_DISABLE_DRAIN_ADOPTION_OPERATION_KIND,
             2,
             3,
             "act-operator",
-            serde_json::json!({
-                "disable_operation_id": "disable-operation",
-                "drain_id": "66666666-6666-4666-8666-666666666666"
-            }),
+            adoption_request,
             serde_json::json!({"goal": "SEALED", "revision": 3}),
             11,
         )
@@ -24343,7 +24368,7 @@ mod tests {
         let next_drain = next.drain.as_mut().unwrap();
         next_drain.goal = DrainGoal::Sealed;
         next_drain.seal_override = Some(DisableDrainAdoption {
-            adoption_id: format!("sha256:{}", "7".repeat(64)),
+            adoption_id,
             disable_operation_id: "disable-operation".to_string(),
             request_digest: receipt.request_digest.clone(),
             profile_revision: 3,

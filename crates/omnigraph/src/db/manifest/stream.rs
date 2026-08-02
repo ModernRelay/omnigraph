@@ -35,6 +35,7 @@ pub(crate) const STREAM_RESUME_OPERATION_KIND: &str = "RESUME";
 pub(crate) const STREAM_REBIND_REQUEST_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const STREAM_REBIND_OPERATION_KIND: &str = "REBIND";
 pub(crate) const STREAM_CORRECTION_OPERATION_KIND: &str = "CORRECTION";
+pub(crate) const STREAM_DISABLE_DRAIN_ADOPTION_OPERATION_KIND: &str = "DISABLE_DRAIN_ADOPTION";
 pub(crate) const STREAM_DATA_BLOCK_VALIDATION_CONTRACT_VERSION: u32 = 1;
 
 pub(crate) const ENROLLMENT_RECEIPT_V2_TAG: &str = "STREAM_ENROLLMENT_RECEIPT_V2";
@@ -64,6 +65,10 @@ const MANAGEMENT_RECEIPT_LOOKUP_DOMAIN: &[u8] = b"omnigraph.stream-management-re
 const MANAGEMENT_RECEIPT_RECORD_DOMAIN: &[u8] = b"omnigraph.stream-management-receipt-record.v1\0";
 const MANAGEMENT_REQUEST_DOMAIN: &[u8] = b"omnigraph.stream-management-request.v1\0";
 const MANAGEMENT_RESULT_DOMAIN: &[u8] = b"omnigraph.stream-management-result.v1\0";
+const DISABLE_DRAIN_ID_DOMAIN: &[u8] = b"omnigraph.stream-disable-drain-id.v1\0";
+const DISABLE_DRAIN_ADOPTION_ID_DOMAIN: &[u8] = b"omnigraph.stream-disable-drain-adoption-id.v1\0";
+const DISABLE_DRAIN_ADOPTION_OPERATION_ID_DOMAIN: &[u8] =
+    b"omnigraph.stream-disable-drain-adoption-operation-id.v1\0";
 const STREAM_CORRECTION_RECEIPT_LOOKUP_DOMAIN: &[u8] =
     b"omnigraph.stream-correction-receipt-lookup.v1\0";
 const STREAM_CORRECTION_RECEIPT_RECORD_DOMAIN: &[u8] =
@@ -2828,6 +2833,99 @@ pub(crate) fn stream_disable_drain_adoption_result_payload(
     }))
 }
 
+/// Derive the stable UUID-v4 drain occurrence owned by one durable disable
+/// plan and one immutable table lifetime.
+///
+/// UUID-v4 shape is part of the existing quiesce grammar. The random payload
+/// is replaced with a domain-separated digest so a replacement offline apply
+/// reconstructs the same occurrence without storing a parallel work queue.
+pub(crate) fn stream_disable_drain_id(
+    disable_operation_id: &str,
+    identity: TableIdentity,
+) -> Result<String> {
+    validate_canonical_text("disable operation id", disable_operation_id)?;
+    identity.validate()?;
+    let mut hasher = Sha256::new();
+    hash_bytes(&mut hasher, DISABLE_DRAIN_ID_DOMAIN);
+    hash_bytes(&mut hasher, disable_operation_id.as_bytes());
+    hash_bytes(&mut hasher, &identity.stable_table_id.to_be_bytes());
+    hash_bytes(&mut hasher, &identity.table_incarnation_id.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(ShardId::from_bytes(bytes).to_string())
+}
+
+/// Canonical request selected by metadata-only disable-drain adoption.
+pub(crate) fn stream_disable_drain_adoption_request_payload(
+    disable_operation_id: &str,
+    identity: TableIdentity,
+    drain_id: &str,
+    profile_revision: u64,
+) -> Result<serde_json::Value> {
+    validate_canonical_text("disable operation id", disable_operation_id)?;
+    identity.validate()?;
+    validate_uuid("disable-drain adoption drain_id", drain_id)?;
+    if profile_revision == 0 {
+        return Err(OmniError::manifest_internal(
+            "disable-drain adoption requires a positive profile revision",
+        ));
+    }
+    Ok(serde_json::json!({
+        "disable_operation_id": disable_operation_id,
+        "identity": identity,
+        "drain_id": drain_id,
+        "profile_revision": profile_revision,
+    }))
+}
+
+/// Stable receipt/adoption occurrence selected by the same durable inputs as
+/// the canonical request.
+pub(crate) fn stream_disable_drain_adoption_id(
+    disable_operation_id: &str,
+    identity: TableIdentity,
+    drain_id: &str,
+    profile_revision: u64,
+) -> Result<String> {
+    let request = stream_disable_drain_adoption_request_payload(
+        disable_operation_id,
+        identity,
+        drain_id,
+        profile_revision,
+    )?;
+    canonical_json_digest(
+        DISABLE_DRAIN_ADOPTION_ID_DOMAIN,
+        "disable-drain adoption request",
+        &request,
+    )
+}
+
+/// Stable UUID occurrence used by the existing management-receipt grammar.
+///
+/// `DisableDrainAdoption::adoption_id` remains the pre-registered digest
+/// commitment; the immutable receipt separately requires a canonical UUID
+/// operation occurrence.
+pub(crate) fn stream_disable_drain_adoption_operation_id(
+    disable_operation_id: &str,
+    identity: TableIdentity,
+    drain_id: &str,
+    profile_revision: u64,
+) -> Result<String> {
+    let request = stream_disable_drain_adoption_request_payload(
+        disable_operation_id,
+        identity,
+        drain_id,
+        profile_revision,
+    )?;
+    canonical_json_uuid(
+        DISABLE_DRAIN_ADOPTION_OPERATION_ID_DOMAIN,
+        "disable-drain adoption request",
+        &request,
+    )
+}
+
 impl ClaimAttemptEffect {
     pub(crate) fn new(
         prior_chain: &ReceiptChainRef,
@@ -4952,6 +5050,25 @@ fn canonical_json_digest(domain: &[u8], field: &str, value: &serde_json::Value) 
     Ok(hash_fields(domain, &[&bytes]))
 }
 
+fn canonical_json_uuid(domain: &[u8], field: &str, value: &serde_json::Value) -> Result<String> {
+    if !value.is_object() {
+        return Err(OmniError::manifest_internal(format!(
+            "stream {field} must be a JSON object"
+        )));
+    }
+    let mut canonical = Vec::new();
+    write_canonical_json(field, value, &mut canonical)?;
+    let mut hasher = Sha256::new();
+    hash_bytes(&mut hasher, domain);
+    hash_bytes(&mut hasher, &canonical);
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(ShardId::from_bytes(bytes).to_string())
+}
+
 /// Encode the receipt JSON contract independently of `serde_json::Map`'s
 /// backing container: object keys sort by their UTF-8 bytes, arrays retain
 /// order, and scalar spellings remain serde_json's stable JSON spellings.
@@ -5171,6 +5288,63 @@ fn validate_uuid(field: &str, value: &str) -> Result<ShardId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disable_plan_derives_stable_lane_occurrences() {
+        let identity = TableIdentity::new(7, 9).unwrap();
+        let drain = stream_disable_drain_id("disable-operation", identity).unwrap();
+        assert_eq!(
+            stream_disable_drain_id("disable-operation", identity).unwrap(),
+            drain
+        );
+        assert_ne!(
+            stream_disable_drain_id("disable-operation", TableIdentity::new(7, 10).unwrap())
+                .unwrap(),
+            drain
+        );
+        let parsed = ShardId::parse_str(&drain).unwrap();
+        assert_eq!(parsed.to_string(), drain);
+
+        let adoption =
+            stream_disable_drain_adoption_id("disable-operation", identity, &drain, 3).unwrap();
+        assert_eq!(
+            stream_disable_drain_adoption_id("disable-operation", identity, &drain, 3).unwrap(),
+            adoption
+        );
+        assert_ne!(
+            stream_disable_drain_adoption_id("disable-operation", identity, &drain, 4).unwrap(),
+            adoption
+        );
+        let operation_id = stream_disable_drain_adoption_operation_id(
+            "disable-operation",
+            identity,
+            &drain,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            stream_disable_drain_adoption_operation_id(
+                "disable-operation",
+                identity,
+                &drain,
+                3,
+            )
+            .unwrap(),
+            operation_id
+        );
+        assert_ne!(
+            stream_disable_drain_adoption_operation_id(
+                "disable-operation",
+                identity,
+                &drain,
+                4,
+            )
+            .unwrap(),
+            operation_id
+        );
+        let parsed = ShardId::parse_str(&operation_id).unwrap();
+        assert_eq!(parsed.to_string(), operation_id);
+    }
 
     fn entry() -> StreamLifecycleEntry {
         let shard_id = "22222222-2222-4222-8222-222222222222".to_string();

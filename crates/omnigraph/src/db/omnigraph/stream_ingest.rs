@@ -19,8 +19,10 @@ use lance::dataset::mem_wal::scanner::LsmScanner;
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardManifestStore, ShardWriter, WalTailer};
 use lance_index::mem_wal::{MemWalIndexDetails, MergedGeneration, ShardId, ShardStatus};
 
+#[cfg(feature = "failpoints")]
+use crate::db::ReadTarget;
 use crate::db::manifest::stream::{
-    CLAIM_RECEIPT_TAG, ClaimProfile, DrainGoal, LastFoldOutcome, LastFoldSummary,
+    CLAIM_RECEIPT_TAG, ClaimProfile, ClaimReceipt, DrainGoal, LastFoldOutcome, LastFoldSummary,
     ManagementReceipt, RetainedShardInventoryCommitment, STREAM_RESUME_OPERATION_KIND,
     StreamGenerationCut, StreamResumeMode, StreamResumeRequestPayload,
     stream_graph_identity_digest, stream_quiesce_result_payload, stream_resume_result_payload,
@@ -45,15 +47,15 @@ use crate::db::manifest::{
     RecoveryStreamClaimContinuationV14, RecoveryStreamClaimOutcomeV14, RecoveryStreamFoldCut,
     RecoveryStreamLifecycleReceiptKind, RecoveryStreamOpenPlanV15, RecoveryStreamResumeOutcomeV15,
     RecoveryStreamResumeRequestV15, SidecarTablePin, StreamLifecycle, StreamLifecycleEntry,
-    StreamPhysicalBinding, TableIdentity, TableVersionExpectation,
-    arm_stream_claim_checkpoint_sidecar_v14, arm_stream_claim_terminal_sidecar_v14,
-    arm_stream_resume_checkpoint_sidecar_v15, arm_stream_resume_terminal_sidecar_v15,
-    classify_effect_free_stream_claim_sidecar_v14, classify_effect_free_stream_resume_sidecar_v15,
-    complete_stream_claim_sidecar_v14, complete_stream_fold_sidecar_v14,
-    complete_stream_lifecycle_receipt_sidecar_v14, complete_stream_resume_sidecar_v15,
-    confirm_stream_claim_sidecar_v14, confirm_stream_fold_sidecar_v14,
-    confirm_stream_lifecycle_receipt_sidecar_v14, confirm_stream_resume_sidecar_v15,
-    finalize_effect_free_stream_fold_sidecar_v14, list_sidecars,
+    StreamPhysicalBinding, StreamProfileEntry, StreamProfileMode, TableIdentity,
+    TableVersionExpectation, arm_stream_claim_checkpoint_sidecar_v14,
+    arm_stream_claim_terminal_sidecar_v14, arm_stream_resume_checkpoint_sidecar_v15,
+    arm_stream_resume_terminal_sidecar_v15, classify_effect_free_stream_claim_sidecar_v14,
+    classify_effect_free_stream_resume_sidecar_v15, complete_stream_claim_sidecar_v14,
+    complete_stream_fold_sidecar_v14, complete_stream_lifecycle_receipt_sidecar_v14,
+    complete_stream_resume_sidecar_v15, confirm_stream_claim_sidecar_v14,
+    confirm_stream_fold_sidecar_v14, confirm_stream_lifecycle_receipt_sidecar_v14,
+    confirm_stream_resume_sidecar_v15, finalize_effect_free_stream_fold_sidecar_v14, list_sidecars,
     lookup_stream_claim_continuation_v14, new_stream_claim_sidecar_v14,
     new_stream_drain_fold_sidecar_v14, new_stream_fold_v2_sidecar_v14,
     new_stream_lifecycle_receipt_sidecar_v14, new_stream_resume_sidecar_v15,
@@ -71,10 +73,9 @@ use crate::table_store::mem_wal::{
     ConfirmedStreamTokenOverlayRow, CurrentGenerationProjectionSource, DurableBatchAck,
     IdleAuthorityCheck, IdleAuthorityFailure, MemWalWorkerError, OpenedMemWalWorker,
     PassiveB1PhysicalState, PassiveQuiesceDisposition, PreparedPut, PreparedPutFailure,
-    QueuedBatchPermit, QuiesceCut, ResidentFoldReadiness, SealedGenerationCut,
-    StreamFoldTrigger, StreamWorkerKey, WorkerOpenFailure,
-    b1_input_accounting, b1_logical_batch_bytes, capture_current_head_witness,
-    reconstruct_b1_writer_config, scan_flushed_generation_projection,
+    QueuedBatchPermit, QuiesceCut, ResidentFoldReadiness, SealedGenerationCut, StreamFoldTrigger,
+    StreamWorkerKey, WorkerOpenFailure, b1_input_accounting, b1_logical_batch_bytes,
+    capture_current_head_witness, reconstruct_b1_writer_config, scan_flushed_generation_projection,
     validate_b1_lifecycle_current_binding_physical_state,
     validate_b1_lifecycle_physical_state_with_binding_inventory, validate_stream_config_v3_binding,
 };
@@ -374,6 +375,33 @@ enum FoldLifecycleMode {
     Draining { drain_id: String },
 }
 
+#[derive(Debug)]
+enum StreamQuiesceInvocation {
+    Caller {
+        drain_id: String,
+        expected_lifecycle_revision: u64,
+        actor_id: String,
+        goal: DrainGoal,
+        stop_after_start: bool,
+    },
+    Resident {
+        expected_identity: TableIdentity,
+    },
+    OfflineDisabling {
+        expected_profile: StreamProfileEntry,
+        expected_identity: TableIdentity,
+        drain_id: String,
+        expected_lifecycle_revision: u64,
+        actor_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResidentQuiesceOutcome {
+    Sealed,
+    Inactive,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResidentFoldOutcome {
     Published,
@@ -397,9 +425,7 @@ fn published_fold_coverage(capture: &StreamAuthorityCapture) -> Result<Option<u6
         .then_some(cut.replay_after_wal_entry_position))
 }
 
-async fn cold_stream_capture_has_unmerged_rows(
-    capture: &StreamAuthorityCapture,
-) -> Result<bool> {
+async fn cold_stream_capture_has_unmerged_rows(capture: &StreamAuthorityCapture) -> Result<bool> {
     if matches!(
         &capture.passive_state,
         PassiveB1PhysicalState::FoldOnlyFlushed(_)
@@ -1839,17 +1865,74 @@ impl Omnigraph {
         let table_key = table_key.to_string();
         let drain_id = drain_id.to_string();
         let actor_id = actor_id.to_string();
-        crate::instrumentation::spawn_with_query_io_probes(async move {
+        let outcome = crate::instrumentation::spawn_with_query_io_probes(async move {
             Box::pin(db.stream_quiesce_background(
                 table_key,
-                drain_id,
-                expected_lifecycle_revision,
-                actor_id,
+                StreamQuiesceInvocation::Caller {
+                    drain_id,
+                    expected_lifecycle_revision,
+                    actor_id,
+                    goal: DrainGoal::Sealed,
+                    stop_after_start: false,
+                },
             ))
             .await
         })
         .await
-        .map_err(|error| OmniError::Lance(format!("stream quiesce task failed: {error}")))?
+        .map_err(|error| OmniError::Lance(format!("stream quiesce task failed: {error}")))??;
+        match outcome {
+            ResidentQuiesceOutcome::Sealed => Ok(()),
+            ResidentQuiesceOutcome::Inactive => Err(OmniError::manifest_internal(
+                "caller-owned stream quiesce became resident-inactive",
+            )),
+        }
+    }
+
+    pub(super) async fn stream_quiesce_from_resident_driver(
+        self: &Arc<Self>,
+        expected_identity: TableIdentity,
+        table_key: &str,
+    ) -> Result<ResidentQuiesceOutcome> {
+        let db = Arc::clone(self);
+        let table_key = table_key.to_string();
+        crate::instrumentation::spawn_with_query_io_probes(async move {
+            Box::pin(db.stream_quiesce_background(
+                table_key,
+                StreamQuiesceInvocation::Resident { expected_identity },
+            ))
+            .await
+        })
+        .await
+        .map_err(|error| {
+            OmniError::Lance(format!(
+                "stream quiesce resident-driver task failed: {error}"
+            ))
+        })?
+    }
+
+    /// Continue one disable-plan quiesce while the caller retains the checked
+    /// offline cluster-state lock. This deliberately awaits the owned future
+    /// inline: spawning would detach the work from that borrowed authority.
+    pub(super) async fn stream_quiesce_offline_disabling_inline(
+        self: &Arc<Self>,
+        table_key: &str,
+        expected_profile: &StreamProfileEntry,
+        expected_identity: TableIdentity,
+        drain_id: &str,
+        expected_lifecycle_revision: u64,
+        actor_id: &str,
+    ) -> Result<ResidentQuiesceOutcome> {
+        Box::pin(Arc::clone(self).stream_quiesce_background(
+            table_key.to_string(),
+            StreamQuiesceInvocation::OfflineDisabling {
+                expected_profile: expected_profile.clone(),
+                expected_identity,
+                drain_id: drain_id.to_string(),
+                expected_lifecycle_revision,
+                actor_id: actor_id.to_string(),
+            },
+        ))
+        .await
     }
 
     /// Settle the one terminal receipt sidecar owned by an exact quiesce
@@ -1928,12 +2011,49 @@ impl Omnigraph {
     async fn stream_quiesce_background(
         self: Arc<Self>,
         table_key: String,
-        drain_id: String,
-        expected_lifecycle_revision: u64,
-        actor_id: String,
-    ) -> Result<()> {
+        invocation: StreamQuiesceInvocation,
+    ) -> Result<ResidentQuiesceOutcome> {
         let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+        let resident_identity = match &invocation {
+            StreamQuiesceInvocation::Caller { .. }
+            | StreamQuiesceInvocation::OfflineDisabling { .. } => None,
+            StreamQuiesceInvocation::Resident { expected_identity } => Some(*expected_identity),
+        };
+        let offline_disabling = match &invocation {
+            StreamQuiesceInvocation::OfflineDisabling {
+                expected_profile,
+                expected_identity,
+                ..
+            } => Some((expected_profile.clone(), *expected_identity)),
+            StreamQuiesceInvocation::Caller { .. } | StreamQuiesceInvocation::Resident { .. } => {
+                None
+            }
+        };
+        if resident_identity.is_some() {
+            self.ensure_streaming_ingest_runtime_authorized().await?;
+        }
+        if let Some((expected_profile, _)) = &offline_disabling {
+            expected_profile.validate()?;
+            if expected_profile.mode() != StreamProfileMode::Disabling {
+                return Err(OmniError::StreamingAuthorityMismatch {
+                    reason: format!(
+                        "offline stream quiesce requires exact DISABLING profile authority, got {} revision {}",
+                        expected_profile.mode().as_str(),
+                        expected_profile.profile_revision
+                    ),
+                });
+            }
+        }
         let mut initial_txn = self.open_write_txn(None).await?;
+        if let Some((expected_profile, _)) = &offline_disabling
+            && initial_txn.base.stream_profile() != expected_profile
+        {
+            return Err(OmniError::manifest_read_set_changed(
+                "offline_stream_quiesce_profile",
+                Some(format!("{expected_profile:?}")),
+                Some(format!("{:?}", initial_txn.base.stream_profile())),
+            ));
+        }
         let mut initial_entry = initial_txn.base.entry(&table_key).cloned().ok_or_else(|| {
             OmniError::manifest_not_found(format!(
                 "stream quiesce cannot resolve unknown table '{table_key}'"
@@ -1948,6 +2068,69 @@ impl Omnigraph {
                     "stream quiesce requires an enrolled stream for '{table_key}'"
                 ))
             })?;
+        if resident_identity.is_some_and(|identity| identity != initial_entry.identity) {
+            return Ok(ResidentQuiesceOutcome::Inactive);
+        }
+        if offline_disabling
+            .as_ref()
+            .is_some_and(|(_, identity)| *identity != initial_entry.identity)
+        {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("offline_stream_quiesce_identity:{table_key}"),
+                offline_disabling
+                    .as_ref()
+                    .map(|(_, identity)| identity.to_string()),
+                Some(initial_entry.identity.to_string()),
+            ));
+        }
+        let (drain_id, expected_lifecycle_revision, actor_id, goal, stop_after_start) =
+            match invocation {
+                StreamQuiesceInvocation::Caller {
+                    drain_id,
+                    expected_lifecycle_revision,
+                    actor_id,
+                    goal,
+                    stop_after_start,
+                } => (
+                    drain_id,
+                    expected_lifecycle_revision,
+                    actor_id,
+                    goal,
+                    stop_after_start,
+                ),
+                StreamQuiesceInvocation::Resident { .. } => {
+                    if initial_lifecycle.lifecycle != StreamLifecycle::Draining {
+                        return Ok(ResidentQuiesceOutcome::Inactive);
+                    }
+                    let Some(drain) = initial_lifecycle.drain.as_ref() else {
+                        return Err(OmniError::manifest_internal(
+                            "resident DRAINING stream has no drain descriptor",
+                        ));
+                    };
+                    if drain.goal != DrainGoal::Sealed {
+                        return Ok(ResidentQuiesceOutcome::Inactive);
+                    }
+                    (
+                        drain.drain_id.clone(),
+                        drain.operation_expected_revision,
+                        drain.initiating_actor.clone(),
+                        DrainGoal::Sealed,
+                        false,
+                    )
+                }
+                StreamQuiesceInvocation::OfflineDisabling {
+                    drain_id,
+                    expected_lifecycle_revision,
+                    actor_id,
+                    ..
+                } => (
+                    drain_id,
+                    expected_lifecycle_revision,
+                    actor_id,
+                    DrainGoal::Sealed,
+                    false,
+                ),
+            };
         let graph_identity_digest =
             stream_graph_identity_digest(&initial_txn.authority.schema_identity_domain)?;
         if self
@@ -1955,6 +2138,15 @@ impl Omnigraph {
             .await?
         {
             initial_txn = self.open_write_txn(None).await?;
+            if let Some((expected_profile, _)) = &offline_disabling
+                && initial_txn.base.stream_profile() != expected_profile
+            {
+                return Err(OmniError::manifest_read_set_changed(
+                    "offline_stream_quiesce_profile_after_receipt_completion",
+                    Some(format!("{expected_profile:?}")),
+                    Some(format!("{:?}", initial_txn.base.stream_profile())),
+                ));
+            }
             initial_entry = initial_txn.base.entry(&table_key).cloned().ok_or_else(|| {
                 OmniError::manifest_not_found(format!(
                     "stream quiesce lost table '{table_key}' while completing its receipt"
@@ -1969,6 +2161,21 @@ impl Omnigraph {
                         "stream quiesce receipt completion lost its lifecycle row",
                     )
                 })?;
+            if resident_identity.is_some_and(|identity| identity != initial_entry.identity) {
+                return Ok(ResidentQuiesceOutcome::Inactive);
+            }
+            if offline_disabling
+                .as_ref()
+                .is_some_and(|(_, identity)| *identity != initial_entry.identity)
+            {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("offline_stream_quiesce_identity:{table_key}"),
+                    offline_disabling
+                        .as_ref()
+                        .map(|(_, identity)| identity.to_string()),
+                    Some(initial_entry.identity.to_string()),
+                ));
+            }
         }
 
         // A selected strict block is already the durable result of this
@@ -1984,7 +2191,7 @@ impl Omnigraph {
             if drain.drain_id != drain_id
                 || drain.operation_expected_revision != expected_lifecycle_revision
                 || drain.initiating_actor != actor_id
-                || drain.goal != DrainGoal::Sealed
+                || drain.goal != goal
             {
                 return Err(OmniError::StreamLifecycleIdempotencyConflict {
                     stable_table_id: initial_entry.identity.stable_table_id,
@@ -1999,6 +2206,9 @@ impl Omnigraph {
             )?;
             if let Some(block) = initial_lifecycle.strict_block.as_ref() {
                 return Err(stream_data_block_error(&block.block_token));
+            }
+            if resident_identity.is_none() && offline_disabling.is_none() {
+                self.notify_stream_fold_pressure(initial_entry.identity);
             }
         }
 
@@ -2025,7 +2235,7 @@ impl Omnigraph {
                 expected_lifecycle_revision,
                 &actor_id,
             )?;
-            return Ok(());
+            return Ok(ResidentQuiesceOutcome::Sealed);
         }
 
         let provisional = match initial_lifecycle.lifecycle {
@@ -2038,8 +2248,17 @@ impl Omnigraph {
                         current_revision: initial_lifecycle.lifecycle_revision,
                     });
                 }
-                self.capture_stream_authority(&table_key, "stream quiesce")
+                if let Some((expected_profile, _)) = &offline_disabling {
+                    self.capture_open_stream_authority_for_disabling_profile(
+                        &table_key,
+                        "offline stream quiesce",
+                        expected_profile,
+                    )
                     .await?
+                } else {
+                    self.capture_stream_authority(&table_key, "stream quiesce")
+                        .await?
+                }
             }
             StreamLifecycle::Draining => {
                 let drain = initial_lifecycle.drain.as_ref().ok_or_else(|| {
@@ -2048,7 +2267,7 @@ impl Omnigraph {
                 if drain.drain_id != drain_id
                     || drain.operation_expected_revision != expected_lifecycle_revision
                     || drain.initiating_actor != actor_id
-                    || drain.goal != DrainGoal::Sealed
+                    || drain.goal != goal
                 {
                     return Err(OmniError::StreamLifecycleIdempotencyConflict {
                         stable_table_id: initial_entry.identity.stable_table_id,
@@ -2094,7 +2313,7 @@ impl Omnigraph {
                         graph_identity_digest: graph_identity_digest.clone(),
                         drain_id: drain_id.clone(),
                         expected_lifecycle_revision,
-                        goal: DrainGoal::Sealed,
+                        goal,
                         initiating_actor: actor_id.clone(),
                         initiated_at: crate::db::now_micros()?,
                         target_epoch_floor_by_shard,
@@ -2155,11 +2374,20 @@ impl Omnigraph {
                     expected_lifecycle_revision,
                     &actor_id,
                 )?;
-                return Ok(());
+                return Ok(ResidentQuiesceOutcome::Sealed);
             }
         }
 
         let current = self.open_write_txn(None).await?;
+        if let Some((expected_profile, _)) = &offline_disabling
+            && current.base.stream_profile() != expected_profile
+        {
+            return Err(OmniError::manifest_read_set_changed(
+                "offline_stream_quiesce_profile_under_admission",
+                Some(format!("{expected_profile:?}")),
+                Some(format!("{:?}", current.base.stream_profile())),
+            ));
+        }
         let current_lifecycle = current
             .base
             .stream_lifecycle(key.identity)
@@ -2191,7 +2419,18 @@ impl Omnigraph {
                 expected_lifecycle_revision,
                 &actor_id,
             )?;
-            return Ok(());
+            return Ok(ResidentQuiesceOutcome::Sealed);
+        }
+        if resident_identity.is_some()
+            && (current_lifecycle.lifecycle != StreamLifecycle::Draining
+                || current_lifecycle.drain.as_ref().is_none_or(|drain| {
+                    drain.drain_id != drain_id
+                        || drain.operation_expected_revision != expected_lifecycle_revision
+                        || drain.initiating_actor != actor_id
+                        || drain.goal != goal
+                }))
+        {
+            return Ok(ResidentQuiesceOutcome::Inactive);
         }
         if current_lifecycle.lifecycle == StreamLifecycle::Open {
             if current_lifecycle.lifecycle_revision != expected_lifecycle_revision {
@@ -2218,7 +2457,7 @@ impl Omnigraph {
                 graph_identity_digest: graph_identity_digest.clone(),
                 drain_id: drain_id.clone(),
                 expected_lifecycle_revision,
-                goal: DrainGoal::Sealed,
+                goal,
                 initiating_actor: actor_id.clone(),
                 initiated_at: crate::db::now_micros()?,
                 target_epoch_floor_by_shard,
@@ -2293,6 +2532,9 @@ impl Omnigraph {
             drop(_branch_guard);
             drop(_schema_guard);
             self.refresh_coordinator_only().await?;
+            if offline_disabling.is_none() && !stop_after_start {
+                self.notify_stream_fold_pressure(key.identity);
+            }
         } else if current_lifecycle.lifecycle == StreamLifecycle::Draining {
             let drain = current_lifecycle.drain.as_ref().ok_or_else(|| {
                 OmniError::manifest_internal("DRAINING stream has no drain descriptor")
@@ -2301,7 +2543,7 @@ impl Omnigraph {
                 || drain.drain_id != drain_id
                 || drain.operation_expected_revision != expected_lifecycle_revision
                 || drain.initiating_actor != actor_id
-                || drain.goal != DrainGoal::Sealed
+                || drain.goal != goal
             {
                 return Err(OmniError::StreamLifecycleIdempotencyConflict {
                     stable_table_id: key.identity.stable_table_id,
@@ -2331,6 +2573,10 @@ impl Omnigraph {
                 expected_revision: expected_lifecycle_revision,
                 current_revision: current_lifecycle.lifecycle_revision,
             });
+        }
+
+        if stop_after_start {
+            return Ok(ResidentQuiesceOutcome::Inactive);
         }
 
         let draining = self
@@ -2455,7 +2701,7 @@ impl Omnigraph {
         )
         .await?;
         drop(cut);
-        Ok(())
+        Ok(ResidentQuiesceOutcome::Sealed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2577,40 +2823,71 @@ impl Omnigraph {
         let next_lifecycle =
             build_draining_to_sealed(&draining, &receipt, &current_claim_receipt, evidence)?;
 
-        let token_dataset = capture.txn.base.open_stream_token_authority().await?;
-        let staged = stage_management_receipt(
-            token_dataset,
-            capture.txn.base.stream_token_authority(),
-            &receipt,
+        self.publish_stream_lifecycle_receipt_v14(
+            &capture.txn,
+            draining,
+            Some(current_claim_receipt),
+            next_lifecycle,
+            receipt,
+            RecoveryStreamLifecycleReceiptKind::QuiesceFinalize,
         )
-        .await?;
+        .await
+    }
+
+    /// Publish one recovery-v14 lifecycle receipt and its exact manifest
+    /// successor. The caller owns the profile/admission and inner writer gates;
+    /// this helper owns only the token effect, sidecar, confirmation, and
+    /// terminal manifest recovery protocol.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn publish_stream_lifecycle_receipt_v14(
+        &self,
+        txn: &WriteTxn,
+        prior_lifecycle: StreamLifecycleEntry,
+        current_claim_receipt: Option<ClaimReceipt>,
+        next_lifecycle: StreamLifecycleEntry,
+        receipt: ManagementReceipt,
+        change_kind: RecoveryStreamLifecycleReceiptKind,
+    ) -> Result<()> {
+        let identity = prior_lifecycle.identity;
+        let graph_identity_digest = receipt.graph_identity_digest.clone();
+        let operation_kind = receipt.operation_kind.clone();
+        let operation_id = receipt.operation_id.clone();
+        let actor_id = receipt.actor_id.clone();
+        let receipt_label = match change_kind {
+            RecoveryStreamLifecycleReceiptKind::QuiesceFinalize => "quiesce",
+            RecoveryStreamLifecycleReceiptKind::DisableDrainAdoption => "disable drain adoption",
+        };
+        let token_dataset = txn.base.open_stream_token_authority().await?;
+        let staged =
+            stage_management_receipt(token_dataset, txn.base.stream_token_authority(), &receipt)
+                .await?;
         let planned_transaction = staged.transaction_identity();
         let token_head = SnapshotHandle::new(
             open_stream_token_authority_head(
                 self.root_uri(),
-                capture.txn.base.stream_token_authority(),
+                txn.base.stream_token_authority(),
                 &crate::lance_access::control_session(),
             )
             .await?,
         );
         let staged = StagedHandle::new(staged);
         let authority = RecoveryAuthorityToken {
-            branch_identifier: capture.txn.authority.branch_identifier.clone(),
-            graph_head: capture.txn.authority.graph_head.clone(),
-            schema_identity_domain: capture.txn.authority.schema_identity_domain.clone(),
-            schema_ir_hash: capture.txn.authority.schema_ir_hash.clone(),
-            schema_identity_version: capture.txn.authority.schema_identity_version,
+            branch_identifier: txn.authority.branch_identifier.clone(),
+            graph_head: txn.authority.graph_head.clone(),
+            schema_identity_domain: txn.authority.schema_identity_domain.clone(),
+            schema_ir_hash: txn.authority.schema_ir_hash.clone(),
+            schema_identity_version: txn.authority.schema_identity_version,
         };
         let mut sidecar = new_stream_lifecycle_receipt_sidecar_v14(
-            actor_id.to_string(),
+            actor_id,
             authority,
-            capture.txn.base.version(),
-            RecoveryStreamLifecycleReceiptKind::QuiesceFinalize,
-            capture.txn.base.stream_profile().clone(),
-            draining,
-            Some(current_claim_receipt),
+            txn.base.version(),
+            change_kind,
+            txn.base.stream_profile().clone(),
+            prior_lifecycle,
+            current_claim_receipt,
             next_lifecycle.clone(),
-            capture.txn.base.stream_token_authority().clone(),
+            txn.base.stream_token_authority().clone(),
             receipt.clone(),
             planned_transaction,
         )?;
@@ -2624,7 +2901,7 @@ impl Omnigraph {
                 let recovered = complete_stream_lifecycle_receipt_sidecar_v14(
                     self.root_uri(),
                     Arc::clone(&self.storage),
-                    &capture.txn.base,
+                    &txn.base,
                     &sidecar,
                 )
                 .await;
@@ -2632,16 +2909,16 @@ impl Omnigraph {
                     Ok(()) => {
                         self.refresh_coordinator_only().await?;
                         let terminal = self.open_write_txn(None).await?;
-                        if terminal.base.stream_lifecycle(key.identity) == Some(&next_lifecycle) {
+                        if terminal.base.stream_lifecycle(identity) == Some(&next_lifecycle) {
                             let selected = terminal.base.open_stream_token_authority().await?;
                             let selected_receipt = lookup_management_receipt(
                                 &selected,
                                 terminal.base.stream_token_authority(),
-                                graph_identity_digest,
-                                key.identity,
+                                &graph_identity_digest,
+                                identity,
                                 &next_lifecycle.enrollment_receipt.stream_incarnation_id,
-                                "QUIESCE",
-                                drain_id,
+                                &operation_kind,
+                                &operation_id,
                             )
                             .await?;
                             if selected_receipt.as_ref() == Some(&receipt) {
@@ -2650,14 +2927,14 @@ impl Omnigraph {
                         }
                         // Recovery proved the staged token transaction
                         // effect-free and retired its intent. That is a safe
-                        // retry outcome, not a successful quiesce.
+                        // retry outcome, not a successful lifecycle change.
                         return Err(error);
                     }
                     Err(recovery_error) => {
                         return Err(OmniError::recovery_required(
                             handle.operation_id,
                             format!(
-                                "quiesce receipt commit failed ({error}) and exact recovery did not complete: {recovery_error}"
+                                "{receipt_label} receipt commit failed ({error}) and exact recovery did not complete: {recovery_error}"
                             ),
                         ));
                     }
@@ -2667,9 +2944,12 @@ impl Omnigraph {
         if !outcome.is_exact() {
             return Err(OmniError::recovery_required(
                 handle.operation_id,
-                "quiesce receipt participant committed a non-exact transaction",
+                format!("{receipt_label} receipt participant committed a non-exact transaction"),
             ));
         }
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::STREAM_LIFECYCLE_RECEIPT_POST_TOKEN_COMMIT_PRE_CONFIRM,
+        )?;
         let next_token_authority =
             stream_token_authority_entry_for_dataset(outcome.snapshot().dataset())
                 .await
@@ -2688,28 +2968,34 @@ impl Omnigraph {
         .map_err(|error| {
             OmniError::recovery_required(
                 handle.operation_id.clone(),
-                format!("quiesce receipt confirmation requires recovery: {error}"),
+                format!("{receipt_label} receipt confirmation requires recovery: {error}"),
             )
         })?;
         complete_stream_lifecycle_receipt_sidecar_v14(
             self.root_uri(),
             Arc::clone(&self.storage),
-            &capture.txn.base,
+            &txn.base,
             &sidecar,
         )
         .await
         .map_err(|error| {
             OmniError::recovery_required(
                 handle.operation_id,
-                format!("quiesce receipt publication requires recovery: {error}"),
+                format!("{receipt_label} receipt publication requires recovery: {error}"),
             )
         })?;
         self.refresh_coordinator_only().await?;
         let terminal = self.open_write_txn(None).await?;
-        if terminal.base.stream_lifecycle(key.identity) != Some(&next_lifecycle) {
-            return Err(OmniError::manifest_internal(
-                "completed quiesce receipt did not install its exact SEALED lifecycle",
-            ));
+        if terminal.base.stream_lifecycle(identity) != Some(&next_lifecycle) {
+            let expected_successor = match change_kind {
+                RecoveryStreamLifecycleReceiptKind::QuiesceFinalize => "exact SEALED lifecycle",
+                RecoveryStreamLifecycleReceiptKind::DisableDrainAdoption => {
+                    "exact successor lifecycle"
+                }
+            };
+            return Err(OmniError::manifest_internal(format!(
+                "completed {receipt_label} receipt did not install its {expected_successor}"
+            )));
         }
         Ok(())
     }
@@ -5691,6 +5977,23 @@ impl Omnigraph {
             operation,
             StreamLifecycle::Open,
             None,
+            None,
+        )
+        .await
+    }
+
+    async fn capture_open_stream_authority_for_disabling_profile(
+        &self,
+        table_key: &str,
+        operation: &str,
+        expected_profile: &StreamProfileEntry,
+    ) -> Result<StreamAuthorityCapture> {
+        self.capture_stream_authority_for_lifecycle(
+            table_key,
+            operation,
+            StreamLifecycle::Open,
+            None,
+            Some(expected_profile),
         )
         .await
     }
@@ -5712,6 +6015,7 @@ impl Omnigraph {
             operation,
             StreamLifecycle::Draining,
             Some(drain_id),
+            None,
         )
         .await
     }
@@ -5729,6 +6033,7 @@ impl Omnigraph {
             operation,
             StreamLifecycle::Sealed,
             None,
+            None,
         )
         .await
     }
@@ -5739,6 +6044,7 @@ impl Omnigraph {
         operation: &str,
         expected_lifecycle: StreamLifecycle,
         expected_drain_id: Option<&str>,
+        expected_disabling_profile: Option<&StreamProfileEntry>,
     ) -> Result<StreamAuthorityCapture> {
         let txn = self.open_write_txn(None).await?;
         let entry = txn.base.entry(table_key).cloned().ok_or_else(|| {
@@ -5760,23 +6066,30 @@ impl Omnigraph {
                     "{operation} requires an enrolled stream for '{table_key}'"
                 ))
             })?;
-        let profile_mode = txn.base.stream_profile().mode();
+        let profile = txn.base.stream_profile();
+        let profile_mode = profile.mode();
+        if let Some(expected) = expected_disabling_profile
+            && (expected.mode() != StreamProfileMode::Disabling || profile != expected)
+        {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("{operation}:stream_profile"),
+                Some(format!("{expected:?}")),
+                Some(format!("{profile:?}")),
+            ));
+        }
         let profile_authorized = match expected_lifecycle {
             StreamLifecycle::Open => {
-                profile_mode == crate::db::manifest::StreamProfileMode::Enabled
+                profile_mode == StreamProfileMode::Enabled || expected_disabling_profile.is_some()
             }
             StreamLifecycle::Draining => matches!(
                 profile_mode,
-                crate::db::manifest::StreamProfileMode::Enabled
-                    | crate::db::manifest::StreamProfileMode::Disabling
+                StreamProfileMode::Enabled | StreamProfileMode::Disabling
             ),
             // This arm is reachable only through the dedicated sealed capture
             // above. The normal OPEN capture remains the sole write-admission
             // path, so accepting ENABLED here does not create a generic
             // `allow_sealed` bypass.
-            StreamLifecycle::Sealed => {
-                profile_mode == crate::db::manifest::StreamProfileMode::Enabled
-            }
+            StreamLifecycle::Sealed => profile_mode == StreamProfileMode::Enabled,
         };
         if !profile_authorized {
             return Err(OmniError::StreamingRequiresClusterRuntime {
@@ -6125,6 +6438,71 @@ impl Omnigraph {
     ) -> Result<()> {
         Box::pin(self.stream_quiesce_as(table_key, drain_id, expected_lifecycle_revision, actor_id))
             .await
+    }
+
+    /// Feature-gated fixture seam which persists the exact first half of a
+    /// maintenance-style quiesce request and deliberately stops at
+    /// `DRAINING(goal = OPEN_AFTER_FOLD)`. Production quiesce remains
+    /// `goal = SEALED`; this exists only so disable-adoption integration tests
+    /// can begin from a state otherwise produced by a later maintenance owner.
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    pub async fn failpoint_start_stream_open_after_fold_drain_for_test(
+        self: &Arc<Self>,
+        table_key: &str,
+        drain_id: &str,
+        expected_lifecycle_revision: u64,
+        actor_id: &str,
+    ) -> Result<u64> {
+        let db = Arc::clone(self);
+        let outcome = crate::instrumentation::spawn_with_query_io_probes({
+            let table_key = table_key.to_string();
+            let drain_id = drain_id.to_string();
+            let actor_id = actor_id.to_string();
+            async move {
+                Box::pin(db.stream_quiesce_background(
+                    table_key,
+                    StreamQuiesceInvocation::Caller {
+                        drain_id,
+                        expected_lifecycle_revision,
+                        actor_id,
+                        goal: DrainGoal::OpenAfterFold,
+                        stop_after_start: true,
+                    },
+                ))
+                .await
+            }
+        })
+        .await
+        .map_err(|error| {
+            OmniError::Lance(format!("OPEN_AFTER_FOLD fixture task failed: {error}"))
+        })??;
+        if outcome == ResidentQuiesceOutcome::Sealed {
+            return Err(OmniError::manifest_internal(
+                "OPEN_AFTER_FOLD fixture unexpectedly reached SEALED",
+            ));
+        }
+        let snapshot = self.snapshot_of(ReadTarget::branch("main")).await?;
+        let entry = snapshot.entry(table_key).ok_or_else(|| {
+            OmniError::manifest_not_found(format!(
+                "OPEN_AFTER_FOLD fixture lost table '{table_key}'"
+            ))
+        })?;
+        let lifecycle = snapshot.stream_lifecycle(entry.identity).ok_or_else(|| {
+            OmniError::manifest_internal("OPEN_AFTER_FOLD fixture lost its lifecycle row")
+        })?;
+        let drain = lifecycle.drain.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal("OPEN_AFTER_FOLD fixture did not persist a drain")
+        })?;
+        if lifecycle.lifecycle != StreamLifecycle::Draining
+            || drain.drain_id != drain_id
+            || drain.goal != DrainGoal::OpenAfterFold
+        {
+            return Err(OmniError::manifest_internal(
+                "OPEN_AFTER_FOLD fixture did not persist its exact requested drain",
+            ));
+        }
+        Ok(lifecycle.lifecycle_revision)
     }
 
     /// Feature-gated lifecycle seam for recovery-v15 `SEALED -> OPEN` resume

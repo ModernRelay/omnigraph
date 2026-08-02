@@ -40,7 +40,7 @@ async fn write_cluster_state(cluster_uri: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
 }
 
-pub async fn enable_stream_profile(db: &Omnigraph, cluster_uri: &str) {
+pub async fn enable_stream_profile(db: &Arc<Omnigraph>, cluster_uri: &str) {
     let cluster_uri = cluster_uri.trim_end_matches('/');
     let state_cas = write_cluster_state(cluster_uri).await;
     let storage = storage_handle_for_uri(cluster_uri).unwrap();
@@ -75,7 +75,11 @@ pub async fn enable_stream_profile(db: &Omnigraph, cluster_uri: &str) {
     assert!(result.streaming_enabled);
 }
 
-pub async fn disable_stream_profile(db: &Omnigraph, cluster_uri: &str) {
+pub async fn disable_stream_profile(db: &Arc<Omnigraph>, cluster_uri: &str) {
+    try_disable_stream_profile(db, cluster_uri).await.unwrap();
+}
+
+pub async fn try_disable_stream_profile(db: &Arc<Omnigraph>, cluster_uri: &str) -> Result<()> {
     let cluster_uri = cluster_uri.trim_end_matches('/');
     let status = db.stream_status().await.unwrap();
     let state_cas = write_cluster_state(cluster_uri).await;
@@ -107,9 +111,47 @@ pub async fn disable_stream_profile(db: &Omnigraph, cluster_uri: &str) {
     .await
     .unwrap();
     let authority = db.check_cluster_apply_authority(guard).await.unwrap();
-    let result = db.set_streaming_profile_checked(authority).await.unwrap();
+    let result = db.set_streaming_profile_checked(authority).await?;
     assert!(!result.streaming_enabled);
     assert_eq!(db.stream_status().await.unwrap().profile_mode, "DISABLED");
+    Ok(())
+}
+
+pub async fn assert_offline_stream_profile_authority_available(
+    db: &Arc<Omnigraph>,
+    cluster_uri: &str,
+) {
+    let cluster_uri = cluster_uri.trim_end_matches('/');
+    let status = db.stream_status().await.unwrap();
+    let state_cas = write_cluster_state(cluster_uri).await;
+    let storage = storage_handle_for_uri(cluster_uri).unwrap();
+    let lock_uri = format!("{cluster_uri}/__cluster/lock.json");
+    let lock = match acquire_state_lock(&storage, &lock_uri, "apply")
+        .await
+        .unwrap()
+    {
+        StateLockAcquire::Acquired(lock) => lock,
+        StateLockAcquire::Held => panic!("fresh MemWAL test apply lock is already held"),
+    };
+    let guard = validate_offline_guard(
+        &lock,
+        OfflineAuthorityRequest {
+            graph_id: GRAPH_ID,
+            graph_store_uri: db.uri(),
+            expected_state_cas: &state_cas,
+            state_revision: 1,
+            declaration_revision: STREAM_DECLARATION_REVISION,
+            declaration_digest: STREAM_DECLARATION_DIGEST,
+            expected_profile_revision: status.profile_revision,
+            operation_id: "memwal-stream-test-shutdown-handoff",
+            operation: AuthorityOperationClass::StreamProfileDisable,
+            actor: "operator:memwal-test",
+            confirm_stream_offline: true,
+        },
+    )
+    .await
+    .expect("clean served-runtime shutdown must release the exclusive local registration");
+    drop(guard);
 }
 
 pub async fn rebind_stream_table_offline(

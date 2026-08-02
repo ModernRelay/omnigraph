@@ -1,15 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
+use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions, StreamingProfileResult};
 use omnigraph_compiler::SchemaMigrationPlan;
 use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::typecheck_query_decl;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_control_authority::{
-    AuthorityOperationClass, OfflineAuthorityRequest, validate_offline_guard,
+    AuthorityOperationClass, OfflineAuthorityRequest, StateLockGuard, validate_offline_guard,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -671,6 +672,114 @@ pub async fn apply_config_dir_with_options(
         completed_op_sidecars.push(sidecar_path);
     }
 
+    // A durable DISABLING profile is already a graph-moving continuation: it
+    // closed admission and retained only recovery/fold/correction authority.
+    // Resume that continuation before attempting any desired schema movement.
+    // If it remains parked, leave the streaming change executable for the
+    // normal phase below (which records the exact observed revision), but
+    // demote schema work and its query dependents for this run.
+    let pre_schema_stream_continuations = changes
+        .iter()
+        .filter(|change| {
+            change.disposition == Some(ApplyDisposition::Applied)
+                && change.operation != PlanOperation::Delete
+        })
+        .filter_map(|change| {
+            let ResourceKind::Streaming(graph_id) = resource_kind(&change.resource) else {
+                return None;
+            };
+            let desired_enabled = desired
+                .graphs
+                .iter()
+                .find(|graph| graph.id == graph_id)
+                .and_then(|graph| graph.streaming)?;
+            Some((
+                graph_id,
+                change
+                    .after_digest
+                    .clone()
+                    .expect("streaming create/update carries an after digest"),
+                desired_enabled,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut schemas_blocked_by_stream_continuation = BTreeSet::new();
+    for (graph_id, declaration_digest, desired_enabled) in pre_schema_stream_continuations {
+        if failed_graphs.contains_key(&graph_id) {
+            continue;
+        }
+        let graph_uri = backend.graph_root(&graph_id);
+        let live_profile_mode = match Omnigraph::open_read_only(&graph_uri).await {
+            Ok(db) => db
+                .stream_status()
+                .await
+                .map(|status| status.profile_mode.to_string()),
+            Err(error) => Err(error),
+        };
+        match classify_pre_schema_stream_probe(live_profile_mode.as_deref()) {
+            PreSchemaStreamProbe::Disabling => {
+                let continuation = Box::pin(reconcile_checked_stream_profile(
+                    &graph_id,
+                    &graph_uri,
+                    &declaration_digest,
+                    desired_enabled,
+                    expected_cas
+                        .as_deref()
+                        .expect("apply read an existing state with a CAS"),
+                    &state,
+                    &desired,
+                    &backend,
+                    lock_guard
+                        .as_ref()
+                        .expect("streaming preflight requires the held state lock"),
+                    options
+                        .actor
+                        .as_deref()
+                        .expect("streaming preflight requires an actor"),
+                    options.confirm_stream_offline,
+                ))
+                .await;
+                if continuation.is_err() {
+                    schemas_blocked_by_stream_continuation.insert(graph_id);
+                }
+            }
+            PreSchemaStreamProbe::Other => {}
+            PreSchemaStreamProbe::Unknown => {
+                // Unknown is not evidence of a safe non-DISABLING profile.
+                // In particular, the manifest may have published DISABLING
+                // before a crash prevented the cluster ledger CAS. Freeze
+                // schema/query movement now; the ordinary streaming phase
+                // below retries through the checked adapter and reports the
+                // concrete open/status error.
+                schemas_blocked_by_stream_continuation.insert(graph_id);
+            }
+        }
+    }
+    if !schemas_blocked_by_stream_continuation.is_empty() {
+        for change in &mut changes {
+            if change.disposition != Some(ApplyDisposition::Applied) {
+                continue;
+            }
+            let reason = match resource_kind(&change.resource) {
+                ResourceKind::Schema(graph_id)
+                    if schemas_blocked_by_stream_continuation.contains(&graph_id) =>
+                {
+                    Some("streaming_disable_continuation_pending")
+                }
+                ResourceKind::Query { graph, .. }
+                    if schemas_blocked_by_stream_continuation.contains(&graph) =>
+                {
+                    Some("dependency_not_applied")
+                }
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                change.disposition = Some(ApplyDisposition::Blocked);
+                change.reason = Some(reason.to_string());
+            }
+        }
+    }
+
     // Schema applies execute next (RFC-004 §D5): the first cluster operation
     // that moves an EXISTING graph manifest, sidecar-fenced the same way.
     let schema_updates_to_run: Vec<String> = changes
@@ -887,6 +996,7 @@ pub async fn apply_config_dir_with_options(
     let mut applied_stream_profile_revisions: BTreeMap<String, u64> = BTreeMap::new();
     let mut applied_streaming_enabled: BTreeMap<String, bool> = BTreeMap::new();
     let mut applied_stream_declaration_revisions: BTreeMap<String, String> = BTreeMap::new();
+    let mut blocked_stream_profile_observations: BTreeMap<String, StateResource> = BTreeMap::new();
     let mut blocked_stream_profile_graphs = changes
         .iter()
         .filter(|change| change.disposition == Some(ApplyDisposition::Blocked))
@@ -922,74 +1032,26 @@ pub async fn apply_config_dir_with_options(
             .expect("streaming create/update carries an after digest");
         let declaration_revision =
             streaming_declaration_revision(&graph_id, declaration_digest);
-        let operation_id = stream_profile_operation_id(
+        let flip = Box::pin(reconcile_checked_stream_profile(
+            &graph_id,
+            &graph_uri,
+            declaration_digest,
+            desired_enabled,
             expected_cas
                 .as_deref()
                 .expect("apply read an existing state with a CAS"),
-            &desired.config_digest,
-            declaration_digest,
-            &graph_id,
-            &graph_uri,
-            desired_enabled,
-        );
-        let flip = async {
-            // The current applied policy remains authoritative until the
-            // final state CAS, while a desired replacement must not be able
-            // to land a profile effect it would itself deny. Enforce their
-            // conjunction across that crash window.
-            let policy = stream_profile_policy_checker(
-                &graph_id,
-                &state,
-                &desired,
-                &backend,
-            )
-            .await
-            .map_err(omnigraph::error::OmniError::Policy)?;
-            let db = Omnigraph::open(&graph_uri).await?;
-            let db = match policy {
-                Some(policy) => db.with_policy(policy),
-                None => db,
-            };
-            let status = db.stream_status().await?;
-            let operation = if desired_enabled {
-                AuthorityOperationClass::StreamProfileEnable
-            } else {
-                AuthorityOperationClass::StreamProfileDisable
-            };
-            let guard = validate_offline_guard(
-                lock_guard
-                    .as_ref()
-                    .expect("streaming preflight requires the held state lock"),
-                OfflineAuthorityRequest {
-                    graph_id: &graph_id,
-                    graph_store_uri: &graph_uri,
-                    expected_state_cas: expected_cas
-                        .as_deref()
-                        .expect("apply read an existing state with a CAS"),
-                    state_revision: state.state_revision,
-                    declaration_revision: &declaration_revision,
-                    declaration_digest,
-                    expected_profile_revision: status.profile_revision,
-                    operation_id: &operation_id,
-                    operation,
-                    actor: options
-                        .actor
-                        .as_deref()
-                        .expect("streaming preflight requires an actor"),
-                    confirm_stream_offline: options.confirm_stream_offline,
-                },
-            )
-            .await
-            .map_err(|err| omnigraph::error::OmniError::StreamingAuthorityMismatch {
-                reason: err.to_string(),
-            })?;
-            let authority = db.check_cluster_apply_authority(guard).await?;
-            // Keep the control-plane apply future bounded. The engine's
-            // recovery-v13 transition owns substantial DataFusion/Lance
-            // state; embedding that future inline in this already-wide
-            // reconciler overflows the normal test/runtime thread stack.
-            Box::pin(db.set_streaming_profile_checked(authority)).await
-        }
+            &state,
+            &desired,
+            &backend,
+            lock_guard
+                .as_ref()
+                .expect("streaming preflight requires the held state lock"),
+            options
+                .actor
+                .as_deref()
+                .expect("streaming preflight requires an actor"),
+            options.confirm_stream_offline,
+        ))
         .await;
         match flip {
             Ok(result) => {
@@ -1013,6 +1075,59 @@ pub async fn apply_config_dir_with_options(
                         "disable waits for stream drain on {undrained_tables:?}; re-run apply after the streams fold"
                     ),
                 ));
+            }
+            Err(omnigraph::error::OmniError::StreamDataBlocked { block_token }) => {
+                blocked_stream_profile_graphs.insert(graph_id.clone());
+                change.disposition = Some(ApplyDisposition::Blocked);
+                change.reason = Some("streaming_data_blocked".to_string());
+
+                // The checked disable publishes DISABLING before it starts
+                // draining lanes. A strict DataBlock is therefore an
+                // operator-actionable continuation, not an effect-free
+                // failure. Persist that exact live operational revision so
+                // the stopped-writer correction command can mint authority,
+                // while its mode-specific digest keeps desired `false`
+                // visibly unresolved until the retry reaches DISABLED.
+                let observation = async {
+                    let db = Omnigraph::open_read_only(&graph_uri).await?;
+                    db.stream_status().await
+                }
+                .await;
+                match observation {
+                    Ok(status) if status.profile_mode == "DISABLING" => {
+                        blocked_stream_profile_observations.insert(
+                            change.resource.clone(),
+                            observed_stream_profile_resource(
+                                &graph_id,
+                                status.profile_mode,
+                                status.streaming_enabled,
+                                status.profile_revision,
+                            ),
+                        );
+                        diagnostics.push(Diagnostic::warning(
+                            "streaming_data_blocked",
+                            change.resource.clone(),
+                            format!(
+                                "disable is parked on strict stream validation block {block_token}; inspect and correct that block, then re-run apply"
+                            ),
+                        ));
+                    }
+                    Ok(status) => diagnostics.push(Diagnostic::error(
+                        "streaming_block_state_observation_failed",
+                        change.resource.clone(),
+                        format!(
+                            "disable returned strict stream block {block_token}, but the live profile is {} revision {} instead of DISABLING",
+                            status.profile_mode, status.profile_revision
+                        ),
+                    )),
+                    Err(err) => diagnostics.push(Diagnostic::error(
+                        "streaming_block_state_observation_failed",
+                        change.resource.clone(),
+                        format!(
+                            "disable returned strict stream block {block_token}, but its live DISABLING authority could not be read: {err}"
+                        ),
+                    )),
+                }
             }
             Err(err) => {
                 blocked_stream_profile_graphs.insert(graph_id.clone());
@@ -1274,6 +1389,15 @@ pub async fn apply_config_dir_with_options(
                 }
             },
             Some(ApplyDisposition::Blocked) => {
+                if let Some(observed) = blocked_stream_profile_observations
+                    .get(&change.resource)
+                    .cloned()
+                {
+                    new_state
+                        .applied_revision
+                        .resources
+                        .insert(change.resource.clone(), observed);
+                }
                 // The sweep owns recovery statuses (Drifted/Error with their
                 // conditions); a generic Blocked must not clobber them.
                 if change.reason.as_deref() != Some("cluster_recovery_pending") {
@@ -2046,6 +2170,31 @@ fn recompute_state_graph_digests(state: &mut ClusterState, desired: &DesiredClus
     }
 }
 
+/// Canonical cluster-ledger projection of one live stream profile.
+///
+/// Intermediate modes deliberately use an observed-mode digest rather than
+/// either desired boolean digest. That keeps a durable DISABLING continuation
+/// visible to the planner while retaining the exact revision required by
+/// stopped-writer control operations.
+fn observed_stream_profile_resource(
+    graph_id: &str,
+    profile_mode: &str,
+    streaming_enabled: bool,
+    profile_revision: u64,
+) -> StateResource {
+    let observed_digest = config::observed_streaming_digest(graph_id, profile_mode);
+    StateResource {
+        digest: observed_digest.clone(),
+        applies_to: None,
+        embedding_provider: None,
+        embedding_profile: None,
+        streaming_enabled: Some(streaming_enabled),
+        declaration_revision: Some(streaming_declaration_revision(graph_id, &observed_digest)),
+        profile_mode: Some(profile_mode.to_string()),
+        profile_revision: Some(profile_revision),
+    }
+}
+
 fn duplicate_key_diagnostics(text: &str) -> Vec<Diagnostic> {
     #[derive(Debug)]
     struct Frame {
@@ -2291,6 +2440,97 @@ fn stream_profile_operation_id(
     format!("stream-profile-{}", sha256_hex(input.as_bytes()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreSchemaStreamProbe {
+    Disabling,
+    Other,
+    Unknown,
+}
+
+fn classify_pre_schema_stream_probe<E>(profile_mode: Result<&str, E>) -> PreSchemaStreamProbe {
+    match profile_mode {
+        Ok("DISABLING") => PreSchemaStreamProbe::Disabling,
+        Ok(_) => PreSchemaStreamProbe::Other,
+        Err(_) => PreSchemaStreamProbe::Unknown,
+    }
+}
+
+/// Run one profile reconciliation through the same stopped-writer authority
+/// and current-plus-desired policy conjunction used by ordinary cluster
+/// apply. Keeping this in one adapter is important for DISABLING recovery:
+/// the pre-schema continuation and the later streaming phase must present the
+/// engine with the exact same occurrence identity and authority envelope.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_checked_stream_profile(
+    graph_id: &str,
+    graph_uri: &str,
+    declaration_digest: &str,
+    desired_enabled: bool,
+    expected_state_cas: &str,
+    state: &ClusterState,
+    desired: &DesiredCluster,
+    backend: &ClusterStore,
+    lock_guard: &StateLockGuard,
+    actor: &str,
+    confirm_stream_offline: bool,
+) -> omnigraph::error::Result<StreamingProfileResult> {
+    let declaration_revision = streaming_declaration_revision(graph_id, declaration_digest);
+    let operation_id = stream_profile_operation_id(
+        expected_state_cas,
+        &desired.config_digest,
+        declaration_digest,
+        graph_id,
+        graph_uri,
+        desired_enabled,
+    );
+
+    // The current applied policy remains authoritative until the final state
+    // CAS, while a desired replacement must not be able to land a profile
+    // effect it would itself deny. Enforce their conjunction across that
+    // crash window.
+    let policy = stream_profile_policy_checker(graph_id, state, desired, backend)
+        .await
+        .map_err(omnigraph::error::OmniError::Policy)?;
+    let db = Omnigraph::open(graph_uri).await?;
+    let db = match policy {
+        Some(policy) => db.with_policy(policy),
+        None => db,
+    };
+    let db = Arc::new(db);
+    let status = db.stream_status().await?;
+    let operation = if desired_enabled {
+        AuthorityOperationClass::StreamProfileEnable
+    } else {
+        AuthorityOperationClass::StreamProfileDisable
+    };
+    let guard = validate_offline_guard(
+        lock_guard,
+        OfflineAuthorityRequest {
+            graph_id,
+            graph_store_uri: graph_uri,
+            expected_state_cas,
+            state_revision: state.state_revision,
+            declaration_revision: &declaration_revision,
+            declaration_digest,
+            expected_profile_revision: status.profile_revision,
+            operation_id: &operation_id,
+            operation,
+            actor,
+            confirm_stream_offline,
+        },
+    )
+    .await
+    .map_err(|err| omnigraph::error::OmniError::StreamingAuthorityMismatch {
+        reason: err.to_string(),
+    })?;
+    let authority = db.check_cluster_apply_authority(guard).await?;
+    // Keep the control-plane apply future bounded. The engine's recovery-v13
+    // transition owns substantial DataFusion/Lance state; embedding that
+    // future inline in this already-wide reconciler overflows the normal
+    // test/runtime thread stack.
+    Box::pin(db.set_streaming_profile_checked(authority)).await
+}
+
 /// Removing the declaration is configuration-only; it must never erase the
 /// last cluster-owned route to an active or in-progress manifest authority.
 /// A whole-graph delete is blocked with it so an approved prefix delete cannot
@@ -2410,24 +2650,17 @@ async fn protect_live_streaming_unmanage(
         }
 
         let streaming_address = config::streaming_address(&graph_id);
-        let observed_digest =
-            config::observed_streaming_digest(&graph_id, status.profile_mode);
-        state.applied_revision.resources.insert(
-            streaming_address.clone(),
-            StateResource {
-                digest: observed_digest.clone(),
-                applies_to: None,
-                embedding_provider: None,
-                embedding_profile: None,
-                streaming_enabled: Some(status.streaming_enabled),
-                declaration_revision: Some(streaming_declaration_revision(
-                    &graph_id,
-                    &observed_digest,
-                )),
-                profile_mode: Some(status.profile_mode.to_string()),
-                profile_revision: Some(status.profile_revision),
-            },
+        let observed = observed_stream_profile_resource(
+            &graph_id,
+            status.profile_mode,
+            status.streaming_enabled,
+            status.profile_revision,
         );
+        let observed_digest = observed.digest.clone();
+        state
+            .applied_revision
+            .resources
+            .insert(streaming_address.clone(), observed);
         set_resource_status(
             state,
             &streaming_address,

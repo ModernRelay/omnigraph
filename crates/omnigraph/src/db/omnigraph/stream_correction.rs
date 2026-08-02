@@ -502,6 +502,7 @@ impl Omnigraph {
             )
             .await?
         {
+            self.notify_stream_fold_pressure(entry.identity);
             return Ok(result);
         }
 
@@ -557,6 +558,7 @@ impl Omnigraph {
             )
             .await?
         {
+            self.notify_stream_fold_pressure(entry.identity);
             return Ok(result);
         }
 
@@ -594,15 +596,18 @@ impl Omnigraph {
                 "receipt-first and exact-cut correction plan digests differ",
             ));
         }
-        self.publish_prepared_data_correction(
-            &capture,
-            reconstructed,
-            prepared,
-            actor,
-            &graph_identity_digest,
-            &request,
-        )
-        .await
+        let result = self
+            .publish_prepared_data_correction(
+                &capture,
+                reconstructed,
+                prepared,
+                actor,
+                &graph_identity_digest,
+                &request,
+            )
+            .await?;
+        self.notify_stream_fold_pressure(entry.identity);
+        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]

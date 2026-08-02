@@ -266,6 +266,7 @@ write_surfaces! {
         "failpoint_stream_b2_for_test",
         "failpoint_stream_ingest_one_as_for_test",
         "failpoint_stream_quiesce_for_test",
+        "failpoint_start_stream_open_after_fold_drain_for_test",
         "failpoint_stream_resume_for_test",
     ],
     "db/omnigraph/stream_rebind.rs" => WriteProtocol::TestOnly => [

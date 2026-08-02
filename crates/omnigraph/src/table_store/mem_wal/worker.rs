@@ -9,10 +9,11 @@
 //! classification, the RC.1 replay watermark bridge, seal/drain proof, and
 //! quiesced retirement.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Display;
 use std::future::Future;
 use std::ops::RangeInclusive;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -21,7 +22,7 @@ use std::time::Duration;
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::take::take;
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
 use lance::Dataset;
 use lance::dataset::mem_wal::scanner::{
     FlushedGeneration as ScannerFlushedGeneration, InMemoryMemTables, LsmScanner, ShardSnapshot,
@@ -394,6 +395,33 @@ pub(crate) struct CheckedExclusiveStreamAuthority {
 impl CheckedExclusiveStreamAuthority {
     pub(crate) fn from_exclusive_admission(guard: OwnedRwLockWriteGuard<()>) -> Self {
         Self { _guard: guard }
+    }
+}
+
+/// Opaque proof that served-runtime shutdown owns the graph-profile gate and
+/// every table admission domain which still has a resident MemWAL owner.
+///
+/// The token is consumed by the root registry shutdown. On an ambiguous or
+/// failed retirement it is retained forever, matching the fail-closed
+/// ownership used by individual append/fold retirements.
+pub(crate) struct CheckedRuntimeShutdownAuthority {
+    _profile_guard: OwnedRwLockWriteGuard<()>,
+    admission_guards: BTreeMap<TableIdentity, OwnedRwLockWriteGuard<()>>,
+}
+
+impl CheckedRuntimeShutdownAuthority {
+    pub(crate) fn new(
+        profile_guard: OwnedRwLockWriteGuard<()>,
+        admission_guards: Vec<(TableIdentity, OwnedRwLockWriteGuard<()>)>,
+    ) -> Self {
+        Self {
+            _profile_guard: profile_guard,
+            admission_guards: admission_guards.into_iter().collect(),
+        }
+    }
+
+    fn covers(&self, identity: TableIdentity) -> bool {
+        self.admission_guards.contains_key(&identity)
     }
 }
 
@@ -2017,6 +2045,19 @@ struct RegistrySlot {
     /// Serializes one caller batch from pre-detach accounting until its exact
     /// charge transfers into this worker (or is refused).
     input_queue: Arc<tokio::sync::Mutex<()>>,
+    /// Join ownership for every idle callback still capable of retaining the
+    /// checked graph runtime. Slots outlive individual workers, so shutdown can
+    /// join a callback even after another retirement made the slot vacant.
+    idle_tasks: Mutex<IdleTaskOwners>,
+}
+
+#[derive(Default)]
+struct IdleTaskOwners {
+    /// Tasks which may still retain the graph-scoped idle authority factory.
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Completed task failures are reaped on the ordinary open path, but the
+    /// first failure remains durable process-local evidence for shutdown.
+    first_failure: Option<String>,
 }
 
 impl Default for RegistrySlot {
@@ -2024,6 +2065,7 @@ impl Default for RegistrySlot {
         Self {
             state: tokio::sync::Mutex::new(RegistrySlotState::Vacant),
             input_queue: Arc::new(tokio::sync::Mutex::new(())),
+            idle_tasks: Mutex::new(IdleTaskOwners::default()),
         }
     }
 }
@@ -2493,6 +2535,213 @@ impl MemWalWorkerRegistry {
         match &*state {
             RegistrySlotState::Active(worker) => Some(Arc::clone(worker)),
             _ => None,
+        }
+    }
+
+    /// Return the immutable table identities whose slots still own or are
+    /// settling a writer. The served runtime holds the profile gate while it
+    /// uses this snapshot to close every corresponding admission domain.
+    pub(crate) async fn served_runtime_resident_identities(&self) -> Vec<TableIdentity> {
+        let slots = self
+            .slots
+            .lock()
+            .expect("MemWAL worker registry poisoned")
+            .iter()
+            .map(|(key, slot)| (*key, Arc::clone(slot)))
+            .collect::<Vec<_>>();
+        let mut identities = BTreeSet::new();
+        for (key, slot) in slots {
+            if !matches!(&*slot.state.lock().await, RegistrySlotState::Vacant) {
+                identities.insert(key.identity);
+            }
+        }
+        identities.into_iter().collect()
+    }
+
+    async fn join_idle_owners(slot: &RegistrySlot) -> Result<(), MemWalWorkerError> {
+        let (tasks, mut first_failure) = {
+            let mut owners = slot
+                .idle_tasks
+                .lock()
+                .expect("MemWAL idle-task registry poisoned");
+            (
+                std::mem::take(&mut owners.handles),
+                owners.first_failure.take(),
+            )
+        };
+        for task in tasks {
+            if let Err(error) = task.await {
+                first_failure.get_or_insert_with(|| error.to_string());
+            }
+        }
+        match first_failure {
+            Some(error) => Err(MemWalWorkerError::state(format!(
+                "idle authority owner task failed during served-runtime shutdown: {error}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    async fn shutdown_served_runtime_background(
+        self: &Arc<Self>,
+        authority: &CheckedRuntimeShutdownAuthority,
+    ) -> Result<(), MemWalWorkerError> {
+        let mut slots = self
+            .slots
+            .lock()
+            .expect("MemWAL worker registry poisoned")
+            .iter()
+            .map(|(key, slot)| (*key, Arc::clone(slot)))
+            .collect::<Vec<_>>();
+        slots.sort_by_key(|(key, _)| key.to_string());
+
+        // Start every original abort before awaiting any one of them. The
+        // production profile currently permits one resident, but this keeps a
+        // wider future bound on one shared shutdown deadline rather than one
+        // deadline per slot.
+        let mut retirements = Vec::new();
+        for (key, slot) in &slots {
+            let worker = {
+                let state = slot.state.lock().await;
+                match &*state {
+                    RegistrySlotState::Vacant => None,
+                    RegistrySlotState::Active(worker) => {
+                        if !authority.covers(key.identity) {
+                            return Err(MemWalWorkerError::state(format!(
+                                "served-runtime shutdown lacks exclusive admission for resident table {}",
+                                key.identity
+                            )));
+                        }
+                        Some(Arc::clone(worker))
+                    }
+                    RegistrySlotState::Opening(_) => {
+                        return Err(MemWalWorkerError::state(format!(
+                            "served-runtime shutdown observed an opening worker for {key} after admission was fenced"
+                        )));
+                    }
+                    RegistrySlotState::Retiring(_) => {
+                        return Err(MemWalWorkerError::state(format!(
+                            "served-runtime shutdown observed an unsettled retirement for {key} after admission was fenced"
+                        )));
+                    }
+                }
+            };
+            if let Some(worker) = worker {
+                *worker.mode.lock().await = WorkerMode::Retiring;
+                let retirement = self.begin_abort(slot, &worker).await;
+                retirements.push((*key, Arc::clone(slot), worker, retirement));
+            }
+        }
+
+        for (key, slot, worker, retirement) in retirements {
+            retirement.wait().await?;
+            let mut state = slot.state.lock().await;
+            if !matches!(&*state, RegistrySlotState::Retiring(_)) {
+                return Err(MemWalWorkerError::state(format!(
+                    "resident writer slot {key} changed during served-runtime shutdown"
+                )));
+            }
+            *state = RegistrySlotState::Vacant;
+            drop(state);
+            self.release_worker_usage(&worker);
+        }
+
+        let mut idle_owner_failure = None;
+        for (_, slot) in &slots {
+            if let Err(error) = Self::join_idle_owners(slot).await
+                && idle_owner_failure.is_none()
+            {
+                idle_owner_failure = Some(error);
+            }
+        }
+
+        let usage = self.usage.lock().expect("MemWAL registry usage poisoned");
+        if usage.resident_writers_root != 0
+            || !usage.resident_writers_by_table.is_empty()
+            || usage.reserved_arrow_bytes != 0
+            || usage.b2_preprocessing_bytes != 0
+            || !usage.reserved_by_key.is_empty()
+            || !usage.fold_required_by_key.is_empty()
+            || usage.inflight_calls != 0
+            || usage.pending_generations != 0
+        {
+            return Err(MemWalWorkerError::state(format!(
+                "served-runtime shutdown retained process-local ownership: resident_writers={}, resident_tables={}, reserved_arrow_bytes={}, preprocessing_bytes={}, reserved_keys={}, fold_required_keys={}, inflight_calls={}, pending_generations={}",
+                usage.resident_writers_root,
+                usage.resident_writers_by_table.len(),
+                usage.reserved_arrow_bytes,
+                usage.b2_preprocessing_bytes,
+                usage.reserved_by_key.len(),
+                usage.fold_required_by_key.len(),
+                usage.inflight_calls,
+                usage.pending_generations,
+            )));
+        }
+        drop(usage);
+        if let Some(error) = idle_owner_failure {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Run the complete root cleanup while retaining checked authority through
+    /// success, panic, or a fail-closed terminal error. The caller must itself
+    /// be a detached owner so cancellation cannot drop the future mid-cleanup.
+    pub(crate) async fn shutdown_served_runtime_owned(
+        self: &Arc<Self>,
+        authority: CheckedRuntimeShutdownAuthority,
+    ) -> Result<(), MemWalWorkerError> {
+        let outcome = AssertUnwindSafe(self.shutdown_served_runtime_background(&authority))
+            .catch_unwind()
+            .await;
+        match outcome {
+            Ok(Ok(())) => {
+                drop(authority);
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                tokio::spawn(async move {
+                    let _authority = authority;
+                    std::future::pending::<()>().await;
+                });
+                Err(error)
+            }
+            Err(_) => {
+                tokio::spawn(async move {
+                    let _authority = authority;
+                    std::future::pending::<()>().await;
+                });
+                Err(MemWalWorkerError::state(
+                    "served-runtime shutdown owner panicked; checked admission remains retained",
+                ))
+            }
+        }
+    }
+
+    /// Abort every root-resident writer and join every idle callback before
+    /// releasing the checked serving-runtime gates. Durable WAL remains the
+    /// source of truth and is replayed by a later runtime; this shutdown only
+    /// removes process-local owners.
+    pub(crate) async fn shutdown_served_runtime(
+        self: &Arc<Self>,
+        authority: CheckedRuntimeShutdownAuthority,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), MemWalWorkerError> {
+        let registry = Arc::clone(self);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let outcome = registry.shutdown_served_runtime_owned(authority).await;
+            let _ = result_tx.send(outcome);
+        });
+
+        match tokio::time::timeout_at(deadline, result_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(MemWalWorkerError::state(
+                "served-runtime shutdown owner exited without reporting an outcome",
+            )),
+            Err(_) => Err(MemWalWorkerError::state(
+                "resident writers or idle authority owners did not settle before the served-runtime shutdown deadline",
+            )),
         }
     }
 
@@ -4172,8 +4421,9 @@ impl MemWalWorkerRegistry {
         }
         let registry = Arc::clone(self);
         let slot = Arc::clone(slot);
+        let owner_slot = Arc::clone(&slot);
         let worker = Arc::clone(worker);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 let last_used = *worker
                     .last_used
@@ -4258,6 +4508,34 @@ impl MemWalWorkerRegistry {
             }
             worker.idle_task_armed.store(false, Ordering::Release);
         });
+        let mut owners = owner_slot
+            .idle_tasks
+            .lock()
+            .expect("MemWAL idle-task registry poisoned");
+        // One slot can be opened and idled many times during a long-lived
+        // served runtime. Reap completed task cells on that ordinary path so
+        // join ownership stays bounded, while retaining the first failed join
+        // as evidence for the final checked shutdown.
+        let mut completed_failure = None;
+        owners.handles.retain_mut(|handle| {
+            if !handle.is_finished() {
+                return true;
+            }
+            match (&mut *handle).now_or_never() {
+                Some(Ok(())) => false,
+                Some(Err(error)) => {
+                    completed_failure.get_or_insert_with(|| error.to_string());
+                    false
+                }
+                // `is_finished` should make this unreachable, but retaining
+                // the handle is the cancellation-safe fallback.
+                None => true,
+            }
+        });
+        if owners.first_failure.is_none() {
+            owners.first_failure = completed_failure;
+        }
+        owners.handles.push(task);
     }
 
     /// Opportunistic idle eviction. The caller performs the same fresh check
@@ -6325,6 +6603,170 @@ mod tests {
         .await
         .expect("quiesce must wake and release the idle owner before its 30-second deadline");
         drop(cut);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn served_runtime_shutdown_aborts_writer_and_joins_idle_owner() {
+        let fixture = enrolled_worker_fixture("runtime-shutdown-joins-idle-owner").await;
+        let mut bounded = limits();
+        bounded.idle_timeout = Duration::from_secs(30);
+        let registry = MemWalWorkerRegistry::for_root(
+            &format!(
+                "memory://runtime-shutdown-joins-idle-owner/{}",
+                ShardId::new_v4()
+            ),
+            bounded,
+        )
+        .unwrap();
+        let opened = claim_opened_worker(
+            &fixture.dataset,
+            &fixture.uri,
+            &fixture.details,
+            &fixture.plan,
+            fixture.initial_epoch,
+        )
+        .await;
+        let worker = install_cached_worker(&registry, fixture.key, opened).await;
+        let slot = registry.slot(fixture.key);
+
+        let retained_runtime = Arc::new(());
+        let runtime_probe = Arc::downgrade(&retained_runtime);
+        let idle_authority: IdleAuthorityCheck = Arc::new(move |_writer| {
+            let retained_runtime = Arc::clone(&retained_runtime);
+            Box::pin(async move {
+                let _retained_runtime = retained_runtime;
+                std::future::pending::<Result<CheckedStreamAuthority, IdleAuthorityFailure>>().await
+            })
+        });
+        let completed_owner = tokio::spawn(async {});
+        while !completed_owner.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        slot.idle_tasks
+            .lock()
+            .unwrap()
+            .handles
+            .push(completed_owner);
+        registry.ensure_idle_task(&slot, &worker, idle_authority);
+        tokio::task::yield_now().await;
+        assert!(runtime_probe.upgrade().is_some());
+        assert_eq!(
+            slot.idle_tasks.lock().unwrap().handles.len(),
+            1,
+            "ordinary worker reuse must reap completed idle-owner handles"
+        );
+
+        let profile_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let admission_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let authority = CheckedRuntimeShutdownAuthority::new(
+            profile_gate.write_owned().await,
+            vec![(fixture.key.identity, admission_gate.write_owned().await)],
+        );
+        registry
+            .shutdown_served_runtime(
+                authority,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .expect("checked runtime shutdown must settle its writer and idle callback");
+
+        assert!(runtime_probe.upgrade().is_none());
+        assert!(matches!(
+            &*slot.state.lock().await,
+            RegistrySlotState::Vacant
+        ));
+        assert!(slot.idle_tasks.lock().unwrap().handles.is_empty());
+        let usage = registry.usage.lock().unwrap();
+        assert_eq!(usage.resident_writers_root, 0);
+        assert!(usage.resident_writers_by_table.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_shutdown_waiter_keeps_authority_until_idle_owner_joins() {
+        let fixture = enrolled_worker_fixture("runtime-shutdown-cancel-safe").await;
+        let registry = MemWalWorkerRegistry::for_root(
+            &format!(
+                "memory://runtime-shutdown-cancel-safe/{}",
+                ShardId::new_v4()
+            ),
+            limits(),
+        )
+        .unwrap();
+        let opened = claim_opened_worker(
+            &fixture.dataset,
+            &fixture.uri,
+            &fixture.details,
+            &fixture.plan,
+            fixture.initial_epoch,
+        )
+        .await;
+        let _worker = install_cached_worker(&registry, fixture.key, opened).await;
+        let slot = registry.slot(fixture.key);
+
+        let idle_release = Arc::new(tokio::sync::Notify::new());
+        let retained_runtime = Arc::new(());
+        let runtime_probe = Arc::downgrade(&retained_runtime);
+        let idle_release_task = Arc::clone(&idle_release);
+        let idle_task = tokio::spawn(async move {
+            let _retained_runtime = retained_runtime;
+            idle_release_task.notified().await;
+        });
+        slot.idle_tasks.lock().unwrap().handles.push(idle_task);
+
+        let profile_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let admission_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let authority = CheckedRuntimeShutdownAuthority::new(
+            Arc::clone(&profile_gate).write_owned().await,
+            vec![(
+                fixture.key.identity,
+                Arc::clone(&admission_gate).write_owned().await,
+            )],
+        );
+        let shutdown_registry = Arc::clone(&registry);
+        let shutdown = tokio::spawn(async move {
+            shutdown_registry
+                .shutdown_served_runtime(
+                    authority,
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(&*slot.state.lock().await, RegistrySlotState::Vacant) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached shutdown owner must reach its idle-task join");
+        assert!(runtime_probe.upgrade().is_some());
+        shutdown.abort();
+        assert!(shutdown.await.unwrap_err().is_cancelled());
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                Arc::clone(&profile_gate).read_owned(),
+            )
+            .await
+            .is_err(),
+            "cancelling the waiter must not release checked shutdown authority"
+        );
+        idle_release.notify_one();
+        let released = tokio::time::timeout(
+            Duration::from_secs(2),
+            Arc::clone(&profile_gate).read_owned(),
+        )
+        .await
+        .expect("late idle-owner completion must release checked shutdown authority");
+        drop(released);
+        assert!(runtime_probe.upgrade().is_none());
+        let usage = registry.usage.lock().unwrap();
+        assert_eq!(usage.resident_writers_root, 0);
+        assert_eq!(usage.inflight_calls, 0);
     }
 
     async fn assert_ordinary_seal_still_refuses_empty(fixture: &EnrolledWorkerFixture) {

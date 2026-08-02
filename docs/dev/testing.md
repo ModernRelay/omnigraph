@@ -615,8 +615,10 @@ the ledger, serving-binding validation, applied-plus-desired graph-policy
 authorization, retention of the prior allowing policy when the profile effect
 is denied before the state CAS, and quarantine of incomplete enabled
 authority. Engine stream-profile tests also pin BranchMerge refusal under
-`ENABLED` and prove that disable rejects an `OPEN` lane but succeeds without
-discarding an already-`SEALED` lifecycle, whose direct-write fence remains.
+`ENABLED`. F5b0 replaces the old effect-free `OPEN`-lane disable refusal with
+a durable `DISABLING` plan: engine and MemWAL cells prove deterministic
+node-before-edge serial convergence of `OPEN`, goal-`SEALED`, and adopted
+`OPEN_AFTER_FOLD` lanes while preserving the direct-write fence.
 The receipt-first replay cell returns the original result to the same actor
 after profile movement and rejects a different actor even though actor is
 outside the stable operation ID and request digest.
@@ -668,6 +670,20 @@ listener bind, prefix cleanup on partial start, and concurrent bounded shutdown
 after Axum settles in-flight requests; because this adds no public route it adds
 no OpenAPI or transport-parity matrix. F5a adds no format, cross-version,
 export, cluster-CLI, or row-transport matrix.
+
+F5b0 extends the same owners without a new format or public surface.
+`stream_driver.rs` and `memwal_stream.rs` pin cold resident continuation of an
+exact unblocked goal-`SEALED` occurrence, parked `DataBlock` wakeup, checked
+runtime shutdown through writer abort plus idle-owner join, and offline
+`DISABLING` convergence. The offline cells cover clean `OPEN` folding,
+deterministic `OPEN_AFTER_FOLD` adoption, adoption receipt recovery before and
+after its token effect, adopted-drain block/correction/retry, row preservation,
+and exactly-once terminal selection. Cluster in-source tests pin the exact
+observed `DISABLING` ledger revision and ensure a parked or unreadable
+continuation blocks schema and dependent query work before schema apply. The
+existing v14 lifecycle-receipt validators retain their historical meaning;
+`forbidden_apis.rs` classifies the sole `OPEN_AFTER_FOLD` constructor as a
+feature-gated test seam rather than a production lifecycle surface.
 
 F5b extends the existing fold/recovery/failpoint/export/cluster/CLI seams with
 one bounded deterministic dead-letter object, current `DEAD_LETTERED` authority,

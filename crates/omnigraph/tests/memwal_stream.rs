@@ -9,6 +9,7 @@ mod helpers;
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -48,8 +49,9 @@ use serial_test::serial;
 
 use helpers::memwal::{CurrentMemWalInventory, MemWalObjectKind};
 use helpers::stream_authority::{
-    confirm_stream_authority_retirement, disable_stream_profile, enable_stream_profile,
-    plan_stream_authority_retirement, rebind_stream_table_offline,
+    assert_offline_stream_profile_authority_available, confirm_stream_authority_retirement,
+    disable_stream_profile, enable_stream_profile, plan_stream_authority_retirement,
+    rebind_stream_table_offline, try_disable_stream_profile,
 };
 
 const STREAM_SCHEMA: &str = "node Person { score: I32 }\n";
@@ -113,6 +115,29 @@ query insert_company($score: I32) {
 const PROVIDER_FAILURE_MESSAGE: &str = "injected RFC-026 provider exhaustion";
 const PROVIDER_PUT_TIMEOUT: Duration = Duration::from_secs(45);
 const PROVIDER_FOLD_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Run one composed debug-build recovery scenario outside libtest's 2-MiB
+/// thread. The production operations are independently exercised on ordinary
+/// Tokio stacks; this helper bounds only the large future assembled by a test
+/// that chains served shutdown and a complete offline fold/disable cycle.
+fn on_big_stack<F>(body: impl FnOnce() -> F + Send + 'static)
+where
+    F: Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderFailureTarget {
     PartialGeneration,
@@ -509,9 +534,11 @@ async fn enroll_stream_at(uri: &str) {
     let cluster_uri = uri
         .strip_suffix("/graphs/knowledge.omni")
         .expect("stream test graph URI must use the checked cluster graph mapping");
-    let db = Omnigraph::init(uri, STREAM_SCHEMA)
-        .await
-        .expect("provider-failure fixture must initialize");
+    let db = Arc::new(
+        Omnigraph::init(uri, STREAM_SCHEMA)
+            .await
+            .expect("provider-failure fixture must initialize"),
+    );
     db.failpoint_enroll_stream_table_for_test(TABLE)
         .await
         .expect("provider-failure fixture must enroll its one stream table");
@@ -1136,6 +1163,402 @@ async fn raw_stream_token_head(db: &Omnigraph) -> u64 {
     Dataset::open(&token_uri).await.unwrap().version().version
 }
 
+async fn management_receipt_revisions(db: &Omnigraph, operation_kind: &str) -> Vec<(u64, u64)> {
+    let token_uri = format!("{}/_stream_tokens.lance", db.uri().trim_end_matches('/'));
+    let dataset = Dataset::open(&token_uri).await.unwrap();
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["record_tag", "record_payload_json"])
+        .unwrap();
+    let mut batches = scanner.try_into_stream().await.unwrap();
+    let mut revisions = Vec::new();
+    while let Some(batch) = batches.next().await {
+        let batch = batch.unwrap();
+        let tags = batch
+            .column_by_name("record_tag")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let payloads = batch
+            .column_by_name("record_payload_json")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            if tags.value(row) != "STREAM_MANAGEMENT_RECEIPT_V1" || payloads.is_null(row) {
+                continue;
+            }
+            let payload: serde_json::Value = serde_json::from_str(payloads.value(row)).unwrap();
+            if payload["operation_kind"] == operation_kind {
+                revisions.push((
+                    payload["from_revision"].as_u64().unwrap(),
+                    payload["to_revision"].as_u64().unwrap(),
+                ));
+            }
+        }
+    }
+    revisions.sort_unstable();
+    revisions
+}
+
+#[test]
+#[serial]
+fn checked_offline_disable_adopts_open_after_fold_and_preserves_its_row() {
+    on_big_stack(|| async {
+        let _scenario = FailScenario::setup();
+        let (dir, served) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+        let row = physical_batch(&served, &[("adopted-disable-row".to_string(), 43)]).await;
+        served
+            .failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+            .await
+            .expect("the fixture row must be durable before its maintenance drain starts");
+        let open = stream_lane(&served).await;
+        let drain_id = "b3b3b3b3-b3b3-43b3-83b3-b3b3b3b3b3b3";
+        let draining_revision = served
+            .failpoint_start_stream_open_after_fold_drain_for_test(
+                TABLE,
+                drain_id,
+                open.lifecycle_revision,
+                "operator:open-after-fold-fixture",
+            )
+            .await
+            .expect("the exact OPEN_AFTER_FOLD drain must be durable");
+        let draining = stream_lane(&served).await;
+        assert_eq!(draining.lifecycle, "DRAINING");
+        assert_eq!(draining.drain_id.as_deref(), Some(drain_id));
+        assert_eq!(draining.lifecycle_revision, draining_revision);
+        assert_eq!(draining_revision, open.lifecycle_revision + 1);
+        assert!(visible_rows(&served).await.is_empty());
+        let cluster_uri = dir.cluster_uri();
+
+        served.shutdown_stream_fold_driver().await.unwrap();
+        drop(served);
+        let offline = reopen_enrolled(&dir).await;
+        disable_stream_profile(&offline, &cluster_uri).await;
+
+        let terminal = offline.stream_status().await.unwrap();
+        assert_eq!(terminal.profile_mode, "DISABLED");
+        assert_eq!(terminal.tables[0].lifecycle, "SEALED");
+        let adoption_revision = draining_revision + 1;
+        assert_eq!(
+            management_receipt_revisions(&offline, "DISABLE_DRAIN_ADOPTION").await,
+            vec![(draining_revision, adoption_revision)],
+            "disable must select exactly one metadata-only adoption revision"
+        );
+        assert!(terminal.tables[0].lifecycle_revision > adoption_revision);
+        assert_eq!(
+            visible_rows(&offline).await,
+            vec![("adopted-disable-row".to_string(), 43)]
+        );
+        assert_no_recovery_sidecars(&dir);
+    });
+}
+
+fn assert_disable_adoption_recovery_boundary(
+    failpoint: &'static str,
+    logical_id: &'static str,
+    drain_id: &'static str,
+) {
+    on_big_stack(move || async move {
+        let _scenario = FailScenario::setup();
+        let (dir, served) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+        let row = physical_batch(&served, &[(logical_id.to_string(), 44)]).await;
+        served
+            .failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+            .await
+            .unwrap();
+        let open = stream_lane(&served).await;
+        let draining_revision = served
+            .failpoint_start_stream_open_after_fold_drain_for_test(
+                TABLE,
+                drain_id,
+                open.lifecycle_revision,
+                "operator:lost-adoption-fixture",
+            )
+            .await
+            .unwrap();
+        let cluster_uri = dir.cluster_uri();
+        served.shutdown_stream_fold_driver().await.unwrap();
+        drop(served);
+        let offline = reopen_enrolled(&dir).await;
+
+        let first_error = {
+            let _receipt_boundary = ScopedFailPoint::new(failpoint, "return");
+            try_disable_stream_profile(&offline, &cluster_uri)
+                .await
+                .expect_err("the first adoption attempt must stop at its receipt boundary")
+        };
+        assert!(
+            first_error.to_string().contains(failpoint),
+            "{first_error:?}"
+        );
+        let interrupted = offline.stream_status().await.unwrap();
+        assert_eq!(interrupted.profile_mode, "DISABLING");
+        assert_eq!(interrupted.tables[0].lifecycle, "DRAINING");
+        assert_eq!(interrupted.tables[0].lifecycle_revision, draining_revision);
+        assert_eq!(
+            helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+            1,
+            "the exact adoption receipt intent must remain armed for recovery"
+        );
+
+        try_disable_stream_profile(&offline, &cluster_uri)
+            .await
+            .expect("the same fixed disable occurrence must recover and converge");
+        let terminal = offline.stream_status().await.unwrap();
+        assert_eq!(terminal.profile_mode, "DISABLED");
+        assert_eq!(terminal.tables[0].lifecycle, "SEALED");
+        assert_eq!(
+            management_receipt_revisions(&offline, "DISABLE_DRAIN_ADOPTION").await,
+            vec![(draining_revision, draining_revision + 1)],
+            "recovery/retry must publish the deterministic adoption exactly once"
+        );
+        assert_eq!(
+            visible_rows(&offline).await,
+            vec![(logical_id.to_string(), 44)]
+        );
+        assert_no_recovery_sidecars(&dir);
+    });
+}
+
+#[test]
+#[serial]
+fn checked_offline_disable_recovers_armed_adoption_intent_and_retries_same_occurrence() {
+    assert_disable_adoption_recovery_boundary(
+        names::STREAM_LIFECYCLE_RECEIPT_POST_SIDECAR_PRE_TOKEN_COMMIT,
+        "recovered-armed-adoption-row",
+        "b4b4b4b4-b4b4-44b4-84b4-b4b4b4b4b4b4",
+    );
+}
+
+#[test]
+#[serial]
+fn checked_offline_disable_recovers_exact_adoption_token_effect_and_retries_same_occurrence() {
+    assert_disable_adoption_recovery_boundary(
+        names::STREAM_LIFECYCLE_RECEIPT_POST_TOKEN_COMMIT_PRE_CONFIRM,
+        "recovered-exact-adoption-row",
+        "b6b6b6b6-b6b6-46b6-86b6-b6b6b6b6b6b6",
+    );
+}
+
+#[test]
+#[serial]
+fn checked_offline_disable_corrects_adopted_open_after_fold_data_block_and_converges() {
+    on_big_stack(|| async {
+        let _scenario = FailScenario::setup();
+        let cluster = tempfile::tempdir().unwrap();
+        let graph = cluster.path().join("graphs/knowledge.omni");
+        let db = Arc::new(
+            Omnigraph::init(graph.to_str().unwrap(), UNIQUE_STREAM_SCHEMA)
+                .await
+                .unwrap(),
+        );
+        db.mutate(
+            "main",
+            INSERT_PERSON,
+            "insert_person",
+            &helpers::int_params(&[("$score", 7)]),
+        )
+        .await
+        .expect("seed the committed uniqueness conflict before enrollment");
+        db.failpoint_enroll_stream_table_for_test(TABLE)
+            .await
+            .unwrap();
+        let dir = EnrolledGraphDir {
+            _cluster: cluster,
+            graph,
+        };
+        let cluster_uri = dir.cluster_uri();
+        enable_stream_profile(&db, &cluster_uri).await;
+        let served = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+
+        let logical_id = "adopted-disable-blocked";
+        let duplicate = physical_batch(&served, &[(logical_id.to_string(), 7)]).await;
+        served
+            .failpoint_stream_b1_for_test(TABLE, Some(duplicate), 0)
+            .await
+            .expect("the uniqueness-conflicting row must be durably acknowledged while served");
+        let open = stream_lane(&served).await;
+        let drain_id = "b5b5b5b5-b5b5-45b5-85b5-b5b5b5b5b5b5";
+        let draining_revision = served
+            .failpoint_start_stream_open_after_fold_drain_for_test(
+                TABLE,
+                drain_id,
+                open.lifecycle_revision,
+                "operator:blocked-open-after-fold",
+            )
+            .await
+            .expect("the maintenance-style OPEN_AFTER_FOLD drain must persist");
+        served.shutdown_stream_fold_driver().await.unwrap();
+        drop(served);
+
+        let offline = reopen_enrolled(&dir).await;
+        let disable_error = try_disable_stream_profile(&offline, &cluster_uri)
+            .await
+            .expect_err("disable adoption must park on the uniqueness DataBlock");
+        let blocked = stream_lane(&offline).await;
+        let block_token = blocked
+            .strict_block_token
+            .clone()
+            .expect("the adopted drain must expose its exact DataBlock token");
+        assert_eq!(stream_data_block_token(&disable_error), block_token);
+        assert_eq!(
+            offline.stream_status().await.unwrap().profile_mode,
+            "DISABLING"
+        );
+        assert_eq!(blocked.lifecycle, "DRAINING");
+        assert_eq!(blocked.drain_id.as_deref(), Some(drain_id));
+        assert_eq!(blocked.last_fold_outcome.as_deref(), Some("STRICT_BLOCKED"));
+        assert_eq!(
+            management_receipt_revisions(&offline, "DISABLE_DRAIN_ADOPTION").await,
+            vec![(draining_revision, draining_revision + 1)],
+            "the blocked disable must already have selected exactly one adoption receipt"
+        );
+        assert_no_recovery_sidecars(&dir);
+
+        let page = offline
+            .failpoint_show_stream_data_block_for_test(TABLE, &block_token, None)
+            .await
+            .expect("offline inspection must reconstruct the adopted drain's exact block");
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].logical_key, logical_id);
+        assert_eq!(page.entries[0].violation_code, "UNIQUE_VIOLATION");
+        assert!(
+            page.entries[0]
+                .allowed_actions
+                .iter()
+                .any(|action| action == "REPLACE")
+        );
+        let correction = StreamDataCorrectionRequest {
+            protocol_version: 1,
+            block_token,
+            correction_id: "c6c6c6c6-c6c6-46c6-86c6-c6c6c6c6c6c6".to_string(),
+            expected_lifecycle_revision: blocked.lifecycle_revision,
+            actions: vec![StreamDataCorrectionAction::Replace {
+                ordinal: page.entries[0].ordinal,
+                logical_key: logical_id.to_string(),
+                current_blocked_winner_stream_token: page.entries[0]
+                    .current_blocked_winner_stream_token
+                    .clone(),
+                write_id: "d7d7d7d7-d7d7-47d7-87d7-d7d7d7d7d7d7".to_string(),
+                row: serde_json::json!({"id": logical_id, "score": 8}),
+            }],
+            expected_plan_digest: None,
+        };
+        let corrected = offline
+            .failpoint_correct_stream_data_block_for_test(
+                TABLE,
+                correction,
+                "operator:adopted-disable-correction",
+            )
+            .await
+            .expect("the exact replacement must clear the adopted drain's DataBlock");
+        assert!(corrected.changed);
+        let corrected_lane = stream_lane(&offline).await;
+        assert_eq!(corrected_lane.lifecycle, "DRAINING");
+        assert_eq!(corrected_lane.strict_block_token, None);
+        assert_eq!(corrected_lane.drain_id.as_deref(), Some(drain_id));
+        let corrected_rows = visible_rows(&offline).await;
+        assert_eq!(corrected_rows.len(), 2);
+        assert!(corrected_rows.contains(&(logical_id.to_string(), 8)));
+        assert!(
+            corrected_rows
+                .iter()
+                .any(|(id, score)| id != logical_id && *score == 7),
+            "replacement must preserve the original committed winner"
+        );
+        assert_no_recovery_sidecars(&dir);
+
+        try_disable_stream_profile(&offline, &cluster_uri)
+            .await
+            .expect("the same fixed disable occurrence must resume the corrected drain");
+        let terminal = offline.stream_status().await.unwrap();
+        assert_eq!(terminal.profile_mode, "DISABLED");
+        assert_eq!(terminal.tables[0].lifecycle, "SEALED");
+        let rows = visible_rows(&offline).await;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&(logical_id.to_string(), 8)));
+        assert!(
+            rows.iter()
+                .any(|(id, score)| id != logical_id && *score == 7),
+            "replacement must preserve the original committed winner"
+        );
+        assert_eq!(
+            management_receipt_revisions(&offline, "DISABLE_DRAIN_ADOPTION").await,
+            vec![(draining_revision, draining_revision + 1)],
+            "correction and disable retry must not duplicate the adoption receipt"
+        );
+        assert_no_recovery_sidecars(&dir);
+    });
+}
+
+#[test]
+#[serial]
+fn checked_offline_disable_drains_open_lane_and_publishes_disabled() {
+    on_big_stack(|| async {
+        let _scenario = FailScenario::setup();
+        let (dir, served) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+        let row = physical_batch(&served, &[("offline-disable-row".to_string(), 41)]).await;
+        served
+            .failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+            .await
+            .expect("the served writer must acknowledge the durable row before shutdown");
+        assert_eq!(stream_lane(&served).await.lifecycle, "OPEN");
+        let cluster_uri = dir.cluster_uri();
+
+        served
+            .shutdown_stream_fold_driver()
+            .await
+            .expect("served-runtime shutdown must retire the writer and release its idle owner");
+        drop(served);
+        let offline = reopen_enrolled(&dir).await;
+        disable_stream_profile(&offline, &cluster_uri).await;
+
+        let status = offline.stream_status().await.unwrap();
+        assert_eq!(status.profile_mode, "DISABLED");
+        assert_eq!(status.tables.len(), 1);
+        assert_eq!(status.tables[0].lifecycle, "SEALED");
+        assert_eq!(
+            visible_rows(&offline).await,
+            vec![("offline-disable-row".to_string(), 41)],
+            "offline disable must fold the retained row before terminalizing"
+        );
+        assert_no_recovery_sidecars(&dir);
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn checked_runtime_shutdown_releases_offline_authority_after_ingest() {
+    let _scenario = FailScenario::setup();
+    let (dir, served) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let row = physical_batch(&served, &[("shutdown-handoff-row".to_string(), 42)]).await;
+    served
+        .failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+        .await
+        .expect("the served writer must acknowledge the durable row before shutdown");
+    let cluster_uri = dir.cluster_uri();
+
+    served
+        .shutdown_stream_fold_driver()
+        .await
+        .expect("served-runtime shutdown must retire the writer and release its idle owner");
+    drop(served);
+    let offline = reopen_enrolled(&dir).await;
+    assert_offline_stream_profile_authority_available(&offline, &cluster_uri).await;
+    assert_eq!(
+        offline.stream_status().await.unwrap().profile_mode,
+        "ENABLED"
+    );
+    assert!(
+        visible_rows(&offline).await.is_empty(),
+        "runtime shutdown must retain acknowledged bytes only in durable WAL"
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn checked_offline_rebind_retries_effect_free_intent_and_selects_fresh_sealed_binding() {
@@ -1718,6 +2141,20 @@ async fn wait_for_visible_rows(db: &Omnigraph, expected: &[(String, i32)]) {
     .expect("resident stream fold driver did not publish the expected rows");
 }
 
+async fn wait_for_stream_lifecycle(db: &Omnigraph, expected: &str) -> StreamTableStatus {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let lane = stream_lane(db).await;
+            if lane.lifecycle == expected {
+                return lane;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("resident stream fold driver did not reach the expected lifecycle")
+}
+
 #[tokio::test]
 #[serial]
 async fn admission_rejects_empty_and_non_exact_physical_batches_without_visibility() {
@@ -1894,16 +2331,17 @@ async fn resident_driver_empty_startup_is_effect_free_and_timer_folds_once() {
         matches!(error, OmniError::StreamingAuthorityMismatch { .. }),
         "{error:?}"
     );
-    let status: serde_json::Value = serde_json::from_str(
-        &db.failpoint_stream_fold_driver_status_for_test(),
-    )
-    .unwrap();
+    let status: serde_json::Value =
+        serde_json::from_str(&db.failpoint_stream_fold_driver_status_for_test()).unwrap();
     assert_eq!(status["running"], true);
     drop(ambient);
     tokio::time::sleep(Duration::from_millis(250)).await;
     let after_empty_start = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     assert_eq!(after_empty_start.version(), manifest_before);
-    assert_eq!(after_empty_start.entry(TABLE).unwrap().table_version, table_before);
+    assert_eq!(
+        after_empty_start.entry(TABLE).unwrap().table_version,
+        table_before
+    );
 
     let batch = physical_batch(&db, &[("automatic".to_string(), 10)]).await;
     db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
@@ -1917,7 +2355,10 @@ async fn resident_driver_empty_startup_is_effect_free_and_timer_folds_once() {
     tokio::time::sleep(Duration::from_millis(1_250)).await;
     let after_retained_wal = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     assert_eq!(after_retained_wal.version(), published_manifest);
-    assert_eq!(after_retained_wal.entry(TABLE).unwrap().table_version, published_table);
+    assert_eq!(
+        after_retained_wal.entry(TABLE).unwrap().table_version,
+        published_table
+    );
     db.shutdown_stream_fold_driver()
         .await
         .expect("resident driver joins after its finite round");
@@ -1944,10 +2385,8 @@ async fn resident_driver_requires_the_exact_checked_served_runtime() {
         after.entry(TABLE).unwrap().table_version,
         before.entry(TABLE).unwrap().table_version
     );
-    let status: serde_json::Value = serde_json::from_str(
-        &db.failpoint_stream_fold_driver_status_for_test(),
-    )
-    .unwrap();
+    let status: serde_json::Value =
+        serde_json::from_str(&db.failpoint_stream_fold_driver_status_for_test()).unwrap();
     assert_eq!(status["running"], false);
     assert_eq!(status["pending_tables"], 0);
 }
@@ -1959,8 +2398,7 @@ async fn resident_driver_restart_discovers_unpublished_wal_but_not_published_ret
     let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
     let batch = physical_batch(&db, &[("cold-discovery".to_string(), 11)]).await;
     let error = {
-        let _after_watcher =
-            ScopedFailPoint::new(names::STREAM_B1_AFTER_WATCHER_SUCCESS, "return");
+        let _after_watcher = ScopedFailPoint::new(names::STREAM_B1_AFTER_WATCHER_SUCCESS, "return");
         db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
             .await
             .expect_err("fixture leaves a durable ambiguous generation unpublished")
@@ -1971,8 +2409,8 @@ async fn resident_driver_restart_discovers_unpublished_wal_but_not_published_ret
 
     let cluster_uri = dir.cluster_uri();
     let reopened = reopen_enrolled(&dir).await;
-    let reopened = helpers::stream_authority::bind_checked_stream_runtime(reopened, &cluster_uri)
-        .await;
+    let reopened =
+        helpers::stream_authority::bind_checked_stream_runtime(reopened, &cluster_uri).await;
     reopened
         .start_stream_fold_driver()
         .await
@@ -1991,8 +2429,8 @@ async fn resident_driver_restart_discovers_unpublished_wal_but_not_published_ret
     drop(reopened);
 
     let reopened = reopen_enrolled(&dir).await;
-    let reopened = helpers::stream_authority::bind_checked_stream_runtime(reopened, &cluster_uri)
-        .await;
+    let reopened =
+        helpers::stream_authority::bind_checked_stream_runtime(reopened, &cluster_uri).await;
     reopened
         .start_stream_fold_driver()
         .await
@@ -2003,7 +2441,10 @@ async fn resident_driver_restart_discovers_unpublished_wal_but_not_published_ret
         .await
         .unwrap();
     assert_eq!(unchanged.version(), published_manifest);
-    assert_eq!(unchanged.entry(TABLE).unwrap().table_version, published_table);
+    assert_eq!(
+        unchanged.entry(TABLE).unwrap().table_version,
+        published_table
+    );
     reopened.shutdown_stream_fold_driver().await.unwrap();
 }
 
@@ -3053,8 +3494,7 @@ async fn data_block_show_and_replace_unstrand_the_exact_drain() {
         .expect("the correction receipt must retain its original result after a later manifest");
     assert!(!replay_after_later_manifest.changed);
     assert_eq!(
-        replay_after_later_manifest.manifest_version,
-        corrected_version,
+        replay_after_later_manifest.manifest_version, corrected_version,
         "receipt-first replay must return the correction's manifest, not the current graph head"
     );
     assert_no_recovery_sidecars(&dir);
@@ -3188,8 +3628,28 @@ async fn data_block_withdraw_uses_a_marker_only_base_effect_and_unstrands_the_dr
     let logical_id = "withdraw-blocked";
     let drain_id = "d4d4d4d4-d4d4-44d4-84d4-d4d4d4d4d4d4";
     let actor = "operator:data-block-withdraw";
-    let (dir, db, blocked, open_revision) =
+    let (dir, db, blocked, _open_revision) =
         prepare_unique_data_block(logical_id, drain_id, actor, true).await;
+    let cluster_uri = dir.cluster_uri();
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let blocked_manifest_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    db.start_stream_fold_driver()
+        .await
+        .expect("the resident owner must park the blocked DRAINING lane");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        blocked_manifest_version,
+        "a selected DataBlock must park without manifest churn"
+    );
+    assert_eq!(stream_lane(&db).await, blocked);
     let block_token = blocked.strict_block_token.clone().unwrap();
     let page = db
         .failpoint_show_stream_data_block_for_test(TABLE, &block_token, None)
@@ -3222,18 +3682,26 @@ async fn data_block_withdraw_uses_a_marker_only_base_effect_and_unstrands_the_dr
         .expect("all-WITHDRAW must still commit an exact marker-only base transaction");
     assert!(corrected.changed);
     let lane = stream_lane(&db).await;
-    assert_eq!(lane.lifecycle, "DRAINING");
+    assert!(
+        matches!(lane.lifecycle, "DRAINING" | "SEALED"),
+        "correction may race the resident continuation but must not reopen the lane"
+    );
     assert_eq!(lane.strict_block_token, None);
     let rows = visible_rows(&db).await;
     assert_eq!(rows.len(), 2);
     assert!(
-        rows.iter().any(|(id, score)| id == logical_id && *score == 1),
+        rows.iter()
+            .any(|(id, score)| id == logical_id && *score == 1),
         "withdrawal must preserve the older visible winner for the same logical key"
     );
     assert!(
         rows.iter()
             .any(|(id, score)| id == "uniqueness-conflict" && *score == 7)
     );
+    wait_for_stream_lifecycle(&db, "SEALED").await;
+    db.shutdown_stream_fold_driver()
+        .await
+        .expect("the corrected resident drain must join cleanly");
     assert_no_recovery_sidecars(&dir);
 
     drop(db);
@@ -3244,10 +3712,6 @@ async fn data_block_withdraw_uses_a_marker_only_base_effect_and_unstrands_the_dr
         .expect("the immutable withdrawal receipt must survive cold reopen");
     assert!(!replay.changed);
     assert_eq!(replay.graph_commit_id, corrected.graph_commit_id);
-    reopened
-        .failpoint_stream_quiesce_for_test(TABLE, drain_id, open_revision, actor)
-        .await
-        .expect("withdrawal must let the original drain prove an empty cut");
     assert_eq!(stream_lane(&reopened).await.lifecycle, "SEALED");
     assert_no_recovery_sidecars(&dir);
 }
@@ -3266,13 +3730,7 @@ async fn assert_data_block_correction_recovery_boundary(
 ) {
     let actor = "operator:data-block-recovery";
     let (dir, db, blocked, open_revision) =
-        prepare_unique_data_block(
-            boundary.logical_id,
-            boundary.drain_id,
-            actor,
-            false,
-        )
-        .await;
+        prepare_unique_data_block(boundary.logical_id, boundary.drain_id, actor, false).await;
     let block_token = blocked.strict_block_token.clone().unwrap();
     let page = db
         .failpoint_show_stream_data_block_for_test(TABLE, &block_token, None)
@@ -4178,7 +4636,7 @@ async fn abort_refuses_an_unmerged_cut_before_claim_and_quiesce_can_continue() {
 #[serial]
 async fn quiesce_continues_the_same_drain_after_crashing_before_its_claim() {
     let _scenario = FailScenario::setup();
-    let (dir, db) = init_enrolled().await;
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
     let initial = stream_lane(&db).await;
     let drain_id = "94949494-9494-4494-8494-949494949494";
     let actor = "operator:pre-claim-retry";
@@ -4204,10 +4662,13 @@ async fn quiesce_continues_the_same_drain_after_crashing_before_its_claim() {
     );
     assert_no_recovery_sidecars(&dir);
 
-    db.failpoint_stream_quiesce_for_test(TABLE, drain_id, initial.lifecycle_revision, actor)
+    db.start_stream_fold_driver()
         .await
-        .expect("the exact request must continue its durable DRAINING descriptor");
-    assert_eq!(stream_lane(&db).await.lifecycle, "SEALED");
+        .expect("startup must discover and continue the durable DRAINING descriptor");
+    wait_for_stream_lifecycle(&db, "SEALED").await;
+    db.shutdown_stream_fold_driver()
+        .await
+        .expect("the continued drain must join cleanly");
     assert!(visible_rows(&db).await.is_empty());
     assert_no_recovery_sidecars(&dir);
 }
@@ -4303,13 +4764,15 @@ async fn quiesce_reuses_the_exact_flushed_cut_after_reopen() {
     assert_no_recovery_sidecars(&dir);
     drop(db);
 
+    let cluster_uri = dir.cluster_uri();
     let reopened = reopen_enrolled(&dir).await;
+    let reopened =
+        helpers::stream_authority::bind_checked_stream_runtime(reopened, &cluster_uri).await;
     reopened
-        .failpoint_stream_quiesce_for_test(TABLE, drain_id, initial.lifecycle_revision, actor)
+        .start_stream_fold_driver()
         .await
-        .expect("restart must reuse and publish the exact flushed generation");
-    let terminal = stream_lane(&reopened).await;
-    assert_eq!(terminal.lifecycle, "SEALED");
+        .expect("restart discovery must continue the exact flushed generation");
+    let terminal = wait_for_stream_lifecycle(&reopened, "SEALED").await;
     assert_eq!(
         epoch_floor(&terminal),
         epoch_floor(&failed),
@@ -4319,6 +4782,10 @@ async fn quiesce_reuses_the_exact_flushed_cut_after_reopen() {
         visible_rows(&reopened).await,
         vec![("sealed-before-fold".to_string(), 31)]
     );
+    reopened
+        .shutdown_stream_fold_driver()
+        .await
+        .expect("the cold continued drain must join cleanly");
     assert_no_recovery_sidecars(&dir);
 }
 
@@ -4526,8 +4993,8 @@ async fn whole_generation_caps_refuse_then_the_resident_driver_folds_for_retry()
         None,
         "agent:cap-retry",
     )
-        .await
-        .expect_err("the real B2 reserve path must refuse one row beyond the generation cap");
+    .await
+    .expect_err("the real B2 reserve path must refuse one row beyond the generation cap");
     assert!(matches!(error, OmniError::FoldRequired { .. }), "{error:?}");
     assert!(visible_rows(&db).await.is_empty());
 
@@ -4546,8 +5013,8 @@ async fn whole_generation_caps_refuse_then_the_resident_driver_folds_for_retry()
         None,
         "agent:cap-retry",
     )
-        .await
-        .expect("producer retry succeeds after the automatic cap fold");
+    .await
+    .expect("producer retry succeeds after the automatic cap fold");
     let mut expected = full;
     expected.push(("over".to_string(), 9_999));
     expected.sort();
@@ -7563,9 +8030,11 @@ async fn blob_bearing_table_is_rejected_before_any_stream_put() {
     let _scenario = FailScenario::setup();
     let cluster = tempfile::tempdir().unwrap();
     let graph = cluster.path().join("graphs/knowledge.omni");
-    let schema_owner = Omnigraph::init(graph.to_str().unwrap(), STREAM_SCHEMA)
-        .await
-        .unwrap();
+    let schema_owner = Arc::new(
+        Omnigraph::init(graph.to_str().unwrap(), STREAM_SCHEMA)
+            .await
+            .unwrap(),
+    );
     let stale_handle = Arc::new(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
     schema_owner
         .apply_schema(BLOB_STREAM_SCHEMA)
