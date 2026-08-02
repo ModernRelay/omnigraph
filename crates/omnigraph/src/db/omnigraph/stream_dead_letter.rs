@@ -142,6 +142,149 @@ impl PreparedStreamDeadLetterObject {
     }
 }
 
+/// Feature-gated measurements from the production dead-letter encoder and
+/// verifier. This is evidence plumbing, not a supported SDK surface or an
+/// admission contract.
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamDeadLetterEncodingCostForTest {
+    pub candidate_count: u64,
+    pub canonical_payload_bytes: u64,
+    pub encoded_bytes: u64,
+    pub encoded_capacity_bytes: u64,
+    pub candidate_view_bytes: u64,
+    pub ordinal_index_bytes: u64,
+    pub line_range_index_bytes: u64,
+    pub verified_candidate_count: u64,
+    pub encode_elapsed_micros: u128,
+    pub verify_elapsed_micros: u128,
+}
+
+/// Exercise the exact production encoder and verifier over caller-owned
+/// canonical payloads while keeping private token grammar out of integration
+/// tests. The fixed authority fields deliberately choose the larger legal
+/// predecessor/reason shapes; only payload bytes and candidate cardinality are
+/// variable.
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+pub fn failpoint_measure_stream_dead_letter_object_for_test(
+    canonical_payloads: &[Vec<u8>],
+) -> Result<StreamDeadLetterEncodingCostForTest> {
+    use std::str::FromStr as _;
+
+    const FOLD_OPERATION_ID: &str = "01K3EJ5J5Y7YWCM2DHRZ2Q5WEQ";
+    const STREAM_INCARNATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const CONTRIBUTOR_ID: &str = "agent:f6b4-dead-letter-envelope";
+
+    let logical_ids = (0..canonical_payloads.len())
+        .map(|ordinal| format!("dead-letter-envelope-{ordinal:05}"))
+        .collect::<Vec<_>>();
+    let write_ids = (0..canonical_payloads.len())
+        .map(|ordinal| {
+            format!(
+                "{ordinal:08x}-0000-4000-8000-{ordinal:012x}",
+                ordinal = u64::try_from(ordinal).unwrap_or(u64::MAX)
+            )
+        })
+        .collect::<Vec<_>>();
+    let current_token = StreamToken::from_str(&format!("sha256:{}", "a".repeat(64)))
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    let predecessor_token = StreamToken::from_str(&format!("sha256:{}", "b".repeat(64)))
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    let payload_digest = PayloadDigest::from_str(&format!("sha256:{}", "c".repeat(64)))
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    let candidates = canonical_payloads
+        .iter()
+        .enumerate()
+        .map(
+            |(ordinal, canonical_payload)| StreamDeadLetterObjectCandidate {
+                logical_id: logical_ids[ordinal].as_str(),
+                stream_incarnation_id: STREAM_INCARNATION_ID,
+                write_id: write_ids[ordinal].as_str(),
+                current_token,
+                predecessor_token: Some(predecessor_token),
+                contributor_id: CONTRIBUTOR_ID,
+                payload_digest,
+                reason_code: StreamDeadLetterReasonCode::MultipleValidationViolations,
+                canonical_payload,
+            },
+        )
+        .collect::<Vec<_>>();
+    let canonical_payload_bytes = canonical_payloads
+        .iter()
+        .try_fold(0_u64, |total, payload| {
+            total
+                .checked_add(u64::try_from(payload.len()).map_err(|_| {
+                    OmniError::manifest_internal("dead-letter test payload length exceeds u64")
+                })?)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("dead-letter test payload byte sum overflow")
+                })
+        })?;
+    let candidate_view_bytes = u64::try_from(
+        candidates
+            .capacity()
+            .saturating_mul(std::mem::size_of::<StreamDeadLetterObjectCandidate<'_>>()),
+    )
+    .map_err(|_| OmniError::manifest_internal("dead-letter candidate view bytes exceed u64"))?;
+
+    let encode_started = std::time::Instant::now();
+    let prepared = prepare_stream_dead_letter_object(FOLD_OPERATION_ID, &candidates)?;
+    let encode_elapsed_micros = encode_started.elapsed().as_micros();
+    let encoded_bytes = u64::try_from(prepared.canonical_ndjson.len())
+        .map_err(|_| OmniError::manifest_internal("dead-letter encoded bytes exceed u64"))?;
+    let encoded_capacity_bytes = u64::try_from(prepared.canonical_ndjson.capacity())
+        .map_err(|_| OmniError::manifest_internal("dead-letter encoded capacity exceeds u64"))?;
+    let ordinal_index_bytes = prepared
+        .candidate_ordinals
+        .iter()
+        .try_fold(
+            prepared
+                .candidate_ordinals
+                .capacity()
+                .saturating_mul(std::mem::size_of::<StreamDeadLetterCandidateOrdinal>()),
+            |total, ordinal| total.checked_add(ordinal.logical_id.capacity()),
+        )
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| {
+            OmniError::manifest_internal("dead-letter ordinal index bytes exceed u64")
+        })?;
+    let line_range_index_bytes = u64::try_from(
+        prepared
+            .canonical_line_ranges
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Range<usize>>()),
+    )
+    .map_err(|_| OmniError::manifest_internal("dead-letter line-range bytes exceed u64"))?;
+
+    let verify_started = std::time::Instant::now();
+    let verified =
+        verify_stream_dead_letter_object(prepared.descriptor(), prepared.canonical_ndjson())?;
+    let verify_elapsed_micros = verify_started.elapsed().as_micros();
+    let verified_candidate_count = u64::try_from(verified.len()).map_err(|_| {
+        OmniError::manifest_internal("dead-letter verified candidate count exceeds u64")
+    })?;
+    if verified_candidate_count != prepared.descriptor.candidate_count {
+        return Err(OmniError::manifest_internal(
+            "dead-letter verification returned the wrong candidate count",
+        ));
+    }
+
+    Ok(StreamDeadLetterEncodingCostForTest {
+        candidate_count: prepared.descriptor.candidate_count,
+        canonical_payload_bytes,
+        encoded_bytes,
+        encoded_capacity_bytes,
+        candidate_view_bytes,
+        ordinal_index_bytes,
+        line_range_index_bytes,
+        verified_candidate_count,
+        encode_elapsed_micros,
+        verify_elapsed_micros,
+    })
+}
+
 /// Result of the sole conditional-create operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamDeadLetterCreateOutcome {
@@ -150,7 +293,12 @@ pub(crate) enum StreamDeadLetterCreateOutcome {
 }
 
 /// Owned, validated line returned to bounded offline payload export.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+///
+/// The payload remains raw canonical JSON. Decoding an object-sized nested
+/// array into `serde_json::Value` here would let a legal 64-MiB object expand
+/// into millions of heap nodes during ordinary verification. Offline export
+/// preserves the same validated raw value while serializing its bounded page.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DecodedStreamDeadLetterObjectEntry {
     pub(crate) protocol_version: u32,
@@ -164,7 +312,7 @@ pub(crate) struct DecodedStreamDeadLetterObjectEntry {
     pub(crate) contributor_id: String,
     pub(crate) payload_digest: PayloadDigest,
     pub(crate) reason_code: StreamDeadLetterReasonCode,
-    pub(crate) payload: serde_json::Value,
+    pub(crate) payload: Box<serde_json::value::RawValue>,
 }
 
 /// Deterministically order, encode, and describe one fold's losing candidates.
@@ -532,6 +680,11 @@ pub(crate) fn decode_stream_dead_letter_canonical_line<'a>(
     }
     let canonical_payload = &bytes[prefix.bytes.len()..payload_end];
     validate_canonical_payload(canonical_payload)?;
+    if entry.payload.get().as_bytes() != canonical_payload {
+        return Err(OmniError::manifest_internal(
+            "decoded dead-letter payload differs from its canonical line slice",
+        ));
+    }
     Ok((entry, canonical_payload))
 }
 
@@ -587,7 +740,8 @@ fn validate_decoded_entry(
             "decoded dead-letter contributor id must be non-empty",
         ));
     }
-    if !entry.payload.is_object() {
+    let payload = entry.payload.get().as_bytes();
+    if payload.first() != Some(&b'{') || payload.last() != Some(&b'}') {
         return Err(OmniError::manifest_internal(
             "decoded dead-letter payload must be a JSON object",
         ));
@@ -666,7 +820,15 @@ fn write_json<T: serde::Serialize + ?Sized>(
 }
 
 fn write_bytes(writer: &mut BoundedNdjsonWriter, bytes: &[u8]) -> Result<()> {
-    writer.write_all(bytes).map_err(|_| bounded_writer_error())
+    writer.write_all(bytes).map_err(|error| {
+        if writer.exceeded {
+            bounded_writer_error()
+        } else {
+            OmniError::manifest_internal(format!(
+                "failed to encode canonical dead-letter NDJSON: {error}"
+            ))
+        }
+    })
 }
 
 fn bounded_writer_error() -> OmniError {
@@ -759,6 +921,20 @@ impl BoundedNdjsonWriter {
             exceeded: false,
         }
     }
+
+    fn reserve_for(&mut self, attempted: usize) -> std::io::Result<()> {
+        if attempted <= self.bytes.capacity() {
+            return Ok(());
+        }
+        let doubled = self.bytes.capacity().max(1).saturating_mul(2);
+        let target = attempted.max(doubled.min(self.limit));
+        let additional = target.saturating_sub(self.bytes.len());
+        self.bytes.try_reserve_exact(additional).map_err(|error| {
+            std::io::Error::other(format!(
+                "canonical dead-letter NDJSON allocation failed within its configured byte cap: {error}"
+            ))
+        })
+    }
 }
 
 impl std::io::Write for BoundedNdjsonWriter {
@@ -770,6 +946,7 @@ impl std::io::Write for BoundedNdjsonWriter {
                 "canonical dead-letter NDJSON exceeds its configured byte cap",
             ));
         }
+        self.reserve_for(self.attempted)?;
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -914,15 +1091,24 @@ mod tests {
             vec![("a", 0), ("b", 1)]
         );
         assert_eq!(
-            decoded[0].payload,
+            serde_json::from_str::<serde_json::Value>(decoded[0].payload.get()).unwrap(),
             serde_json::json!({"id": "a", "score": 1})
         );
     }
 
     #[test]
     fn bounded_writer_accepts_one_under_and_exact_then_refuses_one_over() {
-        let payload = br#"{"id":"a","score":1}"#;
-        let candidate = candidate("a", WRITE_A, token('a'), payload_digest('b'), payload);
+        let payload = br#"{"id":"a\"\\\u0000","text":"quote:\" slash:\\ nul:\u0000"}"#;
+        let mut candidate = candidate(
+            "adversarial-\"-\\-id",
+            WRITE_A,
+            token('a'),
+            payload_digest('b'),
+            payload,
+        );
+        candidate.predecessor_token = Some(token('c'));
+        candidate.contributor_id = "agent:f6b4-\"-\\-envelope";
+        candidate.reason_code = StreamDeadLetterReasonCode::MultipleValidationViolations;
         let measured = prepare_stream_dead_letter_object_with_limit(
             FOLD_OPERATION_ID,
             &[candidate],
@@ -951,6 +1137,35 @@ mod tests {
                 && limit == exact - 1
                 && actual > limit
         ));
+
+        let verified =
+            verify_stream_dead_letter_object(measured.descriptor(), measured.canonical_ndjson())
+                .expect("the adversarial exact spelling must remain decodable and canonical");
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].logical_id, "adversarial-\"-\\-id");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(verified[0].payload.get()).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(payload).unwrap()
+        );
+    }
+
+    #[test]
+    fn verifier_retains_nested_payload_as_raw_canonical_json() {
+        let payload = format!("{{\"flags\":[{}]}}", vec!["true"; 16_384].join(","));
+        let candidate = candidate(
+            "nested",
+            WRITE_A,
+            token('a'),
+            payload_digest('b'),
+            payload.as_bytes(),
+        );
+        let prepared = prepare_stream_dead_letter_object(FOLD_OPERATION_ID, &[candidate]).unwrap();
+        let verified =
+            verify_stream_dead_letter_object(prepared.descriptor(), prepared.canonical_ndjson())
+                .unwrap();
+
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].payload.get(), payload);
     }
 
     #[tokio::test]

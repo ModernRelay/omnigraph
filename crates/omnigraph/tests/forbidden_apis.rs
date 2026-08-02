@@ -1194,21 +1194,26 @@ fn cfg_requires_test(attributes: &[Attribute]) -> bool {
 
 fn cfg_has_exact_feature(attributes: &[Attribute], expected: &str) -> bool {
     attributes.iter().any(|attribute| {
-        if !attribute.path().is_ident("cfg") {
+        let Meta::List(cfg) = &attribute.meta else {
+            return false;
+        };
+        if !cfg.path.is_ident("cfg") {
             return false;
         }
-        let mut matched = false;
-        attribute
-            .parse_nested_meta(|meta| {
-                if meta.path.is_ident("feature") {
-                    let value = meta.value()?;
-                    let feature: syn::LitStr = value.parse()?;
-                    matched |= feature.value() == expected;
-                }
-                Ok(())
-            })
-            .unwrap_or_else(|error| panic!("failed to parse cfg attribute: {error}"));
-        matched
+        let predicates = nested_meta(cfg);
+        matches!(
+            predicates.as_slice(),
+            [Meta::NameValue(feature)]
+                if feature.path.is_ident("feature")
+                    && matches!(
+                        &feature.value,
+                        syn::Expr::Lit(expression)
+                            if matches!(
+                                &expression.lit,
+                                syn::Lit::Str(value) if value.value() == expected
+                            )
+                    )
+        )
     })
 }
 
@@ -2380,6 +2385,99 @@ fn stream_driver_runtime_status_remains_advisory_and_failpoints_only() {
         bridge_count, 1,
         "exactly one failpoints-only JSON bridge may expose process-local driver status"
     );
+}
+
+#[test]
+fn stream_dead_letter_cost_seam_remains_hidden_and_failpoints_only() {
+    let path = engine_src_root().join("db/omnigraph/stream_dead_letter.rs");
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let ast = parse_rust_source(&contents, "db/omnigraph/stream_dead_letter.rs");
+    let mut measurement_types = 0;
+    let mut measurement_functions = 0;
+
+    for item in &ast.items {
+        let (name, visibility, attributes, is_function) = match item {
+            Item::Struct(item) if item.ident == "StreamDeadLetterEncodingCostForTest" => (
+                item.ident.to_string(),
+                &item.vis,
+                item.attrs.as_slice(),
+                false,
+            ),
+            Item::Fn(item)
+                if item.sig.ident == "failpoint_measure_stream_dead_letter_object_for_test" =>
+            {
+                (
+                    item.sig.ident.to_string(),
+                    &item.vis,
+                    item.attrs.as_slice(),
+                    true,
+                )
+            }
+            _ => continue,
+        };
+        assert!(
+            matches!(visibility, Visibility::Public(_)),
+            "the integration cost owner needs the explicit public test seam '{name}'"
+        );
+        assert!(
+            cfg_has_exact_feature(attributes, "failpoints"),
+            "dead-letter cost seam '{name}' must compile only with failpoints"
+        );
+        assert!(
+            has_doc_hidden(attributes),
+            "dead-letter cost seam '{name}' must stay out of generated SDK docs"
+        );
+        if is_function {
+            measurement_functions += 1;
+        } else {
+            measurement_types += 1;
+        }
+    }
+
+    assert_eq!(measurement_types, 1, "the F6b4 seam owns one result type");
+    assert_eq!(
+        measurement_functions, 1,
+        "the F6b4 seam owns one measurement function"
+    );
+
+    for relative in ["db/omnigraph.rs", "db/mod.rs"] {
+        let path = engine_src_root().join(relative);
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let ast = parse_rust_source(&contents, relative);
+        for expected in [
+            "StreamDeadLetterEncodingCostForTest",
+            "failpoint_measure_stream_dead_letter_object_for_test",
+        ] {
+            let exports = ast
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Use(item)
+                        if matches!(item.vis, Visibility::Public(_))
+                            && use_tree_contains_identifier(&item.tree, expected) =>
+                    {
+                        Some(item)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                exports.len(),
+                1,
+                "{relative} must own exactly one public reexport of '{expected}'"
+            );
+            assert!(
+                cfg_has_exact_feature(&exports[0].attrs, "failpoints"),
+                "{relative} reexport '{expected}' must use exactly cfg(feature = \"failpoints\")"
+            );
+            assert!(
+                has_doc_hidden(&exports[0].attrs),
+                "{relative} reexport '{expected}' must stay out of generated SDK docs"
+            );
+        }
+    }
 }
 
 fn low_level_async_surfaces(src: &Path, owner: &str) -> BTreeSet<(String, String, String)> {

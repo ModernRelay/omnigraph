@@ -981,8 +981,10 @@ fn dead_letter_list_payload_retirement_and_export_form_one_operational_exit() {
         assert_eq!(payloads.entries.len(), 1);
         assert!(payloads.next_cursor.is_none());
         assert_eq!(payloads.entries[0].authority, list.entries[0]);
-        assert_eq!(payloads.entries[0].payload["id"], logical_id);
-        assert_eq!(payloads.entries[0].payload["score"], 7);
+        let payload: serde_json::Value =
+            serde_json::from_str(payloads.entries[0].payload.get()).unwrap();
+        assert_eq!(payload["id"], logical_id);
+        assert_eq!(payload["score"], 7);
 
         let plan = plan_stream_authority_retirement(&offline, &cluster_uri).await;
         assert_eq!(plan.withdrawn_token_count, 0);
@@ -3503,8 +3505,10 @@ async fn f6a_inspect_terminal_candidate(fixture: &F6aCandidateRuntimeFixture) ->
     assert_eq!(exported.entries.len(), 1);
     assert!(exported.next_cursor.is_none());
     assert_eq!(exported.entries[0].authority, list.entries[0]);
-    assert_eq!(exported.entries[0].payload["id"], "loser");
-    assert_eq!(exported.entries[0].payload["score"], 7);
+    let payload: serde_json::Value =
+        serde_json::from_str(exported.entries[0].payload.get()).unwrap();
+    assert_eq!(payload["id"], "loser");
+    assert_eq!(payload["score"], 7);
     assert_no_recovery_sidecars(&fixture.dir);
     occurrence_token
 }
@@ -4892,6 +4896,20 @@ async fn quiesce_persists_a_stable_data_block_when_dead_letter_object_overflows(
         .await
         .expect("base-dependent uniqueness remains fold-time work");
     let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let raw_base_head_before = raw_table_head(&db, TABLE).await;
+    let (_, current_token_before) = db
+        .failpoint_stream_token_lookup_for_cost_test(TABLE, "drain-blocked")
+        .await
+        .expect("the overflow fixture token lookup must succeed");
+    assert!(
+        current_token_before.is_none(),
+        "an admitted but unfolded occurrence must not yet be selected as current authority"
+    );
+    let dead_letter_objects_before = dead_letter_object_names(&dir);
+    assert!(
+        dead_letter_objects_before.is_empty(),
+        "the overflow fixture must begin without dead-letter object residue"
+    );
     let before_lane = stream_lane(&db).await;
     let drain_id = "96969696-9696-4696-8696-969696969696";
     let actor = "operator:strict-data-block";
@@ -4929,6 +4947,32 @@ async fn quiesce_persists_a_stable_data_block_when_dead_letter_object_overflows(
     let visible = visible_rows(&db).await;
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].1, 7);
+    assert_eq!(
+        raw_table_head(&db, TABLE).await,
+        raw_base_head_before,
+        "overflow must become a DataBlock before a raw base-table effect"
+    );
+    let (_, current_token_after) = db
+        .failpoint_stream_token_lookup_for_cost_test(TABLE, "drain-blocked")
+        .await
+        .expect("the selected DataBlock token lookup must succeed");
+    assert_eq!(
+        current_token_after, current_token_before,
+        "DataBlock evidence must not select any current-token authority"
+    );
+    assert_eq!(
+        dead_letter_object_names(&dir),
+        dead_letter_objects_before,
+        "overflow must become a DataBlock before canonical-object creation"
+    );
+    let selected_dead_letters =
+        helpers::stream_authority::list_stream_dead_letters(&db, &dir.cluster_uri(), None)
+            .await
+            .expect("the blocked selected token cut must remain inspectable");
+    assert!(
+        selected_dead_letters.entries.is_empty(),
+        "DataBlock evidence must not publish DEAD_LETTERED current-token authority"
+    );
     assert_no_recovery_sidecars(&dir);
 
     let blocked_version = after.version();
@@ -8448,6 +8492,10 @@ async fn all_diverted_dead_letter_advances_marker_and_accepts_an_ordinary_succes
     let cluster_uri = format!("file://{}", cluster.path().display());
     enable_stream_profile(&db, &cluster_uri).await;
     let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let dir = EnrolledGraphDir {
+        _cluster: cluster,
+        graph,
+    };
     let incarnation = db
         .failpoint_stream_incarnation_for_test(TABLE)
         .await
@@ -8468,6 +8516,10 @@ async fn all_diverted_dead_letter_advances_marker_and_accepts_an_ordinary_succes
     .expect("base-dependent uniqueness is fold-time work");
     assert!(!already_durable);
     let snapshot_before_fold = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert!(
+        dead_letter_object_names(&dir).is_empty(),
+        "the all-diverted fixture must begin without dead-letter object residue"
+    );
     db.failpoint_stream_b1_for_test(TABLE, None, 0)
         .await
         .expect("the losing occurrence must publish terminal authority");
@@ -8487,9 +8539,7 @@ async fn all_diverted_dead_letter_advances_marker_and_accepts_an_ordinary_succes
     assert_eq!(visible[0].1, 7);
     assert_ne!(visible[0].0, logical_id);
 
-    let object_dir = cluster
-        .path()
-        .join("graphs/knowledge.omni/__dead_letter/v1");
+    let object_dir = dir.path().join("__dead_letter/v1");
     let object_count = std::fs::read_dir(&object_dir)
         .expect("dead-letter fold must create its canonical object directory")
         .count();
@@ -8617,10 +8667,7 @@ async fn all_diverted_dead_letter_advances_marker_and_accepts_an_ordinary_succes
         object_count + 1,
         "one mixed generation creates exactly one additional fold-owned object"
     );
-    assert_no_recovery_sidecars(&EnrolledGraphDir {
-        _cluster: cluster,
-        graph,
-    });
+    assert_no_recovery_sidecars(&dir);
 }
 
 #[tokio::test]

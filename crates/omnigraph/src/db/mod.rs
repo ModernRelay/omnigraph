@@ -32,6 +32,11 @@ pub(crate) use omnigraph::{
     StreamAuthorityRetirementExportMember, retirement_export_cut_digest,
     retirement_live_branch_heads_digest,
 };
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+pub use omnigraph::{
+    StreamDeadLetterEncodingCostForTest, failpoint_measure_stream_dead_letter_object_for_test,
+};
 
 use crate::error::{OmniError, Result};
 

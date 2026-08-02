@@ -31,8 +31,11 @@ combined maintenance, fresh-target import, and legacy writer refusal.
 F6b3 implements the exact-selected uncovered-token-tail cost harness locally
 and as ignored local/configured-RustFS decision sweeps. Covered/reconciled
 evidence, the status warning and scheduling threshold, bounded public export
-transport, and the rest of the guardrail matrix remain later; F7 remains
-forbidden until all of F6 passes.
+transport, and the rest of the guardrail matrix remain later. F6b4 closes the
+isolated production-size dead-letter encoding/materialization and peak-RSS
+evidence without changing format, recovery, or a production route. Its narrow
+stopped/offline Rust payload DTO source shape changes as recorded in §7; F7
+remains forbidden until all of F6 passes.
 **Design authority:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) — this
 file never overrides it. Where they disagree, the RFC wins and this file is
 wrong. §4.7 records the selected experimental profile; §4.3/§4.6 record the
@@ -248,7 +251,8 @@ provides only the checked terminal served-export capability and hidden
 immutable cut described in §7. F6b3 now owns exact-selected uncovered-tail
 current-token hit/miss and terminal-page measurement; covered/reconciled
 evidence, transport, status, and remaining guardrail acceptance stay in
-F6b/F7.
+F6b/F7. F6b4 now owns the production-size dead-letter byte/capacity/timing and
+isolated peak-RSS acceptance described below.
 
 ---
 
@@ -275,7 +279,8 @@ F6b/F7.
 | ~~F6b1 checked immutable export cut~~ | Exact-terminal served-export authority, ambient-enrolled refusal, one nonwaiting root slot, and a move-only exact-version cut that releases writer gates before output | no format or recovery change | implemented behind a doc-hidden engine seam; no public transport |
 | ~~F6b2 process/lifecycle acceptance~~ | SIGTERM/shared shutdown, sequential OS-process recovery, frozen-round node/edge fairness, rebind/re-enable/reopen/resume, combined maintenance, fresh-target import, and legacy writer refusal | no format or recovery change | implemented; no public route or status |
 | ~~F6b3 selected-token uncovered-tail evidence~~ | Exact manifest-selected coverage diagnostics; fixed-cardinality fresh-handle hit/miss and first terminal-page plus warm hit/miss and repeat terminal-page cost across increasing receipt history; fast local plus ignored local/RustFS sweeps | no format or recovery change | implemented behind doc-hidden failpoints-only read seams; no reconciler or status |
-| **F6b remainder** | Covered/reconciled token curve and threshold, isolated dead-letter encoding/materialization byte and peak-RSS cap evidence, bounded export transport ownership, public status, and the remaining guardrail matrix | — | later |
+| ~~F6b4 dead-letter envelope evidence~~ | Exact production 8,192-candidate one-under/exact/one-over encoding, cap-aware retained capacity, encode/verify timing, paired isolated peak RSS, and real overflow/no-partial-fold assertions | no format or recovery change | implemented behind failpoints-only cost/test seams; 192-MiB remeasurement tripwire, not admission or an SLO |
+| **F6b remainder** | Covered/reconciled token curve and threshold, bounded export transport ownership, public status, and the remaining guardrail matrix | — | later |
 | **F7** | Served SDK / HTTP / remote CLI / OpenAPI activation | — | only after all F6 cells pass |
 
 These are dependency milestones, not mandates for giant PRs. Keep each PR
@@ -1764,7 +1769,7 @@ Fold-time outcomes remain split by semantics:
 
 | Class | Examples | Disposition |
 |---|---|---|
-| **Dead-letter envelope overflow** | canonical terminal payload is above the selected one-object byte envelope after valid conflict evidence exists | Install a durable strict `DataBlock` before object or Lance effects; publish no partial fold |
+| **Dead-letter envelope overflow** | canonical terminal payload is above the selected one-object byte envelope after valid conflict evidence exists | Install a durable strict `DataBlock` before canonical-object creation, base-table effect, or current-token terminal-disposition transition; permit the manifest/token-ledger movement needed to persist the block; publish no partial fold |
 | **Other structural fault** | corrupt/missing authenticated cut, schema or token-authority contradiction, malformed validation evidence | Fail loudly with no partial fold; the driver reports/retries according to the typed failure. `DataBlock` v1 cannot authenticate this evidence, and durable parking waits for a future `AuthorityBlock` strand |
 | **Data conflict** | uniqueness, RI, cardinality, keyed row validation | Divert one terminal LWW candidate per losing key, apply independent winners, and keep the lane progressing |
 
@@ -1782,10 +1787,13 @@ are not separately exported or replayed.
 
 2. **One bounded object per fold.** The driver deterministically orders the
    terminal candidates and canonically encodes one NDJSON object under the
-   reserved graph-relative prefix. The implementation pins an encoded-byte
-   envelope; F6b owns representative peak-RSS measurement. Exceeding it installs
-   `DataBlock` before any object or Lance effect. There is no chunked fallback,
-   chunk manifest, multipart protocol, or object-sized uncharged buffer.
+   reserved graph-relative prefix. The implementation pins a 67,108,864-byte
+   encoded envelope. F6b4's production-size local evidence pins exact retained
+   encoded capacity, encode/verify time, and isolated peak-RSS lift; exceeding
+   the byte envelope installs `DataBlock` before any canonical object,
+   base-table effect, or current-token terminal-disposition transition. There is
+   no chunked fallback, chunk manifest,
+   multipart protocol, or object-sized uncharged buffer.
 
 3. **Recovery owns the object before PUT.** The F5 sidecar binds the
    authenticated generation cut, canonical candidate descriptors, versioned
@@ -1868,9 +1876,9 @@ fairness matrix, long-history token lookup, RSS/latency/object measurements,
 or maintenance/rebind/resume composition. F6b2 later closes the named process,
 fairness, and maintenance/rebind/resume cells; F6b3 closes the exact-selected
 uncovered-tail current-token instrument. Covered/reconciled token cost and its
-threshold, isolated dead-letter encoding/materialization byte and peak-RSS cap
-evidence, transport/status, and the remaining guardrails still keep F6 open and
-F7 forbidden.
+threshold, transport/status, and the remaining guardrails still keep F6 open
+and F7 forbidden. F6b4 separately closes the isolated dead-letter envelope
+evidence.
 
 ### Implemented F6b1 checked immutable export-cut subset
 
@@ -1943,9 +1951,8 @@ Productive SchemaApply is deliberately absent: an
 enrolled graph's schema changes only through checked sealed/retired export,
 fresh graph initialization with the desired schema, and ordinary load there.
 Physical rebind preserves accepted schema. Covered/reconciled token evidence,
-isolated dead-letter encoding/materialization byte and peak-RSS cap evidence,
 bounded public export transport, and served/public parity remain later F6b/F7
-work.
+work. F6b4 separately closes the isolated dead-letter envelope evidence.
 
 ### Implemented F6b3 exact-selected uncovered-tail evidence subset
 
@@ -1980,6 +1987,46 @@ Calling raw `optimize_indices` would move an unselected physical HEAD and would
 not prove production behavior. Covered/reconciled curves, count/oldest-age and
 lookup-cost status, the measured scheduling threshold, and the reconciler stay
 open.
+
+### Implemented F6b4 dead-letter envelope evidence subset
+
+F6b4 extends the existing codec, `memwal_stream.rs`, and
+`memwal_stream_cost.rs` owners; it adds one source-guarded, doc-hidden,
+failpoints-only measurement seam, no production route, and no CI job. The small
+codec regression keeps the inclusive one-under/exact/one-over writer contract.
+The ignored production-size cell uses 8,192 adversarial candidates and the real
+canonical-payload encoder/verifier. On the 2026-08-02 local macOS reference run,
+10,364,432 source-value bytes became 62,301,270 canonical-payload input bytes
+and exactly 67,108,864 encoded object bytes. The cap-aware writer retained
+exactly 67,108,864 bytes of encoded capacity; before the fix the same shape was
+observed retaining 132,644,864 bytes. Encoding took 286,280 microseconds and
+verification took 2,254,424 microseconds. Verification and stopped/offline
+payload export retain canonical payloads as bounded raw JSON, so a legal nested
+list cannot expand the object into millions of `serde_json::Value` nodes. The
+JSON value/schema is unchanged, but the Rust DTO field is now
+`Box<serde_json::value::RawValue>` and serialized object-member order may
+preserve the canonical payload rather than the old `Value` reserialization
+order.
+
+The isolated paired subprocess recorded an 85,557,248-byte baseline peak RSS
+and 231,849,984 bytes for the exact-cap encoder/verifier, a 146,292,736-byte
+lift. `201,326,592` bytes (192 MiB) is a one-sided remeasurement tripwire for
+this implementation shape. These local measurements are evidence, not
+allocator admission, a storage quota, or a latency/RSS SLO.
+
+The one-over production shape is a typed encoded-byte refusal. The real fold
+integration proves it publishes durable operational `DataBlock` evidence
+before any canonical object, base-table effect, or current-token terminal-
+disposition transition. Persisting the block may advance manifest and token-
+ledger state; no recovery sidecar or partial fold remains. The existing
+all-diverted success path creates one object and retains marker-only base
+advancement semantics.
+
+Run the production-size instrument explicitly:
+
+```bash
+cargo test -p omnigraph-engine --features failpoints --test memwal_stream_cost f6b4_dead_letter_object_records_production_envelope_and_peak_rss -- --ignored --exact --nocapture
+```
 
 ### 7.1 Operational guardrails
 
@@ -2176,9 +2223,12 @@ public ingress activates; `AuthorityBlock` repair remains separate.
   that token, and an older predecessor cannot resurrect or bypass the key.
   Race the successor with another table's fold and prove the graph-global token
   pointer serializes both effects without a special replay queue.
-- Dead-letter publication tests pin the measured single-object byte/RSS cap.
-  One-below/exact/one-over expansion proves over-limit `DataBlock` occurs
-  before object/Lance effect. Crash before/after sidecar, conditional PUT,
+- F6b4 dead-letter publication tests pin the measured single-object byte/RSS
+  envelope. One-below/exact/one-over expansion proves over-limit `DataBlock`
+  occurs before canonical-object, base-table, or current-token terminal-
+  disposition transition while permitting the operational manifest/token-
+  ledger movement needed to persist the block.
+  Crash before/after sidecar, conditional PUT,
   exact existing-object verification, optional base effect, token effect, and
   manifest CAS. Digest/length mismatch fails closed; unselected objects remain
   inert. Mixed and 8,192-key all-diverted folds prove no intermediate token
@@ -2198,7 +2248,11 @@ The fold matrix includes a near-cap generation whose strings maximize JSON
 escaping and repeated field-name/null expansion, plus a store stalled during
 upload and verification. It measures canonical encoded bytes and peak RSS,
 pins the single-object envelope, and proves admission above that envelope
-blocks before durable effect.
+blocks before canonical-object, base-table, or current-token terminal-
+disposition transition. F6b4 closes the isolated production-size
+encoder/verifier term with the 2026-08-02 local macOS
+146,292,736-byte peak-RSS lift and 192-MiB remeasurement tripwire; broader
+sustained throughput, store, and transport measurements remain open.
 
 Keep CI sustainable:
 
@@ -2461,7 +2515,7 @@ lands a production writer or claims an SLO before F6.
 | Lifecycle format | Internal v12/lifecycle-v3 + recovery-v14 activates hidden enrollment, claim, ordinary/drain fold, and terminal lifecycle receipt with fixed-size ledger-chain/current authority. Dormant v14 scaffold meanings are immutable: F3 uses them only if exact, otherwise takes a new pre-release strand. F5a and F5b0 change no format; F5b requires a new terminal-authority/object strand. The release gate records the final strand count |
 | Maintenance | Explicit lifecycle-aware integration per writer; no generic `SEALED` bypass |
 | Public ordering | Hidden F4/F5a/F5b0 → format-bearing F5b → acceptance F6a → measurements/full matrix F6b → atomic served/remote activation F7 |
-| Dead letter | One terminal LWW candidate per losing key; one deterministic, conditionally created NDJSON object under a measured byte/RSS cap; one current `DEAD_LETTERED` token per losing key; ordinary-ingest correction; pre-effect `DataBlock` on expansion |
+| Dead letter | One terminal LWW candidate per losing key; one deterministic, conditionally created NDJSON object under a measured 64-MiB encoded envelope and a 192-MiB isolated remeasurement tripwire; one current `DEAD_LETTERED` token per losing key; ordinary-ingest correction; `DataBlock` before canonical-object/base-table/current-token terminal-disposition transition on expansion |
 | Process topology | One externally enforced writer process; profile apply requires stop → cluster-state-locked offline owner → restart; physical rebind additionally requires terminal `DISABLED` before its checked offline authority, with no claim that process-local locks detect foreign processes. Productive SchemaApply has no in-place EXP authority and uses checked export/rebuild into a fresh graph |
 | Capability placement | `omnigraph-storage` plus `omnigraph-control-authority` resolve the engine/storage/cluster-lock dependency without a cycle; opaque stopped/offline and runtime guards preserve one storage path and expose no forgeable mint |
 | Public topology | Under `ENABLED`, Mutation/Load/delete require the exact checked served runtime; under `DISABLING`, they are closed. BranchMerge is closed under both modes even with that runtime. Ambient SDK/direct CLI and Cedar-only lanes refuse before effect |

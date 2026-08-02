@@ -155,11 +155,19 @@ pub struct StreamDeadLetterPage {
 }
 
 /// Descriptor-verified payload for one current DEAD_LETTERED key.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamDeadLetterPayloadEntry {
     pub authority: StreamDeadLetterEntry,
-    pub payload: serde_json::Value,
+    /// Descriptor-verified canonical JSON kept raw so nested legal payloads
+    /// cannot expand into an unbounded tree of `serde_json::Value` nodes.
+    pub payload: Box<serde_json::value::RawValue>,
+}
+
+impl PartialEq for StreamDeadLetterPayloadEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.authority == other.authority && self.payload.get() == other.payload.get()
+    }
 }
 
 /// One bounded payload-export page from the exact manifest/token cut.

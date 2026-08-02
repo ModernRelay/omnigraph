@@ -29,7 +29,12 @@ frozen-round node/edge fairness, physical rebind → re-enable → reopen → re
 combined maintenance, fresh-target import, and legacy writer refusal.
 F6b3 implements exact-selected uncovered-token-tail cost evidence behind
 failpoints-only read seams, with a fast local cell and ignored local/RustFS
-decision sweeps. It adds no reconciler, status, or transport.
+decision sweeps. It adds no reconciler, status, or transport. F6b4 implements
+the isolated production-size dead-letter byte/capacity/timing and peak-RSS
+evidence behind one new source-guarded, doc-hidden failpoints-only measurement
+seam. It changes no format, recovery, or production route; its stopped/offline
+Rust payload DTO now retains raw JSON instead of a `serde_json::Value`, a
+source-shape change described below.
 Public row streaming, public enrollment, general lifecycle/rebind verbs,
 `AuthorityBlock` repair,
 exclusive-cut physical/public driver status, the F6b-remainder guardrail
@@ -215,9 +220,9 @@ prefix listing or second inventory. Recovery-v21 also extends irreversible
 retirement to exact `WITHDRAWN | DEAD_LETTERED` cuts; recovery-v19 and
 recovery-v20 retain their historical meanings. This activates no HTTP, SDK,
 remote CLI, or OpenAPI row surface. F6b3 now owns the exact-selected uncovered-
-tail current-token hit/miss and terminal-page harness; covered/reconciled token
-evidence, isolated dead-letter encoding/materialization byte and peak-RSS cap
-evidence, and the complete guardrail matrix remain.
+tail current-token hit/miss and terminal-page harness, and F6b4 owns isolated
+production-size dead-letter encoding/materialization and peak-RSS evidence.
+Covered/reconciled token evidence and the complete guardrail matrix remain.
 **F6a in-process acceptance slice implemented:** 2026-08-02 — a typed
 failpoints-only snapshot exposes process-local driver run state, pending
 trigger/backoff scheduling, and last completion/error evidence as explicitly
@@ -231,9 +236,8 @@ manifest-only. This slice adds no format/recovery or public API/SDK/HTTP/CLI/
 OpenAPI contract and does not complete F6. Later F6b2 closes the named process,
 fairness, and maintenance/rebind/resume cells, and F6b3 closes the uncovered-
 tail current-token hit/miss and terminal-page instrument. The remaining
-covered/reconciled token curve, isolated dead-letter encoding/materialization
-byte and peak-RSS cap evidence, transport, status, and guardrails keep F7
-forbidden.
+covered/reconciled token curve, transport, status, and guardrails keep F7
+forbidden; F6b4 separately closes the isolated dead-letter envelope evidence.
 **F6b1 checked immutable export-cut slice implemented:** 2026-08-02 — an exact
 managed `DISABLED | RETIRED` applied row, or exact graph/state evidence which
 the engine accepts only for unmanaged `RETIRED` or enrolled `DISABLED`, can
@@ -284,9 +288,8 @@ sequential sole-writer evidence, not a distributed fence.
 Productive SchemaApply stays refused on enrolled graphs: EXP schema evolution
 is checked sealed/retired export followed by fresh init/load, while physical
 rebind keeps accepted schema unchanged. Covered/reconciled token evidence,
-isolated dead-letter encoding/materialization byte and peak-RSS cap evidence,
 bounded public export transport, public status, and served parity remain later
-F6b/F7 work.
+F6b/F7 work. F6b4 separately closes the isolated dead-letter envelope evidence.
 **F6b3 exact-selected uncovered-tail evidence implemented:** 2026-08-02 — a
 fixed-cardinality fixture grows immutable token-ledger receipt history through
 zero-lane profile cycles before enrollment; graph-manifest history also
@@ -307,9 +310,36 @@ listing, and dead-letter payload-object reads. Production has no authority-safe
 token-index reconciler, so this is explicitly uncovered-tail evidence; it
 neither calls raw `optimize_indices` nor publishes an index-only/reconciled token
 HEAD. Fixture setup necessarily publishes ordinary receipt and terminal token
-versions. Public status, the decision threshold, the reconciler, and isolated
-dead-letter encoding/materialization byte and peak-RSS cap evidence remain
-later work.
+versions. Public status, the decision threshold/reconciler, receipt-key cost,
+and covered/reconciled token evidence remain later work.
+**F6b4 dead-letter envelope evidence implemented:** 2026-08-02 — the existing
+codec boundary cell remains the fast one-under/exact/one-over regression, while
+an ignored production-size cell drives 8,192 adversarial candidates through the
+real canonical-payload encoder/verifier at 67,108,863, 67,108,864, and
+67,108,865 encoded bytes. On the accepted local macOS run, 10,364,432
+source-value bytes became 62,301,270 canonical-payload input bytes and exact
+67,108,864-byte encoded length/capacity. The cap-aware writer reduced retained
+encoded capacity from an observed 132,644,864 bytes to the exact cap. Encoding
+took 286,280 microseconds and verification took 2,254,424 microseconds. The
+verifier and stopped/offline payload exporter retain canonical payloads as raw
+JSON rather than recursively materializing nested `serde_json::Value` trees;
+the JSON value and schema are unchanged, while lexical object-member order may
+now preserve the stored canonical payload instead of the old
+`serde_json::Value` reserialization order. The paired subprocess recorded
+85,557,248-byte baseline and 231,849,984-byte exact peak RSS, a
+146,292,736-byte lift beneath a 201,326,592-byte (192-MiB) one-sided
+remeasurement tripwire. These are 2026-08-02 local measurements, not admission,
+quota, or an SLO. The real overflow integration proves durable operational
+`DataBlock` evidence precedes canonical-object creation, base-table effect, and
+a current-token terminal-disposition transition; manifest and token-ledger
+state may advance to persist the block, and no recovery sidecar or partial fold
+remains.
+This slice changes no persisted or wire grammar, adds no production route, and
+adds no CI topology. It keeps the existing hidden payload-export JSON
+value/schema, changes the Rust DTO field from `serde_json::Value` to
+`Box<serde_json::value::RawValue>`, and may therefore preserve a different
+lexical object-member order when serialized. It also adds one source-guarded,
+doc-hidden failpoints-only measurement seam.
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s unified write and
 generic recovery-sidecar protocol, plus
@@ -3399,8 +3429,9 @@ outcome classes:
   keys continue;
 - **dead-letter envelope overflow**—after valid conflict evidence exists, a
   canonical terminal payload above the selected one-object envelope—publishes
-  one durable strict `DataBlock` before object or Lance effects and no partial
-  fold; and
+  one durable strict `DataBlock` before canonical-object creation, base-table
+  effect, or current-token terminal-disposition transition and no partial fold;
+  manifest/token-ledger state may advance to persist the block; and
 - **other structural faults**—missing/corrupt authenticated cuts, schema or
   token contradictions, or malformed evidence—fail loudly with no partial
   fold. `DataBlock` v1 cannot authenticate those facts; the driver exposes and
@@ -3420,9 +3451,12 @@ The selected dead-letter protocol is deliberately small:
 2. **One object for one fold.** After deterministic conflict-component and
    final-LWW selection, F5 canonically orders all terminal candidates and
    encodes one NDJSON object under a fixed, measured encoded-byte and peak-RSS
-   envelope. One-beyond the envelope installs `DataBlock` before any object or
-   Lance effect. There is no chunk set, chunk manifest, conditional multipart
-   protocol, or per-entry replay checkpoint.
+   envelope. One-beyond the envelope installs `DataBlock` before canonical-
+   object creation, base-table effect, or current-token terminal-disposition
+   transition. F6b4's production-size
+   cell pins exact 64-MiB retained encoded capacity and a 192-MiB isolated
+   peak-RSS-lift remeasurement tripwire. There is no chunk set, chunk manifest,
+   conditional multipart protocol, or per-entry replay checkpoint.
 
 3. **Recovery before object effect.** Before conditional create, the F5
    sidecar owns the authenticated generation cut, canonical candidate
@@ -3849,6 +3883,14 @@ authority, and a retry cannot duplicate the object. Current-terminal listing
 uses bounded batches against the selected token version. Retirement records
 its exact cut and then permits rebuild without pretending the old terminal
 authority became `PRESENT`.
+
+F6b4 adds the isolated production-size closure over that existing behavior.
+Its 8,192-candidate encoder/verifier cell pins exact one-under/cap/one-over
+bytes, retained encoded capacity, encode/verify time, and paired peak RSS. The
+real overflow integration separately proves the durable operational
+`DataBlock` lands before canonical-object, base-table, or current-token
+terminal-disposition transition, permits only the manifest/token-ledger movement
+needed to record that block, and leaves no recovery sidecar or partial fold.
 
 The remaining evidence covers prepare witness/actor/lost-response/no-body
 ordering; concurrent first prepare and first writers; stale incarnation and
@@ -4698,6 +4740,21 @@ The implemented private B2 default includes two 128-MiB root preprocessing
 reservations (256 MiB total) acquired before blob materialization/canonical encoding; they are
 separate from the 32-MiB queued-generation Arrow charge and does not weaken the
 retain-all storage profile.
+
+F6b4 closes the isolated production-size dead-letter encoder/verifier term.
+The 2026-08-02 local macOS exact-cap run used 8,192 candidates, 10,364,432
+source-value bytes, 62,301,270 canonical-payload input bytes, and 67,108,864
+encoded bytes with exact 67,108,864-byte retained capacity. Encode and verify
+took 286,280 and 2,254,424 microseconds. Paired peak RSS was 85,557,248 bytes
+at baseline and 231,849,984 bytes at exact cap, a 146,292,736-byte lift.
+`201,326,592` bytes (192 MiB) is a one-sided remeasurement tripwire for this
+materialization shape, not admission, a quota, or a latency/RSS SLO. Before the
+cap-aware writer fix, the same shape retained an observed 132,644,864-byte
+encoded capacity. Exact object verification and stopped/offline payload export
+retain the nested payload as raw canonical JSON, so legal small-scalar lists do
+not create a second recursive allocation term. The JSON value/schema is
+unchanged; the Rust DTO field type and serialized lexical member order may
+differ from the former `serde_json::Value` representation.
 
 The accepted acknowledgement-cost instrument scopes a warm, already-claimed
 writer in steady state and includes both WAL append and synchronous in-memory
@@ -5908,7 +5965,7 @@ remain concurrent with one another.
 | B2a | selected unbounded retain-all/no-GC profile on stock Lance | **Private gate implemented 2026-07-21 (§12.5):** no OmniGraph byte/object/file/history quota; zero canonical `_mem_wal` deletion; complete/partial provider residue remains retained, unreferenced, and untouched below its root through retry/reopen; provider failures are loud; local/configured-RustFS history sweeps are advisory. This gate itself activated no schema or product surface; the later private B2-common slice activates v9 |
 | B2b | candidate managed-reclamation retention profile | Inactive. Requires the Lance-owned durable inspect/plan/execute + receipt, post-success fencing, bounded checkpoint/inventory/accounting, local/RustFS enforced-bound validation, and the profile-specific crash matrix (§4.5.2/§12.6). Passing it alone activates no product surface |
 | B2-common | schema v9/config-v3/state-v2, compare-and-chain token/attribution, graph-global token authority, recovery-v12 base+token fold; then explicit enrollment, revision-fenced lifecycle/correction/full status, SDK row/control methods, HTTP, CLI, and OpenAPI | **Private row/fold subset implemented 2026-07-22 (§11/§12.6):** canonical digests, hidden attribution, stale-authority revalidation after shared admission, same-generation chains, exact two-participant recovery/publication, durable fold attribution, retain-all, and genuine v8↔v9 refusal/rebuild are green. Explicit production enrollment, general lifecycle mutation, exclusive-cut physical status, public row admission, cancellation/shutdown, API compatibility, and transport parity remain inactive. The Cedar vocabulary, embedded manifest-only status, and narrow stopped/offline F3f DataBlock correction shipped in later EXP slices. `GraphHistoryBudget` belongs only to a future bounded/managed profile |
-| EXP | experimental cluster-only activation of the §4.7 profile: capability-bound manifest enablement via offline `cluster apply`; lazy graph-wide enrollment; caller-supplied vectors; terminal per-key object-form dead letter plus recovery-bound structural-authority correction; irreversible same-format authority retirement for fresh-root rebuild; explicit lifecycle-aware content-preserving `SEALED` same-binding maintenance and terminal-disabled physical rebind; schema evolution only through checked fresh-root rebuild; no read-your-writes bridge; starvation-free serial dependency-prioritized fold core with non-overlapping resident-enabled and offline-disable owners; upsert-only; hidden-first ingress followed by atomic served HTTP/remote-client/CLI/OpenAPI activation with direct mutation refused | **Selected 2026-07-27 and protocol choices amended 2026-07-29 (§4.7); v10 P1, v11 profile authority, hidden v12/lifecycle-v3/recovery-v14, F3a v13/recovery-v15, F3b EnsureIndices v14/recovery-v16, F3c Optimize v15/recovery-v17, F3d physical rebind v16/recovery-v18, F3e authority retirement v17/recovery-v19, F3f DataBlock correction v18/recovery-v20, hidden F4 ingest/prepare, format-neutral F5a automatic `OPEN` folding, F5b0 operational convergence, F5b terminal diversion in v19/recovery-v21, F6a in-process acceptance, and F6b1 checked immutable export-cut authority, F6b2 process/lifecycle acceptance, and F6b3 exact-selected uncovered-tail cost evidence are implemented.** V11–v18 retain the profile, lifecycle, maintenance, rebind, retirement, and DataBlock contracts described above. F4 closes the caller-shaped private request path; F5a adds coalesced timer/cap triggers, cold `OPEN` backlog discovery, finite node-before-edge rounds, and bounded shutdown over recovery-v14 authority. F5b0 adds exact-`ENABLED` goal-`SEALED` restart continuation and checked offline `DISABLING` convergence, including `OPEN_AFTER_FOLD` adoption and loud `DataBlock` park/correct/rerun. Current v19/token-schema-v3/recovery-v21 deterministically publishes valid winners, records all losing terminal candidates in one bounded canonical object, makes each losing key current `DEAD_LETTERED`, supports exact retry plus a fresh ordinary successor, exposes stopped/offline selected-token list/export, and extends retirement to `WITHDRAWN | DEAD_LETTERED`. F6a adds only a typed failpoints-only process-local advisory driver snapshot and one hidden in-process composed acceptance; public durable status stays manifest-only. F6b1 adds lower/engine exact-terminal export-only authority plus a doc-hidden move-only cut that freezes the accepted catalog, selected exact table versions, and retired provenance under full gates, then retains one nonwaiting root slot through output after dropping those gates. It changes no format/recovery grammar and activates no public route. Public driver/exclusive-cut status, public ingress/enrollment/lifecycle/rebind control, every served row/lifecycle streaming transport, and unreachable `AuthorityBlock` repair remain inactive. Covered/reconciled token evidence and threshold, isolated dead-letter encoding/materialization byte and peak-RSS cap evidence, bounded export transport, public status, and the remaining guardrail matrix stay open; public activation still requires F7-co-landed bounded export transport plus served/remote DTO/OpenAPI parity after every F6 gate passes. |
+| EXP | experimental cluster-only activation of the §4.7 profile: capability-bound manifest enablement via offline `cluster apply`; lazy graph-wide enrollment; caller-supplied vectors; terminal per-key object-form dead letter plus recovery-bound structural-authority correction; irreversible same-format authority retirement for fresh-root rebuild; explicit lifecycle-aware content-preserving `SEALED` same-binding maintenance and terminal-disabled physical rebind; schema evolution only through checked fresh-root rebuild; no read-your-writes bridge; starvation-free serial dependency-prioritized fold core with non-overlapping resident-enabled and offline-disable owners; upsert-only; hidden-first ingress followed by atomic served HTTP/remote-client/CLI/OpenAPI activation with direct mutation refused | **Selected 2026-07-27 and protocol choices amended 2026-07-29 (§4.7); v10 P1, v11 profile authority, hidden v12/lifecycle-v3/recovery-v14, F3a v13/recovery-v15, F3b EnsureIndices v14/recovery-v16, F3c Optimize v15/recovery-v17, F3d physical rebind v16/recovery-v18, F3e authority retirement v17/recovery-v19, F3f DataBlock correction v18/recovery-v20, hidden F4 ingest/prepare, format-neutral F5a automatic `OPEN` folding, F5b0 operational convergence, F5b terminal diversion in v19/recovery-v21, F6a in-process acceptance, F6b1 checked immutable export-cut authority, F6b2 process/lifecycle acceptance, F6b3 exact-selected uncovered-tail cost evidence, and F6b4 production-size dead-letter envelope evidence are implemented.** V11–v18 retain the profile, lifecycle, maintenance, rebind, retirement, and DataBlock contracts described above. F4 closes the caller-shaped private request path; F5a adds coalesced timer/cap triggers, cold `OPEN` backlog discovery, finite node-before-edge rounds, and bounded shutdown over recovery-v14 authority. F5b0 adds exact-`ENABLED` goal-`SEALED` restart continuation and checked offline `DISABLING` convergence, including `OPEN_AFTER_FOLD` adoption and loud `DataBlock` park/correct/rerun. Current v19/token-schema-v3/recovery-v21 deterministically publishes valid winners, records all losing terminal candidates in one bounded canonical object, makes each losing key current `DEAD_LETTERED`, supports exact retry plus a fresh ordinary successor, exposes stopped/offline selected-token list/export, and extends retirement to `WITHDRAWN | DEAD_LETTERED`. F6a adds only a typed failpoints-only process-local advisory driver snapshot and one hidden in-process composed acceptance; public durable status stays manifest-only. F6b1 adds lower/engine exact-terminal export-only authority plus a doc-hidden move-only cut that freezes the accepted catalog, selected exact table versions, and retired provenance under full gates, then retains one nonwaiting root slot through output after dropping those gates. It changes no format/recovery grammar and activates no public route. Public driver/exclusive-cut status, public ingress/enrollment/lifecycle/rebind control, every served row/lifecycle streaming transport, and unreachable `AuthorityBlock` repair remain inactive. Covered/reconciled token evidence and threshold, bounded export transport, public status, and the remaining guardrail matrix stay open; public activation still requires F7-co-landed bounded export transport plus served/remote DTO/OpenAPI parity after every F6 gate passes. |
 | C | restart-stable reject-row identity, atomic dead letter, richer status, and evidence-backed configurable bounds | reject crash matrix; reject-retention proof; backpressure and RSS/latency evidence. The §4.7 profile pulls a bounded object-form dead-letter subset forward using the §4.1 token as reject identity |
 | D | automatic operation drain, broader schema/branch/upgrade integration, and orchestrated rematerialization rebind beyond P7's explicit bridge | two-coordinator race, old/new physical-binding crash matrix, and format-transition suite |
 | E | fresh cuts and maintained-index reads; cross-process `Fresh` ships only if the substrate generation-retention guard exists (§9), otherwise same-process only | cut consistency; merged-generation exclusion |
