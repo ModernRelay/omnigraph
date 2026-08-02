@@ -279,7 +279,7 @@ v16→v17/recovery-v19 authority retirement, and v17→v18/recovery-v20 exact
 grammar takes another strand when its final shape differs from a dormant
 scaffold. Dormant discriminator names never authorize reinterpretation of
 their frozen payload. The exact pre-release strand count is recorded as shapes
-settle and freezes at the 0.10.0 release gate; an honest extra strand is cheaper
+settle and freezes at the 0.9.0 release gate; an honest extra strand is cheaper
 than pre-registering a guessed on-disk contract.
 
 The lifecycle tranche plus F3 are the operator lifecycle and maintenance
@@ -2229,7 +2229,7 @@ root. V17 owns `WITHDRAWN` retirement; F5 extends it for `DEAD_LETTERED`.
 is either exactly the frozen scaffold already registered or takes a new honest
 pre-release strand. There is no guessed numeric ceiling: every added strand is
 recorded with predecessor refusal/rebuild evidence, and the complete count
-freezes at the 0.10.0 release gate. No discriminator acquires a different
+freezes at the 0.9.0 release gate. No discriminator acquires a different
 payload meaning in place merely to save a rebuild.
 
 **What the experimental designation does and does not buy.** It licenses

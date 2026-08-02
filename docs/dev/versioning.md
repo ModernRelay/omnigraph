@@ -46,8 +46,12 @@ declares exactly non-null physical `id` as Lance's unenforced primary key from
 creation, and production strict insert/upsert routes use the exact-`id`
 filter-bearing adapter.
 
-Internal schema v9 maps to OmniGraph **0.9.x** — the first published release
-line to serve any of these formats.
+Internal schema v9 was also a 0.9.0-dev format: the 0.9.0 release was
+prepared at this stamp (workspace bump plus release notes) but never tagged or
+published, so — like v5–v8 — only source builds off `main` serve it. The
+in-code release map still labels stamp 9 `0.9.x`, and the refusal grammar
+tests pin that string; relabeling it to source-build guidance is release-prep
+work, annotated next to the arm-split note in `migrations.rs`.
 It preserves v8's private data-bearing MemWAL core, then activates
 RFC-026's common B2 storage/recovery contract: stream-config v3, lifecycle
 state v2, the grammar-impossible trusted base-row field
@@ -72,7 +76,7 @@ writer. The physical field's trailing `$` is outside the `.pg` identifier
 grammar, so a genuine v8 user property named `__omnigraph_stream_v1` remains
 ordinary user data and round-trips unchanged.
 
-Internal schema v10 was the first 0.10.0-dev streaming-profile format. It
+Internal schema v10 was the first 0.9.0-dev streaming-profile format. It
 preserved the complete v9 contract and added RFC-026 §4.7 P1's enablement
 authority: one required graph-global `stream_profile` singleton row, present
 from genesis (disabled, revision 1), flipped through the shared publisher's
@@ -109,7 +113,7 @@ accepted v13 discriminator. It owns the exact token-ledger
 selects its achieved token witness and the next profile together makes either
 authoritative.
 
-Internal schema v12 was an unreleased 0.10.0-dev format. It replaces lifecycle
+Internal schema v12 was an unreleased 0.9.0-dev format. It replaces lifecycle
 state-v2's inline receipt histories with lifecycle-v3 fixed-size
 ledger-chain/current pointers and an authenticated WAL-tail commitment. The
 recovery-sidecar ceiling is v14. Its active hidden discriminators are
@@ -126,7 +130,7 @@ historical. It did not encode the complete prior lifecycle/profile/topology,
 the physical claim attempt, or the two terminal receipt families required to
 recover resume safely, so v13 does not reinterpret it.
 
-Internal schema v13 was an unreleased 0.10.0-dev format. It preserves lifecycle-v3
+Internal schema v13 was an unreleased 0.9.0-dev format. It preserves lifecycle-v3
 and raises the recovery-sidecar ceiling to v15. Recovery-v15 has one active
 hidden discriminator, `StreamResume`, which owns the complete revision-fenced
 `SEALED → OPEN` resume or guarded `DRAINING → OPEN` abort: exact request and
@@ -136,7 +140,7 @@ Receipt lookup precedes revision refusal for idempotent retry. The v14
 resume/correction/retirement/ledger-maintenance/sealed-maintenance/rebind
 scaffolds retain their old bytes and continue to fail closed.
 
-Internal schema v14 was an unreleased 0.10.0-dev format. It raised the sidecar
+Internal schema v14 was an unreleased 0.9.0-dev format. It raised the sidecar
 ceiling to recovery-v16 for one active hidden discriminator,
 `StreamSealedEnsureIndices`. V16 reuses the frozen
 recovery-v8 exact CreateIndex plan and layers the enabled profile, selected
@@ -149,7 +153,7 @@ retry idempotency. Ambient EnsureIndices remains refused for enrolled tables.
 Recovery-v14's sealed-maintenance
 scaffold keeps its original bytes and is not reinterpreted.
 
-Internal schema v15 was an unreleased 0.10.0-dev format. It raised the sidecar
+Internal schema v15 was an unreleased 0.9.0-dev format. It raised the sidecar
 ceiling to recovery-v17 for the distinct hidden `StreamSealedOptimize`
 discriminator. V17 owns Optimize's bounded,
 internally committing maintenance plan, exact confirmed outputs, and complete
@@ -158,7 +162,7 @@ refreshes publish atomically; a true no-work invocation is effect-free. It
 writes no token row, advances no receipt chain, and accepts no caller operation
 ID. Ambient Optimize remains refused for enrolled tables.
 
-Internal schema v16 was an unreleased 0.10.0-dev format. It raised the sidecar
+Internal schema v16 was an unreleased 0.9.0-dev format. It raised the sidecar
 ceiling to recovery-v18 for the distinct hidden `StreamRebind` discriminator.
 V18 binds the complete prior `SEALED`
 authority, exact fresh physical enrollment and empty shard, immutable binding
@@ -168,7 +172,7 @@ recovery-v15 resume must claim a higher epoch within the fresh binding scope.
 The v14 rebind scaffold and recovery-v17 Optimize envelope retain their exact
 historical meanings and are never reinterpreted.
 
-Internal schema v17 was an unreleased 0.10.0-dev format. It raised the sidecar ceiling to recovery-v19 for
+Internal schema v17 was an unreleased 0.9.0-dev format. It raised the sidecar ceiling to recovery-v19 for
 one active `StreamAuthorityRetirement` discriminator. Under checked
 stopped/offline cluster authority, a read-only plan proves an exact `DISABLED`
 profile, settled recovery, every enrolled lane `SEALED`, base/token parity, and
@@ -188,7 +192,7 @@ retired source cut; it need not equal the fresh target graph identity, whose
 schema compatibility remains ordinary loader validation. This slice added no
 production path that creates `WITHDRAWN`.
 
-Internal schema v18 was an unreleased 0.10.0-dev format. It raised the sidecar
+Internal schema v18 was an unreleased 0.9.0-dev format. It raised the sidecar
 ceiling to recovery-v20 for exact `DataBlock` correction while leaving the
 frozen recovery-v14 correction
 scaffold unchanged. Recovery-v20 binds the exact blocked generation cut, one
@@ -198,7 +202,7 @@ management-receipt effect, fixed graph lineage, and the complete next
 block; receipt lookup precedes stale block/revision refusal on exact retries.
 
 Internal schema **v19 is the currently served format** (unreleased, current
-0.10.0-dev source builds). It upgrades `_stream_tokens.lance` to schema v3,
+0.9.0-dev source builds). It upgrades `_stream_tokens.lance` to schema v3,
 adds terminal `DEAD_LETTERED` evidence and versioned fold attribution, and
 raises the sidecar ceiling to recovery-v21. `DeadLetterFold` deterministically
 partitions one bounded generation, preserves valid winners, and writes all

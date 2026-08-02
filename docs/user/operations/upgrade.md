@@ -37,26 +37,28 @@ from that line (the latest is safest):
 | internal schema v3 | omnigraph 0.6.2–0.7.2 | the latest 0.7.x (e.g. 0.7.2) |
 | internal schema v4 | omnigraph 0.8.x | the latest 0.8.x (e.g. 0.8.1) |
 | internal schema v5–v8 | no published release (see below) | a source build at the matching commit |
-| internal schema v9 | omnigraph 0.9.x | the latest 0.9.x |
-| internal schema v10 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v11 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v12 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v13 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v14 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v15 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v16 | unreleased (earlier 0.10.0-dev source builds) | final v16 source build at merge `ac59c4f6d1d83acc8118c410c39de2bed91f9c15` |
-| internal schema v17 | unreleased (earlier 0.10.0-dev source builds) | final v17 source build at merge `41a5990d53238d63d17e139859c66613f9c25867` |
-| internal schema v18 | unreleased (earlier 0.10.0-dev source builds) | final v18 source build at merge `c7c81b186bed37989fe5ce591baf0965b5102648` |
-| internal schema v19 | unreleased (current 0.10.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
+| internal schema v9 | no published release (0.9.0-dev source builds; the refusal label still reads `0.9.x`) | a source build at the matching commit |
+| internal schema v10 | unreleased (earlier 0.9.0-dev source builds) | a source build at the matching commit |
+| internal schema v11 | unreleased (earlier 0.9.0-dev source builds) | a source build at the matching commit |
+| internal schema v12 | unreleased (earlier 0.9.0-dev source builds) | a source build at the matching commit |
+| internal schema v13 | unreleased (earlier 0.9.0-dev source builds) | a source build at the matching commit |
+| internal schema v14 | unreleased (earlier 0.9.0-dev source builds) | a source build at the matching commit |
+| internal schema v15 | unreleased (earlier 0.9.0-dev source builds) | a source build at the matching commit |
+| internal schema v16 | unreleased (earlier 0.9.0-dev source builds) | final v16 source build at merge `ac59c4f6d1d83acc8118c410c39de2bed91f9c15` |
+| internal schema v17 | unreleased (earlier 0.9.0-dev source builds) | final v17 source build at merge `41a5990d53238d63d17e139859c66613f9c25867` |
+| internal schema v18 | unreleased (earlier 0.9.0-dev source builds) | final v18 source build at merge `c7c81b186bed37989fe5ce591baf0965b5102648` |
+| internal schema v19 | unreleased (current 0.9.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
 
 **Stamps v5–v8 never shipped.** The storage format advanced five times inside
 the single 0.8.1 → 0.9.0 development window, so the only graphs carrying those
 stamps came from source builds off `main`; no published binary reads them and
 the refusal message names them `0.9.0-dev`. If you have one, export it with a
 build of the commit that created it, then load into a fresh current-format
-graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10–v19 are
-pre-release formats written by matching 0.10.0-dev source builds. The final
-0.10.0 format may use a later stamp.
+graph. A released binary only ever wrote v4 (0.8.x) or earlier stamps: the
+0.9.0 release was prepared at v9 but never published, so v9–v19 are all
+pre-release formats written by matching 0.9.0-dev source builds (v9's refusal
+label still reads `0.9.x` from that expectation). The final 0.9.0 format may
+use a later stamp.
 
 You can also check versions before you hit a refusal:
 
@@ -487,8 +489,9 @@ retirement records provenance and freezes the source before row-only export to
 a fresh graph. None of that later F5 behavior is active in v10.
 
 A v9 graph must use the standard rebuild recipe above: quiesce writers, export
-with the latest 0.9.x binary, initialize a **different** root with the v10
-(0.10.0-dev source build) binary, load the export, and verify the v10 stamp
+with a final-v9 source build (no 0.9.x binary was ever published), initialize
+a **different** root with the v10
+(0.9.0-dev source build) binary, load the export, and verify the v10 stamp
 plus row/vector/blob fidelity before cutover. Keep the v9 root unchanged
 through the rollback window. A v10 binary refuses v9, and a v9 binary refuses
 v10.
@@ -510,7 +513,8 @@ correctness foundations; v9 does not by itself expose a public streaming API.
 A v8 graph must use the standard rebuild recipe above. Because v8 never
 shipped in a release, this affects only source builds off `main` during 0.9.0
 development: quiesce every v8 writer, export with a build of the commit that
-created the graph, initialize a **different** root with the 0.9.x binary, load
+created the graph, initialize a **different** root with a final-v9 source
+build, load
 the export, and verify the v9 stamp plus row/vector/blob fidelity before
 cutover. Keep the v8 root unchanged through the rollback window. A v9 binary
 refuses v8, and a v8 binary refuses v9.

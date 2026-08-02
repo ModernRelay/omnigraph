@@ -940,8 +940,9 @@ OMNIGRAPH_V8_BIN=/path/to/final-v8/omnigraph \
 
 RFC-026 §4.7 P1 (the v10 stream-profile format) added the historical
 `OMNIGRAPH_V9_BIN` seam. It mints a genuine internal-v9 graph with the pinned
-final-v9 binary, proves CURRENT refuses it naming the published `0.9.x` line in
-both message slots (`created by omnigraph 0.9.x` and `with an omnigraph 0.9.x
+final-v9 binary, proves CURRENT refuses it naming the `0.9.x` line in
+both message slots (no 0.9.x binary was ultimately published — the label
+predates that outcome and awaits the release-map relabel) (`created by omnigraph 0.9.x` and `with an omnigraph 0.9.x
 binary` — the exact strings are also pinned in-source by
 `migrations.rs::release_names_the_writing_line_for_each_stamp`), exports with
 v9, rebuilds a distinct current-format root, proves row/vector fidelity plus
@@ -955,7 +956,7 @@ OMNIGRAPH_V9_BIN=/path/to/final-v9/omnigraph \
 ```
 
 The historical `OMNIGRAPH_V10_BIN` seam mints a genuine final-v10 graph with
-the matching 0.10.0-dev source build, proves CURRENT refuses it with
+the matching 0.9.0-dev source build, proves CURRENT refuses it with
 source-build/export guidance, exports with v10, rebuilds a distinct
 current-format root, and proves row/vector/blob fidelity plus exact-`id` PK
 metadata. The old v10 binary must refuse the current root. It remains available
@@ -997,7 +998,7 @@ OMNIGRAPH_V12_BIN=/path/to/final-v12/omnigraph \
 ```
 
 The historical `OMNIGRAPH_V13_BIN` seam mints a
-genuine final-v13 graph with the matching 0.10.0-dev source build, proves CURRENT
+genuine final-v13 graph with the matching 0.9.0-dev source build, proves CURRENT
 refuses it with source-build/export guidance, exports with v13, rebuilds a
 distinct current-format root, and proves row/vector/blob fidelity plus exact-`id` PK
 metadata. The old v13 binary must refuse the current root. The fixture is clean,
