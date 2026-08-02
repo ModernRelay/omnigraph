@@ -232,10 +232,11 @@ guardrail acceptance matrix.
 
 A v18 graph crosses by export/init/load rebuild into a different root. Because
 `MIN_SUPPORTED == CURRENT == 19`, v19 refuses v18 and a v18 binary refuses
-v19. The genuine v17↔v18 fence remains historical evidence. The adjacent
-v18↔v19 genuine-binary refusal/rebuild cell has not landed yet and is an
-explicit release-evidence gap; local stamp/refusal grammar guards do not
-replace it.
+v19. The genuine v17↔v18 fence remains historical evidence. The CI-owned
+v18↔v19 genuine-binary cell builds immutable final v18, proves both refusals
+and logical rebuild fidelity, and loads final-v18 receipt-v1 retirement bytes
+into v19. Local stamp/refusal grammar guards supplement that evidence; they do
+not replace it.
 
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,

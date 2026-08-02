@@ -11,7 +11,7 @@
 //!
 //! Each historical variable supplies only the source binary: `OMNIGRAPH_OLD_BIN`
 //! (v3), `OMNIGRAPH_PREVIOUS_BIN` (v4), and `OMNIGRAPH_V5_BIN` through
-//! `OMNIGRAPH_V16_BIN`. Those cells prove a genuine old source is refused by,
+//! `OMNIGRAPH_V17_BIN`. Those cells prove a genuine old source is refused by,
 //! rebuilt with, and fenced in both directions against the binary under test
 //! (CURRENT); they do not invoke the archived intermediate target binary and
 //! therefore do not claim an adjacent vN↔vN+1 gate. Each skips only when its
@@ -20,8 +20,10 @@
 //! enrollment route. The v8 case additionally proves non-exposure of trusted
 //! physical stream metadata and preservation of the old grammar-valid user
 //! property that motivated v9's grammar-impossible field. The one genuine
-//! adjacent fence in the current tree uses `OMNIGRAPH_V17_BIN` to prove the
-//! immediate-predecessor v17↔v18 refusal and strict rebuild.
+//! adjacent fence in the current tree uses `OMNIGRAPH_V18_BIN` to prove the
+//! immediate-predecessor v18↔v19 refusal and strict rebuild. That cell also
+//! loads a retirement export captured from the exact final-v18 production
+//! exporter, pinning compatibility with v18's frozen receipt-v1 bytes.
 
 mod support;
 
@@ -31,6 +33,14 @@ use std::process::Command;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use support::{HERMETIC_OPERATOR_HOME, cli, fixture, output_failure, output_success};
 use tempfile::tempdir;
+
+/// Captured by final-v18 commit c7c81b186bed37989fe5ce591baf0965b5102648
+/// from the production `export_jsonl` call in its authority-retirement test.
+/// Public v18 had no row-ingress route capable of creating the WITHDRAWN
+/// precondition, so the old test used its failpoint-only setup; the receipt and
+/// logical rows here are the unmodified output of the production exporter.
+const FINAL_V18_RETIRED_MAIN_EXPORT: &str =
+    include_str!("../../omnigraph/tests/fixtures/final_v18_retired_main.jsonl");
 
 /// Resolve the old (0.7.2) binary. `None` ONLY when `OMNIGRAPH_OLD_BIN` is
 /// unset — the legitimate skip. A var that is SET but points at a missing path
@@ -229,6 +239,19 @@ fn v17_bin() -> Option<PathBuf> {
     Some(path)
 }
 
+/// Resolve the final internal-v18 binary (the immutable merge immediately
+/// before current-token-v3 / recovery-v21 dead-letter activation).
+fn v18_bin() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("OMNIGRAPH_V18_BIN")?);
+    assert!(
+        path.exists() && path.is_file(),
+        "OMNIGRAPH_V18_BIN is set but is not a binary file: {} \
+         (unset it to skip, or point it at the omnigraph binary built from the final internal-v18 commit)",
+        path.display(),
+    );
+    Some(path)
+}
+
 /// Run any predecessor binary hermetically (no developer `~/.omnigraph`).
 fn run_old(bin: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin)
@@ -402,6 +425,31 @@ fn assert_current_blob_bytes(graph: &Path, expected: &[u8]) {
             &blob.read().await.expect("read rebuilt blob")[..],
             expected,
             "v5 → current rebuild must preserve exact blob bytes",
+        );
+    });
+}
+
+fn assert_current_graph_is_disabled_and_unenrolled(graph: &Path) {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = Omnigraph::open(graph.to_string_lossy().as_ref())
+            .await
+            .expect("open rebuilt current graph for stream-authority check");
+        let status = db.stream_status().await.expect("read stream status");
+        assert_eq!(status.profile_mode, "DISABLED");
+        assert!(
+            status.tables.is_empty(),
+            "retirement provenance must authorize logical rebuild, never import stream enrollment or sequencing authority"
+        );
+        let token_uri = graph.join("_stream_tokens.lance");
+        let token_rows = lance::Dataset::open(token_uri.to_string_lossy().as_ref())
+            .await
+            .expect("open rebuilt stream-token authority")
+            .count_rows(None)
+            .await
+            .expect("count rebuilt stream-token authority rows");
+        assert_eq!(
+            token_rows, 0,
+            "retirement rebuild must not import current tokens, receipts, or other sequencing authority"
         );
     });
 }
@@ -1858,8 +1906,9 @@ fn current_refuses_and_rebuilds_genuine_v16_and_v16_refuses_current() {
         "the predecessor binary must mint a genuine internal-schema-v16 graph",
     );
 
-    // The required fence stays intentionally clean, disabled, and unenrolled:
-    // ordinary export transfers logical rows, never private stream authority.
+    // This historical source seam stays intentionally clean, disabled, and
+    // unenrolled: ordinary export transfers logical rows, never private stream
+    // authority.
     let export = run_old(&v16, &["export", v16_uri]);
     assert_ok("v16 export", &export);
     assert!(!export.stdout.is_empty(), "v16 export produced no rows");
@@ -1919,10 +1968,10 @@ fn current_refuses_and_rebuilds_genuine_v16_and_v16_refuses_current() {
 }
 
 #[test]
-fn current_v18_refuses_and_rebuilds_genuine_v17_and_v17_refuses_v18() {
+fn current_refuses_and_rebuilds_genuine_v17_and_v17_refuses_current() {
     let Some(v17) = v17_bin() else {
         eprintln!(
-            "skipping immediate-predecessor v17 upgrade test: OMNIGRAPH_V17_BIN is not set to a final internal-v17 binary"
+            "skipping historical source-v17 upgrade test: OMNIGRAPH_V17_BIN is not set to a final internal-v17 binary"
         );
         return;
     };
@@ -1962,8 +2011,9 @@ fn current_v18_refuses_and_rebuilds_genuine_v17_and_v17_refuses_v18() {
         "the predecessor binary must mint a genuine internal-schema-v17 graph",
     );
 
-    // The required fence stays intentionally clean, disabled, and unenrolled:
-    // ordinary export transfers logical rows, never private stream authority.
+    // This historical source seam stays intentionally clean, disabled, and
+    // unenrolled: ordinary export transfers logical rows, never private stream
+    // authority.
     let export = run_old(&v17, &["export", v17_uri]);
     assert_ok("v17 export", &export);
     assert!(!export.stdout.is_empty(), "v17 export produced no rows");
@@ -1974,24 +2024,24 @@ fn current_v18_refuses_and_rebuilds_genuine_v17_and_v17_refuses_v18() {
     let stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(
         stderr.contains("created by omnigraph 0.10.0-dev"),
-        "v18 refusal must name the source-build line that wrote internal schema v17, got: {stderr}",
+        "current refusal must name the source-build line that wrote internal schema v17, got: {stderr}",
     );
     assert!(
         stderr.contains("with an omnigraph 0.10.0-dev binary"),
-        "v18 refusal must direct the operator to the matching v17 source build for export, got: {stderr}",
+        "current refusal must direct the operator to the matching v17 source build for export, got: {stderr}",
     );
     assert!(
         stderr.contains("export"),
-        "v18 refusal must direct the operator to export/import rebuild, got: {stderr}",
+        "current refusal must direct the operator to export/import rebuild, got: {stderr}",
     );
 
-    let v18_graph = temp.path().join("new-v18-data-correction-from-v17.omni");
+    let current_graph = temp.path().join("new-current-from-v17.omni");
     output_success(
         cli()
             .arg("init")
             .arg("--schema")
             .arg(&schema)
-            .arg(&v18_graph),
+            .arg(&current_graph),
     );
     output_success(
         cli()
@@ -2000,24 +2050,182 @@ fn current_v18_refuses_and_rebuilds_genuine_v17_and_v17_refuses_v18() {
             .arg("overwrite")
             .arg("--data")
             .arg(&jsonl)
-            .arg(&v18_graph),
+            .arg(&current_graph),
     );
-    let reexport = output_success(cli().arg("export").arg(&v18_graph));
-    assert_export_fidelity("v17 → v18", &export.stdout, &reexport.stdout);
-    assert_exported_blob_fidelity("v17 → v18", &export.stdout, &reexport.stdout);
-    assert_current_graph_tables_use_exact_id_pk(&v18_graph);
-    assert_current_blob_bytes(&v18_graph, &[0, 1, 2, 3, 255]);
+    let reexport = output_success(cli().arg("export").arg(&current_graph));
+    assert_export_fidelity("v17 → current", &export.stdout, &reexport.stdout);
+    assert_exported_blob_fidelity("v17 → current", &export.stdout, &reexport.stdout);
+    assert_current_graph_tables_use_exact_id_pk(&current_graph);
+    assert_current_blob_bytes(&current_graph, &[0, 1, 2, 3, 255]);
 
-    let reverse = run_old(&v17, &["snapshot", v18_graph.to_str().unwrap()]);
+    let reverse = run_old(&v17, &["snapshot", current_graph.to_str().unwrap()]);
     assert!(
         !reverse.status.success(),
-        "a v17 binary must refuse a genuine v18 graph",
+        "a v17 binary must refuse a genuine current graph",
     );
     let reverse_stderr = String::from_utf8_lossy(&reverse.stderr);
     assert!(
         reverse_stderr.contains("upgrade omnigraph")
             || reverse_stderr.contains("newer")
             || reverse_stderr.contains("expects v17"),
-        "unexpected v17→v18 reverse-refusal message: {reverse_stderr}",
+        "unexpected v17→current reverse-refusal message: {reverse_stderr}",
     );
+}
+
+#[test]
+fn current_v19_refuses_and_rebuilds_genuine_v18_and_v18_refuses_v19() {
+    let Some(v18) = v18_bin() else {
+        eprintln!(
+            "skipping immediate-predecessor v18 upgrade test: OMNIGRAPH_V18_BIN is not set to a final internal-v18 binary"
+        );
+        return;
+    };
+
+    let temp = tempdir().unwrap();
+    let v18_graph = temp.path().join("old-v18-data-correction.omni");
+    let (schema, data) = write_vector_blob_fixture(temp.path(), "v18-vector-blob");
+    let v18_uri = v18_graph.to_str().unwrap();
+
+    assert_ok(
+        "v18 init",
+        &run_old(
+            &v18,
+            &["init", "--schema", schema.to_str().unwrap(), v18_uri],
+        ),
+    );
+    assert_ok(
+        "v18 load",
+        &run_old(
+            &v18,
+            &[
+                "load",
+                "--mode",
+                "overwrite",
+                "--data",
+                data.to_str().unwrap(),
+                v18_uri,
+            ],
+        ),
+    );
+    let v18_snapshot = run_old(&v18, &["snapshot", v18_uri, "--json"]);
+    assert_ok("v18 snapshot", &v18_snapshot);
+    let v18_snapshot: serde_json::Value =
+        serde_json::from_slice(&v18_snapshot.stdout).expect("valid v18 snapshot JSON");
+    assert_eq!(
+        v18_snapshot["internal_schema_version"], 18,
+        "the predecessor binary must mint a genuine internal-schema-v18 graph",
+    );
+
+    let export = run_old(&v18, &["export", v18_uri]);
+    assert_ok("v18 export", &export);
+    assert!(!export.stdout.is_empty(), "v18 export produced no rows");
+    let jsonl = temp.path().join("v18.jsonl");
+    std::fs::write(&jsonl, &export.stdout).unwrap();
+
+    let refusal = output_failure(cli().arg("snapshot").arg(&v18_graph));
+    let stderr = String::from_utf8_lossy(&refusal.stderr);
+    for expected in [
+        "internal schema v18",
+        "reads only v19",
+        "created by omnigraph 0.10.0-dev",
+        "with an omnigraph 0.10.0-dev binary",
+        "omnigraph export",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "v19 refusal must contain `{expected}`, got: {stderr}",
+        );
+    }
+
+    let v19_graph = temp.path().join("new-v19-dead-letter-from-v18.omni");
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg(&v19_graph),
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(&jsonl)
+            .arg(&v19_graph),
+    );
+    let v19_snapshot = output_success(cli().arg("snapshot").arg(&v19_graph).arg("--json"));
+    let v19_snapshot: serde_json::Value =
+        serde_json::from_slice(&v19_snapshot.stdout).expect("valid v19 snapshot JSON");
+    assert_eq!(v19_snapshot["internal_schema_version"], 19);
+    let reexport = output_success(cli().arg("export").arg(&v19_graph));
+    assert_export_fidelity("v18 → v19", &export.stdout, &reexport.stdout);
+    assert_exported_blob_fidelity("v18 → v19", &export.stdout, &reexport.stdout);
+    assert_current_graph_tables_use_exact_id_pk(&v19_graph);
+    assert_current_blob_bytes(&v19_graph, &[0, 1, 2, 3, 255]);
+
+    let reverse = run_old(&v18, &["snapshot", v19_graph.to_str().unwrap()]);
+    assert!(
+        !reverse.status.success(),
+        "a v18 binary must refuse a genuine v19 graph",
+    );
+    let reverse_stderr = String::from_utf8_lossy(&reverse.stderr);
+    for expected in ["internal schema v19", "expects v18", "upgrade omnigraph"] {
+        assert!(
+            reverse_stderr.contains(expected),
+            "v18 reverse refusal must contain `{expected}`, got: {reverse_stderr}",
+        );
+    }
+
+    let mut retired_lines = FINAL_V18_RETIRED_MAIN_EXPORT.lines();
+    let retired_provenance: serde_json::Value = serde_json::from_str(
+        retired_lines
+            .next()
+            .expect("frozen v18 export must begin with provenance"),
+    )
+    .expect("valid frozen v18 provenance JSON");
+    let retired_receipt = &retired_provenance["_omnigraph_export_provenance"]["receipt"];
+    assert_eq!(retired_receipt["protocol_version"], 1);
+    assert_eq!(
+        retired_receipt["record_tag"],
+        "AUTHORITY_RETIREMENT_RECEIPT_V1"
+    );
+    assert_eq!(retired_receipt["source_internal_schema_version"], 18);
+    assert_eq!(retired_receipt["withdrawn_token_count"], 1);
+    assert!(
+        retired_receipt.get("dead_lettered_token_count").is_none(),
+        "the adjacent fixture must retain final-v18's exact receipt-v1 shape"
+    );
+
+    let retired_schema = temp.path().join("v18-retired.pg");
+    let retired_export = temp.path().join("v18-retired.jsonl");
+    std::fs::write(&retired_schema, "node Person { score: I32 }\n").unwrap();
+    std::fs::write(&retired_export, FINAL_V18_RETIRED_MAIN_EXPORT).unwrap();
+    let retired_v19_graph = temp.path().join("new-v19-from-retired-v18.omni");
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&retired_schema)
+            .arg(&retired_v19_graph),
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(&retired_export)
+            .arg(&retired_v19_graph),
+    );
+    let retired_reexport = output_success(cli().arg("export").arg(&retired_v19_graph));
+    let expected_logical_rows = retired_lines
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    assert_eq!(
+        String::from_utf8(retired_reexport.stdout).unwrap(),
+        expected_logical_rows,
+        "v19 must import the frozen v18 proof but re-export only logical rows"
+    );
+    assert_current_graph_is_disabled_and_unenrolled(&retired_v19_graph);
 }
