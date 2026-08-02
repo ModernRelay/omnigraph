@@ -216,6 +216,12 @@ recovery-v19's lineage-neutral retirement contract while binding exact
 Recovery-v19 and recovery-v20 keep their historical meanings and are never
 reinterpreted.
 
+F6b3 changes no storage, recovery, or wire version. Its doc-hidden current-token
+lookup and coverage probes are `failpoints`-only read seams over the exact v19
+manifest-selected token cut. The cost fixtures do not query receipt keys and
+never publish an index-only/reconciled token HEAD; fixture setup necessarily
+publishes ordinary receipt and terminal token versions.
+
 Recovery-v13 remains exactly the v11 profile-change protocol. Historical
 recovery-v10 enrollment and recovery-v12 lifecycle-v2 folds retain their old
 wire meanings and are refused under lifecycle-v3 rather than synthesized.
@@ -227,8 +233,10 @@ inspection/correction through `cluster stream block show|correct`, plus
 manifest-selected current dead-letter inspection through
 `cluster stream dead-letter list|export`. Their recovery owners remain
 crate-private; none activates public row ingress or ordinary lifecycle control.
-F6 still owns the object/RSS and authority-lookup measurements and the broader
-guardrail acceptance matrix.
+F6b3 closes the exact-selected uncovered-tail current-token hit/miss and
+terminal-page instrument. The F6 remainder still owns the covered/reconciled
+curve and threshold, isolated dead-letter encoding/materialization byte and
+peak-RSS cap evidence, and the broader guardrail acceptance matrix.
 
 A v18 graph crosses by export/init/load rebuild into a different root. Because
 `MIN_SUPPORTED == CURRENT == 19`, v19 refuses v18 and a v18 binary refuses

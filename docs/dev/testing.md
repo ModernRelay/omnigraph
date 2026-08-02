@@ -52,6 +52,7 @@ it is not inferred from a local syntax check. See [ci.md](ci.md).
 | `memwal_enrollment_gate.rs` | RFC-026's green production-neutral Gate E0 harness, isolated from the production manifest and graph writer. Fourteen substantive local cells plus one explicit unconfigured-S3 skip cover exact no-effect / `N + 1` index / pre-minted empty-shard classification, buried-effect refusal, marker survival, strict inventory/error handling, and the broad fail-closed matrix. The rejected first instrument used `checkout_latest` plus `IOTracker`, which missed local `read_dir`. The accepted exact-version classifier pins doc-hidden `has_successor_version`; its `AttemptTracker` records failed/`NotFound` attempts before forwarding and proves the identical complete six-attempt shape at baseline versions 8/80: four successful manifest HEADs, one `NotFound` manifest HEAD, one successful manifest GET, zero lists. A Unix execute-only `_versions` tripwire proves exact probing works when latest enumeration fails and an unreadable exact HEAD errors. The configured RustFS exact cell passes non-vacuously with the same zero-list shape and owns the positive lost-result/index/empty-shard/reopen sequence plus foreign shard, malformed/loose root, durable WAL, persisted cursor, and corrupt-manifest negatives. S3 ABA remains in `lance_surface_guards.rs`; CI rejects skipped E0/ABA cells. This file never mutates production manifest/schema state or deletes ambiguous artifacts; Phase A consumes its classifier through the private adapter |
 | `memwal_stream.rs` | Feature-gated RFC-026 private B1 mechanics, B2 compare-and-chain behavior, B2a provider-failure evidence, and the hidden lifecycle-v3 integration. B1 owns bounded put/ack/replay, authority, cancellation, and manifest-only visibility, including row-local value rejection before any WAL or manifest effect. B2 owns idempotency conflicts, same-generation overlays, stale-authority recapture, durable attribution, and one watcher/fence result over a distinct-key contiguous multi-row physical prefix. The hidden F4 request proof additionally pins graph-scoped `stream_ingest` policy and exact checked-runtime authority before body work; separate root-wide and per-actor transport admission before polling; incremental NDJSON framing across accepted chunks, CRLF, EOF, and over-limit-line boundaries without whole-request retention; strict `$stream` parsing; duplicate, unknown, and reserved-field refusal; explicit canonical IDs; dense schema-ordered node/edge conversion; scalar/list/enum/vector and value-constraint validation before recovery entry; and effect-free Blob-table refusal through a deliberately stale pre-schema-apply handle before either the request or lower B1/B2 seam can invoke MemWAL. Run-splitting cells cover invalid lines, repeated keys, token dispositions, and row/byte ceilings; bounded result/reorder ownership preserves caller order and stop-tail `blocking_ordinal` precedence, while disconnect stops new body polling/admission and transfers the invoked tail to root-owned settlement. The bodyless prepare cells pin effect-free witness challenge, checked-runtime/policy ordering, Blob refusal before enrollment, actor-bound durable-receipt replay, and two concurrent request IDs converging on one OPEN lane before ingest/fold composition. F5a extends this same owner with checked-runtime start refusal, coalesced timer/cap folding, trigger-during-fold preservation, cold-reopen discovery without an in-memory pending bit, deterministic finite node-before-edge rounds, root singleflight, retry/backoff visibility, and bounded supervisor shutdown; every effect is still proved by the existing recovery-v14 fold/crash cells rather than a duplicate replay suite. F6a adds one hidden in-process candidate-runtime composition: prepare, ordered NDJSON, an automatic mixed visible/dead-letter fold, stopped/offline selected-token list/export, an ordinary corrected successor, driver restart, clean shutdown ownership, and checked offline disable. F6b1 adds ambient-enrolled pre-byte refusal; managed and unmanaged-terminal checked success; checked `WITHDRAWN | DEAD_LETTERED` pre-byte refusal; one immutable exact-version cut across a later writer; sole nonwaiting root-slot exclusion and release; named-branch delete/recreate exclusion; and preservation of a post-start storage error with slot release. It remains inaccessible to production callers and exposes no SDK/HTTP/CLI/API/OpenAPI ingress, public driver status, or public rebind surface. Lifecycle-v3 owns recovery-covered cold/fold claims, exact full-generation projection after flush/reopen, recovery-v14 ordinary/drain folds, empty and non-empty `OPEN → DRAINING → SEALED`, an empty successor after an ordinary published fold, durable/reopen-stable typed `DataBlock` publication with no base or graph commit (including a fresh-source minimum-cardinality violation whose streamed edge supplies correction identity), idempotent same-request restart, conflicting request/stale-revision refusal, and the claim-before-seal plus seal-before-fold crash boundaries. Recovery-v15 adds receipt-first idempotent `SEALED → OPEN` resume, guarded `DRAINING → OPEN` abort, higher-epoch claim, terminal receipt publication, named-branch refusal, and current-binding-chain ancestry checks. The strict-block path streams `DRAINING` validation directly into the bounded evidence collector; unit owners below pin the detailed cap, empty-evidence refusal, and non-materialized overflow digest. F3d's checked-offline cell releases the served runtime, reaches terminal `DISABLED`, crashes after arming v18 but before a physical effect, and proves retry selects one fresh `SEALED` scope while retaining the old MemWAL inventory; repeating the same occurrence is physically effect-free. B2a injects a recording/failing store at the real Lance table-store boundary and covers post-invocation ambiguity and inert orphan residue. No test here implies a transport-backed/public ingress or a supported lifecycle API. |
 | `memwal_stream_cost.rs` | Feature-gated RFC-026 B1, Gate-R0, and B2a decision instrument. It separately measures warm already-claimed durability acknowledgement, cold replay, selected-generation fold scanning, visibility, retained merged metadata, the uncompacted graph-manifest term, legal no-roll estimates, and paired peak RSS. Gate R0 adds a revision-pinned source-audit tripwire, strict current-object classification/reference census, listed path/class/size retain-all comparisons at one/four/eight folds, referenced-cut retry reuse, and deterministic high-entropy near-cap local/configured-RustFS cells. The near-cap cell proves the exact B2-attributed boundary through the real adapter: 3,742 payload bytes per row admits 8,192 rows at 33,550,336 logical bytes, while 3,743 is rejected effect-free at 33,558,528 bytes. The legal generation acknowledges without graph visibility, then folds and publishes exactly once after logical-slice charging plus dense per-scanner-batch take. The reference-environment paired fold peak-RSS lift measured 286,441,472 bytes (about 273 MiB), below a one-sided 384-MiB remeasurement tripwire; common initialization may censor that lifetime high-water lift to zero or a negative value on another runner, and the tripwire is not a runtime allocator limit. B2a adds 1/8/32/128 local and configured-RustFS retained-history sweeps whose terms remain separate: warm ack, cold reopen/replay, fold, visibility, MemWAL/base-table/token-authority/other table-store work, graph-manifest/adapter work, advisory current-object bytes, and whole-process peak RSS. Older retained roots must receive zero reads, writes, or deletes. The only allowed delete shape is Lance's losing manifest-CAS `.binpb.tmp.<uuid>` staging; canonical durable MemWAL delete requests remain zero. LIST totals, wall times, and RSS are advisory—not a quota, SLO, isolated WAL slope, or provider billing. A green test proves private closure/retention behavior; it does not activate a public API. |
+| `memwal_stream_cost.rs` (F6b3) | Exact-selected uncovered-tail current-token cost owner. The normal local 1/8-cycle cell and ignored local/configured-RustFS 1/8/32/128 sweeps hold current-token/page cardinality fixed while growing immutable token-ledger receipt history; graph-manifest history also advances during setup. Per sample they report selected version, lookup-index coverage, serialized page bytes, and cumulative advisory whole-process RSS. Fresh-handle hit/miss plus the first terminal page, then warm hit/miss and repeat terminal pages, report token-read counts, total table-store read bytes, manifest reads/bytes, adapter operations, and the applicable per-sample warm/repeat p50 plus max-of-eight. The fixture does not claim a cold provider cache, receipt-key lookup, a covered/reconciled curve, or an isolated dead-letter materialization RSS bound. |
 | `durable_head_lookup_cost.rs` | RFC-024 Gate A decision instrument, isolated from the production manifest schema/publisher. At fixed catalog width 10 it runs the full absent/reconciled/one-uncovered/eight-uncovered/reconciled-after-tail matrix over compacted and uncompacted histories, with cold-open and warm-repeat measurements on local FS and bucket-gated S3/RustFS. Default depths are 20/80; the ignored decision-scale cell runs 10/100/1,000. Correct exact heads, flat indexed `rows_scanned`/range work, an index-absent growing negative control, and observable bounded tails all pass; after the eight-fragment tail, `optimize_indices` returns coverage to zero uncovered and representative `rows_scanned`/range work from 27→10 / 17→10. The test deliberately pins the no-go: uncompacted RustFS cold object reads/bytes and compacted byte terms grow, while RC.1 also crosses a bounded one-operation boundary by 1,000 commits, so RFC-024 remains research-blocked. `rows_scanned` is an RC.1 debug proxy, not a universal decoded-row counter. Object-store wrapper bytes and Lance execution-summary bytes are separate fixture-owned metrics and are not additive |
 | `checkpoint_retention_cost.rs` | RFC-025 Gate 0 decision instrument, isolated from the production manifest schema. It models three live checkpoints at catalog width 10 and measures complete list, exact show, and cleanup-root authority reads across absent/reconciled/eight-uncovered index states, compacted/uncompacted layouts, and cold/warm access. It also owns the reference V1 name-normalization matrix. Default local depths 20/80 pass the checked-in **no-go-preservation** assertions; the RC.1 ignored 10/100/1,000 run shows reconciled uncompacted work and the bounded tail flat, but rejects the current format shape after compaction: list/cleanup scan bytes grow 17,012→38,000 cold and 12,336→15,064 warm; show grows 29,348→53,064 and 24,672→30,128; scan operations add one at 1,000. The S3/RustFS cell is bucket-gated and was not run for this decision. The result keeps RFC-025 research-blocked; current v19 adds no checkpoint state |
 | `warm_read_cost.rs` | Cost-budget tests for the warm read/control path (query-latency work), measured at the object-store boundary with Lance `IOTracker` (the LanceDB IO-counted pattern): a warm same-branch read does 0 manifest opens, 1 version probe, validates the schema once (Fix 1 / finding A / Fix 2 at commit-history depth); a cold other-branch resolution derives snapshot state and lineage from one coherent manifest open/scan; native branch create and create-from each use one post-gate open/scan, while delete uses one target capture plus one native-ref opener and only one row scan; stale same-branch reads perform exactly 2 probes and refresh manifest-only; recreated non-main branches with the same Lance version refresh by incarnation; recreated branch-owned table handles are distinguished by table e_tag or refresh-time cache clearing; recreated traversal topology is protected by per-edge-table e_tag in the graph-index cache key or refresh-time cache clearing; a warm *repeat* read does 0 table opens via the held-handle cache and a write re-opens only the changed table at its new version/e_tag (Fix 3/6A). Also the CSR topology-build cost guards: `fresh_branch_traversal_reuses_main_graph_index` (A1 — a lazy-fork branch reuses main's cached CSR index, 0 rebuilds via `graph_build_count`) and `single_edge_query_builds_only_referenced_edge` (A2 — a one-edge query builds only that edge via `graph_edges_built`); both force CSR via the scoped `with_traversal_mode` seam, so they need no `#[serial]`. See "Cost-budget tests" below. |
@@ -696,8 +697,11 @@ version list/export, export blocking, and same-format retirement. The landed
 integration owner covers marker-only all-diverted advancement, mixed winner
 visibility, one object per fold, and list→payload→retire→ordinary-export.
 Object-codec unit cells cover one-under/exact/one-over bytes and conditional
-create/verify. The F6b remainder still owns representative RSS/latency and
-authority-lookup measurements plus the remaining guardrail matrix. No cell may
+create/verify. F6b3 now owns exact-selected uncovered-tail current-token
+hit/miss and terminal-page measurement; isolated dead-letter
+encoding/materialization byte and
+peak-RSS cap evidence, covered/reconciled token cost, and the remaining
+guardrail matrix stay open. No cell may
 assume a chunk chain,
 replay mutation, public history pagination, maintained dead-letter inventory,
 or ordinary `optimize` coverage of `_stream_tokens`.
@@ -709,11 +713,11 @@ event sequencing. The snapshot is explicitly advisory: pending entries are not a
 durable backlog, and stopped run state does not mint or prove checked offline
 authority. `memwal_stream.rs` owns that composition in
 `candidate_runtime_composes_lazy_prepare_mixed_fold_terminal_correction_and_disable`.
-Public durable `StreamStatus` remains manifest-only. F6a does not
-cover OS-process forced termination, the full node+edge/fairness matrix,
-measurements or long-history lookup/RSS/latency evidence, or maintenance/
-rebind/resume composition; those remain F6b-remainder acceptance owners, and
-F7 stays closed.
+Public durable `StreamStatus` remains manifest-only. F6a itself does not cover
+OS-process forced termination, the full node+edge/fairness matrix, cost
+evidence, or maintenance/rebind/resume composition. Later F6b2 closes the named
+acceptance cells and F6b3 closes the uncovered-tail token-cost harness; the
+remaining evidence, transport, status, and guardrails keep F7 closed.
 
 ### RFC-026 F6b1 checked export-cut evidence ownership
 
@@ -735,10 +739,11 @@ managed and unmanaged
 and a cut keeps its exact snapshot/catalog/table versions while a writer commits
 after capture. The cluster delete owner separately proves the same normalized
 root exclusion preserves the graph until release. A later storage error remains
-the provider error and releases the slot. F6b1 changes no
-format or recovery grammar. It does not cover a public HTTP/SDK/CLI/OpenAPI
-handler, bounded channel or byte reservation, deadline, stall/disconnect
-behavior, measurements, or the remaining F6b matrix; those remain F6b/F7 work.
+the provider error and releases the slot. F6b1 changes no format or recovery
+grammar. It does not cover a public HTTP/SDK/CLI/OpenAPI handler, bounded channel
+or byte reservation, deadline, stall/disconnect behavior, or measurement. F6b3
+later closes only the exact-selected uncovered-tail token instrument; transport
+and the remaining correctness/performance matrix stay in F6b/F7.
 
 ### RFC-026 implemented F6b2 acceptance scope
 
@@ -774,10 +779,56 @@ later work.
 F6b2 deliberately does **not** accept in-place productive SchemaApply on an
 enrolled graph. Schema-change acceptance is a separate checked sealed/retired
 export → initialize fresh graph with the desired schema → ordinary load
-workflow; physical rebind keeps the accepted schema unchanged. Long-history
-lookup/RSS/latency and object measurements, bounded public export transport,
-public status, and served SDK/HTTP/CLI/OpenAPI parity remain later F6b/F7
-owners.
+workflow; physical rebind keeps the accepted schema unchanged. Covered/
+reconciled token evidence, isolated dead-letter encoding/materialization byte
+and peak-RSS cap evidence, bounded public export transport, public status, and
+served SDK/HTTP/CLI/OpenAPI parity remain later F6b/F7 owners.
+
+### RFC-026 implemented F6b3 selected-token cost evidence
+
+`memwal_stream_cost.rs` owns F6b3 without creating another test target or CI
+job. Its controlled token-ledger variable is the number of zero-lane profile
+cycles before enrollment: each cycle commits an enable receipt and a terminal-
+disable receipt but cannot touch MemWAL because no lifecycle exists yet. The
+profile transitions also advance graph-manifest history; graph open and offline-
+authority setup occur outside the timed first-probe windows. The fixture then
+enrolls once and creates one all-diverted current token, so hit/miss result size,
+current-token cardinality, and terminal logical ID/page cardinality remain
+fixed. Exact page fields and serialized bytes are measured, not asserted equal
+across depths.
+
+The normal local regression is:
+
+```bash
+cargo test -p omnigraph-engine --features failpoints --test memwal_stream_cost f6b3_selected_token_uncovered_tail_cost_is_measured_at_small_depth -- --exact --nocapture
+```
+
+The on-demand 1/8/32/128 local and configured-RustFS sweeps are:
+
+```bash
+cargo test -p omnigraph-engine --features failpoints --test memwal_stream_cost f6b3_selected_token_uncovered_tail_cost_sweeps_to_128_profile_cycles -- --ignored --exact --nocapture
+OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-engine --features failpoints --test memwal_stream_cost f6b3_selected_token_uncovered_tail_cost_sweeps_on_configured_rustfs -- --ignored --exact --nocapture
+```
+
+Each sample reports the exact selected token version, named-index coverage,
+serialized terminal-page bytes, and cumulative advisory whole-process RSS.
+Fresh-handle hit/miss plus the first terminal page, then warm hit/miss and repeat
+terminal pages, report token-read counts, total table-store read bytes, manifest
+reads/bytes, adapter operations, and per-sample warm/repeat elapsed p50 plus
+max-of-eight. Graph open
+precedes those windows, so “fresh handle” is not a cold-open or cold-provider-
+cache claim. Assertions pin one exact hit, one exact miss, one terminal entry,
+zero writes, zero MemWAL/base reads, zero prefix listing, and zero payload-object
+reads for the measured hit/miss/list windows. Coverage is a separate read-only
+sample-level probe. The doc-hidden lookup and coverage seams are `failpoints`-
+gated and registered in `forbidden_apis.rs` as read-only.
+
+The instrument is intentionally an uncovered-tail curve. The production index
+covers the empty genesis version and no recovery-owned reconciler can yet
+publish extended coverage. Do not use raw `optimize_indices` in this fixture:
+that would move an unselected HEAD and measure a state production cannot
+authorize. Covered/reconciled evidence, status warning/age, and the scheduling
+threshold remain later owners.
 
 ### RFC-026 Phase B2b coverage ownership (specified, inactive)
 

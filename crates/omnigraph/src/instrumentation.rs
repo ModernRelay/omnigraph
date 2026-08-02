@@ -197,7 +197,8 @@ pub(crate) fn record_manifest_scan() {
 pub(crate) fn record_graph_build(edges: usize) {
     let _ = current(|p| {
         p.graph_build_count.fetch_add(1, Ordering::Relaxed);
-        p.graph_edges_built.fetch_add(edges as u64, Ordering::Relaxed);
+        p.graph_edges_built
+            .fetch_add(edges as u64, Ordering::Relaxed);
     });
 }
 
@@ -553,7 +554,7 @@ pub(crate) async fn open_dataset(
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
-/// Per-method read counts for [`CountingStorageAdapter`].
+/// Per-method call counts for [`CountingStorageAdapter`].
 #[derive(Debug, Default)]
 pub struct StorageReadCounts {
     pub read_text: AtomicU64,
@@ -561,6 +562,7 @@ pub struct StorageReadCounts {
     pub exists: AtomicU64,
     pub read_text_versioned: AtomicU64,
     pub list_dir: AtomicU64,
+    pub mutation_calls: AtomicU64,
     pub write_text: AtomicU64,
     pub delete: AtomicU64,
 }
@@ -581,6 +583,9 @@ impl StorageReadCounts {
     pub fn list_dir(&self) -> u64 {
         self.list_dir.load(Ordering::Relaxed)
     }
+    pub fn mutation_calls(&self) -> u64 {
+        self.mutation_calls.load(Ordering::Relaxed)
+    }
     pub fn write_text(&self) -> u64 {
         self.write_text.load(Ordering::Relaxed)
     }
@@ -589,8 +594,8 @@ impl StorageReadCounts {
     }
 }
 
-/// Boundary decorator over a [`StorageAdapter`] that counts read-facing calls.
-/// Reads delegate after incrementing; writes delegate unchanged. Construct with
+/// Boundary decorator over a [`StorageAdapter`] that counts every method call.
+/// Calls delegate after incrementing. Construct with
 /// [`CountingStorageAdapter::new`] and open an engine via
 /// `Omnigraph::open_with_storage` to count its non-Lance storage IO.
 #[derive(Debug)]
@@ -601,7 +606,9 @@ pub struct CountingStorageAdapter {
 
 impl CountingStorageAdapter {
     /// Wrap `inner`, returning the adapter and a shared handle to its counts.
-    pub fn new(inner: Arc<dyn StorageAdapter>) -> (Arc<dyn StorageAdapter>, Arc<StorageReadCounts>) {
+    pub fn new(
+        inner: Arc<dyn StorageAdapter>,
+    ) -> (Arc<dyn StorageAdapter>, Arc<StorageReadCounts>) {
         let counts = Arc::new(StorageReadCounts::default());
         let adapter: Arc<dyn StorageAdapter> = Arc::new(Self {
             inner,
@@ -637,11 +644,13 @@ impl StorageAdapter for CountingStorageAdapter {
     }
 
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.counts.write_text.fetch_add(1, Ordering::Relaxed);
         self.inner.write_text(uri, contents).await
     }
 
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.write_text_if_absent(uri, contents).await
     }
 
@@ -651,10 +660,12 @@ impl StorageAdapter for CountingStorageAdapter {
     }
 
     async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.rename_text(from_uri, to_uri).await
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.counts.delete.fetch_add(1, Ordering::Relaxed);
         self.inner.delete(uri).await
     }
@@ -665,7 +676,9 @@ impl StorageAdapter for CountingStorageAdapter {
     }
 
     async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
-        self.counts.read_text_versioned.fetch_add(1, Ordering::Relaxed);
+        self.counts
+            .read_text_versioned
+            .fetch_add(1, Ordering::Relaxed);
         self.inner.read_text_versioned(uri).await
     }
 
@@ -675,12 +688,14 @@ impl StorageAdapter for CountingStorageAdapter {
         contents: &str,
         expected_version: &str,
     ) -> Result<Option<String>> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner
             .write_text_if_match(uri, contents, expected_version)
             .await
     }
 
     async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.delete_prefix(prefix_uri).await
     }
 }

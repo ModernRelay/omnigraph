@@ -91,6 +91,16 @@ pub async fn disable_stream_profile(db: &Arc<Omnigraph>, cluster_uri: &str) {
 }
 
 pub async fn try_disable_stream_profile(db: &Arc<Omnigraph>, cluster_uri: &str) -> Result<()> {
+    disable_stream_profile_with_operation_id(db, cluster_uri, "memwal-stream-test-disable").await
+}
+
+/// Disable with a caller-owned receipt identity. Cost fixtures use this to
+/// grow immutable profile history through repeated zero-lane transitions.
+pub async fn disable_stream_profile_with_operation_id(
+    db: &Arc<Omnigraph>,
+    cluster_uri: &str,
+    operation_id: &str,
+) -> Result<()> {
     let cluster_uri = cluster_uri.trim_end_matches('/');
     let status = db.stream_status().await.unwrap();
     let state_cas = write_cluster_state(cluster_uri).await;
@@ -113,7 +123,7 @@ pub async fn try_disable_stream_profile(db: &Arc<Omnigraph>, cluster_uri: &str) 
             declaration_revision: STREAM_DECLARATION_REVISION,
             declaration_digest: STREAM_DECLARATION_DIGEST,
             expected_profile_revision: status.profile_revision,
-            operation_id: "memwal-stream-test-disable",
+            operation_id,
             operation: AuthorityOperationClass::StreamProfileDisable,
             actor: "operator:memwal-test",
             confirm_stream_offline: true,
@@ -217,6 +227,21 @@ pub async fn list_stream_dead_letters(
     cluster_uri: &str,
     cursor: Option<&str>,
 ) -> Result<StreamDeadLetterPage> {
+    list_stream_dead_letters_after_authority(db, cluster_uri, cursor, || {}).await
+}
+
+/// Run a callback after stopped/offline authority is fully checked but before
+/// the selected-token scan starts. Cost instruments use this boundary to keep
+/// cluster-lock/state setup out of the measured list operation.
+pub async fn list_stream_dead_letters_after_authority<F>(
+    db: &Omnigraph,
+    cluster_uri: &str,
+    cursor: Option<&str>,
+    ready: F,
+) -> Result<StreamDeadLetterPage>
+where
+    F: FnOnce(),
+{
     let cluster_uri = cluster_uri.trim_end_matches('/');
     let status = db.stream_status().await?;
     let state_cas = write_cluster_state(cluster_uri).await;
@@ -248,6 +273,7 @@ pub async fn list_stream_dead_letters(
     .await
     .unwrap();
     let authority = db.check_cluster_dead_letter_authority(guard).await?;
+    ready();
     db.list_stream_dead_letters(authority, cursor).await
 }
 
