@@ -23,7 +23,10 @@ terminal dead-letter folds plus three-disposition retirement implemented. F6a
 adds a typed failpoints-only process-local advisory driver snapshot and one
 hidden in-process composed candidate-runtime acceptance. F6b1 adds exact-
 terminal lower/engine served-export authority and one hidden immutable export
-cut without a format/recovery change or public route.
+cut without a format/recovery change or public route. F6b2 is the implemented
+no-format acceptance slice for Unix `SIGTERM`, sequential OS-process recovery,
+frozen-round node/edge fairness, physical rebind → re-enable → reopen → resume,
+combined maintenance, fresh-target import, and legacy writer refusal.
 Public row streaming, public enrollment, general lifecycle/rebind verbs,
 `AuthorityBlock` repair,
 exclusive-cut physical/public driver status, the F6b-remainder guardrail
@@ -172,9 +175,10 @@ Cold start re-derives backlog from manifest and authenticated MemWAL authority;
 finite rounds visit nodes before edges with a carried round-robin cursor inside
 each immutable-identity cohort; and retryable failures back off. After listener
 bind the cluster server starts every selected supervisor. Graceful shutdown
-fences producers, joins the driver, then owns the profile and every resident
-lane admission while aborting process-local writers and joining idle authority
-owners. The complete cleanup is detached: cancellation or the bounded caller
+fences root MemWAL opportunity exclusively, then profile authority exclusively,
+drops both gates, and joins the driver before it again owns the profile and
+every resident lane admission while aborting process-local writers and joining
+idle authority owners. The complete cleanup is detached: cancellation or the bounded caller
 deadline cannot release offline authority ahead of it, and any terminal failure
 retains that authority fail-closed. No manifest, token, sidecar, or recovery grammar changed. F5b0
 below closes goal-`SEALED` continuation and the offline disable owner; public
@@ -250,6 +254,31 @@ format or recovery grammar and activates no HTTP, SDK, remote CLI, OpenAPI,
 bounded channel/byte reservation, deadline, stall/disconnect handling,
 measurement, or public status surface. Those plus the remaining matrix stay in
 the F6b remainder/F7 boundary.
+**F6b2 process/lifecycle acceptance slice implemented:** 2026-08-02 — green existing
+server and hidden engine cells cover Unix `SIGTERM` through the shared
+graceful-shutdown path; sequential OS-process exit/reopen with persisted
+recovery; a frozen finite round where a newly ready node cannot overtake an
+already captured edge; and terminal disable → same-schema physical rebind →
+re-enable → reopen → explicit resume → exactly-once ingest/fold. The composed
+`quiesce -> EnsureIndices -> Optimize -> resume` and checked-cut fresh-target
+import cells are green too. The focused legacy Mutation/Load/delete,
+`load_file`, and corresponding `_as` refusal matrix is green under `ENABLED`
+and interrupted `DISABLING`; F6b2 is implemented.
+Resident-producing served puts use bounded preprocessing/inflight → root
+MemWAL opportunity shared → profile shared → table admission. The driver holds
+root opportunity exclusive across its frozen finite round and takes
+profile/admission per candidate; both permit kinds retain the worker-registry
+`Arc`, preventing weak-root fence ABA. Shutdown fences root opportunity
+exclusive and then profile exclusive, drops both, and joins the driver.
+An already-installed empty resume writer does not yet join this root fence, so
+F6b2 claims no hard sub-60-second fairness handoff for it; that broader
+resume/driver integration remains later. Process-local gates remain only
+sequential sole-writer evidence, not a distributed fence.
+Productive SchemaApply stays refused on enrolled graphs: EXP schema evolution
+is checked sealed/retired export followed by fresh init/load, while physical
+rebind keeps accepted schema unchanged. Measurements, long-history evidence,
+bounded public export transport, public status, and served parity remain later
+F6b/F7 work.
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s unified write and
 generic recovery-sidecar protocol, plus
@@ -522,10 +551,12 @@ Every stream contract is bound to RFC-028's
 `(stable_table_id, incarnation_id)` pair. A rename preserves that pair, so the
 logical stream contract and ownership of reject history remain continuous.
 That continuity does **not** authorize adoption of physical WAL artifacts. A
-same-dataset rename preserves the current physical enrollment; a rename or
-other SchemaApply that rematerializes the table binds the preserved logical
+same-dataset rename preserves the current physical enrollment. In future Phase
+D, a SchemaApply that rematerializes the table may bind the preserved logical
 pair to a fresh physical enrollment and fresh shard namespace through §3 and
-§8. Dropping and later re-adding the same name mints a new pair; the new table
+§8; the EXP profile does not activate that writer and instead uses
+checked-export/fresh-target rebuild for schema evolution. Dropping and later
+re-adding the same name mints a new pair; the new table
 cannot adopt the old table's WAL, lifecycle row, reject rows, epochs, or merge
 progress.
 
@@ -780,12 +811,15 @@ accounting. **B2b** is the deferred managed-reclamation profile through the
 Lance-owned protocol in §4.5.2. B2a retains individually bounded protocol
 records indefinitely, but EXP exposes no public audit-history pagination; it
 has no aggregate receipt-count/byte cap, `GraphHistoryBudget`, retained-storage
-quota, or closure-capacity reservation. In-place SchemaApply and maintenance
-on an enrolled table stay refused in current code. Phase D owns automatic
-operation-scoped drain; §4.7 P7 pulls only the explicit
-`quiesce -> served same-binding maintenance -> resume` bridge and the
-`stop -> disable to DISABLED -> offline schema/rebind -> enable -> restart ->
-resume` bridge into the experimental activation.
+quota, or closure-capacity reservation. In-place productive SchemaApply on an
+enrolled graph stays refused in the EXP profile. Phase D owns automatic
+operation-scoped drain and any future broader schema integration; §4.7 P7
+pulls only the explicit `quiesce -> served same-binding maintenance -> resume`
+bridge and the `stop -> disable to DISABLED -> offline physical rebind ->
+enable -> restart -> resume` bridge into the experimental activation. Schema
+evolution in EXP uses checked sealed/retired export, fresh initialization with
+the desired schema, and ordinary load into that fresh graph; it never loads
+over the enrolled source.
 
 ### 4.1 Durable row identity and same-key retry safety
 
@@ -2985,12 +3019,18 @@ available.
 
 Disable is a durable two-publication management operation. F2 adds one
 graph-profile admission gate outside every table gate and takes it exclusively
-for the first disable CAS. The later hidden-ingress slice makes each row path
-hold it shared from the final profile/delegation check through
-`put_no_wait`, watcher durability, and same-writer fence classification; the
-lock order is graph-profile shared, table admission, then same-key queue. The
-gate orders owners within the one current process; it is not the
-cross-process handoff. The required server-exit/apply-start sequence above
+for the first disable CAS. That gate remains outermost for ordinary and other
+non-resident-producing writers. F6b2 makes resident-producing served ingress
+retain bounded preprocessing/inflight ownership, then acquire the root MemWAL
+opportunity shared, graph-profile shared, table admission, and same-key queue.
+These guards transfer through `put_no_wait`, watcher durability, and
+same-writer fence classification. The driver holds root opportunity exclusive
+across one frozen finite round and then takes profile/admission per candidate;
+both permit kinds retain the worker-registry `Arc`, so a weak-root reopen
+cannot create an independent fence. Runtime shutdown fences root opportunity
+exclusive and then profile exclusive, drops both, and only then joins the
+driver. These gates order owners within the one current process; they are not
+the cross-process handoff. The required server-exit/apply-start sequence above
 supplies that boundary. While holding the apply process's gate exclusively,
 the capability-bound adapter CASes
 `ENABLED -> DISABLING`, advances profile revision, and stores `DisablePlan {
@@ -3272,19 +3312,22 @@ lifecycle uses an automatic bodyless prepare handshake before its first row:
    rebuild/re-enrollment requires the caller to choose a new occurrence and
    predecessor.
 
-Before the table lease, prepare and ordinary put acquire the graph-profile gate
-shared. Under the same exclusive table admission lease and existing
-schema/main/token/table gates, prepare reruns the recovery barrier and rereads
-canonical-main `stream_profile`; the eligibility witness, enabled revision,
-live `FoldDelegation`, and checked runtime must all match.
+Before the table lease, prepare—an enrollment control rather than a
+resident-producing row put—acquires the graph-profile gate shared. Under the
+same exclusive table admission lease and existing schema/main/token/table
+gates, prepare reruns the recovery barrier and rereads canonical-main
+`stream_profile`; the eligibility witness, enabled revision, live
+`FoldDelegation`, and checked runtime must all match.
 `DISABLED`, `DISABLING`, a changed graph/table identity, ineligibility, or a
 delegation mismatch refuses before sidecar or Lance effect; a still-eligible
 absent lane with moved HEAD/ref/catalog/profile evidence returns the bounded
-witness challenge above. Ordinary admission
-performs the same final profile/delegation/runtime match before handing off a
-run. Both retain the outer shared guard through invocation, watcher durability,
-and same-writer fence classification; a disconnected request transfers it with
-the bounded invoked tail. The offline disable owner takes its own process's
+witness challenge above. Resident-producing ordinary admission retains bounded
+preprocessing/inflight ownership, then takes root MemWAL opportunity shared,
+graph-profile shared, and table admission before performing the same final
+profile/delegation/runtime match and handing off a run. Those permits remain
+through invocation, watcher durability, and same-writer fence classification;
+a disconnected request transfers them with the bounded invoked tail. The
+offline disable owner takes its own process's
 gate exclusively only for the first profile CAS and releases it before
 per-table drains. The supported production race is closed by the
 server-exit/apply-start handoff, not a cross-process lock.
@@ -3429,10 +3472,10 @@ a no-effect wake. Wakeups coalesce into bounded per-table state; the manifest
 and authenticated Lance MemWAL cursor remain work authority. Cold start
 discovers `OPEN` backlog and retryable errors back off. After listener bind the
 cluster server starts every checked-runtime supervisor; after Axum settles
-in-flight requests it crosses each profile-exclusive producer fence before
-requesting stop, joins each driver, then reacquires the profile fence and every
-resident lane's exclusive admission while aborting writers and joining idle
-authority owners. One detached cleanup owns that full handoff across caller
+in-flight requests it fences each root MemWAL opportunity exclusively and then
+profile authority exclusively, drops both, and requests/joins each driver. It
+then reacquires profile authority and every resident lane's exclusive admission
+while aborting writers and joining idle authority owners. One detached cleanup owns that full handoff across caller
 cancellation or the shared bounded deadline; failure retains authority
 fail-closed. Public health/backlog
 projection remains activation work.
@@ -3538,14 +3581,12 @@ records the complete confirmed Optimize output set and each exact achieved
 HEAD. Both re-prove the selected ClaimReceipt from captured token authority
 and atomically refresh pointers, both HEAD-witness copies, verified-empty
 digests, and lifecycle revisions. Neither writes `_stream_tokens` nor advances
-the management-receipt chain. Their ambient forms remain fenced. Every
-cluster-declared schema operation—even one proved to preserve physical row
-bytes, hidden stream metadata, token semantics, table identity, and
-binding—uses the terminal-`DISABLED` offline owner below and the same explicit
-recovery integration. A schema/configuration/path/native-ref change that
-rematerializes or changes binding stays `SEALED` and completes
-recovery-covered `stream_rebind` with a fresh enrollment, binding-scope ID, and
-shard namespace. Rebind retains the old
+the management-receipt chain. Their ambient forms remain fenced. Productive
+SchemaApply is not one of these sanctioned writers, even under terminal
+`DISABLED`. It remains refused on an enrolled graph; schema changes use checked
+export/rebuild into a fresh graph. A same-schema physical rebind stays
+`SEALED` and completes recovery-covered `stream_rebind` with a fresh
+enrollment, binding-scope ID, and shard namespace. Rebind retains the old
 binding/claim receipts, installs a new `BindingReceipt`, scoped initial
 fence-only `ClaimReceipt`, current receipt ID, and freshly verified empty proof,
 and publishes the new binding as **`SEALED`** without admitting a writer or
@@ -3564,8 +3605,9 @@ not authorize content writes, deletion, or adoption. There is no generic
 exception, but a named graph branch prevents bounded resume. Automatic
 operation-scoped drain remains Phase D. The implemented private compositions
 are explicit `quiesce -> checked-runtime EnsureIndices -> resume` and
-`quiesce -> checked-runtime Optimize -> resume`; served maintenance and cluster
-schema/rebind remain later work.
+`quiesce -> checked-runtime Optimize -> resume`; served maintenance, the
+production physical-rebind handoff, and the fresh-target schema-rebuild
+workflow remain later work.
 
 Production ownership is part of P7, not left to an ambient engine caller.
 Same-binding EnsureIndices and Optimize already execute only through the serving process's
@@ -3585,23 +3627,25 @@ A true no-work invocation creates no sidecar, graph lineage, or lifecycle
 successor. F7 supplies actor/policy/transport ownership without adding a token
 receipt framework.
 
-A cluster schema/configuration, path, native-ref, or rebind change does not
-rely on an operator-timed quiesce/shutdown gap. It follows `graceful server
-shutdown -> offline disable to terminal DISABLED -> cluster apply
---confirm-stream-offline -> separate enable apply -> server restart -> explicit
-resume`. The durable disable plan captures and drains any prepare, put, or
-resume that won before transport closed. Only after terminal `DISABLED` may the
-apply process hold the mandatory cluster state lock and mint
-`CheckedClusterMaintenanceAuthority` bound to the exact disabled profile
-revision, validated declaration, and graph/store mapping. It then runs the
-graph-global recovery barrier before any schema/rebind effect. Only after every
-enrollment, writer-claim, fold, lifecycle, and maintenance sidecar settles—and
-any ordinary cold-WAL reopen/reconstruction is classified—does it release and
-reacquire gates from the root, recapture sealed authority, and permit
-schema/rebind effects. It revalidates every sealed proof and leaves rebound
-lanes `SEALED`. Re-enable is a distinct offline apply that exits before server
-restart. The existing operation's Cedar action and `stream_manage` are both
-required. Any drain blocked on `DataBlock` uses only F3f's offline `cluster
+A same-schema physical rebind does not rely on an operator-timed
+quiesce/shutdown gap. It follows `graceful server shutdown -> offline disable
+to terminal DISABLED -> cluster apply --confirm-stream-offline -> separate
+enable apply -> server restart -> explicit resume`. The durable disable plan
+captures and drains any prepare, put, or resume that won before transport
+closed. Only after terminal `DISABLED` may the apply process hold the mandatory
+cluster state lock and mint `CheckedClusterMaintenanceAuthority` bound to the
+exact disabled profile revision, validated declaration, and graph/store
+mapping. It then runs the graph-global recovery barrier before any rebind
+effect. Only after every enrollment, writer-claim, fold, lifecycle, and
+maintenance sidecar settles—and any ordinary cold-WAL reopen/reconstruction is
+classified—does it release and reacquire gates from the root, recapture sealed
+authority, and permit the physical rebind. It revalidates every sealed proof
+and leaves rebound lanes `SEALED`. Re-enable is a distinct offline apply that
+exits before server restart. Productive SchemaApply remains refused on an
+enrolled graph; schema evolution freezes a checked sealed/retired export and
+initializes and loads a fresh graph under the desired schema. The existing
+operation's Cedar action and `stream_manage` are both required. Any drain
+blocked on `DataBlock` uses only F3f's offline `cluster
 stream block show|correct --confirm-stream-offline` controls under that same
 sole-writer handoff. Future `AuthorityBlock` repair must use a distinct
 reason-gated owner under the same handoff. EXP has no served HTTP
@@ -3693,11 +3737,12 @@ served-only/direct-refusal boundary. Cluster docs separately cover the narrow
 offline dead-letter, correction, authority-repair, and retirement exits.
 Maintenance docs show exact
 `quiesce -> served Optimize/EnsureIndices -> resume`; cluster and upgrade docs
-show `graceful stop -> offline disable to terminal DISABLED ->
-cluster-state-locked offline schema/rebind -> separate enable -> restart ->
-explicit resume`, including safe served export with the old-format binary from
-an exact pinned sealed cut before cutover and init/load into a fresh target
-rather than in-place import. The constants
+show the distinct `graceful stop -> offline disable to terminal DISABLED ->
+cluster-state-locked physical rebind -> separate enable -> restart -> explicit
+resume` and checked-export -> fresh-init/load schema-change workflows. The
+latter includes safe served export with the old-format binary from an exact
+pinned sealed cut before cutover and init/load into a fresh target rather than
+in-place import. The constants
 reference publishes every activated measured F6/F7 row/byte/count/time default:
 ingress line/run/root ownership, preprocessing, fold/dead-letter single-object
 byte and RSS envelopes, driver cadence/backoff, bounded current-terminal scan
@@ -3769,7 +3814,8 @@ authority became `PRESENT`.
 The remaining evidence covers prepare witness/actor/lost-response/no-body
 ordering; concurrent first prepare and first writers; stale incarnation and
 authority movement; shutdown and transport-close races; cross-process
-profile-CAS recovery; schema/rebind refusal before terminal `DISABLED`;
+profile-CAS recovery; physical-rebind refusal before terminal `DISABLED`;
+productive SchemaApply refusal plus checked fresh-target rebuild;
 capability construction and revocation; startup mismatch refusal; bounded
 ingress/reorder/output ownership; disable convergence; pinned-cut safe export
 and backpressure; served/remote DTO parity; `forbidden_apis`; genuine rebuild;
@@ -4252,14 +4298,19 @@ correction uses the same multi-participant envelope described in §4.4; it does
 not turn a generation into multiple base-table keyed transactions.
 
 Because `_stream_tokens.lance` is one graph-global physical participant, B2
-adds one root-shared stream-token gate. The universal order for a manifest
-publisher is `graph-profile (shared or exclusive, when required) -> sorted
-relevant stream admission -> schema -> main branch -> stream token -> sorted
-graph tables -> selected same-key queues`. A writer that requires neither
-outer gate starts at schema; a profile-bound writer with no relevant table
-admission skips only the stream-admission step. No caller acquires a newly
-discovered profile, stream-admission, or same-key authority after entering a
-later gate; it releases and restarts from the root barrier. Every fold or
+adds one root-shared stream-token gate. The universal order for an ordinary or
+other non-resident-producing manifest publisher is `graph-profile (shared or
+exclusive, when required) -> sorted relevant stream admission -> schema ->
+main branch -> stream token -> sorted graph tables -> selected same-key
+queues`. A resident-producing served put first retains its bounded
+preprocessing/inflight reservation and shared root MemWAL opportunity, then
+joins that profile -> admission order. The driver instead holds the root
+opportunity exclusive across the frozen round and takes profile/admission per
+candidate. A writer that requires neither ordinary outer gate starts at schema;
+a profile-bound writer with no relevant table admission skips only the
+stream-admission step. No caller acquires a newly discovered root opportunity,
+profile, stream-admission, or same-key authority after entering a later gate;
+it releases and restarts from the root barrier. Every fold or
 correction captures the token dataset's exact manifest-selected version,
 transaction UUID in its `ReadSet`; it never persists or compares a
 provider-local e_tag and never opens raw token HEAD as current authority. The
@@ -4272,8 +4323,9 @@ EnsureIndices, Optimize, Repair, Cleanup, recovery, and future writers all
 resolve or refuse it before base capture even when its graph table is disjoint.
 Quiesce and rebuild preflight use the same barrier. If final relisting discovers
 a late global sidecar, stream lifecycle, required admission lease, or same-key
-authority, the caller releases every graph-profile, stream-admission, schema,
-branch, token, table, and same-key guard and restarts from the root barrier; it
+authority, the caller releases every held root-opportunity, graph-profile,
+stream-admission, schema, branch, token, table, and same-key guard and restarts
+from the root barrier; it
 never recovers a
 disjoint global sidecar while retaining one caller table's gate. This prevents
 an unmanifested token HEAD from being buried by an ordinary graph commit.
@@ -4468,12 +4520,14 @@ needs that queue. The separate admission gate closes first; fold commit then
 acquires the normal table queue. Crash recovery resumes from the durable state,
 current-HEAD witness, and per-shard epoch map.
 
-Schema apply must drain every affected enrolled type before changing fields,
-constraints, PK, embeddings, or `@stream` and resumes only when compatible.
-RFC-028's current pure type rename retains the same dataset, identity, path,
-and Lance version, so it does not by itself rebind the physical enrollment. If
-a future schema feature supports a rematerializing rename while preserving the
-logical pair, it cannot preserve the old physical enrollment:
+Future Phase-D schema apply must drain every affected enrolled type before
+changing fields, constraints, PK, embeddings, or `@stream` and resumes only
+when compatible. That writer is inactive in EXP, where schema change requires
+checked export and rebuild into a fresh graph. RFC-028's current pure type
+rename retains the same dataset, identity, path, and Lance version, so it does
+not by itself rebind the physical enrollment. If a future schema feature
+supports a rematerializing rename while preserving the logical pair, it cannot
+preserve the old physical enrollment:
 
 1. drain, fold, fence, and publish the old binding as `SEALED`;
 2. let SchemaApply rematerialize and publish the target table while leaving the
@@ -5118,10 +5172,11 @@ RFC remains draft.
   before recovery I/O and before the bounded tombstone allocation; raw-fit input
   then receives exact post-tombstone validation before that recovery I/O. After
   any recovery/authority prelude, the exact charge is recomputed and reserved
-  against the root aggregate. Every put uses exact charge → shared admission →
-  same-key input queue → worker-mode inspection before detached ownership,
-  cold claim, or `put_no_wait`; that queued charge transfers into the resident
-  generation without double-counting;
+  against the root aggregate. Every resident-producing served put uses bounded
+  preprocessing/inflight → root MemWAL opportunity shared → graph-profile
+  shared → table admission → same-key input queue → worker-mode inspection
+  before detached ownership, cold claim, or `put_no_wait`; that queued charge
+  transfers into the resident generation without double-counting;
   crossing the generation cap is typed, row-effect-free `FoldRequired`.
   Anything after invocation is `AckUnknown`, never an effect-free retry.
 - Reopen validates config, binding, lifecycle witness, epoch, authoritative WAL
@@ -5748,11 +5803,13 @@ this activates `AuthorityBlock` repair.
   Measurements validate but do not create the bound, and budget is never
   released optimistically.
 - Base B2 keeps every writer refused at `SEALED`. Experimental §4.7 P7 narrows
-  that only for explicitly integrated content-preserving Optimize,
-  EnsureIndices, and schema-metadata operations whose recovery atomically
-  updates the witness/proof; Mutation/Load, BranchMerge, cleanup, adoption, and
-  every unintegrated writer remain refused. Phase D still owns automatic
-  operation drain and the broader token-aware direct-write/rebind transition.
+  that only for explicitly integrated content-preserving Optimize and
+  EnsureIndices whose recovery atomically updates the witness/proof, plus the
+  separately checked terminal-disabled physical-rebind owner. Productive
+  SchemaApply, Mutation/Load, BranchMerge, cleanup, adoption, and every
+  unintegrated writer remain refused. EXP schema evolution uses checked
+  export/rebuild into a fresh graph. Phase D still owns automatic operation
+  drain and any broader token-aware direct-write/schema integration.
 - `SEALED` alone does not authorize export/rebuild after public terminal
   disposition. Preflight accepts only ordinary `DISABLED` plus token/base
   parity and zero current `DEAD_LETTERED | WITHDRAWN`, or `RETIRED` plus the
@@ -5783,7 +5840,9 @@ this activates `AuthorityBlock` repair.
   `(table, shard, generation, wal_position)` tuple is not accepted as identity.
 - Phase D integrates **automatic** drain/resume orchestration with SchemaApply,
   branches, Optimize, Repair, Cleanup, and physical rebind. Experimental P7
-  separately pulls forward the explicit operator-driven safe subset. A
+  separately pulls forward only the explicit same-binding maintenance and
+  terminal-disabled physical-rebind subset; EXP schema changes remain
+  fresh-target rebuilds. A
   rematerialized table stays `SEALED` until an exact sidecar-covered rebind
   publishes a new namespace and proof; a separate resume opens it.
 - Phase E fresh reads race capture with fold/GC and rebind, retain generation
@@ -5810,7 +5869,7 @@ remain concurrent with one another.
 | B2a | selected unbounded retain-all/no-GC profile on stock Lance | **Private gate implemented 2026-07-21 (§12.5):** no OmniGraph byte/object/file/history quota; zero canonical `_mem_wal` deletion; complete/partial provider residue remains retained, unreferenced, and untouched below its root through retry/reopen; provider failures are loud; local/configured-RustFS history sweeps are advisory. This gate itself activated no schema or product surface; the later private B2-common slice activates v9 |
 | B2b | candidate managed-reclamation retention profile | Inactive. Requires the Lance-owned durable inspect/plan/execute + receipt, post-success fencing, bounded checkpoint/inventory/accounting, local/RustFS enforced-bound validation, and the profile-specific crash matrix (§4.5.2/§12.6). Passing it alone activates no product surface |
 | B2-common | schema v9/config-v3/state-v2, compare-and-chain token/attribution, graph-global token authority, recovery-v12 base+token fold; then explicit enrollment, revision-fenced lifecycle/correction/full status, SDK row/control methods, HTTP, CLI, and OpenAPI | **Private row/fold subset implemented 2026-07-22 (§11/§12.6):** canonical digests, hidden attribution, stale-authority revalidation after shared admission, same-generation chains, exact two-participant recovery/publication, durable fold attribution, retain-all, and genuine v8↔v9 refusal/rebuild are green. Explicit production enrollment, general lifecycle mutation, exclusive-cut physical status, public row admission, cancellation/shutdown, API compatibility, and transport parity remain inactive. The Cedar vocabulary, embedded manifest-only status, and narrow stopped/offline F3f DataBlock correction shipped in later EXP slices. `GraphHistoryBudget` belongs only to a future bounded/managed profile |
-| EXP | experimental cluster-only activation of the §4.7 profile: capability-bound manifest enablement via offline `cluster apply`; lazy graph-wide enrollment; caller-supplied vectors; terminal per-key object-form dead letter plus recovery-bound structural-authority correction; irreversible same-format authority retirement for fresh-root rebuild; explicit lifecycle-aware content-preserving `SEALED` maintenance/rebind; no read-your-writes bridge; starvation-free serial dependency-prioritized fold core with non-overlapping resident-enabled and offline-disable owners; upsert-only; hidden-first ingress followed by atomic served HTTP/remote-client/CLI/OpenAPI activation with direct mutation refused | **Selected 2026-07-27 and protocol choices amended 2026-07-29 (§4.7); v10 P1, v11 profile authority, hidden v12/lifecycle-v3/recovery-v14, F3a v13/recovery-v15, F3b EnsureIndices v14/recovery-v16, F3c Optimize v15/recovery-v17, F3d physical rebind v16/recovery-v18, F3e authority retirement v17/recovery-v19, F3f DataBlock correction v18/recovery-v20, hidden F4 ingest/prepare, format-neutral F5a automatic `OPEN` folding, F5b0 operational convergence, F5b terminal diversion in v19/recovery-v21, F6a in-process acceptance, and F6b1 checked immutable export-cut authority are implemented.** V11–v18 retain the profile, lifecycle, maintenance, rebind, retirement, and DataBlock contracts described above. F4 closes the caller-shaped private request path; F5a adds coalesced timer/cap triggers, cold `OPEN` backlog discovery, finite node-before-edge rounds, and bounded shutdown over recovery-v14 authority. F5b0 adds exact-`ENABLED` goal-`SEALED` restart continuation and checked offline `DISABLING` convergence, including `OPEN_AFTER_FOLD` adoption and loud `DataBlock` park/correct/rerun. Current v19/token-schema-v3/recovery-v21 deterministically publishes valid winners, records all losing terminal candidates in one bounded canonical object, makes each losing key current `DEAD_LETTERED`, supports exact retry plus a fresh ordinary successor, exposes stopped/offline selected-token list/export, and extends retirement to `WITHDRAWN | DEAD_LETTERED`. F6a adds only a typed failpoints-only process-local advisory driver snapshot and one hidden in-process composed acceptance; public durable status stays manifest-only. F6b1 adds lower/engine exact-terminal export-only authority plus a doc-hidden move-only cut that freezes the accepted catalog, selected exact table versions, and retired provenance under full gates, then retains one nonwaiting root slot through output after dropping those gates. It changes no format/recovery grammar and activates no public route. Public driver/exclusive-cut status, public ingress/enrollment/lifecycle/rebind control, every served row/lifecycle streaming transport, and unreachable `AuthorityBlock` repair remain inactive. The F6b remainder owns measurements and the remaining guardrail matrix; public activation still requires F7-co-landed bounded export transport plus served/remote DTO/OpenAPI parity after every F6 gate passes. |
+| EXP | experimental cluster-only activation of the §4.7 profile: capability-bound manifest enablement via offline `cluster apply`; lazy graph-wide enrollment; caller-supplied vectors; terminal per-key object-form dead letter plus recovery-bound structural-authority correction; irreversible same-format authority retirement for fresh-root rebuild; explicit lifecycle-aware content-preserving `SEALED` same-binding maintenance and terminal-disabled physical rebind; schema evolution only through checked fresh-root rebuild; no read-your-writes bridge; starvation-free serial dependency-prioritized fold core with non-overlapping resident-enabled and offline-disable owners; upsert-only; hidden-first ingress followed by atomic served HTTP/remote-client/CLI/OpenAPI activation with direct mutation refused | **Selected 2026-07-27 and protocol choices amended 2026-07-29 (§4.7); v10 P1, v11 profile authority, hidden v12/lifecycle-v3/recovery-v14, F3a v13/recovery-v15, F3b EnsureIndices v14/recovery-v16, F3c Optimize v15/recovery-v17, F3d physical rebind v16/recovery-v18, F3e authority retirement v17/recovery-v19, F3f DataBlock correction v18/recovery-v20, hidden F4 ingest/prepare, format-neutral F5a automatic `OPEN` folding, F5b0 operational convergence, F5b terminal diversion in v19/recovery-v21, F6a in-process acceptance, and F6b1 checked immutable export-cut authority are implemented.** V11–v18 retain the profile, lifecycle, maintenance, rebind, retirement, and DataBlock contracts described above. F4 closes the caller-shaped private request path; F5a adds coalesced timer/cap triggers, cold `OPEN` backlog discovery, finite node-before-edge rounds, and bounded shutdown over recovery-v14 authority. F5b0 adds exact-`ENABLED` goal-`SEALED` restart continuation and checked offline `DISABLING` convergence, including `OPEN_AFTER_FOLD` adoption and loud `DataBlock` park/correct/rerun. Current v19/token-schema-v3/recovery-v21 deterministically publishes valid winners, records all losing terminal candidates in one bounded canonical object, makes each losing key current `DEAD_LETTERED`, supports exact retry plus a fresh ordinary successor, exposes stopped/offline selected-token list/export, and extends retirement to `WITHDRAWN | DEAD_LETTERED`. F6a adds only a typed failpoints-only process-local advisory driver snapshot and one hidden in-process composed acceptance; public durable status stays manifest-only. F6b1 adds lower/engine exact-terminal export-only authority plus a doc-hidden move-only cut that freezes the accepted catalog, selected exact table versions, and retired provenance under full gates, then retains one nonwaiting root slot through output after dropping those gates. It changes no format/recovery grammar and activates no public route. Public driver/exclusive-cut status, public ingress/enrollment/lifecycle/rebind control, every served row/lifecycle streaming transport, and unreachable `AuthorityBlock` repair remain inactive. The F6b remainder owns measurements and the remaining guardrail matrix; public activation still requires F7-co-landed bounded export transport plus served/remote DTO/OpenAPI parity after every F6 gate passes. |
 | C | restart-stable reject-row identity, atomic dead letter, richer status, and evidence-backed configurable bounds | reject crash matrix; reject-retention proof; backpressure and RSS/latency evidence. The §4.7 profile pulls a bounded object-form dead-letter subset forward using the §4.1 token as reject identity |
 | D | automatic operation drain, broader schema/branch/upgrade integration, and orchestrated rematerialization rebind beyond P7's explicit bridge | two-coordinator race, old/new physical-binding crash matrix, and format-transition suite |
 | E | fresh cuts and maintained-index reads; cross-process `Fresh` ships only if the substrate generation-retention guard exists (§9), otherwise same-process only | cut consistency; merged-generation exclusion |

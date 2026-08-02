@@ -202,6 +202,11 @@ pub mod names {
     /// immutable cut while every writer gate is still held. Concurrency tests
     /// park here to prove writers wait only until capture returns.
     pub const STREAM_EXPORT_POST_CUT_CAPTURE: &str = "stream_export.post_cut_capture";
+    /// The resident stream driver has frozen and ordered one finite
+    /// manifest-derived round, but has not attempted its first lane. Tests use
+    /// this boundary to add a new node trigger and prove it cannot enter ahead
+    /// of an edge already captured in the round.
+    pub const STREAM_DRIVER_POST_ROUND_FREEZE: &str = "stream_driver.post_round_freeze";
     /// B1 completed every row-effect-free check and reservation but has not
     /// invoked `ShardWriter::put_no_wait` yet.
     pub const STREAM_B1_BEFORE_PUT_INVOKE: &str = "stream_b1.before_put_invoke";

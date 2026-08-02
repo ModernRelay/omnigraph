@@ -740,6 +740,45 @@ format or recovery grammar. It does not cover a public HTTP/SDK/CLI/OpenAPI
 handler, bounded channel or byte reservation, deadline, stall/disconnect
 behavior, measurements, or the remaining F6b matrix; those remain F6b/F7 work.
 
+### RFC-026 implemented F6b2 acceptance scope
+
+F6b2 extends the existing server, worker, and `memwal_stream.rs` owners rather
+than creating another harness. Green cells cover Unix `SIGTERM` reaching the
+same graceful-shutdown path as Ctrl-C; sequential OS-process exit/reopen with
+persisted recovery; a finite driver round in which a newly ready node cannot
+overtake an edge already captured by the round; and terminal disable →
+same-schema physical rebind → re-enable → reopen → explicit resume. The rebind
+cell must prove that the fresh binding remains `SEALED` until resume, the old
+binding is not re-adopted, and a post-resume ingest/fold publishes exactly
+once.
+
+The composed `quiesce → EnsureIndices → Optimize → resume` chain and checked
+ordinary `DISABLED` export-cut load into a fresh target are green. The latter
+imports logical rows only and proves the target starts `DISABLED` without
+lifecycle or token authority. The legacy Mutation/Load/delete, `load_file`, and
+corresponding `_as` checked-runtime refusal matrix is green under `ENABLED` and
+interrupted `DISABLING`. F6b2 is implemented.
+
+The fairness owner pins bounded preprocessing/inflight → shared root MemWAL
+opportunity → shared profile → table admission for resident-producing served
+puts. The driver holds the root opportunity exclusively across the frozen
+finite round, then takes profile/admission per candidate. Producer and round
+permits retain the `MemWalWorkerRegistry` `Arc`, so dropping every graph handle
+cannot create a second fence through the weak root map while a permit lives.
+Shutdown takes root opportunity exclusive and then profile exclusive, drops
+both before joining the driver, and therefore does not deadlock the driver's
+final round. This cell makes no hard sub-60-second fairness claim for an
+already-installed empty writer created by resume; that broader handoff remains
+later work.
+
+F6b2 deliberately does **not** accept in-place productive SchemaApply on an
+enrolled graph. Schema-change acceptance is a separate checked sealed/retired
+export → initialize fresh graph with the desired schema → ordinary load
+workflow; physical rebind keeps the accepted schema unchanged. Long-history
+lookup/RSS/latency and object measurements, bounded public export transport,
+public status, and served SDK/HTTP/CLI/OpenAPI parity remain later F6b/F7
+owners.
+
 ### RFC-026 Phase B2b coverage ownership (specified, inactive)
 
 B2b adds evidence at the boundary where the design depends on Lance, while

@@ -24,7 +24,8 @@ use crate::db::manifest::{
 use crate::db::write_queue::StreamAdmissionKey;
 use crate::db::{Omnigraph, ReadTarget, Snapshot};
 use crate::error::{OmniError, Result};
-use crate::table_store::mem_wal::CheckedRuntimeShutdownAuthority;
+use crate::failpoints::{maybe_fail, names};
+use crate::table_store::mem_wal::{CheckedRuntimeShutdownAuthority, StreamFoldProducerPermit};
 
 use super::stream_ingest::{ResidentFoldOutcome, ResidentQuiesceOutcome};
 
@@ -282,6 +283,29 @@ impl StreamFoldDriverRegistry {
             .iter()
             .filter_map(|(identity, pending)| {
                 (stopping || pending.due_at <= now).then_some((*identity, pending.sequence))
+            })
+            .collect()
+    }
+
+    /// Re-read the finite round after the exclusive producer fence closes.
+    /// A producer that began before the fence may have installed the one
+    /// resident writer while its ordinary timer is not due yet. Include that
+    /// exact pending identity so the round frees the slot before attempting a
+    /// previously ready cold lane; unrelated failures retain their backoff.
+    fn fenced_round(
+        &self,
+        now: Instant,
+        resident: &BTreeSet<TableIdentity>,
+    ) -> Vec<(TableIdentity, u64)> {
+        let stopping = self.stop.load(Ordering::Acquire);
+        self.shared
+            .lock()
+            .expect("stream fold driver state poisoned")
+            .pending
+            .iter()
+            .filter_map(|(identity, pending)| {
+                (stopping || pending.due_at <= now || resident.contains(identity))
+                    .then_some((*identity, pending.sequence))
             })
             .collect()
     }
@@ -707,6 +731,23 @@ async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegist
         let Some(db) = weak_db.upgrade() else {
             return Ok(());
         };
+        // Close the producer side before selecting the actual finite round.
+        // A put which started before this writer queued may finish and notify
+        // while we wait; the fresh selection below includes that resident
+        // identity even when its ordinary timer is not due yet. Later puts
+        // remain queued until every captured node and edge has had one attempt.
+        let _round_admission = db.stream_workers.acquire_stream_fold_round().await;
+        let resident = db
+            .stream_workers
+            .served_runtime_resident_identities()
+            .await
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let due = driver.fenced_round(Instant::now(), &resident);
+        if due.is_empty() {
+            drop(db);
+            continue;
+        }
         let candidates = match db.stream_driver_candidates(&due).await {
             Ok(candidates) => driver.order_round(candidates),
             Err(error) => {
@@ -746,6 +787,11 @@ async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegist
             drop(db);
             continue;
         }
+
+        // The ordered candidate vector is the complete finite round. This
+        // failpoints-only rendezvous proves that a trigger arriving after this
+        // cut cannot enter ahead of an edge already selected below.
+        maybe_fail(names::STREAM_DRIVER_POST_ROUND_FREEZE)?;
 
         // `candidates` is one finite manifest-derived round. New triggers do
         // not enter it, so continuously active node lanes cannot starve an edge
@@ -820,6 +866,13 @@ async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegist
 }
 
 impl Omnigraph {
+    /// Join the shared side of the process-local finite-round fence before
+    /// taking profile authority. The guard must transfer into detached put
+    /// ownership so cancellation cannot reopen the scheduling race.
+    pub(super) async fn acquire_stream_fold_producer_guard(&self) -> StreamFoldProducerPermit {
+        self.stream_workers.acquire_stream_fold_producer().await
+    }
+
     pub(super) fn notify_stream_fold_pending(&self, identity: TableIdentity) {
         self.stream_fold_driver.notify(identity, false);
     }
@@ -937,14 +990,20 @@ impl Omnigraph {
     }
 
     async fn shutdown_stream_runtime_background(self: &Arc<Self>) -> Result<()> {
-        // Axum has already stopped admission and settled request futures. The
-        // production B2 path transfers this profile-shared guard into every
-        // detached worker, so one exclusive acquire/release proves that no
-        // canceled pre-invocation owner can create a fold trigger after stop.
-        // Drop it before joining: the driver needs shared profile admission to
-        // drain triggers that became ready ahead of this barrier.
+        // Axum has already stopped admission and settled request futures. A
+        // producer now takes the root opportunity before profile authority and
+        // transfers both into detached ownership. Close those gates in the
+        // same order: root-exclusive first, then profile-exclusive. Together
+        // they prove that no canceled pre-invocation owner can create a fold
+        // trigger after this barrier.
+        //
+        // Drop both before joining: the driver needs root-exclusive plus
+        // shared profile admission to drain triggers that became ready ahead
+        // of the barrier.
+        let producer_round = self.stream_workers.acquire_stream_fold_round().await;
         let producers_settled = self.write_queue().acquire_stream_profile_exclusive().await;
         drop(producers_settled);
+        drop(producer_round);
         self.stream_fold_driver.shutdown().await?;
 
         // The supervisor needed profile-shared admission to settle its final

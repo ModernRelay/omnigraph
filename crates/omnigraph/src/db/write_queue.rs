@@ -23,11 +23,20 @@
 //! alias is deliberately not accepted by the key: a rename keeps contending on
 //! the same table lifetime, while drop/re-add gets a different incarnation.
 //!
-//! The graph-profile gate is the **outermost** process-local gate. Ordinary
-//! writers hold it shared from profile preflight through completion; a profile
-//! transition holds it exclusively. A caller that composes it with existing
-//! gates acquires graph-profile -> admission key(s), then keeps the established
-//! schema -> branch -> token-authority -> sorted-table order.
+//! The graph-profile gate is the **outermost** process-local gate for ordinary
+//! and other non-resident-producing writers. They hold it shared from profile
+//! preflight through completion; a profile transition holds it exclusively.
+//! Served ingress that can create resident MemWAL work has one earlier bounded
+//! corridor: preprocessing/inflight reservation -> root MemWAL opportunity
+//! shared -> graph-profile shared -> table admission. The resident driver owns
+//! the opportunity gate exclusively across one frozen finite round, then takes
+//! profile/admission per candidate. Both opportunity permits retain the root
+//! `MemWalWorkerRegistry` `Arc`, so the weak root registry cannot recreate an
+//! independent fence while detached ownership is live. Runtime shutdown fences
+//! root opportunity exclusive and then graph-profile exclusive, drops both,
+//! and only then joins the driver that needs those gates to settle.
+//! Other callers compose graph-profile -> admission key(s), then keep the
+//! established schema -> branch -> token-authority -> sorted-table order.
 //! The token-authority gate is graph-global because every B2 fold advances the
 //! same manifest-selected `_stream_tokens.lance` participant. This prevents an
 //! append (which needs only a shared admission lease) from deadlocking with a
@@ -161,10 +170,15 @@ pub(crate) struct WriteQueueManager {
     stream_token_gate: Arc<AsyncMutex<()>>,
     /// Graph-global RFC-026 profile-transition gate.
     ///
-    /// Mutation/load and the remaining ordinary writers eventually hold a
-    /// shared guard from their profile-authority preflight through the whole
-    /// operation. A profile transition takes the same gate exclusively before
-    /// changing the manifest profile. The gate is root-shared across
+    /// Mutation/load and the remaining ordinary/non-resident-producing writers
+    /// hold a shared guard from their profile-authority preflight through the
+    /// whole operation. Resident-producing served ingress first holds the root
+    /// MemWAL opportunity shared; the driver holds that opportunity exclusive
+    /// for a finite round and takes this gate shared per candidate. A profile
+    /// transition takes this gate exclusively before changing the manifest
+    /// profile. Runtime shutdown first fences root opportunity exclusively,
+    /// then this gate exclusively, and drops both before joining the driver.
+    /// The gate is root-shared across
     /// independently opened handles, but remains process-local contention
     /// control rather than durable profile authority.
     stream_profile_gate: Arc<AsyncRwLock<()>>,
@@ -245,17 +259,22 @@ impl WriteQueueManager {
 
     /// Acquire the graph-global shared profile window for an ordinary writer.
     ///
-    /// This is the outermost process-local gate. Hold it from the future
-    /// profile-authority preflight through the entire operation, including any
-    /// retry or recovery work.
+    /// This is the outermost process-local gate for ordinary and other
+    /// non-resident-producing writers. Resident-producing served callers first
+    /// retain their bounded preprocessing/inflight reservation and shared root
+    /// MemWAL opportunity. Hold this guard from the final profile-authority
+    /// preflight through the entire operation, including retry or recovery.
     pub(crate) async fn acquire_stream_profile_shared(&self) -> OwnedRwLockReadGuard<()> {
         Arc::clone(&self.stream_profile_gate).read_owned().await
     }
 
     /// Acquire exclusive graph-global admission for a profile transition.
     ///
-    /// Take this before any table admission, schema, branch, token-authority,
-    /// or table gate, and keep it through the durable profile transition.
+    /// An ordinary profile transition takes this before any table admission,
+    /// schema, branch, token-authority, or table gate and keeps it through the
+    /// durable transition. Served-runtime shutdown is the deliberate exception:
+    /// it first fences the root MemWAL opportunity, then this gate, drops both,
+    /// and joins the resident driver.
     #[allow(dead_code)] // Scaffolded before the profile-transition writer is wired.
     pub(crate) async fn acquire_stream_profile_exclusive(&self) -> OwnedRwLockWriteGuard<()> {
         Arc::clone(&self.stream_profile_gate).write_owned().await
@@ -266,7 +285,9 @@ impl WriteQueueManager {
     /// Future ordinary writers and MemWAL appends hold this from their final
     /// durable-authority check through physical-effect/durability resolution.
     /// Acquire this after the graph-profile gate and before schema, branch, or
-    /// legacy table queues.
+    /// legacy table queues. A resident-producing served append already holds
+    /// bounded preprocessing/inflight ownership and the shared root MemWAL
+    /// opportunity outside that profile -> admission pair.
     pub(crate) async fn acquire_stream_shared(
         &self,
         key: &StreamAdmissionKey,
@@ -332,9 +353,12 @@ impl WriteQueueManager {
 
     /// Acquire the graph-global RFC-026 token-participant gate.
     ///
-    /// Callers compose this only in the canonical order: sorted relevant
-    /// graph profile -> stream admission -> schema -> main branch -> token ->
-    /// sorted graph tables. The mutex is process-local contention control; the
+    /// Ordinary/non-resident callers compose this only in the canonical order:
+    /// graph profile -> sorted relevant stream admission -> schema -> main
+    /// branch -> token -> sorted graph tables. Resident-producing served
+    /// callers additionally retain their earlier bounded preprocessing/
+    /// inflight and root MemWAL opportunity ownership. The mutex is
+    /// process-local contention control; the
     /// exact manifest-selected token witness and recovery-v12 remain durable
     /// authority.
     pub(crate) async fn acquire_stream_token(&self) -> OwnedMutexGuard<()> {

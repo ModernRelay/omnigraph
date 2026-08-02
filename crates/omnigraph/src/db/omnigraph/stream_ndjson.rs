@@ -794,6 +794,11 @@ async fn flush_run(
             },
         };
         let write_queue = db.write_queue();
+        let driver_round_guard = tokio::select! {
+            biased;
+            _ = sender.closed() => return false,
+            guard = db.acquire_stream_fold_producer_guard() => guard,
+        };
         let profile_guard = tokio::select! {
             biased;
             _ = sender.closed() => return false,
@@ -832,6 +837,7 @@ async fn flush_run(
                 envelopes,
                 contributor_id.clone(),
                 Some(preprocessing),
+                driver_round_guard,
                 profile_guard,
             ) => outcome,
         };

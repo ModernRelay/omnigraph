@@ -36,7 +36,7 @@ use lance_index::mem_wal::{
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, watch};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, watch};
 
 use crate::db::manifest::stream::{
     ClaimReceipt, RetainedShardInventoryCommitment, retained_shard_inventory_commitment,
@@ -352,11 +352,26 @@ impl ConfirmedStreamTokenOverlayRow {
 
 pub(crate) type ConfirmedStreamTokenOverlay = BTreeMap<String, ConfirmedStreamTokenOverlayRow>;
 
+/// Shared side of the process-local resident-writer opportunity fence.
+/// Retaining the registry Arc prevents a weak-root reopen from creating a
+/// second fence while detached producer ownership is still settling.
+pub(crate) struct StreamFoldProducerPermit {
+    _registry: Arc<MemWalWorkerRegistry>,
+    _guard: OwnedRwLockReadGuard<()>,
+}
+
+/// Exclusive side retained by one complete finite resident-driver round.
+pub(crate) struct StreamFoldRoundPermit {
+    _registry: Arc<MemWalWorkerRegistry>,
+    _guard: OwnedRwLockWriteGuard<()>,
+}
+
 /// Opaque proof that the background-owned append task owns the shared
 /// admission lease after completing the caller's fresh authority check.
 pub(crate) struct CheckedStreamAuthority {
     _guard: OwnedRwLockReadGuard<()>,
     _profile_guard: Option<OwnedRwLockReadGuard<()>>,
+    _driver_round_guard: Option<StreamFoldProducerPermit>,
 }
 
 impl CheckedStreamAuthority {
@@ -364,23 +379,26 @@ impl CheckedStreamAuthority {
         Self {
             _guard: guard,
             _profile_guard: None,
+            _driver_round_guard: None,
         }
     }
 
-    /// Carry graph-profile authority into the detached append tail together
-    /// with the table admission lease.
+    /// Carry the root producer opportunity and graph-profile authority into
+    /// the detached append tail together with the table admission lease.
     ///
-    /// Production stream admission acquires profile-shared before the table
-    /// lease. Keeping both guards in this opaque token prevents a cancelled
-    /// request from releasing profile authority while Lance's put watcher or
-    /// same-writer fence check is still settling.
+    /// Production stream admission acquires root-opportunity shared, then
+    /// profile-shared, then the table lease. Keeping all guards in this opaque
+    /// token prevents a cancelled request from releasing either outer fence
+    /// while Lance's put watcher or same-writer fence check is still settling.
     pub(crate) fn from_shared_admission_with_profile(
         guard: OwnedRwLockReadGuard<()>,
         profile_guard: OwnedRwLockReadGuard<()>,
+        driver_round_guard: StreamFoldProducerPermit,
     ) -> Self {
         Self {
             _guard: guard,
             _profile_guard: Some(profile_guard),
+            _driver_round_guard: Some(driver_round_guard),
         }
     }
 }
@@ -2076,6 +2094,7 @@ pub(crate) struct MemWalWorkerRegistry {
     slots: Mutex<HashMap<StreamWorkerKey, Arc<RegistrySlot>>>,
     limits: B1WorkerLimits,
     usage: Mutex<RegistryUsage>,
+    round_admission: Arc<RwLock<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -2412,9 +2431,24 @@ impl MemWalWorkerRegistry {
             slots: Mutex::new(HashMap::new()),
             limits,
             usage: Mutex::new(RegistryUsage::default()),
+            round_admission: Arc::new(RwLock::new(())),
         });
         roots.insert(root_identity.to_string(), Arc::downgrade(&created));
         Ok(created)
+    }
+
+    pub(crate) async fn acquire_stream_fold_producer(self: &Arc<Self>) -> StreamFoldProducerPermit {
+        StreamFoldProducerPermit {
+            _registry: Arc::clone(self),
+            _guard: Arc::clone(&self.round_admission).read_owned().await,
+        }
+    }
+
+    pub(crate) async fn acquire_stream_fold_round(self: &Arc<Self>) -> StreamFoldRoundPermit {
+        StreamFoldRoundPermit {
+            _registry: Arc::clone(self),
+            _guard: Arc::clone(&self.round_admission).write_owned().await,
+        }
     }
 
     fn slot(&self, key: StreamWorkerKey) -> Arc<RegistrySlot> {
