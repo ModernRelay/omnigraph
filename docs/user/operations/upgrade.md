@@ -46,7 +46,7 @@ from that line (the latest is safest):
 | internal schema v15 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
 | internal schema v16 | unreleased (earlier 0.10.0-dev source builds) | final v16 source build at merge `ac59c4f6d1d83acc8118c410c39de2bed91f9c15` |
 | internal schema v17 | unreleased (earlier 0.10.0-dev source builds) | final v17 source build at merge `41a5990d53238d63d17e139859c66613f9c25867` |
-| internal schema v18 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
+| internal schema v18 | unreleased (earlier 0.10.0-dev source builds) | final v18 source build at merge `c7c81b186bed37989fe5ce591baf0965b5102648` |
 | internal schema v19 | unreleased (current 0.10.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
 
 **Stamps v5–v8 never shipped.** The storage format advanced five times inside
@@ -159,9 +159,10 @@ blocked. Use that same v18 binary's exact stopped/offline
 `stream retire-for-rebuild plan|confirm` exit when its preconditions hold; a
 v19 binary cannot open the v18 root to retire it. V18 cannot contain current
 `DEAD_LETTERED` authority because that disposition first becomes reachable in
-v19. The checked-in v17↔v18 binary cell remains historical; the genuine
-v18↔v19 adjacent-binary refusal/rebuild cell is still required release
-evidence.
+v19. The recorded v17↔v18 binary result remains historical; the genuine
+v18↔v19 adjacent-binary cell now proves clean refusal/rebuild in both directions
+and loads retirement receipt-v1 bytes captured from the final-v18 production
+exporter. The rebuilt v19 graph imports logical rows but no stream authority.
 
 ### Rebuilding a v19 graph blocked by terminal stream authority
 

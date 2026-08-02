@@ -176,9 +176,9 @@ fenced. Stream-profile tests pin the immutable,
 actor- and plan-bound receipt chain. Cluster and CLI tests own actor/offline/
 declared-graph preflight plus the exact `--graph`/`--config` command scope.
 The final-v17 merge recorded the genuine v16↔v17 refusal/rebuild fence. The
-current source suite retains v16→CURRENT evidence; the required live adjacent
-gate must now move to v18↔v19; the existing v17↔v18 cell remains historical
-until that genuine adjacent-binary harness lands.
+current source suite retains v16→CURRENT evidence; the live adjacent gate now
+builds immutable final v18 and proves v18↔v19. The v17↔v18 result remains
+historical; the checked-in v17 seam now provides source→CURRENT coverage.
 
 The retired-export cells pin `branch_member` as a closed selected-member
 witness: canonical branch, exact Lance branch identifier, optional graph head,
@@ -431,9 +431,9 @@ commit claim, and B2 must re-qualify any higher resident-writer/resource limit
 before exposing public admission.
 
 Format tests retain historical source-v7 and source-v8 refusal/rebuild evidence
-against CURRENT; the required immediate-predecessor CI cell must move to
-v18 ↔ v19. The checked-in v17 ↔ v18 cell is historical evidence, not the
-current adjacent gate.
+against CURRENT; the required immediate-predecessor CI cell is v18 ↔ v19. The
+recorded v17 ↔ v18 result is historical evidence, while the checked-in v17 seam
+is source→CURRENT coverage rather than the current adjacent gate.
 The v7 binary exposes no production enrollment route, so its historical-source
 cell proves refusal and no in-place adoption but does not claim recovery of
 retained physical config-v1 state. The v8-source cell also pins that the new
@@ -871,8 +871,8 @@ a different current-format root, and proves row/vector fidelity plus exact-`id`
 PK metadata; the v4 case also pins reverse refusal by the old binary. Historical
 cells below have the same shape. They do **not** invoke an archived intermediate
 target binary and therefore do not claim an adjacent vN↔vN+1 gate. The current
-required adjacent gate is final-v18 → v19; the checked-in final-v17 → v18 seam
-below is historical.
+required adjacent gate is final-v18 → v19; the final-v17 → CURRENT seam below
+is historical.
 
 RFC-023 added its then-immediate-predecessor case gated on `OMNIGRAPH_V5_BIN`, built
 from the final internal-v5 commit. It mints a genuine SchemaIR-v2 v5 graph,
@@ -1044,12 +1044,12 @@ OMNIGRAPH_V16_BIN=/path/to/final-v16/omnigraph \
   current_refuses_and_rebuilds_genuine_v16_and_v16_refuses_current -- --exact --nocapture
 ```
 
-The checked-in adjacent seam remains `OMNIGRAPH_V17_BIN`, now historical. CI
-builds the final v17 binary from immutable merge
+The historical `OMNIGRAPH_V17_BIN` seam builds the final v17 binary from
+immutable merge
 `41a5990d53238d63d17e139859c66613f9c25867`, mints a genuine v17 graph, proves
-v18 refuses it with source-build/export guidance, exports with v17, rebuilds a
-distinct v18 root, and proves row/vector/blob fidelity plus exact-`id` PK
-metadata. The old v17 binary must refuse the v18 root. The fixture is clean,
+CURRENT refuses it with source-build/export guidance, exports with v17, rebuilds
+a distinct current-format root, and proves row/vector/blob fidelity plus
+exact-`id` PK metadata. The old v17 binary must refuse the current root. The fixture is clean,
 disabled, and unenrolled; this strict format fence deliberately transfers no
 private lifecycle, WAL, token, ledger, receipt, maintenance, rebind,
 retirement, or correction authority. Run it locally with:
@@ -1057,15 +1057,27 @@ retirement, or correction authority. Run it locally with:
 ```bash
 OMNIGRAPH_V17_BIN=/path/to/final-v17/omnigraph \
   cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
-  current_v18_refuses_and_rebuilds_genuine_v17_and_v17_refuses_v18 -- --exact --nocapture
+  current_refuses_and_rebuilds_genuine_v17_and_v17_refuses_current -- --exact --nocapture
 ```
 
-Internal schema v19 now requires the successor `OMNIGRAPH_V18_BIN` adjacent
-cell: a genuine final-v18 graph must be refused by v19, rebuilt into a distinct
-v19 root with ordinary row/vector/blob fidelity, and the v18 binary must refuse
-that root. In-source stamp guards pin the exact v18 refusal wording and v19
-acceptance, but they are not a substitute for this genuine-binary test. Until
-that cell lands, v18↔v19 is an explicit release-evidence gap.
+The CI-owned adjacent seam uses `OMNIGRAPH_V18_BIN`, built from immutable final-
+v18 merge `c7c81b186bed37989fe5ce591baf0965b5102648`. It mints a genuine v18
+graph, proves v19 refuses it with source-build/export guidance, rebuilds a
+distinct v19 root with row/vector/blob and exact-`id` PK fidelity, and proves
+the v18 binary refuses that root. The same exact cell loads
+`tests/fixtures/final_v18_retired_main.jsonl`, captured once from that commit's
+production retirement exporter after its failpoint-only precondition setup.
+It pins `source_internal_schema_version = 18`, one withdrawn token, and the
+absence of v19's `dead_lettered_token_count`, then proves v19 imports only the
+logical row into a `DISABLED`, unenrolled graph. Freezing the genuine bytes
+avoids compiling a second predecessor failpoint graph in every CI run. Run it
+locally with:
+
+```bash
+OMNIGRAPH_V18_BIN=/path/to/final-v18/omnigraph \
+  cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
+  current_v19_refuses_and_rebuilds_genuine_v18_and_v18_refuses_v19 -- --exact --nocapture
+```
 
 Older cross-version seams remain gated on absolute old-binary paths and skip
 gracefully when unset because rebuilding every historical source revision in
@@ -1073,8 +1085,8 @@ default CI would be expensive. A set but invalid path, including
 `OMNIGRAPH_V8_BIN`, `OMNIGRAPH_V9_BIN`, `OMNIGRAPH_V10_BIN`,
 `OMNIGRAPH_V11_BIN`, `OMNIGRAPH_V12_BIN`, `OMNIGRAPH_V13_BIN`, and
 `OMNIGRAPH_V14_BIN`, `OMNIGRAPH_V15_BIN`, `OMNIGRAPH_V16_BIN`, and
-`OMNIGRAPH_V17_BIN`, fails loudly
-rather than making the proof vacuous.
+`OMNIGRAPH_V17_BIN`, fails loudly rather than making the proof vacuous. The
+CI-owned `OMNIGRAPH_V18_BIN` seam has the same set-but-invalid behavior.
 
 ## System e2e requirements and suppression
 

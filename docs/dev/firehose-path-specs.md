@@ -818,9 +818,11 @@ writer a sidecar-covered witness/rebind transition.
   old-binary/new-format refusal and export/init/load rebuild test with the
   immutable final predecessor binary, not a stamp rewrite. The fixture is clean,
   disabled, and unenrolled because ordinary export does not transfer stream
-  authority. V19 still needs the successor genuine v18↔v19 adjacent-binary
-  cell; its local v18-refusal/current-v19/future-v20 grammar assertions do not
-  substitute for that evidence.
+  authority. V19's successor cell builds immutable final v18 and proves the
+  genuine v18↔v19 boundary; its frozen production-export artifact separately
+  pins v18 receipt-v1 retirement compatibility. Local v18-refusal/current-v19/
+  future-v20 grammar assertions supplement, but do not substitute for, that
+  evidence.
 
 ### 3.6 Evidence
 
@@ -1303,7 +1305,8 @@ replay, all two-participant crash cells, stopped/offline cluster/CLI preflight,
 and the genuine v17↔v18 rebuild/refusal seam. F5b adds focused mixed and
 all-diverted terminal-fold, exact-retry/ordinary-successor, object binding,
 selected-token list/export, and three-disposition retirement evidence. The
-genuine v18↔v19 adjacent-binary cell remains an explicit release-evidence gap.
+genuine v18↔v19 adjacent-binary cell also pins both refusals, ordinary rebuild
+fidelity, and final-v18 retirement receipt-v1 import without authority transfer.
 The broader lifecycle/dead-letter/retirement composition and measurement matrix
 remains an F6 integration gate. `AuthorityBlock` repair is not implied by the
 DataBlock or dead-letter evidence.
@@ -1847,7 +1850,8 @@ v16↔v17 fence. F3f's focused recovery-v20, DataBlock, cluster/CLI, and
 v17↔v18 evidence makes the narrow stopped/offline `WITHDRAWN` path active.
 F5b's focused recovery-v21 evidence makes deterministic terminal diversion,
 selected-token inspection/export, and `WITHDRAWN | DEAD_LETTERED` retirement
-active; the genuine v18↔v19 adjacent-binary cell is still missing. The broader
+active; the genuine v18↔v19 adjacent-binary and frozen-receipt cell closes the
+format-boundary evidence. The broader
 retirement race/failpoint/freeze/export matrix below remains required before
 public ingress activates; `AuthorityBlock` repair remains separate.
 

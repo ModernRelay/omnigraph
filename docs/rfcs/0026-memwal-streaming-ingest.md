@@ -5508,7 +5508,9 @@ and the genuine v17↔v18 fence. Those focused cells are sufficient for the
 narrow offline `WITHDRAWN` path. F5b adds focused mixed/all-diverted fold,
 exact retry/ordinary successor, one-object binding, selected-token list/export,
 and three-disposition retirement evidence. The genuine v18↔v19 adjacent binary
-cell remains a release-evidence gap. The broader race/failpoint/freeze/export
+cell pins both refusals, ordinary rebuild fidelity, and import of frozen final-
+v18 retirement receipt-v1 bytes without authority transfer. The broader race/
+failpoint/freeze/export
 matrix below remains required before public ingress activates, and none of
 this activates `AuthorityBlock` repair.
 

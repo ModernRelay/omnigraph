@@ -429,9 +429,9 @@ mod tests {
         );
         assert!(v16_err.contains("omnigraph export"), "got: {v16_err}");
 
-        // V17 is the immediate predecessor used by the v17↔v18 format fence.
-        // Keep its source-build release wording local and unskippable so
-        // release preparation cannot relabel it with v18.
+        // Historical source-v17 → CURRENT coverage asserts this refusal. Keep
+        // its source-build release wording local and unskippable so release
+        // preparation cannot relabel this superseded stamp.
         let v17_err = refuse_if_stamp_unsupported(17).unwrap_err().to_string();
         assert!(
             v17_err.contains("created by omnigraph 0.10.0-dev"),
