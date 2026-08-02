@@ -4229,11 +4229,9 @@ graphs:
     }
 
     #[cfg(feature = "failpoints")]
-    async fn blocked_disable_persists_exact_disabling_correction_authority_body() {
-        let _scenario = fail::FailScenario::setup();
-        let dir = fixture();
+    async fn prepare_blocked_disable_data_block(dir: &Path) -> std::path::PathBuf {
         fs::write(
-            dir.path().join("people.pg"),
+            dir.join("people.pg"),
             r#"
 node Person {
   name: String @key
@@ -4243,12 +4241,12 @@ node Person {
 "#,
         )
         .unwrap();
-        write_streaming_cluster(dir.path(), Some(false));
-        write_state_resources(dir.path(), &[]);
-        let created = confirmed_streaming_apply(dir.path()).await;
+        write_streaming_cluster(dir, Some(false));
+        write_state_resources(dir, &[]);
+        let created = confirmed_streaming_apply(dir).await;
         assert!(created.ok && created.converged, "{created:?}");
 
-        let graph_root = dir.path().join("graphs/knowledge.omni");
+        let graph_root = dir.join("graphs/knowledge.omni");
         let db = Arc::new(Omnigraph::open(graph_root.to_str().unwrap()).await.unwrap());
         let mut params = ParamMap::new();
         params.insert("name".to_string(), Literal::String("base".to_string()));
@@ -4270,10 +4268,10 @@ query seed($name: String, $age: I32) {
             .unwrap();
         drop(db);
 
-        write_streaming_cluster(dir.path(), Some(true));
-        let enabled = confirmed_streaming_apply(dir.path()).await;
+        write_streaming_cluster(dir, Some(true));
+        let enabled = confirmed_streaming_apply(dir).await;
         assert!(enabled.ok && enabled.converged, "{enabled:?}");
-        let serving = read_serving_snapshot(dir.path()).await.unwrap();
+        let serving = read_serving_snapshot(dir).await.unwrap();
         let binding = serving.graphs[0]
             .stream_runtime_authority
             .clone()
@@ -4320,6 +4318,19 @@ query seed($name: String, $age: I32) {
             .await
             .expect("runtime shutdown must fence and settle detached stream producers");
         drop(db);
+
+        graph_root
+    }
+
+    #[cfg(feature = "failpoints")]
+    async fn blocked_disable_persists_exact_disabling_correction_authority_body() {
+        let _scenario = fail::FailScenario::setup();
+        let dir = fixture();
+        let graph_root = prepare_blocked_disable_data_block(dir.path()).await;
+        let _dead_letter_object_overflow = omnigraph::failpoints::ScopedFailPoint::new(
+            omnigraph::failpoints::names::STREAM_DEAD_LETTER_FORCE_OBJECT_LIMIT,
+            "1*return",
+        );
 
         write_streaming_cluster(dir.path(), Some(false));
         let blocked = confirmed_streaming_apply(dir.path()).await;
