@@ -1380,6 +1380,30 @@ The CLI system tests (`system_local.rs`) spawn the workspace-built `omnigraph` a
   Those macOS measurements predate fail-closed cap handling: the RFC records
   observed `ru_maxrss` and does not claim the requested 256 MiB cap was
   enforced. The current harness refuses a requested capped scenario on macOS.
+- `crates/omnigraph/benches/scenarios.rs` with
+  `benches/scenarios/rfc023.rs` — the `general-merge-updates` scenario, the
+  counterpart to `fenced-adopt-all-new`. That scenario measures the proven
+  insert-only shortcut against an untouched target; this one always advances
+  `main` on a disjoint key range so the merge is genuinely diverged. The update
+  arm (`--source-mode update`) rewrites committed rows, carries no
+  insert-absence certificate, and pins the general ordered-diff route. The
+  insert arm (`--source-mode insert`) writes all-new rows within the pure-insert
+  history-proof limit and records whether the shortcut survives target
+  movement. Both arms assert `MergeOutcome::Merged`; the update arm
+  additionally asserts ordered cursor scans and zero strict-insert preflights.
+  Fresh verification checks the exact
+  row count plus deterministic payloads from both the source delta and target
+  divergence. `--delta-rows` sets the branch delta independently of `--rows`,
+  which is the whole point — the scenario separates delta cost from target
+  cost for [#384](https://github.com/ModernRelay/omnigraph/issues/384). Its
+  fixture sizes `load()` chunks from the loader's real keyed accounting (a
+  JSON array is charged `(dims + 1) * 4` offset bytes **plus** `dims * 4`
+  value bytes, roughly `dims * 8`), not from `derive_chunk_plan`'s `dims * 4`
+  value-buffer model; the two agree at dims=256 only because the 8,192-row cap
+  binds first.
+  A decision instrument, not a CI gate: it asserts route where the shape fixes
+  it, records the insert-arm discovery, and never asserts a performance
+  threshold.
 - Add `benches/` per crate when you ship a perf-driven change, and include the motivating workload with the optimization.
 
 ## Coverage tooling — what's missing

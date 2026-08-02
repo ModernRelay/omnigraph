@@ -6,6 +6,8 @@ use arrow_array::{RecordBatch, UInt32Array};
 pub(crate) const KEYED_WRITE_MAX_ROWS: usize = 8192;
 pub(crate) const KEYED_WRITE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const RECOVERY_MAX_TRANSACTIONS: usize = 1024;
+/// Maximum source-version interval eligible for the pure-insert proof walk.
+pub(crate) const PURE_INSERT_HISTORY_MAX_VERSIONS: usize = 1024;
 
 // Arrow's value buffers dominate these vector batches. Reserve a deliberately
 // conservative fixed allowance for ArrayData/offset buffers and per-row slack

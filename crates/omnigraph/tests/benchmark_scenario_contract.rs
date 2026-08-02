@@ -54,6 +54,12 @@ fn benchmark_caps_match_production() {
         product_const(recovery, "MAX_BRANCH_MERGE_DATA_TRANSACTIONS"),
         rfc023_limits::RECOVERY_MAX_TRANSACTIONS as u64
     );
+
+    let merge = include_str!("../src/exec/merge.rs");
+    assert_eq!(
+        product_const(merge, "PURE_INSERT_HISTORY_MAX_VERSIONS"),
+        rfc023_limits::PURE_INSERT_HISTORY_MAX_VERSIONS as u64
+    );
 }
 
 /// Pin the phased measurement boundary in the ordinary test suite. Setup,
@@ -99,8 +105,15 @@ fn adopt_comparator_is_phased_and_streams_only_the_operation_substitution() {
     );
 
     let source = include_str!("../benches/scenarios/rfc023.rs");
+    let setup = source
+        .split_once("pub(super) async fn fenced_adopt_setup")
+        .expect("setup phase")
+        .1
+        .split_once("/// Phase 2 baseline")
+        .expect("setup phase boundary")
+        .0;
     assert_eq!(
-        source.matches("Omnigraph::init(").count(),
+        setup.matches("Omnigraph::init(").count(),
         1,
         "the persisted fixture must have one common OmniGraph initializer"
     );
@@ -152,13 +165,6 @@ fn adopt_comparator_is_phased_and_streams_only_the_operation_substitution() {
     assert!(!baseline.contains("count_rows("));
     assert!(!baseline.contains("snapshot_of("));
 
-    let setup = source
-        .split_once("pub(super) async fn fenced_adopt_setup")
-        .expect("setup phase")
-        .1
-        .split_once("/// Phase 2 baseline")
-        .expect("setup phase boundary")
-        .0;
     assert!(setup.contains("setup_fingerprint"));
     assert!(setup.contains("setup_main_rows"));
     assert!(setup.contains("setup_source_rows"));
@@ -168,7 +174,10 @@ fn adopt_comparator_is_phased_and_streams_only_the_operation_substitution() {
     let verify = source
         .split_once("pub(super) async fn fenced_adopt_verify")
         .expect("verify phase")
-        .1;
+        .1
+        .split_once("// general-merge-updates:")
+        .expect("verify phase boundary")
+        .0;
     assert!(verify.contains("Omnigraph::open(uri)"));
     assert!(verify.contains("manifest_visible_final_rows"));
     assert!(verify.contains("physical_main_rows"));
