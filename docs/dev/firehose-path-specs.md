@@ -3,21 +3,25 @@
 **Type:** implementation plan for in-flight work
 **Status:** slices F0–F1, F2 profile authority, the hidden F2 lifecycle tranche,
 private F3a resume/abort-drain, F3b EnsureIndices, F3c Optimize, F3d physical
-rebind, F3e authority retirement/export, and F3f exact DataBlock correction are
-implemented. The current development strand selects internal schema v18,
+rebind, F3e authority retirement/export, F3f exact DataBlock correction, and
+F5b terminal dead-letter handling are implemented. The current development
+strand selects internal schema v19/token schema v3,
 lifecycle protocol v3, recovery-v14 exact
 enrollment/claim/fold/drain/terminal-receipt owners, recovery-v15 exact
 `SEALED → OPEN` resume plus guarded `DRAINING → OPEN` abort, and recovery-v16
 same-binding `SEALED` EnsureIndices plus recovery-v17 same-binding `SEALED`
 Optimize, recovery-v18 private exact-`SEALED` physical rebind, recovery-v19
-lineage-neutral root-wide authority retirement, and recovery-v20 exact
-DataBlock correction. Public ingress, operator lifecycle/rebind verbs, and
+lineage-neutral root-wide authority retirement, recovery-v20 exact DataBlock
+correction, and recovery-v21 mixed/all-diverted dead-letter folds plus
+three-disposition retirement. Public ingress, operator lifecycle/rebind verbs, and
 every maintenance transport surface remain inactive; retirement and DataBlock
 inspection/correction are exposed only by narrow offline cluster controls.
 The format-neutral F4, F5a, and F5b0 hidden-path slices are also implemented:
 caller-shaped ingest/prepare, automatic `OPEN` folding, exact-`ENABLED`
 goal-`SEALED` drain continuation, and the checked offline `DISABLING` loop.
-F5b0 adds no public API or persisted format.
+F5b adds stopped/offline selected-token dead-letter list/export but no public
+HTTP, SDK, remote CLI, or OpenAPI row surface. F6 remains the measurement and
+guardrail slice.
 **Design authority:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) — this
 file never overrides it. Where they disagree, the RFC wins and this file is
 wrong. §4.7 records the selected experimental profile; §4.3/§4.6 record the
@@ -54,7 +58,8 @@ they differ only in *where the acknowledgement sits relative to the ceremony*.
         │                                    │
         │                        graph checks at fold
         │                        data conflict ──► dead letter
-        │                        structural fault ──► block
+        │                        structural fault ──► loud fail/retry
+        │                        object over bound ─► DataBlock
         ▼                                    ▼
  ╔══════════════════ THE ONE PROTOCOL ══════════════════╗
  ╚══════════════════════════════════════════════════════╝
@@ -80,7 +85,8 @@ shape, while recovery-v14 contains one frozen fail-closed retirement scaffold.
 F3 may activate that scaffold only if its exact payload is sufficient;
 otherwise it takes a new strand. F3e satisfied the requirement that an
 irreversible retirement/export path exist before F3f made `WITHDRAWN`
-reachable; F5b must extend that path before `DEAD_LETTERED` becomes reachable.
+reachable; v19/recovery-v21 extends that exit before making `DEAD_LETTERED`
+reachable.
 
 ---
 
@@ -110,8 +116,9 @@ reachable; F5b must extend that path before `DEAD_LETTERED` becomes reachable.
 | Caller-shaped authorized JSON/NDJSON ingest plus bodyless lazy-enrollment prepare, behind doc-hidden test seams | engine private seams | F4 |
 | Format-neutral automatic `OPEN`-lane fold supervisor over the existing recovery-v14 fold adapter | engine private server bridge | F5a |
 | Format-neutral resident goal-`SEALED` continuation plus checked offline `DISABLING` drain loop | engine private server bridge + existing cluster apply | F5b0 |
+| Deterministic mixed/all-diverted terminal fold, one bounded object, token-schema-v3 `DEAD_LETTERED`, exact retry/ordinary successor, selected-token list/export, and extended retirement | engine/manifest recovery + stopped/offline cluster control | F5b |
 
-Internal schema is **v18**, profile protocol is **v2**, and lifecycle protocol
+Internal schema is **v19**, token schema is **v3**, profile protocol is **v2**, and lifecycle protocol
 is **v3**. Recovery-v13 remains exactly `StreamProfileChange`: it owns the exact
 `ProfileManagementReceipt` token-ledger transaction, and only its achieved token
 witness plus fixed next profile may reach the terminal manifest CAS.
@@ -120,8 +127,10 @@ Recovery-v14 activates `StreamEnrollmentV2`, `StreamClaim`, `StreamFoldV2`,
 resume/abort-drain; recovery-v16 layers exact `SEALED` lifecycle authority over
 the existing EnsureIndices effect grammar; and recovery-v17 binds Optimize's
 confirmed outputs and exact achieved HEADs to its `SEALED` proof refresh.
-Recovery-v18 owns physical rebind, recovery-v19 owns lineage-neutral authority
-retirement, and recovery-v20 owns only exact DataBlock correction. The frozen
+Recovery-v18 owns physical rebind, recovery-v19 retains its historical
+two-disposition retirement meaning, recovery-v20 owns only exact DataBlock
+correction, and recovery-v21 owns terminal fold plus three-disposition
+retirement. The frozen
 recovery-v14 correction/rebind/retirement/maintenance scaffolds and reserved
 `AuthorityBlock` family still fail closed. Historical recovery-v10 enrollment
 and recovery-v12 lifecycle-v2 folds are not reinterpreted.
@@ -129,10 +138,10 @@ and recovery-v12 lifecycle-v2 folds are not reinterpreted.
 The historical v10 bump also added an explicit-null fold-attribution
 dead-letter compatibility placeholder
 (`StreamFoldAttributionSummary::dead_letter_object`). That incomplete shape is
-now frozen null and is not a dead-letter protocol: the validator rejects a
-populated reference, token authority has no terminal dead-letter disposition,
-and current fold recovery cannot represent an all-diverted cut. F5b therefore
-starts with a full format/recovery audit and assumes a new strand.
+now frozen null and is not reinterpreted: the validator rejects a populated
+reference. V19 instead uses versioned attribution and token-schema-v3 terminal
+evidence for one recovery-v21-owned object, including a marker-only base
+transition for an all-diverted cut.
 
 ### 1.2 Built but unreachable (the private core)
 
@@ -196,9 +205,13 @@ the existing quiesce and recovery-v14 lifecycle-receipt owners. A selected
 `DataBlock` parks the exact durable disable plan loudly until stopped/offline
 correction and an apply retry; apply resumes that continuation before schema
 work, so schema and dependent queries cannot move ahead of the parked drain.
-The resident and offline owners cannot overlap.
-There is still no dead-letter authority, public
-driver health/backlog projection, public lifecycle control, or public
+The resident and offline owners cannot overlap. F5b now lets the hidden fold
+partition data conflicts deterministically: valid winners publish, losing
+terminal candidates enter one bounded canonical object, and each losing key
+becomes current `DEAD_LETTERED`. All-diverted folds advance Lance with a
+marker-only base transaction. Exact retry returns the same terminal result
+while current; a fresh ordinary successor can restore `PRESENT`.
+There is still no public driver health/backlog projection, public lifecycle control, or public
 maintenance integration. The doc-hidden offline seam can perform an exact physical rebind
 while the profile is terminal `DISABLED`; doc-hidden checked-runtime seams can
 run EnsureIndices and Optimize on productive enrolled tables only while they
@@ -208,13 +221,14 @@ reconstructs one receipt-bound immutable cut and publishes bounded
 `REPLACE`/`WITHDRAW` outcomes through recovery-v20 while leaving the lane
 `DRAINING`; this is now a production path to `WITHDRAWN`. The other active
 operator exit is stopped/offline authority retirement for a verified
-current-`WITHDRAWN` cut; it makes the source permanently query/status/export-only
+current-`WITHDRAWN | DEAD_LETTERED` cut; it makes the source permanently query/status/export-only
 and carries its receipt into the rebuild artifact. No active writer can produce
 the reserved `AuthorityBlock` evidence shape, so its repair stays fail-closed
-until a reachable producer and finalized evidence grammar exist. F5b
-`DEAD_LETTERED` authority, public driver status, and every served
-SDK/HTTP/OpenAPI streaming surface remain inactive. F5b0 introduced no new
-format or public method.
+until a reachable producer and finalized evidence grammar exist. Stopped/offline
+`cluster stream dead-letter list|export` inspects only selected current-token
+authority; it is not an import or replay surface. Public driver status and
+every served SDK/HTTP/OpenAPI streaming surface remain inactive. F6 owns the
+remaining measurement and guardrail acceptance.
 
 ---
 
@@ -236,8 +250,8 @@ format or public method.
 | ~~F4~~ | Hidden ingest vertical slice + lazy enrollment | no format change | implemented behind doc-hidden seams; no public transport |
 | ~~F5a~~ | Hidden automatic `OPEN`-lane timer/cap fold supervisor, cold discovery, finite node-before-edge round-robin cohorts, and bounded server shutdown ownership | no format change; reuses recovery-v14 | implemented and server-owned; public status remains closed |
 | ~~F5b0 operational cut~~ | Resident exact-`ENABLED` goal-`SEALED` continuation plus deterministic checked offline `DISABLING` convergence, `OPEN_AFTER_FOLD` adoption, and loud `DataBlock` park/resume | no format change; reuses recovery-v13/v14 and existing cluster controls | implemented; no public API |
-| **F5b** | Minimal `DEAD_LETTERED` authority, one object, ordinary-ingest correction, and retirement | a new strand after lifecycle activation | after F5b0 |
-| **F6** | Guardrails + acceptance evidence | — | after F5b |
+| ~~F5b~~ | Minimal `DEAD_LETTERED` authority, one object, ordinary-ingest correction, selected-token inspection/export, and retirement | internal v19 + token schema v3 + recovery v21 | implemented behind the hidden row seam; no public HTTP/SDK/OpenAPI |
+| **F6** | Guardrails + acceptance evidence | — | next |
 | **F7** | Served SDK / HTTP / remote CLI / OpenAPI activation | — | only after F6 passes |
 
 These are dependency milestones, not mandates for giant PRs. Keep each PR
@@ -794,15 +808,19 @@ writer a sidecar-covered witness/rebind transition.
   the three-field v14 rebind scaffold. Historical recovery-v10 enrollment and recovery-v12
   lifecycle-v2 base-plus-token fold retain their exact meanings and are refused
   under lifecycle-v3. V17/recovery-v19 activates retirement before correction
-  can create `WITHDRAWN`; current v18/recovery-v20 activates exact DataBlock
-  correction without reinterpreting v14's incomplete correction scaffold.
+  can create `WITHDRAWN`; v18/recovery-v20 activates exact DataBlock correction
+  without reinterpreting v14's incomplete correction scaffold. Current
+  v19/recovery-v21 adds the distinct terminal fold and three-disposition
+  retirement owners without changing either historical payload.
 - **Each lifecycle strand requires genuine binary evidence.** The historical
   v11↔v12, v12↔v13, v13↔v14, v14↔v15, v15↔v16, and v16↔v17 seams plus the
-  current v17↔v18 seam use a genuine
+  v17↔v18 seam use a genuine
   old-binary/new-format refusal and export/init/load rebuild test with the
   immutable final predecessor binary, not a stamp rewrite. The fixture is clean,
   disabled, and unenrolled because ordinary export does not transfer stream
-  authority.
+  authority. V19 still needs the successor genuine v18↔v19 adjacent-binary
+  cell; its local v18-refusal/current-v19/future-v20 grammar assertions do not
+  substitute for that evidence.
 
 ### 3.6 Evidence
 
@@ -1074,9 +1092,10 @@ remain future work.
      authenticated generation cut, allowed repair classes, and one
      reason-specific evidence digest. It does **not** pretend the data
      validator view proves a pre-cut binding or witness failure. This tag and
-     its repair owner remain reserved/inactive in v18.
+     its repair owner remain reserved/inactive in v19.
 
-   Current v18 activates only `DataBlock`. The state-lock-held, stopped/offline
+   The current v19 binary still activates only `DataBlock` in the strict-block
+   vocabulary. The state-lock-held, stopped/offline
    cluster commands re-open the manifest-selected immutable generation under
    exclusive stream admission, re-run validator contract v1, and require exact
    count/digest equality before returning evidence or accepting a correction.
@@ -1101,8 +1120,8 @@ remain future work.
 
    In the planned full contract, a fold may install a repairable
    `AuthorityBlock` only while exclusive admission is held and those exact
-   facts can be authenticated and retained. Current v18 does not install or
-   repair that reserved tag.
+   facts can be authenticated and retained. The current v19 binary does not
+   install or repair that reserved tag.
    If the cut or an authority fact needed by every safe repair is missing or
    ambiguous, it reports `RecoveryRequired` or loud storage corruption; it
    never emits an operator-repair token from incomplete evidence. Block
@@ -1153,11 +1172,12 @@ remain future work.
 7. **The post-`SEALED` rebuild preflight and same-format retirement.** This is
    distinct from the in-`DRAINING` structural repair above. A normal preflight
    freshly proves every block cleared, the exact empty proof, token/base parity,
-   and no current non-`PRESENT` token. If current `WITHDRAWN` authority
-   remains, ordinary export stays `StreamExportBlocked`; a replacement is an
-   available semantic successor but is not an absence-preserving export fix.
+   and no current non-`PRESENT` token. If current `WITHDRAWN` or
+   `DEAD_LETTERED` authority remains, ordinary export stays
+   `StreamExportBlocked`; an ordinary successor can restore `PRESENT` but is
+   not an absence-preserving export fix.
 
-   The current v18 binary offers the offline cluster CLI
+   The current v19 binary offers the offline cluster CLI
    `cluster stream retire-for-rebuild plan --graph <id>
    --confirm-stream-offline`, followed by `confirm --graph <id>
    --retirement-id <uuid> --expected-plan-digest <sha256>
@@ -1167,7 +1187,8 @@ remain future work.
    streaming declaration was already unmanaged; checked cluster graph/store
    mapping and `stream_manage` remain mandatory.
 
-   The read-only plan requires at least one current `WITHDRAWN` token and
+   The read-only plan requires at least one current `WITHDRAWN` or
+   `DEAD_LETTERED` token and
    returns one canonical `plan_digest` over root/internal format, manifest and
    the complete live branch-head map, source profile revision, every
    binding/lifecycle/`SEALED` proof, all relevant recovery, exact PRESENT/base
@@ -1183,8 +1204,10 @@ remain future work.
    the same token-authority witness and every other plan input; any movement
    refuses effect-free `StreamRetirementPlanChanged`.
 
-   Recovery-v19 `StreamAuthorityRetirement` pre-mints the immutable ledger
-   receipt transaction and exact receipt-bearing output token version. Its sole
+   Current recovery-v21 `StreamAuthorityRetirementV2` pre-mints the immutable
+   ledger receipt transaction and exact receipt-bearing output token version.
+   It extends recovery-v19's frozen two-disposition owner with exact
+   `PRESENT | WITHDRAWN | DEAD_LETTERED` counts and the selected token cut. Its sole
    manifest CAS revalidates the pre-retirement witness, selects that output
    pointer, advances the profile revision and receipt-chain commitment, and
    publishes `DISABLED → RETIRED`. This control-only CAS appends no ordinary
@@ -1232,7 +1255,7 @@ remain future work.
    incarnation, so a delayed old-incarnation request remains effect-free
    `StreamBindingChanged`. Authority retirement never deletes, ages out,
    rewrites, or
-   pretends a `WITHDRAWN` token is `PRESENT`.
+   pretends a `WITHDRAWN` or `DEAD_LETTERED` token is `PRESENT`.
 
 ### 4.3 Contract points
 
@@ -1277,10 +1300,13 @@ read/export-only source boot, and fresh-root rebuild. F3f then made
 `WITHDRAW` reachable with recovery-v20 and co-landed exact DataBlock
 reconstruction/pagination, replacement, marker-only withdrawal, receipt-first
 replay, all two-participant crash cells, stopped/offline cluster/CLI preflight,
-and the genuine v17↔v18 rebuild/refusal seam. The broader lifecycle/dead-letter/
-retirement composition matrix remains an F6 integration gate; F6 reruns the
-focused cells and adds the deferred cross-feature matrix. `AuthorityBlock`
-repair is not implied by the DataBlock evidence.
+and the genuine v17↔v18 rebuild/refusal seam. F5b adds focused mixed and
+all-diverted terminal-fold, exact-retry/ordinary-successor, object binding,
+selected-token list/export, and three-disposition retirement evidence. The
+genuine v18↔v19 adjacent-binary cell remains an explicit release-evidence gap.
+The broader lifecycle/dead-letter/retirement composition and measurement matrix
+remains an F6 integration gate. `AuthorityBlock` repair is not implied by the
+DataBlock or dead-letter evidence.
 
 The pinned matrix cell from [testing.md](testing.md) closes here:
 *`quiesce → create named branch → resume` — bounded resume must recheck branch
@@ -1664,12 +1690,12 @@ disposition, sidecar discriminator, public method, or transport.
   authority and runs only the persisted `DISABLING` continuation. The existing
   process-handoff contract, not a new distributed lease, separates them.
 
-**Deferred to F5b or later:** operator-requested fold receipts,
+**Deferred beyond F5b:** operator-requested fold receipts,
 dependency-level ordering, and a public health/backlog projection remain
 inactive. No active path creates `AuthorityBlock`;
 reason-gated repair stays fail-closed until such a producer and its finalized
-evidence grammar exist. Section 6.2's `DEAD_LETTERED` token/object/recovery
-shape is the next format-bearing strand, not part of F5b0.
+evidence grammar exist. Section 6.2's terminal shape is implemented in the
+separate v19/recovery-v21 strand.
 
 Cadence is the visibility gap. Expect ~seconds under load; the contract says
 "typically seconds, unbounded tail" and there is **no producer-facing flush**
@@ -1677,11 +1703,17 @@ in this profile (§4.7 P5).
 
 ### 6.2 Minimal terminal dead-letter authority (§4.7 P4)
 
+**F5b implemented (hidden row path, narrow offline inspection):** internal
+schema v19/token schema v3/recovery-v21 implements the following terminal
+protocol. It adds no HTTP, SDK, remote CLI, or OpenAPI row surface; F6 owns the
+remaining measurement and guardrail acceptance.
+
 Fold-time outcomes remain split by semantics:
 
 | Class | Examples | Disposition |
 |---|---|---|
-| **Structural** | corrupt/missing authenticated cut, schema or token-authority contradiction, malformed validation evidence, dead-letter object above the selected envelope | Install a durable strict `DataBlock`; publish no partial fold |
+| **Dead-letter envelope overflow** | canonical terminal payload is above the selected one-object byte envelope after valid conflict evidence exists | Install a durable strict `DataBlock` before object or Lance effects; publish no partial fold |
+| **Other structural fault** | corrupt/missing authenticated cut, schema or token-authority contradiction, malformed validation evidence | Fail loudly with no partial fold; the driver reports/retries according to the typed failure. `DataBlock` v1 cannot authenticate this evidence, and durable parking waits for a future `AuthorityBlock` strand |
 | **Data conflict** | uniqueness, RI, cardinality, keyed row validation | Divert one terminal LWW candidate per losing key, apply independent winners, and keep the lane progressing |
 
 Only the final LWW candidate for each losing key becomes a payload entry.
@@ -1698,14 +1730,15 @@ are not separately exported or replayed.
 
 2. **One bounded object per fold.** The driver deterministically orders the
    terminal candidates and canonically encodes one NDJSON object under the
-   reserved graph-relative prefix. Before implementation, F5 pins one encoded-
-   byte and peak-RSS envelope with a measurement cell. Exceeding it installs
+   reserved graph-relative prefix. The implementation pins an encoded-byte
+   envelope; F6 owns representative peak-RSS measurement. Exceeding it installs
    `DataBlock` before any object or Lance effect. There is no chunked fallback,
    chunk manifest, multipart protocol, or object-sized uncharged buffer.
 
 3. **Recovery owns the object before PUT.** The F5 sidecar binds the
    authenticated generation cut, canonical candidate descriptors, versioned
-   object path/digest/length/row count, exact optional base transaction, exact
+   object path/digest/length/row count, exact base transaction (marker-only
+   when all candidates divert), exact
    token transaction, and final manifest outcome before conditional create.
    `PutMode::Create` is accepted on `AlreadyExists` only after exact
    length/digest verification. A lost result remains recovery-owned. An object
@@ -1738,8 +1771,7 @@ are not separately exported or replayed.
    grow with uncovered fragments/history; §3.3 and F6 own that explicit,
    instrumented EXP gap rather than adding hot disposition counters now.
 
-7. **Retirement remains the same-format exit.** Before
-   `DEAD_LETTERED` becomes reachable, F5 extends cluster-only irreversible
+7. **Retirement remains the same-format exit.** F5 extends cluster-only irreversible
    authority retirement to `WITHDRAWN | DEAD_LETTERED`. Planning pins the
    exact sealed root cut and selected token witness, streams current terminal
    rows in bounded batches, and records scan-derived disposition counts and an
@@ -1812,9 +1844,12 @@ F3e did not claim this full F6 matrix. Its landed baseline pins recovery-v19's
 closed grammar and exact N+1 receipt roll-forward, no lineage/audit movement,
 receipt-bearing retired export, cluster/CLI preflight, and the genuine
 v16↔v17 fence. F3f's focused recovery-v20, DataBlock, cluster/CLI, and
-v17↔v18 evidence makes the narrow stopped/offline `WITHDRAWN` path active. The
-broader retirement race/failpoint/freeze/export matrix below remains required
-before public ingress activates; `AuthorityBlock` repair remains separate.
+v17↔v18 evidence makes the narrow stopped/offline `WITHDRAWN` path active.
+F5b's focused recovery-v21 evidence makes deterministic terminal diversion,
+selected-token inspection/export, and `WITHDRAWN | DEAD_LETTERED` retirement
+active; the genuine v18↔v19 adjacent-binary cell is still missing. The broader
+retirement race/failpoint/freeze/export matrix below remains required before
+public ingress activates; `AuthorityBlock` repair remains separate.
 
 - Failpoints through the hidden candidate-runtime path at acknowledgement, claim,
   lifecycle, maintenance, both fold participants, canonical dead-letter
@@ -2153,7 +2188,7 @@ or irreversible retirement/export understood by that same binary. A successor
 strand is not an exit because strict refusal prevents it from opening the old
 root. V17 owns `WITHDRAWN` retirement; F5 extends it for `DEAD_LETTERED`.
 
-**Strand budget.** V11 through v18 are implemented. Each unsettled future payload
+**Strand budget.** V11 through v19 are implemented. Each unsettled future payload
 is either exactly the frozen scaffold already registered or takes a new honest
 pre-release strand. There is no guessed numeric ceiling: every added strand is
 recorded with predecessor refusal/rebuild evidence, and the complete count

@@ -553,6 +553,7 @@ impl GraphCoordinator {
             merged_parent_commit_id,
             created_at: crate::db::now_micros()?,
             stream_fold_attribution: None,
+            stream_fold_attribution_v2: None,
         })
     }
 
@@ -574,6 +575,7 @@ impl GraphCoordinator {
             merged_parent_commit_id: intent.merged_parent_commit_id,
             actor_id: intent.actor_id,
             created_at: intent.created_at,
+            stream_fold_attribution_v2: intent.stream_fold_attribution_v2,
         };
         self.commit_graph.insert_committed(commit);
         SnapshotId::new(intent.graph_commit_id)

@@ -661,6 +661,153 @@ async fn authority_retirement_unblocks_exact_provenance_rebuild_and_freezes_sour
     assert_retired_named_branch_healer_refuses_orphan_discard(&fixture).await;
 }
 
+#[test]
+#[serial]
+fn dead_letter_list_payload_retirement_and_export_form_one_operational_exit() {
+    on_big_stack(|| async {
+        let _scenario = FailScenario::setup();
+        let cluster = tempfile::tempdir().unwrap();
+        let graph = cluster.path().join("graphs/knowledge.omni");
+        let db = Arc::new(
+            Omnigraph::init(graph.to_str().unwrap(), UNIQUE_STREAM_SCHEMA)
+                .await
+                .unwrap(),
+        );
+        db.mutate(
+            "main",
+            INSERT_PERSON,
+            "insert_person",
+            &helpers::int_params(&[("$score", 7)]),
+        )
+        .await
+        .expect("seed the committed uniqueness conflict before enrollment");
+        db.failpoint_enroll_stream_table_for_test(TABLE)
+            .await
+            .unwrap();
+        let dir = EnrolledGraphDir {
+            _cluster: cluster,
+            graph,
+        };
+        let cluster_uri = dir.cluster_uri();
+        enable_stream_profile(&db, &cluster_uri).await;
+        let served = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+
+        let logical_id = "dead-letter-operational-exit";
+        let duplicate = physical_batch(&served, &[(logical_id.to_string(), 7)]).await;
+        served
+            .failpoint_stream_b1_for_test(TABLE, Some(duplicate), 0)
+            .await
+            .expect("the conflicting occurrence must be durably acknowledged");
+        let open = stream_lane(&served).await;
+        served
+            .failpoint_start_stream_open_after_fold_drain_for_test(
+                TABLE,
+                "d1d1d1d1-d1d1-41d1-81d1-d1d1d1d1d1d1",
+                open.lifecycle_revision,
+                "operator:dead-letter-exit",
+            )
+            .await
+            .expect("the exact acknowledged generation must become the disable drain cut");
+        served.shutdown_stream_fold_driver().await.unwrap();
+        drop(served);
+
+        let offline = reopen_enrolled(&dir).await;
+        let disable_error = {
+            let _fold_arm =
+                ScopedFailPoint::new(names::STREAM_FOLD_POST_TOKEN_COMMIT_PRE_CONFIRM, "return");
+            try_disable_stream_profile(&offline, &cluster_uri)
+                .await
+                .expect_err("disable must stop after committing the dead-letter token effect")
+        };
+        assert!(
+            disable_error
+                .to_string()
+                .contains(names::STREAM_FOLD_POST_TOKEN_COMMIT_PRE_CONFIRM),
+            "{disable_error:?}"
+        );
+        let draining = stream_lane(&offline).await;
+        assert_eq!(draining.lifecycle, "DRAINING");
+        assert_eq!(draining.last_fold_outcome, None);
+        drop(offline);
+
+        let offline = reopen_enrolled(&dir).await;
+        let recovered = stream_lane(&offline).await;
+        assert_eq!(recovered.lifecycle, "DRAINING");
+        assert_eq!(recovered.last_fold_outcome.as_deref(), Some("PUBLISHED"));
+        assert_no_recovery_sidecars(&dir);
+        disable_stream_profile(&offline, &cluster_uri).await;
+        let status = offline.stream_status().await.unwrap();
+        assert_eq!(status.profile_mode, "DISABLED");
+        assert_eq!(status.tables[0].lifecycle, "SEALED");
+        let visible = visible_rows(&offline).await;
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].1, 7);
+        assert_ne!(
+            visible[0].0, logical_id,
+            "the losing occurrence must not become a visible base row"
+        );
+
+        let blocked = offline.export_jsonl("main", &[], &[]).await.unwrap_err();
+        assert!(matches!(
+            blocked,
+            OmniError::StreamExportBlocked {
+                withdrawn_token_count: 0,
+                dead_lettered_token_count: 1,
+            }
+        ));
+
+        let list =
+            helpers::stream_authority::list_stream_dead_letters(&offline, &cluster_uri, None)
+                .await
+                .expect("current terminal authority must be listable while stopped");
+        assert_eq!(list.entries.len(), 1);
+        assert!(list.next_cursor.is_none());
+        assert_eq!(list.entries[0].table_key, TABLE);
+        assert_eq!(list.entries[0].logical_id, logical_id);
+        assert_eq!(list.entries[0].reason_code, "UNIQUE_VIOLATION");
+
+        let payloads = helpers::stream_authority::export_stream_dead_letter_payloads(
+            &offline,
+            &cluster_uri,
+            None,
+        )
+        .await
+        .expect("descriptor-selected payload export must verify the immutable object");
+        assert_eq!(payloads.entries.len(), 1);
+        assert!(payloads.next_cursor.is_none());
+        assert_eq!(payloads.entries[0].authority, list.entries[0]);
+        assert_eq!(payloads.entries[0].payload["id"], logical_id);
+        assert_eq!(payloads.entries[0].payload["score"], 7);
+
+        let plan = plan_stream_authority_retirement(&offline, &cluster_uri).await;
+        assert_eq!(plan.withdrawn_token_count, 0);
+        assert_eq!(plan.dead_lettered_token_count, 1);
+        let retirement_id = "e2e2e2e2-e2e2-42e2-82e2-e2e2e2e2e2e2";
+        let retired = confirm_stream_authority_retirement(
+            &offline,
+            &cluster_uri,
+            retirement_id,
+            &plan.plan_digest,
+        )
+        .await
+        .expect("the exact terminal cut must retire for rebuild");
+        assert!(retired.changed);
+        assert_eq!(retired.dead_lettered_token_count, 1);
+
+        let exported = offline
+            .export_jsonl("main", &[], &[])
+            .await
+            .expect("receipt-bound retirement must release ordinary logical export");
+        let provenance: serde_json::Value =
+            serde_json::from_str(exported.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            provenance["_omnigraph_export_provenance"]["receipt"]["dead_lettered_token_count"],
+            1
+        );
+        assert_no_recovery_sidecars(&dir);
+    });
+}
+
 struct AuthorityRetirementFixture {
     _dir: EnrolledGraphDir,
     db: Arc<Omnigraph>,
@@ -705,7 +852,8 @@ async fn prepare_authority_retirement_fixture() -> AuthorityRetirementFixture {
     assert!(matches!(
         blocked,
         OmniError::StreamExportBlocked {
-            withdrawn_token_count: 1
+            withdrawn_token_count: 1,
+            dead_lettered_token_count: 0,
         }
     ));
 
@@ -6358,9 +6506,326 @@ async fn flushed_unmerged_generation_resumes_fold_only_and_refuses_a_second_gene
     );
 }
 
+struct DeadLetterCrashFixture {
+    dir: EnrolledGraphDir,
+    db: Arc<Omnigraph>,
+    incarnation: String,
+    logical_id: String,
+    write_id: String,
+    terminal_token: String,
+    manifest_version_before_fold: u64,
+    table_version_before_fold: u64,
+}
+
+async fn prepare_all_diverted_dead_letter_crash_fixture(
+    logical_id: &str,
+    write_id: &str,
+) -> DeadLetterCrashFixture {
+    let cluster = tempfile::tempdir().unwrap();
+    let graph = cluster.path().join("graphs/knowledge.omni");
+    let db = Arc::new(
+        Omnigraph::init(graph.to_str().unwrap(), UNIQUE_STREAM_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.mutate(
+        "main",
+        INSERT_PERSON,
+        "insert_person",
+        &helpers::int_params(&[("$score", 7)]),
+    )
+    .await
+    .expect("seed the committed uniqueness conflict before enrollment");
+    db.failpoint_enroll_stream_table_for_test(TABLE)
+        .await
+        .unwrap();
+    let cluster_uri = format!("file://{}", cluster.path().display());
+    enable_stream_profile(&db, &cluster_uri).await;
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    let (terminal_token, already_durable) = authorized_ingest_score(
+        &db,
+        &incarnation,
+        logical_id,
+        7,
+        0,
+        write_id,
+        None,
+        "agent:dead-letter-crash",
+    )
+    .await
+    .expect("base-dependent uniqueness must remain fold-time work");
+    assert!(!already_durable);
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    DeadLetterCrashFixture {
+        dir: EnrolledGraphDir {
+            _cluster: cluster,
+            graph,
+        },
+        db,
+        incarnation,
+        logical_id: logical_id.to_string(),
+        write_id: write_id.to_string(),
+        terminal_token,
+        manifest_version_before_fold: snapshot.version(),
+        table_version_before_fold: snapshot.entry(TABLE).unwrap().table_version,
+    }
+}
+
+fn dead_letter_object_names(dir: &EnrolledGraphDir) -> Vec<String> {
+    let object_dir = dir.path().join("__dead_letter/v1");
+    if !object_dir.exists() {
+        return Vec::new();
+    }
+    let mut names = std::fs::read_dir(object_dir)
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .into_string()
+                .expect("dead-letter object names are canonical ASCII ULIDs")
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+async fn assert_dead_letter_crash_boundary_converges(
+    failpoint: &'static str,
+    logical_id: &str,
+    write_id: &str,
+    object_exists_before_reopen: bool,
+) {
+    let fixture = prepare_all_diverted_dead_letter_crash_fixture(logical_id, write_id).await;
+    let error = {
+        let _failpoint = ScopedFailPoint::new(failpoint, "return");
+        fixture
+            .db
+            .failpoint_stream_b1_for_test(TABLE, None, 0)
+            .await
+            .expect_err("the selected dead-letter recovery occurrence must remain durable")
+    };
+    assert!(
+        matches!(error, OmniError::RecoveryRequired { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains(failpoint), "{error:?}");
+    assert!(
+        visible_rows(&fixture.db)
+            .await
+            .iter()
+            .all(|(id, _)| id != logical_id),
+        "an unpublished losing occurrence must remain invisible"
+    );
+
+    let sidecar_ids = helpers::recovery::sidecar_operation_ids(fixture.dir.path());
+    assert_eq!(sidecar_ids.len(), 1, "the v21 owner must remain armed");
+    let operation_id = sidecar_ids[0].clone();
+    let expected_object_name = format!("{operation_id}.ndjson");
+    let expected_object_location = format!("__dead_letter/v1/{expected_object_name}");
+    let expected_object_path = fixture.dir.path().join(&expected_object_location);
+    let expected_objects = if object_exists_before_reopen {
+        vec![expected_object_name.clone()]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(
+        dead_letter_object_names(&fixture.dir),
+        expected_objects,
+        "the failpoint must stop at its exact declared object boundary"
+    );
+
+    let exact_object_bytes = object_exists_before_reopen.then(|| {
+        std::fs::read(&expected_object_path)
+            .expect("the post-object failpoint must leave the exact descriptor-owned bytes")
+    });
+
+    let DeadLetterCrashFixture {
+        dir,
+        db,
+        incarnation,
+        logical_id,
+        write_id,
+        terminal_token,
+        manifest_version_before_fold,
+        table_version_before_fold,
+    } = fixture;
+    let cluster_uri = dir.cluster_uri();
+    drop(db);
+
+    if let Some(exact_object_bytes) = &exact_object_bytes {
+        std::fs::write(&expected_object_path, b"{\"tampered\":true}\n").unwrap();
+        let error = match Omnigraph::open(dir.path().to_str().unwrap()).await {
+            Ok(_) => {
+                panic!("effect-free recovery must still verify an existing exact-path object")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("dead-letter object"),
+            "{error:?}"
+        );
+        assert_eq!(
+            helpers::recovery::sidecar_operation_ids(dir.path()),
+            [operation_id.clone()],
+            "object corruption must fail closed without retiring its owner"
+        );
+        std::fs::write(&expected_object_path, exact_object_bytes).unwrap();
+    }
+
+    let effect_free =
+        Arc::new(Omnigraph::open(dir.path().to_str().unwrap()).await.expect(
+            "open-time recovery must verify residue and retire the effect-free v21 intent",
+        ));
+    assert!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
+        "effect-free recovery must retire the v21 sidecar"
+    );
+    let effect_free_snapshot = effect_free
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert_eq!(
+        effect_free_snapshot.version(),
+        manifest_version_before_fold,
+        "an object alone is inert and effect-free recovery must not publish"
+    );
+    assert_eq!(
+        effect_free_snapshot.entry(TABLE).unwrap().table_version,
+        table_version_before_fold,
+        "neither Lance participant moved, so recovery must not invent a base effect"
+    );
+    assert!(
+        visible_rows(&effect_free)
+            .await
+            .iter()
+            .all(|(id, _)| id != &logical_id),
+        "effect-free recovery must not expose the losing occurrence"
+    );
+    assert_eq!(
+        dead_letter_object_names(&dir),
+        expected_objects,
+        "effect-free recovery must retain existing object residue without creating any object"
+    );
+
+    let served =
+        helpers::stream_authority::bind_checked_stream_runtime(effect_free, &cluster_uri).await;
+    served
+        .failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the retained acknowledged generation must retry and publish one terminal cut");
+    let recovered_snapshot = served
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert!(
+        recovered_snapshot.version() > manifest_version_before_fold,
+        "the logical retry must publish its terminal graph cut; cold retry may first publish a higher-epoch claim"
+    );
+    assert_eq!(
+        recovered_snapshot.entry(TABLE).unwrap().table_version,
+        table_version_before_fold + 1,
+        "all-diverted retry must publish the marker-only merged-generation effect"
+    );
+    assert!(
+        visible_rows(&served)
+            .await
+            .iter()
+            .all(|(id, _)| id != &logical_id),
+        "the terminal occurrence must never become a base row"
+    );
+    drop(served);
+
+    let reopened = Arc::new(
+        Omnigraph::open(dir.path().to_str().unwrap())
+            .await
+            .expect("the recovered terminal cut must reopen cleanly"),
+    );
+    let dead_letters =
+        helpers::stream_authority::list_stream_dead_letters(&reopened, &cluster_uri, None)
+            .await
+            .expect("offline inspection must observe recovered terminal authority");
+    assert_eq!(dead_letters.entries.len(), 1);
+    let terminal = &dead_letters.entries[0];
+    assert_eq!(terminal.logical_id, logical_id);
+    assert_eq!(terminal.occurrence_token, terminal_token);
+    assert_ne!(
+        terminal.object_location, expected_object_location,
+        "an effect-free sidecar is retired; the logical retry owns a fresh selected descriptor"
+    );
+    let selected_object_name = Path::new(&terminal.object_location)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("selected dead-letter location has one canonical object name")
+        .to_string();
+    let mut final_objects = vec![selected_object_name.clone()];
+    if object_exists_before_reopen {
+        final_objects.push(expected_object_name.clone());
+        final_objects.sort();
+    }
+    assert_eq!(
+        dead_letter_object_names(&dir),
+        final_objects,
+        "only one descriptor is selected; pre-publication object residue remains inert retain-all state"
+    );
+
+    let reopened =
+        helpers::stream_authority::bind_checked_stream_runtime(reopened, &cluster_uri).await;
+    let (retry_token, already_durable) = authorized_ingest_score(
+        &reopened,
+        &incarnation,
+        &logical_id,
+        7,
+        1,
+        &write_id,
+        None,
+        "agent:dead-letter-crash",
+    )
+    .await
+    .expect("the exact occurrence must replay as the selected terminal authority");
+    assert_eq!(retry_token, terminal_token);
+    assert!(already_durable);
+    assert_eq!(
+        dead_letter_object_names(&dir),
+        final_objects,
+        "terminal replay must not create another object or terminal decision"
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
 #[tokio::test]
 #[serial]
-async fn strict_fold_validation_failure_keeps_manifest_old_and_stream_fold_only() {
+async fn dead_letter_crash_after_sidecar_before_object_recovers_one_selected_object() {
+    let _scenario = FailScenario::setup();
+    assert_dead_letter_crash_boundary_converges(
+        names::STREAM_DEAD_LETTER_POST_SIDECAR_PRE_OBJECT,
+        "dead-letter-pre-object",
+        "71717171-7171-4171-8171-717171717171",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn dead_letter_crash_after_object_before_base_verifies_residue_and_selects_one_terminal() {
+    let _scenario = FailScenario::setup();
+    assert_dead_letter_crash_boundary_converges(
+        names::STREAM_DEAD_LETTER_POST_OBJECT_PRE_BASE_COMMIT,
+        "dead-letter-post-object",
+        "72727272-7272-4272-8272-727272727272",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn all_diverted_dead_letter_advances_marker_and_accepts_an_ordinary_successor() {
     let _scenario = FailScenario::setup();
     let cluster = tempfile::tempdir().unwrap();
     let graph = cluster.path().join("graphs/knowledge.omni");
@@ -6380,42 +6845,182 @@ async fn strict_fold_validation_failure_keeps_manifest_old_and_stream_fold_only(
     db.failpoint_enroll_stream_table_for_test(TABLE)
         .await
         .unwrap();
-    enable_stream_profile(&db, &format!("file://{}", cluster.path().display())).await;
-
-    let duplicate = physical_batch(&db, &[("duplicate-id".to_string(), 7)]).await;
-    db.failpoint_stream_b1_for_test(TABLE, Some(duplicate), 0)
+    let cluster_uri = format!("file://{}", cluster.path().display());
+    enable_stream_profile(&db, &cluster_uri).await;
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
         .await
-        .expect("base-dependent uniqueness is fold-time work");
+        .unwrap();
+    let logical_id = "duplicate-id";
+    let write_id = "91919191-9191-4191-8191-919191919191";
+    let (terminal_token, already_durable) = authorized_ingest_score(
+        &db,
+        &incarnation,
+        logical_id,
+        7,
+        0,
+        write_id,
+        None,
+        "agent:dead-letter",
+    )
+    .await
+    .expect("base-dependent uniqueness is fold-time work");
+    assert!(!already_durable);
     let snapshot_before_fold = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let fold_error = db
-        .failpoint_stream_b1_for_test(TABLE, None, 0)
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
         .await
-        .expect_err("strict fold must reject a committed uniqueness conflict");
-    assert!(fold_error.to_string().contains("unique"), "{fold_error:?}");
+        .expect("the losing occurrence must publish terminal authority");
     let snapshot_after_fold = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     assert_eq!(
         snapshot_after_fold.version(),
-        snapshot_before_fold.version(),
-        "validation failure occurs before any fold manifest CAS"
+        snapshot_before_fold.version() + 1,
+        "an all-diverted fold still publishes one graph cut"
     );
     assert_eq!(
         snapshot_after_fold.entry(TABLE).unwrap().table_version,
-        snapshot_before_fold.entry(TABLE).unwrap().table_version,
-        "validation failure occurs before any fold base-table effect"
+        snapshot_before_fold.entry(TABLE).unwrap().table_version + 1,
+        "the marker-only base transaction must advance Lance merged-generation authority"
     );
     let visible = visible_rows(&db).await;
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].1, 7);
+    assert_ne!(visible[0].0, logical_id);
 
-    let correction = physical_batch(&db, &[("later".to_string(), 8)]).await;
-    let correction_error = db
-        .failpoint_stream_b1_for_test(TABLE, Some(correction), 1)
-        .await
-        .expect_err("B1 admits no correction generation beside strict-blocked input");
-    assert!(
-        matches!(correction_error, OmniError::FoldRequired { .. }),
-        "{correction_error:?}"
+    let object_dir = cluster
+        .path()
+        .join("graphs/knowledge.omni/__dead_letter/v1");
+    let object_count = std::fs::read_dir(&object_dir)
+        .expect("dead-letter fold must create its canonical object directory")
+        .count();
+    assert_eq!(object_count, 1);
+
+    let (retry_token, retry_already_durable) = authorized_ingest_score(
+        &db,
+        &incarnation,
+        logical_id,
+        7,
+        1,
+        write_id,
+        None,
+        "agent:dead-letter",
+    )
+    .await
+    .expect("the exact losing occurrence must remain idempotently terminal");
+    assert_eq!(retry_token, terminal_token);
+    assert!(retry_already_durable);
+    assert_eq!(
+        std::fs::read_dir(&object_dir).unwrap().count(),
+        object_count,
+        "an exact retry must not create another dead-letter object"
     );
+
+    let successor_write_id = "92929292-9292-4292-8292-929292929292";
+    let (successor_token, successor_already_durable) = authorized_ingest_score(
+        &db,
+        &incarnation,
+        logical_id,
+        8,
+        2,
+        successor_write_id,
+        Some(&terminal_token),
+        "agent:dead-letter",
+    )
+    .await
+    .expect("a corrected ordinary occurrence may name the terminal token as predecessor");
+    assert!(!successor_already_durable);
+    assert_ne!(successor_token, terminal_token);
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the corrected successor must fold through the ordinary path");
+    let visible = visible_rows(&db).await;
+    assert_eq!(visible.len(), 2);
+    assert!(
+        visible
+            .iter()
+            .any(|(id, score)| id == logical_id && *score == 8)
+    );
+
+    let stale = authorized_ingest_score(
+        &db,
+        &incarnation,
+        logical_id,
+        7,
+        3,
+        write_id,
+        None,
+        "agent:dead-letter",
+    )
+    .await
+    .expect_err("the superseded terminal occurrence cannot resurrect the key");
+    assert!(
+        matches!(
+            stale,
+            OmniError::StreamSequenceConflict {
+                ref logical_id,
+                current_token: Some(ref current),
+                ..
+            } if logical_id == "duplicate-id" && current == &successor_token
+        ),
+        "{stale:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&object_dir).unwrap().count(),
+        object_count,
+        "ordinary correction preserves immutable dead-letter residue without another object"
+    );
+
+    let (mixed_loser_token, _) = authorized_ingest_score(
+        &db,
+        &incarnation,
+        "mixed-loser",
+        7,
+        4,
+        "93939393-9393-4393-8393-939393939393",
+        None,
+        "agent:dead-letter",
+    )
+    .await
+    .unwrap();
+    let (mixed_winner_token, _) = authorized_ingest_score(
+        &db,
+        &incarnation,
+        "mixed-winner",
+        9,
+        5,
+        "94949494-9494-4494-8494-949494949494",
+        None,
+        "agent:dead-letter",
+    )
+    .await
+    .unwrap();
+    assert_ne!(mixed_loser_token, mixed_winner_token);
+    let mixed_before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("a mixed fold must publish its independent winner and terminal loser together");
+    let mixed_after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(mixed_after.version(), mixed_before.version() + 1);
+    assert_eq!(
+        mixed_after.entry(TABLE).unwrap().table_version,
+        mixed_before.entry(TABLE).unwrap().table_version + 1
+    );
+    let visible = visible_rows(&db).await;
+    assert!(
+        visible
+            .iter()
+            .any(|(id, score)| id == "mixed-winner" && *score == 9)
+    );
+    assert!(visible.iter().all(|(id, _)| id != "mixed-loser"));
+    assert_eq!(
+        std::fs::read_dir(&object_dir).unwrap().count(),
+        object_count + 1,
+        "one mixed generation creates exactly one additional fold-owned object"
+    );
+    assert_no_recovery_sidecars(&EnrolledGraphDir {
+        _cluster: cluster,
+        graph,
+    });
 }
 
 #[tokio::test]

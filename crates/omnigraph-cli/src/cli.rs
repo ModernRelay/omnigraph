@@ -489,11 +489,51 @@ pub(crate) enum ClusterStreamCommand {
         #[command(subcommand)]
         command: StreamBlockCommand,
     },
+    /// Inspect current terminal dead-letter authority while writers are stopped.
+    #[command(name = "dead-letter")]
+    DeadLetter {
+        #[command(subcommand)]
+        command: StreamDeadLetterCommand,
+    },
     /// Irreversibly freeze a terminal-authority graph for logical rebuild.
     #[command(name = "retire-for-rebuild")]
     RetireForRebuild {
         #[command(subcommand)]
         command: StreamRetireForRebuildCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum StreamDeadLetterCommand {
+    /// List one bounded page of current DEAD_LETTERED sequencing authority.
+    List {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Opaque cursor returned by a previous page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Attest that every writer-capable process for the graph is stopped.
+        #[arg(long)]
+        confirm_stream_offline: bool,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export descriptor-verified payloads for current DEAD_LETTERED keys.
+    Export {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Opaque cursor returned by a previous page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Attest that every writer-capable process for the graph is stopped.
+        #[arg(long)]
+        confirm_stream_offline: bool,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
     },
 }
 

@@ -32,6 +32,23 @@ const STREAM_TOKEN_DOMAIN_V1: &[u8] = b"omnigraph.stream-token.v1\0";
 const PAYLOAD_DIGEST_DOMAIN_V1: &[u8] = b"omnigraph.stream-payload.v1\0";
 const FOLD_ATTRIBUTION_DOMAIN_V1: &[u8] = b"omnigraph.stream-fold-attribution.v1\0";
 const TOKEN_AUTHORITY_PLAN_DOMAIN_V1: &[u8] = b"omnigraph.stream-token-authority-plan.v1\0";
+const AUTHORITY_RETIREMENT_REQUEST_DOMAIN_V2: &[u8] =
+    b"omnigraph.stream-authority-retirement-request.v2\0";
+const AUTHORITY_RETIREMENT_RECEIPT_LOOKUP_DOMAIN_V2: &[u8] =
+    b"omnigraph.stream-authority-retirement-receipt-lookup.v2\0";
+const AUTHORITY_RETIREMENT_RECEIPT_RECORD_DOMAIN_V2: &[u8] =
+    b"omnigraph.stream-authority-retirement-receipt-record.v2\0";
+const AUTHORITY_RETIREMENT_RECEIPT_CHAIN_DOMAIN_V2: &[u8] =
+    b"omnigraph.stream-authority-retirement-receipt-chain.v2\0";
+const AUTHORITY_RETIREMENT_TOKEN_WITNESS_DOMAIN_V2: &[u8] =
+    b"omnigraph.stream-authority-retirement-token-witness.v2\0";
+pub(crate) const STREAM_DEAD_LETTER_OBJECT_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const STREAM_FOLD_ATTRIBUTION_PROTOCOL_VERSION_V2: u32 = 2;
+pub(crate) const AUTHORITY_RETIREMENT_RECEIPT_PROTOCOL_VERSION_V2: u32 = 2;
+pub(crate) const AUTHORITY_RETIREMENT_RECEIPT_V2_TAG: &str = "AUTHORITY_RETIREMENT_RECEIPT_V2";
+pub(crate) const STREAM_DEAD_LETTER_OBJECT_PREFIX: &str = "__dead_letter/v1";
+pub(crate) const MAX_STREAM_DEAD_LETTER_CANDIDATES: u64 = 8_192;
+pub(crate) const MAX_STREAM_DEAD_LETTER_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 /// Conservative per-entry allowance for the BTree node, allocator headers,
 /// and the duplicated logical-id key retained by exact authority lookups.
 const STREAM_LOOKUP_ENTRY_OVERHEAD_BYTES: usize = 256;
@@ -86,6 +103,12 @@ impl StreamTokenProtocolError {
             field,
             reason: reason.into(),
         }
+    }
+}
+
+impl From<StreamTokenProtocolError> for crate::error::OmniError {
+    fn from(error: StreamTokenProtocolError) -> Self {
+        crate::error::OmniError::manifest_internal(error.to_string())
     }
 }
 
@@ -864,11 +887,178 @@ impl StreamTokenInput<'_> {
     }
 }
 
+/// The one canonical payload encoding owned by the F5 terminal-object strand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum StreamDeadLetterObjectFormat {
+    NdjsonV1,
+}
+
+/// Integrity and deterministic identity of one fold-owned dead-letter object.
+///
+/// The descriptor is repeated in each current terminal row so inspection can
+/// group rows by object without prefix listing or a second inventory. The
+/// object itself is immutable retain-all residue unless this exact descriptor
+/// is selected by the manifest's current-token authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StreamDeadLetterObjectDescriptor {
+    pub(crate) protocol_version: u32,
+    pub(crate) fold_operation_id: String,
+    pub(crate) location: String,
+    pub(crate) format: StreamDeadLetterObjectFormat,
+    pub(crate) object_digest: String,
+    pub(crate) encoded_length: u64,
+    pub(crate) candidate_count: u64,
+}
+
+impl StreamDeadLetterObjectDescriptor {
+    pub(crate) fn new(
+        fold_operation_id: impl Into<String>,
+        object_digest: impl Into<String>,
+        encoded_length: u64,
+        candidate_count: u64,
+    ) -> ProtocolResult<Self> {
+        let fold_operation_id = fold_operation_id.into();
+        let value = Self {
+            protocol_version: STREAM_DEAD_LETTER_OBJECT_PROTOCOL_VERSION,
+            location: canonical_stream_dead_letter_object_location(&fold_operation_id)?,
+            fold_operation_id,
+            format: StreamDeadLetterObjectFormat::NdjsonV1,
+            object_digest: object_digest.into(),
+            encoded_length,
+            candidate_count,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(crate) fn validate(&self) -> ProtocolResult<()> {
+        if self.protocol_version != STREAM_DEAD_LETTER_OBJECT_PROTOCOL_VERSION {
+            return Err(StreamTokenProtocolError::invalid(
+                "dead_letter_object.protocol_version",
+                format!("must be {}", STREAM_DEAD_LETTER_OBJECT_PROTOCOL_VERSION),
+            ));
+        }
+        let expected = canonical_stream_dead_letter_object_location(&self.fold_operation_id)?;
+        if self.location != expected {
+            return Err(StreamTokenProtocolError::invalid(
+                "dead_letter_object.location",
+                format!("must be the canonical fold-owned path '{expected}'"),
+            ));
+        }
+        if self.format != StreamDeadLetterObjectFormat::NdjsonV1 {
+            return Err(StreamTokenProtocolError::invalid(
+                "dead_letter_object.format",
+                "must be NDJSON_V1",
+            ));
+        }
+        decode_sha256("dead_letter_object.object_digest", &self.object_digest)?;
+        if self.encoded_length == 0 || self.encoded_length > MAX_STREAM_DEAD_LETTER_OBJECT_BYTES {
+            return Err(StreamTokenProtocolError::invalid(
+                "dead_letter_object.encoded_length",
+                format!("must be within 1..={MAX_STREAM_DEAD_LETTER_OBJECT_BYTES}"),
+            ));
+        }
+        if self.candidate_count == 0 || self.candidate_count > MAX_STREAM_DEAD_LETTER_CANDIDATES {
+            return Err(StreamTokenProtocolError::invalid(
+                "dead_letter_object.candidate_count",
+                format!("must be within 1..={MAX_STREAM_DEAD_LETTER_CANDIDATES}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Canonical graph-relative object path. A canonical uppercase ULID makes the
+/// conditional-create identity unique to one recovery occurrence and rejects
+/// path separators, traversal, aliases, and caller-selected prefixes.
+pub(crate) fn canonical_stream_dead_letter_object_location(
+    fold_operation_id: &str,
+) -> ProtocolResult<String> {
+    let parsed = ulid::Ulid::from_string(fold_operation_id).map_err(|error| {
+        StreamTokenProtocolError::invalid(
+            "dead_letter_object.fold_operation_id",
+            format!("must be a canonical ULID: {error}"),
+        )
+    })?;
+    if parsed.to_string() != fold_operation_id {
+        return Err(StreamTokenProtocolError::invalid(
+            "dead_letter_object.fold_operation_id",
+            "must use the canonical uppercase ULID spelling",
+        ));
+    }
+    Ok(format!(
+        "{STREAM_DEAD_LETTER_OBJECT_PREFIX}/{fold_operation_id}.ndjson"
+    ))
+}
+
+/// Closed data-conflict vocabulary. Structural failures never enter this
+/// enum. A bounded object-envelope overflow installs a strict DataBlock;
+/// faults without authenticatable correction evidence fail loudly instead of
+/// inventing a repair token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum StreamDeadLetterReasonCode {
+    OrphanEdge,
+    UniqueViolation,
+    CardinalityViolation,
+    ValueConstraintViolation,
+    MultipleValidationViolations,
+    CorrectionViewOverflow,
+}
+
+/// Versioned terminal evidence stored with one current DEAD_LETTERED token.
+///
+/// Most fields deliberately repeat the authority row's sequencing preimage.
+/// Validation requires byte-for-byte agreement, so a copied object reference
+/// cannot be rebound to another occurrence, predecessor, contributor, or
+/// payload while retaining a syntactically valid current-token row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StreamDeadLetterTerminalEvidence {
+    pub(crate) occurrence_token: StreamToken,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub(crate) predecessor_token: Option<StreamToken>,
+    pub(crate) write_id: String,
+    pub(crate) contributor_id: TrustedContributorId,
+    pub(crate) payload_digest: PayloadDigest,
+    pub(crate) reason_code: StreamDeadLetterReasonCode,
+    pub(crate) object: StreamDeadLetterObjectDescriptor,
+    pub(crate) candidate_ordinal: u64,
+}
+
+impl StreamDeadLetterTerminalEvidence {
+    fn validate_for(&self, authority: &StreamTokenAuthorityRow) -> ProtocolResult<()> {
+        self.object.validate()?;
+        canonical_uuid_bytes("dead_letter.write_id", &self.write_id)?;
+        if self.candidate_ordinal >= self.object.candidate_count {
+            return Err(StreamTokenProtocolError::invalid(
+                "dead_letter.candidate_ordinal",
+                "must be below the object's candidate_count",
+            ));
+        }
+        if self.occurrence_token != authority.current_token
+            || self.predecessor_token != authority.predecessor_token
+            || self.write_id != authority.write_id
+            || self.contributor_id != authority.contributor_id
+            || self.payload_digest != authority.payload_digest
+        {
+            return Err(StreamTokenProtocolError::Corruption(format!(
+                "DEAD_LETTERED evidence for '{}' differs from its current-token sequencing preimage",
+                authority.logical_id
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum StreamTokenDisposition {
     Present,
     Withdrawn,
+    DeadLettered,
 }
 
 /// Terminal evidence required when the current token has been withdrawn.
@@ -907,6 +1097,13 @@ pub(crate) struct StreamTokenAuthorityRow {
     pub(crate) origin: StreamRowOrigin,
     #[serde(deserialize_with = "deserialize_present_option")]
     pub(crate) terminal_correction: Option<StreamTerminalCorrection>,
+    // Additive only for nested recovery row JSON: historical v14/v20 rows
+    // omitted this field and must retain their byte shape. A v21
+    // DEAD_LETTERED row necessarily serializes Some, and row/v21 validation
+    // rejects its omission. The token dataset v3 uses an explicit physical
+    // nullable column independently of this compatibility rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_dead_letter: Option<Box<StreamDeadLetterTerminalEvidence>>,
 }
 
 impl StreamTokenAuthorityRow {
@@ -937,6 +1134,13 @@ impl StreamTokenAuthorityRow {
             retained_string_bytes(&mut total, correction.actor.as_str())?;
             retained_string_bytes(&mut total, &correction.correction_id)?;
         }
+        if let Some(terminal) = &self.terminal_dead_letter {
+            retained_string_bytes(&mut total, &terminal.write_id)?;
+            retained_string_bytes(&mut total, terminal.contributor_id.as_str())?;
+            retained_string_bytes(&mut total, &terminal.object.fold_operation_id)?;
+            retained_string_bytes(&mut total, &terminal.object.location)?;
+            retained_string_bytes(&mut total, &terminal.object.object_digest)?;
+        }
         Ok(total)
     }
 
@@ -964,6 +1168,7 @@ impl StreamTokenAuthorityRow {
             payload_digest: metadata.payload_digest,
             origin: metadata.origin.clone(),
             terminal_correction: None,
+            terminal_dead_letter: None,
         };
         row.validate()?;
         Ok(row)
@@ -990,8 +1195,52 @@ impl StreamTokenAuthorityRow {
             actor,
             correction_id,
         });
+        withdrawn.terminal_dead_letter = None;
         withdrawn.validate()?;
         Ok(withdrawn)
+    }
+
+    /// Preserve one losing PRESENT occurrence as terminal sequencing
+    /// authority. The base row is not changed by this constructor; the fold
+    /// recovery protocol decides whether a mixed fold has an independent base
+    /// effect or is all-diverted.
+    pub(crate) fn dead_letter_present_winner(
+        blocked_winner: &Self,
+        fold_operation_id: String,
+        reason_code: StreamDeadLetterReasonCode,
+        object: StreamDeadLetterObjectDescriptor,
+        candidate_ordinal: u64,
+    ) -> ProtocolResult<Self> {
+        blocked_winner.validate()?;
+        if blocked_winner.disposition != StreamTokenDisposition::Present {
+            return Err(StreamTokenProtocolError::invalid(
+                "blocked_winner.disposition",
+                "dead-lettering requires PRESENT token authority",
+            ));
+        }
+        object.validate()?;
+        if object.fold_operation_id != fold_operation_id {
+            return Err(StreamTokenProtocolError::invalid(
+                "dead_letter.fold_operation_id",
+                "must match the object descriptor's fold operation",
+            ));
+        }
+        let terminal = StreamDeadLetterTerminalEvidence {
+            occurrence_token: blocked_winner.current_token,
+            predecessor_token: blocked_winner.predecessor_token,
+            write_id: blocked_winner.write_id.clone(),
+            contributor_id: blocked_winner.contributor_id.clone(),
+            payload_digest: blocked_winner.payload_digest,
+            reason_code,
+            object,
+            candidate_ordinal,
+        };
+        let mut dead_lettered = blocked_winner.clone();
+        dead_lettered.disposition = StreamTokenDisposition::DeadLettered;
+        dead_lettered.terminal_correction = None;
+        dead_lettered.terminal_dead_letter = Some(Box::new(terminal));
+        dead_lettered.validate()?;
+        Ok(dead_lettered)
     }
 
     pub(crate) fn validate(&self) -> ProtocolResult<()> {
@@ -1020,19 +1269,32 @@ impl StreamTokenAuthorityRow {
                 format!("must not exceed {MAX_STREAM_CHAIN_DEPTH}"),
             ));
         }
-        match (self.disposition, &self.terminal_correction) {
-            (StreamTokenDisposition::Present, None) => {}
-            (StreamTokenDisposition::Present, Some(_)) => {
+        match (
+            self.disposition,
+            &self.terminal_correction,
+            &self.terminal_dead_letter,
+        ) {
+            (StreamTokenDisposition::Present, None, None) => {}
+            (StreamTokenDisposition::Present, _, _) => {
                 return Err(StreamTokenProtocolError::invalid(
-                    "terminal_correction",
+                    "terminal_evidence",
                     "must be null for PRESENT token authority",
                 ));
             }
-            (StreamTokenDisposition::Withdrawn, Some(correction)) => correction.validate()?,
-            (StreamTokenDisposition::Withdrawn, None) => {
+            (StreamTokenDisposition::Withdrawn, Some(correction), None) => correction.validate()?,
+            (StreamTokenDisposition::Withdrawn, _, _) => {
                 return Err(StreamTokenProtocolError::invalid(
-                    "terminal_correction",
-                    "must be present for WITHDRAWN token authority",
+                    "terminal_evidence",
+                    "WITHDRAWN requires only terminal_correction",
+                ));
+            }
+            (StreamTokenDisposition::DeadLettered, None, Some(terminal)) => {
+                terminal.validate_for(self)?
+            }
+            (StreamTokenDisposition::DeadLettered, _, _) => {
+                return Err(StreamTokenProtocolError::invalid(
+                    "terminal_evidence",
+                    "DEAD_LETTERED requires only terminal_dead_letter",
                 ));
             }
         }
@@ -1236,6 +1498,462 @@ pub(crate) fn stream_fold_attribution_commitment(
     })
 }
 
+/// Successor attribution grammar for a fold that publishes at least one
+/// terminal candidate. Unlike the frozen v10 shape, visible counts may be zero
+/// and the complete v1 object descriptor is mandatory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StreamFoldAttributionSummaryV2 {
+    pub(crate) protocol_version: u32,
+    pub(crate) visible_contributor_count: u64,
+    pub(crate) visible_write_count: u64,
+    pub(crate) winning_attribution_digest: String,
+    pub(crate) dead_lettered_write_count: u64,
+    pub(crate) dead_letter_object: StreamDeadLetterObjectDescriptor,
+}
+
+impl StreamFoldAttributionSummaryV2 {
+    pub(crate) fn validate(&self) -> ProtocolResult<()> {
+        if self.protocol_version != STREAM_FOLD_ATTRIBUTION_PROTOCOL_VERSION_V2 {
+            return Err(StreamTokenProtocolError::invalid(
+                "fold_attribution.protocol_version",
+                format!("must be {}", STREAM_FOLD_ATTRIBUTION_PROTOCOL_VERSION_V2),
+            ));
+        }
+        if self.visible_contributor_count > self.visible_write_count {
+            return Err(StreamTokenProtocolError::invalid(
+                "fold_attribution.visible_contributor_count",
+                "must not exceed visible_write_count",
+            ));
+        }
+        decode_sha256(
+            "fold_attribution.winning_attribution_digest",
+            &self.winning_attribution_digest,
+        )?;
+        self.dead_letter_object.validate()?;
+        if self.dead_lettered_write_count == 0
+            || self.dead_lettered_write_count != self.dead_letter_object.candidate_count
+        {
+            return Err(StreamTokenProtocolError::invalid(
+                "fold_attribution.dead_lettered_write_count",
+                "must equal the non-zero object candidate_count",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Compute the versioned attribution selected by a mixed or all-diverted
+/// dead-letter fold. Non-empty visible attribution deliberately retains the
+/// established v1 winning-tuple digest; the enclosing protocol version and
+/// mandatory object commitment distinguish the successor grammar.
+pub(crate) fn stream_fold_attribution_commitment_v2(
+    visible_winners: &[StreamTokenAuthorityRow],
+    dead_letter_object: StreamDeadLetterObjectDescriptor,
+) -> ProtocolResult<StreamFoldAttributionSummaryV2> {
+    dead_letter_object.validate()?;
+    let (visible_contributor_count, visible_write_count, winning_attribution_digest) =
+        if visible_winners.is_empty() {
+            let mut hasher = Sha256::new();
+            hasher.update(FOLD_ATTRIBUTION_DOMAIN_V1);
+            hash_u64(&mut hasher, 0);
+            (0, 0, format!("sha256:{:x}", hasher.finalize()))
+        } else {
+            let legacy = stream_fold_attribution_commitment(visible_winners)?;
+            (
+                legacy.visible_contributor_count,
+                legacy.visible_write_count,
+                legacy.winning_attribution_digest,
+            )
+        };
+    let value = StreamFoldAttributionSummaryV2 {
+        protocol_version: STREAM_FOLD_ATTRIBUTION_PROTOCOL_VERSION_V2,
+        visible_contributor_count,
+        visible_write_count,
+        winning_attribution_digest,
+        dead_lettered_write_count: dead_letter_object.candidate_count,
+        dead_letter_object,
+    };
+    value.validate()?;
+    Ok(value)
+}
+
+/// Immutable F5 retirement provenance. V1 remains frozen to PRESENT/WITHDRAWN;
+/// this successor binds DEAD_LETTERED as a third, independent disposition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuthorityRetirementReceiptV2 {
+    pub(crate) protocol_version: u32,
+    pub(crate) record_id: String,
+    pub(crate) record_lookup_key: String,
+    pub(crate) record_tag: String,
+    pub(crate) graph_identity_digest: String,
+    pub(crate) chain_ordinal: u64,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub(crate) predecessor_record_id: Option<String>,
+    pub(crate) prior_chain_digest: String,
+    pub(crate) resulting_chain_digest: String,
+    pub(crate) retirement_id: String,
+    pub(crate) plan_digest: String,
+    pub(crate) operation_request_digest: String,
+    pub(crate) actor: String,
+    pub(crate) source_internal_schema_version: u32,
+    pub(crate) source_manifest_version: u64,
+    pub(crate) live_branch_heads_digest: String,
+    pub(crate) source_profile_revision: u64,
+    pub(crate) lifecycle_and_sealed_proof_digest: String,
+    pub(crate) pre_retirement_token_head: super::CurrentHeadWitness,
+    pub(crate) pre_retirement_token_witness_digest: String,
+    pub(crate) present_token_count: u64,
+    pub(crate) withdrawn_token_count: u64,
+    pub(crate) dead_lettered_token_count: u64,
+    pub(crate) export_cut_digest: String,
+    pub(crate) retired_at: i64,
+}
+
+impl AuthorityRetirementReceiptV2 {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        graph_identity_digest: impl Into<String>,
+        prior_chain: &super::stream_profile::ReceiptChainRef,
+        retirement_id: impl Into<String>,
+        plan_digest: impl Into<String>,
+        actor: impl Into<String>,
+        source_internal_schema_version: u32,
+        source_manifest_version: u64,
+        live_branch_heads_digest: impl Into<String>,
+        source_profile_revision: u64,
+        lifecycle_and_sealed_proof_digest: impl Into<String>,
+        pre_retirement_token_head: super::CurrentHeadWitness,
+        pre_retirement_token_witness_digest: impl Into<String>,
+        present_token_count: u64,
+        withdrawn_token_count: u64,
+        dead_lettered_token_count: u64,
+        export_cut_digest: impl Into<String>,
+        retired_at: i64,
+    ) -> ProtocolResult<Self> {
+        prior_chain.validate().map_err(|error| {
+            StreamTokenProtocolError::invalid("retirement.prior_chain", error.to_string())
+        })?;
+        let graph_identity_digest = graph_identity_digest.into();
+        let retirement_id = retirement_id.into();
+        let plan_digest = plan_digest.into();
+        let actor = actor.into();
+        let mut value = Self {
+            protocol_version: AUTHORITY_RETIREMENT_RECEIPT_PROTOCOL_VERSION_V2,
+            record_id: String::new(),
+            record_lookup_key: Self::lookup_key_for(&graph_identity_digest, &retirement_id)?,
+            record_tag: AUTHORITY_RETIREMENT_RECEIPT_V2_TAG.to_string(),
+            graph_identity_digest,
+            chain_ordinal: prior_chain.record_count.checked_add(1).ok_or_else(|| {
+                StreamTokenProtocolError::invalid(
+                    "retirement.chain_ordinal",
+                    "profile receipt-chain count overflow",
+                )
+            })?,
+            predecessor_record_id: prior_chain.head_record_id.clone(),
+            prior_chain_digest: prior_chain.chain_digest.clone(),
+            resulting_chain_digest: String::new(),
+            retirement_id,
+            operation_request_digest: stream_authority_retirement_request_digest_v2(
+                &plan_digest,
+                &actor,
+            )?,
+            plan_digest,
+            actor,
+            source_internal_schema_version,
+            source_manifest_version,
+            live_branch_heads_digest: live_branch_heads_digest.into(),
+            source_profile_revision,
+            lifecycle_and_sealed_proof_digest: lifecycle_and_sealed_proof_digest.into(),
+            pre_retirement_token_head,
+            pre_retirement_token_witness_digest: pre_retirement_token_witness_digest.into(),
+            present_token_count,
+            withdrawn_token_count,
+            dead_lettered_token_count,
+            export_cut_digest: export_cut_digest.into(),
+            retired_at,
+        };
+        value.record_id = value.compute_record_id()?;
+        value.resulting_chain_digest = value.compute_resulting_chain_digest()?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(crate) fn lookup_key_for(
+        graph_identity_digest: &str,
+        retirement_id: &str,
+    ) -> ProtocolResult<String> {
+        decode_sha256("retirement.graph_identity_digest", graph_identity_digest)?;
+        canonical_uuid_bytes("retirement.retirement_id", retirement_id)?;
+        Ok(format!(
+            "authority-retirement-v2:{}",
+            digest_fields(
+                AUTHORITY_RETIREMENT_RECEIPT_LOOKUP_DOMAIN_V2,
+                &[graph_identity_digest.as_bytes(), retirement_id.as_bytes()],
+            )?
+        ))
+    }
+
+    pub(crate) fn validate(&self) -> ProtocolResult<()> {
+        if self.protocol_version != AUTHORITY_RETIREMENT_RECEIPT_PROTOCOL_VERSION_V2 {
+            return Err(StreamTokenProtocolError::invalid(
+                "retirement.protocol_version",
+                format!(
+                    "must be {}",
+                    AUTHORITY_RETIREMENT_RECEIPT_PROTOCOL_VERSION_V2
+                ),
+            ));
+        }
+        if self.record_tag != AUTHORITY_RETIREMENT_RECEIPT_V2_TAG {
+            return Err(StreamTokenProtocolError::invalid(
+                "retirement.record_tag",
+                format!("must be '{AUTHORITY_RETIREMENT_RECEIPT_V2_TAG}'"),
+            ));
+        }
+        for (field, value) in [
+            ("retirement.record_id", self.record_id.as_str()),
+            (
+                "retirement.graph_identity_digest",
+                self.graph_identity_digest.as_str(),
+            ),
+            ("retirement.plan_digest", self.plan_digest.as_str()),
+            (
+                "retirement.operation_request_digest",
+                self.operation_request_digest.as_str(),
+            ),
+            (
+                "retirement.live_branch_heads_digest",
+                self.live_branch_heads_digest.as_str(),
+            ),
+            (
+                "retirement.lifecycle_and_sealed_proof_digest",
+                self.lifecycle_and_sealed_proof_digest.as_str(),
+            ),
+            (
+                "retirement.pre_retirement_token_witness_digest",
+                self.pre_retirement_token_witness_digest.as_str(),
+            ),
+            (
+                "retirement.export_cut_digest",
+                self.export_cut_digest.as_str(),
+            ),
+            (
+                "retirement.prior_chain_digest",
+                self.prior_chain_digest.as_str(),
+            ),
+            (
+                "retirement.resulting_chain_digest",
+                self.resulting_chain_digest.as_str(),
+            ),
+        ] {
+            decode_sha256(field, value)?;
+        }
+        canonical_uuid_bytes("retirement.retirement_id", &self.retirement_id)?;
+        if self.actor.is_empty() || self.actor.len() > 4 * 1024 {
+            return Err(StreamTokenProtocolError::invalid(
+                "retirement.actor",
+                "must be non-empty and at most 4096 UTF-8 bytes",
+            ));
+        }
+        if self.source_internal_schema_version == 0
+            || self.source_manifest_version == 0
+            || self.source_profile_revision == 0
+            || self.chain_ordinal == 0
+        {
+            return Err(StreamTokenProtocolError::invalid(
+                "retirement.revisions",
+                "format, manifest, profile, and chain revisions must be positive",
+            ));
+        }
+        if self.withdrawn_token_count == 0 && self.dead_lettered_token_count == 0 {
+            return Err(StreamTokenProtocolError::invalid(
+                "retirement.terminal_token_count",
+                "requires at least one current WITHDRAWN or DEAD_LETTERED token",
+            ));
+        }
+        self.pre_retirement_token_head.validate().map_err(|error| {
+            StreamTokenProtocolError::invalid(
+                "retirement.pre_retirement_token_head",
+                error.to_string(),
+            )
+        })?;
+        if self.pre_retirement_token_head.branch_identifier
+            != lance::dataset::refs::BranchIdentifier::main()
+            || self.pre_retirement_token_head.manifest_e_tag.is_some()
+            || self.pre_retirement_token_witness_digest
+                != stream_authority_retirement_token_witness_digest_v2(
+                    &self.pre_retirement_token_head,
+                    self.present_token_count,
+                    self.withdrawn_token_count,
+                    self.dead_lettered_token_count,
+                )?
+        {
+            return Err(StreamTokenProtocolError::invalid(
+                "retirement.pre_retirement_token_witness_digest",
+                "does not bind the exact canonical prior head and three disposition counts",
+            ));
+        }
+        match (self.chain_ordinal, self.predecessor_record_id.as_deref()) {
+            (1, None) => {}
+            (1, Some(_)) => {
+                return Err(StreamTokenProtocolError::invalid(
+                    "retirement.predecessor_record_id",
+                    "first receipt must not have a predecessor",
+                ));
+            }
+            (_, Some(predecessor)) => {
+                decode_sha256("retirement.predecessor_record_id", predecessor)?;
+            }
+            (_, None) => {
+                return Err(StreamTokenProtocolError::invalid(
+                    "retirement.predecessor_record_id",
+                    "non-first receipt requires a predecessor",
+                ));
+            }
+        }
+        if self.retired_at <= 0 {
+            return Err(StreamTokenProtocolError::invalid(
+                "retirement.retired_at",
+                "must be a positive timestamp",
+            ));
+        }
+        if self.record_lookup_key
+            != Self::lookup_key_for(&self.graph_identity_digest, &self.retirement_id)?
+            || self.operation_request_digest
+                != stream_authority_retirement_request_digest_v2(&self.plan_digest, &self.actor)?
+            || self.record_id != self.compute_record_id()?
+            || self.resulting_chain_digest != self.compute_resulting_chain_digest()?
+        {
+            return Err(StreamTokenProtocolError::invalid(
+                "retirement.canonical_commitment",
+                "receipt differs from its canonical identity or chain commitment",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn next_chain_ref(&self) -> ProtocolResult<super::stream_profile::ReceiptChainRef> {
+        self.validate()?;
+        Ok(super::stream_profile::ReceiptChainRef {
+            head_record_id: Some(self.record_id.clone()),
+            record_count: self.chain_ordinal,
+            chain_digest: self.resulting_chain_digest.clone(),
+        })
+    }
+
+    fn compute_record_id(&self) -> ProtocolResult<String> {
+        let predecessor = self.predecessor_record_id.as_deref().unwrap_or("");
+        digest_fields(
+            AUTHORITY_RETIREMENT_RECEIPT_RECORD_DOMAIN_V2,
+            &[
+                self.record_tag.as_bytes(),
+                self.graph_identity_digest.as_bytes(),
+                &self.chain_ordinal.to_be_bytes(),
+                predecessor.as_bytes(),
+                self.prior_chain_digest.as_bytes(),
+                self.retirement_id.as_bytes(),
+                self.plan_digest.as_bytes(),
+                self.operation_request_digest.as_bytes(),
+                self.actor.as_bytes(),
+                &self.source_internal_schema_version.to_be_bytes(),
+                &self.source_manifest_version.to_be_bytes(),
+                self.live_branch_heads_digest.as_bytes(),
+                &self.source_profile_revision.to_be_bytes(),
+                self.lifecycle_and_sealed_proof_digest.as_bytes(),
+                &self.pre_retirement_token_head.table_version.to_be_bytes(),
+                self.pre_retirement_token_head.transaction_uuid.as_bytes(),
+                self.pre_retirement_token_witness_digest.as_bytes(),
+                &self.present_token_count.to_be_bytes(),
+                &self.withdrawn_token_count.to_be_bytes(),
+                &self.dead_lettered_token_count.to_be_bytes(),
+                self.export_cut_digest.as_bytes(),
+                &self.retired_at.to_be_bytes(),
+            ],
+        )
+    }
+
+    fn compute_resulting_chain_digest(&self) -> ProtocolResult<String> {
+        digest_fields(
+            AUTHORITY_RETIREMENT_RECEIPT_CHAIN_DOMAIN_V2,
+            &[
+                self.prior_chain_digest.as_bytes(),
+                &self.chain_ordinal.to_be_bytes(),
+                self.record_id.as_bytes(),
+            ],
+        )
+    }
+}
+
+pub(crate) fn stream_authority_retirement_request_digest_v2(
+    plan_digest: &str,
+    actor: &str,
+) -> ProtocolResult<String> {
+    decode_sha256("retirement.plan_digest", plan_digest)?;
+    if actor.is_empty() || actor.len() > 4 * 1024 {
+        return Err(StreamTokenProtocolError::invalid(
+            "retirement.actor",
+            "must be non-empty and at most 4096 UTF-8 bytes",
+        ));
+    }
+    digest_fields(
+        AUTHORITY_RETIREMENT_REQUEST_DOMAIN_V2,
+        &[
+            &AUTHORITY_RETIREMENT_RECEIPT_PROTOCOL_VERSION_V2.to_be_bytes(),
+            plan_digest.as_bytes(),
+            actor.as_bytes(),
+            b"CONFIRM",
+        ],
+    )
+}
+
+pub(crate) fn stream_authority_retirement_token_witness_digest_v2(
+    witness: &super::CurrentHeadWitness,
+    present_token_count: u64,
+    withdrawn_token_count: u64,
+    dead_lettered_token_count: u64,
+) -> ProtocolResult<String> {
+    witness.validate().map_err(|error| {
+        StreamTokenProtocolError::invalid("retirement.token_witness", error.to_string())
+    })?;
+    if witness.manifest_e_tag.is_some() {
+        return Err(StreamTokenProtocolError::invalid(
+            "retirement.token_witness",
+            "must carry manifest_e_tag None",
+        ));
+    }
+    let witness_bytes = serde_json::to_vec(witness).map_err(|error| {
+        StreamTokenProtocolError::Corruption(format!(
+            "failed to encode authority-retirement token witness: {error}"
+        ))
+    })?;
+    digest_fields(
+        AUTHORITY_RETIREMENT_TOKEN_WITNESS_DOMAIN_V2,
+        &[
+            &witness_bytes,
+            &present_token_count.to_be_bytes(),
+            &withdrawn_token_count.to_be_bytes(),
+            &dead_lettered_token_count.to_be_bytes(),
+        ],
+    )
+}
+
+fn digest_fields(domain: &[u8], fields: &[&[u8]]) -> ProtocolResult<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for field in fields {
+        let length = u64::try_from(field.len()).map_err(|_| {
+            StreamTokenProtocolError::invalid(
+                "canonical_digest",
+                "field length exceeds canonical u64 envelope",
+            )
+        })?;
+        hasher.update(length.to_be_bytes());
+        hasher.update(field);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
 /// Commit to the complete post-correction token-authority plan independent of
 /// caller order. There may be only one row per stable table identity/key.
 pub(crate) fn stream_token_authority_plan_digest(
@@ -1323,8 +2041,9 @@ pub(crate) enum AdmissionClassification {
     },
     AlreadyDurable {
         authority: StreamTokenAuthorityRow,
-        /// Required for PRESENT; absent for WITHDRAWN because the visible base
-        /// row may legitimately be absent or contain the older value.
+        /// Required for PRESENT; absent for terminal authority because the
+        /// visible base row may legitimately be absent or contain an older
+        /// value.
         present_metadata: Option<TrustedStreamRowMetadata>,
     },
     SequenceConflict {
@@ -1345,7 +2064,7 @@ pub(crate) enum AdmissionClassification {
 /// that must agree whenever the selected token is PRESENT. A non-null base
 /// copy with no selected token row is likewise corruption: treating it as an
 /// empty chain would let a later write silently reset sequencing. WITHDRAWN
-/// deliberately permits an absent or older visible base row.
+/// and DEAD_LETTERED deliberately permit an absent or older visible base row.
 pub(crate) fn validate_authority_base_pair(
     identity: TableIdentity,
     logical_id: &str,
@@ -1383,7 +2102,7 @@ pub(crate) fn validate_authority_base_pair(
             }
             Ok(Some(metadata.clone()))
         }
-        StreamTokenDisposition::Withdrawn => Ok(None),
+        StreamTokenDisposition::Withdrawn | StreamTokenDisposition::DeadLettered => Ok(None),
     }
 }
 

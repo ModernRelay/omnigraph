@@ -209,9 +209,12 @@ pub enum OmniError {
     /// Ordinary export cannot discard terminal sequencing authority. The
     /// stopped-writer retirement/rebuild command is the explicit exit.
     #[error(
-        "stream export is blocked by {withdrawn_token_count} current WITHDRAWN token(s); retire authority for rebuild or correct them to PRESENT"
+        "stream export is blocked by {withdrawn_token_count} current WITHDRAWN and {dead_lettered_token_count} current DEAD_LETTERED token(s); retire authority for rebuild or install PRESENT successors"
     )]
-    StreamExportBlocked { withdrawn_token_count: u64 },
+    StreamExportBlocked {
+        withdrawn_token_count: u64,
+        dead_lettered_token_count: u64,
+    },
     /// The exact root-wide retirement plan moved between plan and confirm.
     /// No token-ledger or manifest effect was allowed.
     #[error("stream retirement plan changed before confirmation; rerun the plan command")]

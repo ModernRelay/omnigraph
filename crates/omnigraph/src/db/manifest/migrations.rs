@@ -108,10 +108,15 @@ use crate::error::{OmniError, Result};
 /// - v18 — RFC-026 F3f adds recovery-v20 for exact `DataBlock` correction.
 ///   The v17/recovery-v19 retirement format and frozen recovery-v14 correction
 ///   scaffold keep their old meanings; neither is reinterpreted.
+/// - v19 — RFC-026 F5 adds current-token schema v3 with terminal
+///   `DEAD_LETTERED` evidence, versioned fold attribution, one recovery-owned
+///   dead-letter object, recovery-v21 mixed/all-diverted folds, and
+///   three-disposition authority retirement. Historical v10 attribution,
+///   recovery-v14, recovery-v19, and recovery-v20 retain their exact meanings.
 ///
-/// v1–v17 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
+/// v1–v18 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
 /// is kept for provenance and to document what each stamp value meant.
-pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 18;
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 19;
 
 /// The oldest on-disk internal-schema stamp this binary will open. With no
 /// in-place migration, this equals `INTERNAL_MANIFEST_SCHEMA_VERSION`: a graph
@@ -130,7 +135,7 @@ pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_
 /// stamped each version (verify with
 /// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
 /// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5–v8 unreleased,
-/// v9 0.9.x, v10–v18 unreleased. V10–v18 are source-only development
+/// v9 0.9.x, v10–v19 unreleased. V10–v19 are source-only development
 /// formats; release preparation designates whichever later strand actually
 /// ships instead of relabeling superseded stamps.
 ///
@@ -142,9 +147,9 @@ pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_
 /// line (0.9.x–0.12.x); those releases do not exist and naming them here would
 /// send an operator hunting for a binary that was never published. V10 and v11
 /// remain 0.10.0-dev permanently because each was superseded before release.
-/// V18 is currently written only by 0.10.0-dev source builds. If it is the
+/// V19 is currently written only by 0.10.0-dev source builds. If it is the
 /// format that ships, the 0.10.0 release-prep commit flips only its entry to
-/// the published line; superseded v17 stays dev.
+/// the published line; superseded v18 stays dev.
 pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
     match stamp {
         1 => "0.3.1 or earlier",
@@ -159,13 +164,13 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         // The published line whose binaries serve v9 — the string the gated
         // v9↔v10 crossversion fence asserts inside the v10 refusal message.
         9 => "0.9.x",
-        // Unreachable in refusals while CURRENT == 18 (the sub-floor path
-        // consults 1–17 only; the ceiling path never consults the map). It
+        // Unreachable in refusals while CURRENT == 19 (the sub-floor path
+        // consults 1–18 only; the ceiling path never consults the map). It
         // exists for the table's honesty and the next bump. Release-prep for
         // 0.10.0 release prep MUST split this arm and flip only the stamp that
         // actually ships. Every superseded source-only stamp stays
         // "0.10.0-dev" permanently.
-        10..=18 => "0.10.0-dev",
+        10..=19 => "0.10.0-dev",
         // Worded to read naturally after "created by omnigraph " if a future
         // bump ever leaves a gap.
         _ => "an unrecognized older release",
@@ -245,12 +250,12 @@ mod tests {
     use super::*;
 
     /// The guard accepts exactly the single served version and refuses anything
-    /// below the floor or above the ceiling. With `MIN == CURRENT == 18` the
-    /// live range is exactly `[18, 18]`.
+    /// below the floor or above the ceiling. With `MIN == CURRENT == 19` the
+    /// live range is exactly `[19, 19]`.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
-        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 18);
-        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 18);
+        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 19);
+        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 19);
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
             assert!(
                 refuse_if_stamp_unsupported(stamp).is_ok(),
@@ -291,6 +296,7 @@ mod tests {
         assert_eq!(release_for_internal_schema_version(16), "0.10.0-dev");
         assert_eq!(release_for_internal_schema_version(17), "0.10.0-dev");
         assert_eq!(release_for_internal_schema_version(18), "0.10.0-dev");
+        assert_eq!(release_for_internal_schema_version(19), "0.10.0-dev");
         assert_eq!(
             release_for_internal_schema_version(99),
             "an unrecognized older release"
@@ -436,5 +442,33 @@ mod tests {
             "got: {v17_err}"
         );
         assert!(v17_err.contains("omnigraph export"), "got: {v17_err}");
+
+        // V18 is the immediate predecessor used by the v18↔v19 format
+        // fence. It remains source-only even if v19 later becomes the
+        // published 0.10.x format.
+        let v18_err = refuse_if_stamp_unsupported(18).unwrap_err().to_string();
+        assert!(
+            v18_err.contains("created by omnigraph 0.10.0-dev"),
+            "got: {v18_err}"
+        );
+        assert!(
+            v18_err.contains("with an omnigraph 0.10.0-dev binary"),
+            "got: {v18_err}"
+        );
+        assert!(v18_err.contains("omnigraph export"), "got: {v18_err}");
+    }
+
+    /// Pin both sides of the current v19 grammar locally. The historical
+    /// binary fence is optional in developer environments; this is the
+    /// unskippable guard against changing its upgrade contract.
+    #[test]
+    fn current_v19_and_future_v20_have_exact_guard_behavior() {
+        assert!(refuse_if_stamp_unsupported(19).is_ok());
+
+        let future = refuse_if_stamp_unsupported(20).unwrap_err().to_string();
+        assert_eq!(
+            future,
+            "__manifest is stamped at internal schema v20 but this binary expects v19 — upgrade omnigraph before opening this graph"
+        );
     }
 }

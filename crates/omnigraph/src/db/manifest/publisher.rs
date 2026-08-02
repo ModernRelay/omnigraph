@@ -43,7 +43,7 @@ use super::state::{
     manifest_schema, read_manifest_state, read_publish_scan,
 };
 use super::stream_profile::StreamProfileEntry;
-use super::stream_token::StreamFoldAttributionSummary;
+use super::stream_token::{StreamFoldAttributionSummary, StreamFoldAttributionSummaryV2};
 use super::{
     ExpectedTableVersions, MAIN_BRANCH_HEAD_KEY, ManifestChange, OBJECT_TYPE_STREAM_PROFILE,
     OBJECT_TYPE_STREAM_STATE, OBJECT_TYPE_STREAM_TOKEN_AUTHORITY, OBJECT_TYPE_TABLE,
@@ -82,6 +82,10 @@ pub(crate) struct LineageIntent {
     /// writer leaves this absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_fold_attribution: Option<StreamFoldAttributionSummary>,
+    /// F5 attribution is a distinct wire field; v21 must leave the historical
+    /// v1 field absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_fold_attribution_v2: Option<StreamFoldAttributionSummaryV2>,
 }
 
 /// The exact mutable graph-head authority a prepared write observed. A missing
@@ -816,6 +820,7 @@ impl GraphNamespacePublisher {
             actor_id: intent.actor_id.clone(),
             created_at: intent.created_at,
             stream_fold_attribution: intent.stream_fold_attribution.clone(),
+            stream_fold_attribution_v2: intent.stream_fold_attribution_v2.clone(),
         };
         let parts = graph_lineage_row_parts(&commit, intent.branch.as_deref())?;
         Ok((

@@ -1235,6 +1235,12 @@ async fn validate_achieved_base_authority(root_uri: &str, sidecar: &RecoverySide
                 // not be the trusted metadata selected at achieved N+1.
                 forbidden_withdrawn.push(blocked.clone());
             }
+            super::super::stream_token::StreamTokenDisposition::DeadLettered => {
+                return Err(correction_error(
+                    sidecar,
+                    "recovery-v20 correction cannot mint DEAD_LETTERED authority",
+                ));
+            }
         }
     }
     super::validate_stream_fold_token_rows_against_base(

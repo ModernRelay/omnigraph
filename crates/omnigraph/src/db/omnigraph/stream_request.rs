@@ -10,7 +10,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use crate::db::manifest::stream_token::{StreamRowOrigin, StreamTerminalCorrection};
+use crate::db::manifest::stream_token::{
+    StreamDeadLetterTerminalEvidence, StreamRowOrigin, StreamTerminalCorrection,
+};
 use crate::error::{OmniError, Result};
 
 pub(super) const STREAM_NDJSON_MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
@@ -318,6 +320,11 @@ pub(super) enum StreamLineEvidence {
         origin: StreamRowOrigin,
         terminal_correction: StreamTerminalCorrection,
     },
+    DeadLettered {
+        binding: StreamLineBinding,
+        origin: StreamRowOrigin,
+        terminal_dead_letter: Box<StreamDeadLetterTerminalEvidence>,
+    },
 }
 
 impl StreamLineEvidence {
@@ -326,13 +333,16 @@ impl StreamLineEvidence {
             Self::None => None,
             Self::Binding(binding)
             | Self::Current { binding, .. }
-            | Self::Withdrawn { binding, .. } => Some(binding),
+            | Self::Withdrawn { binding, .. }
+            | Self::DeadLettered { binding, .. } => Some(binding),
         }
     }
 
     fn origin(&self) -> Option<&StreamRowOrigin> {
         match self {
-            Self::Current { origin, .. } | Self::Withdrawn { origin, .. } => Some(origin),
+            Self::Current { origin, .. }
+            | Self::Withdrawn { origin, .. }
+            | Self::DeadLettered { origin, .. } => Some(origin),
             Self::None | Self::Binding(_) => None,
         }
     }
@@ -343,7 +353,19 @@ impl StreamLineEvidence {
                 terminal_correction,
                 ..
             } => Some(terminal_correction),
-            Self::None | Self::Binding(_) | Self::Current { .. } => None,
+            Self::None | Self::Binding(_) | Self::Current { .. } | Self::DeadLettered { .. } => {
+                None
+            }
+        }
+    }
+
+    fn terminal_dead_letter(&self) -> Option<&StreamDeadLetterTerminalEvidence> {
+        match self {
+            Self::DeadLettered {
+                terminal_dead_letter,
+                ..
+            } => Some(terminal_dead_letter),
+            Self::None | Self::Binding(_) | Self::Current { .. } | Self::Withdrawn { .. } => None,
         }
     }
 }
@@ -375,7 +397,6 @@ pub(super) enum StreamLineDetail {
         confirmed_stream_token: String,
         message: String,
     },
-    #[allow(dead_code)] // Reserved fail-closed vocabulary for the inactive F5 disposition.
     DeadLettered {
         occurrence: StreamOccurrence,
         current_token: String,
@@ -656,6 +677,20 @@ impl StreamLineOutcome {
         self
     }
 
+    pub(super) fn with_dead_letter_evidence(
+        mut self,
+        binding: StreamLineBinding,
+        origin: StreamRowOrigin,
+        terminal_dead_letter: Box<StreamDeadLetterTerminalEvidence>,
+    ) -> Self {
+        self.evidence = StreamLineEvidence::DeadLettered {
+            binding,
+            origin,
+            terminal_dead_letter,
+        };
+        self
+    }
+
     pub(super) fn binding(&self) -> Option<&StreamLineBinding> {
         self.evidence.binding()
     }
@@ -666,6 +701,10 @@ impl StreamLineOutcome {
 
     pub(super) fn terminal_correction(&self) -> Option<&StreamTerminalCorrection> {
         self.evidence.terminal_correction()
+    }
+
+    pub(super) fn terminal_dead_letter(&self) -> Option<&StreamDeadLetterTerminalEvidence> {
+        self.evidence.terminal_dead_letter()
     }
 
     pub(super) fn status(&self) -> StreamLineStatus {

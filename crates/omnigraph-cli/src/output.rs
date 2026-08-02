@@ -423,6 +423,7 @@ pub(crate) fn finish_stream_authority_retirement_plan(
         );
         println!("  present tokens: {}", plan.present_token_count);
         println!("  withdrawn tokens: {}", plan.withdrawn_token_count);
+        println!("  dead-lettered tokens: {}", plan.dead_lettered_token_count);
         println!("  export cut: {}", plan.export_cut_digest);
         println!("  no graph state changed; confirm this exact digest to retire");
         print_cluster_diagnostics(&output.diagnostics);
@@ -475,6 +476,75 @@ pub(crate) fn finish_stream_block_show(output: &StreamBlockShowOutput, json: boo
     Ok(())
 }
 
+pub(crate) fn finish_stream_dead_letter_list(
+    output: &StreamDeadLetterListOutput,
+    json: bool,
+) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else if let Some(page) = output.page.as_ref() {
+        println!("current stream dead letters for {}", output.graph_id);
+        println!("  source manifest: {}", page.source_manifest_version);
+        println!(
+            "  source profile revision: {}",
+            page.source_profile_revision
+        );
+        println!("  token table version: {}", page.token_table_version);
+        println!("  entries:");
+        for entry in &page.entries {
+            println!("    {}", serde_json::to_string(entry)?);
+        }
+        if let Some(cursor) = page.next_cursor.as_deref() {
+            println!("  next cursor: {cursor}");
+        }
+        print_cluster_diagnostics(&output.diagnostics);
+    } else {
+        println!("stream dead-letter listing failed for {}", output.graph_id);
+        print_cluster_diagnostics(&output.diagnostics);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_stream_dead_letter_export(
+    output: &StreamDeadLetterExportOutput,
+    json: bool,
+) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else if let Some(page) = output.page.as_ref() {
+        println!(
+            "current stream dead-letter payloads for {}",
+            output.graph_id
+        );
+        println!("  source manifest: {}", page.source_manifest_version);
+        println!(
+            "  source profile revision: {}",
+            page.source_profile_revision
+        );
+        println!("  token table version: {}", page.token_table_version);
+        println!("  entries:");
+        for entry in &page.entries {
+            println!("    {}", serde_json::to_string(entry)?);
+        }
+        if let Some(cursor) = page.next_cursor.as_deref() {
+            println!("  next cursor: {cursor}");
+        }
+        print_cluster_diagnostics(&output.diagnostics);
+    } else {
+        println!("stream dead-letter export failed for {}", output.graph_id);
+        print_cluster_diagnostics(&output.diagnostics);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 pub(crate) fn finish_stream_block_correct(
     output: &StreamBlockCorrectOutput,
     json: bool,
@@ -516,6 +586,10 @@ pub(crate) fn finish_stream_authority_retirement_confirm(
         println!("  plan digest: {}", result.plan_digest);
         println!("  export cut: {}", result.export_cut_digest);
         println!("  profile revision: {}", result.profile_revision);
+        println!(
+            "  dead-lettered tokens: {}",
+            result.dead_lettered_token_count
+        );
         println!(
             "  source is permanently read/query/status/export-only; rebuild into a fresh graph"
         );

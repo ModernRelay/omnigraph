@@ -50,6 +50,13 @@ pub trait StorageAdapter: Debug + Send + Sync {
     /// `read_text()` when disappearance between the probe and read is a valid
     /// concurrent outcome.
     async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>>;
+    /// Read at most `max_bytes + 1` bytes and refuse an oversized object
+    /// before materializing its full body. `None` is reserved for NotFound.
+    async fn read_text_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<String>>;
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()>;
     /// Write a text object only if no object exists at `uri`.
     ///
@@ -311,6 +318,38 @@ impl StorageAdapter for ObjectStorageAdapter {
         };
         let text = String::from_utf8(bytes.to_vec()).map_err(|err| {
             StorageError::internal(format!("storage read failed for '{}': {}", uri, err))
+        })?;
+        Ok(Some(text))
+    }
+
+    async fn read_text_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<String>> {
+        let location = self.object_path(uri)?;
+        let end = max_bytes.checked_add(1).ok_or_else(|| {
+            StorageError::internal(format!(
+                "bounded storage read limit overflows for '{uri}': {max_bytes}"
+            ))
+        })?;
+        let bytes = match self.store.get_range(&location, 0..end).await {
+            Ok(bytes) => bytes,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(storage_backend_error("bounded_read", uri, err)),
+        };
+        let actual = u64::try_from(bytes.len()).map_err(|_| {
+            StorageError::internal(format!(
+                "bounded storage read length exceeds u64 for '{uri}'"
+            ))
+        })?;
+        if actual > max_bytes {
+            return Err(StorageError::internal(format!(
+                "bounded storage read for '{uri}' exceeds {max_bytes} bytes"
+            )));
+        }
+        let text = String::from_utf8(bytes.to_vec()).map_err(|err| {
+            StorageError::internal(format!("storage read failed for '{uri}': {err}"))
         })?;
         Ok(Some(text))
     }
@@ -777,6 +816,26 @@ mod tests {
         assert_eq!(
             adapter
                 .read_text_if_exists(&format!("{root}/contract/missing.json"))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            adapter
+                .read_text_if_exists_bounded(&a, 2)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("v2")
+        );
+        let bounded = adapter
+            .read_text_if_exists_bounded(&a, 1)
+            .await
+            .expect_err("the bounded reader must refuse before reading the full body");
+        assert!(bounded.to_string().contains("exceeds 1 bytes"), "{bounded}");
+        assert_eq!(
+            adapter
+                .read_text_if_exists_bounded(&format!("{root}/contract/missing-bounded.json"), 2,)
                 .await
                 .unwrap(),
             None

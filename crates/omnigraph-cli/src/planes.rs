@@ -14,7 +14,7 @@ use color_eyre::eyre::bail;
 
 use crate::cli::{
     Cli, ClusterCommand, ClusterStreamCommand, Command, GraphsCommand, QueriesCommand,
-    SchemaCommand, StreamBlockCommand, StreamRetireForRebuildCommand,
+    SchemaCommand, StreamBlockCommand, StreamDeadLetterCommand, StreamRetireForRebuildCommand,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,6 +312,18 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             } => "cluster stream block correct",
             ClusterCommand::Stream {
                 command:
+                    ClusterStreamCommand::DeadLetter {
+                        command: StreamDeadLetterCommand::List { .. },
+                    },
+            } => "cluster stream dead-letter list",
+            ClusterCommand::Stream {
+                command:
+                    ClusterStreamCommand::DeadLetter {
+                        command: StreamDeadLetterCommand::Export { .. },
+                    },
+            } => "cluster stream dead-letter export",
+            ClusterCommand::Stream {
+                command:
                     ClusterStreamCommand::RetireForRebuild {
                         command: StreamRetireForRebuildCommand::Plan { .. },
                     },
@@ -585,6 +597,14 @@ mod tests {
                 "--plan",
                 "plan.json",
             ]),
+            Capability::Control
+        );
+        assert_eq!(
+            cap(&["omnigraph", "cluster", "stream", "dead-letter", "list",]),
+            Capability::Control
+        );
+        assert_eq!(
+            cap(&["omnigraph", "cluster", "stream", "dead-letter", "export",]),
             Capability::Control
         );
         assert_eq!(

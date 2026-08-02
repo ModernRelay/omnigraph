@@ -42,15 +42,16 @@ use super::stream_profile::{
     ProfileManagementReceipt,
 };
 use super::stream_token::{
-    PayloadDigest, StreamRowOrigin, StreamTerminalCorrection, StreamToken, StreamTokenAuthorityRow,
-    StreamTokenDisposition, TrustedContributorId,
+    AUTHORITY_RETIREMENT_RECEIPT_V2_TAG, AuthorityRetirementReceiptV2, PayloadDigest,
+    StreamDeadLetterTerminalEvidence, StreamRowOrigin, StreamTerminalCorrection, StreamToken,
+    StreamTokenAuthorityRow, StreamTokenDisposition, TrustedContributorId,
 };
 use super::{CurrentHeadWitness, TableIdentity};
 
 pub(crate) const STREAM_TOKEN_DATASET_PATH: &str = "_stream_tokens.lance";
-pub(crate) const STREAM_TOKEN_AUTHORITY_SCHEMA_VERSION: u32 = 2;
+pub(crate) const STREAM_TOKEN_AUTHORITY_SCHEMA_VERSION: u32 = 3;
 const STREAM_TOKEN_AUTHORITY_PROTOCOL_VERSION: u32 = 1;
-pub(crate) const CURRENT_TOKEN_RECORD_TAG: &str = "CURRENT_TOKEN_V1";
+pub(crate) const CURRENT_TOKEN_RECORD_TAG: &str = "CURRENT_TOKEN_V2";
 const MAX_LIFECYCLE_LEDGER_RECORDS_PER_TRANSACTION: usize = 8;
 const MAX_LIFECYCLE_LEDGER_RECORD_JSON_BYTES: usize = 16 * 1024;
 const MAX_LIFECYCLE_LEDGER_TRANSACTION_JSON_BYTES: usize =
@@ -74,6 +75,7 @@ pub(crate) enum LifecycleLedgerRecord {
     ClaimAttemptEffect(ClaimAttemptEffect),
     ClaimReceipt(ClaimReceipt),
     AuthorityRetirementReceipt(AuthorityRetirementReceipt),
+    AuthorityRetirementReceiptV2(AuthorityRetirementReceiptV2),
 }
 
 impl LifecycleLedgerRecord {
@@ -86,6 +88,7 @@ impl LifecycleLedgerRecord {
             Self::ClaimAttemptEffect(value) => &value.record_id,
             Self::ClaimReceipt(value) => &value.record_id,
             Self::AuthorityRetirementReceipt(value) => &value.record_id,
+            Self::AuthorityRetirementReceiptV2(value) => &value.record_id,
         }
     }
 
@@ -98,6 +101,7 @@ impl LifecycleLedgerRecord {
             Self::ClaimAttemptEffect(_) => CLAIM_ATTEMPT_EFFECT_TAG,
             Self::ClaimReceipt(_) => CLAIM_RECEIPT_TAG,
             Self::AuthorityRetirementReceipt(_) => AUTHORITY_RETIREMENT_RECEIPT_TAG,
+            Self::AuthorityRetirementReceiptV2(_) => AUTHORITY_RETIREMENT_RECEIPT_V2_TAG,
         }
     }
 
@@ -110,6 +114,7 @@ impl LifecycleLedgerRecord {
             Self::ClaimAttemptEffect(value) => &value.record_lookup_key,
             Self::ClaimReceipt(value) => &value.record_lookup_key,
             Self::AuthorityRetirementReceipt(value) => &value.record_lookup_key,
+            Self::AuthorityRetirementReceiptV2(value) => &value.record_lookup_key,
         }
     }
 
@@ -122,6 +127,9 @@ impl LifecycleLedgerRecord {
             Self::ClaimAttemptEffect(value) => value.validate(),
             Self::ClaimReceipt(value) => value.validate(),
             Self::AuthorityRetirementReceipt(value) => value.validate(),
+            Self::AuthorityRetirementReceiptV2(value) => {
+                value.validate().map_err(stream_token_protocol_error)
+            }
         }
     }
 
@@ -135,6 +143,7 @@ impl LifecycleLedgerRecord {
             Self::ClaimAttemptEffect(value) => serde_json::to_string(value),
             Self::ClaimReceipt(value) => serde_json::to_string(value),
             Self::AuthorityRetirementReceipt(value) => serde_json::to_string(value),
+            Self::AuthorityRetirementReceiptV2(value) => serde_json::to_string(value),
         }
         .map_err(|error| {
             OmniError::manifest_internal(format!(
@@ -200,6 +209,13 @@ impl LifecycleLedgerRecord {
                     ))
                 })?,
             ),
+            AUTHORITY_RETIREMENT_RECEIPT_V2_TAG => Self::AuthorityRetirementReceiptV2(
+                serde_json::from_str(&envelope.record_payload_json).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to decode authority-retirement-v2 receipt: {error}"
+                    ))
+                })?,
+            ),
             other => {
                 return Err(OmniError::manifest_internal(format!(
                     "lifecycle ledger decoder received unsupported trusted record tag '{other}'"
@@ -224,8 +240,8 @@ impl LifecycleLedgerRecord {
 /// Keep this in the same order and nullability as [`stream_token_schema`].  A
 /// physical schema change requires a new descriptor, schema version, and graph
 /// format strand; it must never be accepted through permissive field matching.
-const STREAM_TOKEN_SCHEMA_DESCRIPTOR_V2: &str = concat!(
-    "omnigraph.stream-token-authority.schema.v2\n",
+const STREAM_TOKEN_SCHEMA_DESCRIPTOR_V3: &str = concat!(
+    "omnigraph.stream-token-authority.schema.v3\n",
     "id:utf8:required:unenforced-primary-key\n",
     "record_tag:utf8:required\n",
     "record_lookup_key:utf8:required\n",
@@ -247,6 +263,7 @@ const STREAM_TOKEN_SCHEMA_DESCRIPTOR_V2: &str = concat!(
     "chain_depth:uint32:nullable\n",
     "terminal_correction_actor:utf8:nullable\n",
     "terminal_correction_operation_id:utf8:nullable\n",
+    "terminal_dead_letter_json:utf8:nullable\n",
     "record_payload_json:utf8:nullable\n",
 );
 
@@ -393,12 +410,13 @@ pub(crate) fn stream_token_schema() -> SchemaRef {
         Field::new("chain_depth", DataType::UInt32, true),
         Field::new("terminal_correction_actor", DataType::Utf8, true),
         Field::new("terminal_correction_operation_id", DataType::Utf8, true),
+        Field::new("terminal_dead_letter_json", DataType::Utf8, true),
         Field::new("record_payload_json", DataType::Utf8, true),
     ]))
 }
 
 pub(crate) fn stream_token_schema_hash() -> String {
-    let digest = Sha256::digest(STREAM_TOKEN_SCHEMA_DESCRIPTOR_V2.as_bytes());
+    let digest = Sha256::digest(STREAM_TOKEN_SCHEMA_DESCRIPTOR_V3.as_bytes());
     format!("sha256:{digest:x}")
 }
 
@@ -417,7 +435,7 @@ pub(crate) fn stream_token_row_id(identity: TableIdentity, logical_id: &str) -> 
     ))
 }
 
-/// Encode complete current-token rows using the exact v1 physical schema.
+/// Encode complete current-token rows using the exact v3 physical schema.
 pub(crate) fn stream_token_rows_to_batch(rows: &[StreamTokenAuthorityRow]) -> Result<RecordBatch> {
     if rows.is_empty() {
         return Err(OmniError::manifest_internal(
@@ -446,6 +464,7 @@ pub(crate) fn stream_token_rows_to_batch(rows: &[StreamTokenAuthorityRow]) -> Re
     let mut chain_depths = Vec::with_capacity(rows.len());
     let mut terminal_actors = Vec::with_capacity(rows.len());
     let mut terminal_operation_ids = Vec::with_capacity(rows.len());
+    let mut terminal_dead_letters = Vec::with_capacity(rows.len());
     let mut record_payloads = Vec::with_capacity(rows.len());
     let mut seen = std::collections::HashSet::with_capacity(rows.len());
 
@@ -493,6 +512,7 @@ pub(crate) fn stream_token_rows_to_batch(rows: &[StreamTokenAuthorityRow]) -> Re
         dispositions.push(match row.disposition {
             StreamTokenDisposition::Present => "PRESENT",
             StreamTokenDisposition::Withdrawn => "WITHDRAWN",
+            StreamTokenDisposition::DeadLettered => "DEAD_LETTERED",
         });
         contributors.push(row.contributor_id.as_str().to_string());
         payload_digests.push(row.payload_digest.to_string());
@@ -503,6 +523,17 @@ pub(crate) fn stream_token_rows_to_batch(rows: &[StreamTokenAuthorityRow]) -> Re
         chain_depths.push(row.chain_depth);
         terminal_actors.push(terminal_actor);
         terminal_operation_ids.push(terminal_operation_id);
+        terminal_dead_letters.push(
+            row.terminal_dead_letter
+                .as_deref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to encode terminal dead-letter evidence: {error}"
+                    ))
+                })?,
+        );
         record_payloads.push(None::<String>);
     }
 
@@ -530,6 +561,7 @@ pub(crate) fn stream_token_rows_to_batch(rows: &[StreamTokenAuthorityRow]) -> Re
             Arc::new(UInt32Array::from(chain_depths)),
             Arc::new(StringArray::from(terminal_actors)),
             Arc::new(StringArray::from(terminal_operation_ids)),
+            Arc::new(StringArray::from(terminal_dead_letters)),
             Arc::new(StringArray::from(record_payloads)),
         ],
     )
@@ -644,7 +676,7 @@ pub(crate) fn stream_token_rows_from_batch(
 ) -> Result<Vec<StreamTokenAuthorityRow>> {
     if batch.schema().as_ref() != stream_token_schema().as_ref() {
         return Err(OmniError::manifest_internal(
-            "stream-token scan returned a non-v2 physical schema",
+            "stream-token scan returned a non-v3 physical schema",
         ));
     }
     let ids = required_string_array(batch, "id")?;
@@ -668,6 +700,7 @@ pub(crate) fn stream_token_rows_from_batch(
     let chain_depths = required_u32_array(batch, "chain_depth")?;
     let terminal_actors = required_string_array(batch, "terminal_correction_actor")?;
     let terminal_operation_ids = required_string_array(batch, "terminal_correction_operation_id")?;
+    let terminal_dead_letters = required_string_array(batch, "terminal_dead_letter_json")?;
     let record_payloads = required_string_array(batch, "record_payload_json")?;
 
     let mut rows = Vec::with_capacity(batch.num_rows());
@@ -745,6 +778,7 @@ pub(crate) fn stream_token_rows_from_batch(
         let disposition = match dispositions.value(index) {
             "PRESENT" => StreamTokenDisposition::Present,
             "WITHDRAWN" => StreamTokenDisposition::Withdrawn,
+            "DEAD_LETTERED" => StreamTokenDisposition::DeadLettered,
             other => {
                 return Err(OmniError::manifest_internal(format!(
                     "stream-token row has unsupported disposition '{other}'"
@@ -767,6 +801,28 @@ pub(crate) fn stream_token_rows_from_batch(
                 ));
             }
         };
+        let terminal_dead_letter = if terminal_dead_letters.is_null(index) {
+            None
+        } else {
+            let encoded = terminal_dead_letters.value(index);
+            let evidence: StreamDeadLetterTerminalEvidence = serde_json::from_str(encoded)
+                .map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to decode terminal dead-letter evidence: {error}"
+                    ))
+                })?;
+            let canonical = serde_json::to_string(&evidence).map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "failed to re-encode terminal dead-letter evidence: {error}"
+                ))
+            })?;
+            if canonical != encoded {
+                return Err(OmniError::manifest_internal(
+                    "terminal dead-letter evidence is not in canonical JSON field order",
+                ));
+            }
+            Some(Box::new(evidence))
+        };
         let row = StreamTokenAuthorityRow {
             identity,
             logical_id,
@@ -785,6 +841,7 @@ pub(crate) fn stream_token_rows_from_batch(
             fold_base_token: optional_stream_token(fold_base_tokens, index)?,
             chain_depth: chain_depths.value(index),
             terminal_correction,
+            terminal_dead_letter,
         };
         row.validate().map_err(stream_token_protocol_error)?;
         rows.push(row);
@@ -1097,6 +1154,7 @@ fn lifecycle_ledger_envelopes_to_batch(rows: &[LifecycleLedgerEnvelope]) -> Resu
             Arc::new(UInt32Array::from(vec![None::<u32>; rows.len()])),
             null_string(),
             null_string(),
+            null_string(),
             Arc::new(StringArray::from(payloads)),
         ],
     )
@@ -1121,7 +1179,7 @@ fn lifecycle_ledger_envelopes_from_batch(
 ) -> Result<Vec<LifecycleLedgerEnvelope>> {
     if batch.schema().as_ref() != stream_token_schema().as_ref() {
         return Err(OmniError::manifest_internal(
-            "lifecycle ledger scan returned a non-v2 physical schema",
+            "lifecycle ledger scan returned a non-v3 physical schema",
         ));
     }
     if batch.num_rows() > MAX_LIFECYCLE_LEDGER_RECORDS_PER_TRANSACTION {
@@ -1164,6 +1222,7 @@ fn lifecycle_ledger_envelopes_from_batch(
         "chain_depth",
         "terminal_correction_actor",
         "terminal_correction_operation_id",
+        "terminal_dead_letter_json",
     ];
     let mut rows = Vec::with_capacity(batch.num_rows());
     let mut seen_ids = std::collections::HashSet::with_capacity(batch.num_rows());
@@ -1545,6 +1604,32 @@ pub(crate) async fn lookup_authority_retirement_receipt(
     }
 }
 
+/// Receipt-first lookup for the F5 three-disposition retirement occurrence.
+pub(crate) async fn lookup_authority_retirement_receipt_v2(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    graph_identity_digest: &str,
+    retirement_id: &str,
+) -> Result<Option<AuthorityRetirementReceiptV2>> {
+    let lookup_key =
+        AuthorityRetirementReceiptV2::lookup_key_for(graph_identity_digest, retirement_id)
+            .map_err(stream_token_protocol_error)?;
+    match lookup_lifecycle_ledger_record(
+        dataset,
+        authority,
+        AUTHORITY_RETIREMENT_RECEIPT_V2_TAG,
+        &lookup_key,
+    )
+    .await?
+    {
+        Some(LifecycleLedgerRecord::AuthorityRetirementReceiptV2(value)) => Ok(Some(value)),
+        None => Ok(None),
+        Some(_) => Err(OmniError::manifest_internal(
+            "authority-retirement-v2 lookup decoded another lifecycle ledger family",
+        )),
+    }
+}
+
 async fn stage_lifecycle_ledger_envelopes(
     dataset: Dataset,
     authority: &StreamTokenAuthorityEntry,
@@ -1678,9 +1763,24 @@ pub(crate) async fn stage_authority_retirement_receipt(
     .await
 }
 
+pub(crate) async fn stage_authority_retirement_receipt_v2(
+    dataset: Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    receipt: &AuthorityRetirementReceiptV2,
+) -> Result<crate::table_store::StagedWrite> {
+    stage_lifecycle_ledger_records(
+        dataset,
+        authority,
+        &[LifecycleLedgerRecord::AuthorityRetirementReceiptV2(
+            receipt.clone(),
+        )],
+    )
+    .await
+}
+
 const MAX_PROFILE_MANAGEMENT_RECEIPT_JSON_BYTES: usize = 64 * 1024;
 
-/// Encode one immutable profile-management ledger row using the tagged v2
+/// Encode one immutable profile-management ledger row using the tagged v3
 /// union schema. Every current-token column is structurally null.
 pub(crate) fn profile_management_receipt_to_batch(
     receipt: &ProfileManagementReceipt,
@@ -1723,6 +1823,7 @@ pub(crate) fn profile_management_receipt_to_batch(
             Arc::new(UInt32Array::from(vec![None::<u32>])),
             null_string(),
             null_string(),
+            null_string(),
             Arc::new(StringArray::from(vec![Some(payload)])),
         ],
     )
@@ -1740,7 +1841,7 @@ pub(crate) fn profile_management_receipts_from_batch(
 ) -> Result<Vec<ProfileManagementReceipt>> {
     if batch.schema().as_ref() != stream_token_schema().as_ref() {
         return Err(OmniError::manifest_internal(
-            "profile-management receipt scan returned a non-v2 physical schema",
+            "profile-management receipt scan returned a non-v3 physical schema",
         ));
     }
     let ids = required_string_array(batch, "id")?;
@@ -1766,6 +1867,7 @@ pub(crate) fn profile_management_receipts_from_batch(
         "chain_depth",
         "terminal_correction_actor",
         "terminal_correction_operation_id",
+        "terminal_dead_letter_json",
     ];
     let mut receipts = Vec::with_capacity(batch.num_rows());
     for index in 0..batch.num_rows() {
@@ -2426,6 +2528,7 @@ mod tests {
             fold_base_token: None,
             chain_depth: 1,
             terminal_correction: None,
+            terminal_dead_letter: None,
         }
     }
 

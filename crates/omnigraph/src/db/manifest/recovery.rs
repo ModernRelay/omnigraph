@@ -37,6 +37,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use lance::dataset::mem_wal::DatasetMemWalExt;
@@ -75,6 +76,10 @@ pub(crate) use stream_rebind_v18::*;
 #[path = "recovery/stream_retirement_v19.rs"]
 mod stream_retirement_v19;
 pub(crate) use stream_retirement_v19::*;
+
+#[path = "recovery/stream_retirement_v21.rs"]
+mod stream_retirement_v21;
+pub(crate) use stream_retirement_v21::*;
 
 #[path = "recovery/stream_correction_v20.rs"]
 mod stream_correction_v20;
@@ -173,6 +178,10 @@ async fn publish_recovery_commit(
                 let RecoveryProtocolV20::StreamCorrection(protocol) = protocol;
                 &protocol.lineage
             })
+        })
+        .or_else(|| match sidecar.protocol_v21.as_deref() {
+            Some(RecoveryProtocolV21::DeadLetterFold(protocol)) => Some(&protocol.lineage),
+            Some(RecoveryProtocolV21::StreamAuthorityRetirementV2(_)) | None => None,
         });
     let exact_rollback_id = sidecar
         .protocol_v3
@@ -224,6 +233,7 @@ async fn publish_recovery_commit(
                 .parse::<i64>()
                 .unwrap_or(crate::db::now_micros()?),
             stream_fold_attribution: None,
+            stream_fold_attribution_v2: None,
         },
         (Some(_), _, RecoveryKind::OrphanedBranchDiscarded)
         | (_, Some(_), RecoveryKind::OrphanedBranchDiscarded) => {
@@ -245,6 +255,7 @@ async fn publish_recovery_commit(
                 merged_parent_commit_id,
                 created_at: crate::db::now_micros()?,
                 stream_fold_attribution: None,
+                stream_fold_attribution_v2: None,
             }
         }
         _ => {
@@ -266,6 +277,11 @@ async fn publish_recovery_commit(
             sidecar.protocol_v20.as_deref()
         {
             intent.stream_fold_attribution = protocol.token.attribution_summary.clone();
+        } else if let Some(RecoveryProtocolV21::DeadLetterFold(protocol)) =
+            sidecar.protocol_v21.as_deref()
+        {
+            intent.stream_fold_attribution = None;
+            intent.stream_fold_attribution_v2 = Some(protocol.token.attribution_summary.clone());
         }
     }
     let publisher = GraphNamespacePublisher::new_with_session(
@@ -335,6 +351,10 @@ async fn publish_recovery_commit(
                 let RecoveryProtocolV20::StreamCorrection(protocol) = protocol;
                 &protocol.authority
             })
+        })
+        .or_else(|| match sidecar.protocol_v21.as_deref() {
+            Some(RecoveryProtocolV21::DeadLetterFold(protocol)) => Some(&protocol.authority),
+            Some(RecoveryProtocolV21::StreamAuthorityRetirementV2(_)) | None => None,
         });
     let precondition = match (exact_authority, kind) {
         (Some(authority), RecoveryKind::RolledForward) => {
@@ -494,7 +514,12 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// fixed lineage, and sole manifest publication that clears that exact block
 /// while keeping the drain active. The frozen v14 correction scaffold keeps
 /// its old fail-closed meaning.
-pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 20;
+///
+/// v20 → v21: RFC-026 F5 terminal dead-letter authority. V21 is one closed
+/// discriminator for a dead-letter fold (including an optional base effect
+/// and the object effect) or three-disposition authority retirement. It does
+/// not reinterpret recovery-v14 fold/retirement scaffolds or recovery-v19.
+pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 21;
 
 /// The only recovery generation emitted by the manifest-v5 write paths.
 pub(crate) const IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION: u32 = 9;
@@ -539,6 +564,9 @@ pub(crate) const STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION: u32 = 19;
 
 /// Exact offline DataBlock-correction generation.
 pub(crate) const STREAM_CORRECTION_SIDECAR_SCHEMA_VERSION: u32 = 20;
+
+/// Exact dead-letter fold and three-disposition retirement generation.
+pub(crate) const STREAM_DEAD_LETTER_SIDECAR_SCHEMA_VERSION: u32 = 21;
 
 /// Schema v11 is the first sidecar allowed to describe data-bearing MemWAL
 /// state, which is bound to stream-config v2 rather than Phase A's config-v1.
@@ -929,6 +957,8 @@ pub(crate) struct RecoveryLineageIntent {
     pub actor_id: Option<String>,
     pub merged_parent_commit_id: Option<String>,
     pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_fold_attribution_v2: Option<super::stream_token::StreamFoldAttributionSummaryV2>,
 }
 
 impl From<&RecoveryLineageIntent> for LineageIntent {
@@ -940,6 +970,7 @@ impl From<&RecoveryLineageIntent> for LineageIntent {
             merged_parent_commit_id: intent.merged_parent_commit_id.clone(),
             created_at: intent.created_at,
             stream_fold_attribution: None,
+            stream_fold_attribution_v2: intent.stream_fold_attribution_v2.clone(),
         }
     }
 }
@@ -1964,6 +1995,173 @@ pub(crate) enum RecoveryProtocolV17 {
     StreamSealedOptimize(RecoveryStreamSealedOptimizeV17),
 }
 
+/// One deterministically ordered terminal candidate whose exact line bytes can
+/// reconstruct a lost dead-letter PUT without listing or trusting an orphan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamDeadLetterCandidateV21 {
+    pub(crate) terminal_authority: super::stream_token::StreamTokenAuthorityRow,
+    /// Canonical JSON object bytes without the terminating LF. Recovery joins
+    /// every ordered line with exactly one LF and re-proves descriptor digest
+    /// and length before any object effect.
+    pub(crate) canonical_ndjson_line: String,
+}
+
+/// Required base-table participant. An all-diverted fold still commits the
+/// exact marker-only Lance update which advances MergedGeneration; otherwise
+/// Lance would continue to report the cut as unmerged after manifest publish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamDeadLetterBaseEffectV21 {
+    pub(crate) planned_transaction: StagedTransactionIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) confirmed_transaction: Option<StagedTransactionIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) confirmed_merged_generation: Option<MergedGeneration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) confirmed_head: Option<super::CurrentHeadWitness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) confirmed_update: Option<RecoveryConfirmedTableUpdate>,
+}
+
+/// Exact graph-global token participant. `planned_rows` is the complete
+/// post-fold authority set; terminal candidates are a sorted exact subset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamDeadLetterTokenEffectV21 {
+    pub(crate) prior_authority: super::StreamTokenAuthorityEntry,
+    pub(crate) planned_transaction: StagedTransactionIdentity,
+    pub(crate) planned_rows: Vec<super::stream_token::StreamTokenAuthorityRow>,
+    pub(crate) attribution_summary: super::stream_token::StreamFoldAttributionSummaryV2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) confirmed_transaction: Option<StagedTransactionIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) confirmed_head: Option<super::CurrentHeadWitness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) next_authority: Option<super::StreamTokenAuthorityEntry>,
+}
+
+/// Recovery-owned immutable object effect. `effect_confirmed` records either
+/// a successful conditional create or exact length/digest verification of an
+/// already-existing object; a lost result remains Armed and is re-verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamDeadLetterObjectEffectV21 {
+    pub(crate) descriptor: super::stream_token::StreamDeadLetterObjectDescriptor,
+    pub(crate) candidates: Vec<RecoveryStreamDeadLetterCandidateV21>,
+    pub(crate) effect_confirmed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum RecoveryStreamDeadLetterManifestOutcomeV21 {
+    MixedVisible,
+    AllDiverted,
+}
+
+/// Complete v21 dead-letter fold authority. OPEN and DRAINING reuse v14's
+/// exact optional drain proof; conflict-free folds remain on recovery-v14.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamDeadLetterFoldV21 {
+    pub(crate) authority: RecoveryAuthorityToken,
+    pub(crate) lineage: RecoveryLineageIntent,
+    pub(crate) admission_scope: RecoveryStreamAdmissionScope,
+    pub(crate) prior_manifest_version: u64,
+    pub(crate) profile: super::StreamProfileEntry,
+    pub(crate) binding: super::StreamPhysicalBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prior_merged_generation: Option<MergedGeneration>,
+    pub(crate) generation_cut: RecoveryStreamFoldCut,
+    pub(crate) merged_generation: MergedGeneration,
+    pub(crate) effect_phase: RecoveryEffectPhase,
+    pub(crate) manifest_outcome: RecoveryStreamDeadLetterManifestOutcomeV21,
+    pub(crate) prior_lifecycle: super::StreamLifecycleEntry,
+    pub(crate) current_claim_receipt: super::stream::ClaimReceipt,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) drain_authority: Option<RecoveryStreamDrainFoldAuthorityV14>,
+    pub(crate) planned_next_lifecycle: super::StreamLifecycleEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) next_lifecycle: Option<super::StreamLifecycleEntry>,
+    pub(crate) base: RecoveryStreamDeadLetterBaseEffectV21,
+    pub(crate) token: RecoveryStreamDeadLetterTokenEffectV21,
+    pub(crate) object: RecoveryStreamDeadLetterObjectEffectV21,
+}
+
+/// Exact immutable token-ledger participant for three-disposition retirement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamAuthorityRetirementReceiptEffectV21 {
+    pub(crate) prior_authority: super::StreamTokenAuthorityEntry,
+    pub(crate) planned_receipt: super::stream_token::AuthorityRetirementReceiptV2,
+    pub(crate) planned_transaction: StagedTransactionIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) confirmed_transaction: Option<StagedTransactionIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) confirmed_head: Option<super::CurrentHeadWitness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) next_authority: Option<super::StreamTokenAuthorityEntry>,
+}
+
+/// Recovery-v19 remains frozen. This successor differs only where F5 needs a
+/// third terminal disposition in the immutable scan proof and receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStreamAuthorityRetirementV21 {
+    pub(crate) authority: RecoveryAuthorityToken,
+    pub(crate) prior_manifest_version: u64,
+    pub(crate) effect_phase: RecoveryEffectPhase,
+    pub(crate) prior_profile: super::StreamProfileEntry,
+    pub(crate) next_profile: super::StreamProfileEntry,
+    pub(crate) receipt: RecoveryStreamAuthorityRetirementReceiptEffectV21,
+}
+
+/// F5's one closed recovery grammar. Adding another operation or changing
+/// either payload requires a later sidecar generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", deny_unknown_fields)]
+pub(crate) enum RecoveryProtocolV21 {
+    DeadLetterFold(RecoveryStreamDeadLetterFoldV21),
+    StreamAuthorityRetirementV2(RecoveryStreamAuthorityRetirementV21),
+}
+
+impl RecoveryProtocolV21 {
+    fn admission_scope(&self) -> Option<&RecoveryStreamAdmissionScope> {
+        match self {
+            Self::DeadLetterFold(protocol) => Some(&protocol.admission_scope),
+            Self::StreamAuthorityRetirementV2(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RecoveryStreamDeadLetterBaseConfirmationV21 {
+    pub(crate) committed_transaction: StagedTransactionIdentity,
+    pub(crate) merged_generation: MergedGeneration,
+    pub(crate) achieved_head: super::CurrentHeadWitness,
+    pub(crate) update: SubTableUpdate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveryStreamDeadLetterFoldOutcomeV21 {
+    pub(crate) graph_commit_id: String,
+    pub(crate) manifest_version: u64,
+    pub(crate) lifecycle_revision: u64,
+    pub(crate) base_head: super::CurrentHeadWitness,
+    pub(crate) token_head: super::CurrentHeadWitness,
+    pub(crate) all_diverted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecoveryStreamAuthorityRetirementOutcomeV21 {
+    TerminalVisible {
+        receipt: super::stream_token::AuthorityRetirementReceiptV2,
+        token_authority: super::StreamTokenAuthorityEntry,
+        profile: super::StreamProfileEntry,
+        manifest_version: u64,
+    },
+}
+
 /// Schema-v6 EnsureIndices rollback identity retained for compatibility.
 /// Recovery must still be able to prove that a previously published
 /// compensation was a rollback rather than infer the outcome from aligned
@@ -2076,6 +2274,10 @@ pub(crate) struct RecoverySidecar {
     /// Exact RFC-026 offline DataBlock-correction envelope (schema v20 only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v20: Option<Box<RecoveryProtocolV20>>,
+    /// Closed RFC-026 F5 dead-letter fold / retirement-v2 envelope (schema
+    /// v21 only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_v21: Option<Box<RecoveryProtocolV21>>,
     /// EnsureIndices-only fixed rollback identity. It does not make the
     /// physical index effects exact; it only makes compensation retry-safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2103,6 +2305,11 @@ impl RecoverySidecar {
                 self.protocol_v20
                     .as_deref()
                     .map(RecoveryProtocolV20::admission_scope)
+            })
+            .or_else(|| {
+                self.protocol_v21
+                    .as_deref()
+                    .and_then(RecoveryProtocolV21::admission_scope)
             })
     }
 }
@@ -2623,6 +2830,20 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             STREAM_CORRECTION_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
         )));
     }
+    if sidecar.protocol_v21.is_some()
+        && sidecar.schema_version != STREAM_DEAD_LETTER_SIDECAR_SCHEMA_VERSION
+    {
+        return Err(malformed(format!(
+            "protocol_v21 requires schema-v{}, found schema-v{}",
+            STREAM_DEAD_LETTER_SIDECAR_SCHEMA_VERSION, sidecar.schema_version
+        )));
+    }
+    if historical_lineage_carries_stream_fold_attribution_v2(sidecar) {
+        return Err(malformed(
+            "stream_fold_attribution_v2 is reserved for recovery-v21 DeadLetterFold lineage"
+                .to_string(),
+        ));
+    }
 
     if sidecar.schema_version < EXACT_EFFECT_IDENTITY_SCHEMA_VERSION {
         if sidecar.protocol_v3.is_some()
@@ -2640,6 +2861,7 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             || sidecar.protocol_v18.is_some()
             || sidecar.protocol_v19.is_some()
             || sidecar.protocol_v20.is_some()
+            || sidecar.protocol_v21.is_some()
         {
             return Err(malformed(
                 "an exact-effect protocol is present on a pre-v3 sidecar".to_string(),
@@ -2690,6 +2912,10 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
 
     if sidecar.schema_version == STREAM_CORRECTION_SIDECAR_SCHEMA_VERSION {
         return validate_stream_protocol_v20_shape(sidecar_uri, sidecar);
+    }
+
+    if sidecar.schema_version == STREAM_DEAD_LETTER_SIDECAR_SCHEMA_VERSION {
+        return validate_stream_protocol_v21_shape(sidecar_uri, sidecar);
     }
 
     if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
@@ -2800,6 +3026,323 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
         )));
     }
     validate_mutation_load_shape(sidecar_uri, sidecar)
+}
+
+fn historical_lineage_carries_stream_fold_attribution_v2(sidecar: &RecoverySidecar) -> bool {
+    let direct = [
+        sidecar
+            .protocol_v3
+            .as_ref()
+            .map(|protocol| &protocol.lineage),
+        sidecar
+            .protocol_v4
+            .as_ref()
+            .map(|protocol| &protocol.lineage),
+        sidecar
+            .protocol_v7
+            .as_ref()
+            .map(|protocol| &protocol.lineage),
+        sidecar
+            .protocol_v8
+            .as_ref()
+            .map(|protocol| &protocol.lineage),
+        sidecar
+            .protocol_v10
+            .as_ref()
+            .map(|protocol| &protocol.lineage),
+        sidecar
+            .protocol_v11
+            .as_ref()
+            .map(|protocol| &protocol.lineage),
+        sidecar
+            .protocol_v12
+            .as_deref()
+            .map(|protocol| &protocol.lineage),
+    ];
+    direct
+        .into_iter()
+        .flatten()
+        .any(|lineage| lineage.stream_fold_attribution_v2.is_some())
+        || sidecar.protocol_v13.as_deref().is_some_and(|protocol| {
+            let RecoveryProtocolV13::StreamProfileChange(protocol) = protocol;
+            protocol.lineage.stream_fold_attribution_v2.is_some()
+        })
+        || sidecar
+            .protocol_v14
+            .as_deref()
+            .is_some_and(|protocol| match protocol {
+                RecoveryProtocolV14::StreamEnrollmentV2(protocol) => {
+                    protocol.lineage.stream_fold_attribution_v2.is_some()
+                }
+                RecoveryProtocolV14::StreamFoldV2(protocol)
+                | RecoveryProtocolV14::StreamDrainFold(protocol) => {
+                    protocol.lineage.stream_fold_attribution_v2.is_some()
+                }
+                _ => false,
+            })
+        || sidecar.protocol_v17.as_deref().is_some_and(|protocol| {
+            let RecoveryProtocolV17::StreamSealedOptimize(protocol) = protocol;
+            protocol.lineage.stream_fold_attribution_v2.is_some()
+        })
+        || sidecar.protocol_v18.as_deref().is_some_and(|protocol| {
+            let RecoveryProtocolV18::StreamRebind(protocol) = protocol;
+            protocol.lineage.stream_fold_attribution_v2.is_some()
+        })
+        || sidecar.protocol_v20.as_deref().is_some_and(|protocol| {
+            let RecoveryProtocolV20::StreamCorrection(protocol) = protocol;
+            protocol.lineage.stream_fold_attribution_v2.is_some()
+        })
+}
+
+fn recovery_v21_carries_only_v21(sidecar: &RecoverySidecar) -> bool {
+    sidecar.protocol_v3.is_none()
+        && sidecar.protocol_v4.is_none()
+        && sidecar.protocol_v7.is_none()
+        && sidecar.protocol_v8.is_none()
+        && sidecar.protocol_v10.is_none()
+        && sidecar.protocol_v11.is_none()
+        && sidecar.protocol_v12.is_none()
+        && sidecar.protocol_v13.is_none()
+        && sidecar.protocol_v14.is_none()
+        && sidecar.protocol_v15.is_none()
+        && sidecar.protocol_v16.is_none()
+        && sidecar.protocol_v17.is_none()
+        && sidecar.protocol_v18.is_none()
+        && sidecar.protocol_v19.is_none()
+        && sidecar.protocol_v20.is_none()
+        && sidecar.ensure_indices_rollback_v6.is_none()
+        && sidecar.merge_source_commit_id.is_none()
+        && sidecar.additional_registrations.is_empty()
+        && sidecar.tombstones.is_empty()
+        && !sidecar.schema_apply_manifest_published
+        && sidecar.schema_apply_target_schema_ir_hash.is_none()
+}
+
+fn validate_dead_letter_candidate_lines_v21<F>(
+    malformed: &F,
+    identity: super::TableIdentity,
+    accepted_schema_hash: &str,
+    descriptor: &super::stream_token::StreamDeadLetterObjectDescriptor,
+    candidates: &[RecoveryStreamDeadLetterCandidateV21],
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    descriptor
+        .validate()
+        .map_err(|error| malformed(format!("invalid dead-letter object descriptor: {error}")))?;
+    if candidates.len() != descriptor.candidate_count as usize {
+        return Err(malformed(
+            "dead-letter candidate count differs from its object descriptor".to_string(),
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut encoded_length = 0_u64;
+    let mut prior_logical_id: Option<&str> = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let row = &candidate.terminal_authority;
+        row.validate()
+            .map_err(|error| malformed(format!("invalid terminal token authority: {error}")))?;
+        let terminal = row.terminal_dead_letter.as_deref().ok_or_else(|| {
+            malformed("dead-letter candidate has no terminal evidence".to_string())
+        })?;
+        let ordinal = u64::try_from(index)
+            .map_err(|_| malformed("dead-letter candidate ordinal exceeds u64".to_string()))?;
+        if row.disposition != super::stream_token::StreamTokenDisposition::DeadLettered
+            || terminal.object != *descriptor
+            || terminal.candidate_ordinal != ordinal
+            || prior_logical_id.is_some_and(|prior| prior >= row.logical_id.as_str())
+        {
+            return Err(malformed(
+                "dead-letter candidates must be exact DEAD_LETTERED rows in strict logical-id and contiguous ordinal order"
+                    .to_string(),
+            ));
+        }
+        let (decoded, canonical_payload) =
+            crate::db::omnigraph::stream_dead_letter::decode_stream_dead_letter_canonical_line(
+                &candidate.canonical_ndjson_line,
+                ordinal,
+                prior_logical_id,
+            )
+            .map_err(|error| malformed(format!("invalid canonical dead-letter line: {error}")))?;
+        let payload_digest =
+            super::stream_token::PayloadDigest::derive(&super::stream_token::PayloadDigestInput {
+                identity,
+                accepted_schema_hash,
+                canonical_payload,
+            })
+            .map_err(|error| malformed(format!("invalid dead-letter payload digest: {error}")))?;
+        if decoded.logical_id != row.logical_id
+            || decoded.stream_incarnation_id != row.stream_incarnation_id
+            || decoded.write_id != row.write_id
+            || decoded.current_token != row.current_token
+            || decoded.predecessor_token != row.predecessor_token
+            || decoded.contributor_id != row.contributor_id.as_str()
+            || decoded.payload_digest != row.payload_digest
+            || decoded.reason_code != terminal.reason_code
+            || payload_digest != row.payload_digest
+        {
+            return Err(malformed(
+                "canonical dead-letter line differs from terminal token authority or payload digest"
+                    .to_string(),
+            ));
+        }
+        hasher.update(candidate.canonical_ndjson_line.as_bytes());
+        hasher.update(b"\n");
+        encoded_length = encoded_length
+            .checked_add(
+                u64::try_from(candidate.canonical_ndjson_line.len())
+                    .map_err(|_| malformed("dead-letter line length exceeds u64".to_string()))?,
+            )
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| malformed("dead-letter object length overflow".to_string()))?;
+        if encoded_length > super::stream_token::MAX_STREAM_DEAD_LETTER_OBJECT_BYTES {
+            return Err(malformed(
+                "dead-letter object exceeds its fixed encoded-byte envelope".to_string(),
+            ));
+        }
+        prior_logical_id = Some(&row.logical_id);
+    }
+    let digest = format!("sha256:{:x}", hasher.finalize());
+    if encoded_length != descriptor.encoded_length || digest != descriptor.object_digest {
+        return Err(malformed(
+            "dead-letter candidate bytes differ from the descriptor length or digest".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stream_dead_letter_fold_v21<F>(
+    malformed: &F,
+    sidecar: &RecoverySidecar,
+    protocol: &RecoveryStreamDeadLetterFoldV21,
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    let drain_mode = protocol.drain_authority.is_some();
+    let expected_writer = if drain_mode {
+        SidecarKind::StreamDrainFold
+    } else {
+        SidecarKind::StreamFoldV2
+    };
+    if sidecar.writer_kind != expected_writer || sidecar.branch.is_some() {
+        return Err(malformed(
+            "DeadLetterFold discriminator must match its canonical-main fold mode".to_string(),
+        ));
+    }
+    validate_authority_identity(malformed, &protocol.authority)?;
+    validate_stream_admission_scope(malformed, &protocol.admission_scope)?;
+    if protocol.authority.branch_identifier != lance::dataset::refs::BranchIdentifier::main() {
+        return Err(malformed(
+            "DeadLetterFold requires canonical-main graph authority".to_string(),
+        ));
+    }
+
+    // Dead-letter folds share the exact v14 physical and lifecycle contract.
+    // Project only for validation/classification; the serialized v21 grammar
+    // and its attribution-v2/object authority remain distinct.
+    let projection = dead_letter_fold_v21_physical_projection(sidecar);
+    let projected = stream_fold_protocol_v14(&projection);
+    validate_stream_fold_v14_shape(malformed, &projection, projected, drain_mode, false)?;
+
+    let pin = &sidecar.tables[0];
+    let mut visible_rows = Vec::new();
+    let mut terminal_rows = Vec::new();
+    for row in &protocol.token.planned_rows {
+        match row.disposition {
+            super::stream_token::StreamTokenDisposition::Present => visible_rows.push(row.clone()),
+            super::stream_token::StreamTokenDisposition::DeadLettered => {
+                terminal_rows.push(row.clone())
+            }
+            super::stream_token::StreamTokenDisposition::Withdrawn => {
+                return Err(malformed(
+                    "DeadLetterFold cannot publish WITHDRAWN authority".to_string(),
+                ));
+            }
+        }
+    }
+
+    validate_dead_letter_candidate_lines_v21(
+        malformed,
+        pin.identity,
+        &protocol.authority.schema_ir_hash,
+        &protocol.object.descriptor,
+        &protocol.object.candidates,
+    )?;
+    let candidate_rows = protocol
+        .object
+        .candidates
+        .iter()
+        .map(|candidate| candidate.terminal_authority.clone())
+        .collect::<Vec<_>>();
+    if protocol.object.descriptor.fold_operation_id != sidecar.operation_id
+        || terminal_rows != candidate_rows
+        || protocol.object.descriptor != protocol.token.attribution_summary.dead_letter_object
+    {
+        return Err(malformed(
+            "dead-letter object/candidates are not owned by this fold or the exact terminal token subset"
+                .to_string(),
+        ));
+    }
+
+    let expected_attribution = super::stream_token::stream_fold_attribution_commitment_v2(
+        &visible_rows,
+        protocol.object.descriptor.clone(),
+    )
+    .map_err(|error| malformed(format!("invalid dead-letter attribution: {error}")))?;
+    if protocol.token.attribution_summary != expected_attribution
+        || protocol.lineage.stream_fold_attribution_v2.as_ref()
+            != Some(&protocol.token.attribution_summary)
+    {
+        return Err(malformed(
+            "dead-letter rows, lineage, and attribution-v2 commitment disagree".to_string(),
+        ));
+    }
+
+    let expected_outcome = if visible_rows.is_empty() {
+        RecoveryStreamDeadLetterManifestOutcomeV21::AllDiverted
+    } else {
+        RecoveryStreamDeadLetterManifestOutcomeV21::MixedVisible
+    };
+    if protocol.manifest_outcome != expected_outcome {
+        return Err(malformed(
+            "dead-letter manifest outcome disagrees with visible winner count".to_string(),
+        ));
+    }
+    match (protocol.effect_phase, protocol.object.effect_confirmed) {
+        (RecoveryEffectPhase::Armed, false) | (RecoveryEffectPhase::EffectsConfirmed, true) => {
+            Ok(())
+        }
+        _ => Err(malformed(
+            "dead-letter object confirmation must track the fold effect phase".to_string(),
+        )),
+    }
+}
+fn validate_stream_protocol_v21_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+    if !recovery_v21_carries_only_v21(sidecar) {
+        return Err(malformed(
+            "schema-v21 must carry only its closed protocol_v21 payload".to_string(),
+        ));
+    }
+    let protocol = sidecar
+        .protocol_v21
+        .as_deref()
+        .ok_or_else(|| malformed("missing required protocol_v21 payload".to_string()))?;
+    match protocol {
+        RecoveryProtocolV21::DeadLetterFold(protocol) => {
+            validate_stream_dead_letter_fold_v21(&malformed, sidecar, protocol)
+        }
+        RecoveryProtocolV21::StreamAuthorityRetirementV2(protocol) => {
+            validate_stream_authority_retirement_v21(&malformed, sidecar, protocol)
+        }
+    }
 }
 
 /// Bind identity-aware recovery ownership to this graph root before any path
@@ -5407,6 +5950,7 @@ fn validate_stream_fold_v14_shape<F>(
     sidecar: &RecoverySidecar,
     protocol: &RecoveryStreamFoldV14,
     drain_mode: bool,
+    validate_legacy_attribution: bool,
 ) -> Result<()>
 where
     F: Fn(String) -> OmniError,
@@ -5612,7 +6156,9 @@ where
         &protocol.token.planned_transaction.uuid,
         false,
     )?;
-    validate_stream_fold_attribution_summary(malformed, &protocol.token.attribution_summary)?;
+    if validate_legacy_attribution {
+        validate_stream_fold_attribution_summary(malformed, &protocol.token.attribution_summary)?;
+    }
     if protocol.token.planned_rows.is_empty()
         || protocol.token.planned_rows.len()
             > crate::table_store::mem_wal::B1_MAX_GENERATION_ROWS as usize
@@ -5640,13 +6186,16 @@ where
         }
         prior_id = Some(row.logical_id.as_str());
     }
-    let attribution =
-        super::stream_token::stream_fold_attribution_commitment(&protocol.token.planned_rows)
-            .map_err(|error| malformed(format!("invalid StreamFoldV14 attribution: {error}")))?;
-    if attribution != protocol.token.attribution_summary {
-        return Err(malformed(
-            "StreamFoldV14 token rows differ from their exact attribution commitment".to_string(),
-        ));
+    if validate_legacy_attribution {
+        let attribution =
+            super::stream_token::stream_fold_attribution_commitment(&protocol.token.planned_rows)
+                .map_err(|error| malformed(format!("invalid StreamFoldV14 attribution: {error}")))?;
+        if attribution != protocol.token.attribution_summary {
+            return Err(malformed(
+                "StreamFoldV14 token rows differ from their exact attribution commitment"
+                    .to_string(),
+            ));
+        }
     }
 
     let planned_head = super::CurrentHeadWitness {
@@ -5800,10 +6349,10 @@ fn validate_stream_protocol_v14_shape(sidecar_uri: &str, sidecar: &RecoverySidec
             validate_stream_claim_v14_shape(&malformed, sidecar, protocol)
         }
         RecoveryProtocolV14::StreamFoldV2(protocol) => {
-            validate_stream_fold_v14_shape(&malformed, sidecar, protocol, false)
+            validate_stream_fold_v14_shape(&malformed, sidecar, protocol, false, true)
         }
         RecoveryProtocolV14::StreamDrainFold(protocol) => {
-            validate_stream_fold_v14_shape(&malformed, sidecar, protocol, true)
+            validate_stream_fold_v14_shape(&malformed, sidecar, protocol, true, true)
         }
         RecoveryProtocolV14::StreamLifecycleReceipt(protocol) => {
             validate_stream_lifecycle_receipt_v14_shape(&malformed, sidecar, protocol)
@@ -8091,7 +8640,13 @@ fn heal_one_sidecar_roll_forward(
         // manifest CAS is visible it may verify the immutable receipt and
         // remove its own sidecar.
         let main_snapshot = main_coord.snapshot();
-        if sidecar.schema_version != STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION {
+        let is_retirement_continuation = sidecar.schema_version
+            == STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION
+            || matches!(
+                sidecar.protocol_v21.as_deref(),
+                Some(RecoveryProtocolV21::StreamAuthorityRetirementV2(_))
+            );
+        if !is_retirement_continuation {
             if let Some(error) = main_snapshot.stream_profile().retired_error() {
                 return Err(error);
             }
@@ -8184,19 +8739,20 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
     let mut processed_any = false;
     let mut unresolved = Vec::new();
     for sidecar in sidecars {
-        let outcome = if matches!(
-            sidecar.schema_version,
-            STREAM_REBIND_SIDECAR_SCHEMA_VERSION | STREAM_CORRECTION_SIDECAR_SCHEMA_VERSION
-        ) {
-            // The v18 and v20 continuations reach deep Lance coordinator and
-            // exact-effect planning. Their fresh task owns the complete gate
-            // envelope, under-gate reread, classification, and effects, so
-            // parent cancellation can never release recovery ownership while
-            // the child keeps running.
-            let root_uri = root_uri.to_string();
-            let storage = std::sync::Arc::clone(&storage);
-            let write_queue = std::sync::Arc::clone(&write_queue);
-            crate::instrumentation::spawn_with_query_io_probes(
+        let outcome =
+            if matches!(
+                sidecar.schema_version,
+                STREAM_REBIND_SIDECAR_SCHEMA_VERSION | STREAM_CORRECTION_SIDECAR_SCHEMA_VERSION
+            ) {
+                // The v18 and v20 continuations reach deep Lance coordinator and
+                // exact-effect planning. Their fresh task owns the complete gate
+                // envelope, under-gate reread, classification, and effects, so
+                // parent cancellation can never release recovery ownership while
+                // the child keeps running.
+                let root_uri = root_uri.to_string();
+                let storage = std::sync::Arc::clone(&storage);
+                let write_queue = std::sync::Arc::clone(&write_queue);
+                crate::instrumentation::spawn_with_query_io_probes(
                 heal_one_sidecar_roll_forward(root_uri, storage, write_queue, sidecar),
             )
             .await
@@ -8205,15 +8761,15 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
                     "stream recovery owner task failed before returning its exact outcome: {error}"
                 ))
             })??
-        } else {
-            heal_one_sidecar_roll_forward(
-                root_uri.to_string(),
-                std::sync::Arc::clone(&storage),
-                std::sync::Arc::clone(&write_queue),
-                sidecar,
-            )
-            .await?
-        };
+            } else {
+                heal_one_sidecar_roll_forward(
+                    root_uri.to_string(),
+                    std::sync::Arc::clone(&storage),
+                    std::sync::Arc::clone(&write_queue),
+                    sidecar,
+                )
+                .await?
+            };
         processed_any |= outcome.processed_any;
         if let Some(intent) = outcome.unresolved {
             unresolved.push(intent);
@@ -8279,6 +8835,7 @@ async fn discard_orphaned_branch_sidecar(
             merged_parent_commit_id: None,
             created_at: crate::db::now_micros()?,
             stream_fold_attribution: None,
+            stream_fold_attribution_v2: None,
         };
         let publisher = GraphNamespacePublisher::new_with_session(
             root_uri,
@@ -8403,7 +8960,13 @@ pub(crate) async fn recover_manifest_drift(
         // therefore cannot authorize root-wide effects after RETIRED.
         coordinator.refresh().await?;
         let main_snapshot = coordinator.snapshot();
-        if sidecar.schema_version != STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION {
+        let is_retirement_continuation = sidecar.schema_version
+            == STREAM_AUTHORITY_RETIREMENT_SIDECAR_SCHEMA_VERSION
+            || matches!(
+                sidecar.protocol_v21.as_deref(),
+                Some(RecoveryProtocolV21::StreamAuthorityRetirementV2(_))
+            );
+        if !is_retirement_continuation {
             if let Some(error) = main_snapshot.stream_profile().retired_error() {
                 return Err(error);
             }
@@ -13873,6 +14436,15 @@ async fn process_sidecar_inner(
         )
         .await;
     }
+    if matches!(
+        sidecar.protocol_v21.as_deref(),
+        Some(RecoveryProtocolV21::StreamAuthorityRetirementV2(_))
+    ) {
+        return process_stream_authority_retirement_sidecar_v21(
+            root_uri, storage, snapshot, sidecar,
+        )
+        .await;
+    }
     if let Some(error) = snapshot.stream_profile().retired_error() {
         return Err(error);
     }
@@ -13919,6 +14491,10 @@ async fn process_sidecar_inner(
         // heap boundary so adding the variant does not inflate the closed
         // recovery dispatcher's stack frame on every open.
         return process_stream_correction_sidecar_v20(root_uri, storage, snapshot, sidecar).await;
+    }
+    if sidecar.schema_version == STREAM_DEAD_LETTER_SIDECAR_SCHEMA_VERSION {
+        return process_stream_dead_letter_fold_sidecar_v21(root_uri, storage, snapshot, sidecar)
+            .await;
     }
     if sidecar.schema_version == STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION {
         return match sidecar
@@ -18781,8 +19357,784 @@ fn new_unvalidated_sidecar(
         protocol_v18: None,
         protocol_v19: None,
         protocol_v20: None,
+        protocol_v21: None,
         ensure_indices_rollback_v6: None,
     }
+}
+
+/// Mint the identity used by both the recovery sidecar and its deterministic
+/// dead-letter object path. Callers mint this before encoding object bytes.
+pub(crate) fn mint_recovery_operation_id() -> String {
+    ulid::Ulid::new().to_string()
+}
+
+fn stream_dead_letter_fold_protocol_v21(
+    sidecar: &RecoverySidecar,
+) -> &RecoveryStreamDeadLetterFoldV21 {
+    let RecoveryProtocolV21::DeadLetterFold(protocol) = sidecar
+        .protocol_v21
+        .as_deref()
+        .expect("validated schema-v21 DeadLetterFold")
+    else {
+        panic!("validated schema-v21 sidecar is not DeadLetterFold")
+    };
+    protocol
+}
+
+fn stream_dead_letter_fold_protocol_v21_mut(
+    sidecar: &mut RecoverySidecar,
+) -> &mut RecoveryStreamDeadLetterFoldV21 {
+    let RecoveryProtocolV21::DeadLetterFold(protocol) = sidecar
+        .protocol_v21
+        .as_deref_mut()
+        .expect("validated schema-v21 DeadLetterFold")
+    else {
+        panic!("validated schema-v21 sidecar is not DeadLetterFold")
+    };
+    protocol
+}
+
+/// Arm the object + base-marker + token transaction set before the first
+/// object or Lance effect. The provided operation identity must already own
+/// the deterministic object descriptor.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new_stream_dead_letter_fold_sidecar_v21(
+    operation_id: String,
+    table: SidecarTablePin,
+    authority: RecoveryAuthorityToken,
+    mut lineage: RecoveryLineageIntent,
+    prior_manifest_version: u64,
+    profile: super::StreamProfileEntry,
+    prior_lifecycle: super::StreamLifecycleEntry,
+    current_claim_receipt: super::stream::ClaimReceipt,
+    drain_authority: Option<RecoveryStreamDrainFoldAuthorityV14>,
+    planned_next_lifecycle: super::StreamLifecycleEntry,
+    prior_merged_generation: Option<MergedGeneration>,
+    generation_cut: RecoveryStreamFoldCut,
+    base_planned_transaction: StagedTransactionIdentity,
+    prior_token_authority: super::StreamTokenAuthorityEntry,
+    token_planned_transaction: StagedTransactionIdentity,
+    token_planned_rows: Vec<super::stream_token::StreamTokenAuthorityRow>,
+    dead_letter_candidates: Vec<RecoveryStreamDeadLetterCandidateV21>,
+    attribution_summary: super::stream_token::StreamFoldAttributionSummaryV2,
+) -> Result<RecoverySidecar> {
+    if attribution_summary.dead_letter_object.fold_operation_id != operation_id {
+        return Err(OmniError::manifest_internal(
+            "dead-letter object fold_operation_id differs from recovery operation_id",
+        ));
+    }
+    if lineage
+        .stream_fold_attribution_v2
+        .as_ref()
+        .is_some_and(|existing| existing != &attribution_summary)
+    {
+        return Err(OmniError::manifest_internal(
+            "dead-letter recovery lineage carries a different v2 attribution",
+        ));
+    }
+    lineage.stream_fold_attribution_v2 = Some(attribution_summary.clone());
+    super::stream_token::canonical_stream_dead_letter_object_location(&operation_id)?;
+    let binding = prior_lifecycle.binding.clone();
+    let admission_scope = RecoveryStreamAdmissionScope {
+        identity: prior_lifecycle.identity,
+        table_branch: binding.table_branch.clone(),
+        binding_scope_id: prior_lifecycle.binding_scope_id.clone(),
+    };
+    let manifest_outcome = if attribution_summary.visible_write_count == 0 {
+        RecoveryStreamDeadLetterManifestOutcomeV21::AllDiverted
+    } else {
+        RecoveryStreamDeadLetterManifestOutcomeV21::MixedVisible
+    };
+    let writer_kind = if drain_authority.is_some() {
+        SidecarKind::StreamDrainFold
+    } else {
+        SidecarKind::StreamFoldV2
+    };
+    let actor = lineage.actor_id.clone();
+    let merged_generation =
+        MergedGeneration::new(generation_cut.shard_id, generation_cut.generation);
+    let mut sidecar = new_unvalidated_sidecar(
+        STREAM_DEAD_LETTER_SIDECAR_SCHEMA_VERSION,
+        writer_kind,
+        None,
+        actor,
+        vec![table],
+    );
+    sidecar.operation_id = operation_id;
+    sidecar.protocol_v21 = Some(Box::new(RecoveryProtocolV21::DeadLetterFold(
+        RecoveryStreamDeadLetterFoldV21 {
+            authority,
+            lineage,
+            admission_scope,
+            prior_manifest_version,
+            profile,
+            binding,
+            prior_merged_generation,
+            generation_cut,
+            merged_generation,
+            effect_phase: RecoveryEffectPhase::Armed,
+            manifest_outcome,
+            prior_lifecycle,
+            current_claim_receipt,
+            drain_authority,
+            planned_next_lifecycle,
+            next_lifecycle: None,
+            base: RecoveryStreamDeadLetterBaseEffectV21 {
+                planned_transaction: base_planned_transaction,
+                confirmed_transaction: None,
+                confirmed_merged_generation: None,
+                confirmed_head: None,
+                confirmed_update: None,
+            },
+            token: RecoveryStreamDeadLetterTokenEffectV21 {
+                prior_authority: prior_token_authority,
+                planned_transaction: token_planned_transaction,
+                planned_rows: token_planned_rows,
+                attribution_summary,
+                confirmed_transaction: None,
+                confirmed_head: None,
+                next_authority: None,
+            },
+            object: RecoveryStreamDeadLetterObjectEffectV21 {
+                descriptor: dead_letter_candidates
+                    .first()
+                    .and_then(|candidate| {
+                        candidate
+                            .terminal_authority
+                            .terminal_dead_letter
+                            .as_deref()
+                            .map(|terminal| terminal.object.clone())
+                    })
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "dead-letter recovery requires at least one terminal candidate",
+                        )
+                    })?,
+                candidates: dead_letter_candidates,
+                effect_confirmed: false,
+            },
+        },
+    )));
+    validate_sidecar_shape("<new-stream-dead-letter-fold-sidecar-v21>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Persist the exact object verification and both achieved Lance participants
+/// before the sole manifest CAS may select them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn confirm_stream_dead_letter_fold_sidecar_v21(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    object_descriptor: super::stream_token::StreamDeadLetterObjectDescriptor,
+    base_confirmation: RecoveryStreamDeadLetterBaseConfirmationV21,
+    token_committed_transaction: StagedTransactionIdentity,
+    achieved_token_head: super::CurrentHeadWitness,
+    next_token_authority: super::StreamTokenAuthorityEntry,
+) -> Result<()> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    validate_sidecar_shape(&uri, sidecar)?;
+    let current = stream_dead_letter_fold_protocol_v21(sidecar);
+    let expected_token_post = current
+        .token
+        .planned_transaction
+        .read_version
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("dead-letter token version overflow"))?;
+    if current.effect_phase != RecoveryEffectPhase::Armed
+        || object_descriptor != current.object.descriptor
+        || base_confirmation.committed_transaction != current.base.planned_transaction
+        || base_confirmation.merged_generation != current.merged_generation
+        || base_confirmation.achieved_head.table_version != sidecar.tables[0].post_commit_pin
+        || base_confirmation.achieved_head.branch_identifier
+            != lance::dataset::refs::BranchIdentifier::main()
+        || base_confirmation.achieved_head.transaction_uuid
+            != base_confirmation.committed_transaction.uuid
+        || base_confirmation.update.identity != sidecar.tables[0].identity
+        || base_confirmation.update.table_key != sidecar.tables[0].table_key
+        || base_confirmation.update.table_version != sidecar.tables[0].post_commit_pin
+        || base_confirmation.update.table_branch.is_some()
+        || token_committed_transaction != current.token.planned_transaction
+        || achieved_token_head.table_version != expected_token_post
+        || achieved_token_head.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
+        || achieved_token_head.transaction_uuid != token_committed_transaction.uuid
+        || next_token_authority.current_head_witness != achieved_token_head
+        || next_token_authority.location != current.token.prior_authority.location
+        || next_token_authority.schema_version != current.token.prior_authority.schema_version
+        || next_token_authority.schema_hash != current.token.prior_authority.schema_hash
+    {
+        return Err(OmniError::manifest_internal(
+            "DeadLetterFold confirmation differs from its object+base+token plan",
+        ));
+    }
+    let mut confirmed = sidecar.clone();
+    confirmed.tables[0].confirmed_version = Some(base_confirmation.update.table_version);
+    let protocol = stream_dead_letter_fold_protocol_v21_mut(&mut confirmed);
+    protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+    protocol.object.effect_confirmed = true;
+    protocol.base.confirmed_transaction = Some(base_confirmation.committed_transaction);
+    protocol.base.confirmed_merged_generation = Some(base_confirmation.merged_generation);
+    protocol.base.confirmed_head = Some(base_confirmation.achieved_head.clone());
+    protocol.base.confirmed_update = Some(RecoveryConfirmedTableUpdate {
+        table_version: base_confirmation.update.table_version,
+        table_branch: base_confirmation.update.table_branch,
+        row_count: base_confirmation.update.row_count,
+        version_metadata: base_confirmation.update.version_metadata,
+    });
+    protocol.token.confirmed_transaction = Some(token_committed_transaction);
+    protocol.token.confirmed_head = Some(achieved_token_head);
+    protocol.token.next_authority = Some(next_token_authority);
+    let mut next_lifecycle = protocol.planned_next_lifecycle.clone();
+    next_lifecycle.current_head_witness = base_confirmation.achieved_head.clone();
+    if let Some(drain) = next_lifecycle.drain.as_mut() {
+        drain.expected_current_head_witness = base_confirmation.achieved_head;
+    }
+    protocol.next_lifecycle = Some(next_lifecycle);
+    validate_sidecar_shape(&uri, &confirmed)?;
+    let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize confirmed DeadLetterFold sidecar: {error}"
+        ))
+    })?;
+    storage.write_text(&uri, &json).await?;
+    *sidecar = confirmed;
+    Ok(())
+}
+
+/// Project v21's physical participants onto the already-proven v14 Lance
+/// classifiers. This is an in-memory adapter only: it is never serialized and
+/// never asks a historical decoder to understand DEAD_LETTERED semantics.
+fn dead_letter_fold_v21_physical_projection(sidecar: &RecoverySidecar) -> RecoverySidecar {
+    let protocol = stream_dead_letter_fold_protocol_v21(sidecar);
+    let legacy_attribution = super::stream_token::StreamFoldAttributionSummary {
+        visible_contributor_count: protocol.token.attribution_summary.visible_contributor_count,
+        visible_write_count: protocol.token.attribution_summary.visible_write_count,
+        winning_attribution_digest: protocol
+            .token
+            .attribution_summary
+            .winning_attribution_digest
+            .clone(),
+        dead_letter_object: None,
+    };
+    let projected = RecoveryStreamFoldV14 {
+        authority: protocol.authority.clone(),
+        lineage: protocol.lineage.clone(),
+        admission_scope: protocol.admission_scope.clone(),
+        prior_manifest_version: protocol.prior_manifest_version,
+        profile: protocol.profile.clone(),
+        binding: protocol.binding.clone(),
+        prior_merged_generation: protocol.prior_merged_generation.clone(),
+        generation_cut: protocol.generation_cut.clone(),
+        merged_generation: protocol.merged_generation.clone(),
+        effect_phase: protocol.effect_phase,
+        prior_lifecycle: protocol.prior_lifecycle.clone(),
+        current_claim_receipt: protocol.current_claim_receipt.clone(),
+        drain_authority: protocol.drain_authority.clone(),
+        planned_next_lifecycle: protocol.planned_next_lifecycle.clone(),
+        next_lifecycle: protocol.next_lifecycle.clone(),
+        base: RecoveryStreamFoldBaseEffect {
+            planned_transaction: protocol.base.planned_transaction.clone(),
+            confirmed_transaction: protocol.base.confirmed_transaction.clone(),
+            confirmed_merged_generation: protocol.base.confirmed_merged_generation.clone(),
+            confirmed_head: protocol.base.confirmed_head.clone(),
+            confirmed_update: protocol.base.confirmed_update.clone(),
+        },
+        token: RecoveryStreamFoldTokenEffect {
+            prior_authority: protocol.token.prior_authority.clone(),
+            planned_transaction: protocol.token.planned_transaction.clone(),
+            planned_rows: protocol.token.planned_rows.clone(),
+            attribution_summary: legacy_attribution,
+            confirmed_transaction: protocol.token.confirmed_transaction.clone(),
+            confirmed_head: protocol.token.confirmed_head.clone(),
+            next_authority: protocol.token.next_authority.clone(),
+        },
+    };
+    let mut projection = sidecar.clone();
+    projection.protocol_v21 = None;
+    projection.protocol_v14 = Some(Box::new(if protocol.drain_authority.is_some() {
+        RecoveryProtocolV14::StreamDrainFold(projected)
+    } else {
+        RecoveryProtocolV14::StreamFoldV2(projected)
+    }));
+    projection
+}
+
+fn dead_letter_object_body_v21(protocol: &RecoveryStreamDeadLetterFoldV21) -> Result<String> {
+    let capacity = usize::try_from(protocol.object.descriptor.encoded_length).map_err(|_| {
+        OmniError::manifest_internal("dead-letter object length exceeds process address space")
+    })?;
+    let mut body = String::with_capacity(capacity);
+    for candidate in &protocol.object.candidates {
+        body.push_str(&candidate.canonical_ndjson_line);
+        body.push('\n');
+    }
+    if body.len() != capacity {
+        return Err(OmniError::manifest_internal(
+            "dead-letter recovery body length differs from its descriptor",
+        ));
+    }
+    Ok(body)
+}
+
+async fn ensure_dead_letter_object_v21(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    let protocol = stream_dead_letter_fold_protocol_v21(sidecar);
+    let body = dead_letter_object_body_v21(protocol)?;
+    crate::db::omnigraph::stream_dead_letter::create_or_verify_recovered_stream_dead_letter_object(
+        storage,
+        root_uri,
+        &protocol.object.descriptor,
+        &body,
+    )
+    .await?;
+    Ok(())
+}
+
+fn stream_dead_letter_fold_v21_manifest_is_prior(
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> bool {
+    let protocol = stream_dead_letter_fold_protocol_v21(sidecar);
+    let pin = &sidecar.tables[0];
+    snapshot.version() == protocol.prior_manifest_version
+        && snapshot.stream_profile() == &protocol.profile
+        && snapshot.stream_token_authority() == &protocol.token.prior_authority
+        && snapshot.stream_lifecycle(pin.identity) == Some(&protocol.prior_lifecycle)
+        && snapshot_entry_by_identity(snapshot, pin.identity).is_some_and(|entry| {
+            entry.table_key == pin.table_key
+                && entry.table_path == protocol.binding.table_location
+                && entry.table_version == pin.expected_version
+                && entry.table_branch.is_none()
+        })
+}
+
+async fn stream_dead_letter_fold_v21_original_visible(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let protocol = stream_dead_letter_fold_protocol_v21(sidecar);
+    if protocol.effect_phase != RecoveryEffectPhase::EffectsConfirmed {
+        return Ok(false);
+    }
+    let (commits, _) = ManifestCoordinator::read_graph_lineage_at(root_uri, None).await?;
+    let Some(commit) = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id)
+    else {
+        return Ok(false);
+    };
+    let expected_version = protocol
+        .prior_manifest_version
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("dead-letter manifest version overflow"))?;
+    if commit.manifest_branch.is_some()
+        || commit.manifest_version != expected_version
+        || commit.parent_commit_id.as_ref() != protocol.authority.graph_head.as_ref()
+        || commit.merged_parent_commit_id.is_some()
+        || commit.actor_id != protocol.lineage.actor_id
+        || commit.created_at != protocol.lineage.created_at
+        || commit.stream_fold_attribution.is_some()
+        || commit.stream_fold_attribution_v2.as_ref() != Some(&protocol.token.attribution_summary)
+    {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "DeadLetterFold fixed lineage exists with different parent, actor, timestamp, version, or v2 attribution",
+        ));
+    }
+    let committed =
+        ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version).await?;
+    let pin = &sidecar.tables[0];
+    let update = protocol
+        .base
+        .confirmed_update
+        .as_ref()
+        .expect("validated confirmed dead-letter base update");
+    let next_lifecycle = protocol
+        .next_lifecycle
+        .as_ref()
+        .expect("validated confirmed dead-letter lifecycle");
+    let next_token = protocol
+        .token
+        .next_authority
+        .as_ref()
+        .expect("validated confirmed dead-letter token authority");
+    let exact = snapshot_entry_by_identity(&committed, pin.identity).is_some_and(|entry| {
+        entry.table_key == pin.table_key
+            && entry.table_path == protocol.binding.table_location
+            && entry.table_version == update.table_version
+            && entry.table_branch.is_none()
+            && entry.row_count == update.row_count
+            && entry.version_metadata == update.version_metadata
+    }) && committed.stream_lifecycle(pin.identity) == Some(next_lifecycle)
+        && committed.stream_token_authority() == next_token
+        && committed.stream_profile() == &protocol.profile;
+    if !exact {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "DeadLetterFold fixed lineage is visible with a different table/token/lifecycle/profile outcome",
+        ));
+    }
+    Ok(true)
+}
+
+async fn finalize_visible_stream_dead_letter_fold_v21(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    cleanup_policy: StreamFoldCleanup,
+) -> Result<RecoveryStreamDeadLetterFoldOutcomeV21> {
+    let protocol = stream_dead_letter_fold_protocol_v21(sidecar);
+    let pin = &sidecar.tables[0];
+    let update = protocol
+        .base
+        .confirmed_update
+        .as_ref()
+        .expect("validated confirmed dead-letter base update");
+    let outcomes = vec![TableOutcome {
+        table_key: pin.table_key.clone(),
+        from_version: pin.expected_version,
+        to_version: update.table_version,
+    }];
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    let expected_writer_kind = format!("{:?}", sidecar.writer_kind);
+    let records = audit.list().await?;
+    let operation_records = records
+        .iter()
+        .filter(|record| record.operation_id == sidecar.operation_id)
+        .collect::<Vec<_>>();
+    if operation_records.iter().any(|record| {
+        record.graph_commit_id != protocol.lineage.graph_commit_id
+            || record.recovery_kind != RecoveryKind::RolledForward
+            || record.recovery_for_actor != sidecar.actor_id
+            || record.sidecar_writer_kind != expected_writer_kind
+            || record.per_table_outcomes != outcomes
+    }) {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "DeadLetterFold recovery audit differs from its fixed outcome",
+        ));
+    }
+    if operation_records.is_empty() {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id: protocol.lineage.graph_commit_id.clone(),
+                recovery_kind: RecoveryKind::RolledForward,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: expected_writer_kind,
+                per_table_outcomes: outcomes,
+                created_at: crate::db::now_micros()?,
+            })
+            .await?;
+    }
+    cleanup_visible_stream_fold_sidecar(root_uri, storage, sidecar, cleanup_policy).await?;
+    Ok(RecoveryStreamDeadLetterFoldOutcomeV21 {
+        graph_commit_id: protocol.lineage.graph_commit_id.clone(),
+        manifest_version: protocol.prior_manifest_version + 1,
+        lifecycle_revision: protocol
+            .next_lifecycle
+            .as_ref()
+            .expect("validated confirmed dead-letter lifecycle")
+            .lifecycle_revision,
+        base_head: protocol
+            .base
+            .confirmed_head
+            .as_ref()
+            .expect("validated confirmed dead-letter base head")
+            .clone(),
+        token_head: protocol
+            .token
+            .confirmed_head
+            .as_ref()
+            .expect("validated confirmed dead-letter token head")
+            .clone(),
+        all_diverted: protocol.manifest_outcome
+            == RecoveryStreamDeadLetterManifestOutcomeV21::AllDiverted,
+    })
+}
+
+async fn process_stream_dead_letter_fold_sidecar_v21_typed(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+    cleanup_policy: StreamFoldCleanup,
+) -> Result<Option<RecoveryStreamDeadLetterFoldOutcomeV21>> {
+    validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
+    let projection = dead_letter_fold_v21_physical_projection(sidecar);
+    let mut base = observe_stream_fold_base_v14(root_uri, &projection).await?;
+    let mut token = observe_stream_fold_token_v14(root_uri, &projection).await?;
+
+    if stream_dead_letter_fold_v21_original_visible(root_uri, sidecar).await? {
+        if classify_stream_fold_v14_effect_matrix(base.state, token.state)
+            != StreamFoldV14EffectMatrix::Complete
+        {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                "visible DeadLetterFold lineage lacks both exact Lance effects",
+            ));
+        }
+        ensure_dead_letter_object_v21(root_uri, storage.as_ref(), sidecar).await?;
+        let protocol = stream_dead_letter_fold_protocol_v21(sidecar);
+        let visible = protocol
+            .token
+            .planned_rows
+            .iter()
+            .filter(|row| row.disposition == super::stream_token::StreamTokenDisposition::Present)
+            .cloned()
+            .collect::<Vec<_>>();
+        let terminal = protocol
+            .object
+            .candidates
+            .iter()
+            .map(|candidate| candidate.terminal_authority.clone())
+            .collect::<Vec<_>>();
+        validate_stream_fold_token_rows_against_base(
+            root_uri,
+            sidecar,
+            &protocol.binding,
+            &visible,
+            &terminal,
+        )
+        .await?;
+        return finalize_visible_stream_dead_letter_fold_v21(
+            root_uri,
+            storage.as_ref(),
+            sidecar,
+            cleanup_policy,
+        )
+        .await
+        .map(Some);
+    }
+
+    if !stream_dead_letter_fold_v21_manifest_is_prior(snapshot, sidecar) {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "DeadLetterFold manifest table/token/profile/lifecycle prestate changed after arm",
+        ));
+    }
+    let protocol = stream_dead_letter_fold_protocol_v21(sidecar);
+    let live_authority = read_live_recovery_authority(root_uri, storage, None).await?;
+    if live_authority != protocol.authority {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "DeadLetterFold graph/schema authority changed after arm",
+        ));
+    }
+    validate_stream_fold_current_claim_ledger_v14(root_uri, &projection).await?;
+    match classify_stream_fold_v14_effect_matrix(base.state, token.state) {
+        StreamFoldV14EffectMatrix::EffectFree => {
+            if protocol.effect_phase != RecoveryEffectPhase::Armed {
+                return Err(OmniError::recovery_required(
+                    sidecar.operation_id.clone(),
+                    "confirmed DeadLetterFold has no Lance participant effects",
+                ));
+            }
+            let body = dead_letter_object_body_v21(protocol)?;
+            crate::db::omnigraph::stream_dead_letter::verify_existing_recovered_stream_dead_letter_object(
+                storage.as_ref(),
+                root_uri,
+                &protocol.object.descriptor,
+                &body,
+            )
+            .await?;
+            delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
+                .await?;
+            return Ok(None);
+        }
+        StreamFoldV14EffectMatrix::TokenOnly => {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                "DeadLetterFold token-only outcome is impossible in commit order",
+            ));
+        }
+        StreamFoldV14EffectMatrix::BaseOnly => {
+            ensure_dead_letter_object_v21(root_uri, storage.as_ref(), sidecar).await?;
+            token = finish_missing_stream_fold_token_v14(root_uri, &projection).await?;
+        }
+        StreamFoldV14EffectMatrix::Complete => {
+            ensure_dead_letter_object_v21(root_uri, storage.as_ref(), sidecar).await?;
+        }
+    }
+    if base.state != StreamFoldParticipantState::ExactEffect
+        || token.state != StreamFoldParticipantState::ExactEffect
+    {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "DeadLetterFold did not converge to both exact Lance effects",
+        ));
+    }
+    let visible = protocol
+        .token
+        .planned_rows
+        .iter()
+        .filter(|row| row.disposition == super::stream_token::StreamTokenDisposition::Present)
+        .cloned()
+        .collect::<Vec<_>>();
+    let terminal = protocol
+        .object
+        .candidates
+        .iter()
+        .map(|candidate| candidate.terminal_authority.clone())
+        .collect::<Vec<_>>();
+    validate_stream_fold_token_rows_against_base(
+        root_uri,
+        sidecar,
+        &protocol.binding,
+        &visible,
+        &terminal,
+    )
+    .await?;
+
+    let mut confirmed = sidecar.clone();
+    if protocol.effect_phase == RecoveryEffectPhase::Armed {
+        let exact_update = base
+            .exact_update
+            .clone()
+            .expect("exact DeadLetterFold base has reconstructed update");
+        confirm_stream_dead_letter_fold_sidecar_v21(
+            root_uri,
+            storage.as_ref(),
+            &mut confirmed,
+            protocol.object.descriptor.clone(),
+            RecoveryStreamDeadLetterBaseConfirmationV21 {
+                committed_transaction: base.transaction.clone(),
+                merged_generation: protocol.merged_generation.clone(),
+                achieved_head: base.head.clone(),
+                update: SubTableUpdate {
+                    identity: sidecar.tables[0].identity,
+                    table_key: sidecar.tables[0].table_key.clone(),
+                    table_version: exact_update.table_version,
+                    table_branch: exact_update.table_branch,
+                    row_count: exact_update.row_count,
+                    version_metadata: exact_update.version_metadata,
+                },
+            },
+            token.transaction.clone(),
+            token.head.clone(),
+            token.authority.clone(),
+        )
+        .await?;
+        base = observe_stream_fold_base_v14(
+            root_uri,
+            &dead_letter_fold_v21_physical_projection(&confirmed),
+        )
+        .await?;
+    }
+    let confirmed_protocol = stream_dead_letter_fold_protocol_v21(&confirmed);
+    let update = confirmed_protocol
+        .base
+        .confirmed_update
+        .as_ref()
+        .expect("confirmed DeadLetterFold base update");
+    let changes = vec![
+        ManifestChange::Update(SubTableUpdate {
+            identity: confirmed.tables[0].identity,
+            table_key: confirmed.tables[0].table_key.clone(),
+            table_version: update.table_version,
+            table_branch: update.table_branch.clone(),
+            row_count: update.row_count,
+            version_metadata: update.version_metadata.clone(),
+        }),
+        ManifestChange::SetStreamTokenAuthority {
+            expected: confirmed_protocol.token.prior_authority.clone(),
+            next: confirmed_protocol
+                .token
+                .next_authority
+                .as_ref()
+                .expect("confirmed DeadLetterFold token authority")
+                .clone(),
+        },
+        ManifestChange::SetStreamLifecycle {
+            expected: Some(confirmed_protocol.prior_lifecycle.clone()),
+            next: confirmed_protocol
+                .next_lifecycle
+                .as_ref()
+                .expect("confirmed DeadLetterFold lifecycle")
+                .clone(),
+        },
+        ManifestChange::SetStreamProfile {
+            expected: confirmed_protocol.profile.clone(),
+            next: confirmed_protocol.profile.clone(),
+        },
+    ];
+    let expected = HashMap::from([(
+        confirmed.tables[0].identity,
+        TableVersionExpectation {
+            table_key: confirmed.tables[0].table_key.clone(),
+            table_version: confirmed.tables[0].expected_version,
+        },
+    )]);
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    let (manifest_version, graph_commit_id) = publish_recovery_commit(
+        root_uri,
+        &confirmed,
+        RecoveryKind::RolledForward,
+        &changes,
+        &expected,
+    )
+    .await?;
+    if manifest_version != confirmed_protocol.prior_manifest_version + 1
+        || graph_commit_id != confirmed_protocol.lineage.graph_commit_id
+    {
+        return Err(OmniError::recovery_required(
+            confirmed.operation_id.clone(),
+            "DeadLetterFold publish returned a different manifest version or lineage ID",
+        ));
+    }
+    debug_assert_eq!(base.state, StreamFoldParticipantState::ExactEffect);
+    finalize_visible_stream_dead_letter_fold_v21(
+        root_uri,
+        storage.as_ref(),
+        &confirmed,
+        cleanup_policy,
+    )
+    .await
+    .map(Some)
+}
+
+async fn process_stream_dead_letter_fold_sidecar_v21(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    process_stream_dead_letter_fold_sidecar_v21_typed(
+        root_uri,
+        storage,
+        snapshot,
+        sidecar,
+        StreamFoldCleanup::Required,
+    )
+    .await
+    .map(|_| true)
+}
+
+pub(crate) async fn complete_stream_dead_letter_fold_sidecar_v21(
+    root_uri: &str,
+    storage: std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<RecoveryStreamDeadLetterFoldOutcomeV21> {
+    process_stream_dead_letter_fold_sidecar_v21_typed(
+        root_uri,
+        &storage,
+        snapshot,
+        sidecar,
+        StreamFoldCleanup::BestEffortAfterVisible,
+    )
+    .await?
+    .ok_or_else(|| {
+        OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "DeadLetterFold completion found no Lance effects; retry the logical fold",
+        )
+    })
 }
 
 /// Arm one exact roll-forward-only RFC-026 one-generation fold.
@@ -20613,6 +21965,7 @@ pub(crate) fn new_ensure_indices_sidecar_v9(
         protocol_v18: None,
         protocol_v19: None,
         protocol_v20: None,
+        protocol_v21: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-ensure-indices-v9-sidecar>", &sidecar)?;
@@ -20975,6 +22328,7 @@ pub(crate) fn new_occ_sidecar_v9(
         protocol_v18: None,
         protocol_v19: None,
         protocol_v20: None,
+        protocol_v21: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-occ-sidecar>", &sidecar)?;
@@ -21171,6 +22525,7 @@ pub(crate) fn new_schema_apply_sidecar_v9(
         protocol_v18: None,
         protocol_v19: None,
         protocol_v20: None,
+        protocol_v21: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-schema-apply-v9-sidecar>", &sidecar)?;
@@ -21348,6 +22703,7 @@ pub(crate) fn new_branch_merge_sidecar_v9(
         protocol_v18: None,
         protocol_v19: None,
         protocol_v20: None,
+        protocol_v21: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-branch-merge-sidecar>", &sidecar)?;
@@ -23462,6 +24818,7 @@ mod tests {
             actor_id: Some(STREAM_FOLD_ACTOR.to_string()),
             merged_parent_commit_id: None,
             created_at: 20,
+            stream_fold_attribution_v2: None,
         };
         let generation_cut = RecoveryStreamFoldCut {
             shard_id: ShardId::parse_str(shard_id).unwrap(),
@@ -23592,6 +24949,186 @@ mod tests {
             )
             .unwrap()
         }
+    }
+
+    fn all_diverted_stream_dead_letter_sidecar_v21() -> RecoverySidecar {
+        use crate::db::manifest::stream_token::{
+            AdmissionRequest, PayloadDigest, PayloadDigestInput, StreamDeadLetterReasonCode,
+            StreamTokenAuthorityRow, StreamWriteEnvelope, TrustedContributorId,
+            TrustedStreamRowMetadata, stream_fold_attribution_commitment_v2,
+        };
+        use crate::db::omnigraph::stream_dead_letter::{
+            StreamDeadLetterObjectCandidate, prepare_stream_dead_letter_object,
+        };
+
+        let prior = stream_fold_sidecar_v14(false);
+        let v14 = stream_fold_protocol_v14(&prior).clone();
+        let identity = prior.tables[0].identity;
+        let operation_id = "01K3EJ5J5Y7YWCM2DHRZ2Q5WEQ".to_string();
+        let mut authority = v14.authority.clone();
+        authority.schema_ir_hash = format!("sha256:{}", "a".repeat(64));
+        let payload = br#"{"id":"person-1"}"#;
+        let payload_digest = PayloadDigest::derive(&PayloadDigestInput {
+            identity,
+            accepted_schema_hash: &authority.schema_ir_hash,
+            canonical_payload: payload,
+        })
+        .unwrap();
+        let request = AdmissionRequest {
+            identity,
+            logical_id: "person-1".to_string(),
+            envelope: StreamWriteEnvelope {
+                stream_incarnation_id: v14
+                    .prior_lifecycle
+                    .enrollment_receipt
+                    .stream_incarnation_id
+                    .clone(),
+                write_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+                predecessor_token: None,
+            },
+            contributor_id: TrustedContributorId::new("actor:test").unwrap(),
+            payload_digest,
+        };
+        let metadata = TrustedStreamRowMetadata::new_admission(
+            &request,
+            request.candidate_token().unwrap(),
+            None,
+            1,
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_string(),
+            0,
+        )
+        .unwrap();
+        let present = StreamTokenAuthorityRow::from_present_metadata(
+            identity,
+            request.logical_id.clone(),
+            v14.binding.enrollment_id.clone(),
+            &metadata,
+        )
+        .unwrap();
+        let object_candidate = StreamDeadLetterObjectCandidate::from_present_winner(
+            &present,
+            StreamDeadLetterReasonCode::UniqueViolation,
+            payload,
+        )
+        .unwrap();
+        let object = prepare_stream_dead_letter_object(
+            &operation_id,
+            std::slice::from_ref(&object_candidate),
+        )
+        .unwrap();
+        let terminal = StreamTokenAuthorityRow::dead_letter_present_winner(
+            &present,
+            operation_id.clone(),
+            StreamDeadLetterReasonCode::UniqueViolation,
+            object.descriptor().clone(),
+            0,
+        )
+        .unwrap();
+        let candidate = RecoveryStreamDeadLetterCandidateV21 {
+            terminal_authority: terminal.clone(),
+            canonical_ndjson_line: object
+                .ordered_candidates()
+                .next()
+                .unwrap()
+                .canonical_ndjson_line
+                .to_string(),
+        };
+        let attribution =
+            stream_fold_attribution_commitment_v2(&[], object.descriptor().clone()).unwrap();
+        let mut next_lifecycle = v14.planned_next_lifecycle.clone();
+        let summary = next_lifecycle.last_fold_summary.as_mut().unwrap();
+        summary.operation_id = operation_id.clone();
+        summary.visible_rows = 0;
+        summary.visible_bytes = 0;
+
+        new_stream_dead_letter_fold_sidecar_v21(
+            operation_id,
+            prior.tables[0].clone(),
+            authority,
+            v14.lineage,
+            v14.prior_manifest_version,
+            v14.profile,
+            v14.prior_lifecycle,
+            v14.current_claim_receipt,
+            None,
+            next_lifecycle,
+            v14.prior_merged_generation,
+            v14.generation_cut,
+            v14.base.planned_transaction,
+            v14.token.prior_authority,
+            v14.token.planned_transaction,
+            vec![terminal],
+            vec![candidate],
+            attribution,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn recovery_v21_all_diverted_requires_and_classifies_marker_base_effect() {
+        let sidecar = all_diverted_stream_dead_letter_sidecar_v21();
+        validate_sidecar_shape("<all-diverted-v21>", &sidecar).unwrap();
+        let protocol = stream_dead_letter_fold_protocol_v21(&sidecar);
+        assert_eq!(
+            protocol.manifest_outcome,
+            RecoveryStreamDeadLetterManifestOutcomeV21::AllDiverted
+        );
+        assert_eq!(protocol.token.attribution_summary.visible_write_count, 0);
+        assert_eq!(
+            sidecar.tables[0].post_commit_pin,
+            sidecar.tables[0].expected_version + 1
+        );
+        assert_eq!(
+            protocol.base.planned_transaction.read_version,
+            sidecar.tables[0].expected_version
+        );
+
+        let projection = dead_letter_fold_v21_physical_projection(&sidecar);
+        let projected = stream_fold_protocol_v14(&projection);
+        let achieved_head = crate::db::manifest::CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: sidecar.tables[0].post_commit_pin,
+            transaction_uuid: projected.base.planned_transaction.uuid.clone(),
+            manifest_e_tag: Some("marker-effect".to_string()),
+        };
+        assert_eq!(
+            classify_stream_fold_base_v14_observation(
+                &sidecar.tables[0],
+                projected,
+                &achieved_head,
+                &projected.base.planned_transaction,
+                Some(std::slice::from_ref(&projected.merged_generation)),
+                Some(&projected.merged_generation),
+            )
+            .unwrap(),
+            StreamFoldParticipantState::ExactEffect
+        );
+
+        let mut json = serde_json::to_value(&sidecar).unwrap();
+        json.get_mut("protocol_v21")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|protocol| protocol.get_mut("payload"))
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("base");
+        assert!(
+            serde_json::from_value::<RecoverySidecar>(json).is_err(),
+            "v21 must never decode an all-diverted fold without its required marker participant"
+        );
+    }
+
+    #[test]
+    fn recovery_v21_rejects_noncanonical_dead_letter_line_bytes() {
+        let mut sidecar = all_diverted_stream_dead_letter_sidecar_v21();
+        let protocol = stream_dead_letter_fold_protocol_v21_mut(&mut sidecar);
+        protocol.object.candidates[0]
+            .canonical_ndjson_line
+            .insert_str(1, "\"extra\":null,");
+        let error = validate_sidecar_shape("<tampered-v21>", &sidecar).unwrap_err();
+        assert!(
+            error.to_string().contains("canonical dead-letter line"),
+            "got: {error}"
+        );
     }
 
     #[test]
@@ -23875,6 +25412,7 @@ mod tests {
                 actor_id: Some("act-alice".to_string()),
                 merged_parent_commit_id: None,
                 created_at: 123,
+                stream_fold_attribution_v2: None,
             },
             HashMap::from([(identity, planned)]),
         )
@@ -23947,6 +25485,7 @@ mod tests {
                 actor_id,
                 merged_parent_commit_id: None,
                 created_at: 456,
+                stream_fold_attribution_v2: None,
             },
             baseline_head,
             enrollment_plan,
@@ -23978,6 +25517,7 @@ mod tests {
                 actor_id: Some(STREAM_FOLD_ACTOR.to_string()),
                 merged_parent_commit_id: None,
                 created_at: 456,
+                stream_fold_attribution_v2: None,
             },
             crate::db::manifest::StreamPhysicalBinding {
                 stable_table_id: identity.stable_table_id,
@@ -24080,6 +25620,7 @@ mod tests {
             actor_id: Some(STREAM_FOLD_ACTOR.to_string()),
             merged_parent_commit_id: None,
             created_at: 456,
+            stream_fold_attribution_v2: None,
         };
         let mut planned_next_lifecycle = prior_lifecycle.clone();
         planned_next_lifecycle.current_head_witness = CurrentHeadWitness {
@@ -25862,6 +27403,7 @@ mod tests {
             actor_id: protocol.lineage.actor_id.clone(),
             created_at: protocol.lineage.created_at,
             stream_fold_attribution: Some(protocol.token.attribution_summary.clone()),
+            stream_fold_attribution_v2: None,
         };
         assert!(stream_fold_v12_lineage_matches(&commit, protocol));
         commit.stream_fold_attribution = None;
@@ -26456,6 +27998,7 @@ mod tests {
                 actor_id: Some("act-schema".to_string()),
                 merged_parent_commit_id: None,
                 created_at: 790,
+                stream_fold_attribution_v2: None,
             },
             Vec::new(),
             RecoveryManifestDelta {
@@ -26549,6 +28092,7 @@ mod tests {
                 actor_id: Some("act-schema".to_string()),
                 merged_parent_commit_id: None,
                 created_at: 789,
+                stream_fold_attribution_v2: None,
             },
             vec![RecoverySchemaApplyEffect {
                 identity,
@@ -26677,6 +28221,7 @@ mod tests {
                 actor_id: Some("act-maintenance".to_string()),
                 merged_parent_commit_id: None,
                 created_at: 812,
+                stream_fold_attribution_v2: None,
             },
             HashMap::from([(
                 identity,
@@ -26922,6 +28467,7 @@ mod tests {
                 actor_id: None,
                 merged_parent_commit_id: None,
                 created_at: 456,
+                stream_fold_attribution_v2: None,
             },
             HashMap::from([
                 (person_identity, transaction(5, "index-person")),
@@ -27030,6 +28576,7 @@ mod tests {
             actor_id: Some("act-merge".to_string()),
             merged_parent_commit_id: Some("01H000000000000000000000S1".to_string()),
             created_at: 456,
+            stream_fold_attribution_v2: None,
         };
         let mut multi_pin = make_pin("node:Person", "memory://person", 5, 6);
         multi_pin.table_branch = Some("target".to_string());
@@ -28096,6 +29643,7 @@ node Person {
             actor_id: lineage.actor_id,
             merged_parent_commit_id: lineage.merged_parent_commit_id,
             created_at: lineage.created_at,
+            stream_fold_attribution_v2: None,
         };
         let sidecar = new_occ_sidecar_v9(
             SidecarKind::Mutation,
@@ -28248,6 +29796,7 @@ node Company { age: I32? }
             actor_id: lineage.actor_id,
             merged_parent_commit_id: lineage.merged_parent_commit_id,
             created_at: lineage.created_at,
+            stream_fold_attribution_v2: None,
         };
         let sidecar = new_occ_sidecar_v9(
             SidecarKind::Mutation,
@@ -28434,6 +29983,7 @@ node Person { age: I32? }
                 actor_id: lineage.actor_id,
                 merged_parent_commit_id: lineage.merged_parent_commit_id,
                 created_at: lineage.created_at,
+                stream_fold_attribution_v2: None,
             },
             HashMap::from([(entry.identity, planned.clone())]),
         )
@@ -28763,6 +30313,7 @@ node Person {
                 actor_id: Some("operator:alice".to_string()),
                 merged_parent_commit_id: None,
                 created_at: 1_700_000_000_000_002,
+                stream_fold_attribution_v2: None,
             },
             snapshot.version(),
             RecoveryStreamProfileChangeKind::EnableReceipt,
@@ -29405,6 +30956,7 @@ query delete_person($name: String) {
                 actor_id: ensure_indices.actor_id.clone(),
                 merged_parent_commit_id: None,
                 created_at: 813,
+                stream_fold_attribution_v2: None,
             },
             overlay.profile.clone(),
             overlay.token_authority.clone(),
@@ -29821,6 +31373,7 @@ query delete_person($name: String) {
                 actor_id: Some("act-operator".to_string()),
                 merged_parent_commit_id: None,
                 created_at: 51,
+                stream_fold_attribution_v2: None,
             },
             terminal.prior_manifest_version,
             profile,
@@ -29856,6 +31409,27 @@ query delete_person($name: String) {
         let encoded = serde_json::to_string(&armed).unwrap();
         let parsed = parse_sidecar("<stream-rebind-v18-physical-armed>", &encoded).unwrap();
         assert_eq!(serde_json::to_string(&parsed).unwrap(), encoded);
+
+        let v21 = all_diverted_stream_dead_letter_sidecar_v21();
+        let forged_attribution = stream_dead_letter_fold_protocol_v21(&v21)
+            .lineage
+            .stream_fold_attribution_v2
+            .clone()
+            .unwrap();
+        let mut historical_with_v2 = armed.clone();
+        let Some(RecoveryProtocolV18::StreamRebind(protocol)) =
+            historical_with_v2.protocol_v18.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.lineage.stream_fold_attribution_v2 = Some(forged_attribution);
+        assert!(
+            validate_sidecar_shape("<v18-with-v21-lineage>", &historical_with_v2)
+                .unwrap_err()
+                .to_string()
+                .contains("stream_fold_attribution_v2 is reserved for recovery-v21 DeadLetterFold"),
+            "historical recovery must not reinterpret v21 lineage vocabulary"
+        );
 
         let mut wrong_schema = armed.clone();
         wrong_schema.schema_version = STREAM_SEALED_OPTIMIZE_SIDECAR_SCHEMA_VERSION;

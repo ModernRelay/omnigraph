@@ -21,7 +21,10 @@ use super::publisher::{
     PublishPrecondition,
 };
 use super::state::read_publish_scan;
-use super::stream_token::{STREAM_FOLD_ACTOR, StreamFoldAttributionSummary};
+use super::stream_token::{
+    STREAM_FOLD_ACTOR, StreamDeadLetterObjectDescriptor, StreamFoldAttributionSummary,
+    stream_fold_attribution_commitment_v2,
+};
 use super::*;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
@@ -2752,6 +2755,7 @@ async fn graph_commit_metadata_round_trips_optional_stream_fold_attribution() {
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
         stream_fold_attribution: None,
+        stream_fold_attribution_v2: None,
     };
     publisher
         .publish(&[], &empty, Some(&ordinary))
@@ -2771,6 +2775,7 @@ async fn graph_commit_metadata_round_trips_optional_stream_fold_attribution() {
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
         stream_fold_attribution: None,
+        stream_fold_attribution_v2: None,
     };
     publisher
         .publish(&[], &empty, Some(&historical_fold))
@@ -2784,6 +2789,7 @@ async fn graph_commit_metadata_round_trips_optional_stream_fold_attribution() {
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
         stream_fold_attribution: Some(summary.clone()),
+        stream_fold_attribution_v2: None,
     };
     let error = publisher
         .publish(&[], &empty, Some(&wrong_actor))
@@ -2798,8 +2804,34 @@ async fn graph_commit_metadata_round_trips_optional_stream_fold_attribution() {
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
         stream_fold_attribution: Some(summary.clone()),
+        stream_fold_attribution_v2: None,
     };
     publisher.publish(&[], &empty, Some(&fold)).await.unwrap();
+
+    let summary_v2 = stream_fold_attribution_commitment_v2(
+        &[],
+        StreamDeadLetterObjectDescriptor::new(
+            "01K3EJ5J5Y7YWCM2DHRZ2Q5WEQ",
+            format!("sha256:{}", "cd".repeat(32)),
+            128,
+            1,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let fold_v2 = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: None,
+        actor_id: Some(STREAM_FOLD_ACTOR.to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+        stream_fold_attribution: None,
+        stream_fold_attribution_v2: Some(summary_v2.clone()),
+    };
+    publisher
+        .publish(&[], &empty, Some(&fold_v2))
+        .await
+        .unwrap();
 
     let dataset = open_manifest_dataset(uri, None).await.unwrap();
     let (rows, _) = read_graph_lineage(&dataset).await.unwrap();
@@ -2826,6 +2858,15 @@ async fn graph_commit_metadata_round_trips_optional_stream_fold_attribution() {
             .stream_fold_attribution
             .as_ref(),
         Some(&summary)
+    );
+    let decoded_v2 = rows
+        .iter()
+        .find(|row| row.graph_commit_id == fold_v2.graph_commit_id)
+        .unwrap();
+    assert!(decoded_v2.stream_fold_attribution.is_none());
+    assert_eq!(
+        decoded_v2.stream_fold_attribution_v2.as_ref(),
+        Some(&summary_v2)
     );
     assert!(
         rows.iter()
@@ -2863,6 +2904,7 @@ async fn assert_exact_named_head_race(establish_head: bool) {
             merged_parent_commit_id: None,
             created_at: lineage_now_micros(),
             stream_fold_attribution: None,
+            stream_fold_attribution_v2: None,
         };
         publisher
             .publish(&[], &empty, Some(&intent))
@@ -2893,6 +2935,7 @@ async fn assert_exact_named_head_race(establish_head: bool) {
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
         stream_fold_attribution: None,
+        stream_fold_attribution_v2: None,
     };
     let intent_b = LineageIntent {
         graph_commit_id: ulid::Ulid::new().to_string(),
@@ -2901,6 +2944,7 @@ async fn assert_exact_named_head_race(establish_head: bool) {
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
         stream_fold_attribution: None,
+        stream_fold_attribution_v2: None,
     };
     let publisher_a = GraphNamespacePublisher::new(uri, Some("feature"));
     let publisher_b = GraphNamespacePublisher::new(uri, Some("feature"));
@@ -3168,6 +3212,7 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
         stream_fold_attribution: None,
+        stream_fold_attribution_v2: None,
     };
     let intent_b = LineageIntent {
         graph_commit_id: ulid::Ulid::new().to_string(),
@@ -3176,6 +3221,7 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
         stream_fold_attribution: None,
+        stream_fold_attribution_v2: None,
     };
     // Empty expected-versions: the two writers are disjoint, so neither asserts a
     // version on the other's table; contention is purely the shared head row.
@@ -3256,6 +3302,7 @@ async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
         stream_fold_attribution: None,
+        stream_fold_attribution_v2: None,
     };
     let intent_b = LineageIntent {
         graph_commit_id: ulid::Ulid::new().to_string(),
@@ -3264,6 +3311,7 @@ async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
         stream_fold_attribution: None,
+        stream_fold_attribution_v2: None,
     };
     let empty = HashMap::new();
     let (res_a, res_b) = tokio::join!(
@@ -3354,6 +3402,7 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
                     merged_parent_commit_id: None,
                     created_at: lineage_now_micros(),
                     stream_fold_attribution: None,
+                    stream_fold_attribution_v2: None,
                 };
                 let publisher = GraphNamespacePublisher::new(&uri, None);
                 match publisher.publish(&changes, &empty, Some(&intent)).await {

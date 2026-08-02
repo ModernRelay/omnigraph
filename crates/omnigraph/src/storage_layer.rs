@@ -629,6 +629,19 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         generation: u64,
     ) -> Result<StagedHandle>;
 
+    /// Stage an F5 terminal-conflict fold. Mixed folds upsert only independent
+    /// winners; all-diverted folds carry an empty row projection. Both forms
+    /// durably advance Lance's `MergedGeneration` in the exact base-table
+    /// transaction, so lifecycle metadata never shadows substrate progress.
+    async fn stage_stream_dead_letter_fold(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        batches: Vec<RecordBatch>,
+        shard_id: ShardId,
+        generation: u64,
+    ) -> Result<StagedHandle>;
+
     /// Stage a provenance-proven strict insert without re-running Lance's
     /// target merge join or exact target-membership preflight. The caller's
     /// complete durable absence proof and final target-incarnation/baseline
@@ -1102,6 +1115,22 @@ impl TableStorage for TableStore {
         TableStore::stage_stream_correction(self, ds, table_key, batches, shard_id, generation)
             .await
             .map(StagedHandle::new)
+    }
+
+    async fn stage_stream_dead_letter_fold(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        batches: Vec<RecordBatch>,
+        shard_id: ShardId,
+        generation: u64,
+    ) -> Result<StagedHandle> {
+        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
+        TableStore::stage_stream_dead_letter_fold(
+            self, ds, table_key, batches, shard_id, generation,
+        )
+        .await
+        .map(StagedHandle::new)
     }
 
     async fn stage_proven_strict_insert(

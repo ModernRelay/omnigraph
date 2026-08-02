@@ -188,14 +188,33 @@ retired source cut; it need not equal the fresh target graph identity, whose
 schema compatibility remains ordinary loader validation. This slice added no
 production path that creates `WITHDRAWN`.
 
-Internal schema **v18 is the currently served format** (unreleased, current
-0.10.0-dev source builds). It raises the sidecar ceiling to recovery-v20 for
-exact `DataBlock` correction while leaving the frozen recovery-v14 correction
+Internal schema v18 was an unreleased 0.10.0-dev format. It raised the sidecar
+ceiling to recovery-v20 for exact `DataBlock` correction while leaving the
+frozen recovery-v14 correction
 scaffold unchanged. Recovery-v20 binds the exact blocked generation cut, one
 base-table effect, one combined current-token plus immutable correction and
 management-receipt effect, fixed graph lineage, and the complete next
 `DRAINING` lifecycle. Only the exact joint outcome may clear the matching
 block; receipt lookup precedes stale block/revision refusal on exact retries.
+
+Internal schema **v19 is the currently served format** (unreleased, current
+0.10.0-dev source builds). It upgrades `_stream_tokens.lance` to schema v3,
+adds terminal `DEAD_LETTERED` evidence and versioned fold attribution, and
+raises the sidecar ceiling to recovery-v21. `DeadLetterFold` deterministically
+partitions one bounded generation, preserves valid winners, and writes all
+diverted terminal candidates to one canonical bounded NDJSON object. The
+sidecar owns conditional object creation before either Lance effect; exact
+base plus token effects and the lifecycle/lineage outcome still become visible
+only at the manifest CAS. An all-diverted fold uses a marker-only base
+transaction so Lance's merged-generation authority advances. Exact retry
+returns the terminal result only while that token remains current; a fresh
+ordinary successor naming it as predecessor can restore `PRESENT`.
+
+Recovery-v21 also owns `StreamAuthorityRetirementV2`, which preserves
+recovery-v19's lineage-neutral retirement contract while binding exact
+`PRESENT | WITHDRAWN | DEAD_LETTERED` counts and the selected token cut.
+Recovery-v19 and recovery-v20 keep their historical meanings and are never
+reinterpreted.
 
 Recovery-v13 remains exactly the v11 profile-change protocol. Historical
 recovery-v10 enrollment and recovery-v12 lifecycle-v2 folds retain their old
@@ -204,13 +223,19 @@ There is still no public firehose ingress, public production enrollment,
 quiesce, resume/abort, physical rebind, or streaming or maintenance
 transport surface. The narrow offline operator surfaces are
 `cluster stream retire-for-rebuild plan|confirm` and exact `DataBlock`
-inspection/correction through `cluster stream block show|correct`. Their
-recovery owners remain crate-private; neither activates public row ingress or
-ordinary lifecycle control.
+inspection/correction through `cluster stream block show|correct`, plus
+manifest-selected current dead-letter inspection through
+`cluster stream dead-letter list|export`. Their recovery owners remain
+crate-private; none activates public row ingress or ordinary lifecycle control.
+F6 still owns the object/RSS and authority-lookup measurements and the broader
+guardrail acceptance matrix.
 
-A v17 graph crosses by export/init/load rebuild into a different root. Because
-`MIN_SUPPORTED == CURRENT == 18`, v18 refuses v17 and a v17 binary refuses
-v18. The genuine v16↔v17 fence remains historical evidence.
+A v18 graph crosses by export/init/load rebuild into a different root. Because
+`MIN_SUPPORTED == CURRENT == 19`, v19 refuses v18 and a v18 binary refuses
+v19. The genuine v17↔v18 fence remains historical evidence. The adjacent
+v18↔v19 genuine-binary refusal/rebuild cell has not landed yet and is an
+explicit release-evidence gap; local stamp/refusal grammar guards do not
+replace it.
 
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,

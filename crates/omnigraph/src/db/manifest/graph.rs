@@ -50,6 +50,7 @@ pub(super) async fn init_manifest_graph(
         actor_id: None,
         created_at: crate::db::now_micros()?,
         stream_fold_attribution: None,
+        stream_fold_attribution_v2: None,
     };
     let genesis_lineage = graph_lineage_row_parts(&genesis, None)?;
 

@@ -345,6 +345,43 @@ pub struct StreamBlockCorrectOutput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Stopped-writer inputs for read-only current dead-letter inspection.
+#[derive(Debug, Clone, Default)]
+pub struct StreamDeadLetterControlOptions {
+    pub actor: Option<String>,
+    pub confirm_stream_offline: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamDeadLetterListOutput {
+    pub ok: bool,
+    pub config_dir: String,
+    pub graph_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    pub state_observations: StateObservations,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<omnigraph::db::StreamDeadLetterPage>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamDeadLetterExportOutput {
+    pub ok: bool,
+    pub config_dir: String,
+    pub graph_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    pub state_observations: StateObservations,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<omnigraph::db::StreamDeadLetterPayloadPage>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 /// Output of config-only `cluster apply`. "Applied" means recorded in the
 /// local cluster catalog (`__cluster/`); nothing applied here serves traffic —
 /// the server still boots from `omnigraph.yaml` until the server-boot stage.

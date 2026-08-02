@@ -5022,7 +5022,9 @@ policies: {}
         assert!(!engine_refusal.ok);
         assert!(engine_refusal.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "stream_authority_retirement_plan_failed"
-                && diagnostic.message.contains("at least one current WITHDRAWN token")
+                && diagnostic
+                    .message
+                    .contains("at least one current WITHDRAWN or DEAD_LETTERED token")
         }));
         assert!(
             !dir.path().join(CLUSTER_LOCK_FILE).exists(),
@@ -5101,6 +5103,101 @@ policies: {}
             !dir.path().join(CLUSTER_LOCK_FILE).exists(),
             "applied-profile refusal must release the state lock"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_dead_letter_preflight_requires_actor_confirmation_and_declared_graph() {
+        let dir = fixture();
+        let missing_authority = list_stream_dead_letters_config_dir(
+            dir.path(),
+            "knowledge",
+            None,
+            StreamDeadLetterControlOptions::default(),
+        )
+        .await;
+        assert!(!missing_authority.ok);
+        assert!(
+            missing_authority
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "stream_dead_letter_actor_required")
+        );
+        assert!(missing_authority.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "streaming_offline_confirmation_required"
+        }));
+        assert!(
+            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
+            "dead-letter preflight refusal must happen before lock acquisition"
+        );
+
+        let unknown_graph = list_stream_dead_letters_config_dir(
+            dir.path(),
+            "other",
+            None,
+            StreamDeadLetterControlOptions {
+                actor: Some("stream-operator".to_string()),
+                confirm_stream_offline: true,
+            },
+        )
+        .await;
+        assert!(!unknown_graph.ok);
+        assert!(unknown_graph.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "stream_dead_letter_graph_not_declared"
+                && diagnostic.path == "graphs.other"
+        }));
+        assert!(
+            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
+            "unknown dead-letter graph refusal must happen before lock acquisition"
+        );
+
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+        let applied = confirmed_streaming_apply(dir.path()).await;
+        assert!(applied.ok && applied.converged, "{applied:?}");
+        let mut stale_state = read_state_json(dir.path());
+        let recorded_revision = stale_state["applied_revision"]["resources"]
+            ["streaming.knowledge"]["profile_revision"]
+            .as_u64()
+            .unwrap();
+        stale_state["applied_revision"]["resources"]["streaming.knowledge"]
+            ["profile_revision"] = json!(recorded_revision + 1);
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&stale_state).unwrap(),
+        )
+        .unwrap();
+        let stale_options = StreamDeadLetterControlOptions {
+            actor: Some("stream-operator".to_string()),
+            confirm_stream_offline: true,
+        };
+        let stale_list = list_stream_dead_letters_config_dir(
+            dir.path(),
+            "knowledge",
+            None,
+            stale_options.clone(),
+        )
+        .await;
+        assert!(!stale_list.ok);
+        assert!(stale_list.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "stream_dead_letter_list_failed"
+                && diagnostic
+                    .message
+                    .contains("offline stream dead-letter control expected profile revision")
+        }));
+        let stale_export = export_stream_dead_letters_config_dir(
+            dir.path(),
+            "knowledge",
+            None,
+            stale_options,
+        )
+        .await;
+        assert!(!stale_export.ok);
+        assert!(stale_export.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "stream_dead_letter_export_failed"
+                && diagnostic
+                    .message
+                    .contains("offline stream dead-letter control expected profile revision")
+        }));
     }
 
     #[cfg(feature = "failpoints")]

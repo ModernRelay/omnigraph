@@ -15,10 +15,12 @@ use omnigraph_cluster::{
     ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput,
     StateSyncOutput, StatusOutput, StreamAuthorityRetirementConfirmOutput,
     StreamAuthorityRetirementOptions, StreamAuthorityRetirementPlanOutput,
-    StreamBlockControlOptions, StreamBlockCorrectOutput, StreamBlockShowOutput, ValidateOutput,
-    apply_config_dir_with_options, approve_config_dir,
+    StreamBlockControlOptions, StreamBlockCorrectOutput, StreamBlockShowOutput,
+    StreamDeadLetterControlOptions, StreamDeadLetterExportOutput, StreamDeadLetterListOutput,
+    ValidateOutput, apply_config_dir_with_options, approve_config_dir,
     confirm_stream_authority_retirement_config_dir, correct_stream_data_block_config_dir,
-    force_unlock_config_dir, import_config_dir, plan_config_dir,
+    export_stream_dead_letters_config_dir, force_unlock_config_dir, import_config_dir,
+    list_stream_dead_letters_config_dir, plan_config_dir,
     plan_stream_authority_retirement_config_dir, refresh_config_dir,
     show_stream_data_block_config_dir, status_config_dir, validate_config_dir,
 };
@@ -1267,6 +1269,50 @@ async fn main() -> Result<()> {
                             )
                             .await;
                             finish_stream_block_correct(&output, json)?;
+                        }
+                    }
+                }
+                ClusterStreamCommand::DeadLetter { command } => {
+                    let Some(graph_id) = cli.graph.as_deref() else {
+                        bail!("`cluster stream dead-letter` requires --graph <GRAPH_ID>");
+                    };
+                    let actor = resolve_cluster_actor(cli.as_actor.as_deref())?;
+                    match command {
+                        StreamDeadLetterCommand::List {
+                            config,
+                            cursor,
+                            confirm_stream_offline,
+                            json,
+                        } => {
+                            let output = list_stream_dead_letters_config_dir(
+                                config,
+                                graph_id,
+                                cursor.as_deref(),
+                                StreamDeadLetterControlOptions {
+                                    actor,
+                                    confirm_stream_offline,
+                                },
+                            )
+                            .await;
+                            finish_stream_dead_letter_list(&output, json)?;
+                        }
+                        StreamDeadLetterCommand::Export {
+                            config,
+                            cursor,
+                            confirm_stream_offline,
+                            json,
+                        } => {
+                            let output = export_stream_dead_letters_config_dir(
+                                config,
+                                graph_id,
+                                cursor.as_deref(),
+                                StreamDeadLetterControlOptions {
+                                    actor,
+                                    confirm_stream_offline,
+                                },
+                            )
+                            .await;
+                            finish_stream_dead_letter_export(&output, json)?;
                         }
                     }
                 }
