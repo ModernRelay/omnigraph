@@ -253,6 +253,16 @@ pub mod names {
     /// publishing.
     pub const STREAM_FOLD_POST_SIDECAR_PRE_BASE_COMMIT: &str =
         "stream_fold.post_sidecar_pre_base_commit";
+    /// A v21 dead-letter fold is durably armed, while its immutable object and
+    /// both Lance participants remain untouched. Recovery may retire this
+    /// occurrence effect-free or reconstruct the exact object on retry.
+    pub const STREAM_DEAD_LETTER_POST_SIDECAR_PRE_OBJECT: &str =
+        "stream_dead_letter.post_sidecar_pre_object";
+    /// The descriptor-selected immutable object is exact and durable, while
+    /// neither Lance participant has been invoked. The object is inert until
+    /// the sole manifest publication selects its terminal token rows.
+    pub const STREAM_DEAD_LETTER_POST_OBJECT_PRE_BASE_COMMIT: &str =
+        "stream_dead_letter.post_object_pre_base_commit";
     /// The exact base-table fold/correction committed, while the separate
     /// `_stream_tokens.lance` participant is still at its manifest-selected
     /// prior witness. Recovery must classify this partial cell under the

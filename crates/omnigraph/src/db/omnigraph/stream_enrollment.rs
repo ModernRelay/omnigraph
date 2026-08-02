@@ -13,9 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::manifest::stream::{
     BINDING_RECEIPT_TAG, BindingReceipt, CLAIM_RECEIPT_TAG, CurrentHeadWitness,
-    EnrollmentReceiptV2, MAX_SELECTED_BINDING_CHAIN_RECORDS,
-    RetainedShardInventoryCommitment, binding_receipt_chain_genesis, stream_graph_identity_digest,
-    stream_physical_binding_digest,
+    EnrollmentReceiptV2, MAX_SELECTED_BINDING_CHAIN_RECORDS, RetainedShardInventoryCommitment,
+    binding_receipt_chain_genesis, stream_graph_identity_digest, stream_physical_binding_digest,
 };
 use crate::db::manifest::stream_profile::ReceiptChainRef;
 use crate::db::manifest::token_store::{
@@ -684,6 +683,7 @@ impl Omnigraph {
             actor_id: lineage.actor_id.clone(),
             merged_parent_commit_id: lineage.merged_parent_commit_id.clone(),
             created_at: lineage.created_at,
+            stream_fold_attribution_v2: None,
         };
         let pin = SidecarTablePin {
             identity: live_entry.identity,
@@ -1053,11 +1053,8 @@ pub(super) async fn validate_selected_lifecycle_ledger_authority(
             "stream lifecycle binding head decoded as another ledger family",
         ));
     };
-    let retained_inventory = validate_selected_binding_receipt(
-        &binding,
-        graph_identity_digest,
-        lifecycle,
-    )?;
+    let retained_inventory =
+        validate_selected_binding_receipt(&binding, graph_identity_digest, lifecycle)?;
 
     let Some(current_claim_receipt_id) = lifecycle.current_claim_receipt_id.as_deref() else {
         return Ok(retained_inventory);
@@ -1294,10 +1291,9 @@ mod tests {
     #[test]
     fn selected_binding_head_authenticates_rebind_inventory_without_chain_walk() {
         let (_, _, rebound, lifecycle) = binding_chain_fixture();
-        let inventory =
-            validate_selected_binding_receipt(&rebound, &digest('b'), &lifecycle)
-                .unwrap()
-                .expect("rebound binding carries fixed-size inventory");
+        let inventory = validate_selected_binding_receipt(&rebound, &digest('b'), &lifecycle)
+            .unwrap()
+            .expect("rebound binding carries fixed-size inventory");
         assert_eq!(inventory.retained_shard_count, 2);
 
         let mut wrong = rebound;

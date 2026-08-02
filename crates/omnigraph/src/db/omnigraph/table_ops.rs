@@ -137,11 +137,7 @@ async fn ensure_indices_for_branch(
     // Lance index artifacts. Retirement takes this gate exclusively and must
     // drain the complete physical writer, not merely its final HEAD publish.
     let _stream_profile_guard = db.write_queue().acquire_stream_profile_shared().await;
-    if let Some(error) = db
-        .current_canonical_stream_profile()
-        .await?
-        .retired_error()
-    {
+    if let Some(error) = db.current_canonical_stream_profile().await?.retired_error() {
         return Err(error);
     }
     db.ensure_schema_apply_idle("ensure_indices").await?;
@@ -512,6 +508,7 @@ async fn ensure_indices_for_branch(
             actor_id: lineage.actor_id.clone(),
             merged_parent_commit_id: lineage.merged_parent_commit_id.clone(),
             created_at: lineage.created_at,
+            stream_fold_attribution_v2: None,
         };
         let mut sidecar = if prior_stream_lifecycles.is_empty() {
             crate::db::manifest::new_ensure_indices_sidecar_v9(

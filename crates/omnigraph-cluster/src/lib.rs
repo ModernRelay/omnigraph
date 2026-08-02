@@ -41,16 +41,19 @@ use diff::{
     compute_blast_radius, demote_dependents_of_failed_graphs,
     demote_policies_for_blocked_stream_profiles, diff_resources, resource_kind,
 };
+pub use omnigraph_control_authority::{
+    RuntimeAuthorityBinding, ValidatedRuntimeGuard, mint_runtime_guard,
+};
 pub use serve::{
     ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot, cluster_graph_ids,
     cluster_root_for_graph_uri, read_serving_snapshot, read_serving_snapshot_from_storage,
     resolve_graph_storage_uri,
 };
-pub use omnigraph_control_authority::{
-    RuntimeAuthorityBinding, ValidatedRuntimeGuard, mint_runtime_guard,
-};
 use store::ClusterStore;
-pub use stream_block::{correct_stream_data_block_config_dir, show_stream_data_block_config_dir};
+pub use stream_block::{
+    correct_stream_data_block_config_dir, export_stream_dead_letters_config_dir,
+    list_stream_dead_letters_config_dir, show_stream_data_block_config_dir,
+};
 use stream_policy::stream_profile_policy_checker;
 pub use stream_retirement::{
     confirm_stream_authority_retirement_config_dir, plan_stream_authority_retirement_config_dir,
@@ -581,7 +584,9 @@ pub async fn apply_config_dir_with_options(
                 continue;
             }
         };
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_CREATE) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_CREATE)
+        {
             // Simulated crash before the init: the sidecar stays for the
             // sweep (row 1: root absent -> intent removed next run).
             diagnostics.push(diagnostic);
@@ -658,7 +663,9 @@ pub async fn apply_config_dir_with_options(
         // Crash point: the graph exists, the cluster state does not record it
         // yet. A failure here must acknowledge nothing; the next run's sweep
         // rolls the ledger forward (row 4).
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_CREATE) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_CREATE)
+        {
             diagnostics.push(diagnostic);
             return early_return(
                 display_path(&desired.config_dir),
@@ -906,7 +913,9 @@ pub async fn apply_config_dir_with_options(
                 continue;
             }
         };
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_SCHEMA_APPLY) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_SCHEMA_APPLY)
+        {
             // Simulated crash before the engine call: the sidecar stays; the
             // sweep retires it next run (ledger still consistent with live).
             diagnostics.push(diagnostic);
@@ -966,7 +975,9 @@ pub async fn apply_config_dir_with_options(
         }
         // Crash point: the manifest moved, the ledger does not record it yet.
         // A failure here acknowledges nothing; the sweep rolls forward.
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_SCHEMA_APPLY) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_SCHEMA_APPLY)
+        {
             diagnostics.push(diagnostic);
             return early_return(
                 display_path(&desired.config_dir),
@@ -1030,8 +1041,7 @@ pub async fn apply_config_dir_with_options(
             .after_digest
             .as_deref()
             .expect("streaming create/update carries an after digest");
-        let declaration_revision =
-            streaming_declaration_revision(&graph_id, declaration_digest);
+        let declaration_revision = streaming_declaration_revision(&graph_id, declaration_digest);
         let flip = Box::pin(reconcile_checked_stream_profile(
             &graph_id,
             &graph_uri,
@@ -1055,8 +1065,7 @@ pub async fn apply_config_dir_with_options(
         .await;
         match flip {
             Ok(result) => {
-                applied_streaming_enabled
-                    .insert(change.resource.clone(), result.streaming_enabled);
+                applied_streaming_enabled.insert(change.resource.clone(), result.streaming_enabled);
                 applied_stream_profile_modes
                     .insert(change.resource.clone(), result.profile_mode.clone());
                 applied_stream_profile_revisions
@@ -1215,7 +1224,9 @@ pub async fn apply_config_dir_with_options(
     // Crash point: payloads are on disk, state has not moved. A failure here
     // must leave state.json byte-identical and acknowledge nothing; re-running
     // apply repairs via the skip-if-exists blob reuse.
-    if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_PAYLOAD_PHASE) {
+    if let Err(diagnostic) =
+        failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_PAYLOAD_PHASE)
+    {
         diagnostics.push(diagnostic);
         return early_return(
             display_path(&desired.config_dir),
@@ -1292,7 +1303,9 @@ pub async fn apply_config_dir_with_options(
                 continue;
             }
         };
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_DELETE) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_DELETE)
+        {
             // Simulated crash before removal: row 8 retires the intent and
             // the still-valid approval lets a later run retry.
             diagnostics.push(diagnostic);
@@ -1317,7 +1330,9 @@ pub async fn apply_config_dir_with_options(
         }
         // Crash point: the root is gone, the ledger does not record it yet.
         // The sweep rolls forward (row 7b) and consumes the approval.
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_DELETE) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_DELETE)
+        {
             diagnostics.push(diagnostic);
             return early_return(
                 display_path(&desired.config_dir),
@@ -1447,7 +1462,9 @@ pub async fn apply_config_dir_with_options(
         // persisted-statuses revert contract below is exercised; a cfg_callback
         // on this point can mutate state.json to simulate a concurrent writer,
         // making write_state's CAS check fail organically.
-        let write_result = match failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_STATE_WRITE) {
+        let write_result = match failpoints::maybe_fail(
+            crate::failpoints::names::CLUSTER_APPLY_BEFORE_STATE_WRITE,
+        ) {
             Ok(()) => {
                 backend
                     .write_state(&new_state, expected_cas.as_deref(), &mut observations)
@@ -2520,9 +2537,11 @@ async fn reconcile_checked_stream_profile(
         },
     )
     .await
-    .map_err(|err| omnigraph::error::OmniError::StreamingAuthorityMismatch {
-        reason: err.to_string(),
-    })?;
+    .map_err(
+        |err| omnigraph::error::OmniError::StreamingAuthorityMismatch {
+            reason: err.to_string(),
+        },
+    )?;
     let authority = db.check_cluster_apply_authority(guard).await?;
     // Keep the control-plane apply future bounded. The engine's recovery-v13
     // transition owns substantial DataFusion/Lance state; embedding that
@@ -2535,10 +2554,7 @@ async fn reconcile_checked_stream_profile(
 /// last cluster-owned route to an active or in-progress manifest authority.
 /// A whole-graph delete is blocked with it so an approved prefix delete cannot
 /// bypass the explicit offline disable.
-fn block_unsafe_streaming_unmanage(
-    changes: &mut [PlanChange],
-    state: Option<&ClusterState>,
-) {
+fn block_unsafe_streaming_unmanage(changes: &mut [PlanChange], state: Option<&ClusterState>) {
     let Some(state) = state else {
         return;
     };
@@ -2550,14 +2566,13 @@ fn block_unsafe_streaming_unmanage(
         let ResourceKind::Streaming(graph_id) = resource_kind(&change.resource) else {
             continue;
         };
-        let Some(resource) = state
-            .applied_revision
-            .resources
-            .get(&change.resource)
-        else {
+        let Some(resource) = state.applied_revision.resources.get(&change.resource) else {
             continue;
         };
-        if !matches!(resource.profile_mode.as_deref(), Some("DISABLED" | "RETIRED")) {
+        if !matches!(
+            resource.profile_mode.as_deref(),
+            Some("DISABLED" | "RETIRED")
+        ) {
             blocked_graphs.insert(graph_id);
         }
     }

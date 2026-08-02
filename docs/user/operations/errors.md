@@ -37,10 +37,12 @@
   HTTP returns **413** with `resource_limit.{resource,limit,actual}`.
   Reshape the input; it is not partial success.
 - `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id`. Resolve the sidecar through a read-write reopen/server restart before retrying; this is intentionally not an ordinary OCC retry.
-- `StreamExportBlocked { withdrawn_token_count }` — ordinary export found
-  current `WITHDRAWN` sequencing authority that a row-only artifact cannot
-  preserve. Correct it to `PRESENT` when correction is available, or use the
-  stopped/offline `cluster stream retire-for-rebuild` handshake.
+- `StreamExportBlocked { withdrawn_token_count, dead_lettered_token_count }` —
+  ordinary export found current `WITHDRAWN` or `DEAD_LETTERED` sequencing
+  authority that a row-only artifact cannot preserve. The hidden ingest path
+  can install a fresh ordinary `PRESENT` successor, but no public row-ingress
+  surface exposes it yet; the current operator exit is the stopped/offline
+  `cluster stream retire-for-rebuild` handshake.
 - `StreamRetirementPlanChanged` — graph/profile/lifecycle/token authority moved
   between retirement plan and confirm. No retirement effect is accepted; rerun
   the plan and review the new digest.

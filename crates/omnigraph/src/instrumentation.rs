@@ -625,6 +625,17 @@ impl StorageAdapter for CountingStorageAdapter {
         self.inner.read_text_if_exists(uri).await
     }
 
+    async fn read_text_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<String>> {
+        self.counts
+            .read_text_if_exists
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.read_text_if_exists_bounded(uri, max_bytes).await
+    }
+
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
         self.counts.write_text.fetch_add(1, Ordering::Relaxed);
         self.inner.write_text(uri, contents).await

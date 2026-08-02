@@ -19,7 +19,7 @@ authority.
 - No `omnigraph run *` CLI subcommands and no `/runs/*` HTTP endpoints.
 - No `__run__<id>` staging branches; `__run__*` is no longer a reserved
   name. The branch-name guard was removed in MR-770. Historically, the v2→v3
-  in-place migration swept stale `__run__*` entries; the current v18 strand is
+  in-place migration swept stale `__run__*` entries; the current v19 strand is
   strict single-version, so older graphs are refused and rebuilt by
   export/init/load rather than migrated on open. (Inert `_graph_runs.lance`
   bytes in an old export source remain irrelevant to the rebuilt graph.)
@@ -560,15 +560,19 @@ revision-fenced resume and guarded drain-abort. V14 adds recovery-v16 for the
 narrow checked-runtime `SEALED` EnsureIndices bridge; v15 adds the distinct
   recovery-v17 `SEALED` Optimize bridge; v16 adds recovery-v18 private physical
 rebind for an exact `SEALED` lane; v17 adds recovery-v19 terminal
-stream-authority retirement; current v18 adds recovery-v20 exact `DataBlock`
-correction. The hidden one-lane core can
-quiesce an enrolled lane `OPEN → DRAINING → SEALED`, including empty and non-empty lanes, but no
-supported production surface can invoke it. The Cedar vocabulary,
+stream-authority retirement; v18 adds recovery-v20 exact `DataBlock`
+correction; current v19/token-schema-v3/recovery-v21 adds deterministic
+mixed/all-diverted terminal folding and three-disposition retirement. The hidden
+one-lane core can quiesce an enrolled lane `OPEN → DRAINING → SEALED`, including
+empty and non-empty lanes; the resident supervisor and checked offline-disable
+owner can invoke it, but no public lifecycle surface can. The Cedar vocabulary,
 manifest-only status, and checked stopped/offline and runtime ownership exist;
-there is no accepted-schema declaration, production enrollment/quiesce/resume/rebind,
-public ingest, or HTTP/OpenAPI streaming, rebind, or maintenance surface. The
+there is no accepted-schema declaration, public enrollment/general lifecycle
+control, public ingest, or HTTP/OpenAPI streaming, rebind, or maintenance
+surface. The
 narrow supported exceptions are the offline cluster retirement plan/confirm
-handshake and stopped/offline `stream block show|correct` DataBlock control.
+handshake, stopped/offline `stream block show|correct` DataBlock control, and
+selected-current-token `stream dead-letter list|export` inspection.
 
 Lifecycle-v3 enrollment owns the physical binding:
 
@@ -1404,7 +1408,7 @@ chain is the audit record, so it appends neither graph lineage nor
 `db/manifest/migrations.rs` is the single place the on-disk `__manifest` shape is
 reconciled with what the binary expects. Storage is **strict-single-version** (the
 strand model): this binary reads exactly ONE internal-schema version
-(`MIN_SUPPORTED == CURRENT == 18`), so there is no in-place migration.
+(`MIN_SUPPORTED == CURRENT == 19`), so there is no in-place migration.
 
 - **Graph creation** stamps `omnigraph:internal_schema_version` at CURRENT, so a
   fresh graph always opens.
@@ -1460,13 +1464,15 @@ recovery-v16 private SEALED EnsureIndices; v15 activates the distinct
   maintenance scaffold; v16 activates recovery-v18 private physical rebind
   without reinterpreting v14's three-field rebind scaffold. V17 activates
   recovery-v19 root-wide authority retirement and receipt-bearing
-  export/rebuild. Current v18 activates recovery-v20 exact DataBlock
-  correction without reinterpreting v14's incomplete correction scaffold. The
-  older hidden seams are not supported production lifecycle APIs. Historical
+  export/rebuild. V18 activates recovery-v20 exact DataBlock correction
+  without reinterpreting v14's incomplete correction scaffold. Current v19
+  upgrades token authority to schema v3 and adds recovery-v21 terminal
+  dead-letter folds plus three-disposition retirement. The older hidden seams
+  are not supported general lifecycle APIs. Historical
   v10 enrollment, v12 fold, and v14 resume/maintenance/correction/retirement
-  sidecars are refused, not reinterpreted. Public ingress,
-  enrollment/quiesce/resume/abort/rebind, and public integration remain
-  inactive.
+  sidecars are refused, not reinterpreted. Checked offline disable is the sole
+  active quiescence owner; public ingress/enrollment and general
+  resume/abort/rebind integration remain inactive.
 
 The stamp history (v1 PK-less, v2 unenforced-PK, v3 `__run__*` sweep, v4 lineage
 in `__manifest` with the commit-graph tables retired, v5 stable table identity,
@@ -1479,8 +1485,9 @@ recovery-v13 profile receipts, v12 lifecycle-v3 plus recovery-v14, v13
 private resume/guarded drain-abort plus recovery-v15, v14 private SEALED
   EnsureIndices plus recovery-v16, v15 private SEALED Optimize plus
   recovery-v17, v16 private physical rebind plus recovery-v18, v17 authority
-  retirement plus recovery-v19, and v18 DataBlock correction plus recovery-v20)
-is recorded on the `INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v18 is
+  retirement plus recovery-v19, v18 DataBlock correction plus recovery-v20,
+  and v19 terminal dead-letter folds plus recovery-v21)
+is recorded on the `INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v19 is
 served. An
 earlier-stamped graph is rebuilt via export/import, not migrated in place.
 

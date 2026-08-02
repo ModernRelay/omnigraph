@@ -1223,6 +1223,7 @@ impl StagedMutation {
             actor_id: lineage_intent.actor_id.clone(),
             merged_parent_commit_id: lineage_intent.merged_parent_commit_id.clone(),
             created_at: lineage_intent.created_at,
+            stream_fold_attribution_v2: None,
         };
         let mut sidecar = new_occ_sidecar_v9(
             sidecar_kind,

@@ -12,14 +12,16 @@ pub use manifest::{Snapshot, SnapshotScanner, SnapshotTable, SubTableEntry, SubT
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub(crate) use omnigraph::stream_lifecycle::build_sealed_maintenance_successor;
 pub use omnigraph::{
-    CheckedClusterApplyAuthority, CheckedClusterBlockAuthority, CheckedClusterMaintenanceAuthority,
-    CheckedClusterRetirementAuthority, CheckedClusterStreamRuntimeAuthority, CleanupPolicyOptions,
-    InitOptions, MergeOutcome, Omnigraph, OpenMode, PendingIndex, RepairAction,
-    RepairClassification, RepairOptions, RepairStats, SchemaApplyOptions, SchemaApplyResult,
-    SkipReason, StreamAuthorityRetirementPlan, StreamAuthorityRetirementResult,
-    StreamDataBlockEntry, StreamDataBlockPage, StreamDataCorrectionAction,
-    StreamDataCorrectionRequest, StreamDataCorrectionResult, StreamStatus, StreamTableStatus,
-    StreamingProfileResult, TableCleanupStats, TableOptimizeStats, TableRepairStats,
+    CheckedClusterApplyAuthority, CheckedClusterBlockAuthority, CheckedClusterDeadLetterAuthority,
+    CheckedClusterMaintenanceAuthority, CheckedClusterRetirementAuthority,
+    CheckedClusterStreamRuntimeAuthority, CleanupPolicyOptions, InitOptions, MergeOutcome,
+    Omnigraph, OpenMode, PendingIndex, RepairAction, RepairClassification, RepairOptions,
+    RepairStats, SchemaApplyOptions, SchemaApplyResult, SkipReason, StreamAuthorityRetirementPlan,
+    StreamAuthorityRetirementResult, StreamDataBlockEntry, StreamDataBlockPage,
+    StreamDataCorrectionAction, StreamDataCorrectionRequest, StreamDataCorrectionResult,
+    StreamDeadLetterEntry, StreamDeadLetterPage, StreamDeadLetterPayloadEntry,
+    StreamDeadLetterPayloadPage, StreamStatus, StreamTableStatus, StreamingProfileResult,
+    TableCleanupStats, TableOptimizeStats, TableRepairStats,
 };
 pub(crate) use omnigraph::{
     DeferredTableFork, StreamAuthorityRetirementExportProvenance, WriteAuthorityToken, WriteTxn,

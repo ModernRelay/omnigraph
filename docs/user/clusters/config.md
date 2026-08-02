@@ -179,10 +179,12 @@ Semantics are deliberately asymmetric:
   touches the graph's flag. *Removing* the key unmanages it — it never
   disables a previously enabled graph.
 - **Disabling requires an explicit `streaming: false`.** The profile can
-  return to `DISABLED` when the graph has no lanes or every existing lane is
-  already `SEALED`. This slice cannot drain an `OPEN` or `DRAINING` lane, so
-  any non-`SEALED` lifecycle makes disable refuse rather than discard
-  sequencing authority. Only the no-lane case restores embedded/direct
+  return to `DISABLED` after a checked offline apply drains its finite
+  manifest-derived lane cut. Apply persists `DISABLING`, handles `OPEN` and
+  goal-`SEALED` lanes, and adopts an existing `OPEN_AFTER_FOLD` drain without
+  minting a second occurrence. A selected `DataBlock` leaves that exact plan
+  pending until stopped/offline correction and an apply retry; sequencing
+  authority is never discarded. Only the no-lane case restores embedded/direct
   content writes: existing `SEALED` enrollments remain fenced and are not
   de-enrolled by the profile transition. Rebuild the logical graph through
   export/init/load to return an enrolled graph to the non-streaming physical

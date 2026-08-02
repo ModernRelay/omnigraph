@@ -38,6 +38,29 @@ struct FailedBlockCommand {
     diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Clone, Copy)]
+enum OfflineStreamControlKind {
+    Block,
+    DeadLetter,
+}
+
+impl OfflineStreamControlKind {
+    fn subject(self) -> &'static str {
+        match self {
+            Self::Block => "stream-block control",
+            Self::DeadLetter => "stream dead-letter control",
+        }
+    }
+
+    fn code(self, suffix: &str) -> String {
+        let prefix = match self {
+            Self::Block => "stream_block",
+            Self::DeadLetter => "stream_dead_letter",
+        };
+        format!("{prefix}_{suffix}")
+    }
+}
+
 pub async fn show_stream_data_block_config_dir(
     config_dir: impl AsRef<Path>,
     graph_id: impl AsRef<str>,
@@ -205,10 +228,198 @@ pub async fn correct_stream_data_block_config_dir(
     }
 }
 
+pub async fn list_stream_dead_letters_config_dir(
+    config_dir: impl AsRef<Path>,
+    graph_id: impl AsRef<str>,
+    cursor: Option<&str>,
+    options: StreamDeadLetterControlOptions,
+) -> StreamDeadLetterListOutput {
+    let graph_id = graph_id.as_ref().to_string();
+    let prepared = match prepare_offline_control_command(
+        config_dir.as_ref(),
+        &graph_id,
+        options.actor.as_deref(),
+        options.confirm_stream_offline,
+        OfflineStreamControlKind::DeadLetter,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(failed) => {
+            return StreamDeadLetterListOutput {
+                ok: false,
+                config_dir: failed.config_dir,
+                graph_id: failed.graph_id,
+                graph_uri: failed.graph_uri,
+                actor: failed.actor,
+                state_observations: failed.observations,
+                page: None,
+                diagnostics: failed.diagnostics,
+            };
+        }
+    };
+    let PreparedBlockCommand {
+        config_dir,
+        graph_id,
+        graph_uri,
+        actor,
+        desired,
+        backend,
+        state,
+        state_cas,
+        expected_profile_revision,
+        observations,
+        mut diagnostics,
+        lock_guard,
+    } = prepared;
+    let result = async {
+        let db =
+            open_authorized_block_graph(&graph_id, &graph_uri, &desired, &backend, &state).await?;
+        let guard = validated_dead_letter_offline_guard(
+            &lock_guard,
+            &graph_id,
+            &graph_uri,
+            &actor,
+            &state,
+            &state_cas,
+            expected_profile_revision,
+            "dead-letter-list",
+        )
+        .await?;
+        let authority = db.check_cluster_dead_letter_authority(guard).await?;
+        db.list_stream_dead_letters(authority, cursor).await
+    }
+    .await;
+    let page = match result {
+        Ok(page) => Some(page),
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                "stream_dead_letter_list_failed",
+                format!("graph.{graph_id}"),
+                error.to_string(),
+            ));
+            None
+        }
+    };
+    StreamDeadLetterListOutput {
+        ok: page.is_some() && !has_errors(&diagnostics),
+        config_dir,
+        graph_id,
+        graph_uri: Some(graph_uri),
+        actor: Some(actor),
+        state_observations: observations,
+        page,
+        diagnostics,
+    }
+}
+
+pub async fn export_stream_dead_letters_config_dir(
+    config_dir: impl AsRef<Path>,
+    graph_id: impl AsRef<str>,
+    cursor: Option<&str>,
+    options: StreamDeadLetterControlOptions,
+) -> StreamDeadLetterExportOutput {
+    let graph_id = graph_id.as_ref().to_string();
+    let prepared = match prepare_offline_control_command(
+        config_dir.as_ref(),
+        &graph_id,
+        options.actor.as_deref(),
+        options.confirm_stream_offline,
+        OfflineStreamControlKind::DeadLetter,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(failed) => {
+            return StreamDeadLetterExportOutput {
+                ok: false,
+                config_dir: failed.config_dir,
+                graph_id: failed.graph_id,
+                graph_uri: failed.graph_uri,
+                actor: failed.actor,
+                state_observations: failed.observations,
+                page: None,
+                diagnostics: failed.diagnostics,
+            };
+        }
+    };
+    let PreparedBlockCommand {
+        config_dir,
+        graph_id,
+        graph_uri,
+        actor,
+        desired,
+        backend,
+        state,
+        state_cas,
+        expected_profile_revision,
+        observations,
+        mut diagnostics,
+        lock_guard,
+    } = prepared;
+    let result = async {
+        let db =
+            open_authorized_block_graph(&graph_id, &graph_uri, &desired, &backend, &state).await?;
+        let guard = validated_dead_letter_offline_guard(
+            &lock_guard,
+            &graph_id,
+            &graph_uri,
+            &actor,
+            &state,
+            &state_cas,
+            expected_profile_revision,
+            "dead-letter-export",
+        )
+        .await?;
+        let authority = db.check_cluster_dead_letter_authority(guard).await?;
+        db.export_stream_dead_letter_payloads(authority, cursor)
+            .await
+    }
+    .await;
+    let page = match result {
+        Ok(page) => Some(page),
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                "stream_dead_letter_export_failed",
+                format!("graph.{graph_id}"),
+                error.to_string(),
+            ));
+            None
+        }
+    };
+    StreamDeadLetterExportOutput {
+        ok: page.is_some() && !has_errors(&diagnostics),
+        config_dir,
+        graph_id,
+        graph_uri: Some(graph_uri),
+        actor: Some(actor),
+        state_observations: observations,
+        page,
+        diagnostics,
+    }
+}
+
 async fn prepare_block_command(
     config_dir: &Path,
     graph_id: &str,
     options: &StreamBlockControlOptions,
+) -> Result<PreparedBlockCommand, FailedBlockCommand> {
+    prepare_offline_control_command(
+        config_dir,
+        graph_id,
+        options.actor.as_deref(),
+        options.confirm_stream_offline,
+        OfflineStreamControlKind::Block,
+    )
+    .await
+}
+
+async fn prepare_offline_control_command(
+    config_dir: &Path,
+    graph_id: &str,
+    actor: Option<&str>,
+    confirm_stream_offline: bool,
+    kind: OfflineStreamControlKind,
 ) -> Result<PreparedBlockCommand, FailedBlockCommand> {
     let outcome = load_desired(config_dir);
     let mut diagnostics = outcome.diagnostics;
@@ -225,25 +436,23 @@ async fn prepare_block_command(
         }
     };
     let mut observations = backend.observations();
-    let actor = options
-        .actor
-        .as_deref()
+    let actor = actor
         .map(str::trim)
         .filter(|actor| !actor.is_empty())
         .map(str::to_string);
 
     if actor.is_none() {
         diagnostics.push(Diagnostic::error(
-            "stream_block_actor_required",
+            kind.code("actor_required"),
             "actor",
-            "stream-block control requires an authenticated actor",
+            format!("{} requires an authenticated actor", kind.subject()),
         ));
     }
-    if !options.confirm_stream_offline {
+    if !confirm_stream_offline {
         diagnostics.push(Diagnostic::error(
             "streaming_offline_confirmation_required",
             "confirm_stream_offline",
-            "stream-block control requires --confirm-stream-offline after every writer-capable process for the graph has stopped",
+            format!("{} requires --confirm-stream-offline after every writer-capable process for the graph has stopped", kind.subject()),
         ));
     }
 
@@ -260,16 +469,22 @@ async fn prepare_block_command(
     let graph_uri = backend.graph_root(graph_id);
     if !desired.graphs.iter().any(|graph| graph.id == graph_id) {
         diagnostics.push(Diagnostic::error(
-            "stream_block_graph_not_declared",
+            kind.code("graph_not_declared"),
             format!("graphs.{graph_id}"),
-            "stream-block control requires a graph declared by this cluster config",
+            format!(
+                "{} requires a graph declared by this cluster config",
+                kind.subject()
+            ),
         ));
     }
     if !desired.state_lock {
         diagnostics.push(Diagnostic::error(
             "streaming_requires_state_lock",
             "state.lock",
-            "stream-block control requires state.lock: true and the held cluster state lock",
+            format!(
+                "{} requires state.lock: true and the held cluster state lock",
+                kind.subject()
+            ),
         ));
     }
     if has_errors(&diagnostics) {
@@ -315,7 +530,10 @@ async fn prepare_block_command(
         diagnostics.push(Diagnostic::error(
             "state_missing",
             CLUSTER_STATE_FILE,
-            "stream-block control requires an existing state.json; run `cluster import` first",
+            format!(
+                "{} requires an existing state.json; run `cluster import` first",
+                kind.subject()
+            ),
         ));
         return Err(FailedBlockCommand {
             config_dir: config_dir_display,
@@ -335,9 +553,12 @@ async fn prepare_block_command(
         .contains_key(&graph_address(graph_id))
     {
         diagnostics.push(Diagnostic::error(
-            "stream_block_graph_not_applied",
+            kind.code("graph_not_applied"),
             format!("graph.{graph_id}"),
-            "stream-block control requires the selected graph in applied cluster state",
+            format!(
+                "{} requires the selected graph in applied cluster state",
+                kind.subject()
+            ),
         ));
     }
     let streaming_address = crate::config::streaming_address(graph_id);
@@ -349,9 +570,9 @@ async fn prepare_block_command(
         }
         _ => {
             diagnostics.push(Diagnostic::error(
-                "stream_block_profile_not_applied",
+                kind.code("profile_not_applied"),
                 streaming_address,
-                "stream-block control requires applied streaming declaration and exact profile-revision authority; run cluster refresh/apply first",
+                format!("{} requires applied streaming declaration and exact profile-revision authority; run cluster refresh/apply first", kind.subject()),
             ));
             None
         }
@@ -361,17 +582,23 @@ async fn prepare_block_command(
     let pending_recovery = backend.list_recovery_sidecars(&mut diagnostics).await;
     if diagnostics.len() != diagnostic_count_before_recovery_scan {
         diagnostics.push(Diagnostic::error(
-            "stream_block_recovery_unverifiable",
+            kind.code("recovery_unverifiable"),
             CLUSTER_RECOVERIES_DIR,
-            "could not prove cluster recovery clear before stream-block control",
+            format!(
+                "could not prove cluster recovery clear before {}",
+                kind.subject()
+            ),
         ));
     }
     for (path, sidecar) in pending_recovery {
         if sidecar.graph_id == graph_id {
             diagnostics.push(Diagnostic::error(
-                "stream_block_recovery_pending",
+                kind.code("recovery_pending"),
                 path,
-                "an interrupted cluster graph operation must be settled before stream-block control",
+                format!(
+                    "an interrupted cluster graph operation must be settled before {}",
+                    kind.subject()
+                ),
             ));
         }
     }
@@ -460,6 +687,55 @@ async fn validated_block_offline_guard<'lock>(
             expected_profile_revision,
             operation_id,
             operation: AuthorityOperationClass::StreamBlockControl,
+            actor,
+            confirm_stream_offline: true,
+        },
+    )
+    .await
+    .map_err(
+        |error| omnigraph::error::OmniError::StreamingAuthorityMismatch {
+            reason: error.to_string(),
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn validated_dead_letter_offline_guard<'lock>(
+    lock_guard: &'lock StateLockGuard,
+    graph_id: &str,
+    graph_uri: &str,
+    actor: &str,
+    state: &ClusterState,
+    state_cas: &str,
+    expected_profile_revision: u64,
+    operation_id: &str,
+) -> omnigraph::error::Result<ValidatedOfflineGuard<'lock>> {
+    let streaming = state
+        .applied_revision
+        .resources
+        .get(&crate::config::streaming_address(graph_id))
+        .ok_or_else(|| omnigraph::error::OmniError::StreamingAuthorityMismatch {
+            reason: format!("applied streaming resource 'streaming.{graph_id}' disappeared"),
+        })?;
+    let declaration_revision = streaming.declaration_revision.as_deref().ok_or_else(|| {
+        omnigraph::error::OmniError::StreamingAuthorityMismatch {
+            reason: format!(
+                "applied streaming resource 'streaming.{graph_id}' has no declaration revision"
+            ),
+        }
+    })?;
+    validate_offline_guard(
+        lock_guard,
+        OfflineAuthorityRequest {
+            graph_id,
+            graph_store_uri: graph_uri,
+            expected_state_cas: state_cas,
+            state_revision: state.state_revision,
+            declaration_revision,
+            declaration_digest: &streaming.digest,
+            expected_profile_revision,
+            operation_id,
+            operation: AuthorityOperationClass::StreamDeadLetterControl,
             actor,
             confirm_stream_offline: true,
         },

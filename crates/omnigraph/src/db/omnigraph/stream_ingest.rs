@@ -7,7 +7,7 @@
 //! the graph authority checks around those primitives and the one
 //! `__manifest` publication which makes a folded generation visible.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, RecordBatch, StringArray, UInt32Array};
@@ -29,11 +29,12 @@ use crate::db::manifest::stream::{
 };
 use crate::db::manifest::stream_token::{
     AdmissionClassification, AdmissionRequest, PayloadDigest, PayloadDigestInput,
-    StreamFoldAttributionSummary, StreamRowOrigin, StreamTerminalCorrection, StreamToken,
+    StreamDeadLetterReasonCode, StreamDeadLetterTerminalEvidence, StreamFoldAttributionSummary,
+    StreamFoldAttributionSummaryV2, StreamRowOrigin, StreamTerminalCorrection, StreamToken,
     StreamTokenAuthorityRow, StreamTokenDisposition, StreamWriteEnvelope, TrustedContributorId,
     TrustedStreamRowMetadata, build_trusted_stream_metadata_array, classify_admission,
     decode_trusted_stream_metadata, stream_fold_attribution_commitment,
-    validate_authority_base_pair,
+    stream_fold_attribution_commitment_v2, validate_authority_base_pair,
 };
 use crate::db::manifest::token_store::{
     LifecycleLedgerRecord, add_stream_lookup_retained_bytes, lookup_lifecycle_ledger_record_by_id,
@@ -44,24 +45,28 @@ use crate::db::manifest::token_store::{
 use crate::db::manifest::{
     CurrentHeadWitness, ExpectedTableVersions, ManifestChange, RecoveryAuthorityToken,
     RecoveryLineageIntent, RecoveryProtocolV14, RecoveryProtocolV15,
-    RecoveryStreamClaimContinuationV14, RecoveryStreamClaimOutcomeV14, RecoveryStreamFoldCut,
-    RecoveryStreamLifecycleReceiptKind, RecoveryStreamOpenPlanV15, RecoveryStreamResumeOutcomeV15,
-    RecoveryStreamResumeRequestV15, SidecarTablePin, StreamLifecycle, StreamLifecycleEntry,
-    StreamPhysicalBinding, StreamProfileEntry, StreamProfileMode, TableIdentity,
-    TableVersionExpectation, arm_stream_claim_checkpoint_sidecar_v14,
-    arm_stream_claim_terminal_sidecar_v14, arm_stream_resume_checkpoint_sidecar_v15,
-    arm_stream_resume_terminal_sidecar_v15, classify_effect_free_stream_claim_sidecar_v14,
-    classify_effect_free_stream_resume_sidecar_v15, complete_stream_claim_sidecar_v14,
+    RecoveryStreamClaimContinuationV14, RecoveryStreamClaimOutcomeV14,
+    RecoveryStreamDeadLetterBaseConfirmationV21, RecoveryStreamDeadLetterCandidateV21,
+    RecoveryStreamDrainFoldAuthorityV14, RecoveryStreamFoldCut, RecoveryStreamLifecycleReceiptKind,
+    RecoveryStreamOpenPlanV15, RecoveryStreamResumeOutcomeV15, RecoveryStreamResumeRequestV15,
+    SidecarTablePin, StreamLifecycle, StreamLifecycleEntry, StreamPhysicalBinding,
+    StreamProfileEntry, StreamProfileMode, TableIdentity, TableVersionExpectation,
+    arm_stream_claim_checkpoint_sidecar_v14, arm_stream_claim_terminal_sidecar_v14,
+    arm_stream_resume_checkpoint_sidecar_v15, arm_stream_resume_terminal_sidecar_v15,
+    classify_effect_free_stream_claim_sidecar_v14, classify_effect_free_stream_resume_sidecar_v15,
+    complete_stream_claim_sidecar_v14, complete_stream_dead_letter_fold_sidecar_v21,
     complete_stream_fold_sidecar_v14, complete_stream_lifecycle_receipt_sidecar_v14,
     complete_stream_resume_sidecar_v15, confirm_stream_claim_sidecar_v14,
-    confirm_stream_fold_sidecar_v14, confirm_stream_lifecycle_receipt_sidecar_v14,
-    confirm_stream_resume_sidecar_v15, finalize_effect_free_stream_fold_sidecar_v14, list_sidecars,
-    lookup_stream_claim_continuation_v14, new_stream_claim_sidecar_v14,
-    new_stream_drain_fold_sidecar_v14, new_stream_fold_v2_sidecar_v14,
-    new_stream_lifecycle_receipt_sidecar_v14, new_stream_resume_sidecar_v15,
-    prepared_stream_claim_attempt_v14, prepared_stream_resume_attempt_v15,
-    rearm_stream_claim_checkpoint_sidecar_v14, rearm_stream_resume_checkpoint_sidecar_v15,
-    receipt_first_rearm_stream_claim_sidecar_v14, write_sidecar,
+    confirm_stream_dead_letter_fold_sidecar_v21, confirm_stream_fold_sidecar_v14,
+    confirm_stream_lifecycle_receipt_sidecar_v14, confirm_stream_resume_sidecar_v15,
+    finalize_effect_free_stream_fold_sidecar_v14, list_sidecars,
+    lookup_stream_claim_continuation_v14, mint_recovery_operation_id, new_stream_claim_sidecar_v14,
+    new_stream_dead_letter_fold_sidecar_v21, new_stream_drain_fold_sidecar_v14,
+    new_stream_fold_v2_sidecar_v14, new_stream_lifecycle_receipt_sidecar_v14,
+    new_stream_resume_sidecar_v15, prepared_stream_claim_attempt_v14,
+    prepared_stream_resume_attempt_v15, rearm_stream_claim_checkpoint_sidecar_v14,
+    rearm_stream_resume_checkpoint_sidecar_v15, receipt_first_rearm_stream_claim_sidecar_v14,
+    write_sidecar,
 };
 use crate::db::write_queue::StreamAdmissionKey;
 use crate::error::{OmniError, Result};
@@ -81,6 +86,11 @@ use crate::table_store::mem_wal::{
 };
 use crate::validate::{ChangeSet, CommittedState, TableChange};
 
+use super::stream_dead_letter::{
+    PreparedStreamDeadLetterObject, StreamDeadLetterObjectCandidate,
+    create_or_verify_stream_dead_letter_object, is_stream_dead_letter_object_limit,
+    prepare_stream_dead_letter_object,
+};
 use super::stream_lifecycle::{
     CanonicalDataBlockEvidence, ClaimAttemptEvidence, ClaimAttemptRequest, ClaimOperationRequest,
     DataBlockEvidenceCollector, EmptyCutEvidence, QuiesceRequest, StreamResumeRequest,
@@ -119,6 +129,7 @@ pub(crate) struct StreamTokenAdmissionAck {
     pub(crate) origin: StreamRowOrigin,
     pub(crate) disposition: StreamTokenDisposition,
     pub(crate) terminal_correction: Option<StreamTerminalCorrection>,
+    pub(crate) terminal_dead_letter: Option<Box<StreamDeadLetterTerminalEvidence>>,
     pub(crate) already_durable: bool,
 }
 
@@ -248,6 +259,70 @@ pub(super) struct AttributedFoldPlan {
 struct StreamJsonRowWire {
     envelope: StreamWriteEnvelope,
     body: BTreeMap<String, serde_json::Value>,
+}
+
+/// One final-LWW generation candidate diverted by deterministic graph-state
+/// validation. The row and its still-PRESENT authority remain paired until
+/// the dead-letter object descriptor is fixed; only then may the terminal
+/// authority row be constructed.
+#[derive(Debug)]
+struct DivertedFoldCandidatePlan {
+    logical_id: String,
+    row: RecordBatch,
+    authority: StreamTokenAuthorityRow,
+    violation_codes: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct FoldConflictPartition {
+    visible_batches: Vec<RecordBatch>,
+    visible_token_rows: Vec<StreamTokenAuthorityRow>,
+    diverted: Vec<DivertedFoldCandidatePlan>,
+}
+
+#[derive(Debug)]
+struct PreparedDeadLetterFold {
+    visible_batches: Vec<RecordBatch>,
+    token_rows: Vec<StreamTokenAuthorityRow>,
+    attribution: StreamFoldAttributionSummaryV2,
+    object: PreparedStreamDeadLetterObject,
+}
+
+#[derive(Debug)]
+enum FoldPublicationPlan {
+    Ordinary {
+        batches: Vec<RecordBatch>,
+        attribution: AttributedFoldPlan,
+    },
+    DeadLetter(PreparedDeadLetterFold),
+}
+
+impl FoldPublicationPlan {
+    fn visible_batches(&self) -> &[RecordBatch] {
+        match self {
+            Self::Ordinary { batches, .. } => batches,
+            Self::DeadLetter(plan) => &plan.visible_batches,
+        }
+    }
+
+    fn token_rows(&self) -> &[StreamTokenAuthorityRow] {
+        match self {
+            Self::Ordinary { attribution, .. } => &attribution.token_rows,
+            Self::DeadLetter(plan) => &plan.token_rows,
+        }
+    }
+}
+
+fn same_prepared_dead_letter_fold(
+    planned: &PreparedDeadLetterFold,
+    revalidated: &PreparedDeadLetterFold,
+) -> bool {
+    planned.visible_batches == revalidated.visible_batches
+        && planned.token_rows == revalidated.token_rows
+        && planned.attribution == revalidated.attribution
+        && planned.object.descriptor() == revalidated.object.descriptor()
+        && planned.object.canonical_ndjson() == revalidated.object.canonical_ndjson()
+        && planned.object.candidate_ordinals() == revalidated.object.candidate_ordinals()
 }
 
 impl<'de> serde::Deserialize<'de> for StreamJsonRowWire {
@@ -1132,6 +1207,7 @@ impl Omnigraph {
                                         origin: authority.origin,
                                         disposition: authority.disposition,
                                         terminal_correction: authority.terminal_correction,
+                                        terminal_dead_letter: authority.terminal_dead_letter,
                                         already_durable: true,
                                     },
                                 ),
@@ -1243,6 +1319,7 @@ impl Omnigraph {
                         origin,
                         disposition: StreamTokenDisposition::Present,
                         terminal_correction: None,
+                        terminal_dead_letter: None,
                         already_durable: false,
                     },
                     ambiguous: StreamB2AmbiguousRow {
@@ -1840,6 +1917,36 @@ impl Omnigraph {
                     last_effect_free_error = Some(error);
                 }
                 Ok(FoldAttempt::EffectFree(error)) => return Err(error),
+                Ok(FoldAttempt::NeedsStrictBlock) => {
+                    // The current DataBlock grammar deliberately belongs to a
+                    // DRAINING cut. Release the completed OPEN cut, start one
+                    // ordinary goal-SEALED drain, and let its fold re-read the
+                    // same immutable generation and publish the block before
+                    // any dead-letter object or Lance participant can move.
+                    drop(cut);
+                    let drain_id = ShardId::new_v4().to_string();
+                    return match self
+                        .stream_quiesce_as(
+                            &table_key,
+                            &drain_id,
+                            post_claim.lifecycle.lifecycle_revision,
+                            "omnigraph:stream-dead-letter-limit",
+                        )
+                        .await
+                    {
+                        Err(error @ OmniError::StreamDataBlocked { .. }) => Err(error),
+                        Err(error) => Err(error),
+                        // The graph validation cut may legitimately change
+                        // while OPEN admission is released and the explicit
+                        // drain is established (for example, a referenced
+                        // table's independent fold can remove the conflict).
+                        // If the DRAINING recheck publishes and seals instead
+                        // of reproducing the block, report the achieved
+                        // terminal progress rather than the stale first-pass
+                        // object-limit cause.
+                        Ok(()) => Ok(ResidentFoldOutcome::Published),
+                    };
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -2682,6 +2789,11 @@ impl Omnigraph {
                         last_effect_free_error = Some(error);
                     }
                     FoldAttempt::EffectFree(error) => return Err(error),
+                    FoldAttempt::NeedsStrictBlock => {
+                        return Err(OmniError::manifest_internal(
+                            "a DRAINING fold returned an OPEN-only strict-block handoff",
+                        ));
+                    }
                 }
             }
             if let Some(error) = last_effect_free_error {
@@ -3295,77 +3407,101 @@ impl Omnigraph {
         );
         let committed = CommittedState::write(&prepared.txn.base, self, None);
         let constraints = crate::validate::constraints_for(&prepared.txn.catalog);
-        match mode {
-            FoldLifecycleMode::Open => {
-                let mut first_violation = None;
-                crate::validate::evaluate_with_sink(
-                    &constraints,
-                    &changeset,
-                    &committed,
-                    &prepared.txn.catalog,
-                    |violation| {
-                        if first_violation.is_none() {
-                            first_violation = Some(violation);
-                        }
-                        Ok(())
-                    },
-                )
-                .await?;
-                if let Some(violation) = first_violation {
-                    return Err(violation.into_omni_error());
-                }
+        let partition = partition_fold_data_conflicts(
+            table_key,
+            key.identity,
+            &batches,
+            &attribution,
+            &constraints,
+            &committed,
+            &prepared.txn.catalog,
+        )
+        .await;
+        let publication = match partition.and_then(|partition| {
+            if partition.diverted.is_empty() {
+                Ok(FoldPublicationPlan::Ordinary {
+                    batches: batches.clone(),
+                    attribution: attribution.clone(),
+                })
+            } else {
+                let operation_id = mint_recovery_operation_id();
+                prepare_dead_letter_fold(&operation_id, partition)
+                    .map(FoldPublicationPlan::DeadLetter)
             }
-            FoldLifecycleMode::Draining { drain_id } => {
-                let winner_tokens = attribution
-                    .token_rows
-                    .iter()
-                    .map(|row| (row.logical_id.clone(), row.current_token.to_string()))
-                    .collect::<BTreeMap<_, _>>();
-                let mut collector = DataBlockEvidenceCollector::new(table_key, &winner_tokens);
-                crate::validate::evaluate_with_sink(
-                    &constraints,
-                    &changeset,
-                    &committed,
-                    &prepared.txn.catalog,
-                    |violation| collector.push(&violation),
-                )
-                .await?;
-                if let Some(evidence) = collector.finish()? {
-                    let block_token = self
-                        .publish_stream_data_block(
-                            table_key,
-                            key,
-                            &prepared,
-                            cut,
-                            drain_id,
-                            &changeset,
-                            &attribution,
-                            evidence,
-                        )
-                        .await?;
-                    return Err(stream_data_block_error(&block_token));
+        }) {
+            Ok(publication) => publication,
+            Err(error) => match mode {
+                FoldLifecycleMode::Open if is_stream_dead_letter_object_limit(&error) => {
+                    return Ok(FoldAttempt::NeedsStrictBlock);
                 }
-            }
-        }
+                FoldLifecycleMode::Open => return Err(error),
+                FoldLifecycleMode::Draining { drain_id } => {
+                    let winner_tokens = attribution
+                        .token_rows
+                        .iter()
+                        .map(|row| (row.logical_id.clone(), row.current_token.to_string()))
+                        .collect::<BTreeMap<_, _>>();
+                    let mut collector = DataBlockEvidenceCollector::new(table_key, &winner_tokens);
+                    crate::validate::evaluate_with_sink(
+                        &constraints,
+                        &changeset,
+                        &committed,
+                        &prepared.txn.catalog,
+                        |violation| collector.push(&violation),
+                    )
+                    .await?;
+                    if let Some(evidence) = collector.finish()? {
+                        let block_token = self
+                            .publish_stream_data_block(
+                                table_key,
+                                key,
+                                &prepared,
+                                cut,
+                                drain_id,
+                                &changeset,
+                                &attribution,
+                                evidence,
+                            )
+                            .await?;
+                        return Err(stream_data_block_error(&block_token));
+                    }
+                    return Err(error);
+                }
+            },
+        };
 
         // Staging may materialize URI-backed blobs.  Its own post-materialized
         // bound is the final 32-MiB proof; no HEAD moves here.
-        let staged = self
-            .storage()
-            .stage_stream_fold(
-                prepared.head.clone(),
-                table_key,
-                batches.clone(),
-                cut.key.shard_id,
-                cut.generation,
-            )
-            .await?;
+        let staged = match &publication {
+            FoldPublicationPlan::Ordinary { batches, .. } => {
+                self.storage()
+                    .stage_stream_fold(
+                        prepared.head.clone(),
+                        table_key,
+                        batches.clone(),
+                        cut.key.shard_id,
+                        cut.generation,
+                    )
+                    .await?
+            }
+            FoldPublicationPlan::DeadLetter(plan) => {
+                self.storage()
+                    .stage_stream_dead_letter_fold(
+                        prepared.head.clone(),
+                        table_key,
+                        plan.visible_batches.clone(),
+                        cut.key.shard_id,
+                        cut.generation,
+                    )
+                    .await?
+            }
+        };
         let planned_transaction = staged.transaction_identity();
         let token_dataset = prepared.txn.base.open_stream_token_authority().await?;
         let token_staged = stage_stream_token_upsert(
             token_dataset.clone(),
             prepared.txn.base.stream_token_authority(),
-            &attribution.token_rows,
+            publication.token_rows(),
         )
         .await?;
         let token_stage = (
@@ -3423,7 +3559,7 @@ impl Omnigraph {
             ));
         }
         let current_claim_receipt = self.selected_claim_receipt(&live, &live_lifecycle).await?;
-        let revalidated = plan_fold_attribution(
+        let revalidated_attribution = plan_fold_attribution(
             &live,
             key.identity,
             &live_lifecycle,
@@ -3431,12 +3567,41 @@ impl Omnigraph {
             &batches,
         )
         .await?;
-        if revalidated != attribution {
-            return Err(OmniError::manifest_read_set_changed(
-                "stream_fold_attribution",
-                Some("prepared attributed winner set".to_string()),
-                Some("changed attributed winner set".to_string()),
-            ));
+        validate_generation_token_plan(table_key, &revalidated_attribution.token_rows)?;
+        match &publication {
+            FoldPublicationPlan::Ordinary { attribution, .. } => {
+                if &revalidated_attribution != attribution {
+                    return Err(OmniError::manifest_read_set_changed(
+                        "stream_fold_attribution",
+                        Some("prepared attributed winner set".to_string()),
+                        Some("changed attributed winner set".to_string()),
+                    ));
+                }
+            }
+            FoldPublicationPlan::DeadLetter(planned) => {
+                let committed = CommittedState::write(&live, self, None);
+                let partition = partition_fold_data_conflicts(
+                    table_key,
+                    key.identity,
+                    &batches,
+                    &revalidated_attribution,
+                    &constraints,
+                    &committed,
+                    &prepared.txn.catalog,
+                )
+                .await?;
+                let revalidated = prepare_dead_letter_fold(
+                    &planned.object.descriptor().fold_operation_id,
+                    partition,
+                )?;
+                if !same_prepared_dead_letter_fold(planned, &revalidated) {
+                    return Err(OmniError::manifest_read_set_changed(
+                        "stream_dead_letter_plan",
+                        Some("prepared terminal fold plan".to_string()),
+                        Some("changed terminal fold plan".to_string()),
+                    ));
+                }
+            }
         }
 
         let final_head = self
@@ -3494,6 +3659,7 @@ impl Omnigraph {
             actor_id: lineage.actor_id.clone(),
             merged_parent_commit_id: lineage.merged_parent_commit_id.clone(),
             created_at: lineage.created_at,
+            stream_fold_attribution_v2: None,
         };
         let post_commit_pin =
             prepared.entry.table_version.checked_add(1).ok_or_else(|| {
@@ -3550,11 +3716,24 @@ impl Omnigraph {
                 .ok_or_else(|| {
                     OmniError::manifest_internal("stream lifecycle revision overflow")
                 })?;
-            let (fold_rows, fold_bytes) = fold_output_size(&batches)?;
+            let (input_rows, input_bytes) = fold_output_size(&batches)?;
+            let (visible_rows, visible_bytes) = fold_output_size(publication.visible_batches())?;
             next_lifecycle.last_fold_summary = Some(LastFoldSummary {
-                operation_id: match mode {
-                    FoldLifecycleMode::Open => "pending-stream-fold-operation".to_string(),
-                    FoldLifecycleMode::Draining { drain_id } => drain_id.clone(),
+                operation_id: match (&publication, mode) {
+                    (FoldPublicationPlan::DeadLetter(plan), FoldLifecycleMode::Open) => {
+                        plan.object.descriptor().fold_operation_id.clone()
+                    }
+                    (
+                        FoldPublicationPlan::DeadLetter(_),
+                        FoldLifecycleMode::Draining { drain_id },
+                    ) => drain_id.clone(),
+                    (FoldPublicationPlan::Ordinary { .. }, FoldLifecycleMode::Open) => {
+                        "pending-stream-fold-operation".to_string()
+                    }
+                    (
+                        FoldPublicationPlan::Ordinary { .. },
+                        FoldLifecycleMode::Draining { drain_id },
+                    ) => drain_id.clone(),
                 },
                 graph_commit_id: Some(lineage.graph_commit_id.clone()),
                 exact_generation_cut: StreamGenerationCut {
@@ -3566,14 +3745,15 @@ impl Omnigraph {
                     generation_path: cut.path.clone(),
                 },
                 outcome: LastFoldOutcome::Published,
-                input_rows: fold_rows,
-                input_bytes: fold_bytes,
-                visible_rows: fold_rows,
-                visible_bytes: fold_bytes,
+                input_rows,
+                input_bytes,
+                visible_rows,
+                visible_bytes,
                 recorded_at: lineage.created_at,
             });
-            let mut sidecar = match mode {
-                FoldLifecycleMode::Open => new_stream_fold_v2_sidecar_v14(
+            let mut sidecar = match (&publication, mode) {
+                (FoldPublicationPlan::Ordinary { attribution, .. }, FoldLifecycleMode::Open) => {
+                    new_stream_fold_v2_sidecar_v14(
                     pin,
                     authority,
                     recovery_lineage,
@@ -3589,8 +3769,12 @@ impl Omnigraph {
                     token_planned_transaction,
                     attribution.token_rows.clone(),
                     attribution.summary.clone(),
-                )?,
-                FoldLifecycleMode::Draining { drain_id } => {
+                )?
+                }
+                (
+                    FoldPublicationPlan::Ordinary { attribution, .. },
+                    FoldLifecycleMode::Draining { drain_id },
+                ) => {
                     new_stream_drain_fold_sidecar_v14(
                         pin,
                         authority,
@@ -3615,26 +3799,131 @@ impl Omnigraph {
                         attribution.summary.clone(),
                     )?
                 }
+                (FoldPublicationPlan::DeadLetter(plan), mode) => {
+                    let terminal_rows = plan
+                        .token_rows
+                        .iter()
+                        .filter(|row| row.disposition == StreamTokenDisposition::DeadLettered)
+                        .map(|row| (row.logical_id.as_str(), row))
+                        .collect::<BTreeMap<_, _>>();
+                    let candidates = plan
+                        .object
+                        .ordered_candidates()
+                        .map(|candidate| {
+                            let terminal_authority = (**terminal_rows
+                                .get(candidate.logical_id)
+                                .ok_or_else(|| {
+                                    OmniError::manifest_internal(format!(
+                                        "dead-letter object candidate '{}' has no terminal token row",
+                                        candidate.logical_id
+                                    ))
+                                })?)
+                            .clone();
+                            Ok(RecoveryStreamDeadLetterCandidateV21 {
+                                terminal_authority,
+                                canonical_ndjson_line: candidate.canonical_ndjson_line.to_string(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let drain_authority = match mode {
+                        FoldLifecycleMode::Open => None,
+                        FoldLifecycleMode::Draining { drain_id } => {
+                            Some(RecoveryStreamDrainFoldAuthorityV14 {
+                                drain_id: drain_id.clone(),
+                                recomputed_lww_projection_digest: recomputed_drain_lww
+                                    .clone()
+                                    .ok_or_else(|| {
+                                        OmniError::manifest_internal(
+                                            "dead-letter drain fold omitted its recomputed LWW projection",
+                                        )
+                                    })?,
+                            })
+                        }
+                    };
+                    new_stream_dead_letter_fold_sidecar_v21(
+                        plan.object.descriptor().fold_operation_id.clone(),
+                        pin,
+                        authority,
+                        recovery_lineage,
+                        live.version(),
+                        live.stream_profile().clone(),
+                        prepared.lifecycle.clone(),
+                        current_claim_receipt,
+                        drain_authority,
+                        next_lifecycle,
+                        prior_merged,
+                        generation_cut,
+                        planned_transaction,
+                        prepared.txn.base.stream_token_authority().clone(),
+                        token_planned_transaction,
+                        plan.token_rows.clone(),
+                        candidates,
+                        plan.attribution.clone(),
+                    )?
+                }
             };
             let handle = write_sidecar(self.root_uri(), self.storage_adapter(), &sidecar).await?;
 
-            // The armed-but-no-effect cell: the intent is durable while both
-            // exact Lance participants are still untouched.  Recovery must
-            // retire it effect-free rather than publish or adopt anything.
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::STREAM_FOLD_POST_SIDECAR_PRE_BASE_COMMIT,
-            )
-            .map_err(|error| {
-                OmniError::recovery_required(
-                    handle.operation_id.clone(),
-                    format!("stream fold stopped after arming its recovery intent: {error}"),
-                )
-            })?;
+            match &publication {
+                FoldPublicationPlan::Ordinary { .. } => {
+                    // The armed-but-no-effect cell: the intent is durable while
+                    // both exact Lance participants are still untouched.
+                    crate::failpoints::maybe_fail(
+                        crate::failpoints::names::STREAM_FOLD_POST_SIDECAR_PRE_BASE_COMMIT,
+                    )
+                    .map_err(|error| {
+                        OmniError::recovery_required(
+                            handle.operation_id.clone(),
+                            format!(
+                                "stream fold stopped after arming its recovery intent: {error}"
+                            ),
+                        )
+                    })?;
+                }
+                FoldPublicationPlan::DeadLetter(plan) => {
+                    crate::failpoints::maybe_fail(
+                        crate::failpoints::names::STREAM_DEAD_LETTER_POST_SIDECAR_PRE_OBJECT,
+                    )
+                    .map_err(|error| {
+                        OmniError::recovery_required(
+                            handle.operation_id.clone(),
+                            format!(
+                                "dead-letter fold stopped before its object effect: {error}"
+                            ),
+                        )
+                    })?;
+                    create_or_verify_stream_dead_letter_object(
+                        self.storage_adapter(),
+                        self.root_uri(),
+                        &plan.object,
+                    )
+                    .await
+                    .map_err(|error| {
+                        OmniError::recovery_required(
+                            handle.operation_id.clone(),
+                            format!("dead-letter object requires recovery: {error}"),
+                        )
+                    })?;
+                    crate::failpoints::maybe_fail(
+                        crate::failpoints::names::STREAM_DEAD_LETTER_POST_OBJECT_PRE_BASE_COMMIT,
+                    )
+                    .map_err(|error| {
+                        OmniError::recovery_required(
+                            handle.operation_id.clone(),
+                            format!(
+                                "dead-letter fold stopped after its object effect: {error}"
+                            ),
+                        )
+                    })?;
+                }
+            }
 
             let base_outcome = match self.storage().commit_staged_exact(final_head, staged).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    if error.is_retryable_commit_conflict() {
+                    if matches!(&publication, FoldPublicationPlan::Ordinary { .. })
+                        && error.is_retryable_commit_conflict()
+                    {
                         let effect_free = finalize_effect_free_stream_fold_sidecar_v14(
                             self.root_uri(),
                             &self.storage,
@@ -3704,13 +3993,28 @@ impl Omnigraph {
             {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    let recovered = complete_stream_fold_sidecar_v14(
-                        self.root_uri(),
-                        Arc::clone(&self.storage),
-                        &live,
-                        &sidecar,
-                    )
-                    .await;
+                    let recovered = match &publication {
+                        FoldPublicationPlan::Ordinary { .. } => {
+                            complete_stream_fold_sidecar_v14(
+                                self.root_uri(),
+                                Arc::clone(&self.storage),
+                                &live,
+                                &sidecar,
+                            )
+                            .await
+                            .map(|_| ())
+                        }
+                        FoldPublicationPlan::DeadLetter(_) => {
+                            complete_stream_dead_letter_fold_sidecar_v21(
+                                self.root_uri(),
+                                Arc::clone(&self.storage),
+                                &live,
+                                &sidecar,
+                            )
+                            .await
+                            .map(|_| ())
+                        }
+                    };
                     if recovered.is_ok() {
                         self.refresh_coordinator_only().await?;
                         return Ok(FoldAttempt::Published);
@@ -3758,39 +4062,82 @@ impl Omnigraph {
                 OmniError::recovery_required(handle.operation_id.clone(), error.to_string())
             })?;
             let achieved_token_head = next_token_authority.current_head_witness.clone();
-            confirm_stream_fold_sidecar_v14(
-                self.root_uri(),
-                self.storage_adapter(),
-                &mut sidecar,
-                base_outcome.committed_transaction().clone(),
-                MergedGeneration::new(key.shard_id, cut.generation),
-                achieved_base_head,
-                crate::db::SubTableUpdate {
-                    identity: key.identity,
-                    table_key: table_key.to_string(),
-                    table_version: base_state.version,
-                    table_branch: None,
-                    row_count: base_state.row_count,
-                    version_metadata: base_version_metadata,
-                },
-                token_outcome.committed_transaction().clone(),
-                achieved_token_head,
-                next_token_authority,
-            )
-            .await
+            let base_update = crate::db::SubTableUpdate {
+                identity: key.identity,
+                table_key: table_key.to_string(),
+                table_version: base_state.version,
+                table_branch: None,
+                row_count: base_state.row_count,
+                version_metadata: base_version_metadata,
+            };
+            match &publication {
+                FoldPublicationPlan::Ordinary { .. } => {
+                    confirm_stream_fold_sidecar_v14(
+                        self.root_uri(),
+                        self.storage_adapter(),
+                        &mut sidecar,
+                        base_outcome.committed_transaction().clone(),
+                        MergedGeneration::new(key.shard_id, cut.generation),
+                        achieved_base_head,
+                        base_update,
+                        token_outcome.committed_transaction().clone(),
+                        achieved_token_head,
+                        next_token_authority,
+                    )
+                    .await
+                }
+                FoldPublicationPlan::DeadLetter(plan) => {
+                    confirm_stream_dead_letter_fold_sidecar_v21(
+                        self.root_uri(),
+                        self.storage_adapter(),
+                        &mut sidecar,
+                        plan.object.descriptor().clone(),
+                        RecoveryStreamDeadLetterBaseConfirmationV21 {
+                            committed_transaction: base_outcome
+                                .committed_transaction()
+                                .clone(),
+                            merged_generation: MergedGeneration::new(
+                                key.shard_id,
+                                cut.generation,
+                            ),
+                            achieved_head: achieved_base_head,
+                            update: base_update,
+                        },
+                        token_outcome.committed_transaction().clone(),
+                        achieved_token_head,
+                        next_token_authority,
+                    )
+                    .await
+                }
+            }
             .map_err(|error| {
                 OmniError::recovery_required(
                     handle.operation_id.clone(),
                     format!("stream fold confirmation requires recovery: {error}"),
                 )
             })?;
-            complete_stream_fold_sidecar_v14(
-                self.root_uri(),
-                Arc::clone(&self.storage),
-                &live,
-                &sidecar,
-            )
-            .await
+            match &publication {
+                FoldPublicationPlan::Ordinary { .. } => {
+                    complete_stream_fold_sidecar_v14(
+                        self.root_uri(),
+                        Arc::clone(&self.storage),
+                        &live,
+                        &sidecar,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+                FoldPublicationPlan::DeadLetter(_) => {
+                    complete_stream_dead_letter_fold_sidecar_v21(
+                        self.root_uri(),
+                        Arc::clone(&self.storage),
+                        &live,
+                        &sidecar,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            }
             .map_err(|error| {
                 OmniError::recovery_required(
                     handle.operation_id,
@@ -6602,6 +6949,7 @@ impl Omnigraph {
 enum FoldAttempt {
     Published,
     EffectFree(OmniError),
+    NeedsStrictBlock,
 }
 
 async fn lookup_base_stream_metadata(
@@ -7556,6 +7904,228 @@ async fn scan_fresh_generation(
         ));
     }
     Ok(batches)
+}
+
+/// Partition one authenticated final-LWW generation into graph-visible rows
+/// and terminal data-conflict candidates.
+///
+/// Validation is repeated after removing every conflict component discovered
+/// in a round. This matters for constraints such as cardinality-min: removing
+/// one violating edge can expose another key-local violation. Each successful
+/// round removes at least one generation key, so convergence is bounded by the
+/// already-enforced 8,192-row generation limit. A validator without structured
+/// current-key evidence remains a structural fault and fails closed.
+async fn partition_fold_data_conflicts(
+    table_key: &str,
+    identity: TableIdentity,
+    batches: &[RecordBatch],
+    attribution: &AttributedFoldPlan,
+    constraints: &[crate::validate::Constraint],
+    committed: &CommittedState<'_>,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+) -> Result<FoldConflictPartition> {
+    let mut remaining =
+        super::stream_correction::physical_rows_by_logical_id(table_key, identity, batches)?;
+    let mut authorities = attribution
+        .token_rows
+        .iter()
+        .map(|row| (row.logical_id.clone(), row.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if remaining.len() != authorities.len() || !remaining.keys().eq(authorities.keys()) {
+        return Err(OmniError::manifest_internal(
+            "stream dead-letter row projection differs from attributed winner keys",
+        ));
+    }
+
+    let mut diverted = BTreeMap::<String, DivertedFoldCandidatePlan>::new();
+    while !remaining.is_empty() {
+        let current_batches = remaining.values().cloned().collect::<Vec<_>>();
+        let mut changeset = ChangeSet::new();
+        changeset.insert(
+            table_key.to_string(),
+            TableChange {
+                added: Vec::new(),
+                changed: current_batches,
+                deleted_ids: Vec::new(),
+            },
+        );
+        let winner_tokens = remaining
+            .keys()
+            .map(|logical_id| {
+                let row = authorities
+                    .get(logical_id)
+                    .expect("row/authority key sets checked and removed together");
+                (logical_id.clone(), row.current_token.to_string())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut collector = DataBlockEvidenceCollector::new(table_key, &winner_tokens);
+        crate::validate::evaluate_with_sink(
+            constraints,
+            &changeset,
+            committed,
+            catalog,
+            |violation| collector.push(&violation),
+        )
+        .await?;
+        let Some(view) = collector.finish_with_view()? else {
+            break;
+        };
+
+        let mut round = BTreeMap::<String, BTreeSet<String>>::new();
+        for entry in view.entries {
+            if !remaining.contains_key(&entry.logical_key) {
+                return Err(OmniError::manifest_internal(format!(
+                    "stream validator selected non-generation dead-letter key '{}'",
+                    entry.logical_key
+                )));
+            }
+            round
+                .entry(entry.logical_key)
+                .or_default()
+                .insert(entry.violation_code);
+        }
+        if round.is_empty() {
+            return Err(OmniError::manifest_internal(
+                "stream validator reported a data conflict without a terminal generation key",
+            ));
+        }
+
+        for (logical_id, violation_codes) in round {
+            let row = remaining
+                .remove(&logical_id)
+                .expect("round keys were checked against remaining rows");
+            let authority = authorities
+                .remove(&logical_id)
+                .expect("row/authority key sets remain paired");
+            diverted.insert(
+                logical_id.clone(),
+                DivertedFoldCandidatePlan {
+                    logical_id,
+                    row,
+                    authority,
+                    violation_codes,
+                },
+            );
+        }
+    }
+
+    if remaining.len() != authorities.len() || !remaining.keys().eq(authorities.keys()) {
+        return Err(OmniError::manifest_internal(
+            "stream dead-letter partition lost row/token pairing",
+        ));
+    }
+    Ok(FoldConflictPartition {
+        visible_batches: remaining.into_values().collect(),
+        visible_token_rows: authorities.into_values().collect(),
+        diverted: diverted.into_values().collect(),
+    })
+}
+
+fn dead_letter_reason_code(codes: &BTreeSet<String>) -> Result<StreamDeadLetterReasonCode> {
+    if codes.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "dead-letter candidate has no validator reason",
+        ));
+    }
+    if codes.len() > 1 {
+        return Ok(StreamDeadLetterReasonCode::MultipleValidationViolations);
+    }
+    match codes.iter().next().expect("non-empty reason set").as_str() {
+        "ORPHAN_EDGE" => Ok(StreamDeadLetterReasonCode::OrphanEdge),
+        "UNIQUE_VIOLATION" => Ok(StreamDeadLetterReasonCode::UniqueViolation),
+        "CARDINALITY_VIOLATION" => Ok(StreamDeadLetterReasonCode::CardinalityViolation),
+        "VALUE_CONSTRAINT_VIOLATION" => Ok(StreamDeadLetterReasonCode::ValueConstraintViolation),
+        "CORRECTION_VIEW_OVERFLOW" => Ok(StreamDeadLetterReasonCode::CorrectionViewOverflow),
+        code => Err(OmniError::manifest_internal(format!(
+            "validator reason '{code}' is not a dead-letter data-conflict code"
+        ))),
+    }
+}
+
+fn prepare_dead_letter_fold(
+    fold_operation_id: &str,
+    partition: FoldConflictPartition,
+) -> Result<PreparedDeadLetterFold> {
+    if partition.diverted.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "dead-letter fold preparation requires at least one diverted candidate",
+        ));
+    }
+
+    let canonical_payloads = partition
+        .diverted
+        .iter()
+        .map(|candidate| {
+            if candidate.row.num_rows() != 1 {
+                return Err(OmniError::manifest_internal(
+                    "dead-letter candidate projection must contain exactly one row",
+                ));
+            }
+            super::canonical_stream_payload_v1(&candidate.row, 0)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let reason_codes = partition
+        .diverted
+        .iter()
+        .map(|candidate| dead_letter_reason_code(&candidate.violation_codes))
+        .collect::<Result<Vec<_>>>()?;
+    let object_candidates = partition
+        .diverted
+        .iter()
+        .zip(&reason_codes)
+        .zip(&canonical_payloads)
+        .map(|((candidate, reason_code), canonical_payload)| {
+            StreamDeadLetterObjectCandidate::from_present_winner(
+                &candidate.authority,
+                *reason_code,
+                canonical_payload,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let object = prepare_stream_dead_letter_object(fold_operation_id, &object_candidates)?;
+    let ordinals = object
+        .candidate_ordinals()
+        .iter()
+        .map(|entry| (entry.logical_id.as_str(), entry.candidate_ordinal))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut token_rows = partition.visible_token_rows;
+    for (candidate, reason_code) in partition.diverted.iter().zip(reason_codes) {
+        let candidate_ordinal = *ordinals.get(candidate.logical_id.as_str()).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "dead-letter object omitted candidate '{}'",
+                candidate.logical_id
+            ))
+        })?;
+        token_rows.push(
+            StreamTokenAuthorityRow::dead_letter_present_winner(
+                &candidate.authority,
+                fold_operation_id.to_string(),
+                reason_code,
+                object.descriptor().clone(),
+                candidate_ordinal,
+            )
+            .map_err(|error| OmniError::manifest_internal(error.to_string()))?,
+        );
+    }
+    token_rows.sort_by(|left, right| left.logical_id.as_bytes().cmp(right.logical_id.as_bytes()));
+    validate_stream_token_plan_bounds(&token_rows)
+        .map_err(|error| OmniError::manifest(error.to_string()))?;
+    let attribution = stream_fold_attribution_commitment_v2(
+        &token_rows
+            .iter()
+            .filter(|row| row.disposition == StreamTokenDisposition::Present)
+            .cloned()
+            .collect::<Vec<_>>(),
+        object.descriptor().clone(),
+    )
+    .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    Ok(PreparedDeadLetterFold {
+        visible_batches: partition.visible_batches,
+        token_rows,
+        attribution,
+        object,
+    })
 }
 
 pub(super) async fn plan_fold_attribution(

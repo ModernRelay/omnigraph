@@ -382,6 +382,7 @@ impl Omnigraph {
             actor_id: lineage.actor_id,
             merged_parent_commit_id: lineage.merged_parent_commit_id,
             created_at: lineage.created_at,
+            stream_fold_attribution_v2: None,
         };
         let post_commit_pin = entry
             .table_version

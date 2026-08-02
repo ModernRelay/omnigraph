@@ -241,11 +241,7 @@ where
     // avoids acquiring a newly discovered admission lease inside the established
     // admission -> schema order. Adds in *this* apply have no prior lifecycle.
     db.refresh_coordinator_only().await?;
-    if let Some(error) = db
-        .current_canonical_stream_profile()
-        .await?
-        .retired_error()
-    {
+    if let Some(error) = db.current_canonical_stream_profile().await?.retired_error() {
         return Err(error);
     }
     let mut admission_keys = {
@@ -851,6 +847,7 @@ where
         actor_id: lineage_intent.actor_id.clone(),
         merged_parent_commit_id: lineage_intent.merged_parent_commit_id.clone(),
         created_at: lineage_intent.created_at,
+        stream_fold_attribution_v2: None,
     };
     let mut sidecar = crate::db::manifest::new_schema_apply_sidecar_v9(
         actor.map(str::to_string),

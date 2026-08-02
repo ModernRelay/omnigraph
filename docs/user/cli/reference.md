@@ -20,7 +20,7 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `commit list \| show` | inspect commit graph. `list` is newest-first; `--branch <name>` lists that branch's reachable history, omitted = `main` |
 | `schema plan \| apply \| show (alias: get)` | migrations. `apply` refuses a cluster-managed graph (one whose storage is inside a cluster) and points at `cluster apply` — those graphs evolve through the cluster ledger, not a direct apply |
 | `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
-| `cluster validate \| plan \| apply \| approve \| status \| refresh \| import \| force-unlock; cluster stream block show \| correct; cluster stream retire-for-rebuild plan \| confirm` | declarative cluster control plane. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state at `__cluster/state.json`, annotates dispositions, and embeds real schema-migration previews; `apply` converges the cluster — stored-query/policy catalog writes (content-addressed under `__cluster/resources/`), graph creates, schema updates (soft drops only; `--as` records the actor), and graph deletes behind a digest-bound approval from `cluster approve <resource> --as <actor>` (`apply`/`approve` default the actor from `~/.omnigraph/config.yaml`'s `operator.actor` when `--as` is omitted); what apply converges is what an `omnigraph-server --cluster <dir>` deployment serves on its next restart (`--cluster` is the server's only boot source — cluster-only); `status` reads the state ledger; `refresh`/`import` explicitly update local JSON state from read-only graph observations; `force-unlock <LOCK_ID>` manually removes a held local state lock by exact id; `stream block` is the stopped/offline inspection and correction surface for one exact strict drain block; `stream retire-for-rebuild` is the irreversible terminal-authority export/rebuild exit described below |
+| `cluster validate \| plan \| apply \| approve \| status \| refresh \| import \| force-unlock; cluster stream block show \| correct; cluster stream dead-letter list \| export; cluster stream retire-for-rebuild plan \| confirm` | declarative cluster control plane. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state at `__cluster/state.json`, annotates dispositions, and embeds real schema-migration previews; `apply` converges the cluster — stored-query/policy catalog writes (content-addressed under `__cluster/resources/`), graph creates, schema updates (soft drops only; `--as` records the actor), and graph deletes behind a digest-bound approval from `cluster approve <resource> --as <actor>` (`apply`/`approve` default the actor from `~/.omnigraph/config.yaml`'s `operator.actor` when `--as` is omitted); what apply converges is what an `omnigraph-server --cluster <dir>` deployment serves on its next restart (`--cluster` is the server's only boot source — cluster-only); `status` reads the state ledger; `refresh`/`import` explicitly update local JSON state from read-only graph observations; `force-unlock <LOCK_ID>` manually removes a held local state lock by exact id; `stream block` is the stopped/offline inspection and correction surface for one exact strict drain block; `stream dead-letter` lists selected current terminal authority or exports descriptor-verified payloads; `stream retire-for-rebuild` is the irreversible terminal-authority export/rebuild exit described below |
 | `optimize` | non-destructive Lance compaction + index reconciliation (blob-bearing tables use the normal path; tables with uncovered drift are skipped and `--json` reports `skipped`) |
 | `repair [--confirm] [--force]` | preview or explicitly publish uncovered manifest/head drift. `--confirm` heals verified maintenance drift and exits non-zero if suspicious/unverifiable drift is refused; `--force --confirm` publishes suspicious/unverifiable drift after operator review |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC (`--confirm` to execute; also needs `--yes` against a non-local `s3://` target — see *Write diagnostics & destructive confirmation*) |
@@ -200,7 +200,12 @@ omnigraph --graph <graph-id> --as <actor> cluster stream block correct node:Pers
   --config company-brain --block-token <token> --correction-id <uuid> \
   --expected-lifecycle-revision <revision> --plan correction.json \
   --confirm-stream-offline --json
-# When current WITHDRAWN authority blocks ordinary export:
+# Inspect current DEAD_LETTERED authority and descriptor-verified payloads:
+omnigraph --graph <graph-id> --as <actor> cluster stream dead-letter list \
+  --config company-brain --confirm-stream-offline --json
+omnigraph --graph <graph-id> --as <actor> cluster stream dead-letter export \
+  --config company-brain --confirm-stream-offline --json
+# When current WITHDRAWN or DEAD_LETTERED authority blocks ordinary export:
 omnigraph --graph <graph-id> --as <actor> cluster stream retire-for-rebuild plan \
   --config company-brain --confirm-stream-offline --json
 omnigraph --graph <graph-id> --as <actor> cluster stream retire-for-rebuild confirm \
@@ -233,9 +238,11 @@ experimental profile disables embedded/direct Mutation/Load/delete, does not
 yet add a public firehose endpoint, and should be followed by a server restart
 so served writes carry the checked runtime authority. Branch merge remains
 unavailable while that profile is `ENABLED` or `DISABLING`, even through the
-served runtime. A disable can finish only when there are no lanes or all
-existing lanes are already `SEALED`; it does not drain a non-`SEALED` lane or
-de-enroll an existing `SEALED` lane. `cluster
+served runtime. Offline disable publishes `DISABLING`, derives one finite
+manifest lane cut, and serially drains `OPEN`, goal-`SEALED`, and adopted
+`OPEN_AFTER_FOLD` lanes. A selected `DataBlock` leaves apply visibly pending
+until stopped/offline correction and an apply retry; disable never de-enrolls
+an existing `SEALED` lane. `cluster
 status` reads state only and reports any existing lock metadata. `force-unlock`
 removes a lock only when the supplied id exactly matches the lock file.
 `cluster stream block` is also separate from normal apply. Both `show` and
@@ -268,13 +275,22 @@ optional `--expected-plan-digest` makes a retry assert the exact
 engine-normalized plan. A correction UUID is an idempotency key: reuse it only
 for an exact retry of the same actor and plan.
 
+`cluster stream dead-letter` is also separate from normal apply. `list` and
+`export` require the same declared/applied graph, state lock, authenticated
+actor, settled recovery, and stopped-writer attestation. Both pin the exact
+manifest-selected current-token version and return one bounded page; pass the
+opaque `--cursor` for the next page. `list` returns current `DEAD_LETTERED`
+sequencing evidence. `export` additionally verifies the recovery-owned object
+descriptor and returns canonical payload entries. It never lists the object
+prefix or treats payload export as replay/import.
+
 `cluster stream retire-for-rebuild` is separate from normal apply. Both `plan`
 and `confirm` require a declared/applied graph, `state.lock: true`, an
 authenticated actor, the held state lock, settled cluster and graph recovery,
 and `--confirm-stream-offline`. The graph must be exactly `DISABLED`, every
 enrolled lane `SEALED`, base/token parity valid, and at least one current
-`WITHDRAWN` token. Planning is read-only. Confirm binds a canonical retirement
-UUID to the exact plan digest and irreversibly makes the source
+`WITHDRAWN` or `DEAD_LETTERED` token. Planning is read-only. Confirm binds a
+canonical retirement UUID to the exact plan digest and irreversibly makes the source
 read/query/status/export-only; export carries the selected root receipt plus a
 closed witness for the selected frozen branch member as provenance for a
 fresh-root rebuild. A fully `PRESENT` graph uses ordinary

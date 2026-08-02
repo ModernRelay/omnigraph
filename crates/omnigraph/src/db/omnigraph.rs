@@ -39,6 +39,7 @@ mod optimize;
 mod repair;
 mod schema_apply;
 mod stream_correction;
+pub(crate) mod stream_dead_letter;
 mod stream_driver;
 mod stream_enrollment;
 mod stream_ingest;
@@ -62,9 +63,9 @@ pub use stream_correction::{
 };
 #[doc(hidden)]
 pub use stream_profile::{
-    CheckedClusterApplyAuthority, CheckedClusterBlockAuthority, CheckedClusterMaintenanceAuthority,
-    CheckedClusterRetirementAuthority, CheckedClusterStreamRuntimeAuthority,
-    StreamingProfileResult,
+    CheckedClusterApplyAuthority, CheckedClusterBlockAuthority, CheckedClusterDeadLetterAuthority,
+    CheckedClusterMaintenanceAuthority, CheckedClusterRetirementAuthority,
+    CheckedClusterStreamRuntimeAuthority, StreamingProfileResult,
 };
 pub(crate) use stream_retirement::StreamAuthorityRetirementExportProvenance;
 #[cfg(test)]
@@ -72,7 +73,10 @@ pub(crate) use stream_retirement::{
     StreamAuthorityRetirementExportMember, retirement_export_cut_digest,
     retirement_live_branch_heads_digest,
 };
-pub use stream_retirement::{StreamAuthorityRetirementPlan, StreamAuthorityRetirementResult};
+pub use stream_retirement::{
+    StreamAuthorityRetirementPlan, StreamAuthorityRetirementResult, StreamDeadLetterEntry,
+    StreamDeadLetterPage, StreamDeadLetterPayloadEntry, StreamDeadLetterPayloadPage,
+};
 pub use stream_status::{StreamStatus, StreamTableStatus};
 pub use table_ops::PendingIndex;
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
@@ -4487,6 +4491,15 @@ edge WorksAt: Person -> Company
             self.inner.read_text_if_exists(uri).await
         }
 
+        async fn read_text_if_exists_bounded(
+            &self,
+            uri: &str,
+            max_bytes: u64,
+        ) -> Result<Option<String>> {
+            self.reads.lock().unwrap().push(uri.to_string());
+            self.inner.read_text_if_exists_bounded(uri, max_bytes).await
+        }
+
         async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
             self.writes.lock().unwrap().push(uri.to_string());
             self.inner.write_text(uri, contents).await
@@ -4554,6 +4567,14 @@ edge WorksAt: Person -> Company
 
         async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>> {
             self.inner.read_text_if_exists(uri).await
+        }
+
+        async fn read_text_if_exists_bounded(
+            &self,
+            uri: &str,
+            max_bytes: u64,
+        ) -> Result<Option<String>> {
+            self.inner.read_text_if_exists_bounded(uri, max_bytes).await
         }
 
         async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {

@@ -2611,13 +2611,15 @@ edge WorksAt: Person -> Company
             transaction_uuid: "18181818-1818-4818-8818-181818181818".to_string(),
             manifest_e_tag: None,
         };
-        let token_witness = crate::db::manifest::stream_authority_retirement_token_witness_digest(
-            &token_head,
-            3,
-            1,
-        )
-        .unwrap();
-        let receipt = crate::db::manifest::AuthorityRetirementReceipt::new(
+        let token_witness =
+            crate::db::manifest::stream_token::stream_authority_retirement_token_witness_digest_v2(
+                &token_head,
+                3,
+                1,
+                0,
+            )
+            .unwrap();
+        let receipt = crate::db::manifest::stream_token::AuthorityRetirementReceiptV2::new(
             retirement_digest('1'),
             &crate::db::manifest::stream_profile::ReceiptChainRef::genesis(),
             "11111111-1111-4111-8111-111111111111",
@@ -2632,13 +2634,14 @@ edge WorksAt: Person -> Company
             token_witness,
             3,
             1,
+            0,
             export_cut_digest,
             1_700_000_000_000_000,
         )
         .unwrap();
         let provenance = crate::db::StreamAuthorityRetirementExportProvenance {
             kind: "STREAM_AUTHORITY_RETIREMENT".to_string(),
-            receipt,
+            receipt: receipt.into(),
             source_schema_ir_hash: source_schema_ir_hash.to_string(),
             ordered_branch_member_digests,
             selected_member_index: 1,
@@ -2648,6 +2651,55 @@ edge WorksAt: Person -> Company
             "_omnigraph_export_provenance": provenance,
         })
         .to_string()
+    }
+
+    fn v18_retirement_provenance_line(source_schema_ir_hash: &str) -> String {
+        // Reuse the exact branch-cut proof above, but replace its current v2
+        // receipt with the frozen v18 receipt bytes an adjacent older binary
+        // writes. This makes the loader test exercise the real unchanged outer
+        // provenance wire rather than a synthetic version tag.
+        let mut provenance: JsonValue =
+            serde_json::from_str(&retirement_provenance_line(source_schema_ir_hash)).unwrap();
+        let receipt = &provenance["_omnigraph_export_provenance"]["receipt"];
+        let live_branch_heads_digest = receipt["live_branch_heads_digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let export_cut_digest = receipt["export_cut_digest"].as_str().unwrap().to_string();
+        let token_head = crate::db::manifest::CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 5,
+            transaction_uuid: "18181818-1818-4818-8818-181818181818".to_string(),
+            manifest_e_tag: None,
+        };
+        let token_witness = crate::db::manifest::stream_authority_retirement_token_witness_digest(
+            &token_head,
+            3,
+            1,
+        )
+        .unwrap();
+        let receipt = crate::db::manifest::AuthorityRetirementReceipt::new(
+            retirement_digest('1'),
+            &crate::db::manifest::stream_profile::ReceiptChainRef::genesis(),
+            "11111111-1111-4111-8111-111111111111",
+            retirement_digest('2'),
+            "operator:alice",
+            18,
+            7,
+            live_branch_heads_digest,
+            2,
+            retirement_digest('4'),
+            token_head,
+            token_witness,
+            3,
+            1,
+            export_cut_digest,
+            1_700_000_000_000_000,
+        )
+        .unwrap();
+        provenance["_omnigraph_export_provenance"]["receipt"] =
+            serde_json::to_value(receipt).unwrap();
+        provenance.to_string()
     }
 
     #[test]
@@ -2910,6 +2962,45 @@ edge WorksAt: Person -> Company
                 .to_string()
                 .contains("export provenance must appear exactly once before logical rows"),
             "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_loader_accepts_frozen_v18_retired_export_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let txn = db.open_write_txn(None).await.unwrap();
+        let schema_ir_hash = txn.authority.schema_ir_hash.clone();
+        drop(txn);
+
+        let provenance_line = v18_retirement_provenance_line(&schema_ir_hash);
+        let encoded: JsonValue = serde_json::from_str(&provenance_line).unwrap();
+        let receipt = &encoded["_omnigraph_export_provenance"]["receipt"];
+        assert_eq!(receipt["source_internal_schema_version"], 18);
+        assert!(
+            receipt.get("dead_lettered_token_count").is_none(),
+            "the compatibility fixture must retain the exact frozen v1 receipt shape"
+        );
+
+        let input = format!("{provenance_line}\n{TEST_DATA}");
+        let result = load_jsonl(&mut db, &input, LoadMode::Overwrite)
+            .await
+            .expect("the current loader must rebuild a valid v18 retired export");
+        assert_eq!(result.nodes_loaded["Person"], 2);
+        assert_eq!(result.nodes_loaded["Company"], 1);
+        assert_eq!(db.stream_status().await.unwrap().profile_mode, "DISABLED");
+        let snapshot = db.snapshot().await;
+        assert_eq!(snapshot.stream_lifecycles().count(), 0);
+        assert_eq!(
+            snapshot
+                .open_stream_token_authority()
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            0
         );
     }
 

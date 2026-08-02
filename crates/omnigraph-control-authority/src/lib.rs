@@ -234,7 +234,7 @@ pub async fn acquire_state_lock(
 /// Operation class bound into a checked control-plane authority.
 ///
 /// The engine consumes this value; no caller-supplied boolean can retarget an
-/// already checked profile, maintenance, block-control, or retirement
+/// already checked profile, maintenance, block-control, dead-letter, or retirement
 /// operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorityOperationClass {
@@ -254,6 +254,12 @@ pub enum AuthorityOperationClass {
     /// `DISABLING` profile, while rebind and schema maintenance remain
     /// `DISABLED`-only.
     StreamBlockControl,
+    /// Read-only offline inspection of current dead-letter authority.
+    ///
+    /// Keeping this separate from maintenance and block correction prevents a
+    /// listing/export capability from being reused for a graph mutation. The
+    /// engine additionally binds it to one exact manifest/profile cut.
+    StreamDeadLetterControl,
     /// Irreversible, graph-wide stream-authority retirement for rebuild.
     ///
     /// This is deliberately distinct from ordinary offline maintenance.  A
@@ -271,6 +277,7 @@ impl AuthorityOperationClass {
             Self::StreamProfileDisable => Some(false),
             Self::StreamMaintenance
             | Self::StreamBlockControl
+            | Self::StreamDeadLetterControl
             | Self::StreamAuthorityRetirement
             | Self::StreamRuntime => None,
         }
@@ -281,7 +288,8 @@ impl AuthorityOperationClass {
             Self::StreamProfileEnable
             | Self::StreamProfileDisable
             | Self::StreamMaintenance
-            | Self::StreamBlockControl => Some("apply"),
+            | Self::StreamBlockControl
+            | Self::StreamDeadLetterControl => Some("apply"),
             Self::StreamAuthorityRetirement => Some(STREAM_AUTHORITY_RETIREMENT_LOCK_OPERATION),
             Self::StreamRuntime => None,
         }
@@ -381,7 +389,7 @@ impl ValidatedOfflineGuard<'_> {
 /// Validate and mint one offline streaming authority under the actual state
 /// lock.
 ///
-/// Profile changes, maintenance, block control, and authority retirement
+/// Profile changes, maintenance, block control, dead-letter inspection, and authority retirement
 /// deliberately share the same concrete stopped-process proof. Their engine
 /// capabilities remain distinct: this lower guard cannot turn one operation
 /// class into another.
@@ -391,7 +399,7 @@ pub async fn validate_offline_guard<'lock>(
 ) -> Result<ValidatedOfflineGuard<'lock>, AuthorityError> {
     let Some(required_lock_operation) = request.operation.offline_lock_operation() else {
         return Err(invalid_binding(
-            "offline guard operation must be a streaming profile transition, stream maintenance, stream-block control, or stream-authority retirement",
+            "offline guard operation must be a streaming profile transition, stream maintenance, stream-block control, stream dead-letter control, or stream-authority retirement",
         ));
     };
     if lock.operation() != required_lock_operation {
@@ -407,6 +415,9 @@ pub async fn validate_offline_guard<'lock>(
             }
             AuthorityOperationClass::StreamBlockControl => {
                 "stream-block control requires explicit confirm_stream_offline"
+            }
+            AuthorityOperationClass::StreamDeadLetterControl => {
+                "stream dead-letter control requires explicit confirm_stream_offline"
             }
             AuthorityOperationClass::StreamAuthorityRetirement => {
                 "stream-authority retirement requires explicit confirm_stream_offline"
@@ -1166,6 +1177,37 @@ mod tests {
         );
         drop(block_control);
 
+        let dead_letter_control = validate_offline_guard(
+            &lock,
+            OfflineAuthorityRequest {
+                graph_id: "knowledge",
+                graph_store_uri: &graph_store,
+                expected_state_cas: &state_cas,
+                state_revision: 7,
+                declaration_revision: "stream-dead-letter-declaration-v1",
+                declaration_digest: "stream-dead-letter-declaration",
+                expected_profile_revision: 1,
+                operation_id: "dead-letter-page",
+                operation: AuthorityOperationClass::StreamDeadLetterControl,
+                actor: "operator",
+                confirm_stream_offline: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dead_letter_control.operation(),
+            AuthorityOperationClass::StreamDeadLetterControl
+        );
+        assert_eq!(dead_letter_control.operation_id(), "dead-letter-page");
+        assert_eq!(
+            dead_letter_control
+                .operation()
+                .requested_streaming_enabled(),
+            None
+        );
+        drop(dead_letter_control);
+
         std::fs::write(
             dir.path().join(CLUSTER_LOCK_FILE),
             serde_json::json!({
@@ -1427,6 +1469,28 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             block_control,
+            AuthorityError::RuntimeStillRegistered { .. }
+        ));
+        let dead_letter_control = validate_offline_guard(
+            &lock,
+            OfflineAuthorityRequest {
+                graph_id: "knowledge",
+                graph_store_uri: &graph_store,
+                expected_state_cas: &state_cas,
+                state_revision: 11,
+                declaration_revision: "stream-declaration-v1",
+                declaration_digest: "stream-declaration",
+                expected_profile_revision: 4,
+                operation_id: "dead-letter-while-running",
+                operation: AuthorityOperationClass::StreamDeadLetterControl,
+                actor: "operator",
+                confirm_stream_offline: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            dead_letter_control,
             AuthorityError::RuntimeStillRegistered { .. }
         ));
         drop(lock);

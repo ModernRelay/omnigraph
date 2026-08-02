@@ -9,42 +9,49 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, StringArray};
+use base64::Engine;
 use datafusion::prelude::col;
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedMutexGuard, OwnedRwLockWriteGuard};
 
-use super::{CheckedClusterRetirementAuthority, Omnigraph};
+use super::stream_dead_letter::{
+    DecodedStreamDeadLetterObjectEntry, verify_stream_dead_letter_object,
+};
+use super::{CheckedClusterDeadLetterAuthority, CheckedClusterRetirementAuthority, Omnigraph};
 #[cfg(feature = "failpoints")]
 use crate::db::manifest::ManifestChange;
 use crate::db::manifest::stream::stream_graph_identity_digest;
 #[cfg(feature = "failpoints")]
 use crate::db::manifest::stream_token::StreamTerminalCorrection;
 use crate::db::manifest::stream_token::{
+    AUTHORITY_RETIREMENT_RECEIPT_V2_TAG, AuthorityRetirementReceiptV2,
+    StreamDeadLetterObjectDescriptor, StreamDeadLetterReasonCode, StreamDeadLetterTerminalEvidence,
     StreamTokenDisposition, TrustedStreamRowMetadata, decode_trusted_stream_metadata,
-    validate_authority_base_pair,
+    stream_authority_retirement_token_witness_digest_v2, validate_authority_base_pair,
 };
 #[cfg(feature = "failpoints")]
 use crate::db::manifest::token_store::stage_stream_token_upsert;
 use crate::db::manifest::token_store::{
-    LifecycleLedgerRecord, scan_current_stream_token_batches, stream_token_rows_for_keys,
-    stream_token_rows_from_batch,
+    LifecycleLedgerRecord, lookup_authority_retirement_receipt_v2,
+    scan_current_stream_token_batches, stage_authority_retirement_receipt_v2,
+    stream_token_rows_for_keys, stream_token_rows_from_batch,
 };
 use crate::db::manifest::{
     AuthorityRetirementReceipt, INTERNAL_MANIFEST_SCHEMA_VERSION, RecoveryAuthorityToken,
-    RecoveryStreamAuthorityRetirementOutcomeV19, StreamLifecycle, StreamProfileEntry,
-    StreamProfileMode, TableIdentity, complete_stream_authority_retirement_sidecar_v19,
-    confirm_stream_authority_retirement_sidecar_v19, lookup_authority_retirement_receipt,
-    lookup_lifecycle_ledger_record_by_id, new_stream_authority_retirement_sidecar_v19,
-    open_stream_token_authority_head, stage_authority_retirement_receipt,
+    RecoveryStreamAuthorityRetirementOutcomeV21, StreamLifecycle, StreamProfileEntry,
+    StreamProfileMode, TableIdentity, complete_stream_authority_retirement_sidecar_v21,
+    confirm_stream_authority_retirement_sidecar_v21, lookup_lifecycle_ledger_record_by_id,
+    new_stream_authority_retirement_sidecar_v21, open_stream_token_authority_head,
     stream_token_authority_entry_for_dataset, write_sidecar,
 };
 use crate::db::write_queue::StreamAdmissionKey;
 use crate::error::{OmniError, Result};
+use crate::storage::join_uri;
 use crate::storage_layer::{SnapshotHandle, StagedHandle};
 
-const PLAN_DOMAIN: &[u8] = b"omnigraph.stream-authority-retirement-plan.v1\0";
+const PLAN_DOMAIN: &[u8] = b"omnigraph.stream-authority-retirement-plan.v2\0";
 const BRANCH_HEADS_DOMAIN: &[u8] = b"omnigraph.stream-authority-retirement-live-branch-heads.v1\0";
 const LIFECYCLE_PROOF_DOMAIN: &[u8] = b"omnigraph.stream-authority-retirement-lifecycle-proof.v1\0";
 const EXPORT_CUT_DOMAIN: &[u8] = b"omnigraph.stream-authority-retirement-export-cut.v1\0";
@@ -53,6 +60,12 @@ const EXPORT_BRANCH_MEMBER_DOMAIN: &[u8] =
 const EXPORT_TABLE_WITNESS_DOMAIN: &[u8] =
     b"omnigraph.stream-authority-retirement-export-table-witness.v1\0";
 const EXPORT_PROVENANCE_KIND: &str = "STREAM_AUTHORITY_RETIREMENT";
+const DEAD_LETTER_PAGE_ENTRIES: usize = 256;
+const DEAD_LETTER_PAGE_SERIALIZED_BYTES: usize = 256 * 1024 * 1024;
+const DEAD_LETTER_PAGE_ENVELOPE_BYTES: usize = 64 * 1024;
+const DEAD_LETTER_CURSOR_MAX_DECODED_BYTES: usize = 4 * 1024;
+const DEAD_LETTER_CURSOR_MAX_ENCODED_BYTES: usize =
+    DEAD_LETTER_CURSOR_MAX_DECODED_BYTES.div_ceil(3) * 4;
 
 /// Complete in-process writer envelope retained through retirement planning or
 /// publication. The durable cluster lock remains the cross-process fence.
@@ -77,6 +90,7 @@ pub struct StreamAuthorityRetirementPlan {
     pub pre_retirement_token_witness_digest: String,
     pub present_token_count: u64,
     pub withdrawn_token_count: u64,
+    pub dead_lettered_token_count: u64,
     pub export_cut_digest: String,
 }
 
@@ -91,6 +105,100 @@ pub struct StreamAuthorityRetirementResult {
     pub manifest_version: u64,
     pub present_token_count: u64,
     pub withdrawn_token_count: u64,
+    pub dead_lettered_token_count: u64,
+}
+
+/// Current manifest-selected DEAD_LETTERED authority for one logical key.
+/// Object references are descriptor-selected; no object-store inventory is
+/// exposed or consulted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDeadLetterEntry {
+    pub stable_table_id: u64,
+    pub table_incarnation_id: u64,
+    pub table_key: String,
+    pub logical_id: String,
+    pub stream_incarnation_id: String,
+    pub occurrence_token: String,
+    pub predecessor_token: Option<String>,
+    pub write_id: String,
+    pub contributor_id: String,
+    pub payload_digest: String,
+    pub reason_code: String,
+    pub fold_operation_id: String,
+    pub object_location: String,
+    pub object_digest: String,
+    pub object_encoded_length: u64,
+    pub object_candidate_count: u64,
+    pub candidate_ordinal: u64,
+}
+
+/// One bounded canonical page of current terminal authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDeadLetterPage {
+    pub source_manifest_version: u64,
+    pub source_profile_revision: u64,
+    pub token_table_version: u64,
+    pub token_transaction_uuid: String,
+    pub entries: Vec<StreamDeadLetterEntry>,
+    pub next_cursor: Option<String>,
+}
+
+/// Descriptor-verified payload for one current DEAD_LETTERED key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDeadLetterPayloadEntry {
+    pub authority: StreamDeadLetterEntry,
+    pub payload: serde_json::Value,
+}
+
+/// One bounded payload-export page from the exact manifest/token cut.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDeadLetterPayloadPage {
+    pub source_manifest_version: u64,
+    pub source_profile_revision: u64,
+    pub token_table_version: u64,
+    pub token_transaction_uuid: String,
+    pub entries: Vec<StreamDeadLetterPayloadEntry>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct StreamDeadLetterKey {
+    identity: TableIdentity,
+    logical_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedStreamDeadLetterEntry {
+    key: StreamDeadLetterKey,
+    public: StreamDeadLetterEntry,
+    descriptor: StreamDeadLetterObjectDescriptor,
+    evidence: StreamDeadLetterTerminalEvidence,
+    stream_incarnation_id: String,
+}
+
+struct CapturedStreamDeadLetterPage {
+    source_manifest_version: u64,
+    source_profile_revision: u64,
+    token_table_version: u64,
+    token_transaction_uuid: String,
+    entries: Vec<CapturedStreamDeadLetterEntry>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamDeadLetterCursor {
+    source_manifest_version: u64,
+    source_profile_revision: u64,
+    token_table_version: u64,
+    token_transaction_uuid: String,
+    last_stable_table_id: u64,
+    last_table_incarnation_id: u64,
+    last_logical_id: String,
 }
 
 /// Exact frozen branch member named by one retired export. The receipt binds
@@ -106,6 +214,52 @@ pub(crate) struct StreamAuthorityRetirementExportMember {
     pub(crate) branch_member_digest: String,
 }
 
+/// Frozen retirement receipt carried by a rebuild export.
+///
+/// The outer provenance shape predates F5. V18 exporters wrote the v1
+/// PRESENT/WITHDRAWN receipt, while current exporters write the v2
+/// PRESENT/WITHDRAWN/DEAD_LETTERED receipt. Keeping the version choice inside
+/// this untagged field preserves both exact historical wire shapes; the
+/// receipt's own protocol version, tag, and canonical commitment remain the
+/// authoritative discriminator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum StreamAuthorityRetirementExportReceipt {
+    V2(AuthorityRetirementReceiptV2),
+    V1(AuthorityRetirementReceipt),
+}
+
+impl StreamAuthorityRetirementExportReceipt {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::V2(receipt) => {
+                receipt.validate()?;
+                Ok(())
+            }
+            Self::V1(receipt) => receipt.validate(),
+        }
+    }
+
+    fn export_cut_digest(&self) -> &str {
+        match self {
+            Self::V2(receipt) => &receipt.export_cut_digest,
+            Self::V1(receipt) => &receipt.export_cut_digest,
+        }
+    }
+}
+
+impl From<AuthorityRetirementReceiptV2> for StreamAuthorityRetirementExportReceipt {
+    fn from(receipt: AuthorityRetirementReceiptV2) -> Self {
+        Self::V2(receipt)
+    }
+}
+
+impl From<AuthorityRetirementReceipt> for StreamAuthorityRetirementExportReceipt {
+    fn from(receipt: AuthorityRetirementReceipt) -> Self {
+        Self::V1(receipt)
+    }
+}
+
 /// Closed import proof for one selected member of the receipt-bound frozen
 /// branch set. The ordered digest vector is the exact preimage of the flat
 /// root cut; the selected member carries the otherwise source-only table-cut
@@ -114,7 +268,7 @@ pub(crate) struct StreamAuthorityRetirementExportMember {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StreamAuthorityRetirementExportProvenance {
     pub(crate) kind: String,
-    pub(crate) receipt: AuthorityRetirementReceipt,
+    pub(crate) receipt: StreamAuthorityRetirementExportReceipt,
     /// Exact source-identity hash committed by the cut root. A rebuild mints a
     /// fresh graph identity, so this authenticates the source proof and is not
     /// compared with the target's accepted-IR hash.
@@ -224,7 +378,7 @@ impl StreamAuthorityRetirementExportProvenance {
             &self.source_schema_ir_hash,
             &self.ordered_branch_member_digests,
         )?;
-        if recomputed_cut != self.receipt.export_cut_digest {
+        if recomputed_cut != self.receipt.export_cut_digest() {
             return Err(OmniError::manifest(
                 "retirement export branch member is not in the receipt-bound export cut",
             ));
@@ -234,6 +388,352 @@ impl StreamAuthorityRetirementExportProvenance {
 }
 
 impl Omnigraph {
+    /// List current DEAD_LETTERED authority from the manifest-selected token
+    /// version. The page scan is bounded and never lists object prefixes or
+    /// walks token history.
+    #[doc(hidden)]
+    pub async fn list_stream_dead_letters(
+        &self,
+        authority: CheckedClusterDeadLetterAuthority<'_>,
+        cursor: Option<&str>,
+    ) -> Result<StreamDeadLetterPage> {
+        let _profile = self.write_queue().acquire_stream_profile_shared().await;
+        let captured = self
+            .capture_stream_dead_letter_page(&authority, cursor)
+            .await?;
+        let page = StreamDeadLetterPage {
+            source_manifest_version: captured.source_manifest_version,
+            source_profile_revision: captured.source_profile_revision,
+            token_table_version: captured.token_table_version,
+            token_transaction_uuid: captured.token_transaction_uuid,
+            entries: captured
+                .entries
+                .into_iter()
+                .map(|entry| entry.public)
+                .collect(),
+            next_cursor: captured.next_cursor,
+        };
+        enforce_dead_letter_page_bound("stream_dead_letter_list_page_bytes", &page)?;
+        Ok(page)
+    }
+
+    /// Export descriptor-verified dead-letter payloads for current terminal
+    /// authority. This adds Cedar `export` to the stopped/offline
+    /// `stream_manage` capability and reads only exact descriptor locations.
+    #[doc(hidden)]
+    pub async fn export_stream_dead_letter_payloads(
+        &self,
+        authority: CheckedClusterDeadLetterAuthority<'_>,
+        cursor: Option<&str>,
+    ) -> Result<StreamDeadLetterPayloadPage> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::Export,
+            &omnigraph_policy::ResourceScope::Graph,
+            Some(authority.actor()),
+        )?;
+        let _profile = self.write_queue().acquire_stream_profile_shared().await;
+        let captured = self
+            .capture_stream_dead_letter_page(&authority, cursor)
+            .await?;
+        let cut_cursor = |entry: &CapturedStreamDeadLetterEntry| {
+            encode_stream_dead_letter_cursor(&StreamDeadLetterCursor {
+                source_manifest_version: captured.source_manifest_version,
+                source_profile_revision: captured.source_profile_revision,
+                token_table_version: captured.token_table_version,
+                token_transaction_uuid: captured.token_transaction_uuid.clone(),
+                last_stable_table_id: entry.key.identity.stable_table_id,
+                last_table_incarnation_id: entry.key.identity.table_incarnation_id,
+                last_logical_id: entry.key.logical_id.clone(),
+            })
+        };
+
+        let mut entries = Vec::new();
+        let mut entries_bytes = 0_usize;
+        let mut stopped_before_end = false;
+        let mut cached_descriptor: Option<StreamDeadLetterObjectDescriptor> = None;
+        let mut cached_object = Vec::<DecodedStreamDeadLetterObjectEntry>::new();
+        for entry in &captured.entries {
+            if cached_descriptor.as_ref() != Some(&entry.descriptor) {
+                entry.descriptor.validate().map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "invalid descriptor-selected dead-letter object: {error}"
+                    ))
+                })?;
+                let object_uri = join_uri(self.root_uri(), &entry.descriptor.location);
+                let stored = self
+                    .storage_adapter()
+                    .read_text_if_exists_bounded(&object_uri, entry.descriptor.encoded_length)
+                    .await?
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "descriptor-selected dead-letter object '{}' is missing",
+                            entry.descriptor.location
+                        ))
+                    })?;
+                cached_object = verify_stream_dead_letter_object(&entry.descriptor, &stored)?;
+                cached_descriptor = Some(entry.descriptor.clone());
+            }
+            let ordinal = usize::try_from(entry.evidence.candidate_ordinal).map_err(|_| {
+                OmniError::manifest_internal("dead-letter candidate ordinal exceeds usize")
+            })?;
+            let decoded = cached_object.get(ordinal).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "dead-letter object '{}' omits selected candidate ordinal {}",
+                    entry.descriptor.location, entry.evidence.candidate_ordinal
+                ))
+            })?;
+            validate_dead_letter_payload_binding(entry, decoded)?;
+            let payload_entry = StreamDeadLetterPayloadEntry {
+                authority: entry.public.clone(),
+                payload: decoded.payload.clone(),
+            };
+            let encoded = serde_json::to_vec(&payload_entry).map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "failed to size dead-letter payload export entry: {error}"
+                ))
+            })?;
+            let next_bytes = entries_bytes.checked_add(encoded.len()).ok_or_else(|| {
+                OmniError::manifest_internal("dead-letter payload page byte count overflow")
+            })?;
+            let entry_budget =
+                DEAD_LETTER_PAGE_SERIALIZED_BYTES.saturating_sub(DEAD_LETTER_PAGE_ENVELOPE_BYTES);
+            if next_bytes > entry_budget {
+                if entries.is_empty() {
+                    return Err(OmniError::resource_limit(
+                        "stream_dead_letter_payload_entry_bytes",
+                        u64::try_from(entry_budget).unwrap_or(u64::MAX),
+                        u64::try_from(encoded.len()).unwrap_or(u64::MAX),
+                    ));
+                }
+                stopped_before_end = true;
+                break;
+            }
+            entries_bytes = next_bytes;
+            entries.push(payload_entry);
+        }
+
+        let next_cursor = if stopped_before_end {
+            let returned = captured
+                .entries
+                .get(entries.len().saturating_sub(1))
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "dead-letter payload pagination stopped without a returned entry",
+                    )
+                })?;
+            Some(cut_cursor(returned)?)
+        } else {
+            captured.next_cursor
+        };
+        let page = StreamDeadLetterPayloadPage {
+            source_manifest_version: captured.source_manifest_version,
+            source_profile_revision: captured.source_profile_revision,
+            token_table_version: captured.token_table_version,
+            token_transaction_uuid: captured.token_transaction_uuid,
+            entries,
+            next_cursor,
+        };
+        enforce_dead_letter_page_bound("stream_dead_letter_payload_page_bytes", &page)?;
+        Ok(page)
+    }
+
+    async fn capture_stream_dead_letter_page(
+        &self,
+        authority: &CheckedClusterDeadLetterAuthority<'_>,
+        encoded_cursor: Option<&str>,
+    ) -> Result<CapturedStreamDeadLetterPage> {
+        let main = self.open_coordinator_for_branch(None).await?;
+        let snapshot = main.snapshot();
+        authority.validate_profile(snapshot.stream_profile())?;
+        let token_authority = snapshot.stream_token_authority();
+        let token_head = &token_authority.current_head_witness;
+        if token_head.manifest_e_tag.is_some() {
+            return Err(OmniError::manifest_internal(
+                "dead-letter inspection requires the canonical token main witness with e-tag None",
+            ));
+        }
+
+        let cursor = encoded_cursor
+            .map(decode_stream_dead_letter_cursor)
+            .transpose()?;
+        if cursor.as_ref().is_some_and(|cursor| {
+            cursor.source_manifest_version != snapshot.version()
+                || cursor.source_profile_revision != snapshot.stream_profile().profile_revision
+                || cursor.token_table_version != token_head.table_version
+                || cursor.token_transaction_uuid != token_head.transaction_uuid
+        }) {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: "stream dead-letter cursor belongs to another manifest/profile/token cut"
+                    .to_string(),
+            });
+        }
+        let after = cursor.as_ref().map(|cursor| StreamDeadLetterKey {
+            identity: TableIdentity {
+                stable_table_id: cursor.last_stable_table_id,
+                table_incarnation_id: cursor.last_table_incarnation_id,
+            },
+            logical_id: cursor.last_logical_id.clone(),
+        });
+
+        let table_keys = snapshot
+            .entries()
+            .map(|entry| (entry.identity, entry.table_key.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let token_dataset = snapshot.open_stream_token_authority().await?;
+        let mut batches =
+            scan_current_stream_token_batches(&token_dataset, token_authority).await?;
+        let mut retained =
+            BTreeMap::<StreamDeadLetterKey, (CapturedStreamDeadLetterEntry, usize)>::new();
+        let mut retained_bytes = 0_usize;
+        let mut seen_after_cursor = 0_u64;
+        let entry_budget =
+            DEAD_LETTER_PAGE_SERIALIZED_BYTES.saturating_sub(DEAD_LETTER_PAGE_ENVELOPE_BYTES);
+        while let Some(batch) = batches
+            .try_next()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+        {
+            let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+                OmniError::manifest_internal("dead-letter token batch Arrow size exceeds u64")
+            })?;
+            if batch_bytes > crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES {
+                return Err(OmniError::resource_limit(
+                    "stream_dead_letter_token_batch_arrow_bytes",
+                    crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES,
+                    batch_bytes,
+                ));
+            }
+            for row in stream_token_rows_from_batch(&batch)? {
+                if row.disposition != StreamTokenDisposition::DeadLettered {
+                    continue;
+                }
+                let key = StreamDeadLetterKey {
+                    identity: row.identity,
+                    logical_id: row.logical_id.clone(),
+                };
+                if after.as_ref().is_some_and(|after| &key <= after) {
+                    continue;
+                }
+                seen_after_cursor = seen_after_cursor.checked_add(1).ok_or_else(|| {
+                    OmniError::manifest_internal("dead-letter current-token count overflow")
+                })?;
+                let table_key = table_keys.get(&row.identity).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "current DEAD_LETTERED token identity {} has no selected base table",
+                        row.identity
+                    ))
+                })?;
+                let lifecycle = snapshot.stream_lifecycle(row.identity).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "current DEAD_LETTERED token identity {} has no selected lifecycle",
+                        row.identity
+                    ))
+                })?;
+                if row.stream_incarnation_id != lifecycle.enrollment_receipt.stream_incarnation_id {
+                    return Err(OmniError::manifest_internal(format!(
+                        "current DEAD_LETTERED token for {} belongs to another stream incarnation",
+                        row.identity
+                    )));
+                }
+                let evidence = row
+                    .terminal_dead_letter
+                    .as_deref()
+                    .cloned()
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "DEAD_LETTERED current token has no terminal evidence",
+                        )
+                    })?;
+                let public = stream_dead_letter_public_entry(&row, table_key, &evidence);
+                let encoded_bytes = serde_json::to_vec(&public).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to size stream dead-letter entry: {error}"
+                    ))
+                })?;
+                if encoded_bytes.len() > entry_budget {
+                    return Err(OmniError::resource_limit(
+                        "stream_dead_letter_list_entry_bytes",
+                        u64::try_from(entry_budget).unwrap_or(u64::MAX),
+                        u64::try_from(encoded_bytes.len()).unwrap_or(u64::MAX),
+                    ));
+                }
+                let captured = CapturedStreamDeadLetterEntry {
+                    key: key.clone(),
+                    public,
+                    descriptor: evidence.object.clone(),
+                    evidence,
+                    stream_incarnation_id: row.stream_incarnation_id,
+                };
+                if retained
+                    .insert(key, (captured, encoded_bytes.len()))
+                    .is_some()
+                {
+                    return Err(OmniError::manifest_internal(
+                        "manifest-selected token authority contains duplicate current DEAD_LETTERED key",
+                    ));
+                }
+                retained_bytes =
+                    retained_bytes
+                        .checked_add(encoded_bytes.len())
+                        .ok_or_else(|| {
+                            OmniError::manifest_internal(
+                                "stream dead-letter retained-byte count overflow",
+                            )
+                        })?;
+                while retained.len() > DEAD_LETTER_PAGE_ENTRIES || retained_bytes > entry_budget {
+                    let largest = retained.last_entry().ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "dead-letter bounded selection lost its largest entry",
+                        )
+                    })?;
+                    let removed_bytes = largest.get().1;
+                    largest.remove();
+                    retained_bytes =
+                        retained_bytes.checked_sub(removed_bytes).ok_or_else(|| {
+                            OmniError::manifest_internal(
+                                "stream dead-letter retained-byte count underflow",
+                            )
+                        })?;
+                }
+            }
+        }
+
+        let entries = retained
+            .into_values()
+            .map(|(entry, _)| entry)
+            .collect::<Vec<_>>();
+        let has_more = seen_after_cursor
+            > u64::try_from(entries.len()).map_err(|_| {
+                OmniError::manifest_internal("stream dead-letter page length exceeds u64")
+            })?;
+        let next_cursor = if has_more {
+            let last = entries.last().ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "dead-letter scan found additional entries but retained no page boundary",
+                )
+            })?;
+            Some(encode_stream_dead_letter_cursor(&StreamDeadLetterCursor {
+                source_manifest_version: snapshot.version(),
+                source_profile_revision: snapshot.stream_profile().profile_revision,
+                token_table_version: token_head.table_version,
+                token_transaction_uuid: token_head.transaction_uuid.clone(),
+                last_stable_table_id: last.key.identity.stable_table_id,
+                last_table_incarnation_id: last.key.identity.table_incarnation_id,
+                last_logical_id: last.key.logical_id.clone(),
+            })?)
+        } else {
+            None
+        };
+        Ok(CapturedStreamDeadLetterPage {
+            source_manifest_version: snapshot.version(),
+            source_profile_revision: snapshot.stream_profile().profile_revision,
+            token_table_version: token_head.table_version,
+            token_transaction_uuid: token_head.transaction_uuid.clone(),
+            entries,
+            next_cursor,
+        })
+    }
+
     /// Prove a deterministic retirement cut under the checked stopped-writer
     /// authority. No receipt, sidecar, table, or manifest effect is produced.
     #[doc(hidden)]
@@ -273,7 +773,7 @@ impl Omnigraph {
         let main = self.open_coordinator_for_branch(None).await?;
         let current = main.snapshot();
         let selected_token = current.open_stream_token_authority().await?;
-        if let Some(receipt) = lookup_authority_retirement_receipt(
+        if let Some(receipt) = lookup_authority_retirement_receipt_v2(
             &selected_token,
             current.stream_token_authority(),
             &graph_identity_digest,
@@ -314,7 +814,7 @@ impl Omnigraph {
         {
             return Err(OmniError::StreamRetirementPlanChanged);
         }
-        let receipt = AuthorityRetirementReceipt::new(
+        let receipt = AuthorityRetirementReceiptV2::new(
             graph_identity_digest,
             &prior_profile.profile_receipt_chain,
             retirement_id,
@@ -332,6 +832,7 @@ impl Omnigraph {
             plan.pre_retirement_token_witness_digest.clone(),
             plan.present_token_count,
             plan.withdrawn_token_count,
+            plan.dead_lettered_token_count,
             plan.export_cut_digest.clone(),
             crate::db::now_micros()?,
         )?;
@@ -344,7 +845,7 @@ impl Omnigraph {
         )?;
 
         let selected_token = current.open_stream_token_authority().await?;
-        let staged = stage_authority_retirement_receipt(
+        let staged = stage_authority_retirement_receipt_v2(
             selected_token,
             current.stream_token_authority(),
             &receipt,
@@ -375,7 +876,7 @@ impl Omnigraph {
             schema_ir_hash: schema_state.schema_ir_hash,
             schema_identity_version: schema_state.schema_identity_version,
         };
-        let mut sidecar = new_stream_authority_retirement_sidecar_v19(
+        let mut sidecar = new_stream_authority_retirement_sidecar_v21(
             authority.actor().to_string(),
             recovery_authority,
             current.version(),
@@ -396,7 +897,7 @@ impl Omnigraph {
                 ));
             }
             Err(error) => {
-                let recovered = complete_stream_authority_retirement_sidecar_v19(
+                let recovered = complete_stream_authority_retirement_sidecar_v21(
                     self.root_uri(),
                     Arc::clone(&self.storage),
                     &current,
@@ -404,7 +905,7 @@ impl Omnigraph {
                 )
                 .await;
                 return match recovered {
-                    Ok(RecoveryStreamAuthorityRetirementOutcomeV19::TerminalVisible {
+                    Ok(RecoveryStreamAuthorityRetirementOutcomeV21::TerminalVisible {
                         receipt,
                         profile,
                         manifest_version,
@@ -430,7 +931,7 @@ impl Omnigraph {
                 .map_err(|error| {
                     OmniError::recovery_required(handle.operation_id.clone(), error.to_string())
                 })?;
-        confirm_stream_authority_retirement_sidecar_v19(
+        confirm_stream_authority_retirement_sidecar_v21(
             self.root_uri(),
             self.storage_adapter(),
             &mut sidecar,
@@ -445,7 +946,7 @@ impl Omnigraph {
                 format!("retirement receipt confirmation requires recovery: {error}"),
             )
         })?;
-        let outcome = complete_stream_authority_retirement_sidecar_v19(
+        let outcome = complete_stream_authority_retirement_sidecar_v21(
             self.root_uri(),
             Arc::clone(&self.storage),
             &current,
@@ -458,7 +959,7 @@ impl Omnigraph {
                 format!("retirement publication requires recovery: {error}"),
             )
         })?;
-        let RecoveryStreamAuthorityRetirementOutcomeV19::TerminalVisible {
+        let RecoveryStreamAuthorityRetirementOutcomeV21::TerminalVisible {
             receipt,
             profile,
             manifest_version,
@@ -480,7 +981,7 @@ impl Omnigraph {
         self.ensure_schema_state_valid().await?;
 
         // The profile gate drains every graph writer. Close the lower domains
-        // too so the final proof and v19 participant use the same canonical
+        // too so the final proof and v21 participant use the same canonical
         // profile -> admission -> schema -> branches -> token -> tables order
         // as the operations they exclude.
         let mut admission_keys = self
@@ -656,7 +1157,7 @@ impl Omnigraph {
     /// exact selected provenance receipt after re-proving its immutable cut.
     pub(super) async fn export_stream_authority_preflight(
         &self,
-    ) -> Result<Option<AuthorityRetirementReceipt>> {
+    ) -> Result<Option<AuthorityRetirementReceiptV2>> {
         let main = self.open_coordinator_for_branch(None).await?;
         let snapshot = main.snapshot();
         if let crate::db::manifest::StreamProfileState::Retired {
@@ -668,11 +1169,12 @@ impl Omnigraph {
             let selected = lookup_lifecycle_ledger_record_by_id(
                 &tokens,
                 snapshot.stream_token_authority(),
-                crate::db::manifest::stream_profile::AUTHORITY_RETIREMENT_RECEIPT_TAG,
+                AUTHORITY_RETIREMENT_RECEIPT_V2_TAG,
                 authority_retirement_receipt_id,
             )
             .await?;
-            let Some(LifecycleLedgerRecord::AuthorityRetirementReceipt(receipt)) = selected else {
+            let Some(LifecycleLedgerRecord::AuthorityRetirementReceiptV2(receipt)) = selected
+            else {
                 return Err(OmniError::manifest_internal(
                     "RETIRED profile does not select its immutable authority-retirement receipt",
                 ));
@@ -701,10 +1203,12 @@ impl Omnigraph {
                 });
             }
         }
-        let (_, withdrawn) = validate_current_token_base_parity_and_counts(self, &snapshot).await?;
-        if withdrawn != 0 {
+        let (_, withdrawn, dead_lettered) =
+            validate_current_token_base_parity_and_counts(self, &snapshot).await?;
+        if withdrawn != 0 || dead_lettered != 0 {
             return Err(OmniError::StreamExportBlocked {
                 withdrawn_token_count: withdrawn,
+                dead_lettered_token_count: dead_lettered,
             });
         }
         Ok(None)
@@ -713,7 +1217,7 @@ impl Omnigraph {
     pub(super) async fn validate_visible_retirement_receipt(
         &self,
         snapshot: &crate::db::Snapshot,
-        receipt: &AuthorityRetirementReceipt,
+        receipt: &AuthorityRetirementReceiptV2,
     ) -> Result<()> {
         receipt.validate()?;
         let schema_state =
@@ -863,19 +1367,20 @@ impl Omnigraph {
         let lifecycle_and_sealed_proof_digest = finish_digest(lifecycle_hasher);
 
         let token_authority = snapshot.stream_token_authority().clone();
-        let (present_token_count, withdrawn_token_count) =
+        let (present_token_count, withdrawn_token_count, dead_lettered_token_count) =
             validate_current_token_base_parity_and_counts(self, &snapshot).await?;
-        if withdrawn_token_count == 0 {
+        if withdrawn_token_count == 0 && dead_lettered_token_count == 0 {
             return Err(OmniError::StreamingAuthorityMismatch {
-                reason: "authority retirement requires at least one current WITHDRAWN token; use ordinary export for a fully PRESENT cut".to_string(),
+                reason: "authority retirement requires at least one current WITHDRAWN or DEAD_LETTERED token; use ordinary export for a fully PRESENT cut".to_string(),
             });
         }
 
         let pre_retirement_token_witness_digest =
-            crate::db::manifest::stream_authority_retirement_token_witness_digest(
+            stream_authority_retirement_token_witness_digest_v2(
                 &token_authority.current_head_witness,
                 present_token_count,
                 withdrawn_token_count,
+                dead_lettered_token_count,
             )?;
 
         let (live_branch_heads_digest, export_cut_digest) =
@@ -901,6 +1406,7 @@ impl Omnigraph {
         );
         hash_u64(&mut plan_hasher, present_token_count);
         hash_u64(&mut plan_hasher, withdrawn_token_count);
+        hash_u64(&mut plan_hasher, dead_lettered_token_count);
         hash_field(&mut plan_hasher, export_cut_digest.as_bytes());
         let plan_digest = finish_digest(plan_hasher);
 
@@ -914,6 +1420,7 @@ impl Omnigraph {
             pre_retirement_token_witness_digest,
             present_token_count,
             withdrawn_token_count,
+            dead_lettered_token_count,
             export_cut_digest,
         })
     }
@@ -989,7 +1496,7 @@ impl Omnigraph {
         &self,
         branch: &str,
         expected_snapshot: &crate::db::Snapshot,
-        receipt: AuthorityRetirementReceipt,
+        receipt: AuthorityRetirementReceiptV2,
     ) -> Result<StreamAuthorityRetirementExportProvenance> {
         let normalized = Self::normalize_branch_name(branch)?;
         let canonical_branch = normalized.as_deref().unwrap_or("main").to_string();
@@ -1035,7 +1542,7 @@ impl Omnigraph {
         })?;
         let provenance = StreamAuthorityRetirementExportProvenance {
             kind: EXPORT_PROVENANCE_KIND.to_string(),
-            receipt,
+            receipt: receipt.into(),
             source_schema_ir_hash,
             ordered_branch_member_digests,
             selected_member_index,
@@ -1044,6 +1551,140 @@ impl Omnigraph {
         provenance.validate_for_rebuild()?;
         Ok(provenance)
     }
+}
+
+fn stream_dead_letter_public_entry(
+    row: &crate::db::manifest::stream_token::StreamTokenAuthorityRow,
+    table_key: &str,
+    evidence: &StreamDeadLetterTerminalEvidence,
+) -> StreamDeadLetterEntry {
+    StreamDeadLetterEntry {
+        stable_table_id: row.identity.stable_table_id,
+        table_incarnation_id: row.identity.table_incarnation_id,
+        table_key: table_key.to_string(),
+        logical_id: row.logical_id.clone(),
+        stream_incarnation_id: row.stream_incarnation_id.clone(),
+        occurrence_token: evidence.occurrence_token.to_string(),
+        predecessor_token: evidence.predecessor_token.map(|token| token.to_string()),
+        write_id: evidence.write_id.clone(),
+        contributor_id: evidence.contributor_id.as_str().to_string(),
+        payload_digest: evidence.payload_digest.to_string(),
+        reason_code: stream_dead_letter_reason_code(evidence.reason_code).to_string(),
+        fold_operation_id: evidence.object.fold_operation_id.clone(),
+        object_location: evidence.object.location.clone(),
+        object_digest: evidence.object.object_digest.clone(),
+        object_encoded_length: evidence.object.encoded_length,
+        object_candidate_count: evidence.object.candidate_count,
+        candidate_ordinal: evidence.candidate_ordinal,
+    }
+}
+
+fn stream_dead_letter_reason_code(reason: StreamDeadLetterReasonCode) -> &'static str {
+    match reason {
+        StreamDeadLetterReasonCode::OrphanEdge => "ORPHAN_EDGE",
+        StreamDeadLetterReasonCode::UniqueViolation => "UNIQUE_VIOLATION",
+        StreamDeadLetterReasonCode::CardinalityViolation => "CARDINALITY_VIOLATION",
+        StreamDeadLetterReasonCode::ValueConstraintViolation => "VALUE_CONSTRAINT_VIOLATION",
+        StreamDeadLetterReasonCode::MultipleValidationViolations => {
+            "MULTIPLE_VALIDATION_VIOLATIONS"
+        }
+        StreamDeadLetterReasonCode::CorrectionViewOverflow => "CORRECTION_VIEW_OVERFLOW",
+    }
+}
+
+fn validate_dead_letter_payload_binding(
+    selected: &CapturedStreamDeadLetterEntry,
+    decoded: &DecodedStreamDeadLetterObjectEntry,
+) -> Result<()> {
+    let evidence = &selected.evidence;
+    if decoded.protocol_version != selected.descriptor.protocol_version
+        || decoded.candidate_ordinal != evidence.candidate_ordinal
+        || decoded.logical_id != selected.key.logical_id
+        || decoded.stream_incarnation_id != selected.stream_incarnation_id
+        || decoded.write_id != evidence.write_id
+        || decoded.current_token != evidence.occurrence_token
+        || decoded.predecessor_token != evidence.predecessor_token
+        || decoded.contributor_id != evidence.contributor_id.as_str()
+        || decoded.payload_digest != evidence.payload_digest
+        || decoded.reason_code != evidence.reason_code
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "dead-letter object '{}' candidate {} differs from current token authority",
+            selected.descriptor.location, evidence.candidate_ordinal
+        )));
+    }
+    Ok(())
+}
+
+fn encode_stream_dead_letter_cursor(cursor: &StreamDeadLetterCursor) -> Result<String> {
+    let bytes = serde_json::to_vec(cursor).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to encode stream dead-letter cursor: {error}"
+        ))
+    })?;
+    if bytes.len() > DEAD_LETTER_CURSOR_MAX_DECODED_BYTES {
+        return Err(OmniError::resource_limit(
+            "stream_dead_letter_cursor_decoded_bytes",
+            DEAD_LETTER_CURSOR_MAX_DECODED_BYTES as u64,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        ));
+    }
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_stream_dead_letter_cursor(encoded: &str) -> Result<StreamDeadLetterCursor> {
+    if encoded.len() > DEAD_LETTER_CURSOR_MAX_ENCODED_BYTES {
+        return Err(OmniError::resource_limit(
+            "stream_dead_letter_cursor_encoded_bytes",
+            DEAD_LETTER_CURSOR_MAX_ENCODED_BYTES as u64,
+            u64::try_from(encoded.len()).unwrap_or(u64::MAX),
+        ));
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|error| {
+            OmniError::manifest(format!(
+                "invalid stream dead-letter cursor encoding: {error}"
+            ))
+        })?;
+    if bytes.len() > DEAD_LETTER_CURSOR_MAX_DECODED_BYTES {
+        return Err(OmniError::resource_limit(
+            "stream_dead_letter_cursor_decoded_bytes",
+            DEAD_LETTER_CURSOR_MAX_DECODED_BYTES as u64,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        ));
+    }
+    let cursor: StreamDeadLetterCursor = serde_json::from_slice(&bytes).map_err(|error| {
+        OmniError::manifest(format!(
+            "invalid stream dead-letter cursor payload: {error}"
+        ))
+    })?;
+    if cursor.source_manifest_version == 0
+        || cursor.source_profile_revision == 0
+        || cursor.token_table_version == 0
+        || cursor.token_transaction_uuid.is_empty()
+        || cursor.last_stable_table_id == 0
+        || cursor.last_table_incarnation_id == 0
+    {
+        return Err(OmniError::manifest(
+            "invalid stream dead-letter cursor fields",
+        ));
+    }
+    Ok(cursor)
+}
+
+fn enforce_dead_letter_page_bound(resource: &'static str, page: &impl Serialize) -> Result<()> {
+    let encoded = serde_json::to_vec(page).map_err(|error| {
+        OmniError::manifest_internal(format!("failed to size stream dead-letter page: {error}"))
+    })?;
+    if encoded.len() > DEAD_LETTER_PAGE_SERIALIZED_BYTES {
+        return Err(OmniError::resource_limit(
+            resource,
+            DEAD_LETTER_PAGE_SERIALIZED_BYTES as u64,
+            u64::try_from(encoded.len()).unwrap_or(u64::MAX),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_canonical_retirement_digest(field: &str, value: &str) -> Result<()> {
@@ -1201,7 +1842,7 @@ pub(crate) fn retirement_export_cut_digest(
 async fn validate_current_token_base_parity_and_counts(
     db: &Omnigraph,
     snapshot: &crate::db::Snapshot,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64, u64)> {
     let token_authority = snapshot.stream_token_authority();
     if token_authority
         .current_head_witness
@@ -1216,6 +1857,7 @@ async fn validate_current_token_base_parity_and_counts(
     let mut batches = scan_current_stream_token_batches(&token_dataset, token_authority).await?;
     let mut present_token_count = 0_u64;
     let mut withdrawn_token_count = 0_u64;
+    let mut dead_lettered_token_count = 0_u64;
     while let Some(batch) = batches
         .try_next()
         .await
@@ -1272,6 +1914,12 @@ async fn validate_current_token_base_parity_and_counts(
                             OmniError::manifest_internal("WITHDRAWN token count overflow")
                         })?;
                 }
+                StreamTokenDisposition::DeadLettered => {
+                    dead_lettered_token_count =
+                        dead_lettered_token_count.checked_add(1).ok_or_else(|| {
+                            OmniError::manifest_internal("DEAD_LETTERED token count overflow")
+                        })?;
+                }
             }
         }
         for (identity, logical_ids) in ids_by_identity {
@@ -1305,7 +1953,11 @@ async fn validate_current_token_base_parity_and_counts(
         }
     }
     validate_base_to_token_parity(db, snapshot, &token_dataset).await?;
-    Ok((present_token_count, withdrawn_token_count))
+    Ok((
+        present_token_count,
+        withdrawn_token_count,
+        dead_lettered_token_count,
+    ))
 }
 
 /// Prove the reverse half of the authority/base invariant without retaining a
@@ -1417,7 +2069,7 @@ async fn validate_base_to_token_parity(
 impl StreamAuthorityRetirementResult {
     fn from_receipt(
         changed: bool,
-        receipt: &AuthorityRetirementReceipt,
+        receipt: &AuthorityRetirementReceiptV2,
         profile: &StreamProfileEntry,
         manifest_version: u64,
     ) -> Self {
@@ -1430,6 +2082,7 @@ impl StreamAuthorityRetirementResult {
             manifest_version,
             present_token_count: receipt.present_token_count,
             withdrawn_token_count: receipt.withdrawn_token_count,
+            dead_lettered_token_count: receipt.dead_lettered_token_count,
         }
     }
 }
@@ -1449,4 +2102,42 @@ fn hash_u64(hasher: &mut Sha256, value: u64) {
 
 fn finish_digest(hasher: Sha256) -> String {
     format!("sha256:{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cursor() -> StreamDeadLetterCursor {
+        StreamDeadLetterCursor {
+            source_manifest_version: 9,
+            source_profile_revision: 4,
+            token_table_version: 7,
+            token_transaction_uuid: "00000000-0000-4000-8000-000000000001".to_string(),
+            last_stable_table_id: 11,
+            last_table_incarnation_id: 12,
+            last_logical_id: "person-42".to_string(),
+        }
+    }
+
+    #[test]
+    fn dead_letter_cursor_round_trips_exact_cut_and_boundary() {
+        let expected = cursor();
+        let encoded = encode_stream_dead_letter_cursor(&expected).unwrap();
+        assert_eq!(
+            decode_stream_dead_letter_cursor(&encoded).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn dead_letter_cursor_bounds_encoded_input_before_base64_allocation() {
+        let encoded = "A".repeat(DEAD_LETTER_CURSOR_MAX_ENCODED_BYTES + 1);
+        let error = decode_stream_dead_letter_cursor(&encoded).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("stream_dead_letter_cursor_encoded_bytes")
+        );
+    }
 }

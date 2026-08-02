@@ -1331,6 +1331,7 @@ impl Omnigraph {
             actor_id: lineage.actor_id.clone(),
             merged_parent_commit_id: lineage.merged_parent_commit_id.clone(),
             created_at: lineage.created_at,
+            stream_fold_attribution_v2: None,
         };
         let pin = SidecarTablePin {
             identity: capture.entry.identity,
@@ -1581,7 +1582,7 @@ fn validate_optional_block_authority(
     }
 }
 
-fn physical_rows_by_logical_id(
+pub(super) fn physical_rows_by_logical_id(
     table_key: &str,
     identity: crate::db::manifest::TableIdentity,
     batches: &[RecordBatch],

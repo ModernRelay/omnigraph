@@ -25,6 +25,13 @@ pub trait StorageAdapter: Debug + Send + Sync {
     /// `read_text()` when disappearance between the probe and read is a valid
     /// concurrent outcome.
     async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>>;
+    /// Read at most `max_bytes + 1` bytes and reject an oversized object
+    /// before its full body can be materialized.
+    async fn read_text_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<String>>;
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()>;
     /// Write a text object only if no object exists at `uri`.
     ///
@@ -124,6 +131,21 @@ impl StorageAdapter for ObjectStorageAdapter {
 
     async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>> {
         Ok(omnigraph_storage::StorageAdapter::read_text_if_exists(&self.inner, uri).await?)
+    }
+
+    async fn read_text_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<String>> {
+        Ok(
+            omnigraph_storage::StorageAdapter::read_text_if_exists_bounded(
+                &self.inner,
+                uri,
+                max_bytes,
+            )
+            .await?,
+        )
     }
 
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {

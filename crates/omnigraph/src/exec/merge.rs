@@ -3781,6 +3781,7 @@ impl Omnigraph {
                 actor_id: merge_lineage.actor_id.clone(),
                 merged_parent_commit_id: merge_lineage.merged_parent_commit_id.clone(),
                 created_at: merge_lineage.created_at,
+                stream_fold_attribution_v2: None,
             };
             let sidecar = crate::db::manifest::new_branch_merge_sidecar_v9(
                 active_branch_for_keys.clone(),

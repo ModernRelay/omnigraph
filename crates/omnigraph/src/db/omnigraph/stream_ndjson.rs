@@ -984,7 +984,10 @@ fn durable_outcome(
     ack: StreamTokenAdmissionAck,
     binding: StreamLineBinding,
 ) -> StreamLineOutcome {
-    if ack.disposition != StreamTokenDisposition::Present || ack.terminal_correction.is_some() {
+    if ack.disposition != StreamTokenDisposition::Present
+        || ack.terminal_correction.is_some()
+        || ack.terminal_dead_letter.is_some()
+    {
         return StreamLineOutcome::new(
             row.ordinal,
             StreamLineDetail::Invalid {
@@ -1027,7 +1030,7 @@ fn boundary_outcome(
     match disposition {
         StreamB2BoundaryDisposition::AlreadyDurable(ack) => match ack.disposition {
             StreamTokenDisposition::Present => {
-                if ack.terminal_correction.is_some() {
+                if ack.terminal_correction.is_some() || ack.terminal_dead_letter.is_some() {
                     return StreamLineOutcome::new(
                         row.ordinal,
                         StreamLineDetail::Invalid {
@@ -1047,6 +1050,15 @@ fn boundary_outcome(
                 .with_current_evidence(binding, ack.origin)
             }
             StreamTokenDisposition::Withdrawn => {
+                if ack.terminal_dead_letter.is_some() {
+                    return StreamLineOutcome::new(
+                        row.ordinal,
+                        StreamLineDetail::Invalid {
+                            message: "WITHDRAWN token carried dead-letter evidence".to_string(),
+                        },
+                    )
+                    .with_binding(binding);
+                }
                 let Some(terminal_correction) = ack.terminal_correction else {
                     return StreamLineOutcome::new(
                         row.ordinal,
@@ -1066,6 +1078,42 @@ fn boundary_outcome(
                     },
                 )
                 .with_withdrawn_evidence(binding, ack.origin, terminal_correction)
+            }
+            StreamTokenDisposition::DeadLettered => {
+                if ack.terminal_correction.is_some() {
+                    return StreamLineOutcome::new(
+                        row.ordinal,
+                        StreamLineDetail::Invalid {
+                            message: "DEAD_LETTERED token carried withdrawal evidence".to_string(),
+                        },
+                    )
+                    .with_binding(binding);
+                }
+                let Some(terminal_dead_letter) = ack.terminal_dead_letter else {
+                    return StreamLineOutcome::new(
+                        row.ordinal,
+                        StreamLineDetail::Invalid {
+                            message: "DEAD_LETTERED token omitted terminal evidence".to_string(),
+                        },
+                    )
+                    .with_binding(binding);
+                };
+                let operation_id = terminal_dead_letter.object.fold_operation_id.clone();
+                StreamLineOutcome::new(
+                    row.ordinal,
+                    StreamLineDetail::DeadLettered {
+                        occurrence: row.occurrence(),
+                        current_token: ack.stream_token.to_string(),
+                        operation_id,
+                        message: "the current occurrence was diverted by graph validation"
+                            .to_string(),
+                    },
+                )
+                .with_dead_letter_evidence(
+                    binding,
+                    ack.origin,
+                    terminal_dead_letter,
+                )
             }
         },
         StreamB2BoundaryDisposition::BindingChanged {
@@ -1389,6 +1437,9 @@ fn stream_line_outcome_json(outcome: &StreamLineOutcome) -> serde_json::Value {
     let terminal_correction = outcome.terminal_correction().map(|correction| {
         serde_json::to_value(correction).expect("terminal stream correction is serializable")
     });
+    let terminal_dead_letter = outcome.terminal_dead_letter().map(|terminal| {
+        serde_json::to_value(terminal).expect("terminal dead-letter evidence is serializable")
+    });
     let (limit, actual) = match &outcome.detail {
         StreamLineDetail::StreamInputTooLarge { limit, actual } => (Some(*limit), Some(*actual)),
         _ => (None, None),
@@ -1408,6 +1459,7 @@ fn stream_line_outcome_json(outcome: &StreamLineOutcome) -> serde_json::Value {
         "shard_id": binding.map(|binding| binding.shard_id.as_str()),
         "writer_epoch": binding.map(|binding| binding.writer_epoch),
         "terminal_correction": terminal_correction,
+        "terminal_dead_letter": terminal_dead_letter,
         "operation_id": outcome.operation_id(),
         "message": outcome.message(),
         "limit": limit,

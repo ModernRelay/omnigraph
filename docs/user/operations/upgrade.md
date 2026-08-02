@@ -17,7 +17,7 @@ message that **names the release line that wrote it** and the exact commands —
 so you can fetch the right old binary without guessing:
 
 ```
-__manifest is stamped at internal schema v4, but this omnigraph reads only v18.
+__manifest is stamped at internal schema v4, but this omnigraph reads only v19.
 This graph was created by omnigraph 0.8.x. Rebuild it: with an omnigraph
 0.8.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
 binary run `omnigraph init --schema <schema.pg> <new-graph>` and `omnigraph load
@@ -46,14 +46,15 @@ from that line (the latest is safest):
 | internal schema v15 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
 | internal schema v16 | unreleased (earlier 0.10.0-dev source builds) | final v16 source build at merge `ac59c4f6d1d83acc8118c410c39de2bed91f9c15` |
 | internal schema v17 | unreleased (earlier 0.10.0-dev source builds) | final v17 source build at merge `41a5990d53238d63d17e139859c66613f9c25867` |
-| internal schema v18 | unreleased (current 0.10.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
+| internal schema v18 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
+| internal schema v19 | unreleased (current 0.10.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
 
 **Stamps v5–v8 never shipped.** The storage format advanced five times inside
 the single 0.8.1 → 0.9.0 development window, so the only graphs carrying those
 stamps came from source builds off `main`; no published binary reads them and
 the refusal message names them `0.9.0-dev`. If you have one, export it with a
 build of the commit that created it, then load into a fresh current-format
-graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10–v18 are
+graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10–v19 are
 pre-release formats written by matching 0.10.0-dev source builds. The final
 0.10.0 format may use a later stamp.
 
@@ -125,6 +126,75 @@ complete. Do not use force-init to turn the old root into the new format.
   `append`/`merge` writes copy external payloads instead, as described below.
 - **Server deployments**: take the graph out of the serving set, rebuild it offline
   with the CLI, then point the cluster at the rebuilt graph (`cluster apply`).
+
+## Migrating from internal schema v18 to v19
+
+Internal schema v19 upgrades `_stream_tokens.lance` to schema v3 and adds
+recovery-v21 for deterministic mixed/all-diverted terminal folds. Valid winners
+publish normally; losing terminal candidates are bound to one canonical bounded
+object and become current `DEAD_LETTERED` authority. An all-diverted cut still
+advances the base through a marker-only transaction. Recovery-v21 also extends
+irreversible retirement from the historical `WITHDRAWN`-only v18 cut to exact
+`WITHDRAWN | DEAD_LETTERED` cuts. Recovery-v19 and recovery-v20 retain their
+historical meanings.
+
+For a clean v18 graph, use the matching final v18 source build:
+
+1. Gracefully stop every writer-capable process for the graph.
+2. Explicitly disable its streaming profile.
+3. Verify that it is clean and `DISABLED`, every enrolled lane is `SEALED`,
+   recovery is settled, base/token parity holds, and no current terminal token
+   remains. Ordinary export transfers logical rows, vectors, blobs, and
+   ordinary properties—not private lifecycle, WAL, token, receipt, correction,
+   or dead-letter authority.
+4. Export the visible logical graph.
+
+Then use the v19 binary to initialize a **different** root, load the export,
+apply cluster configuration, and restart serving. Verify row/vector/blob
+fidelity and the v19 stamp before cutover. Keep the v18 root unchanged through
+the rollback window. A v19 binary refuses v18, and a v18 binary refuses v19.
+
+If the v18 source has current `WITHDRAWN` authority, ordinary export remains
+blocked. Use that same v18 binary's exact stopped/offline
+`stream retire-for-rebuild plan|confirm` exit when its preconditions hold; a
+v19 binary cannot open the v18 root to retire it. V18 cannot contain current
+`DEAD_LETTERED` authority because that disposition first becomes reachable in
+v19. The checked-in v17↔v18 binary cell remains historical; the genuine
+v18↔v19 adjacent-binary refusal/rebuild cell is still required release
+evidence.
+
+### Rebuilding a v19 graph blocked by terminal stream authority
+
+Ordinary v19 export refuses while any selected current token is `WITHDRAWN` or
+`DEAD_LETTERED`, because a row-only rebuild cannot preserve that per-key
+sequencing authority. With every writer-capable process stopped, the cluster
+state lock enabled, and an authorized actor, inspect current dead-letter keys
+and descriptor-verified payloads in bounded pages:
+
+```bash
+omnigraph --graph <graph-id> --as <actor> \
+  cluster stream dead-letter list \
+  --config <cluster-dir> --confirm-stream-offline --json
+
+omnigraph --graph <graph-id> --as <actor> \
+  cluster stream dead-letter export \
+  --config <cluster-dir> --confirm-stream-offline --json
+```
+
+Pass the returned `--cursor` to request the next page. Payload export is an
+inspection artifact, not a replay or import protocol. In the hidden row path,
+a corrected value is a fresh ordinary stream admission naming the current
+terminal token as its predecessor; while it remains current, exact retry
+returns the same terminal result. No public HTTP, SDK, remote-CLI, or OpenAPI
+row-ingress surface exposes that successor yet.
+
+If terminal authority must intentionally be discarded for a fresh-root
+rebuild, use the same v19 binary's irreversible
+`stream retire-for-rebuild plan|confirm` handshake described below. V19 binds
+exact `PRESENT | WITHDRAWN | DEAD_LETTERED` counts and the selected token cut.
+Once `RETIRED`, the source remains read/query/status/export-only and its export
+carries the verified retirement provenance. The rebuild does not import WAL,
+token, receipt, or dead-letter authority.
 
 ## Migrating from internal schema v17 to v18
 

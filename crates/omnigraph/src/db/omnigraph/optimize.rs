@@ -287,11 +287,7 @@ async fn optimize_all_tables_with_mode(
     // and retirement must be able to drain ambient maintenance before fixing
     // its exact logical cut.
     let _stream_profile_guard = db.write_queue().acquire_stream_profile_shared().await;
-    if let Some(error) = db
-        .current_canonical_stream_profile()
-        .await?
-        .retired_error()
-    {
+    if let Some(error) = db.current_canonical_stream_profile().await?.retired_error() {
         return Err(error);
     }
     if mode.is_sealed_maintenance() {
@@ -495,6 +491,7 @@ async fn optimize_all_tables_with_mode(
                 actor_id: lineage.actor_id.clone(),
                 merged_parent_commit_id: lineage.merged_parent_commit_id.clone(),
                 created_at: lineage.created_at,
+                stream_fold_attribution_v2: None,
             };
             crate::db::manifest::new_stream_sealed_optimize_sidecar_v17(
                 mode.actor_id()
@@ -1308,11 +1305,7 @@ pub async fn cleanup_all_tables(
     crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES)?;
 
     let _stream_profile_guard = db.write_queue().acquire_stream_profile_shared().await;
-    if let Some(error) = db
-        .current_canonical_stream_profile()
-        .await?
-        .retired_error()
-    {
+    if let Some(error) = db.current_canonical_stream_profile().await?.retired_error() {
         return Err(error);
     }
 

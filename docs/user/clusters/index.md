@@ -200,9 +200,10 @@ effects. Existing served mutations work only through the restarted
 cluster-booted server's checked runtime authority. There is no public firehose
 ingress yet. Branch merge remains refused while the profile is `ENABLED` or
 `DISABLING`, including through the checked server runtime. A later explicit
-`streaming: false` offline apply can reach `DISABLED` when there are no lanes
-or every existing lane is already `SEALED`; it cannot drain a non-`SEALED`
-lane in this release. Only the no-lane case restores the direct physical lane.
+`streaming: false` offline apply publishes `DISABLING`, derives one finite
+manifest lane cut, and serially drains `OPEN`, goal-`SEALED`, and adopted
+`OPEN_AFTER_FOLD` lanes. A selected `DataBlock` leaves the apply pending until
+stopped/offline correction and a retry. Only the no-lane case restores the direct physical lane.
 Already-`SEALED` enrollments remain fenced, so use the strict export/init/load
 rebuild to return an enrolled graph to that non-streaming lane.
 
@@ -237,10 +238,33 @@ durable receipt; reusing the UUID for a different plan is refused. The cluster
 state lock plus `--confirm-stream-offline` bind the stopped-writer protocol,
 but do not replace the operator's responsibility to stop all processes first.
 
+### Current dead letters: list or export payloads
+
+When a fold diverts a data conflict, the key's selected current token becomes
+`DEAD_LETTERED`. With writers stopped, list the sequencing evidence or export
+descriptor-verified canonical payloads in bounded pages:
+
+```bash
+omnigraph --graph knowledge --as andrew \
+  cluster stream dead-letter list \
+  --config company-brain --confirm-stream-offline --json
+
+omnigraph --graph knowledge --as andrew \
+  cluster stream dead-letter export \
+  --config company-brain --confirm-stream-offline --json
+```
+
+Follow `next_cursor` with `--cursor` until it is absent. Both commands pin the
+manifest-selected token version; export verifies the recovery-owned object
+descriptor and does not prefix-list storage. Payload export is an inspection
+artifact, not replay or import. The hidden row path can restore `PRESENT` with
+a fresh ordinary stream occurrence naming the terminal token as predecessor;
+there is no public row-ingress command or HTTP/SDK surface yet.
+
 ### Terminal authority retirement: plan → confirm → rebuild
 
-If a graph has current `WITHDRAWN` sequencing authority, ordinary export
-refuses rather than silently discarding it. After stopping every writer and
+If a graph has current `WITHDRAWN` or `DEAD_LETTERED` sequencing authority,
+ordinary export refuses rather than silently discarding it. After stopping every writer and
 reaching exact `DISABLED` with every enrolled lane `SEALED`, use the separate
 cluster-only retirement handshake:
 

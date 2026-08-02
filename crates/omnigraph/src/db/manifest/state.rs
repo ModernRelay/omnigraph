@@ -11,7 +11,9 @@ use crate::error::{OmniError, Result};
 use super::layout::{stream_state_object_id, table_object_id, version_object_id};
 use super::metadata::TableVersionMetadata;
 use super::stream_profile::StreamProfileEntry;
-use super::stream_token::{STREAM_FOLD_ACTOR, StreamFoldAttributionSummary};
+use super::stream_token::{
+    STREAM_FOLD_ACTOR, StreamFoldAttributionSummary, StreamFoldAttributionSummaryV2,
+};
 use super::{
     MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD,
     OBJECT_TYPE_STREAM_PROFILE, OBJECT_TYPE_STREAM_STATE, OBJECT_TYPE_STREAM_TOKEN_AUTHORITY,
@@ -69,6 +71,9 @@ pub(crate) struct GraphLineageRow {
     /// Ordinary graph commits carry `None`; the complete winning rows remain
     /// in the base and stream-token datasets.
     pub(crate) stream_fold_attribution: Option<StreamFoldAttributionSummary>,
+    /// F5's closed attribution grammar. Kept separate so historical v1 bytes
+    /// and readers are never reinterpreted.
+    pub(crate) stream_fold_attribution_v2: Option<StreamFoldAttributionSummaryV2>,
 }
 
 /// JSON payload of a `graph_commit` row's `metadata` column. The immutable
@@ -86,11 +91,36 @@ struct GraphCommitMetadata {
     created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stream_fold_attribution: Option<StreamFoldAttributionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream_fold_attribution_v2: Option<StreamFoldAttributionSummaryV2>,
 }
 
 fn validate_graph_commit_attribution(commit: &GraphLineageRow) -> Result<()> {
     let fixed_actor = commit.actor_id.as_deref() == Some(STREAM_FOLD_ACTOR);
+    if commit.stream_fold_attribution.is_some() && commit.stream_fold_attribution_v2.is_some() {
+        return Err(OmniError::manifest_internal(format!(
+            "graph commit '{}' carries both stream-fold attribution versions",
+            commit.graph_commit_id
+        )));
+    }
     let Some(summary) = commit.stream_fold_attribution.as_ref() else {
+        if let Some(summary) = commit.stream_fold_attribution_v2.as_ref() {
+            summary.validate().map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "graph commit '{}' has invalid stream-fold attribution v2: {error}",
+                    commit.graph_commit_id
+                ))
+            })?;
+            if commit.manifest_branch.is_some()
+                || commit.merged_parent_commit_id.is_some()
+                || !fixed_actor
+            {
+                return Err(OmniError::manifest_internal(format!(
+                    "graph commit '{}' carries stream-fold attribution v2 without fixed canonical-main actor '{}'",
+                    commit.graph_commit_id, STREAM_FOLD_ACTOR
+                )));
+            }
+        }
         // Config-v2/v11 folds predate this metadata field and used the same
         // fixed actor. Their immutable lineage must remain readable and their
         // recovery must remain publishable. Recovery-v12 separately requires
@@ -455,6 +485,7 @@ fn decode_graph_commit_row(
         actor_id: commit_meta.actor_id,
         created_at: commit_meta.created_at,
         stream_fold_attribution: commit_meta.stream_fold_attribution,
+        stream_fold_attribution_v2: commit_meta.stream_fold_attribution_v2,
     };
     validate_graph_commit_attribution(&commit)?;
     Ok(commit)
@@ -929,6 +960,7 @@ pub(crate) fn graph_lineage_row_parts(
         actor_id: commit.actor_id.clone(),
         created_at: commit.created_at,
         stream_fold_attribution: commit.stream_fold_attribution.clone(),
+        stream_fold_attribution_v2: commit.stream_fold_attribution_v2.clone(),
     })
     .map_err(|e| {
         OmniError::manifest_internal(format!("failed to encode graph_commit metadata: {e}"))

@@ -1601,6 +1601,32 @@ impl TableStore {
         .await
     }
 
+    /// Stage one F5 mixed or all-diverted terminal-conflict fold.
+    ///
+    /// The logical row projection may be empty, but the exact Lance Update is
+    /// still required to select the consumed `MergedGeneration`. This keeps
+    /// reopen/replay authority in Lance rather than duplicating it in the graph
+    /// lifecycle row.
+    pub async fn stage_stream_dead_letter_fold(
+        &self,
+        ds: Dataset,
+        table_key: &str,
+        batches: Vec<RecordBatch>,
+        shard_id: ShardId,
+        generation: u64,
+    ) -> Result<StagedWrite> {
+        self.stage_stream_generation_update(
+            ds,
+            table_key,
+            batches,
+            shard_id,
+            generation,
+            true,
+            "stage_stream_dead_letter_fold",
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn stage_stream_generation_update(
         &self,
@@ -3152,10 +3178,7 @@ impl TableStore {
         Ok(count as usize)
     }
 
-    async fn user_indices_for_column(
-        ds: &Dataset,
-        column: &str,
-    ) -> Result<Vec<IndexMetadata>> {
+    async fn user_indices_for_column(ds: &Dataset, column: &str) -> Result<Vec<IndexMetadata>> {
         let field_id = ds
             .schema()
             .field(column)

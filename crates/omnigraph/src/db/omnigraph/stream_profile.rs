@@ -82,6 +82,17 @@ pub struct CheckedClusterBlockAuthority<'lock> {
     pub(super) guard: ValidatedOfflineGuard<'lock>,
 }
 
+/// Engine-checked stopped-writer authority for bounded, read-only inspection
+/// of current dead-letter authority at one exact profile revision.
+///
+/// This capability cannot be consumed by maintenance, repair, or mutation
+/// adapters. The lower guard retains the concrete cluster apply lock and
+/// process-local runtime exclusion for the complete inspection.
+#[doc(hidden)]
+pub struct CheckedClusterDeadLetterAuthority<'lock> {
+    pub(super) guard: ValidatedOfflineGuard<'lock>,
+}
+
 /// Engine-checked stopped-writer authority for one root-wide retirement
 /// occurrence. Unlike ordinary maintenance, this capability may reach an
 /// already-RETIRED graph so confirmation can perform receipt-first replay.
@@ -156,6 +167,23 @@ impl CheckedClusterBlockAuthority<'_> {
     /// acquired its final admission and graph-write gates.
     pub(super) fn validate_profile(&self, profile: &StreamProfileEntry) -> Result<()> {
         validate_offline_block_profile_binding(profile, &self.guard)
+    }
+}
+
+impl CheckedClusterDeadLetterAuthority<'_> {
+    pub(super) fn actor(&self) -> &str {
+        self.guard.actor()
+    }
+
+    #[cfg(test)]
+    pub(super) fn graph_store_uri(&self) -> &str {
+        self.guard.graph_store_uri()
+    }
+
+    /// Revalidate the exact profile after the inspector has acquired its final
+    /// profile gate and captured the manifest/token cut.
+    pub(super) fn validate_profile(&self, profile: &StreamProfileEntry) -> Result<()> {
+        validate_dead_letter_control_profile_binding(profile, &self.guard)
     }
 }
 
@@ -404,6 +432,22 @@ fn validate_offline_block_profile_binding(
     Ok(())
 }
 
+fn validate_dead_letter_control_profile_binding(
+    profile: &StreamProfileEntry,
+    guard: &ValidatedOfflineGuard<'_>,
+) -> Result<()> {
+    if profile.profile_revision != guard.expected_profile_revision() {
+        return Err(OmniError::StreamingAuthorityMismatch {
+            reason: format!(
+                "offline stream dead-letter control expected profile revision {} but graph is at {}",
+                guard.expected_profile_revision(),
+                profile.profile_revision
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl Omnigraph {
     /// Consume a lower stopped-writer guard into the only engine capability
     /// that can change the graph-global stream profile.
@@ -508,6 +552,41 @@ impl Omnigraph {
         let profile = self.current_canonical_stream_profile().await?;
         validate_offline_block_profile_binding(&profile, &guard)?;
         Ok(CheckedClusterBlockAuthority { guard })
+    }
+
+    /// Consume the dedicated read-only stopped-writer guard for bounded
+    /// dead-letter listing and payload export. Payload export performs the
+    /// additional Cedar `export` check at its own call boundary.
+    #[doc(hidden)]
+    pub async fn check_cluster_dead_letter_authority<'lock>(
+        &self,
+        guard: ValidatedOfflineGuard<'lock>,
+    ) -> Result<CheckedClusterDeadLetterAuthority<'lock>> {
+        if guard.graph_store_uri() != self.uri() {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: format!(
+                    "validated stream dead-letter store '{}' does not match opened graph '{}'",
+                    guard.graph_store_uri(),
+                    self.uri()
+                ),
+            });
+        }
+        if guard.operation() != AuthorityOperationClass::StreamDeadLetterControl {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: "offline authority is not a stream dead-letter control operation"
+                    .to_string(),
+            });
+        }
+        self.enforce(
+            omnigraph_policy::PolicyAction::StreamManage,
+            &omnigraph_policy::ResourceScope::Graph,
+            Some(guard.actor()),
+        )?;
+
+        let _profile_gate = self.write_queue().acquire_stream_profile_shared().await;
+        let profile = self.current_canonical_stream_profile().await?;
+        validate_dead_letter_control_profile_binding(&profile, &guard)?;
+        Ok(CheckedClusterDeadLetterAuthority { guard })
     }
 
     /// Consume the dedicated offline guard used only by authority retirement.
@@ -751,6 +830,7 @@ impl Omnigraph {
             actor_id: lineage.actor_id.clone(),
             merged_parent_commit_id: lineage.merged_parent_commit_id.clone(),
             created_at: lineage.created_at,
+            stream_fold_attribution_v2: None,
         };
         let mut sidecar = new_stream_profile_change_sidecar_v13(
             terminal_actor,
