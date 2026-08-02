@@ -220,6 +220,11 @@ pub struct GraphStartupConfig {
     /// This is not writer authority; `open_single_graph` rereads canonical
     /// cluster state and consumes it into a non-cloneable runtime guard.
     pub stream_runtime_authority: Option<omnigraph_cluster::RuntimeAuthorityBinding>,
+    /// Cloneable serving-snapshot evidence for a terminal stream profile.
+    /// This is not export authority; `open_single_graph` rereads canonical
+    /// cluster state and consumes it into a non-cloneable served-export guard.
+    pub stream_served_export_authority:
+        Option<omnigraph_cluster::ServedExportAuthorityBinding>,
     /// Pre-resolved embedding config from an applied cluster provider profile.
     /// Legacy config paths leave this unset and continue to use env resolution.
     pub embedding: Option<omnigraph::embedding::EmbeddingConfig>,
@@ -1554,47 +1559,110 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<OpenedGraph> {
         .await
         .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, uri))?;
     let has_checked_stream_runtime = cfg.stream_runtime_authority.is_some();
-    let db = if let Some(binding) = cfg.stream_runtime_authority {
-        let operation_id = format!(
-            "serve:{}:state-{}",
-            graph_id.as_str(),
-            binding.state_revision()
-        );
-        let guard = omnigraph_cluster::mint_runtime_guard(
-            binding,
-            &operation_id,
-            "omnigraph:server",
-        )
-        .await
-        .map_err(|err| {
-            color_eyre::eyre::eyre!(
-                "validate stream runtime authority for graph '{}': {err}",
+    let db = match (
+        cfg.stream_runtime_authority,
+        cfg.stream_served_export_authority,
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(color_eyre::eyre::eyre!(
+                "graph '{}' received both stream runtime and served-export authority",
                 graph_id
+            ));
+        }
+        (Some(binding), None) => {
+            let operation_id = format!(
+                "serve:{}:state-{}",
+                graph_id.as_str(),
+                binding.state_revision()
+            );
+            let guard = omnigraph_cluster::mint_runtime_guard(
+                binding,
+                &operation_id,
+                "omnigraph:server",
             )
-        })?;
-        db.with_checked_cluster_stream_runtime(guard)
             .await
             .map_err(|err| {
                 color_eyre::eyre::eyre!(
-                    "bind stream runtime authority for graph '{}': {err}",
+                    "validate stream runtime authority for graph '{}': {err}",
                     graph_id
                 )
-            })?
-    } else {
-        let status = db.stream_status().await.map_err(|err| {
-            color_eyre::eyre::eyre!(
-                "read stream profile for graph '{}' during startup: {err}",
-                graph_id
-            )
-        })?;
-        if !matches!(status.profile_mode, "DISABLED" | "RETIRED") {
-            return Err(color_eyre::eyre::eyre!(
-                "graph '{}' is {}, but the applied cluster snapshot supplied no matching stream runtime authority; stop serving, reconcile with `cluster apply --confirm-stream-offline`, and restart",
-                graph_id,
-                status.profile_mode
-            ));
+            })?;
+            db.with_checked_cluster_stream_runtime(guard)
+                .await
+                .map_err(|err| {
+                    color_eyre::eyre::eyre!(
+                        "bind stream runtime authority for graph '{}': {err}",
+                        graph_id
+                    )
+                })?
         }
-        db
+        (None, Some(binding)) => {
+            let bind_terminal = if binding.is_unmanaged_terminal() {
+                let status = db.stream_status().await.map_err(|err| {
+                    color_eyre::eyre::eyre!(
+                        "read unmanaged stream profile for graph '{}' during startup: {err}",
+                        graph_id
+                    )
+                })?;
+                match status.profile_mode {
+                    "RETIRED" => true,
+                    "DISABLED" => !status.tables.is_empty(),
+                    mode => {
+                        return Err(color_eyre::eyre::eyre!(
+                            "graph '{}' is {mode}, but its applied cluster snapshot has no matching managed streaming authority; reconcile with `cluster apply --confirm-stream-offline`, and restart",
+                            graph_id
+                        ));
+                    }
+                }
+            } else {
+                true
+            };
+            if bind_terminal {
+                let operation_id = format!(
+                    "serve-export:{}:state-{}",
+                    graph_id.as_str(),
+                    binding.state_revision()
+                );
+                let guard = omnigraph_cluster::mint_served_export_guard(
+                    binding,
+                    &operation_id,
+                    "omnigraph:server",
+                )
+                .await
+                .map_err(|err| {
+                    color_eyre::eyre::eyre!(
+                        "validate served-export authority for graph '{}': {err}",
+                        graph_id
+                    )
+                })?;
+                db.with_checked_cluster_served_export(guard)
+                    .await
+                    .map_err(|err| {
+                        color_eyre::eyre::eyre!(
+                            "bind served-export authority for graph '{}': {err}",
+                            graph_id
+                        )
+                    })?
+            } else {
+                db
+            }
+        }
+        (None, None) => {
+            let status = db.stream_status().await.map_err(|err| {
+                color_eyre::eyre::eyre!(
+                    "read stream profile for graph '{}' during startup: {err}",
+                    graph_id
+                )
+            })?;
+            if !matches!(status.profile_mode, "DISABLED" | "RETIRED") {
+                return Err(color_eyre::eyre::eyre!(
+                    "graph '{}' is {}, but the applied cluster snapshot supplied no matching stream serving authority; stop serving, reconcile with `cluster apply --confirm-stream-offline`, and restart",
+                    graph_id,
+                    status.profile_mode
+                ));
+            }
+            db
+        }
     };
     let db = if let Some(embedding) = cfg.embedding {
         db.with_embedding_config(Arc::new(embedding))

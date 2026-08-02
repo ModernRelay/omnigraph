@@ -509,6 +509,7 @@ graphs:
         .stream_runtime_authority
         .as_ref()
         .expect("enabled graph must carry validated serving evidence");
+    assert!(graphs[0].stream_served_export_authority.is_none());
     assert_eq!(binding.graph_id(), "knowledge");
     assert_eq!(binding.profile_mode(), "ENABLED");
 
@@ -542,6 +543,71 @@ graphs:
 }
 
 #[tokio::test]
+async fn cluster_boot_installs_disabled_stream_served_export_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("cluster.yaml"),
+        r#"
+version: 1
+state:
+  backend: cluster
+  lock: true
+graphs:
+  knowledge:
+    schema: ./people.pg
+    streaming: false
+"#,
+    )
+    .unwrap();
+    let import = omnigraph_cluster::import_config_dir(temp.path()).await;
+    assert!(import.ok, "{:?}", import.diagnostics);
+    let apply = omnigraph_cluster::apply_config_dir_with_options(
+        temp.path(),
+        omnigraph_cluster::ApplyOptions {
+            actor: Some("stream-operator".to_string()),
+            confirm_stream_offline: true,
+        },
+    )
+    .await;
+    assert!(apply.ok && apply.converged, "{apply:?}");
+
+    let settings = cluster_settings(temp.path()).await.unwrap();
+    let omnigraph_server::ServerConfigMode::Multi {
+        graphs,
+        config_path,
+        server_policy,
+    } = settings.mode
+    else {
+        panic!("cluster boot must select multi-graph routing");
+    };
+    assert!(graphs[0].stream_runtime_authority.is_none());
+    let binding = graphs[0]
+        .stream_served_export_authority
+        .as_ref()
+        .expect("disabled graph must carry validated served-export evidence");
+    assert_eq!(binding.graph_id(), "knowledge");
+    assert_eq!(
+        binding.managed_profile().map(|(mode, _)| mode),
+        Some("DISABLED")
+    );
+
+    omnigraph_server::open_multi_graph_state(
+        graphs,
+        Vec::new(),
+        server_policy.as_ref(),
+        config_path,
+        false,
+    )
+    .await
+    .expect("server startup consumes terminal binding into checked authority");
+}
+
+#[tokio::test]
 async fn cluster_boot_quarantines_graph_open_failures() {
     let temp = tempfile::tempdir().unwrap();
     let schema = "\nnode Person {\n  name: String @key\n}\n";
@@ -570,6 +636,7 @@ rules:
             uri: bad_uri.to_string_lossy().to_string(),
             policy: None,
             stream_runtime_authority: None,
+            stream_served_export_authority: None,
             embedding: None,
             queries: stored_query_registry(&[]),
         },
@@ -578,6 +645,7 @@ rules:
             uri: good_uri.to_string_lossy().to_string(),
             policy: None,
             stream_runtime_authority: None,
+            stream_served_export_authority: None,
             embedding: None,
             queries: stored_query_registry(&[]),
         },

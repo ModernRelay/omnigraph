@@ -42,7 +42,9 @@ use diff::{
     demote_policies_for_blocked_stream_profiles, diff_resources, resource_kind,
 };
 pub use omnigraph_control_authority::{
-    RuntimeAuthorityBinding, ValidatedRuntimeGuard, mint_runtime_guard,
+    RuntimeAuthorityBinding, ServedExportAuthorityBinding, ServedExportTerminalRequest,
+    ValidatedRuntimeGuard, ValidatedServedExportGuard, mint_runtime_guard,
+    mint_served_export_guard,
 };
 pub use serve::{
     ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot, cluster_graph_ids,
@@ -1273,6 +1275,22 @@ pub async fn apply_config_dir_with_options(
             })
             .map(|artifact| artifact.approval_id.clone());
         let graph_uri = backend.graph_root(graph_id);
+        let _export_exclusion =
+            match omnigraph::db::reserve_stream_export_root_exclusion(&graph_uri) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    diagnostics.push(Diagnostic::error(
+                        "graph_delete_export_in_progress",
+                        graph_addr.clone(),
+                        format!(
+                            "cannot remove graph root '{graph_uri}' while an immutable export owns it: {error}"
+                        ),
+                    ));
+                    failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
+                    graph_moving_aborted = true;
+                    continue;
+                }
+            };
         let observed_manifest_version = match Omnigraph::open_read_only(&graph_uri).await {
             Ok(db) => match db.snapshot_of(ReadTarget::branch("main")).await {
                 Ok(snapshot) => Some(snapshot.version()),

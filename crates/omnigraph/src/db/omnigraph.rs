@@ -52,6 +52,8 @@ mod stream_retirement;
 mod stream_status;
 mod table_ops;
 
+#[doc(hidden)]
+pub use export::StreamExportCut;
 pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
 pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
@@ -65,7 +67,8 @@ pub use stream_correction::{
 pub use stream_profile::{
     CheckedClusterApplyAuthority, CheckedClusterBlockAuthority, CheckedClusterDeadLetterAuthority,
     CheckedClusterMaintenanceAuthority, CheckedClusterRetirementAuthority,
-    CheckedClusterStreamRuntimeAuthority, StreamingProfileResult,
+    CheckedClusterServedExportAuthority, CheckedClusterStreamRuntimeAuthority,
+    StreamingProfileResult,
 };
 pub(crate) use stream_retirement::StreamAuthorityRetirementExportProvenance;
 #[cfg(test)]
@@ -313,6 +316,10 @@ pub struct Omnigraph {
     /// cluster-served writer handle. Ambient embedded/direct handles leave
     /// this unset and therefore fail closed while the profile is enabled.
     stream_runtime_authority: Option<CheckedClusterStreamRuntimeAuthority>,
+    /// Non-cloneable checked authority retained by a cluster-served terminal
+    /// graph handle. Ambient embedded/direct handles leave this unset and may
+    /// not capture stream-aware export cuts.
+    stream_served_export_authority: Option<CheckedClusterServedExportAuthority>,
     /// Handle-local mutex held across the swap → operate → restore window
     /// in `branch_merge_impl`. Two concurrent merges through the same handle
     /// with distinct targets
@@ -614,6 +621,7 @@ impl Omnigraph {
             stream_requests,
             stream_fold_driver,
             stream_runtime_authority: None,
+            stream_served_export_authority: None,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
@@ -853,6 +861,7 @@ impl Omnigraph {
             stream_requests,
             stream_fold_driver,
             stream_runtime_authority: None,
+            stream_served_export_authority: None,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
@@ -3049,6 +3058,24 @@ impl Omnigraph {
         normalize_branch_name(branch)
     }
 
+    /// Cooperative destructive control can remove or reuse a table path or
+    /// exact numeric version, so it must own the shared side of the root gate
+    /// retained exclusively by an immutable export cut.
+    /// This is non-waiting to remain safe for loader composition that already
+    /// holds shared stream gates: either side owns the slot, never waits while
+    /// holding the opposite side's gates.
+    pub(super) fn reserve_stream_export_destructive_control(
+        &self,
+    ) -> Result<crate::db::write_queue::StreamExportDestructivePermit> {
+        self.write_queue()
+            .try_acquire_stream_export_destructive()
+            .ok_or_else(|| OmniError::ResourceLimitExceeded {
+                resource: "stream_export_slots".to_string(),
+                limit: 1,
+                actual: 2,
+            })
+    }
+
     pub async fn branch_create(&self, name: &str) -> Result<()> {
         self.branch_create_as(name, None).await
     }
@@ -3069,6 +3096,7 @@ impl Omnigraph {
         ensure_public_branch_ref(name, "branch_create")?;
         let target = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
+        let _export_exclusion = self.reserve_stream_export_destructive_control()?;
         self.ensure_schema_state_valid().await?;
         let source = self.active_branch().await;
         let relevant = [source.as_deref(), Some(target.as_str()), None];
@@ -3211,6 +3239,7 @@ impl Omnigraph {
         let branch = normalize_branch_name(&branch_name)?;
         let target_branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
+        let _export_exclusion = self.reserve_stream_export_destructive_control()?;
         self.ensure_schema_state_valid().await?;
         let relevant = [branch.as_deref(), Some(target_branch.as_str()), None];
         if heal_recovery {
@@ -3314,6 +3343,7 @@ impl Omnigraph {
         ensure_public_branch_ref(name, "branch_delete")?;
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
+        let _export_exclusion = self.reserve_stream_export_destructive_control()?;
         self.ensure_schema_state_valid().await?;
         self.heal_pending_recovery_sidecars_for_branch_delete(&branch)
             .await?;

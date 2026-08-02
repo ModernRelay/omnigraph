@@ -198,6 +198,10 @@ pub mod names {
     /// old sealed lane's base table or MemWAL state can change.
     pub const STREAM_REBIND_POST_SIDECAR_PRE_PHYSICAL: &str =
         "stream_rebind.post_sidecar_pre_physical";
+    /// A checked stream-aware export has captured and validated its complete
+    /// immutable cut while every writer gate is still held. Concurrency tests
+    /// park here to prove writers wait only until capture returns.
+    pub const STREAM_EXPORT_POST_CUT_CAPTURE: &str = "stream_export.post_cut_capture";
     /// B1 completed every row-effect-free check and reservation but has not
     /// invoked `ShardWriter::put_no_wait` yet.
     pub const STREAM_B1_BEFORE_PUT_INVOKE: &str = "stream_b1.before_put_invoke";

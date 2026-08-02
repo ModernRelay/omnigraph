@@ -319,10 +319,12 @@ pub(crate) async fn observe_declared_graphs(
         let graph_address = graph_address(&graph.id);
         let schema_address = schema_address(&graph.id);
         let streaming_address = streaming_address(&graph.id);
-        let had_streaming_resource = state
+        let prior_streaming_resource = state
             .applied_revision
             .resources
-            .contains_key(&streaming_address);
+            .get(&streaming_address)
+            .cloned();
+        let had_streaming_resource = prior_streaming_resource.is_some();
         let graph_uri = backend.graph_root(&graph.id);
         let observed_at = now_rfc3339();
 
@@ -407,17 +409,37 @@ pub(crate) async fn observe_declared_graphs(
                     || had_streaming_resource
                     || streaming_profile_is_active
                 {
-                    let observed_digest = observed_streaming_digest(
-                        &graph.id,
-                        &observation.streaming_profile_mode,
-                    );
+                    let (observed_digest, declaration_revision) =
+                        if observation.streaming_profile_mode == "RETIRED" {
+                            prior_streaming_resource
+                                .as_ref()
+                                .map(|resource| {
+                                    let digest = resource.digest.clone();
+                                    let declaration_revision = Some(
+                                        resource.declaration_revision.clone().unwrap_or_else(|| {
+                                            streaming_declaration_revision(&graph.id, &digest)
+                                        }),
+                                    );
+                                    (digest, declaration_revision)
+                                })
+                                .unwrap_or_else(|| {
+                                    let digest = streaming_digest(&graph.id, false);
+                                    let revision =
+                                        streaming_declaration_revision(&graph.id, &digest);
+                                    (digest, Some(revision))
+                                })
+                        } else {
+                            let digest = observed_streaming_digest(
+                                &graph.id,
+                                &observation.streaming_profile_mode,
+                            );
+                            let revision = streaming_declaration_revision(&graph.id, &digest);
+                            (digest, Some(revision))
+                        };
                     state.applied_revision.resources.insert(
                         streaming_address.clone(),
                         StateResource {
-                            declaration_revision: Some(streaming_declaration_revision(
-                                &graph.id,
-                                &observed_digest,
-                            )),
+                            declaration_revision,
                             digest: observed_digest,
                             applies_to: None,
                             embedding_provider: None,
@@ -1223,7 +1245,7 @@ pub(crate) fn streaming_mode_matches_desired(
 ) -> bool {
     matches!(
         (profile_mode, desired_enabled),
-        ("ENABLED", true) | ("DISABLED", false)
+        ("ENABLED", true) | ("DISABLED" | "RETIRED", false)
     )
 }
 
