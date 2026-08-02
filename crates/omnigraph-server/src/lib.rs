@@ -1704,10 +1704,108 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<OpenedGraph> {
     })
 }
 
-async fn shutdown_signal() {
+async fn wait_for_ctrl_c() {
     if let Err(err) = tokio::signal::ctrl_c().await {
         error!(error = %err, "failed to install ctrl-c handler");
-        return;
     }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal_with_terminate(mut terminate: tokio::signal::unix::Signal) {
+    tokio::select! {
+        () = wait_for_ctrl_c() => {},
+        received = terminate.recv() => {
+            if received.is_none() {
+                error!("SIGTERM handler closed before receiving a signal");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(terminate) => wait_for_shutdown_signal_with_terminate(terminate).await,
+        Err(err) => {
+            error!(error = %err, "failed to install SIGTERM handler; waiting for ctrl-c only");
+            wait_for_ctrl_c().await
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    wait_for_ctrl_c().await
+}
+
+async fn shutdown_signal() {
+    wait_for_shutdown_signal().await;
     info!("shutdown signal received");
+}
+
+#[cfg(all(test, unix))]
+mod shutdown_signal_tests {
+    use std::process::Command;
+    use std::time::Duration;
+
+    use super::*;
+
+    const SIGTERM_CHILD_ENV: &str = "OMNIGRAPH_SERVER_SIGTERM_TEST_CHILD";
+    const SIGTERM_READY_PATH_ENV: &str = "OMNIGRAPH_SERVER_SIGTERM_TEST_READY_PATH";
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "subprocess helper; exercised by sigterm_reaches_the_shared_shutdown_path"]
+    async fn sigterm_child_waits_for_signal() {
+        if std::env::var_os(SIGTERM_CHILD_ENV).is_none() {
+            return;
+        }
+
+        let terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        let ready_path = std::env::var(SIGTERM_READY_PATH_ENV).unwrap();
+        std::fs::write(ready_path, b"ready").unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_shutdown_signal_with_terminate(terminate),
+        )
+        .await
+        .expect("SIGTERM was not observed before the child deadline");
+    }
+
+    #[test]
+    fn sigterm_reaches_the_shared_shutdown_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let ready_path = temp.path().join("signal-handler-ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("shutdown_signal_tests::sigterm_child_waits_for_signal")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(SIGTERM_CHILD_ENV, "1")
+            .env(SIGTERM_READY_PATH_ENV, &ready_path)
+            .spawn()
+            .unwrap();
+
+        for _ in 0..500 {
+            if ready_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready_path.exists(),
+            "SIGTERM helper did not install its handler before the deadline"
+        );
+
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill -TERM failed with {status}");
+
+        let status = child.wait().unwrap();
+        assert!(status.success(), "SIGTERM helper failed with {status}");
+    }
 }

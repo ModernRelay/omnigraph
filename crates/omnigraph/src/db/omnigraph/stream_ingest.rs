@@ -78,9 +78,10 @@ use crate::table_store::mem_wal::{
     ConfirmedStreamTokenOverlayRow, CurrentGenerationProjectionSource, DurableBatchAck,
     IdleAuthorityCheck, IdleAuthorityFailure, MemWalWorkerError, OpenedMemWalWorker,
     PassiveB1PhysicalState, PassiveQuiesceDisposition, PreparedPut, PreparedPutFailure,
-    QueuedBatchPermit, QuiesceCut, ResidentFoldReadiness, SealedGenerationCut, StreamFoldTrigger,
-    StreamWorkerKey, WorkerOpenFailure, b1_input_accounting, b1_logical_batch_bytes,
-    capture_current_head_witness, reconstruct_b1_writer_config, scan_flushed_generation_projection,
+    QueuedBatchPermit, QuiesceCut, ResidentFoldReadiness, SealedGenerationCut,
+    StreamFoldProducerPermit, StreamFoldTrigger, StreamWorkerKey, WorkerOpenFailure,
+    b1_input_accounting, b1_logical_batch_bytes, capture_current_head_witness,
+    reconstruct_b1_writer_config, scan_flushed_generation_projection,
     validate_b1_lifecycle_current_binding_physical_state,
     validate_b1_lifecycle_physical_state_with_binding_inventory, validate_stream_config_v3_binding,
 };
@@ -565,10 +566,13 @@ impl Omnigraph {
         batch: RecordBatch,
         caller_ordinals: CallerOrdinalRange,
     ) -> Result<DurableBatchAck> {
-        // Profile authority is outermost. Keeping this shared lease through
-        // admission and detached worker completion prevents a concurrent
-        // disable from waiting on our admission lease while a cold claim waits
-        // behind the disable's profile-exclusive lease.
+        // This legacy B1 failpoint seam receives an already-normalized physical
+        // batch. Its resident-producing gates therefore begin with the root
+        // MemWAL opportunity, followed by profile authority and table
+        // admission. Both outer guards transfer through detached worker
+        // completion so cancellation cannot let later work consume the one
+        // resident slot ahead of an already-frozen driver round.
+        let driver_round_guard = self.acquire_stream_fold_producer_guard().await;
         let profile_guard = self.write_queue().acquire_stream_profile_shared().await;
         // Refuse an oversized caller buffer synchronously before recovery IO,
         // authority capture, detached ownership, or a cold epoch claim.
@@ -612,7 +616,11 @@ impl Omnigraph {
                     .write_queue()
                     .acquire_stream_shared(&authority_key)
                     .await;
-                CheckedStreamAuthority::from_shared_admission_with_profile(shared, profile_guard)
+                CheckedStreamAuthority::from_shared_admission_with_profile(
+                    shared,
+                    profile_guard,
+                    driver_round_guard,
+                )
             })
             .await;
         let (mut queued, put_authority) = match reserved {
@@ -825,6 +833,7 @@ impl Omnigraph {
         // `stream_put_phase_b2_one` here would attempt a nested read lock and
         // can deadlock behind a queued profile writer because Tokio's RwLock is
         // fair/write-preferring.
+        let driver_round_guard = self.acquire_stream_fold_producer_guard().await;
         let profile_guard = self.write_queue().acquire_stream_profile_shared().await;
         self.ensure_streaming_ingest_runtime_authorized().await?;
         self.stream_put_phase_b2_one_under_profile_guard(
@@ -834,6 +843,7 @@ impl Omnigraph {
             normalized.envelope,
             contributor_id,
             Some(preprocessing),
+            driver_round_guard,
             profile_guard,
         )
         .await
@@ -851,6 +861,10 @@ impl Omnigraph {
         envelope: StreamWriteEnvelope,
         contributor_id: TrustedContributorId,
     ) -> Result<StreamTokenAdmissionAck> {
+        // Bound the caller's normalization/canonicalization ownership before
+        // it can wait on the finite-round fence.
+        let preprocessing = self.stream_workers.reserve_b2_preprocessing()?;
+        let driver_round_guard = self.acquire_stream_fold_producer_guard().await;
         let profile_guard = self.write_queue().acquire_stream_profile_shared().await;
         self.stream_put_phase_b2_one_under_profile_guard(
             table_key,
@@ -858,7 +872,8 @@ impl Omnigraph {
             caller_ordinal,
             envelope,
             contributor_id,
-            None,
+            Some(preprocessing),
+            driver_round_guard,
             profile_guard,
         )
         .await
@@ -873,6 +888,7 @@ impl Omnigraph {
         envelope: StreamWriteEnvelope,
         contributor_id: TrustedContributorId,
         preprocessing: Option<B2PreprocessingPermit>,
+        driver_round_guard: StreamFoldProducerPermit,
         profile_guard: tokio::sync::OwnedRwLockReadGuard<()>,
     ) -> Result<StreamTokenAdmissionAck> {
         let caller_ordinals =
@@ -885,6 +901,7 @@ impl Omnigraph {
                 vec![envelope],
                 contributor_id,
                 preprocessing,
+                driver_round_guard,
                 profile_guard,
             )
             .await?
@@ -966,6 +983,7 @@ impl Omnigraph {
         envelopes: Vec<StreamWriteEnvelope>,
         contributor_id: TrustedContributorId,
         preprocessing: Option<B2PreprocessingPermit>,
+        driver_round_guard: StreamFoldProducerPermit,
         profile_guard: tokio::sync::OwnedRwLockReadGuard<()>,
     ) -> Result<StreamB2PrefixOutcome> {
         let ordinal_len = caller_ordinals
@@ -1065,6 +1083,7 @@ impl Omnigraph {
                     CheckedStreamAuthority::from_shared_admission_with_profile(
                         shared,
                         profile_guard,
+                        driver_round_guard,
                     )
                 },
             )
@@ -1645,8 +1664,11 @@ impl Omnigraph {
         let prepare_table_key = table_key.clone();
         let prepare = Box::new(move |warm_writer: Option<Arc<ShardWriter>>| {
             Box::pin(async move {
-                // Admission is outermost and remains inside the detached worker
-                // through watcher success or retained abort retirement.
+                // Bounded preprocessing/inflight, root MemWAL opportunity,
+                // profile, and then this table admission authority were
+                // acquired in that order. Their transferred ownership remains
+                // inside the detached worker through watcher success or
+                // retained abort retirement.
                 let authority = put_authority;
 
                 match warm_writer {
@@ -4189,6 +4211,10 @@ impl Omnigraph {
         mode: StreamResumeMode,
         actor_id: String,
     ) -> Result<()> {
+        // Resume installs a fresh resident writer. Join the same outer
+        // process-local producer fence as row admission so it cannot consume
+        // the sole root slot during a frozen node/edge driver round.
+        let _driver_round_guard = self.acquire_stream_fold_producer_guard().await;
         let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
         let initial = self.open_write_txn(None).await?;
         let entry = initial.base.entry(&table_key).cloned().ok_or_else(|| {
@@ -5432,12 +5458,14 @@ impl Omnigraph {
         claim_kind: &str,
         actor_id: Option<String>,
     ) -> std::result::Result<OpenedMemWalWorker, WorkerOpenFailure> {
-        // Admission (and the caller-owned profile-shared lease) are already
-        // outermost. Hold the complete graph-write inner order from the final
-        // recapture through sidecar arm, physical classification, ledger
-        // effect, and manifest selection. In particular, the graph-global
-        // token gate prevents an unrelated lane from invalidating a prepared
-        // claim transaction after the physical epoch fence happened.
+        // The resident caller already owns bounded preprocessing/inflight,
+        // root MemWAL opportunity, profile-shared authority, and table
+        // admission in that order. Hold the complete graph-write inner order
+        // from the final recapture through sidecar arm, physical
+        // classification, ledger effect, and manifest selection. In
+        // particular, the graph-global token gate prevents an unrelated lane
+        // from invalidating a prepared claim transaction after the physical
+        // epoch fence happened.
         let write_queue = self.write_queue();
         let _schema_guard = write_queue
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())

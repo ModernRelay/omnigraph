@@ -47,6 +47,12 @@ async fn write_cluster_state(cluster_uri: &str) -> String {
 
 pub async fn enable_stream_profile(db: &Arc<Omnigraph>, cluster_uri: &str) {
     let cluster_uri = cluster_uri.trim_end_matches('/');
+    let expected_profile_revision = db.stream_status().await.unwrap().profile_revision;
+    let operation_id = if expected_profile_revision == 1 {
+        "memwal-stream-test-enable".to_string()
+    } else {
+        format!("memwal-stream-test-enable-{expected_profile_revision}")
+    };
     let state_cas = write_cluster_state(cluster_uri).await;
     let storage = storage_handle_for_uri(cluster_uri).unwrap();
     let lock_uri = format!("{cluster_uri}/__cluster/lock.json");
@@ -66,8 +72,8 @@ pub async fn enable_stream_profile(db: &Arc<Omnigraph>, cluster_uri: &str) {
             state_revision: 1,
             declaration_revision: STREAM_DECLARATION_REVISION,
             declaration_digest: STREAM_DECLARATION_DIGEST,
-            expected_profile_revision: 1,
-            operation_id: "memwal-stream-test-enable",
+            expected_profile_revision,
+            operation_id: &operation_id,
             operation: AuthorityOperationClass::StreamProfileEnable,
             actor: "operator:memwal-test",
             confirm_stream_offline: true,

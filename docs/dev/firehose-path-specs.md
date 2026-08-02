@@ -24,9 +24,13 @@ HTTP, SDK, remote CLI, or OpenAPI row surface. The first F6 acceptance slice,
 F6a, adds only a failpoints-only process-local advisory driver snapshot and one
 hidden in-process candidate-runtime composition. F6b1 adds the checked terminal
 served-export authority and hidden immutable export-cut substrate without a
-format/recovery change or public route. The F6b remainder still owns
-measurements and the full guardrail matrix; F7 remains forbidden until all of
-F6 passes.
+format/recovery change or public route. F6b2 is the implemented no-format
+acceptance slice for SIGTERM/shared shutdown, sequential OS-process recovery,
+frozen-round node/edge fairness, physical rebind → re-enable → reopen → resume,
+combined maintenance, fresh-target import, and legacy writer refusal.
+Measurements, long-history
+evidence, bounded public export transport, and the rest of the guardrail matrix
+remain later; F7 remains forbidden until all of F6 passes.
 **Design authority:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) — this
 file never overrides it. Where they disagree, the RFC wins and this file is
 wrong. §4.7 records the selected experimental profile; §4.3/§4.6 record the
@@ -265,7 +269,8 @@ remaining guardrail acceptance.
 | ~~F5b~~ | Minimal `DEAD_LETTERED` authority, one object, ordinary-ingest correction, selected-token inspection/export, and retirement | internal v19 + token schema v3 + recovery v21 | implemented behind the hidden row seam; no public HTTP/SDK/OpenAPI |
 | ~~F6a~~ | Typed failpoints-only process-local advisory driver snapshot plus one hidden in-process candidate-runtime composition | no format or recovery change | implemented; public durable status remains manifest-only |
 | ~~F6b1 checked immutable export cut~~ | Exact-terminal served-export authority, ambient-enrolled refusal, one nonwaiting root slot, and a move-only exact-version cut that releases writer gates before output | no format or recovery change | implemented behind a doc-hidden engine seam; no public transport |
-| **F6b remainder** | Measurements, long-history lookup/RSS/latency evidence, bounded export transport ownership, and the remaining guardrail/composition matrix | — | next |
+| ~~F6b2 process/lifecycle acceptance~~ | SIGTERM/shared shutdown, sequential OS-process recovery, frozen-round node/edge fairness, rebind/re-enable/reopen/resume, combined maintenance, fresh-target import, and legacy writer refusal | no format or recovery change | implemented; no public route or status |
+| **F6b remainder** | Measurements, long-history lookup/RSS/latency evidence, bounded export transport ownership, and the remaining guardrail matrix | — | later |
 | **F7** | Served SDK / HTTP / remote CLI / OpenAPI activation | — | only after all F6 cells pass |
 
 These are dependency milestones, not mandates for giant PRs. Keep each PR
@@ -485,12 +490,17 @@ writer a sidecar-covered witness/rebind transition.
    Disable is a durable multi-publication operation, not a retrying error. F5b0
    implements the continuation below without changing its v11/v14 persisted
    shapes. The
-   profile-authority tranche introduces one graph-profile admission gate outside
-   every table gate and takes it exclusively for the first disable CAS; F4 makes
-   every row path hold
-   it shared from its final `ENABLED`/delegation check through
-   `put_no_wait`, watcher durability, and same-writer fence classification;
-   lock order is graph-profile shared → table admission → same-key queue.
+   profile-authority tranche introduces one graph-profile admission gate
+   outside every table gate and takes it exclusively for the first disable
+   CAS. It remains the outermost gate for ordinary and other
+   non-resident-producing writers. F6b2 makes each resident-producing served
+   row path reserve bounded preprocessing/inflight ownership, then take the
+   root MemWAL opportunity shared, graph-profile shared, table admission, and
+   the same-key queue. Those outer permits transfer through `put_no_wait`,
+   watcher durability, and same-writer fence classification. The resident
+   driver owns the root opportunity exclusively across one frozen finite round
+   and then takes profile/admission per candidate; opportunity permits retain
+   the `MemWalWorkerRegistry` `Arc`, preventing weak-root fence ABA.
    This gate orders owners inside the one current process; it is not the
    cross-process handoff. The required server-exit/apply-start sequence above
    supplies that boundary. Under the apply process's gate exclusively, the
@@ -950,11 +960,14 @@ that lets maintenance move a streamed table's HEAD without bypassing lifecycle
 authority. All lifecycle and maintenance entry points remain crate-private,
 doc-hidden physical seams. The separate EnsureIndices and Optimize bridges
 already require the retained checked serving-runtime authority; F7 exposes
-them through the served policy/API layer. F7 gives
-cluster-declared schema/rebind work, only after the graph reaches terminal
-profile `DISABLED`, a separate offline
-`CheckedClusterMaintenanceAuthority`; neither becomes an ambient engine
-writer.
+them through the served policy/API layer. A same-schema physical rebind is the
+separate offline case: only terminal profile `DISABLED` plus
+`CheckedClusterMaintenanceAuthority` may move an exact `SEALED` lane into a
+fresh binding scope. Productive SchemaApply is not an EXP maintenance writer,
+even after disable. A schema change instead uses a checked sealed/retired
+export, initializes a fresh graph with the desired schema, and loads the
+artifact there; it never applies over or imports back into the enrolled
+source.
 
 **Implemented F3a:** internal schema v13 and recovery-v15 cover the
 crate-private `SEALED → OPEN` resume and guarded `DRAINING → OPEN` abort,
@@ -979,10 +992,13 @@ remain future work.
    complete expected row and revision, `resume_id`,
    request digest, binding, configuration, base witness, graph-branch
    topology, fixed actor/operation, an `OPEN` plan, and a **minimum next epoch
-   floor**. The current hidden seam first
-   acquires the graph-profile gate shared, binds the exact `ENABLED` profile and
-   delegation, and retains that outer guard through claim, terminal-ledger
-   confirmation, and manifest publication. F7's production wrapper must also
+   floor**. The current hidden resume seam first acquires the graph-profile
+   gate shared, binds the exact `ENABLED` profile and delegation, and retains
+   that guard through claim, terminal-ledger confirmation, and manifest
+   publication. Unlike served row admission, an already-installed empty resume
+   writer does not yet join the root MemWAL opportunity fence; F6b2 therefore
+   claims no hard sub-60-second fairness handoff for that case. A broader
+   resume/driver handoff remains later work. F7's production wrapper must also
    require matching checked serving-runtime authority before invoking it.
 2. **Two-phase epoch claim.** The achieved epoch is unknowable before the
    claim, so: claim under closed admission → durably record the exact
@@ -1007,12 +1023,13 @@ remain future work.
      achieved HEAD. Only then is `verified_empty_digest` recomputed over that
      witness while preserving the authenticated shard cut and current claim
      receipt, and only that row may publish;
-   - a schema/config/path/native-ref change that rematerializes the table or
-     changes its physical binding leaves the old lifecycle `SEALED` and must
-     complete recovery-covered `stream_rebind` with a fresh enrollment and
-     shard namespace. Rebind publishes a new exact **`SEALED`** binding and
-     proof; a separate `StreamResume` claims a higher epoch in that new scope
-     before `OPEN`; and
+   - a physical rebind under the same accepted schema leaves the old lifecycle
+     `SEALED` and must complete recovery-covered `stream_rebind` with a fresh
+     enrollment and shard namespace. Rebind publishes a new exact
+     **`SEALED`** binding and proof; a separate `StreamResume` claims a higher
+     epoch in that new scope before `OPEN`. Productive SchemaApply is not
+     authorized by this shape; schema evolution uses checked export/rebuild
+     into a fresh graph instead; and
    - native branch-ref controls remain the existing exception, but any named
      graph branch keeps resume safely `SEALED`.
 
@@ -1056,11 +1073,12 @@ remain future work.
    to prove fresh identifier disjointness.
 
    The hidden served same-binding matrix now covers only content-preserving
-   Optimize and EnsureIndices. Cluster-declared schema
-   operations—even when they preserve
-   physical row bytes, hidden stream metadata, token semantics, table identity,
-   and binding—require the terminal-`DISABLED` offline authority; a
-   rematerializing schema operation additionally uses the rebind shape above.
+   Optimize and EnsureIndices. Productive SchemaApply on a graph with any
+   enrollment remains refused in every lifecycle/profile state; terminal
+   `DISABLED` does not turn it into a maintenance writer, and the physical
+   rebind shape above does not change accepted schema. Schema evolution uses a
+   checked sealed or retired export, fresh graph initialization with the
+   desired schema, and ordinary load into that fresh target.
    For a multi-table operation, acquire all
    affected stream-admission leases exclusively in sorted table-identity order
    as the outermost gates, retain them through effects and recovery, and
@@ -1077,7 +1095,8 @@ remain future work.
    remains Phase D. F3b/F3c prove the private
    `quiesce → checked-runtime EnsureIndices → resume` and
    `quiesce → checked-runtime Optimize → resume` compositions; the served
-   surface and disabled offline schema/rebind workflow remain later slices.
+   surface, terminal-disabled physical-rebind handoff, and fresh-target schema
+   rebuild workflow remain later slices.
 6. **A representable, non-circular structural-block exit.** Internal v11 makes
    `StrictBlock` a tagged authority:
 
@@ -1344,11 +1363,13 @@ OPEN/DRAINING, named-branch, stale-proof, mismatched-runtime, and remaining
 crash-boundary cells are still evidence requirements, not claims of this
 slice. F3c evidence pins authorized `SEALED` Optimize, achieved-HEAD recovery,
 true no-work, ambient refusal, and `quiesce → optimize → resume`. The later
-matrix must still cover rebind, including
-`disable to terminal DISABLED → schema change → rebind (still SEALED) →
-enable → server restart → explicit resume`, old-binding receipt retention plus
+matrix must still cover physical rebind, including
+`disable to terminal DISABLED → physical rebind (still SEALED) → enable →
+server restart → explicit resume`, old-binding receipt retention plus
 new-scope epoch restart, and a blocked-cut correction or
 authority-repair → lost response → receipt replay → retry → sealed path.
+Schema changes use a separate checked-export → fresh-init-with-new-schema →
+load matrix; no enrolled source graph is changed in place.
 Add shutdown/resume handoff tests at every claim/confirmation/publication
 boundary: graceful shutdown cannot complete until the in-process resume owner
 settles, and offline disable cannot begin until that process exits. Race
@@ -1362,18 +1383,20 @@ The production ownership matrix is part of the proof: same-binding
 EnsureIndices and Optimize already require the serving process's retained
 runtime capability. F7 exposes both only after their transport and policy
 surfaces co-land.
-Cluster-declared schema/rebind does **not** rely on an operator-timed
-quiesce/shutdown gap. The operator stops the server and runs the ordinary
-offline disable apply to terminal `DISABLED`; its durable plan captures and
-drains any prepare/put/resume that won before transport closed. Only then may a
+Physical rebind does **not** rely on an operator-timed quiesce/shutdown gap.
+The operator stops the server and runs the ordinary offline disable apply to
+terminal `DISABLED`; its durable plan captures and drains any
+prepare/put/resume that won before transport closed. Only then may a
 cluster-state-locked `CheckedClusterMaintenanceAuthority` session with
 `--confirm-stream-offline` bind that exact disabled profile revision and run
-schema/rebind. It uses the same externally enforced single-writer handoff and,
-before schema/rebind capture or effect, the same graph-global recovery barrier
-plus root-order reacquire. Re-enable is a later offline apply; it exits before
-server restart, and rebound lanes remain `SEALED` until explicit resume. The
-confirmation is not described as a distributed fence. Raw direct `--store`
-maintenance on a stream lifecycle remains refused.
+the same-schema physical rebind. It uses the same externally enforced
+single-writer handoff and, before rebind capture or effect, the same
+graph-global recovery barrier plus root-order reacquire. Re-enable is a later
+offline apply; it exits before server restart, and rebound lanes remain
+`SEALED` until explicit resume. Productive SchemaApply remains refused on an
+enrolled graph; changing schema requires checked export/rebuild into a fresh
+graph. The confirmation is not described as a distributed fence. Raw direct
+`--store` maintenance on a stream lifecycle remains refused.
 
 ---
 
@@ -1539,15 +1562,17 @@ no stable SDK, server, CLI, or OpenAPI entry point exists until F7.
    v11/recovery-v13. F4 exposes that existing authority through prepare and
    does not mint a second enrollment shape or another ordinary format strand.
 
-   Enrollment acquires graph-profile shared before the table lease. Under the
-   same exclusive table admission lease and existing schema/main/token/table
-   gates, it reruns the recovery barrier and rereads canonical-main
-   `stream_profile`; the enabled revision/delegation and eligibility witness
-   must match the checked runtime. Ordinary admission performs the same final
-   profile/delegation/runtime match before handing off a run and retains the
-   graph-profile guard through `put_no_wait`, watcher durability, and the
-   same-writer fence result; ownership transfers with the invoked tail if the
-   request disconnects. The offline disable owner takes its own process's gate
+   Enrollment, which is not a resident-producing row put, acquires
+   graph-profile shared before the table lease. Under the same exclusive table
+   admission lease and existing schema/main/token/table gates, it reruns the
+   recovery barrier and rereads canonical-main `stream_profile`; the enabled
+   revision/delegation and eligibility witness must match the checked runtime.
+   Resident-producing ordinary admission retains bounded preprocessing/
+   inflight ownership, then acquires the shared root MemWAL opportunity,
+   graph-profile guard, and table admission before handing off a run. It keeps
+   those guards through `put_no_wait`, watcher durability, and the same-writer
+   fence result; ownership transfers with the invoked tail if the request
+   disconnects. The offline disable owner takes its own process's gate
    exclusively for `ENABLED → DISABLING` and releases it before any per-table
    drain. Unit tests cover that in-process order, while production
    disable-versus-first-write is closed by server-exit/apply-start handoff.
@@ -1664,10 +1689,13 @@ meaning as an explicit private fold.
   claim.
 - **Graceful server ownership.** After the listener binds, the cluster server
   starts every selected graph supervisor and refuses startup if any start
-  fails, cleaning up the already-started prefix. Graceful shutdown joins every
-  graph's profile-exclusive producer fence before requesting stop, then joins
-  every supervisor concurrently so the process pays one bounded deadline, not
-  one deadline per graph; an early server error follows the same cleanup path.
+  fails, cleaning up the already-started prefix. Graceful shutdown first takes
+  each graph's root MemWAL opportunity exclusively, then its profile gate
+  exclusively. It drops both fences before requesting/joining the driver,
+  because the driver needs root-exclusive plus per-candidate profile shared to
+  settle its final finite round. Supervisors are joined concurrently so the
+  process pays one bounded deadline, not one deadline per graph; an early
+  server error follows the same cleanup path.
   An invoked fold is never aborted out from under recovery-v14. Timeout is loud,
   retains the live task handle, and leaves any sidecar-owned effect recoverable.
   Public health/backlog status remains later work.
@@ -1872,6 +1900,39 @@ queue-byte reservation, wait deadline, stall/disconnect handling, measurement,
 or public status. Those and the remaining correctness/performance matrix stay
 in the F6b remainder/F7 boundaries below.
 
+### Implemented F6b2 process/lifecycle acceptance subset
+
+F6b2 reuses the server and hidden engine acceptance owners. Green cells cover
+Unix `SIGTERM` reaching the same graceful-shutdown path as Ctrl-C;
+sequential OS-process exit/reopen with persisted recovery; a frozen finite
+driver round in which a newly ready node cannot overtake an edge already in the
+round; and terminal disable → same-schema physical rebind → re-enable → reopen
+→ explicit resume → exactly-once ingest/fold. The composed
+`quiesce → EnsureIndices → Optimize → resume` chain and checked ordinary
+`DISABLED` cut loaded into a fresh target with no imported lifecycle/token
+authority are green too. The legacy Mutation/Load/delete, `load_file`, and
+corresponding `_as` refusal matrix is green under `ENABLED` and interrupted
+`DISABLING`. F6b2 is implemented. Process-local gates are not recast as
+cross-process fencing: the process cases remain sequential under the externally
+enforced sole-writer handoff.
+
+The fairness proof covers resident-producing served puts: bounded
+preprocessing/inflight → root MemWAL opportunity shared → profile shared →
+table admission. The driver retains root opportunity exclusively across its
+frozen finite round, then takes profile/admission per candidate. Both permit
+kinds retain the worker-registry `Arc`, preventing weak-root fence ABA.
+Shutdown fences root opportunity exclusive and then profile exclusive, drops
+both, and only then joins the driver. This does not impose a hard sub-60-second
+fairness bound on an already-installed empty writer created by resume; that
+broader resume/driver handoff remains later.
+
+Productive SchemaApply is deliberately absent: an
+enrolled graph's schema changes only through checked sealed/retired export,
+fresh graph initialization with the desired schema, and ordinary load there.
+Physical rebind preserves accepted schema. Measurements, long-history lookup,
+bounded public export transport, and served/public parity remain later F6b/F7
+work.
+
 ### 7.1 Operational guardrails
 
 - **Deployment**: main-only, unsharded, one resident writer, one externally
@@ -1921,8 +1982,8 @@ in the F6b remainder/F7 boundaries below.
   non-authoritative; cluster-only list/export revalidates each current terminal
   row.
 - **Shutdown**: the F5 supervisor protocol is wired into multi-graph server
-  shutdown. F6a composes clean in-process shutdown ownership; forced
-  OS-process termination remains an F6b acceptance cell.
+  shutdown. F6a composes clean in-process shutdown ownership; F6b2 owns the
+  active Unix `SIGTERM` and sequential OS-process recovery cells.
 
 ### 7.2 Correctness evidence
 
@@ -1976,8 +2037,10 @@ public ingress activates; `AuthorityBlock` repair remains separate.
   server and apply process. Forced shutdown with an armed enrollment or
   old-delegation fold proves offline apply resolves it under old authority
   before the first disable profile CAS, then reacquires from the root.
-  Schema/rebind refuses before terminal `DISABLED` and reruns the recovery
-  barrier under that exact disabled revision before its own CAS.
+  Physical rebind refuses before terminal `DISABLED` and reruns the recovery
+  barrier under that exact disabled revision before its own CAS. Productive
+  SchemaApply remains refused on an enrolled graph and is covered instead by
+  a checked-export/fresh-target rebuild cell.
 - A long-history token-ledger instrument measures exact receipt/token lookup
   and bounded current-terminal scanning across covered history plus increasing
   uncovered tails, locally and on RustFS/S3. It records rows/bytes/object reads
@@ -2125,7 +2188,8 @@ time F7 executes, F2 will already have landed the profile adapter and
 | resume / abort | capability-bound resume | `POST .../streams/{type_name}/resume` | `stream resume [--abort-drain]` |
 | graph export / rebuild artifact | runtime-pinned exact sealed cut | existing `POST /graphs/{graph_id}/export` with stream-aware guards | existing `export --server`; direct `--store` refuses an enrolled graph |
 | same-binding maintenance | lifecycle-aware Optimize / EnsureIndices | `POST /graphs/{graph_id}/maintenance/optimize`, `POST /graphs/{graph_id}/maintenance/ensure-indices` | `optimize --server`, `maintenance ensure-indices --server` |
-| cluster schema / rebind | no serving runtime; exact terminal `DISABLED` revision + `CheckedClusterMaintenanceAuthority` | none | disable to `DISABLED`, then `cluster apply --confirm-stream-offline`; later enable/restart/resume |
+| physical rebind | no serving runtime; exact terminal `DISABLED` revision + `CheckedClusterMaintenanceAuthority`; accepted schema unchanged | none | disable to `DISABLED`, then `cluster apply --confirm-stream-offline`; later enable/restart/resume |
+| schema change | no in-place EXP writer; freeze one checked sealed/retired export cut | none | initialize a fresh graph with the desired schema and load the artifact; never load over the enrolled source |
 
 The table contains the five primary stream workflows plus existing export and
 maintenance integration. Bodyless prepare is an automatic ingest handshake,
@@ -2207,14 +2271,17 @@ lane already be exactly `SEALED`, and otherwise returns a typed lifecycle
 refusal. After the operator explicitly quiesces them, the runtime executes the
 lifecycle-aware writer while holding the required sorted exclusive leases.
 Optimize joins this workflow only after its separate recovery integration. A
-cluster schema/configuration, path, native-ref, or rebind change uses
-`graceful server shutdown → offline disable to terminal DISABLED →
-cluster apply --confirm-stream-offline → separate enable apply → server
-restart → explicit resume`. Disable, not an operator-timed quiesce, closes the
-last-ingress race and drains every operation that won before shutdown. The
-offline process holds the cluster state lock, validates the exact disabled
-profile revision, declaration, graph/store mapping, and sealed proofs, and
-leaves every rebound lane `SEALED`.
+same-schema physical rebind uses `graceful server shutdown → offline disable
+to terminal DISABLED → cluster apply --confirm-stream-offline → separate
+enable apply → server restart → explicit resume`. Disable, not an
+operator-timed quiesce, closes the last-ingress race and drains every operation
+that won before shutdown. The offline process holds the cluster state lock,
+validates the exact disabled profile revision, declaration, graph/store
+mapping, and sealed proofs, and leaves every rebound lane `SEALED`. Productive
+SchemaApply is not part of that workflow: changing schema freezes a checked
+sealed/retired export, initializes a fresh graph with the desired schema, and
+loads the artifact there without transferring stream authority or modifying
+the enrolled source.
 The existing operation's Cedar action and `stream_manage` are both required;
 offline block correction additionally applies the reason-specific
 authorization and payload-export rules. A raw direct `--store` caller has
@@ -2242,14 +2309,14 @@ activation PR updates:
   block/correction, authority-repair, retirement, and dead-letter-export exits;
 - `docs/user/operations/maintenance.md` for exact
   `quiesce → served Optimize/EnsureIndices → resume`, and
-  `docs/user/clusters/index.md` plus `docs/user/operations/upgrade.md` for
-  `graceful stop → offline disable to terminal DISABLED → cluster-state-locked
-  offline schema/rebind → separate enable → restart → explicit resume`,
-  including the stream-aware old-format binary's safe served export from an
-  exact pinned sealed cut before a **later activated-stream** format cutover
-  and init/load into a fresh target rather than in-place import. This extends,
-  and does not defer or replace, F2's already-landed v10→v11 refusal/rebuild
-  guide; and
+  `docs/user/clusters/index.md` plus `docs/user/operations/upgrade.md` for the
+  distinct `graceful stop → offline disable to terminal DISABLED →
+  cluster-state-locked physical rebind → separate enable → restart → explicit
+  resume` and checked-export → fresh-init/load schema-change workflows. The
+  latter includes the stream-aware old-format binary's safe served export from
+  an exact pinned sealed cut before a **later activated-stream** format
+  cutover; it never imports over the enrolled source. This extends, and does
+  not defer or replace, F2's already-landed v10→v11 refusal/rebuild guide; and
 - `docs/user/reference/constants.md` for every activated, measured F6/F7
   row/byte/count/time default: ingress line/run/root ownership, preprocessing,
   fold/dead-letter single-object byte/RSS envelope, driver cadence/backoff,
@@ -2342,7 +2409,7 @@ lands a production writer or claims an SLO before F6.
 | Maintenance | Explicit lifecycle-aware integration per writer; no generic `SEALED` bypass |
 | Public ordering | Hidden F4/F5a/F5b0 → format-bearing F5b → acceptance F6a → measurements/full matrix F6b → atomic served/remote activation F7 |
 | Dead letter | One terminal LWW candidate per losing key; one deterministic, conditionally created NDJSON object under a measured byte/RSS cap; one current `DEAD_LETTERED` token per losing key; ordinary-ingest correction; pre-effect `DataBlock` on expansion |
-| Process topology | One externally enforced writer process; profile apply requires stop → cluster-state-locked offline owner → restart; schema/rebind additionally requires terminal `DISABLED` before its checked offline authority, with no claim that process-local locks detect foreign processes |
+| Process topology | One externally enforced writer process; profile apply requires stop → cluster-state-locked offline owner → restart; physical rebind additionally requires terminal `DISABLED` before its checked offline authority, with no claim that process-local locks detect foreign processes. Productive SchemaApply has no in-place EXP authority and uses checked export/rebuild into a fresh graph |
 | Capability placement | `omnigraph-storage` plus `omnigraph-control-authority` resolve the engine/storage/cluster-lock dependency without a cycle; opaque stopped/offline and runtime guards preserve one storage path and expose no forgeable mint |
 | Public topology | Under `ENABLED`, Mutation/Load/delete require the exact checked served runtime; under `DISABLING`, they are closed. BranchMerge is closed under both modes even with that runtime. Ambient SDK/direct CLI and Cedar-only lanes refuse before effect |
 | Control authority | Profile flip requires validated offline cluster-apply capability; `DISABLING` closes admission durably and retains one fixed-principal fold continuation until the sole apply owner seals all lanes |

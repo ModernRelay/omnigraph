@@ -12,10 +12,11 @@ use std::fmt;
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
@@ -76,6 +77,11 @@ const EDGE_STREAM_SCHEMA: &str = r#"
 node Person { name: String @key }
 edge Knows: Person -> Person
 "#;
+const F6B2_NODE_EDGE_SCHEMA: &str = r#"
+node Person { score: I32 }
+node Company { score: I32 }
+edge Knows: Person -> Person
+"#;
 const TYPED_STREAM_SCHEMA: &str = r#"
 node Person {
     slug: String @key
@@ -102,6 +108,7 @@ node Person {
 "#;
 const PAYLOAD_STREAM_SCHEMA: &str = "node Person { payload: String }\n";
 const TABLE: &str = "node:Person";
+const COMPANY_TABLE: &str = "node:Company";
 const MIN_CARD_EDGE_TABLE: &str = "edge:Knows";
 const INSERT_PERSON: &str = r#"
 query insert_person($score: I32) {
@@ -113,10 +120,28 @@ query insert_company($score: I32) {
     insert Company { score: $score }
 }
 "#;
+const LEGACY_WRITER_MUTATIONS: &str = r#"
+query legacy_insert($score: I32) {
+    insert Person { score: $score }
+}
+
+query legacy_update($old_score: I32, $score: I32) {
+    update Person set { score: $score } where score = $old_score
+}
+
+query legacy_delete($score: I32) {
+    delete Person where score = $score
+}
+"#;
+const LEGACY_WRITER_JSONL: &str = r#"{"type":"Person","data":{"id":"legacy-writer","score":99}}"#;
 
 const PROVIDER_FAILURE_MESSAGE: &str = "injected RFC-026 provider exhaustion";
 const PROVIDER_PUT_TIMEOUT: Duration = Duration::from_secs(45);
 const PROVIDER_FOLD_TIMEOUT: Duration = Duration::from_secs(90);
+const F6B2_PROCESS_MODE_ENV: &str = "OMNIGRAPH_F6B2_PROCESS_MODE";
+const F6B2_PROCESS_GRAPH_ENV: &str = "OMNIGRAPH_F6B2_PROCESS_GRAPH";
+const F6B2_PROCESS_CLUSTER_ENV: &str = "OMNIGRAPH_F6B2_PROCESS_CLUSTER";
+const F6B2_PROCESS_READY_ENV: &str = "OMNIGRAPH_F6B2_PROCESS_READY";
 
 /// Run one composed debug-build recovery scenario outside libtest's 2-MiB
 /// thread. The production operations are independently exercised on ordinary
@@ -138,6 +163,77 @@ where
         .unwrap()
         .join()
         .unwrap();
+}
+
+/// Park the first two arrivals at one driver boundary independently.
+///
+/// The first stop lets a test add work after a finite round is frozen. The
+/// second stop observes the completed first round before the newly triggered
+/// lane can run. Both waits are condition-driven and bounded; no elapsed-time
+/// guess determines correctness.
+struct TwoRoundRendezvous {
+    reached: [Arc<AtomicBool>; 2],
+    release: [Arc<AtomicBool>; 2],
+    _failpoint: ScopedFailPoint,
+}
+
+impl TwoRoundRendezvous {
+    fn new() -> Self {
+        let reached = [
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ];
+        let release = [
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ];
+        let hits = Arc::new(AtomicUsize::new(0));
+        let callback_reached = reached.clone();
+        let callback_release = release.clone();
+        let _failpoint =
+            ScopedFailPoint::with_callback(names::STREAM_DRIVER_POST_ROUND_FREEZE, move || {
+                let hit = hits.fetch_add(1, Ordering::SeqCst);
+                let (Some(reached), Some(release)) =
+                    (callback_reached.get(hit), callback_release.get(hit))
+                else {
+                    return;
+                };
+                reached.store(true, Ordering::SeqCst);
+                for _ in 0..6_000 {
+                    if release.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                panic!("stream-driver round rendezvous {hit} timed out");
+            });
+        Self {
+            reached,
+            release,
+            _failpoint,
+        }
+    }
+
+    async fn wait_for(&self, round: usize) {
+        let reached = self
+            .reached
+            .get(round)
+            .unwrap_or_else(|| panic!("unknown stream-driver round {round}"));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !reached.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("stream-driver round {round} was never frozen"));
+    }
+
+    fn release(&self, round: usize) {
+        self.release
+            .get(round)
+            .unwrap_or_else(|| panic!("unknown stream-driver round {round}"))
+            .store(true, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -693,6 +789,16 @@ async fn stream_lane(db: &Omnigraph) -> StreamTableStatus {
     let status = db.stream_status().await.unwrap();
     assert_eq!(status.tables.len(), 1, "fixture owns exactly one lane");
     status.tables.into_iter().next().unwrap()
+}
+
+async fn stream_lane_for(db: &Omnigraph, table_key: &str) -> StreamTableStatus {
+    db.stream_status()
+        .await
+        .unwrap()
+        .tables
+        .into_iter()
+        .find(|lane| lane.table_key == table_key)
+        .unwrap_or_else(|| panic!("fixture has no stream lane for {table_key}"))
 }
 
 async fn checked_export_jsonl(
@@ -1551,9 +1657,9 @@ async fn checked_export_cut_is_immutable_single_slot_and_releases_writer_gates()
             &helpers::int_params(&[("$score", 99)]),
         ),
     )
-        .await
-        .expect("a live cut must not retain the capture gates through output")
-        .expect("ordinary disabled-profile writer must commit while the cut retains only its slot");
+    .await
+    .expect("a live cut must not retain the capture gates through output")
+    .expect("ordinary disabled-profile writer must commit while the cut retains only its slot");
 
     let frozen = cut.into_jsonl().await.unwrap();
     assert_eq!(
@@ -1561,6 +1667,31 @@ async fn checked_export_cut_is_immutable_single_slot_and_releases_writer_gates()
         4,
         "a later table commit must not retarget an already captured export cut"
     );
+
+    let rebuilt_dir = tempfile::tempdir().unwrap();
+    let rebuilt = Omnigraph::init(
+        rebuilt_dir.path().to_str().unwrap(),
+        TWO_TABLE_STREAM_SCHEMA,
+    )
+    .await
+    .expect("a checked cut rebuilds only into a fresh initialized graph");
+    load_jsonl(&rebuilt, &frozen, LoadMode::Overwrite)
+        .await
+        .expect("ordinary load imports the frozen logical cut into the fresh target");
+    assert_eq!(helpers::count_rows(&rebuilt, TABLE).await, 4);
+    assert_eq!(helpers::count_rows(&rebuilt, COMPANY_TABLE).await, 4);
+    let rebuilt_status = rebuilt.stream_status().await.unwrap();
+    assert_eq!(rebuilt_status.profile_mode, "DISABLED");
+    assert!(
+        rebuilt_status.tables.is_empty(),
+        "checked export/import must not transfer lifecycle, binding, or token authority"
+    );
+    assert_eq!(
+        rebuilt.export_jsonl("main", &[], &[]).await.unwrap(),
+        frozen,
+        "the fresh target must contain exactly the captured logical cut"
+    );
+
     writer_db
         .branch_delete("frozen-export")
         .await
@@ -1718,6 +1849,144 @@ async fn raw_table_head(db: &Omnigraph, table_key: &str) -> u64 {
 async fn raw_stream_token_head(db: &Omnigraph) -> u64 {
     let token_uri = format!("{}/_stream_tokens.lance", db.uri().trim_end_matches('/'));
     Dataset::open(&token_uri).await.unwrap().version().version
+}
+
+fn assert_streaming_runtime_refusal<T>(
+    result: Result<T, OmniError>,
+    expected_mode: &str,
+    operation: &str,
+) {
+    match result {
+        Err(OmniError::StreamingRequiresClusterRuntime { mode }) => {
+            assert_eq!(mode, expected_mode, "{operation} refused in the wrong mode");
+        }
+        Err(error) => panic!("{operation} returned the wrong refusal: {error:?}"),
+        Ok(_) => panic!("{operation} unexpectedly bypassed the stream-profile fence"),
+    }
+}
+
+async fn assert_legacy_writers_require_cluster_runtime(
+    dir: &EnrolledGraphDir,
+    db: &Arc<Omnigraph>,
+    expected_mode: &str,
+) {
+    let before_status = db.stream_status().await.unwrap();
+    assert_eq!(before_status.profile_mode, expected_mode);
+    let before_manifest_head = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    let before_table_head = raw_table_head(db, TABLE).await;
+    let before_token_head = raw_stream_token_head(db).await;
+    assert_no_recovery_sidecars(dir);
+
+    let insert_params = helpers::int_params(&[("$score", 99)]);
+    let update_params = helpers::int_params(&[("$old_score", 98), ("$score", 99)]);
+    let delete_params = helpers::int_params(&[("$score", 99)]);
+    let mutations = [
+        ("insert", "legacy_insert", &insert_params),
+        ("update", "legacy_update", &update_params),
+        ("delete", "legacy_delete", &delete_params),
+    ];
+    for (kind, query_name, params) in mutations {
+        assert_streaming_runtime_refusal(
+            db.mutate("main", LEGACY_WRITER_MUTATIONS, query_name, params)
+                .await,
+            expected_mode,
+            &format!("mutate {kind}"),
+        );
+        assert_streaming_runtime_refusal(
+            db.mutate_as(
+                "main",
+                LEGACY_WRITER_MUTATIONS,
+                query_name,
+                params,
+                Some("operator:legacy-writer-matrix"),
+            )
+            .await,
+            expected_mode,
+            &format!("mutate_as {kind}"),
+        );
+    }
+
+    for (mode, name) in [
+        (LoadMode::Append, "Append"),
+        (LoadMode::Merge, "Merge"),
+        (LoadMode::Overwrite, "Overwrite"),
+    ] {
+        assert_streaming_runtime_refusal(
+            db.load("main", LEGACY_WRITER_JSONL, mode).await,
+            expected_mode,
+            &format!("load {name}"),
+        );
+        assert_streaming_runtime_refusal(
+            db.load_as(
+                "main",
+                None,
+                LEGACY_WRITER_JSONL,
+                mode,
+                Some("operator:legacy-writer-matrix"),
+            )
+            .await,
+            expected_mode,
+            &format!("load_as {name}"),
+        );
+    }
+
+    let nonexistent_path = dir
+        .path()
+        .join("legacy-writer-input-must-not-be-read.jsonl");
+    assert!(!nonexistent_path.exists());
+    let nonexistent_path = nonexistent_path.to_str().unwrap();
+    for (mode, name) in [
+        (LoadMode::Append, "Append"),
+        (LoadMode::Merge, "Merge"),
+        (LoadMode::Overwrite, "Overwrite"),
+    ] {
+        assert_streaming_runtime_refusal(
+            db.load_file("main", nonexistent_path, mode).await,
+            expected_mode,
+            &format!("load_file {name} nonexistent path"),
+        );
+        assert_streaming_runtime_refusal(
+            db.load_file_as(
+                "main",
+                None,
+                nonexistent_path,
+                mode,
+                Some("operator:legacy-writer-matrix"),
+            )
+            .await,
+            expected_mode,
+            &format!("load_file_as {name} nonexistent path"),
+        );
+    }
+
+    assert_eq!(
+        db.stream_status().await.unwrap(),
+        before_status,
+        "legacy writer refusals must not move stream authority"
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        before_manifest_head,
+        "legacy writer refusals must not publish a manifest version"
+    );
+    assert_eq!(
+        raw_table_head(db, TABLE).await,
+        before_table_head,
+        "legacy writer refusals must not commit the enrolled table"
+    );
+    assert_eq!(
+        raw_stream_token_head(db).await,
+        before_token_head,
+        "legacy writer refusals must not commit stream-token authority"
+    );
+    assert_no_recovery_sidecars(dir);
 }
 
 async fn management_receipt_revisions(db: &Omnigraph, operation_kind: &str) -> Vec<(u64, u64)> {
@@ -2509,8 +2778,16 @@ async fn public_snapshot_hides_the_memwal_system_index() {
 }
 
 async fn physical_batch(db: &Omnigraph, rows: &[(String, i32)]) -> RecordBatch {
+    physical_score_batch(db, TABLE, rows).await
+}
+
+async fn physical_score_batch(
+    db: &Omnigraph,
+    table_key: &str,
+    rows: &[(String, i32)],
+) -> RecordBatch {
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let table = snapshot.open(TABLE).await.unwrap();
+    let table = snapshot.open(table_key).await.unwrap();
     let schema = Arc::new(Schema::from(table.schema()));
     assert_eq!(
         schema
@@ -2671,7 +2948,11 @@ async fn physical_payload_batch(db: &Omnigraph, id: &str, payload_bytes: usize) 
 }
 
 async fn visible_rows(db: &Omnigraph) -> Vec<(String, i32)> {
-    let batches = helpers::read_table(db, TABLE).await;
+    visible_score_rows(db, TABLE).await
+}
+
+async fn visible_score_rows(db: &Omnigraph, table_key: &str) -> Vec<(String, i32)> {
+    let batches = helpers::read_table(db, table_key).await;
     let mut rows = Vec::new();
     for batch in batches {
         let ids = batch
@@ -2738,6 +3019,166 @@ async fn wait_for_published_open_fold(db: &Omnigraph, minimum_count: u64) -> ser
     })
     .await
     .expect("resident driver status did not observe the published OPEN fold")
+}
+
+async fn visible_edge_rows(db: &Omnigraph) -> Vec<(String, String, String)> {
+    let mut rows = Vec::new();
+    for batch in helpers::read_table(db, MIN_CARD_EDGE_TABLE).await {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let src = batch
+            .column_by_name("src")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let dst = batch
+            .column_by_name("dst")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.value(row).to_string(),
+                src.value(row).to_string(),
+                dst.value(row).to_string(),
+            ));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+async fn wait_for_node_edge_rows(
+    db: &Omnigraph,
+    expected_nodes: &[(String, i32)],
+    expected_edges: &[(String, String, String)],
+) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if visible_rows(db).await == expected_nodes
+                && visible_edge_rows(db).await == expected_edges
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("resident stream fold driver did not publish the node/edge cut");
+}
+
+async fn init_f6b2_node_edge_fixture() -> (EnrolledGraphDir, Arc<Omnigraph>) {
+    let cluster = tempfile::tempdir().unwrap();
+    let graph = cluster.path().join("graphs/knowledge.omni");
+    let db = Arc::new(
+        Omnigraph::init(graph.to_str().unwrap(), F6B2_NODE_EDGE_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    load_jsonl(
+        &db,
+        r#"{"type":"Person","data":{"id":"Alice","score":1}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("seed the endpoint visible before the two-lane stream cut");
+    db.failpoint_enroll_stream_table_for_test(TABLE)
+        .await
+        .unwrap();
+    db.failpoint_enroll_stream_table_for_test(COMPANY_TABLE)
+        .await
+        .unwrap();
+    db.failpoint_enroll_stream_table_for_test(MIN_CARD_EDGE_TABLE)
+        .await
+        .unwrap();
+    let dir = EnrolledGraphDir {
+        _cluster: cluster,
+        graph,
+    };
+    let cluster_uri = dir.cluster_uri();
+    enable_stream_profile(&db, &cluster_uri).await;
+    (dir, db)
+}
+
+fn spawn_f6b2_process(mode: &str, graph: &Path, cluster_uri: &str, ready_path: &Path) -> Child {
+    Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("f6b2_stream_process")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(F6B2_PROCESS_MODE_ENV, mode)
+        .env(F6B2_PROCESS_GRAPH_ENV, graph)
+        .env(F6B2_PROCESS_CLUSTER_ENV, cluster_uri)
+        .env(F6B2_PROCESS_READY_ENV, ready_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start F6b2 {mode} process: {error}"))
+}
+
+fn wait_for_process_marker(path: &Path, child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if std::fs::read_to_string(path).ok().as_deref() == Some("acknowledged") {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("query F6b2 child status") {
+            panic!("F6b2 acknowledgement process exited before its marker: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "F6b2 acknowledgement process did not reach its durable marker"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn publish_process_marker(path: &Path) {
+    std::fs::write(path, b"acknowledged").expect("publish F6b2 durable-ack marker");
+    std::fs::File::open(path)
+        .unwrap()
+        .sync_all()
+        .expect("flush F6b2 durable-ack marker");
+}
+
+fn run_and_kill_ack_process(mode: &str, graph: &Path, cluster_uri: &str, ready_path: &Path) {
+    if ready_path.exists() {
+        std::fs::remove_file(ready_path).unwrap();
+    }
+    let mut child = spawn_f6b2_process(mode, graph, cluster_uri, ready_path);
+    wait_for_process_marker(ready_path, &mut child);
+    child
+        .kill()
+        .unwrap_or_else(|error| panic!("force-terminate the acknowledged {mode} process: {error}"));
+    let killed = child
+        .wait()
+        .unwrap_or_else(|error| panic!("reap force-terminated F6b2 {mode} process: {error}"));
+    assert!(
+        !killed.success(),
+        "the {mode} acknowledgement owner must die"
+    );
+}
+
+fn wait_for_process_exit(child: &mut Child, mode: &str) -> ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().expect("query F6b2 child status") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("F6b2 {mode} process exceeded its bounded completion window");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 async fn wait_for_stream_lifecycle(db: &Omnigraph, expected: &str) -> StreamTableStatus {
@@ -3165,6 +3606,357 @@ fn candidate_runtime_composes_lazy_prepare_mixed_fold_terminal_correction_and_di
         let terminal_token = f6a_inspect_terminal_candidate(&fixture).await;
         f6a_publish_correction_and_disable(&fixture, &terminal_token).await;
     });
+}
+
+/// Subprocess-only half of the F6b2 forced-termination acceptance cell.
+///
+/// Keep this helper non-`serial`: the parent deliberately holds serial_test's
+/// cross-process lock while waiting for this exact child invocation.
+#[test]
+#[ignore = "subprocess helper; exercised by F6b2 operational acceptance"]
+fn f6b2_stream_process() {
+    let Some(mode) = std::env::var_os(F6B2_PROCESS_MODE_ENV) else {
+        return;
+    };
+    let mode = mode.to_string_lossy().into_owned();
+    let graph = std::env::var(F6B2_PROCESS_GRAPH_ENV).expect("F6b2 graph path");
+    let cluster_uri = std::env::var(F6B2_PROCESS_CLUSTER_ENV).expect("F6b2 cluster URI");
+    let ready_path = PathBuf::from(
+        std::env::var_os(F6B2_PROCESS_READY_ENV).expect("F6b2 acknowledgement marker path"),
+    );
+
+    on_big_stack(move || async move {
+        let _scenario = FailScenario::setup();
+        let db = Arc::new(
+            Omnigraph::open(&graph)
+                .await
+                .expect("F6b2 child opens graph"),
+        );
+        let served = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+        match mode.as_str() {
+            "ack-node" => {
+                let node = physical_batch(&served, &[("Bob".to_string(), 2)]).await;
+                served
+                    .failpoint_stream_b1_for_test(TABLE, Some(node), 0)
+                    .await
+                    .expect("child durably acknowledges the node generation");
+                assert_eq!(visible_rows(&served).await, vec![("Alice".to_string(), 1)]);
+                assert!(visible_edge_rows(&served).await.is_empty());
+                publish_process_marker(&ready_path);
+                std::future::pending::<()>().await;
+            }
+            "ack-edge" => {
+                let edge = physical_edge_batch(
+                    &served,
+                    &[(
+                        "crash-edge".to_string(),
+                        "Alice".to_string(),
+                        "Bob".to_string(),
+                    )],
+                )
+                .await;
+                served
+                    .failpoint_stream_b1_for_test(MIN_CARD_EDGE_TABLE, Some(edge), 1)
+                    .await
+                    .expect("child durably acknowledges the edge generation");
+                assert_eq!(visible_rows(&served).await, vec![("Alice".to_string(), 1)]);
+                assert!(visible_edge_rows(&served).await.is_empty());
+                publish_process_marker(&ready_path);
+                std::future::pending::<()>().await;
+            }
+            "recover" => {
+                served
+                    .start_stream_fold_driver()
+                    .await
+                    .expect("replacement process cold-starts the resident driver");
+                wait_for_node_edge_rows(
+                    &served,
+                    &[("Alice".to_string(), 1), ("Bob".to_string(), 2)],
+                    &[(
+                        "crash-edge".to_string(),
+                        "Alice".to_string(),
+                        "Bob".to_string(),
+                    )],
+                )
+                .await;
+                let completed = wait_for_published_open_fold(&served, 2).await;
+                assert_eq!(completed["last_error"], serde_json::Value::Null);
+                served
+                    .shutdown_stream_fold_driver()
+                    .await
+                    .expect("replacement process joins every recovered owner");
+            }
+            other => panic!("unknown F6b2 process mode '{other}'"),
+        }
+    });
+}
+
+#[test]
+#[serial]
+fn process_kill_cold_recovers_node_and_edge_then_rebinds_and_resumes() {
+    on_big_stack(|| async {
+        let _scenario = FailScenario::setup();
+        let (dir, db) = init_f6b2_node_edge_fixture().await;
+        let cluster_uri = dir.cluster_uri();
+        let ready_path = dir.path().parent().unwrap().join("f6b2-durable-ack.ready");
+        drop(db);
+
+        run_and_kill_ack_process("ack-node", dir.path(), &cluster_uri, &ready_path);
+        run_and_kill_ack_process("ack-edge", dir.path(), &cluster_uri, &ready_path);
+
+        let unpublished = reopen_enrolled(&dir).await;
+        assert_eq!(
+            visible_rows(&unpublished).await,
+            vec![("Alice".to_string(), 1)],
+            "durable MemWAL acknowledgement is not graph visibility"
+        );
+        assert!(visible_edge_rows(&unpublished).await.is_empty());
+        drop(unpublished);
+
+        let mut recovery = spawn_f6b2_process("recover", dir.path(), &cluster_uri, &ready_path);
+        let recovered = wait_for_process_exit(&mut recovery, "recovery");
+        assert!(
+            recovered.success(),
+            "F6b2 recovery process failed: {recovered}"
+        );
+
+        let offline = reopen_enrolled(&dir).await;
+        assert_eq!(
+            visible_rows(&offline).await,
+            vec![("Alice".to_string(), 1), ("Bob".to_string(), 2)]
+        );
+        assert_eq!(
+            visible_edge_rows(&offline).await,
+            vec![(
+                "crash-edge".to_string(),
+                "Alice".to_string(),
+                "Bob".to_string(),
+            )]
+        );
+        assert_no_recovery_sidecars(&dir);
+
+        disable_stream_profile(&offline, &cluster_uri).await;
+        let disabled = offline.stream_status().await.unwrap();
+        assert_eq!(disabled.profile_mode, "DISABLED");
+        assert_eq!(disabled.tables.len(), 3);
+        assert!(
+            disabled
+                .tables
+                .iter()
+                .all(|lane| lane.lifecycle == "SEALED")
+        );
+
+        let old_person_binding = stream_lane_for(&offline, TABLE).await;
+        let rebound_enrollment = rebind_stream_table_offline(
+            &offline,
+            &cluster_uri,
+            TABLE,
+            "f6b20000-0000-4000-8000-000000000001",
+            old_person_binding.lifecycle_revision,
+        )
+        .await
+        .expect("offline rebind selects one fresh sealed Person binding");
+        assert_ne!(rebound_enrollment, old_person_binding.enrollment_id);
+        assert_eq!(stream_lane_for(&offline, TABLE).await.lifecycle, "SEALED");
+
+        enable_stream_profile(&offline, &cluster_uri).await;
+        drop(offline);
+        let reopened = reopen_enrolled(&dir).await;
+        assert_eq!(stream_lane_for(&reopened, TABLE).await.lifecycle, "SEALED");
+        let served =
+            helpers::stream_authority::bind_checked_stream_runtime(reopened, &cluster_uri).await;
+        let sealed_person = stream_lane_for(&served, TABLE).await;
+        served
+            .failpoint_stream_resume_for_test(
+                TABLE,
+                "f6b20000-0000-4000-8000-000000000002",
+                sealed_person.lifecycle_revision,
+                false,
+                "operator:f6b2-resume",
+            )
+            .await
+            .expect("the rebound Person lane resumes under checked runtime authority");
+        let node = physical_batch(&served, &[("Carol".to_string(), 3)]).await;
+        served
+            .failpoint_stream_b1_for_test(TABLE, Some(node), 2)
+            .await
+            .expect("the rebound node writer acknowledges a new generation");
+        served
+            .failpoint_stream_b1_for_test(TABLE, None, 0)
+            .await
+            .expect("the rebound node generation folds before the edge resumes");
+
+        let sealed_edge = stream_lane_for(&served, MIN_CARD_EDGE_TABLE).await;
+        served
+            .failpoint_stream_resume_for_test(
+                MIN_CARD_EDGE_TABLE,
+                "f6b20000-0000-4000-8000-000000000003",
+                sealed_edge.lifecycle_revision,
+                false,
+                "operator:f6b2-resume",
+            )
+            .await
+            .expect("the recovered edge lane resumes after the node worker retires");
+        let edge = physical_edge_batch(
+            &served,
+            &[(
+                "resumed-edge".to_string(),
+                "Alice".to_string(),
+                "Carol".to_string(),
+            )],
+        )
+        .await;
+        served
+            .failpoint_stream_b1_for_test(MIN_CARD_EDGE_TABLE, Some(edge), 3)
+            .await
+            .expect("the resumed edge writer acknowledges a new generation");
+        served
+            .failpoint_stream_b1_for_test(MIN_CARD_EDGE_TABLE, None, 0)
+            .await
+            .expect("the resumed edge generation folds after the node generation");
+        assert_eq!(
+            visible_rows(&served).await,
+            vec![
+                ("Alice".to_string(), 1),
+                ("Bob".to_string(), 2),
+                ("Carol".to_string(), 3),
+            ]
+        );
+        assert_eq!(
+            visible_edge_rows(&served).await,
+            vec![
+                (
+                    "crash-edge".to_string(),
+                    "Alice".to_string(),
+                    "Bob".to_string(),
+                ),
+                (
+                    "resumed-edge".to_string(),
+                    "Alice".to_string(),
+                    "Carol".to_string(),
+                ),
+            ]
+        );
+        served.shutdown_stream_fold_driver().await.unwrap();
+        assert_no_recovery_sidecars(&dir);
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn finite_round_runs_captured_edge_before_later_node_trigger() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_f6b2_node_edge_fixture().await;
+    let cluster_uri = dir.cluster_uri();
+    let node_owner = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let node = physical_batch(&node_owner, &[("Bob".to_string(), 2)]).await;
+    node_owner
+        .failpoint_stream_b1_for_test(TABLE, Some(node), 0)
+        .await
+        .expect("the node endpoint is durable before its owner retires");
+    node_owner.shutdown_stream_fold_driver().await.unwrap();
+    drop(node_owner);
+
+    let edge_owner = reopen_enrolled(&dir).await;
+    let edge_owner =
+        helpers::stream_authority::bind_checked_stream_runtime(edge_owner, &cluster_uri).await;
+    let edge = physical_edge_batch(
+        &edge_owner,
+        &[(
+            "round-edge".to_string(),
+            "Alice".to_string(),
+            "Bob".to_string(),
+        )],
+    )
+    .await;
+    edge_owner
+        .failpoint_stream_b1_for_test(MIN_CARD_EDGE_TABLE, Some(edge), 1)
+        .await
+        .expect("the dependent edge is durable before its owner retires");
+    edge_owner.shutdown_stream_fold_driver().await.unwrap();
+    drop(edge_owner);
+
+    let served = reopen_enrolled(&dir).await;
+    let served = helpers::stream_authority::bind_checked_stream_runtime(served, &cluster_uri).await;
+    let late_node =
+        physical_score_batch(&served, COMPANY_TABLE, &[("late-company".to_string(), 4)]).await;
+
+    let rounds = TwoRoundRendezvous::new();
+    served.start_stream_fold_driver().await.unwrap();
+    rounds.wait_for(0).await;
+
+    let late_call_started = Arc::new(AtomicBool::new(false));
+    let late_db = Arc::clone(&served);
+    let late_started = Arc::clone(&late_call_started);
+    let mut late_put = tokio::spawn(async move {
+        late_started.store(true, Ordering::SeqCst);
+        late_db
+            .failpoint_stream_b1_for_test(COMPANY_TABLE, Some(late_node), 2)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !late_call_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late node task never reached its put call");
+    tokio::task::yield_now().await;
+    assert!(
+        !late_put.is_finished(),
+        "the frozen round must retain exclusive admission ahead of the late node put"
+    );
+
+    rounds.release(0);
+    rounds.wait_for(1).await;
+    tokio::time::timeout(Duration::from_secs(20), &mut late_put)
+        .await
+        .expect("late node put stayed fenced after the captured round completed")
+        .unwrap()
+        .expect("late node work must become durable before the next round runs");
+    assert_eq!(
+        visible_rows(&served).await,
+        vec![("Alice".to_string(), 1), ("Bob".to_string(), 2)],
+        "the first captured node must publish before its dependent edge"
+    );
+    assert_eq!(
+        visible_edge_rows(&served).await,
+        vec![(
+            "round-edge".to_string(),
+            "Alice".to_string(),
+            "Bob".to_string(),
+        )],
+        "the captured edge must use a fresh post-node snapshot"
+    );
+    assert!(
+        visible_score_rows(&served, COMPANY_TABLE).await.is_empty(),
+        "node work admitted after the round cut must wait for the next round"
+    );
+    let first_round = stream_fold_driver_status(&served);
+    assert_eq!(first_round["published_open_folds"], 2);
+    assert_eq!(
+        first_round["last_completion"]["outcome"],
+        "published_open_fold"
+    );
+    assert_eq!(first_round["last_error"], serde_json::Value::Null);
+
+    rounds.release(1);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if visible_score_rows(&served, COMPANY_TABLE).await
+                == vec![("late-company".to_string(), 4)]
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the next finite round did not publish the late node");
+    let completed = wait_for_published_open_fold(&served, 3).await;
+    assert_eq!(completed["last_error"], serde_json::Value::Null);
+    served.shutdown_stream_fold_driver().await.unwrap();
+    assert_no_recovery_sidecars(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3668,9 +4460,34 @@ async fn sealed_ensure_indices_armed_effect_compensates_with_refreshed_proof() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn sealed_optimize_refreshes_only_productive_enrolled_authority_and_preserves_resume() {
+async fn sealed_indices_then_optimize_refresh_productive_authority_and_preserve_resume() {
     let _scenario = FailScenario::setup();
-    let (dir, db, sealed) = init_productive_mixed_sealed_lane().await;
+    let (dir, db, initially_sealed) = init_productive_mixed_sealed_lane().await;
+    let before_indices = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let pending = db
+        .failpoint_stream_sealed_ensure_indices_for_test("operator:sealed-indices-then-optimize")
+        .await
+        .expect("checked EnsureIndices must build both deferred id indices");
+    assert!(pending.is_empty());
+    let sealed = stream_lane(&db).await;
+    assert_eq!(sealed.lifecycle, "SEALED");
+    assert_eq!(
+        sealed.lifecycle_revision,
+        initially_sealed.lifecycle_revision + 1,
+        "productive EnsureIndices refreshes the enrolled SEALED witness exactly once"
+    );
+    let after_indices = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    for table_key in [TABLE, COMPANY_TABLE] {
+        assert!(
+            after_indices.entry(table_key).unwrap().table_version
+                > before_indices.entry(table_key).unwrap().table_version,
+            "checked EnsureIndices must publish real work for {table_key}"
+        );
+    }
+    assert_eq!(helpers::count_rows(&db, TABLE).await, 4);
+    assert_eq!(helpers::count_rows(&db, COMPANY_TABLE).await, 4);
+    assert_no_recovery_sidecars(&dir);
+
     let sealed_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let sealed_person_version = sealed_snapshot.entry(TABLE).unwrap().table_version;
     let sealed_company_version = sealed_snapshot.entry("node:Company").unwrap().table_version;
@@ -5707,6 +6524,54 @@ async fn disabled_profile_refuses_fresh_quiesce_without_effect() {
     );
     assert!(visible_rows(&db).await.is_empty());
     assert_no_recovery_sidecars(&dir);
+}
+
+#[test]
+#[serial]
+fn legacy_writers_refuse_without_cluster_runtime_while_enabled_or_disabling() {
+    on_big_stack(|| async {
+        let _scenario = FailScenario::setup();
+        let (dir, db) = init_enrolled().await;
+
+        assert_legacy_writers_require_cluster_runtime(&dir, &db, "ENABLED").await;
+
+        let row = physical_batch(&db, &[("legacy-writer-disable-cut".to_string(), 41)]).await;
+        db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+            .await
+            .expect("the disable fixture row must be durable before the first drain attempt");
+        let cluster_uri = dir.cluster_uri();
+        let first_disable = {
+            let _pre_sidecar =
+                ScopedFailPoint::new(names::STREAM_FOLD_POST_DRAIN_PRE_SIDECAR, "return");
+            try_disable_stream_profile(&db, &cluster_uri)
+                .await
+                .expect_err("the first disable must stop after entering DISABLING")
+        };
+        assert!(
+            first_disable
+                .to_string()
+                .contains(names::STREAM_FOLD_POST_DRAIN_PRE_SIDECAR),
+            "{first_disable:?}"
+        );
+        let interrupted = db.stream_status().await.unwrap();
+        assert_eq!(interrupted.profile_mode, "DISABLING");
+        assert_eq!(interrupted.tables[0].lifecycle, "DRAINING");
+        assert_no_recovery_sidecars(&dir);
+
+        assert_legacy_writers_require_cluster_runtime(&dir, &db, "DISABLING").await;
+
+        try_disable_stream_profile(&db, &cluster_uri)
+            .await
+            .expect("retry must finish the interrupted disable");
+        let terminal = db.stream_status().await.unwrap();
+        assert_eq!(terminal.profile_mode, "DISABLED");
+        assert_eq!(terminal.tables[0].lifecycle, "SEALED");
+        assert_eq!(
+            visible_rows(&db).await,
+            vec![("legacy-writer-disable-cut".to_string(), 41)]
+        );
+        assert_no_recovery_sidecars(&dir);
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
