@@ -740,13 +740,14 @@ fn graphs_list_rejects_cluster_bound_profile() {
 #[test]
 fn graphs_list_rejects_as_actor() {
     // The registry read carries no actor; `--as` is for direct-engine and
-    // cluster writes. Rejected loudly instead of silently ignored.
+    // actor-bound cluster operations. Rejected loudly instead of silently
+    // ignored.
     let output = output_failure(cli().arg("graphs").arg("list").arg("--as").arg("act-op"));
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         stderr.contains("`graphs list` is a served command")
             && stderr.contains(
-                "--as sets the actor for a direct-engine or cluster write and does not apply"
+                "--as sets the actor for a direct-engine or actor-bound cluster operation and does not apply"
             ),
         "expected the addressing-guard --as rejection in stderr; got:\n{stderr}"
     );

@@ -255,6 +255,69 @@ impl StreamAuthorityRetirementExportReceipt {
             Self::V1(receipt) => &receipt.export_cut_digest,
         }
     }
+
+    fn retirement_id(&self) -> &str {
+        match self {
+            Self::V2(receipt) => &receipt.retirement_id,
+            Self::V1(receipt) => &receipt.retirement_id,
+        }
+    }
+
+    fn record_id(&self) -> &str {
+        match self {
+            Self::V2(receipt) => &receipt.record_id,
+            Self::V1(receipt) => &receipt.record_id,
+        }
+    }
+
+    fn graph_identity_digest(&self) -> &str {
+        match self {
+            Self::V2(receipt) => &receipt.graph_identity_digest,
+            Self::V1(receipt) => &receipt.graph_identity_digest,
+        }
+    }
+
+    fn source_internal_schema_version(&self) -> u32 {
+        match self {
+            Self::V2(receipt) => receipt.source_internal_schema_version,
+            Self::V1(receipt) => receipt.source_internal_schema_version,
+        }
+    }
+
+    fn source_manifest_version(&self) -> u64 {
+        match self {
+            Self::V2(receipt) => receipt.source_manifest_version,
+            Self::V1(receipt) => receipt.source_manifest_version,
+        }
+    }
+
+    fn source_profile_revision(&self) -> u64 {
+        match self {
+            Self::V2(receipt) => receipt.source_profile_revision,
+            Self::V1(receipt) => receipt.source_profile_revision,
+        }
+    }
+
+    fn live_branch_heads_digest(&self) -> &str {
+        match self {
+            Self::V2(receipt) => &receipt.live_branch_heads_digest,
+            Self::V1(receipt) => &receipt.live_branch_heads_digest,
+        }
+    }
+
+    fn pre_retirement_token_head(&self) -> &crate::db::manifest::CurrentHeadWitness {
+        match self {
+            Self::V2(receipt) => &receipt.pre_retirement_token_head,
+            Self::V1(receipt) => &receipt.pre_retirement_token_head,
+        }
+    }
+
+    fn next_chain_ref(&self) -> Result<crate::db::manifest::stream_profile::ReceiptChainRef> {
+        match self {
+            Self::V2(receipt) => Ok(receipt.next_chain_ref()?),
+            Self::V1(receipt) => receipt.next_chain_ref(),
+        }
+    }
 }
 
 impl From<AuthorityRetirementReceiptV2> for StreamAuthorityRetirementExportReceipt {
@@ -802,8 +865,11 @@ impl Omnigraph {
                     retirement_id: retirement_id.to_string(),
                 });
             }
-            self.validate_visible_retirement_receipt(&current, &receipt)
-                .await?;
+            self.validate_visible_retirement_receipt(
+                &current,
+                &StreamAuthorityRetirementExportReceipt::V2(receipt.clone()),
+            )
+            .await?;
             return Ok(StreamAuthorityRetirementResult::from_receipt(
                 false,
                 &receipt,
@@ -1172,25 +1238,49 @@ impl Omnigraph {
     pub(super) async fn export_stream_authority_preflight_at(
         &self,
         snapshot: &crate::db::Snapshot,
-    ) -> Result<Option<AuthorityRetirementReceiptV2>> {
+    ) -> Result<Option<StreamAuthorityRetirementExportReceipt>> {
         if let crate::db::manifest::StreamProfileState::Retired {
             authority_retirement_receipt_id,
             ..
         } = &snapshot.stream_profile().state
         {
             let tokens = snapshot.open_stream_token_authority().await?;
-            let selected = lookup_lifecycle_ledger_record_by_id(
+            let selected_v2 = lookup_lifecycle_ledger_record_by_id(
                 &tokens,
                 snapshot.stream_token_authority(),
                 AUTHORITY_RETIREMENT_RECEIPT_V2_TAG,
                 authority_retirement_receipt_id,
             )
             .await?;
-            let Some(LifecycleLedgerRecord::AuthorityRetirementReceiptV2(receipt)) = selected
-            else {
-                return Err(OmniError::manifest_internal(
-                    "RETIRED profile does not select its immutable authority-retirement receipt",
-                ));
+            let selected_v1 = lookup_lifecycle_ledger_record_by_id(
+                &tokens,
+                snapshot.stream_token_authority(),
+                crate::db::manifest::stream_profile::AUTHORITY_RETIREMENT_RECEIPT_TAG,
+                authority_retirement_receipt_id,
+            )
+            .await?;
+            let receipt = match (selected_v2, selected_v1) {
+                (Some(LifecycleLedgerRecord::AuthorityRetirementReceiptV2(receipt)), None) => {
+                    StreamAuthorityRetirementExportReceipt::V2(receipt)
+                }
+                (None, Some(LifecycleLedgerRecord::AuthorityRetirementReceipt(receipt))) => {
+                    StreamAuthorityRetirementExportReceipt::V1(receipt)
+                }
+                (None, None) => {
+                    return Err(OmniError::manifest_internal(
+                        "RETIRED profile does not select its immutable authority-retirement receipt",
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(OmniError::manifest_internal(
+                        "RETIRED profile ambiguously selects both v1 and v2 authority-retirement receipts",
+                    ));
+                }
+                _ => {
+                    return Err(OmniError::manifest_internal(
+                        "RETIRED profile selects an invalid authority-retirement ledger family",
+                    ));
+                }
             };
             self.validate_visible_retirement_receipt(snapshot, &receipt)
                 .await?;
@@ -1230,7 +1320,7 @@ impl Omnigraph {
     pub(super) async fn validate_visible_retirement_receipt(
         &self,
         snapshot: &crate::db::Snapshot,
-        receipt: &AuthorityRetirementReceiptV2,
+        receipt: &StreamAuthorityRetirementExportReceipt,
     ) -> Result<()> {
         receipt.validate()?;
         let schema_state =
@@ -1238,15 +1328,15 @@ impl Omnigraph {
         let graph_identity_digest =
             stream_graph_identity_digest(&schema_state.schema_identity_domain)?;
         let expected_profile_revision = receipt
-            .source_profile_revision
+            .source_profile_revision()
             .checked_add(1)
             .ok_or_else(|| OmniError::manifest_internal("retirement profile revision overflow"))?;
         let expected_manifest_version = receipt
-            .source_manifest_version
+            .source_manifest_version()
             .checked_add(1)
             .ok_or_else(|| OmniError::manifest_internal("retirement manifest version overflow"))?;
         let expected_token_version = receipt
-            .pre_retirement_token_head
+            .pre_retirement_token_head()
             .table_version
             .checked_add(1)
             .ok_or_else(|| OmniError::manifest_internal("retirement token version overflow"))?;
@@ -1258,13 +1348,13 @@ impl Omnigraph {
                 authority_retirement_id,
                 authority_retirement_receipt_id,
                 authority_retirement_cut_digest,
-            } if authority_retirement_id == &receipt.retirement_id
-                && authority_retirement_receipt_id == &receipt.record_id
-                && authority_retirement_cut_digest == &receipt.export_cut_digest
+            } if authority_retirement_id == receipt.retirement_id()
+                && authority_retirement_receipt_id == receipt.record_id()
+                && authority_retirement_cut_digest == receipt.export_cut_digest()
         );
         if !matches_profile
-            || receipt.graph_identity_digest != graph_identity_digest
-            || receipt.source_internal_schema_version != INTERNAL_MANIFEST_SCHEMA_VERSION
+            || receipt.graph_identity_digest() != graph_identity_digest
+            || receipt.source_internal_schema_version() != INTERNAL_MANIFEST_SCHEMA_VERSION
             || profile.profile_revision != expected_profile_revision
             || profile.profile_receipt_chain != expected_chain
             || snapshot.version() != expected_manifest_version
@@ -1277,7 +1367,7 @@ impl Omnigraph {
                 .stream_token_authority()
                 .current_head_witness
                 .transaction_uuid
-                == receipt.pre_retirement_token_head.transaction_uuid
+                == receipt.pre_retirement_token_head().transaction_uuid
             || snapshot
                 .stream_token_authority()
                 .current_head_witness
@@ -1294,9 +1384,11 @@ impl Omnigraph {
             ));
         }
         let (heads, cut) = self
-            .capture_retirement_logical_cut_with_main_version(Some(receipt.source_manifest_version))
+            .capture_retirement_logical_cut_with_main_version(Some(
+                receipt.source_manifest_version(),
+            ))
             .await?;
-        if heads != receipt.live_branch_heads_digest || cut != receipt.export_cut_digest {
+        if heads != receipt.live_branch_heads_digest() || cut != receipt.export_cut_digest() {
             return Err(OmniError::manifest_internal(
                 "retired graph logical cut differs from its selected authority-retirement receipt",
             ));
@@ -1509,7 +1601,7 @@ impl Omnigraph {
         &self,
         branch: &str,
         expected_snapshot: &crate::db::Snapshot,
-        receipt: AuthorityRetirementReceiptV2,
+        receipt: StreamAuthorityRetirementExportReceipt,
     ) -> Result<StreamAuthorityRetirementExportProvenance> {
         let normalized = Self::normalize_branch_name(branch)?;
         let canonical_branch = normalized.as_deref().unwrap_or("main").to_string();
@@ -1524,7 +1616,7 @@ impl Omnigraph {
         }
         let (source_schema_ir_hash, members) = self
             .capture_retirement_logical_cut_members_with_main_version(Some(
-                receipt.source_manifest_version,
+                receipt.source_manifest_version(),
             ))
             .await?;
         let live_branch_heads_digest = retirement_live_branch_heads_digest(&members)?;
@@ -1534,8 +1626,8 @@ impl Omnigraph {
             .collect::<Vec<_>>();
         let export_cut_digest =
             retirement_export_cut_digest(&source_schema_ir_hash, &ordered_branch_member_digests)?;
-        if live_branch_heads_digest != receipt.live_branch_heads_digest
-            || export_cut_digest != receipt.export_cut_digest
+        if live_branch_heads_digest != receipt.live_branch_heads_digest()
+            || export_cut_digest != receipt.export_cut_digest()
         {
             return Err(OmniError::manifest_internal(
                 "retired export proof differs from its selected authority-retirement receipt",
@@ -1555,7 +1647,7 @@ impl Omnigraph {
         })?;
         let provenance = StreamAuthorityRetirementExportProvenance {
             kind: EXPORT_PROVENANCE_KIND.to_string(),
-            receipt: receipt.into(),
+            receipt,
             source_schema_ir_hash,
             ordered_branch_member_digests,
             selected_member_index,
