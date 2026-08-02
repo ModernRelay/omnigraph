@@ -1,3 +1,8 @@
+// The failpoint-only cluster state-machine tests compose several large async
+// futures. Linux rustc needs the wider layout-query budget while building the
+// lib-test harness; production and ordinary test builds keep the default.
+#![cfg_attr(all(test, feature = "failpoints"), recursion_limit = "256")]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self};
 use std::path::{Path, PathBuf};
