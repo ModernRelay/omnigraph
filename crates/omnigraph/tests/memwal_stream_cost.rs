@@ -31,7 +31,10 @@ use futures::TryStreamExt;
 use lance_core::utils::bloomfilter::sbbf::Sbbf;
 use lance_index::mem_wal::{FlushedGeneration, ShardId, ShardManifest, ShardStatus};
 use lance_io::utils::tracking_store::{IOTracker, IoStats};
-use omnigraph::db::{Omnigraph, ReadTarget, StreamDeadLetterPage};
+use omnigraph::db::{
+    Omnigraph, ReadTarget, StreamDeadLetterEncodingCostForTest, StreamDeadLetterPage,
+    failpoint_measure_stream_dead_letter_object_for_test,
+};
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
 use omnigraph::instrumentation::{CountingStorageAdapter, StorageReadCounts};
@@ -81,6 +84,18 @@ const NO_AUTO_ROLL_ROWS: usize = 8_193;
 const NO_AUTO_ROLL_BATCHES: usize = 8_193;
 
 const RSS_CHILD_ENV: &str = "OMNIGRAPH_MEMWAL_COST_CHILD";
+const DEAD_LETTER_RSS_CHILD_ENV: &str = "OMNIGRAPH_DEAD_LETTER_COST_CHILD";
+const DEAD_LETTER_CANDIDATES: usize = 8_192;
+const DEAD_LETTER_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+const DEAD_LETTER_BASE_CONTROL_CHARS: usize = 1_250;
+// These two fixture terms close the current production grammar from its
+// 8,192-candidate base shape to exactly 64 MiB. A prefix/field change must
+// deliberately recalibrate them instead of silently changing the evidence.
+const DEAD_LETTER_EXACT_EXTRA_CONTROL_CHARS: usize = 124_430;
+const DEAD_LETTER_EXACT_LITERAL_CHARS: usize = 2;
+// Filled from the first isolated F6b4 run; this remains a remeasurement
+// tripwire, not admission, a storage quota, or a product RSS SLO.
+const DEAD_LETTER_RSS_DELTA_REMEASURE_BYTES: u64 = 192 * 1024 * 1024;
 /// The exact Lance release Gate R0's source audit was performed against.
 /// Through the 9.0.0-rc.1 era this was a git rev (`cec0b7df`); the 9.0.0
 /// stable bump moved every Lance crate to the crates.io registry, so the
@@ -3030,6 +3045,171 @@ async fn gate_r0_widest_generation_closes_and_records_retain_all_growth_on_confi
     assert_widest_retained_growth(&sample, "rustfs");
 }
 
+fn f6b4_dead_letter_payloads(literal_adjustment: i8) -> (Vec<Vec<u8>>, u64) {
+    let literal_chars =
+        i64::try_from(DEAD_LETTER_EXACT_LITERAL_CHARS).unwrap() + i64::from(literal_adjustment);
+    assert!(literal_chars >= 0);
+    let literal_chars = usize::try_from(literal_chars).unwrap();
+
+    let base_value = "\0".repeat(DEAD_LETTER_BASE_CONTROL_CHARS);
+    let base_payload = serde_json::to_vec(&serde_json::json!({
+        "payload": base_value,
+    }))
+    .unwrap();
+    let mut payloads = Vec::with_capacity(DEAD_LETTER_CANDIDATES);
+    for _ in 0..DEAD_LETTER_CANDIDATES - 1 {
+        payloads.push(base_payload.clone());
+    }
+    let mut final_value =
+        "\0".repeat(DEAD_LETTER_BASE_CONTROL_CHARS + DEAD_LETTER_EXACT_EXTRA_CONTROL_CHARS);
+    final_value.push_str(&"x".repeat(literal_chars));
+    payloads.push(
+        serde_json::to_vec(&serde_json::json!({
+            "payload": final_value,
+        }))
+        .unwrap(),
+    );
+    let source_value_bytes = DEAD_LETTER_BASE_CONTROL_CHARS
+        .checked_mul(DEAD_LETTER_CANDIDATES)
+        .and_then(|bytes| bytes.checked_add(DEAD_LETTER_EXACT_EXTRA_CONTROL_CHARS))
+        .and_then(|bytes| bytes.checked_add(literal_chars))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap();
+    (payloads, source_value_bytes)
+}
+
+fn assert_f6b4_dead_letter_measurement(
+    measurement: &StreamDeadLetterEncodingCostForTest,
+    expected_encoded_bytes: u64,
+) {
+    assert_eq!(
+        measurement.candidate_count,
+        u64::try_from(DEAD_LETTER_CANDIDATES).unwrap()
+    );
+    assert_eq!(
+        measurement.verified_candidate_count,
+        measurement.candidate_count
+    );
+    assert_eq!(measurement.encoded_bytes, expected_encoded_bytes);
+    assert!(measurement.encoded_capacity_bytes >= measurement.encoded_bytes);
+    assert!(measurement.encoded_capacity_bytes <= DEAD_LETTER_OBJECT_BYTES);
+    assert!(measurement.canonical_payload_bytes > 58 * 1024 * 1024);
+    assert!(measurement.candidate_view_bytes > 0);
+    assert!(measurement.ordinal_index_bytes > 0);
+    assert!(measurement.line_range_index_bytes > 0);
+}
+
+#[test]
+#[ignore = "F6b4 production-size dead-letter envelope; run explicitly with a 120-second timeout"]
+fn f6b4_dead_letter_object_records_production_envelope_and_peak_rss() {
+    let (one_under_payloads, _) = f6b4_dead_letter_payloads(-1);
+    let one_under = failpoint_measure_stream_dead_letter_object_for_test(&one_under_payloads)
+        .expect("the production object one byte below its cap must encode and verify");
+    assert_f6b4_dead_letter_measurement(&one_under, DEAD_LETTER_OBJECT_BYTES - 1);
+    drop(one_under_payloads);
+
+    let (exact_payloads, source_value_bytes) = f6b4_dead_letter_payloads(0);
+    let exact = failpoint_measure_stream_dead_letter_object_for_test(&exact_payloads)
+        .expect("the production object exactly at its cap must encode and verify");
+    assert_f6b4_dead_letter_measurement(&exact, DEAD_LETTER_OBJECT_BYTES);
+    drop(exact_payloads);
+
+    let (one_over_payloads, _) = f6b4_dead_letter_payloads(1);
+    let one_over = failpoint_measure_stream_dead_letter_object_for_test(&one_over_payloads)
+        .expect_err("the production object one byte above its cap must not become prepared");
+    assert!(
+        matches!(
+            one_over,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit,
+                actual,
+            } if resource == "stream_dead_letter_object_encoded_bytes"
+                && limit == DEAD_LETTER_OBJECT_BYTES
+                && actual == DEAD_LETTER_OBJECT_BYTES + 1
+        ),
+        "{one_over:?}"
+    );
+
+    #[cfg(unix)]
+    {
+        let baseline_peak_rss = run_rss_child(
+            "f6b4_dead_letter_object_cost_child",
+            DEAD_LETTER_RSS_CHILD_ENV,
+            "baseline",
+        );
+        let exact_peak_rss = run_rss_child(
+            "f6b4_dead_letter_object_cost_child",
+            DEAD_LETTER_RSS_CHILD_ENV,
+            "exact",
+        );
+        let signed_peak_rss_lift = i128::from(exact_peak_rss) - i128::from(baseline_peak_rss);
+        eprintln!(
+            "F6b4 dead-letter envelope: candidates={} source_value_bytes={} canonical_payload_bytes={} encoded_bytes={} encoded_capacity_bytes={} candidate_view_bytes={} ordinal_index_bytes={} line_range_index_bytes={} encode_elapsed_micros={} verify_elapsed_micros={} baseline_peak_rss={} exact_peak_rss={} signed_peak_rss_lift={} rss_delta_remeasure_bytes={}",
+            exact.candidate_count,
+            source_value_bytes,
+            exact.canonical_payload_bytes,
+            exact.encoded_bytes,
+            exact.encoded_capacity_bytes,
+            exact.candidate_view_bytes,
+            exact.ordinal_index_bytes,
+            exact.line_range_index_bytes,
+            exact.encode_elapsed_micros,
+            exact.verify_elapsed_micros,
+            baseline_peak_rss,
+            exact_peak_rss,
+            signed_peak_rss_lift,
+            DEAD_LETTER_RSS_DELTA_REMEASURE_BYTES,
+        );
+        assert!(
+            signed_peak_rss_lift <= i128::from(DEAD_LETTER_RSS_DELTA_REMEASURE_BYTES),
+            "the isolated dead-letter encoder/verifier crossed its measured peak-RSS-lift envelope; remeasure before changing the object grammar or materialization shape"
+        );
+    }
+
+    #[cfg(not(unix))]
+    eprintln!(
+        "F6b4 dead-letter envelope: candidates={} source_value_bytes={} canonical_payload_bytes={} encoded_bytes={} encoded_capacity_bytes={} candidate_view_bytes={} ordinal_index_bytes={} line_range_index_bytes={} encode_elapsed_micros={} verify_elapsed_micros={}; peak RSS unavailable on this platform",
+        exact.candidate_count,
+        source_value_bytes,
+        exact.canonical_payload_bytes,
+        exact.encoded_bytes,
+        exact.encoded_capacity_bytes,
+        exact.candidate_view_bytes,
+        exact.ordinal_index_bytes,
+        exact.line_range_index_bytes,
+        exact.encode_elapsed_micros,
+        exact.verify_elapsed_micros,
+    );
+}
+
+/// Subprocess half of
+/// `f6b4_dead_letter_object_records_production_envelope_and_peak_rss`.
+#[test]
+#[ignore = "subprocess helper; exercised by the F6b4 dead-letter cost cell"]
+fn f6b4_dead_letter_object_cost_child() {
+    let Some(mode) = std::env::var_os(DEAD_LETTER_RSS_CHILD_ENV) else {
+        return;
+    };
+    let mode = mode.to_string_lossy();
+    let (payloads, source_value_bytes) = f6b4_dead_letter_payloads(0);
+    std::hint::black_box(source_value_bytes);
+    match mode.as_ref() {
+        "baseline" => {
+            let canonical_payload_bytes = payloads.iter().map(Vec::len).sum::<usize>();
+            assert!(canonical_payload_bytes > 58 * 1024 * 1024);
+            std::hint::black_box(&payloads);
+        }
+        "exact" => {
+            let measurement = failpoint_measure_stream_dead_letter_object_for_test(&payloads)
+                .expect("the exact F6b4 child must encode and verify the production envelope");
+            assert_f6b4_dead_letter_measurement(&measurement, DEAD_LETTER_OBJECT_BYTES);
+            std::hint::black_box(measurement);
+        }
+        other => panic!("unknown F6b4 dead-letter RSS child mode '{other}'"),
+    }
+}
+
 #[cfg(unix)]
 fn normalized_peak_rss_bytes(rusage: &libc::rusage) -> u64 {
     #[cfg(target_os = "macos")]
@@ -3061,15 +3241,15 @@ fn wait4_rusage(pid: i32) -> (i64, u64) {
 }
 
 #[cfg(unix)]
-fn run_rss_child(mode: &str) -> u64 {
+fn run_rss_child(test_name: &str, env_name: &str, mode: &str) -> u64 {
     use std::process::{Command, Stdio};
 
     let child = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("widest_legal_generation_cost_child")
+        .arg(test_name)
         .arg("--ignored")
         .arg("--nocapture")
-        .env(RSS_CHILD_ENV, mode)
+        .env(env_name, mode)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -3078,7 +3258,7 @@ fn run_rss_child(mode: &str) -> u64 {
     let (exit, peak) = wait4_rusage(pid);
     // `wait4` reaped the child; dropping the handle only closes its pipes.
     drop(child);
-    assert_eq!(exit, 0, "{mode} widest-generation RSS child failed");
+    assert_eq!(exit, 0, "{mode} RSS child '{test_name}' failed");
     peak
 }
 
@@ -3113,10 +3293,26 @@ fn widest_legal_generation_records_no_roll_estimates_and_peak_rss() {
 
     #[cfg(unix)]
     {
-        let baseline_peak_rss = run_rss_child("baseline");
-        let widest_peak_rss = run_rss_child("widest");
-        let baseline_fold_peak_rss = run_rss_child("baseline-fold");
-        let widest_fold_peak_rss = run_rss_child("widest-fold");
+        let baseline_peak_rss = run_rss_child(
+            "widest_legal_generation_cost_child",
+            RSS_CHILD_ENV,
+            "baseline",
+        );
+        let widest_peak_rss = run_rss_child(
+            "widest_legal_generation_cost_child",
+            RSS_CHILD_ENV,
+            "widest",
+        );
+        let baseline_fold_peak_rss = run_rss_child(
+            "widest_legal_generation_cost_child",
+            RSS_CHILD_ENV,
+            "baseline-fold",
+        );
+        let widest_fold_peak_rss = run_rss_child(
+            "widest_legal_generation_cost_child",
+            RSS_CHILD_ENV,
+            "widest-fold",
+        );
         let signed_process_delta = i128::from(widest_peak_rss) - i128::from(baseline_peak_rss);
         let signed_fold_peak_lift =
             i128::from(widest_fold_peak_rss) - i128::from(baseline_fold_peak_rss);
