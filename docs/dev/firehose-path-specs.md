@@ -28,9 +28,11 @@ format/recovery change or public route. F6b2 is the implemented no-format
 acceptance slice for SIGTERM/shared shutdown, sequential OS-process recovery,
 frozen-round node/edge fairness, physical rebind → re-enable → reopen → resume,
 combined maintenance, fresh-target import, and legacy writer refusal.
-Measurements, long-history
-evidence, bounded public export transport, and the rest of the guardrail matrix
-remain later; F7 remains forbidden until all of F6 passes.
+F6b3 implements the exact-selected uncovered-token-tail cost harness locally
+and as ignored local/configured-RustFS decision sweeps. Covered/reconciled
+evidence, the status warning and scheduling threshold, bounded public export
+transport, and the rest of the guardrail matrix remain later; F7 remains
+forbidden until all of F6 passes.
 **Design authority:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) — this
 file never overrides it. Where they disagree, the RFC wins and this file is
 wrong. §4.7 records the selected experimental profile; §4.3/§4.6 record the
@@ -243,8 +245,10 @@ explicitly advisory, and its pending triggers are not a durable backlog.
 Public durable `StreamStatus` remains manifest-only, and public driver status
 plus every served SDK/HTTP/OpenAPI streaming surface remain inactive. F6b1 now
 provides only the checked terminal served-export capability and hidden
-immutable cut described in §7; the F6b remainder owns measurements and the
-remaining guardrail acceptance.
+immutable cut described in §7. F6b3 now owns exact-selected uncovered-tail
+current-token hit/miss and terminal-page measurement; covered/reconciled
+evidence, transport, status, and remaining guardrail acceptance stay in
+F6b/F7.
 
 ---
 
@@ -270,7 +274,8 @@ remaining guardrail acceptance.
 | ~~F6a~~ | Typed failpoints-only process-local advisory driver snapshot plus one hidden in-process candidate-runtime composition | no format or recovery change | implemented; public durable status remains manifest-only |
 | ~~F6b1 checked immutable export cut~~ | Exact-terminal served-export authority, ambient-enrolled refusal, one nonwaiting root slot, and a move-only exact-version cut that releases writer gates before output | no format or recovery change | implemented behind a doc-hidden engine seam; no public transport |
 | ~~F6b2 process/lifecycle acceptance~~ | SIGTERM/shared shutdown, sequential OS-process recovery, frozen-round node/edge fairness, rebind/re-enable/reopen/resume, combined maintenance, fresh-target import, and legacy writer refusal | no format or recovery change | implemented; no public route or status |
-| **F6b remainder** | Measurements, long-history lookup/RSS/latency evidence, bounded export transport ownership, and the remaining guardrail matrix | — | later |
+| ~~F6b3 selected-token uncovered-tail evidence~~ | Exact manifest-selected coverage diagnostics; fixed-cardinality fresh-handle hit/miss and first terminal-page plus warm hit/miss and repeat terminal-page cost across increasing receipt history; fast local plus ignored local/RustFS sweeps | no format or recovery change | implemented behind doc-hidden failpoints-only read seams; no reconciler or status |
+| **F6b remainder** | Covered/reconciled token curve and threshold, isolated dead-letter encoding/materialization byte and peak-RSS cap evidence, bounded export transport ownership, public status, and the remaining guardrail matrix | — | later |
 | **F7** | Served SDK / HTTP / remote CLI / OpenAPI activation | — | only after all F6 cells pass |
 
 These are dependency milestones, not mandates for giant PRs. Keep each PR
@@ -637,11 +642,13 @@ writer a sidecar-covered witness/rebind transition.
    scaffold fail-closed; a different final payload requires a new strand.
    Logical operations remain correct through Lance's uncovered-fragment
    fallback. The reconciler is not an F3 correctness prerequisite for EXP.
-   Status must expose uncovered count/oldest age and a lookup-cost warning; F6
-   measures exact lookup plus cluster-only current-terminal scans at increasing
-   history depth locally and on RustFS/S3, records an activation threshold,
-   and schedules an authority-safe reconciler only when that threshold is
-   crossed. Ordinary graph `optimize` does not maintain this dataset.
+   F6b3 measures exact current-token hit/miss plus cluster-only terminal-page
+   scans across increasing **uncovered** receipt history locally and on
+   RustFS/S3. The F6b remainder still owns the covered/reconciled curve, public
+   uncovered-count/oldest-age and lookup-cost status, the recorded activation
+   threshold, and the authority-safe reconciler scheduled only when that
+   threshold is crossed. Ordinary graph `optimize` does not maintain this
+   dataset.
 
    `ManagementReceipt` now carries bounded canonical request **and result**
    payloads with digest recomputation in validation. A quiesce request is one
@@ -1856,10 +1863,14 @@ clean shutdown ownership, and checked offline disable. It proves those already
 implemented mechanisms work together without changing manifest, token, or
 recovery grammar or adding an SDK, HTTP, CLI, or OpenAPI contract.
 
-This cell does not prove OS-process forced termination, the full node+edge
+F6a itself does not prove OS-process forced termination, the full node+edge
 fairness matrix, long-history token lookup, RSS/latency/object measurements,
-or maintenance/rebind/resume composition. Those remain F6b-remainder work, so
-F6 is not complete and F7 remains forbidden.
+or maintenance/rebind/resume composition. F6b2 later closes the named process,
+fairness, and maintenance/rebind/resume cells; F6b3 closes the exact-selected
+uncovered-tail current-token instrument. Covered/reconciled token cost and its
+threshold, isolated dead-letter encoding/materialization byte and peak-RSS cap
+evidence, transport/status, and the remaining guardrails still keep F6 open and
+F7 forbidden.
 
 ### Implemented F6b1 checked immutable export-cut subset
 
@@ -1894,11 +1905,13 @@ version can be removed or reused under a live cut. Terminal/refusal errors occur
 byte; a storage or writer error after output starts is preserved as that stream
 error, and completion/drop/error releases the slot.
 
-This slice changes no manifest, token, recovery, or storage format. It adds no
-new public HTTP/SDK/remote-CLI/OpenAPI route, response contract, bounded channel or
-queue-byte reservation, wait deadline, stall/disconnect handling, measurement,
-or public status. Those and the remaining correctness/performance matrix stay
-in the F6b remainder/F7 boundaries below.
+This slice changes no manifest, token, recovery, or storage format. F6b1 itself
+adds no new public HTTP/SDK/remote-CLI/OpenAPI route, response contract, bounded
+channel or queue-byte reservation, wait deadline, stall/disconnect handling,
+measurement, or public status. F6b3 later closes only the exact-selected
+uncovered-tail token instrument; transport/status, covered/reconciled cost, and
+the remaining correctness/performance matrix stay in the F6b remainder/F7
+boundaries below.
 
 ### Implemented F6b2 process/lifecycle acceptance subset
 
@@ -1929,9 +1942,44 @@ broader resume/driver handoff remains later.
 Productive SchemaApply is deliberately absent: an
 enrolled graph's schema changes only through checked sealed/retired export,
 fresh graph initialization with the desired schema, and ordinary load there.
-Physical rebind preserves accepted schema. Measurements, long-history lookup,
+Physical rebind preserves accepted schema. Covered/reconciled token evidence,
+isolated dead-letter encoding/materialization byte and peak-RSS cap evidence,
 bounded public export transport, and served/public parity remain later F6b/F7
 work.
+
+### Implemented F6b3 exact-selected uncovered-tail evidence subset
+
+F6b3 extends `memwal_stream_cost.rs`; it does not add a production maintenance
+path. The fixture seeds one base uniqueness conflict while `DISABLED`, then
+repeats zero-lane enable/disable cycles before enrollment. Each cycle adds two
+immutable profile-management receipts without touching MemWAL. This is the
+controlled token-ledger variable; the profile transitions also advance graph-
+manifest history, while graph open and offline-authority setup stay outside the
+timed first-probe windows. Enrollment, the final enable, one all-diverted
+occurrence, current-token cardinality, and the returned terminal logical ID and
+one-entry page cardinality stay fixed at every depth. Exact page fields and
+serialized byte length are observations, not asserted byte-identical fixtures.
+
+The normal local cell covers 1 and 8 cycles. Ignored local and
+configured-RustFS cells cover 1/8/32/128. Every sample reports the exact token
+version selected by main, the named lookup index's total/uncovered fragments,
+serialized page size, and the cumulative advisory whole-process RSS high-water
+mark. Fresh-handle hit/miss plus the first terminal page, then warm hit/miss and
+repeat terminal pages, report token-read counts, total table-store read bytes,
+manifest reads/bytes, adapter operations, and per-sample warm/repeat elapsed p50
+plus max-of-eight. Graph
+open happens before those windows, so “fresh handle” is not a cold-open or cold-
+provider-cache claim. The
+measured operation windows fail on authority writes, MemWAL/base-table reads,
+prefix listing, or dead-letter payload-object access. Coverage is a separate
+read-only sample-level probe. Wall time is evidence, not an SLO.
+
+This is deliberately an uncovered-tail instrument. The production token index
+is created at genesis, and no recovery-owned authority-safe reconciler exists.
+Calling raw `optimize_indices` would move an unselected physical HEAD and would
+not prove production behavior. Covered/reconciled curves, count/oldest-age and
+lookup-cost status, the measured scheduling threshold, and the reconciler stay
+open.
 
 ### 7.1 Operational guardrails
 
@@ -2041,13 +2089,18 @@ public ingress activates; `AuthorityBlock` repair remains separate.
   barrier under that exact disabled revision before its own CAS. Productive
   SchemaApply remains refused on an enrolled graph and is covered instead by
   a checked-export/fresh-target rebuild cell.
-- A long-history token-ledger instrument measures exact receipt/token lookup
-  and bounded current-terminal scanning across covered history plus increasing
-  uncovered tails, locally and on RustFS/S3. It records rows/bytes/object reads
-  and p95, exposes degraded physical work in status, and pins the threshold
-  that schedules an authority-safe reconciler. No reconciler is required for
-  logical EXP activation, and ordinary graph `optimize` is not credited with
-  token-ledger convergence.
+- F6b3's long-history token-ledger instrument measures exact current-token
+  hit/miss lookup and bounded terminal-page scanning across increasing
+  uncovered receipt tails, locally and on RustFS/S3. Per sample it records
+  result/page bytes, coverage, and cumulative advisory whole-process RSS. The
+  fresh-handle hit/miss and first page plus warm hit/miss and repeat pages report
+  token-read counts, total table-store read bytes, manifest reads/bytes, adapter
+  operations, and per-sample warm/repeat elapsed p50 plus max-of-eight while forbidding payload-object
+  reads. It does not measure receipt-key lookup. The covered/reconciled curve,
+  degraded-work status, and measured threshold that schedules an authority-
+  safe reconciler remain open. No reconciler is required for logical EXP
+  activation, and ordinary graph
+  `optimize` is not credited with token-ledger convergence.
 - A sustained mixed-backlog cell continuously makes node work ready while an
   edge is already in the frozen scheduling round and proves that the edge gets
   its bounded turn with a fresh post-node snapshot.

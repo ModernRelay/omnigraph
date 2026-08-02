@@ -28,6 +28,10 @@
 use std::collections::HashMap;
 
 use crate::db::manifest::StreamLifecycle;
+#[cfg(feature = "failpoints")]
+use crate::db::manifest::token_store::{
+    lookup_stream_token_row, stream_token_lookup_index_coverage,
+};
 use crate::db::{Omnigraph, ReadTarget, Snapshot};
 use crate::error::{OmniError, Result};
 
@@ -179,6 +183,49 @@ impl Omnigraph {
         // normalizes to the canonical branch, so the named-branch-only profile
         // projection is not involved.
         project_stream_status(&snapshot)
+    }
+
+    /// Measure one exact current-token probe without exposing raw token-table
+    /// authority or folding unrelated WAL work into the observation.
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    pub async fn failpoint_stream_token_lookup_for_cost_test(
+        &self,
+        table_key: &str,
+        logical_id: &str,
+    ) -> Result<(u64, Option<String>)> {
+        let snapshot = self.snapshot_of(ReadTarget::branch("main")).await?;
+        let entry = snapshot.entry(table_key).ok_or_else(|| {
+            OmniError::manifest_not_found(format!(
+                "stream-token cost probe found no table '{table_key}'"
+            ))
+        })?;
+        let authority = snapshot.stream_token_authority();
+        let selected_version = authority.current_head_witness.table_version;
+        let dataset = snapshot.open_stream_token_authority().await?;
+        let selected =
+            lookup_stream_token_row(&dataset, authority, entry.identity, logical_id).await?;
+        Ok((
+            selected_version,
+            selected.map(|row| row.current_token.to_string()),
+        ))
+    }
+
+    /// Measure physical lookup-index coverage on the exact selected token cut.
+    /// Unknown coverage stays `None`; this probe never opens raw HEAD or
+    /// publishes a derived index version.
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    pub async fn failpoint_stream_token_lookup_coverage_for_cost_test(
+        &self,
+    ) -> Result<(u64, u64, Option<u64>)> {
+        let snapshot = self.snapshot_of(ReadTarget::branch("main")).await?;
+        let authority = snapshot.stream_token_authority();
+        let selected_version = authority.current_head_witness.table_version;
+        let dataset = snapshot.open_stream_token_authority().await?;
+        let (total_fragments, uncovered_fragments) =
+            stream_token_lookup_index_coverage(&dataset, authority).await?;
+        Ok((selected_version, total_fragments, uncovered_fragments))
     }
 }
 

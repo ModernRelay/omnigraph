@@ -375,6 +375,14 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     // read-only is the structural claim that it cannot move a lifecycle.
     ("db/omnigraph/stream_status.rs", "stream_status"),
     (
+        "db/omnigraph/stream_status.rs",
+        "failpoint_stream_token_lookup_for_cost_test",
+    ),
+    (
+        "db/omnigraph/stream_status.rs",
+        "failpoint_stream_token_lookup_coverage_for_cost_test",
+    ),
+    (
         "db/omnigraph/stream_retirement.rs",
         "plan_stream_authority_retirement",
     ),

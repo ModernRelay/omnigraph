@@ -1,6 +1,6 @@
 #![cfg(feature = "failpoints")]
 
-//! RFC-026 Phase-B1 cost evidence.
+//! RFC-026 private-stream cost evidence.
 //!
 //! Keep the terms separate.  A warm already-claimed acknowledgement, a cold
 //! claim/replay, one selected flushed-generation scan, retained shard-manifest
@@ -12,6 +12,10 @@
 //! real private B1 path grows retained shard metadata and the folded base table
 //! together, so the sweep reports each observable term but does not attribute a
 //! slope to retained objects alone or turn local timings into a product claim.
+//!
+//! F6b3 separately holds current-token cardinality fixed while immutable
+//! control-ledger history grows, then measures the exact manifest-selected
+//! uncovered index tail. It never creates an unselected reconciled HEAD.
 
 mod helpers;
 
@@ -27,7 +31,7 @@ use futures::TryStreamExt;
 use lance_core::utils::bloomfilter::sbbf::Sbbf;
 use lance_index::mem_wal::{FlushedGeneration, ShardId, ShardManifest, ShardStatus};
 use lance_io::utils::tracking_store::{IOTracker, IoStats};
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::{Omnigraph, ReadTarget, StreamDeadLetterPage};
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
 use omnigraph::instrumentation::{CountingStorageAdapter, StorageReadCounts};
@@ -48,6 +52,22 @@ query add_history($tick: I32) {
     insert History { tick: $tick }
 }
 "#;
+const TOKEN_COST_SCHEMA: &str = r#"
+node Person {
+    score: I32
+    @unique(score)
+}
+"#;
+const TOKEN_COST_SEED: &str = r#"
+query seed_token_cost_conflict($score: I32) {
+    insert Person { score: $score }
+}
+"#;
+const TOKEN_COST_LOGICAL_ID_PREFIX: &str = "token-cost-current";
+const TOKEN_COST_LOGICAL_ID: &str = "token-cost-current-00000";
+const TOKEN_COST_MISSING_ID: &str = "token-cost-missing";
+const TOKEN_COST_CONTRIBUTOR: &str = "agent:f6b3-token-cost";
+const TOKEN_COST_SERIES_REPETITIONS: usize = 8;
 
 const WIDEST_ROWS: usize = 8_192;
 const HARD_ARROW_BYTES: usize = 32 * 1024 * 1024;
@@ -123,12 +143,15 @@ struct PathIo {
     total_read_bytes: u64,
     total_writes: u64,
     total_written_bytes: u64,
+    list_requests: u64,
     memwal_reads: u64,
     memwal_writes: u64,
     base_table_reads: u64,
     base_table_writes: u64,
     stream_token_reads: u64,
     stream_token_writes: u64,
+    dead_letter_object_reads: u64,
+    dead_letter_object_writes: u64,
     other_reads: u64,
     other_writes: u64,
     wal_reads: u64,
@@ -199,6 +222,12 @@ impl PathIo {
         for request in &stats.requests {
             let path = request.path.as_ref();
             let components = path.split('/').collect::<Vec<_>>();
+            if matches!(
+                request.method,
+                "list" | "list_with_offset" | "list_with_delimiter"
+            ) {
+                out.list_requests += 1;
+            }
             let write = matches!(
                 request.method,
                 "put_opts" | "put_part" | "copy" | "rename" | "delete"
@@ -206,6 +235,7 @@ impl PathIo {
             let read = !write;
             let memwal = components.contains(&"_mem_wal");
             let stream_token = components.contains(&"_stream_tokens.lance");
+            let dead_letter_object = components.contains(&"__dead_letter");
             let base_table = !memwal
                 && components.windows(2).any(|pair| {
                     matches!(pair[0], "nodes" | "edges")
@@ -224,6 +254,12 @@ impl PathIo {
                 *classified_reads += 1;
             } else {
                 *classified_writes += 1;
+            }
+            if dead_letter_object && read {
+                out.dead_letter_object_reads += 1;
+            }
+            if dead_letter_object && write {
+                out.dead_letter_object_writes += 1;
             }
             let wal = memwal && (path.contains("/wal/") || path.ends_with("/wal"));
             let shard_manifest =
@@ -325,8 +361,7 @@ struct AdapterIo {
     exists: u64,
     read_text_versioned: u64,
     list_dir: u64,
-    write_text: u64,
-    delete: u64,
+    mutation_calls: u64,
 }
 
 impl AdapterIo {
@@ -337,24 +372,23 @@ impl AdapterIo {
             exists: counts.exists(),
             read_text_versioned: counts.read_text_versioned(),
             list_dir: counts.list_dir(),
-            write_text: counts.write_text(),
-            delete: counts.delete(),
+            mutation_calls: counts.mutation_calls(),
         }
     }
 
     fn since(self, before: Self) -> Self {
+        let delta = |current: u64, prior: u64| {
+            current
+                .checked_sub(prior)
+                .expect("storage call counter regressed")
+        };
         Self {
-            read_text: self.read_text.saturating_sub(before.read_text),
-            read_text_if_exists: self
-                .read_text_if_exists
-                .saturating_sub(before.read_text_if_exists),
-            exists: self.exists.saturating_sub(before.exists),
-            read_text_versioned: self
-                .read_text_versioned
-                .saturating_sub(before.read_text_versioned),
-            list_dir: self.list_dir.saturating_sub(before.list_dir),
-            write_text: self.write_text.saturating_sub(before.write_text),
-            delete: self.delete.saturating_sub(before.delete),
+            read_text: delta(self.read_text, before.read_text),
+            read_text_if_exists: delta(self.read_text_if_exists, before.read_text_if_exists),
+            exists: delta(self.exists, before.exists),
+            read_text_versioned: delta(self.read_text_versioned, before.read_text_versioned),
+            list_dir: delta(self.list_dir, before.list_dir),
+            mutation_calls: delta(self.mutation_calls, before.mutation_calls),
         }
     }
 
@@ -364,8 +398,7 @@ impl AdapterIo {
             + self.exists
             + self.read_text_versioned
             + self.list_dir
-            + self.write_text
-            + self.delete
+            + self.mutation_calls
     }
 }
 
@@ -454,6 +487,599 @@ struct WidestRetainedGrowthSample {
     visible_rows: usize,
     sampled_payloads: Vec<(String, String)>,
     recovery_sidecars_after_fold: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TokenCostObservation {
+    elapsed_us: u128,
+    table: PathIo,
+    manifest: PathIo,
+    adapter: AdapterIo,
+}
+
+#[derive(Debug)]
+struct TokenAuthorityCostSample {
+    profile_cycles: u64,
+    profile_revision: u64,
+    selected_token_version: u64,
+    total_fragments: u64,
+    uncovered_fragments: Option<u64>,
+    fresh_handle_hit: TokenCostObservation,
+    fresh_handle_miss: TokenCostObservation,
+    first_terminal_page: TokenCostObservation,
+    warm_hits: Vec<TokenCostObservation>,
+    warm_misses: Vec<TokenCostObservation>,
+    repeat_terminal_pages: Vec<TokenCostObservation>,
+    terminal_page_entries: usize,
+    terminal_page_bytes: usize,
+    cumulative_process_peak_rss_bytes: Option<u64>,
+}
+
+fn token_cost_observation(
+    started: Instant,
+    table_tracker: &IOTracker,
+    manifest_tracker: &IOTracker,
+    adapter_counts: &StorageReadCounts,
+    adapter_before: AdapterIo,
+) -> TokenCostObservation {
+    TokenCostObservation {
+        elapsed_us: started.elapsed().as_micros(),
+        table: PathIo::from_stats(&table_tracker.incremental_stats()),
+        manifest: PathIo::from_stats(&manifest_tracker.incremental_stats()),
+        adapter: AdapterIo::snapshot(adapter_counts).since(adapter_before),
+    }
+}
+
+async fn initialize_token_authority_cost_fixture(
+    cluster_uri: &str,
+    profile_cycles: u64,
+) -> (String, String, u64) {
+    assert!(profile_cycles > 0);
+    let uri = helpers::stream_authority::graph_uri(cluster_uri);
+    let db = Arc::new(Omnigraph::init(&uri, TOKEN_COST_SCHEMA).await.unwrap());
+    db.mutate(
+        "main",
+        TOKEN_COST_SEED,
+        "seed_token_cost_conflict",
+        &helpers::int_params(&[("$score", 0)]),
+    )
+    .await
+    .expect("seed the fixed base uniqueness conflict before profile history");
+
+    let setup_table_tracker = IOTracker::default();
+    let setup_manifest_tracker = IOTracker::default();
+    with_raw_io_trackers(&setup_table_tracker, &setup_manifest_tracker, async {
+        for cycle in 0..profile_cycles {
+            let status = db.stream_status().await.unwrap();
+            assert_eq!(status.profile_mode, "DISABLED");
+            assert!(
+                status.tables.is_empty(),
+                "variable authority history must be generated before enrollment"
+            );
+            helpers::stream_authority::enable_stream_profile(&db, cluster_uri).await;
+            helpers::stream_authority::disable_stream_profile_with_operation_id(
+                &db,
+                cluster_uri,
+                &format!("memwal-token-cost-disable-{cycle:08}"),
+            )
+            .await
+            .expect("a zero-lane profile cycle must finish disabled");
+        }
+    })
+    .await;
+    let setup_table = PathIo::from_stats(&setup_table_tracker.incremental_stats());
+    let _ = setup_manifest_tracker.incremental_stats();
+    assert_eq!(setup_table.memwal_reads, 0, "{setup_table:#?}");
+    assert_eq!(setup_table.memwal_writes, 0, "{setup_table:#?}");
+
+    let status = db.stream_status().await.unwrap();
+    assert_eq!(status.profile_mode, "DISABLED");
+    assert!(status.tables.is_empty());
+    db.failpoint_enroll_stream_table_for_test(TABLE)
+        .await
+        .expect("cost fixture enrollment must remain profile-disabled");
+    helpers::stream_authority::enable_stream_profile(&db, cluster_uri).await;
+    let profile_revision = db.stream_status().await.unwrap().profile_revision;
+    assert!(profile_revision > 0);
+
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, cluster_uri).await;
+    let stream_incarnation_id = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    let batch = score_batch(table_schema(&db).await, TOKEN_COST_LOGICAL_ID_PREFIX, 1);
+    let terminal_token = db
+        .failpoint_stream_b2_for_test(
+            TABLE,
+            batch,
+            0,
+            &stream_incarnation_id,
+            "f6b3f6b3-f6b3-46b3-86b3-f6b3f6b3f6b3",
+            None,
+            TOKEN_COST_CONTRIBUTOR,
+        )
+        .await
+        .expect("the fixed conflicting occurrence must be acknowledged before fold");
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the fixed conflicting occurrence must become terminal");
+    drop(db);
+
+    (uri, terminal_token, profile_revision)
+}
+
+async fn measure_token_lookup(
+    db: &Omnigraph,
+    logical_id: &str,
+    table_tracker: &IOTracker,
+    manifest_tracker: &IOTracker,
+    adapter_counts: &StorageReadCounts,
+) -> (TokenCostObservation, u64, Option<String>) {
+    let adapter_before =
+        reset_retention_term_trackers(table_tracker, manifest_tracker, adapter_counts);
+    let started = Instant::now();
+    let (selected_version, token) = db
+        .failpoint_stream_token_lookup_for_cost_test(TABLE, logical_id)
+        .await
+        .expect("the exact selected-token cost probe must succeed");
+    (
+        token_cost_observation(
+            started,
+            table_tracker,
+            manifest_tracker,
+            adapter_counts,
+            adapter_before,
+        ),
+        selected_version,
+        token,
+    )
+}
+
+async fn measure_terminal_page(
+    db: &Omnigraph,
+    cluster_uri: &str,
+    table_tracker: &IOTracker,
+    manifest_tracker: &IOTracker,
+    adapter_counts: &StorageReadCounts,
+) -> (TokenCostObservation, StreamDeadLetterPage) {
+    let mut adapter_before = None;
+    let mut started = None;
+    let page = helpers::stream_authority::list_stream_dead_letters_after_authority(
+        db,
+        cluster_uri,
+        None,
+        || {
+            adapter_before = Some(reset_retention_term_trackers(
+                table_tracker,
+                manifest_tracker,
+                adapter_counts,
+            ));
+            started = Some(Instant::now());
+        },
+    )
+    .await
+    .expect("the exact selected-token terminal scan must succeed");
+    (
+        token_cost_observation(
+            started.expect("the authority boundary must start the measurement"),
+            table_tracker,
+            manifest_tracker,
+            adapter_counts,
+            adapter_before.expect("the authority boundary must reset the adapters"),
+        ),
+        page,
+    )
+}
+
+async fn token_authority_cost_sample_at(
+    cluster_uri: &str,
+    profile_cycles: u64,
+) -> TokenAuthorityCostSample {
+    let (uri, terminal_token, profile_revision) =
+        initialize_token_authority_cost_fixture(cluster_uri, profile_cycles).await;
+    let table_tracker = IOTracker::default();
+    let manifest_tracker = IOTracker::default();
+
+    with_raw_io_trackers(&table_tracker, &manifest_tracker, async {
+        let (adapter, adapter_counts) = CountingStorageAdapter::new(storage_for_uri(&uri).unwrap());
+
+        let coverage_db = Arc::new(
+            Omnigraph::open_with_storage(&uri, Arc::clone(&adapter))
+                .await
+                .unwrap(),
+        );
+        let (selected_token_version, total_fragments, uncovered_fragments) = coverage_db
+            .failpoint_stream_token_lookup_coverage_for_cost_test()
+            .await
+            .expect("selected token-index coverage must be observable");
+        drop(coverage_db);
+
+        let fresh_handle_hit_db = Arc::new(
+            Omnigraph::open_with_storage(&uri, Arc::clone(&adapter))
+                .await
+                .unwrap(),
+        );
+        let (fresh_handle_hit, hit_version, hit) = measure_token_lookup(
+            &fresh_handle_hit_db,
+            TOKEN_COST_LOGICAL_ID,
+            &table_tracker,
+            &manifest_tracker,
+            &adapter_counts,
+        )
+        .await;
+        assert_eq!(hit_version, selected_token_version);
+        assert_eq!(hit.as_deref(), Some(terminal_token.as_str()));
+        drop(fresh_handle_hit_db);
+
+        let fresh_handle_miss_db = Arc::new(
+            Omnigraph::open_with_storage(&uri, Arc::clone(&adapter))
+                .await
+                .unwrap(),
+        );
+        let (fresh_handle_miss, miss_version, miss) = measure_token_lookup(
+            &fresh_handle_miss_db,
+            TOKEN_COST_MISSING_ID,
+            &table_tracker,
+            &manifest_tracker,
+            &adapter_counts,
+        )
+        .await;
+        assert_eq!(miss_version, selected_token_version);
+        assert!(miss.is_none());
+        drop(fresh_handle_miss_db);
+
+        let first_page_db = Arc::new(
+            Omnigraph::open_with_storage(&uri, Arc::clone(&adapter))
+                .await
+                .unwrap(),
+        );
+        let (first_terminal_page, first_page) = measure_terminal_page(
+            &first_page_db,
+            cluster_uri,
+            &table_tracker,
+            &manifest_tracker,
+            &adapter_counts,
+        )
+        .await;
+        assert_eq!(first_page.token_table_version, selected_token_version);
+        assert_eq!(first_page.entries.len(), 1);
+        assert_eq!(first_page.entries[0].logical_id, TOKEN_COST_LOGICAL_ID);
+        assert_eq!(first_page.entries[0].occurrence_token, terminal_token);
+        assert!(first_page.next_cursor.is_none());
+        drop(first_page_db);
+
+        let warm_db = Arc::new(
+            Omnigraph::open_with_storage(&uri, Arc::clone(&adapter))
+                .await
+                .unwrap(),
+        );
+        let (_, warmup_version, warmup_hit) = measure_token_lookup(
+            &warm_db,
+            TOKEN_COST_LOGICAL_ID,
+            &table_tracker,
+            &manifest_tracker,
+            &adapter_counts,
+        )
+        .await;
+        assert_eq!(warmup_version, selected_token_version);
+        assert_eq!(warmup_hit.as_deref(), Some(terminal_token.as_str()));
+        let (_, warmup_version, warmup_miss) = measure_token_lookup(
+            &warm_db,
+            TOKEN_COST_MISSING_ID,
+            &table_tracker,
+            &manifest_tracker,
+            &adapter_counts,
+        )
+        .await;
+        assert_eq!(warmup_version, selected_token_version);
+        assert!(warmup_miss.is_none());
+        let (_, repeat_warmup_page) = measure_terminal_page(
+            &warm_db,
+            cluster_uri,
+            &table_tracker,
+            &manifest_tracker,
+            &adapter_counts,
+        )
+        .await;
+        assert_eq!(repeat_warmup_page.entries.len(), 1);
+
+        let mut warm_hits = Vec::with_capacity(TOKEN_COST_SERIES_REPETITIONS);
+        for _ in 0..TOKEN_COST_SERIES_REPETITIONS {
+            let (observation, version, hit) = measure_token_lookup(
+                &warm_db,
+                TOKEN_COST_LOGICAL_ID,
+                &table_tracker,
+                &manifest_tracker,
+                &adapter_counts,
+            )
+            .await;
+            assert_eq!(version, selected_token_version);
+            assert_eq!(hit.as_deref(), Some(terminal_token.as_str()));
+            warm_hits.push(observation);
+        }
+        let mut warm_misses = Vec::with_capacity(TOKEN_COST_SERIES_REPETITIONS);
+        for _ in 0..TOKEN_COST_SERIES_REPETITIONS {
+            let (observation, version, miss) = measure_token_lookup(
+                &warm_db,
+                TOKEN_COST_MISSING_ID,
+                &table_tracker,
+                &manifest_tracker,
+                &adapter_counts,
+            )
+            .await;
+            assert_eq!(version, selected_token_version);
+            assert!(miss.is_none());
+            warm_misses.push(observation);
+        }
+        let mut repeat_terminal_pages = Vec::with_capacity(TOKEN_COST_SERIES_REPETITIONS);
+        for _ in 0..TOKEN_COST_SERIES_REPETITIONS {
+            let (observation, page) = measure_terminal_page(
+                &warm_db,
+                cluster_uri,
+                &table_tracker,
+                &manifest_tracker,
+                &adapter_counts,
+            )
+            .await;
+            assert_eq!(page.token_table_version, selected_token_version);
+            assert_eq!(page.entries, first_page.entries);
+            assert!(page.next_cursor.is_none());
+            repeat_terminal_pages.push(observation);
+        }
+
+        TokenAuthorityCostSample {
+            profile_cycles,
+            profile_revision,
+            selected_token_version,
+            total_fragments,
+            uncovered_fragments,
+            fresh_handle_hit,
+            fresh_handle_miss,
+            first_terminal_page,
+            warm_hits,
+            warm_misses,
+            repeat_terminal_pages,
+            terminal_page_entries: first_page.entries.len(),
+            terminal_page_bytes: serde_json::to_vec(&first_page).unwrap().len(),
+            cumulative_process_peak_rss_bytes: current_process_peak_rss_bytes(),
+        }
+    })
+    .await
+}
+
+fn assert_token_cost_observation(
+    sample: &TokenAuthorityCostSample,
+    term: &str,
+    observation: &TokenCostObservation,
+) {
+    assert_eq!(
+        observation.table.total_writes, 0,
+        "{term} moved table authority: {sample:#?}"
+    );
+    assert_eq!(
+        observation.manifest.total_writes, 0,
+        "{term} moved graph authority: {sample:#?}"
+    );
+    assert_eq!(
+        observation.table.list_requests, 0,
+        "{term} listed the table store: {sample:#?}"
+    );
+    assert_eq!(
+        observation.manifest.list_requests, 0,
+        "{term} listed the manifest store: {sample:#?}"
+    );
+    assert_eq!(
+        observation.table.memwal_reads, 0,
+        "{term} consulted MemWAL history: {sample:#?}"
+    );
+    assert_eq!(
+        observation.table.base_table_reads, 0,
+        "{term} consulted the base table: {sample:#?}"
+    );
+    assert_eq!(
+        observation.table.other_reads, 0,
+        "{term} escaped the selected token dataset: {sample:#?}"
+    );
+    assert_eq!(
+        observation.table.dead_letter_object_reads, 0,
+        "{term} fetched a dead-letter payload object: {sample:#?}"
+    );
+    assert_eq!(
+        observation.table.dead_letter_object_writes, 0,
+        "{term} wrote a dead-letter payload object: {sample:#?}"
+    );
+    assert_eq!(
+        observation.adapter.read_text_if_exists, 0,
+        "{term} fetched a dead-letter payload object: {sample:#?}"
+    );
+    assert_eq!(
+        observation.adapter.read_text_versioned, 0,
+        "{term} performed an unexpected versioned metadata read: {sample:#?}"
+    );
+    assert_eq!(
+        observation.adapter.list_dir, 0,
+        "{term} listed through the storage adapter: {sample:#?}"
+    );
+    assert_eq!(
+        observation.adapter.mutation_calls, 0,
+        "{term} mutated through the storage adapter: {sample:#?}"
+    );
+}
+
+fn assert_token_authority_cost_sample(sample: &TokenAuthorityCostSample) {
+    assert!(sample.profile_cycles > 0);
+    assert!(sample.profile_revision > 0);
+    assert!(sample.selected_token_version > 0);
+    assert!(sample.total_fragments > 0, "{sample:#?}");
+    let uncovered = sample
+        .uncovered_fragments
+        .expect("the named genesis lookup index must report exact bitmap coverage");
+    assert!(uncovered > 0, "the fixture must retain an uncovered tail");
+    assert!(uncovered <= sample.total_fragments, "{sample:#?}");
+    assert_eq!(sample.terminal_page_entries, 1);
+    assert!(sample.terminal_page_bytes > 0);
+    assert!(sample.cumulative_process_peak_rss_bytes.is_some() || !cfg!(unix));
+
+    assert_token_cost_observation(sample, "fresh_handle_hit", &sample.fresh_handle_hit);
+    assert_token_cost_observation(sample, "fresh_handle_miss", &sample.fresh_handle_miss);
+    assert_token_cost_observation(sample, "first_terminal_page", &sample.first_terminal_page);
+    assert!(
+        sample.fresh_handle_hit.table.stream_token_reads > 0,
+        "{sample:#?}"
+    );
+    assert!(
+        sample.fresh_handle_miss.table.stream_token_reads > 0,
+        "{sample:#?}"
+    );
+    assert!(
+        sample.first_terminal_page.table.stream_token_reads > 0,
+        "{sample:#?}"
+    );
+    assert_eq!(sample.first_terminal_page.adapter.operations(), 0);
+    assert_eq!(sample.warm_hits.len(), TOKEN_COST_SERIES_REPETITIONS);
+    assert_eq!(sample.warm_misses.len(), TOKEN_COST_SERIES_REPETITIONS);
+    assert_eq!(
+        sample.repeat_terminal_pages.len(),
+        TOKEN_COST_SERIES_REPETITIONS
+    );
+    for observation in &sample.warm_hits {
+        assert_token_cost_observation(sample, "warm_hit", observation);
+    }
+    for observation in &sample.warm_misses {
+        assert_token_cost_observation(sample, "warm_miss", observation);
+    }
+    for observation in &sample.repeat_terminal_pages {
+        assert_token_cost_observation(sample, "repeat_terminal_page", observation);
+        assert_eq!(observation.adapter.operations(), 0);
+    }
+}
+
+fn assert_token_authority_cost_growth(
+    shallow: &TokenAuthorityCostSample,
+    deep: &TokenAuthorityCostSample,
+) {
+    assert!(
+        deep.selected_token_version > shallow.selected_token_version,
+        "the variable fixture failed to grow selected token authority: shallow={shallow:#?} deep={deep:#?}"
+    );
+    assert!(
+        deep.profile_revision > shallow.profile_revision,
+        "the variable fixture failed to grow selected profile authority: shallow={shallow:#?} deep={deep:#?}"
+    );
+    assert!(
+        deep.total_fragments > shallow.total_fragments,
+        "the variable fixture failed to grow retained token fragments: shallow={shallow:#?} deep={deep:#?}"
+    );
+    assert!(
+        deep.uncovered_fragments.unwrap() > shallow.uncovered_fragments.unwrap(),
+        "the variable fixture failed to grow the selected uncovered tail: shallow={shallow:#?} deep={deep:#?}"
+    );
+}
+
+fn sample_p50_elapsed_us(observations: &[TokenCostObservation]) -> u128 {
+    assert!(!observations.is_empty());
+    let mut values = observations
+        .iter()
+        .map(|observation| observation.elapsed_us)
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values[(values.len() - 1) / 2]
+}
+
+fn series_io(observations: &[TokenCostObservation]) -> (u64, u64, u64, u64, u64) {
+    observations.iter().fold(
+        (0, 0, 0, 0, 0),
+        |(token_reads, table_bytes, manifest_reads, manifest_bytes, adapter_ops), observation| {
+            (
+                token_reads.saturating_add(observation.table.stream_token_reads),
+                table_bytes.saturating_add(observation.table.total_read_bytes),
+                manifest_reads.saturating_add(observation.manifest.total_reads),
+                manifest_bytes.saturating_add(observation.manifest.total_read_bytes),
+                adapter_ops.saturating_add(observation.adapter.operations()),
+            )
+        },
+    )
+}
+
+fn print_token_cost_observation(
+    sample: &TokenAuthorityCostSample,
+    scale: &str,
+    term: &str,
+    observation: &TokenCostObservation,
+) {
+    eprintln!(
+        "F6b3 token-authority {scale} profile_cycles={} term={term} elapsed_us={} token_reads={} table_read_bytes={} manifest_reads={} manifest_read_bytes={} adapter_ops={}",
+        sample.profile_cycles,
+        observation.elapsed_us,
+        observation.table.stream_token_reads,
+        observation.table.total_read_bytes,
+        observation.manifest.total_reads,
+        observation.manifest.total_read_bytes,
+        observation.adapter.operations(),
+    );
+}
+
+fn print_token_cost_series(
+    sample: &TokenAuthorityCostSample,
+    scale: &str,
+    term: &str,
+    observations: &[TokenCostObservation],
+) {
+    let (token_reads, table_read_bytes, manifest_reads, manifest_read_bytes, adapter_ops) =
+        series_io(observations);
+    eprintln!(
+        "F6b3 token-authority {scale} profile_cycles={} term={term} samples={} sample_p50_us={} sample_max_us={} token_reads={} table_read_bytes={} manifest_reads={} manifest_read_bytes={} adapter_ops={}",
+        sample.profile_cycles,
+        observations.len(),
+        sample_p50_elapsed_us(observations),
+        observations
+            .iter()
+            .map(|observation| observation.elapsed_us)
+            .max()
+            .unwrap(),
+        token_reads,
+        table_read_bytes,
+        manifest_reads,
+        manifest_read_bytes,
+        adapter_ops,
+    );
+}
+
+fn print_token_authority_cost_sample(sample: &TokenAuthorityCostSample, scale: &str) {
+    let uncovered = sample.uncovered_fragments.unwrap_or(0);
+    eprintln!(
+        "F6b3 token-authority {scale} profile_cycles={} term=summary profile_revision={} selected_token_version={} fragments={} covered_fragments={} uncovered_fragments={:?} terminal_entries={} terminal_page_bytes={} cumulative_process_peak_rss_bytes={:?}",
+        sample.profile_cycles,
+        sample.profile_revision,
+        sample.selected_token_version,
+        sample.total_fragments,
+        sample.total_fragments.saturating_sub(uncovered),
+        sample.uncovered_fragments,
+        sample.terminal_page_entries,
+        sample.terminal_page_bytes,
+        sample.cumulative_process_peak_rss_bytes,
+    );
+    print_token_cost_observation(sample, scale, "fresh_handle_hit", &sample.fresh_handle_hit);
+    print_token_cost_observation(
+        sample,
+        scale,
+        "fresh_handle_miss",
+        &sample.fresh_handle_miss,
+    );
+    print_token_cost_observation(
+        sample,
+        scale,
+        "first_terminal_page",
+        &sample.first_terminal_page,
+    );
+    print_token_cost_series(sample, scale, "warm_hit", &sample.warm_hits);
+    print_token_cost_series(sample, scale, "warm_miss", &sample.warm_misses);
+    print_token_cost_series(
+        sample,
+        scale,
+        "repeat_terminal_page",
+        &sample.repeat_terminal_pages,
+    );
 }
 
 async fn initialize_history(
@@ -1470,6 +2096,74 @@ async fn b2a_retained_history_decision_scale_sweeps_to_128_generations_on_config
         .remove_dir_all(root)
         .await
         .expect("configured S3/RustFS benchmark fixture cleanup must succeed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn f6b3_selected_token_uncovered_tail_cost_is_measured_at_small_depth() {
+    let _scenario = FailScenario::setup();
+    let mut previous = None;
+    for depth in [1, 8] {
+        let dir = tempfile::tempdir().unwrap();
+        let sample = token_authority_cost_sample_at(dir.path().to_str().unwrap(), depth).await;
+        print_token_authority_cost_sample(&sample, "ci");
+        assert_token_authority_cost_sample(&sample);
+        if let Some(shallow) = previous.as_ref() {
+            assert_token_authority_cost_growth(shallow, &sample);
+        }
+        previous = Some(sample);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[ignore = "on-demand RFC-026 F6b3 selected-token decision-scale instrument"]
+async fn f6b3_selected_token_uncovered_tail_cost_sweeps_to_128_profile_cycles() {
+    let _scenario = FailScenario::setup();
+    let mut previous = None;
+    for depth in [1, 8, 32, 128] {
+        let dir = tempfile::tempdir().unwrap();
+        let sample = token_authority_cost_sample_at(dir.path().to_str().unwrap(), depth).await;
+        print_token_authority_cost_sample(&sample, "decision");
+        assert_token_authority_cost_sample(&sample);
+        if let Some(shallow) = previous.as_ref() {
+            assert_token_authority_cost_growth(shallow, &sample);
+        }
+        previous = Some(sample);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[ignore = "on-demand RFC-026 F6b3 configured-object-store decision-scale instrument"]
+async fn f6b3_selected_token_uncovered_tail_cost_sweeps_on_configured_rustfs() {
+    let _scenario = FailScenario::setup();
+    let Some(uri) = helpers::s3_test_graph_uri("memwal-f6b3-token-authority") else {
+        eprintln!("SKIP f6b3_selected_token_uncovered_tail_cost_sweeps_on_configured_rustfs");
+        return;
+    };
+    let mut previous = None;
+    for depth in [1, 8, 32, 128] {
+        let sample = Box::pin(token_authority_cost_sample_at(
+            &format!("{}/cycles-{depth}", uri.trim_end_matches('/')),
+            depth,
+        ))
+        .await;
+        print_token_authority_cost_sample(&sample, "rustfs-decision");
+        assert_token_authority_cost_sample(&sample);
+        if let Some(shallow) = previous.as_ref() {
+            assert_token_authority_cost_growth(shallow, &sample);
+        }
+        previous = Some(sample);
+    }
+
+    let (store, root) = lance_io::object_store::ObjectStore::from_uri(&uri)
+        .await
+        .expect("configured S3/RustFS F6b3 fixture URI must resolve for cleanup");
+    store
+        .remove_dir_all(root)
+        .await
+        .expect("configured S3/RustFS F6b3 fixture cleanup must succeed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

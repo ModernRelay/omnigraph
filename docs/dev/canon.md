@@ -1240,9 +1240,12 @@ fail-closed rather than blocking public enrollment, quiesce, exclusive-cut
 physical status, row admission, and transport-parity evidence. F5b's bounded
 deterministic NDJSON object, current `DEAD_LETTERED` authority, fresh ordinary
 successor correction, selected-token inspection/export, and extended
-same-format retirement are active behind the hidden row path; F6 still owns
-representative object/RSS/lookup measurements and the broader guardrail
-matrix. Dead-letter inspection/export, future `AuthorityBlock` repair, and
+same-format retirement are active behind the hidden row path. F6b3 closes the
+exact-selected uncovered-tail current-token hit/miss and terminal-page
+instrument; the F6 remainder still owns the covered/reconciled curve and
+threshold, isolated dead-letter encoding/materialization byte and peak-RSS cap
+evidence, and the broader guardrail matrix. Dead-letter inspection/export,
+future `AuthorityBlock` repair, and
 retirement remain cluster/offline-only, with no replay mutation or public
 history surface; the Cedar vocabulary and embedded
 manifest-only status are active)**;
@@ -1318,8 +1321,10 @@ Live design questions, each owned by an RFC or a known gap — not a wishlist:
    fold, current `DEAD_LETTERED` token authority, correction through a fresh
    ordinary successor, and three-disposition same-format retirement. It
    adds no Replay origin, replay checkpoint family, chunk chain, or public
-   history walk. Public driver status and F6 acceptance remain later. No active
-   producer creates `AuthorityBlock`, so its repair stays fail-closed.
+   history walk. F6b1's immutable export cut, F6b2's process/lifecycle matrix,
+   and F6b3's uncovered-tail instrument are implemented; public driver status
+   and the F6 remainder remain later. No active producer creates
+   `AuthorityBlock`, so its repair stays fail-closed.
    RFC-024's heads, RFC-025's retention, and later RFC-026 phases remain
    independently reviewable. Any later format activation requires its own
    export/init/load rebuild unless capabilities deliberately co-release after
@@ -1352,7 +1357,7 @@ The plan of record is the RFC-022…028 family (all under
 | [0023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | Substrate-native keyed-write fencing via Lance's unenforced-PK filter; fleet/format activation barrier | **Implemented** (2026-07-15) |
 | [0024 — Durable table heads](../rfcs/0024-durable-table-heads.md) | Materialized head-row research; the first exact-BTREE candidate bounded scan work but failed the full latest-manifest/object-byte cost gate | **Research blocked** |
 | [0025 — Checkpoint-pinned retention](../rfcs/0025-checkpoint-retention.md) | Named checkpoints as authoritative retention roots, materialized as Lance tags; current in-manifest registry lookup rejected by Gate 0 | **Research-blocked** |
-| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: bounded watcher-plus-post-fence acknowledgement, compare-and-chain token authority, unbounded retain-all, checked profile/lifecycle control, recovery-v15–v20 maintenance/rebind/retirement/correction, and v19/recovery-v21 bounded terminal dead-letter folds plus three-disposition retirement. Hidden lifecycle/rebind/dead-letter and narrow cluster/offline inspection/correction/rebuild exits are implemented; public enrollment/lifecycle/driver status and row transports remain inactive | **Draft; hidden firehose protocol through F5b implemented; F6 evidence and F7 public activation remain** |
+| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: bounded watcher-plus-post-fence acknowledgement, compare-and-chain token authority, unbounded retain-all, checked profile/lifecycle control, recovery-v15–v20 maintenance/rebind/retirement/correction, and v19/recovery-v21 bounded terminal dead-letter folds plus three-disposition retirement. Hidden lifecycle/rebind/dead-letter and narrow cluster/offline inspection/correction/rebuild exits are implemented; public enrollment/lifecycle/driver status and row transports remain inactive | **Draft; hidden firehose protocol through F5b plus F6b1–F6b3 subsets implemented; F6 remainder and F7 public activation remain** |
 | [0027 — Lineage merge deltas](../rfcs/0027-lineage-merge-deltas.md) | O(delta) merge classification from row-version lineage | Research-blocked |
 
 Deliberately split, not one mega-format: identity, key fencing, head rows,

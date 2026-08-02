@@ -49,6 +49,7 @@ use super::stream_token::{
 use super::{CurrentHeadWitness, TableIdentity};
 
 pub(crate) const STREAM_TOKEN_DATASET_PATH: &str = "_stream_tokens.lance";
+pub(crate) const STREAM_TOKEN_LOOKUP_INDEX_NAME: &str = "stream_control_record_lookup_v1";
 pub(crate) const STREAM_TOKEN_AUTHORITY_SCHEMA_VERSION: u32 = 3;
 const STREAM_TOKEN_AUTHORITY_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const CURRENT_TOKEN_RECORD_TAG: &str = "CURRENT_TOKEN_V2";
@@ -869,7 +870,74 @@ pub(crate) async fn scan_current_stream_token_batches(
         .map_err(|error| OmniError::Lance(error.to_string()))
 }
 
+/// Report physical coverage of the exact manifest-selected token lookup index.
+///
+/// Coverage is diagnostic derived state, never logical authority. `None`
+/// means that the expected index is absent or at least one matching segment
+/// does not publish a fragment bitmap; callers must not reinterpret that as
+/// complete coverage. Multiple physical segments are treated as one logical
+/// index by taking the union of their reported fragment bitmaps.
+#[cfg(any(test, feature = "failpoints"))]
+pub(crate) async fn stream_token_lookup_index_coverage(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+) -> Result<(u64, Option<u64>)> {
+    validate_exact_dataset(dataset, authority).await?;
+    let Some(lookup_field_id) = dataset
+        .schema()
+        .field("record_lookup_key")
+        .map(|field| field.id)
+    else {
+        return Err(OmniError::manifest_internal(
+            "stream-token authority is missing record_lookup_key",
+        ));
+    };
+    let fragments = dataset.fragments();
+    let total_fragments = u64::try_from(fragments.len())
+        .map_err(|_| OmniError::manifest_internal("stream-token fragment count exceeds u64"))?;
+    let indices = dataset
+        .load_indices()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let matching = indices
+        .iter()
+        .filter(|index| {
+            index.name == STREAM_TOKEN_LOOKUP_INDEX_NAME
+                && index.fields.len() == 1
+                && index.fields[0] == lookup_field_id
+        })
+        .collect::<Vec<_>>();
+    if matching.is_empty() || matching.iter().any(|index| index.fragment_bitmap.is_none()) {
+        return Ok((total_fragments, None));
+    }
+    let fragment_ids = fragments
+        .iter()
+        .map(|fragment| {
+            u32::try_from(fragment.id)
+                .map_err(|_| OmniError::manifest_internal("stream-token fragment id exceeds u32"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let uncovered = fragment_ids
+        .iter()
+        .filter(|fragment_id| {
+            !matching.iter().any(|index| {
+                index
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.contains(**fragment_id))
+            })
+        })
+        .count();
+    Ok((
+        total_fragments,
+        Some(u64::try_from(uncovered).map_err(|_| {
+            OmniError::manifest_internal("stream-token uncovered fragment count exceeds u64")
+        })?),
+    ))
+}
+
 /// Look up one logical graph key from an already exact-pinned token dataset.
+#[cfg(any(test, feature = "failpoints"))]
 pub(crate) async fn lookup_stream_token_row(
     dataset: &Dataset,
     authority: &StreamTokenAuthorityEntry,
@@ -2301,7 +2369,7 @@ pub(super) async fn initialize_stream_token_authority(
         .create_index(
             &["record_lookup_key"],
             IndexType::BTree,
-            Some("stream_control_record_lookup_v1".to_string()),
+            Some(STREAM_TOKEN_LOOKUP_INDEX_NAME.to_string()),
             &ScalarIndexParams::default(),
             true,
         )
@@ -3010,6 +3078,13 @@ mod tests {
         let dataset = open_stream_token_authority_at(root, &authority, &session)
             .await
             .unwrap();
+        assert_eq!(
+            stream_token_lookup_index_coverage(&dataset, &authority)
+                .await
+                .unwrap(),
+            (0, Some(0)),
+            "the genesis lookup index covers the empty selected dataset"
+        );
         let row = authority_row();
         let staged =
             stage_stream_token_upsert(dataset.clone(), &authority, std::slice::from_ref(&row))
@@ -3029,6 +3104,13 @@ mod tests {
         let next = stream_token_authority_entry_for_dataset(&achieved)
             .await
             .unwrap();
+        assert_eq!(
+            stream_token_lookup_index_coverage(&achieved, &next)
+                .await
+                .unwrap(),
+            (1, Some(1)),
+            "the production append leaves one manifest-selected uncovered fragment"
+        );
         assert!(next.current_head_witness.manifest_e_tag.is_none());
         assert_eq!(
             lookup_stream_token_row(&achieved, &next, row.identity, &row.logical_id)
