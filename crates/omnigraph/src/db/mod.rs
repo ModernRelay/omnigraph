@@ -14,14 +14,15 @@ pub(crate) use omnigraph::stream_lifecycle::build_sealed_maintenance_successor;
 pub use omnigraph::{
     CheckedClusterApplyAuthority, CheckedClusterBlockAuthority, CheckedClusterDeadLetterAuthority,
     CheckedClusterMaintenanceAuthority, CheckedClusterRetirementAuthority,
-    CheckedClusterStreamRuntimeAuthority, CleanupPolicyOptions, InitOptions, MergeOutcome,
-    Omnigraph, OpenMode, PendingIndex, RepairAction, RepairClassification, RepairOptions,
-    RepairStats, SchemaApplyOptions, SchemaApplyResult, SkipReason, StreamAuthorityRetirementPlan,
+    CheckedClusterServedExportAuthority, CheckedClusterStreamRuntimeAuthority,
+    CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, PendingIndex,
+    RepairAction, RepairClassification, RepairOptions, RepairStats, SchemaApplyOptions,
+    SchemaApplyResult, SkipReason, StreamAuthorityRetirementPlan,
     StreamAuthorityRetirementResult, StreamDataBlockEntry, StreamDataBlockPage,
     StreamDataCorrectionAction, StreamDataCorrectionRequest, StreamDataCorrectionResult,
     StreamDeadLetterEntry, StreamDeadLetterPage, StreamDeadLetterPayloadEntry,
-    StreamDeadLetterPayloadPage, StreamStatus, StreamTableStatus, StreamingProfileResult,
-    TableCleanupStats, TableOptimizeStats, TableRepairStats,
+    StreamDeadLetterPayloadPage, StreamExportCut, StreamStatus, StreamTableStatus,
+    StreamingProfileResult, TableCleanupStats, TableOptimizeStats, TableRepairStats,
 };
 pub(crate) use omnigraph::{
     DeferredTableFork, StreamAuthorityRetirementExportProvenance, WriteAuthorityToken, WriteTxn,
@@ -33,6 +34,38 @@ pub(crate) use omnigraph::{
 };
 
 use crate::error::{OmniError, Result};
+
+/// Process-local exclusion shared by immutable export cuts and cooperative
+/// whole-root destructive control. It grants no storage or graph authority;
+/// cluster deletion retains it only so a supported delete/recreate cannot ABA
+/// a cut's exact table paths and versions.
+#[doc(hidden)]
+#[must_use = "dropping the guard releases destructive root control"]
+pub struct StreamExportRootExclusion {
+    _permit: write_queue::StreamExportDestructivePermit,
+}
+
+/// Nonwaitingly reserve one graph root against a live immutable export cut.
+///
+/// This hidden bridge lets the upper cluster-control crate serialize approved
+/// graph deletion without exposing the engine's queue manager or a capability
+/// that can read, write, or delete storage.
+#[doc(hidden)]
+pub fn reserve_stream_export_root_exclusion(
+    graph_uri: &str,
+) -> Result<StreamExportRootExclusion> {
+    let normalized = crate::storage::normalize_root_uri(graph_uri)?;
+    let identity = crate::storage::write_queue_root_identity(&normalized)?;
+    let manager = write_queue::WriteQueueManager::for_root(&identity);
+    let permit = manager
+        .try_acquire_stream_export_destructive()
+        .ok_or_else(|| OmniError::ResourceLimitExceeded {
+            resource: "stream_export_slots".to_string(),
+            limit: 1,
+            actual: 2,
+        })?;
+    Ok(StreamExportRootExclusion { _permit: permit })
+}
 
 pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
 

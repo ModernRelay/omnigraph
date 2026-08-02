@@ -1,5 +1,137 @@
 use super::*;
 
+/// One checked, immutable graph export cut.
+///
+/// Capture validates cluster authority, stream terminality, recovery, the
+/// selected branch, and every requested table while all graph write domains
+/// are closed. The cut retains only immutable Lance version pins and the sole
+/// exclusive root export gate; no writer gate remains held while bytes are produced.
+/// Private fields and the absence of `Clone`/serde/default constructors keep
+/// the cut non-forgeable.
+#[doc(hidden)]
+pub struct StreamExportCut {
+    db: Arc<Omnigraph>,
+    snapshot: Snapshot,
+    catalog: Arc<Catalog>,
+    selected_tables: Vec<String>,
+    retirement_provenance: Option<StreamAuthorityRetirementExportProvenance>,
+    _slot: crate::db::write_queue::StreamExportCutPermit,
+}
+
+impl StreamExportCut {
+    /// Consume this cut and write its exact pinned contents as JSONL.
+    ///
+    /// A storage or writer failure after output starts is returned unchanged;
+    /// dropping this future or any error path releases the root export gate.
+    pub async fn write_to<W: Write>(self, writer: &mut W) -> Result<()> {
+        let Self {
+            db,
+            snapshot,
+            catalog,
+            selected_tables,
+            retirement_provenance,
+            _slot,
+        } = self;
+        if let Some(provenance) = retirement_provenance {
+            write_export_jsonl_row(
+                writer,
+                "_omnigraph_export_provenance",
+                &serde_json::json!({
+                    "_omnigraph_export_provenance": provenance,
+                }),
+            )?;
+        }
+        export_selected_tables_to_writer(
+            db.as_ref(),
+            &snapshot,
+            catalog.as_ref(),
+            &selected_tables,
+            writer,
+        )
+        .await
+    }
+
+    /// Consume this cut and return its exact pinned contents as one JSONL
+    /// string. Intended for the hidden F6 acceptance seam; F7 owns transport.
+    pub async fn into_jsonl(self) -> Result<String> {
+        let mut out = Vec::new();
+        self.write_to(&mut out).await?;
+        String::from_utf8(out)
+            .map_err(|err| OmniError::manifest(format!("export produced invalid UTF-8: {err}")))
+    }
+}
+
+impl Omnigraph {
+    /// Capture one cluster-authorized immutable stream-aware export cut.
+    ///
+    /// The exclusive root gate is non-waiting. F7 may add a bounded transport queue
+    /// in front of this method, but it must not create another cut owner.
+    #[doc(hidden)]
+    pub async fn capture_checked_stream_export_cut(
+        self: &Arc<Self>,
+        branch: &str,
+        type_names: &[String],
+        table_keys: &[String],
+    ) -> Result<StreamExportCut> {
+        let slot = self
+            .write_queue()
+            .try_acquire_stream_export_cut()
+            .ok_or_else(|| OmniError::ResourceLimitExceeded {
+                resource: "stream_export_slots".to_string(),
+                limit: 1,
+                actual: 2,
+            })?;
+
+        let authority = match self.checked_cluster_served_export_authority() {
+            Some(authority) => authority,
+            None => {
+                let profile = self.current_canonical_stream_profile().await?;
+                return Err(OmniError::StreamingRequiresClusterRuntime {
+                    mode: profile.mode().as_str().to_string(),
+                });
+            }
+        };
+        self.heal_pending_recovery_sidecars_outcome().await?;
+        let gates = self.acquire_stream_exclusive_cut_gates("stream_export").await?;
+        let catalog = gates.catalog();
+
+        let main = self.open_coordinator_for_branch(None).await?;
+        let main_snapshot = main.snapshot();
+        authority.validate_profile(main_snapshot.stream_profile())?;
+
+        let normalized = Self::normalize_branch_name(branch)?;
+        let selected = self
+            .open_coordinator_for_branch(normalized.as_deref())
+            .await?;
+        let snapshot = selected.snapshot().clone();
+        validate_bound_catalog_against_snapshot(catalog.as_ref(), &snapshot)?;
+        let selected_tables = export_table_keys(&snapshot, type_names, table_keys)?;
+
+        let retirement_receipt = self
+            .export_stream_authority_preflight_at(&main_snapshot)
+            .await?;
+        let retirement_provenance = match retirement_receipt {
+            Some(receipt) => Some(
+                self.capture_retirement_export_provenance(branch, &snapshot, receipt)
+                    .await?,
+            ),
+            None => None,
+        };
+
+        crate::failpoints::maybe_fail(crate::failpoints::names::STREAM_EXPORT_POST_CUT_CAPTURE)?;
+        drop(gates);
+
+        Ok(StreamExportCut {
+            db: Arc::clone(self),
+            snapshot,
+            catalog,
+            selected_tables,
+            retirement_provenance,
+            _slot: slot,
+        })
+    }
+}
+
 pub(super) async fn entity_at_target(
     db: &Omnigraph,
     target: impl Into<ReadTarget>,
@@ -44,10 +176,50 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
     table_keys: &[String],
     writer: &mut W,
 ) -> Result<()> {
+    // Reserve before the first manifest/profile read. Whole-root deletion does
+    // not take the stream-profile gate, so reading first would permit a
+    // delete/recreate ABA before this export acquired the exclusive root gate.
+    // Retain the exclusive cut for ordinary pristine exports too: cleanup, schema apply,
+    // branch replacement, and root deletion must not remove or reuse their
+    // exact snapshot coordinates while bytes are still being read.
+    let _export_cut = db
+        .write_queue()
+        .try_acquire_stream_export_cut()
+        .ok_or_else(|| OmniError::ResourceLimitExceeded {
+            resource: "stream_export_slots".to_string(),
+            limit: 1,
+            actual: 2,
+        })?;
     let _profile_gate = db.write_queue().acquire_stream_profile_shared().await;
-    let retirement_provenance = db.export_stream_authority_preflight().await?;
+    let main = db.open_coordinator_for_branch(None).await?;
+    let main_snapshot = main.snapshot();
+    let profile = main_snapshot.stream_profile();
+    let retirement_receipt = if profile.mode() == crate::db::manifest::StreamProfileMode::Retired {
+        // F6b1 deliberately keeps the checked cut hidden until F7 owns its
+        // bounded transport. Retirement is already irreversible, so retain
+        // the existing receipt-verified export as a narrow rebuild bridge in
+        // the meantime. The exclusive root cut excludes cooperative version GC
+        // and whole-root delete/recreate for the complete output lifetime.
+        Some(
+            db.export_stream_authority_preflight_at(&main_snapshot)
+                .await?
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "RETIRED export preflight did not return retirement provenance",
+                    )
+                })?,
+        )
+    } else if profile.mode() == crate::db::manifest::StreamProfileMode::Disabled
+        && main_snapshot.stream_lifecycles().next().is_none()
+    {
+        None
+    } else {
+        return Err(OmniError::StreamingRequiresClusterRuntime {
+            mode: profile.mode().as_str().to_string(),
+        });
+    };
     let (resolved, catalog) = db.capture_read_view(ReadTarget::branch(branch)).await?;
-    if let Some(receipt) = retirement_provenance {
+    if let Some(receipt) = retirement_receipt {
         let provenance = db
             .capture_retirement_export_provenance(branch, &resolved.snapshot, receipt)
             .await?;
@@ -104,8 +276,18 @@ async fn export_snapshot_jsonl_to_writer<W: Write>(
     writer: &mut W,
 ) -> Result<()> {
     let selected_tables = export_table_keys(snapshot, type_names, table_keys)?;
+    export_selected_tables_to_writer(db, snapshot, catalog, &selected_tables, writer).await
+}
+
+async fn export_selected_tables_to_writer<W: Write>(
+    db: &Omnigraph,
+    snapshot: &Snapshot,
+    catalog: &Catalog,
+    selected_tables: &[String],
+    writer: &mut W,
+) -> Result<()> {
     for table_key in selected_tables {
-        export_table_to_writer(db, snapshot, catalog, &table_key, writer).await?;
+        export_table_to_writer(db, snapshot, catalog, table_key, writer).await?;
     }
     Ok(())
 }
@@ -336,12 +518,13 @@ fn write_export_jsonl_row<W: Write>(
     table_key: &str,
     row: &serde_json::Value,
 ) -> Result<()> {
-    serde_json::to_writer(&mut *writer, row).map_err(|err| {
+    let encoded = serde_json::to_vec(row).map_err(|err| {
         OmniError::manifest(format!(
             "failed to serialize export row for '{}': {}",
             table_key, err
         ))
     })?;
+    writer.write_all(&encoded)?;
     writer.write_all(b"\n")?;
     Ok(())
 }

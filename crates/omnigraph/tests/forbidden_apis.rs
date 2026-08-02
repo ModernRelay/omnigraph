@@ -338,6 +338,14 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
         "with_checked_cluster_stream_runtime",
     ),
     (
+        "db/omnigraph/stream_profile.rs",
+        "with_checked_cluster_served_export",
+    ),
+    (
+        "db/omnigraph/export.rs",
+        "capture_checked_stream_export_cut",
+    ),
+    (
         "db/omnigraph/stream_ingest.rs",
         "failpoint_stream_incarnation_for_test",
     ),
@@ -1198,7 +1206,7 @@ fn cfg_has_exact_feature(attributes: &[Attribute], expected: &str) -> bool {
 
 fn has_doc_hidden(attributes: &[Attribute]) -> bool {
     attributes.iter().any(|attribute| {
-        if !attribute.path().is_ident("doc") {
+        if !attribute.path().is_ident("doc") || !matches!(&attribute.meta, Meta::List(_)) {
             return false;
         }
         let mut hidden = false;
@@ -2189,6 +2197,117 @@ fn public_graph_surfaces(src: &Path) -> BTreeSet<(String, String)> {
         }
     }
     surfaces
+}
+
+#[test]
+fn checked_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
+    let path = engine_src_root().join("db/omnigraph/export.rs");
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let ast = parse_rust_source(&contents, "db/omnigraph/export.rs");
+    let mut cut_structs = 0;
+    let mut capture_methods = 0;
+    let mut cut_methods = BTreeSet::new();
+
+    for item in &ast.items {
+        match item {
+            Item::Struct(item) if item.ident == "StreamExportCut" => {
+                cut_structs += 1;
+                assert!(
+                    matches!(item.vis, Visibility::Public(_)),
+                    "the server-facing cut type must be nameable through the hidden engine seam"
+                );
+                assert!(
+                    has_doc_hidden(&item.attrs),
+                    "StreamExportCut must stay out of generated SDK documentation"
+                );
+                assert!(
+                    item.fields
+                        .iter()
+                        .all(|field| matches!(field.vis, Visibility::Inherited)),
+                    "every StreamExportCut field must remain private"
+                );
+                let mut derives_clone = false;
+                for attribute in &item.attrs {
+                    if attribute.path().is_ident("derive") {
+                        attribute
+                            .parse_nested_meta(|meta| {
+                                derives_clone |= meta.path.is_ident("Clone");
+                                Ok(())
+                            })
+                            .unwrap_or_else(|error| panic!("failed to parse cut derive: {error}"));
+                    }
+                }
+                assert!(
+                    !derives_clone,
+                    "an immutable export cut must not duplicate its root slot/version pins"
+                );
+            }
+            Item::Impl(item)
+                if item.trait_.is_none()
+                    && type_final_ident(&item.self_ty)
+                        .is_some_and(|ident| ident == "StreamExportCut") =>
+            {
+                for member in &item.items {
+                    let syn::ImplItem::Fn(function) = member else {
+                        continue;
+                    };
+                    if !matches!(function.vis, Visibility::Public(_)) {
+                        continue;
+                    }
+                    assert!(
+                        function.sig.asyncness.is_some(),
+                        "cut output must remain an owned async operation"
+                    );
+                    assert!(
+                        matches!(
+                            function.sig.inputs.first(),
+                            Some(syn::FnArg::Receiver(receiver)) if receiver.reference.is_none()
+                        ),
+                        "cut output must consume the non-cloneable slot owner"
+                    );
+                    cut_methods.insert(function.sig.ident.to_string());
+                }
+            }
+            Item::Impl(item) if item.trait_.is_none() && is_omnigraph_type(&item.self_ty) => {
+                for member in &item.items {
+                    let syn::ImplItem::Fn(function) = member else {
+                        continue;
+                    };
+                    if function.sig.ident != "capture_checked_stream_export_cut" {
+                        continue;
+                    }
+                    capture_methods += 1;
+                    assert!(matches!(function.vis, Visibility::Public(_)));
+                    assert!(function.sig.asyncness.is_some());
+                    assert!(has_doc_hidden(&function.attrs));
+                    assert!(return_type_contains_identifier(
+                        &function.sig.output,
+                        "StreamExportCut"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        cut_structs, 1,
+        "exactly one immutable export-cut type is allowed"
+    );
+    assert_eq!(
+        capture_methods, 1,
+        "exactly one checked export-cut capture surface is allowed"
+    );
+    assert_eq!(
+        cut_methods,
+        BTreeSet::from(["into_jsonl".to_string(), "write_to".to_string()]),
+        "the hidden cut may only be consumed through its two output conveniences"
+    );
+    assert!(
+        !contents.contains("impl Clone for StreamExportCut"),
+        "StreamExportCut must remain non-cloneable"
+    );
 }
 
 #[test]

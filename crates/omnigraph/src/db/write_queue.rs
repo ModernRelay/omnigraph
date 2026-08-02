@@ -94,6 +94,30 @@ pub(crate) struct StreamAdmissionKey {
     physical_ref: Option<String>,
 }
 
+/// Non-cloneable ownership of the sole immutable export cut for one root.
+///
+/// The manager registry intentionally holds only weak references. Keeping the
+/// manager alive here is therefore part of the one-slot contract: a cut may
+/// outlive the `Omnigraph` handle that created it without allowing a reopened
+/// handle to allocate a fresh semaphore for the same root.
+#[must_use = "dropping the permit releases the stream-export cut"]
+pub(crate) struct StreamExportCutPermit {
+    _manager: Arc<WriteQueueManager>,
+    _permit: OwnedRwLockWriteGuard<()>,
+}
+
+/// Shared exclusion held by controls that can remove or reuse an export cut's
+/// exact path/version coordinates.
+///
+/// Destructive controls may proceed concurrently with one another when their
+/// existing schema/branch/table gates permit it. They only need to exclude the
+/// sole export cut, which owns the write side of this root-scoped gate.
+#[must_use = "dropping the permit releases stream-export destructive control"]
+pub(crate) struct StreamExportDestructivePermit {
+    _manager: Arc<WriteQueueManager>,
+    _permit: OwnedRwLockReadGuard<()>,
+}
+
 impl StreamAdmissionKey {
     /// Bind one immutable table lifetime to its resolved physical Lance ref.
     pub(crate) fn for_resolved_ref(identity: TableIdentity, physical_ref: Option<&str>) -> Self {
@@ -151,6 +175,12 @@ pub(crate) struct WriteQueueManager {
     /// every admitted effect to finish. This remains an in-process guard only;
     /// the manifest lifecycle row and Lance witness are durable authority.
     stream_admission_leases: Mutex<HashMap<StreamAdmissionKey, Arc<AsyncRwLock<()>>>>,
+    /// Root-wide export/destructive-control exclusion.
+    ///
+    /// One immutable export cut owns this gate exclusively through output.
+    /// Cooperative controls that can remove/reuse exact paths or versions own
+    /// it shared, so they remain mutually concurrent but cannot race a cut.
+    stream_export_gate: Arc<AsyncRwLock<()>>,
 }
 
 impl WriteQueueManager {
@@ -309,6 +339,41 @@ impl WriteQueueManager {
     /// authority.
     pub(crate) async fn acquire_stream_token(&self) -> OwnedMutexGuard<()> {
         Arc::clone(&self.stream_token_gate).lock_owned().await
+    }
+
+    /// Try to reserve the sole root-wide stream-aware export cut.
+    ///
+    /// This is deliberately non-waiting in F6b1: exhaustion must refuse before
+    /// another cut is captured. F7 may place a bounded transport deadline in
+    /// front of this same reservation; it must not create a second slot owner.
+    pub(crate) fn try_acquire_stream_export_cut(
+        self: &Arc<Self>,
+    ) -> Option<StreamExportCutPermit> {
+        let permit = Arc::clone(&self.stream_export_gate)
+            .try_write_owned()
+            .ok()?;
+        Some(StreamExportCutPermit {
+            _manager: Arc::clone(self),
+            _permit: permit,
+        })
+    }
+
+    /// Try to exclude a live export cut while destructive control is active.
+    ///
+    /// This takes the shared side deliberately: unrelated branch controls and
+    /// other operations already serialized by their own authority gates must
+    /// not be turned into one graph-global queue merely because each could
+    /// invalidate an export's exact coordinates.
+    pub(crate) fn try_acquire_stream_export_destructive(
+        self: &Arc<Self>,
+    ) -> Option<StreamExportDestructivePermit> {
+        let permit = Arc::clone(&self.stream_export_gate)
+            .try_read_owned()
+            .ok()?;
+        Some(StreamExportDestructivePermit {
+            _manager: Arc::clone(self),
+            _permit: permit,
+        })
     }
 
     /// Acquire several graph-branch control gates in one deterministic order.
@@ -629,6 +694,66 @@ mod tests {
             .expect("token gate did not acquire after release")
             .expect("token gate task exited before acquisition");
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_export_gate_is_root_shared_non_waiting_and_released_on_drop() {
+        let root = format!("memory://stream-export-slot/{}", ulid::Ulid::new());
+        let first = WriteQueueManager::for_root(&root);
+        let second = WriteQueueManager::for_root(&root);
+
+        let destructive_a = first
+            .try_acquire_stream_export_destructive()
+            .expect("first destructive control must acquire the shared gate");
+        let destructive_b = second
+            .try_acquire_stream_export_destructive()
+            .expect("independent destructive controls must remain concurrent");
+        assert!(
+            second.try_acquire_stream_export_cut().is_none(),
+            "an export must refuse while destructive control is active"
+        );
+        drop(first);
+        drop(second);
+        let reopened = WriteQueueManager::for_root(&root);
+        assert!(
+            reopened.try_acquire_stream_export_cut().is_none(),
+            "a shared permit must keep the weakly registered root manager alive"
+        );
+        let destructive_c = reopened
+            .try_acquire_stream_export_destructive()
+            .expect("reopened destructive control must share the retained gate");
+        drop(destructive_a);
+        drop(destructive_b);
+        drop(destructive_c);
+
+        let held = reopened
+            .try_acquire_stream_export_cut()
+            .expect("first export must reserve the root gate exclusively");
+        assert!(
+            WriteQueueManager::for_root(&root)
+                .try_acquire_stream_export_cut()
+                .is_none(),
+            "a second handle must refuse before pinning another export cut"
+        );
+        assert!(
+            WriteQueueManager::for_root(&root)
+                .try_acquire_stream_export_destructive()
+                .is_none(),
+            "destructive control must refuse while an export cut is live"
+        );
+
+        drop(reopened);
+        let reopened_again = WriteQueueManager::for_root(&root);
+        assert!(
+            reopened_again.try_acquire_stream_export_cut().is_none(),
+            "the permit must keep the weakly registered root manager alive"
+        );
+
+        drop(held);
+        let reacquired = reopened_again
+            .try_acquire_stream_export_cut()
+            .expect("dropping the cut owner must release the root gate");
+        drop(reacquired);
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ mod helpers;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -37,8 +38,8 @@ use object_store::{
     UploadPart,
 };
 use omnigraph::db::{
-    Omnigraph, ReadTarget, StreamAuthorityRetirementPlan, StreamDataCorrectionAction,
-    StreamDataCorrectionRequest, StreamTableStatus,
+    CleanupPolicyOptions, Omnigraph, ReadTarget, StreamAuthorityRetirementPlan,
+    StreamDataCorrectionAction, StreamDataCorrectionRequest, StreamTableStatus,
 };
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
@@ -49,7 +50,8 @@ use serial_test::serial;
 
 use helpers::memwal::{CurrentMemWalInventory, MemWalObjectKind};
 use helpers::stream_authority::{
-    assert_offline_stream_profile_authority_available, confirm_stream_authority_retirement,
+    assert_offline_stream_profile_authority_available, bind_checked_served_export,
+    bind_checked_unmanaged_terminal_export, confirm_stream_authority_retirement,
     disable_stream_profile, enable_stream_profile, plan_stream_authority_retirement,
     rebind_stream_table_offline, try_disable_stream_profile,
 };
@@ -143,23 +145,33 @@ enum ProviderFailureTarget {
     PartialGeneration,
     ShardManifest,
     WalEntry,
+    BaseTableRead,
 }
 
 impl ProviderFailureTarget {
-    fn matches(self, location: &ObjectPath) -> bool {
+    fn matches(self, kind: ProviderAccessKind, location: &ObjectPath) -> bool {
         let path = location.to_string();
         let is_mem_wal = path.split('/').any(|part| part == "_mem_wal");
-        if !is_mem_wal {
-            return false;
-        }
         match self {
             Self::PartialGeneration => {
-                generation_root_in_path(&path).is_some() && path.ends_with("/bloom_filter.bin")
+                kind != ProviderAccessKind::Get
+                    && is_mem_wal
+                    && generation_root_in_path(&path).is_some()
+                    && path.ends_with("/bloom_filter.bin")
             }
             Self::ShardManifest => {
-                path.contains("/manifest/") && !path.ends_with("version_hint.json")
+                kind != ProviderAccessKind::Get
+                    && is_mem_wal
+                    && path.contains("/manifest/")
+                    && !path.ends_with("version_hint.json")
             }
-            Self::WalEntry => path.contains("/wal/") && path.contains(".arrow"),
+            Self::WalEntry => {
+                kind != ProviderAccessKind::Get
+                    && is_mem_wal
+                    && path.contains("/wal/")
+                    && path.contains(".arrow")
+            }
+            Self::BaseTableRead => kind == ProviderAccessKind::Get && !is_mem_wal,
         }
     }
 }
@@ -195,11 +207,12 @@ struct ProviderFailureState {
     successful_generation_writes: usize,
 }
 
-/// Fails real object-store writes made by Lance's detached MemWAL workers.
+/// Fails selected real object-store accesses made by Lance.
 ///
 /// `QueryIoProbes` installs this on the table handle before the worker is
 /// opened, and OmniGraph propagates that task-local wrapper into detached put
-/// and fold owners. This therefore exercises the provider boundary rather than
+/// and fold owners. Write targets exercise those workers; the base-table read
+/// target exercises export. Both cross the provider boundary rather than
 /// translating an OmniGraph failpoint into a provider-shaped error.
 #[derive(Debug, Clone, Default)]
 struct ProviderWriteFailure(Arc<Mutex<ProviderFailureState>>);
@@ -251,7 +264,7 @@ impl ProviderWriteFailure {
         }
     }
 
-    fn record_write_and_maybe_fail(
+    fn record_and_maybe_fail(
         &self,
         kind: ProviderAccessKind,
         location: &ObjectPath,
@@ -262,7 +275,7 @@ impl ProviderWriteFailure {
             path: location.to_string(),
         });
         let target = state.active?;
-        if !target.matches(location) {
+        if !target.matches(kind, location) {
             return None;
         }
         state.failed.push((target, location.to_string()));
@@ -291,6 +304,37 @@ impl ProviderWriteFailure {
             offending.is_empty(),
             "{boundary} must not descend into, read, write, copy, or delete at/below retained unreferenced roots {roots:?}; observed {offending:?}"
         );
+    }
+}
+
+struct ArmBaseReadFailureAfterFirstLine {
+    output: Vec<u8>,
+    failure: ProviderWriteFailure,
+    armed: bool,
+}
+
+impl ArmBaseReadFailureAfterFirstLine {
+    fn new(failure: ProviderWriteFailure) -> Self {
+        Self {
+            output: Vec::new(),
+            failure,
+            armed: false,
+        }
+    }
+}
+
+impl Write for ArmBaseReadFailureAfterFirstLine {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.output.extend_from_slice(bytes);
+        if !self.armed && self.output.contains(&b'\n') {
+            self.failure.arm(ProviderFailureTarget::BaseTableRead);
+            self.armed = true;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -357,7 +401,7 @@ impl ObjectStore for ProviderFailingStore {
     ) -> ObjectStoreResult<PutResult> {
         if let Some(error) = self
             .failure
-            .record_write_and_maybe_fail(ProviderAccessKind::Put, location)
+            .record_and_maybe_fail(ProviderAccessKind::Put, location)
         {
             return Err(error);
         }
@@ -375,7 +419,7 @@ impl ObjectStore for ProviderFailingStore {
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
         if let Some(error) = self
             .failure
-            .record_write_and_maybe_fail(ProviderAccessKind::MultipartStart, location)
+            .record_and_maybe_fail(ProviderAccessKind::MultipartStart, location)
         {
             return Err(error);
         }
@@ -392,7 +436,12 @@ impl ObjectStore for ProviderFailingStore {
         location: &ObjectPath,
         options: GetOptions,
     ) -> ObjectStoreResult<GetResult> {
-        self.failure.record(ProviderAccessKind::Get, location);
+        if let Some(error) = self
+            .failure
+            .record_and_maybe_fail(ProviderAccessKind::Get, location)
+        {
+            return Err(error);
+        }
         self.target.get_opts(location, options).await
     }
 
@@ -481,7 +530,7 @@ impl ObjectStore for ProviderFailingStore {
         self.failure.record(ProviderAccessKind::CopyFrom, from);
         if let Some(error) = self
             .failure
-            .record_write_and_maybe_fail(ProviderAccessKind::CopyTo, to)
+            .record_and_maybe_fail(ProviderAccessKind::CopyTo, to)
         {
             return Err(error);
         }
@@ -646,6 +695,35 @@ async fn stream_lane(db: &Omnigraph) -> StreamTableStatus {
     status.tables.into_iter().next().unwrap()
 }
 
+async fn checked_export_jsonl(
+    db: &Arc<Omnigraph>,
+    branch: &str,
+) -> std::result::Result<String, OmniError> {
+    db.capture_checked_stream_export_cut(branch, &[], &[])
+        .await?
+        .into_jsonl()
+        .await
+}
+
+async fn checked_export_jsonl_to_bytes(
+    db: &Arc<Omnigraph>,
+    branch: &str,
+    output: &mut Vec<u8>,
+) -> std::result::Result<(), OmniError> {
+    db.capture_checked_stream_export_cut(branch, &[], &[])
+        .await?
+        .write_to(output)
+        .await
+}
+
+fn exported_type_row_count(export: &str, type_name: &str) -> usize {
+    export
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|row| row.get("type").and_then(serde_json::Value::as_str) == Some(type_name))
+        .count()
+}
+
 #[tokio::test]
 #[serial]
 async fn authority_retirement_unblocks_exact_provenance_rebuild_and_freezes_source() {
@@ -747,7 +825,23 @@ fn dead_letter_list_payload_retirement_and_export_form_one_operational_exit() {
             "the losing occurrence must not become a visible base row"
         );
 
-        let blocked = offline.export_jsonl("main", &[], &[]).await.unwrap_err();
+        let mut ambient_output = Vec::new();
+        let ambient = offline
+            .export_jsonl_to_writer("main", &[], &[], &mut ambient_output)
+            .await
+            .expect_err("an ambient enrolled export must refuse before output");
+        assert!(matches!(
+            ambient,
+            OmniError::StreamingRequiresClusterRuntime { ref mode } if mode == "DISABLED"
+        ));
+        assert!(ambient_output.is_empty());
+
+        let checked_export =
+            bind_checked_served_export(reopen_enrolled(&dir).await, &cluster_uri).await;
+        let mut blocked_output = Vec::new();
+        let blocked = checked_export_jsonl_to_bytes(&checked_export, "main", &mut blocked_output)
+            .await
+            .unwrap_err();
         assert!(matches!(
             blocked,
             OmniError::StreamExportBlocked {
@@ -755,6 +849,11 @@ fn dead_letter_list_payload_retirement_and_export_form_one_operational_exit() {
                 dead_lettered_token_count: 1,
             }
         ));
+        assert!(
+            blocked_output.is_empty(),
+            "terminal sequencing authority must refuse before any export byte"
+        );
+        drop(checked_export);
 
         let list =
             helpers::stream_authority::list_stream_dead_letters(&offline, &cluster_uri, None)
@@ -794,10 +893,12 @@ fn dead_letter_list_payload_retirement_and_export_form_one_operational_exit() {
         assert!(retired.changed);
         assert_eq!(retired.dead_lettered_token_count, 1);
 
-        let exported = offline
-            .export_jsonl("main", &[], &[])
+        let checked_export =
+            bind_checked_served_export(reopen_enrolled(&dir).await, &cluster_uri).await;
+        let exported = checked_export_jsonl(&checked_export, "main")
             .await
-            .expect("receipt-bound retirement must release ordinary logical export");
+            .expect("receipt-bound retirement must release checked logical export");
+        drop(checked_export);
         let provenance: serde_json::Value =
             serde_json::from_str(exported.lines().next().unwrap()).unwrap();
         assert_eq!(
@@ -821,8 +922,7 @@ async fn prepare_authority_retirement_fixture() -> AuthorityRetirementFixture {
     let enabled_export = served.export_jsonl("main", &[], &[]).await.unwrap_err();
     assert!(matches!(
         enabled_export,
-        OmniError::StreamingAuthorityMismatch { ref reason }
-            if reason.contains("exact DISABLED")
+        OmniError::StreamingRequiresClusterRuntime { ref mode } if mode == "ENABLED"
     ));
     drop(served);
     let db = reopen_enrolled(&dir).await;
@@ -848,7 +948,23 @@ async fn prepare_authority_retirement_fixture() -> AuthorityRetirementFixture {
     .await
     .unwrap();
 
-    let blocked = db.export_jsonl("main", &[], &[]).await.unwrap_err();
+    let mut ambient_output = Vec::new();
+    let ambient = db
+        .export_jsonl_to_writer("main", &[], &[], &mut ambient_output)
+        .await
+        .expect_err("an ambient disabled enrolled export must refuse");
+    assert!(matches!(
+        ambient,
+        OmniError::StreamingRequiresClusterRuntime { ref mode } if mode == "DISABLED"
+    ));
+    assert!(ambient_output.is_empty());
+
+    let checked_export =
+        bind_checked_served_export(reopen_enrolled(&dir).await, &cluster_uri).await;
+    let mut blocked_output = Vec::new();
+    let blocked = checked_export_jsonl_to_bytes(&checked_export, "main", &mut blocked_output)
+        .await
+        .unwrap_err();
     assert!(matches!(
         blocked,
         OmniError::StreamExportBlocked {
@@ -856,6 +972,11 @@ async fn prepare_authority_retirement_fixture() -> AuthorityRetirementFixture {
             dead_lettered_token_count: 0,
         }
     ));
+    assert!(
+        blocked_output.is_empty(),
+        "WITHDRAWN authority must refuse before any checked export byte"
+    );
+    drop(checked_export);
 
     let plan = plan_stream_authority_retirement(&db, &cluster_uri).await;
     assert_eq!(
@@ -877,10 +998,10 @@ async fn confirm_retirement_and_export_frozen_cut(
     fixture: &AuthorityRetirementFixture,
 ) -> (String, String) {
     let AuthorityRetirementFixture {
+        _dir: dir,
         db,
         cluster_uri,
         plan,
-        ..
     } = fixture;
     let retirement_id = "89898989-8989-4898-8898-898989898989";
     let confirmed =
@@ -891,12 +1012,30 @@ async fn confirm_retirement_and_export_frozen_cut(
     assert_eq!(confirmed.retirement_id, retirement_id);
     assert_eq!(db.stream_status().await.unwrap().profile_mode, "RETIRED");
 
-    let main_export = db.export_jsonl("main", &[], &[]).await.unwrap();
+    let mut ambient_output = Vec::new();
+    db
+        .export_jsonl_to_writer("main", &[], &[], &mut ambient_output)
+        .await
+        .expect("the receipt-verified ambient RETIRED bridge must remain until F7 activates transport");
+    let ambient_export = String::from_utf8(ambient_output).unwrap();
+    let ambient_provenance: serde_json::Value =
+        serde_json::from_str(ambient_export.lines().next().unwrap()).unwrap();
     assert_eq!(
-        db.export_jsonl("main", &[], &[]).await.unwrap(),
+        ambient_provenance["_omnigraph_export_provenance"]["receipt"]["retirement_id"],
+        retirement_id
+    );
+
+    let checked_export =
+        bind_checked_unmanaged_terminal_export(reopen_enrolled(dir).await, cluster_uri).await;
+    let main_export = checked_export_jsonl(&checked_export, "main").await.unwrap();
+    assert_eq!(
+        checked_export_jsonl(&checked_export, "main").await.unwrap(),
         main_export
     );
-    let archive_export = db.export_jsonl("archive", &[], &[]).await.unwrap();
+    let archive_export = checked_export_jsonl(&checked_export, "archive")
+        .await
+        .unwrap();
+    drop(checked_export);
     assert_eq!(
         archive_export.lines().skip(1).collect::<Vec<_>>(),
         main_export.lines().skip(1).collect::<Vec<_>>(),
@@ -1293,6 +1432,276 @@ async fn init_productive_mixed_sealed_lane() -> (EnrolledGraphDir, Arc<Omnigraph
         db,
         sealed,
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn checked_export_cut_is_immutable_single_slot_and_releases_writer_gates() {
+    let _scenario = FailScenario::setup();
+    let (dir, served, sealed) = init_productive_mixed_sealed_lane().await;
+    assert_eq!(sealed.lifecycle, "SEALED");
+    drop(served);
+
+    let cluster_uri = dir.cluster_uri();
+    let writer_db = reopen_enrolled(&dir).await;
+    disable_stream_profile(&writer_db, &cluster_uri).await;
+    writer_db
+        .branch_create("frozen-export")
+        .await
+        .expect("a sealed disabled graph may create the named export branch");
+    let export_db =
+        bind_checked_unmanaged_terminal_export(reopen_enrolled(&dir).await, &cluster_uri).await;
+
+    let unknown = match export_db
+        .capture_checked_stream_export_cut("main", &["Missing".to_string()], &[])
+        .await
+    {
+        Ok(_) => panic!("an unknown export filter must fail during cut capture"),
+        Err(error) => error,
+    };
+    assert!(
+        unknown
+            .to_string()
+            .contains("unknown export type 'Missing'"),
+        "invalid filters must stay pre-output typed capture failures: {unknown:?}"
+    );
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::STREAM_EXPORT_POST_CUT_CAPTURE);
+    let capture_db = Arc::clone(&export_db);
+    let capture = tokio::spawn(async move {
+        capture_db
+            .capture_checked_stream_export_cut("frozen-export", &[], &[])
+            .await
+    });
+    rendezvous.wait_until_reached().await;
+
+    rendezvous.release();
+    let cut = tokio::time::timeout(Duration::from_secs(20), capture)
+        .await
+        .expect("checked export capture did not resume")
+        .unwrap()
+        .expect("the terminal checked cut must capture");
+
+    let second = match export_db
+        .capture_checked_stream_export_cut("main", &[], &[])
+        .await
+    {
+        Ok(_) => panic!("a live immutable cut must own the sole root export slot"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        second,
+        OmniError::ResourceLimitExceeded {
+            ref resource,
+            limit: 1,
+            actual: 2,
+        } if resource == "stream_export_slots"
+    ));
+    let delete_while_pinned = writer_db
+        .branch_delete("frozen-export")
+        .await
+        .expect_err("a live cut must exclude named-branch delete/recreate ABA");
+    assert!(matches!(
+        delete_while_pinned,
+        OmniError::ResourceLimitExceeded {
+            ref resource,
+            limit: 1,
+            actual: 2,
+        } if resource == "stream_export_slots"
+    ));
+
+    let mut cleanup_db = Omnigraph::open(dir.path().to_str().unwrap())
+        .await
+        .expect("the destructive-control probe must reopen the graph");
+    let cleanup_while_pinned = cleanup_db
+        .cleanup(CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .expect_err("a live cut must retain every exact selected Lance version");
+    assert!(matches!(
+        cleanup_while_pinned,
+        OmniError::ResourceLimitExceeded {
+            ref resource,
+            limit: 1,
+            actual: 2,
+        } if resource == "stream_export_slots"
+    ));
+    let schema_while_pinned = writer_db
+        .apply_schema(TWO_TABLE_STREAM_SCHEMA)
+        .await
+        .expect_err("a live cut must exclude schema apply before planning or effects");
+    assert!(matches!(
+        schema_while_pinned,
+        OmniError::ResourceLimitExceeded {
+            ref resource,
+            limit: 1,
+            actual: 2,
+        } if resource == "stream_export_slots"
+    ));
+
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        writer_db.mutate(
+            "main",
+            INSERT_COMPANY,
+            "insert_company",
+            &helpers::int_params(&[("$score", 99)]),
+        ),
+    )
+        .await
+        .expect("a live cut must not retain the capture gates through output")
+        .expect("ordinary disabled-profile writer must commit while the cut retains only its slot");
+
+    let frozen = cut.into_jsonl().await.unwrap();
+    assert_eq!(
+        exported_type_row_count(&frozen, "Company"),
+        4,
+        "a later table commit must not retarget an already captured export cut"
+    );
+    writer_db
+        .branch_delete("frozen-export")
+        .await
+        .expect("consuming the cut must release branch-control exclusion");
+    drop(cleanup_db);
+
+    let current = checked_export_jsonl(&export_db, "main")
+        .await
+        .expect("consuming the first cut must release the root slot");
+    assert_eq!(
+        exported_type_row_count(&current, "Company"),
+        5,
+        "a fresh cut must observe the writer that committed after the frozen cut"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn checked_pristine_export_cut_retains_versions_until_consumed() {
+    let _scenario = FailScenario::setup();
+    let cluster = tempfile::tempdir().unwrap();
+    let graph = cluster.path().join("graphs/knowledge.omni");
+    let db = Arc::new(
+        Omnigraph::init(graph.to_str().unwrap(), TWO_TABLE_STREAM_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    for ordinal in 0..4 {
+        load_jsonl(
+            &db,
+            &format!(
+                "{{\"type\":\"Company\",\"data\":{{\"id\":\"c{ordinal}\",\"score\":{ordinal}}}}}"
+            ),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    }
+    let writer_db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let cluster_uri = format!("file://{}", cluster.path().display());
+    let export_db = bind_checked_served_export(db, &cluster_uri).await;
+    let cut = export_db
+        .capture_checked_stream_export_cut("main", &[], &[])
+        .await
+        .expect("managed pristine DISABLED state may capture a checked cut");
+
+    writer_db
+        .mutate(
+            "main",
+            INSERT_COMPANY,
+            "insert_company",
+            &helpers::int_params(&[("$score", 99)]),
+        )
+        .await
+        .expect("a later ordinary write must advance the main table");
+    let mut cleanup_db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let blocked = cleanup_db
+        .cleanup(CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .expect_err("cleanup must not collect a live cut's exact versions");
+    assert!(matches!(
+        blocked,
+        OmniError::ResourceLimitExceeded {
+            ref resource,
+            limit: 1,
+            actual: 2,
+        } if resource == "stream_export_slots"
+    ));
+
+    let frozen = cut.into_jsonl().await.unwrap();
+    assert_eq!(
+        exported_type_row_count(&frozen, "Company"),
+        4,
+        "the pinned cut must remain readable after main advances"
+    );
+    cleanup_db
+        .cleanup(CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .expect("consuming the cut must release exact-version GC exclusion");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn checked_export_preserves_post_start_storage_error_and_releases_slot() {
+    let _scenario = FailScenario::setup();
+    let (dir, served, sealed) = init_productive_mixed_sealed_lane().await;
+    assert_eq!(sealed.lifecycle, "SEALED");
+    drop(served);
+
+    let cluster_uri = dir.cluster_uri();
+    let offline = reopen_enrolled(&dir).await;
+    disable_stream_profile(&offline, &cluster_uri).await;
+    drop(offline);
+
+    let failure = ProviderWriteFailure::default();
+    let probes = QueryIoProbes {
+        table_wrapper: Some(Arc::new(failure.clone())),
+        ..Default::default()
+    };
+    with_query_io_probes(probes, async {
+        let export_db = bind_checked_served_export(reopen_enrolled(&dir).await, &cluster_uri).await;
+        let cut = export_db
+            .capture_checked_stream_export_cut("main", &[], &[])
+            .await
+            .expect("checked two-table export cut must capture before failure is armed");
+        let mut writer = ArmBaseReadFailureAfterFirstLine::new(failure.clone());
+        let error = cut
+            .write_to(&mut writer)
+            .await
+            .expect_err("a pinned table read after output starts must surface provider failure");
+        failure.disarm();
+
+        assert!(
+            !writer.output.is_empty() && writer.output.contains(&b'\n'),
+            "one complete NDJSON row must be visible before the later storage error"
+        );
+        assert!(matches!(error, OmniError::Lance(_)), "{error:?}");
+        assert!(
+            error.to_string().contains(PROVIDER_FAILURE_MESSAGE),
+            "post-start export error must preserve its provider cause: {error:?}"
+        );
+        assert!(
+            !failure
+                .failed_paths(ProviderFailureTarget::BaseTableRead)
+                .is_empty(),
+            "the failure must come from a real pinned base-table GET"
+        );
+
+        let retry = checked_export_jsonl(&export_db, "main")
+            .await
+            .expect("the failed cut must release the root export slot");
+        assert_eq!(exported_type_row_count(&retry, "Company"), 4);
+        assert_eq!(exported_type_row_count(&retry, "Person"), 4);
+    })
+    .await;
 }
 
 async fn raw_table_head(db: &Omnigraph, table_key: &str) -> u64 {

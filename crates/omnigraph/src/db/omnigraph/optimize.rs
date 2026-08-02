@@ -1285,6 +1285,8 @@ pub async fn cleanup_all_tables(
         ));
     }
 
+    let _export_exclusion = db.reserve_stream_export_destructive_control()?;
+
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("cleanup").await?;
 

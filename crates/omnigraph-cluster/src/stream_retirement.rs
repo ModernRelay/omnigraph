@@ -152,9 +152,9 @@ pub async fn confirm_stream_authority_retirement_config_dir(
         actor,
         desired,
         backend,
-        state,
+        mut state,
         state_cas,
-        observations,
+        mut observations,
         mut diagnostics,
         lock_guard,
     } = prepared;
@@ -181,7 +181,21 @@ pub async fn confirm_stream_authority_retirement_config_dir(
     .await;
 
     let result = match result {
-        Ok(result) => Some(result),
+        Ok(result) => {
+            if let Err(diagnostic) = converge_retired_streaming_resource(
+                &backend,
+                &mut state,
+                &state_cas,
+                &mut observations,
+                &graph_id,
+                result.profile_revision,
+            )
+            .await
+            {
+                diagnostics.push(diagnostic);
+            }
+            Some(result)
+        }
         Err(error) => {
             diagnostics.push(Diagnostic::error(
                 "stream_authority_retirement_confirm_failed",
@@ -201,6 +215,58 @@ pub async fn confirm_stream_authority_retirement_config_dir(
         result,
         diagnostics,
     }
+}
+
+/// Converge a managed streaming declaration to the exact terminal profile
+/// published by retirement while the caller still holds the retirement state
+/// lock. An unmanaged graph deliberately has no streaming resource to update;
+/// its graph-resource binding remains the serving authority.
+async fn converge_retired_streaming_resource(
+    backend: &ClusterStore,
+    state: &mut ClusterState,
+    expected_state_cas: &str,
+    observations: &mut StateObservations,
+    graph_id: &str,
+    profile_revision: u64,
+) -> Result<(), Diagnostic> {
+    let streaming_address = format!("streaming.{graph_id}");
+    let Some(streaming) = state
+        .applied_revision
+        .resources
+        .get_mut(&streaming_address)
+    else {
+        return Ok(());
+    };
+    if streaming.streaming_enabled == Some(false)
+        && streaming.profile_mode.as_deref() == Some("RETIRED")
+        && streaming.profile_revision == Some(profile_revision)
+        && streaming.declaration_revision.is_some()
+    {
+        return Ok(());
+    }
+
+    // The declaration digest and declaration revision remain the cluster
+    // identity of this managed resource. Retirement changes only the live
+    // manifest profile projection recorded beside them. A legacy/malformed
+    // row may lack the deterministically derived declaration revision; repair
+    // that local projection now so serving cannot quarantine a row refresh
+    // otherwise recognizes as converged.
+    if streaming.declaration_revision.is_none() {
+        streaming.declaration_revision = Some(crate::config::streaming_declaration_revision(
+            graph_id,
+            &streaming.digest,
+        ));
+    }
+    streaming.streaming_enabled = Some(false);
+    streaming.profile_mode = Some("RETIRED".to_string());
+    streaming.profile_revision = Some(profile_revision);
+    state.state_revision = state.state_revision.saturating_add(1);
+    crate::failpoints::maybe_fail(
+        crate::failpoints::names::CLUSTER_STREAM_RETIREMENT_BEFORE_STATE_WRITE,
+    )?;
+    backend
+        .write_state(state, Some(expected_state_cas), observations)
+        .await
 }
 
 async fn prepare_retirement_command(

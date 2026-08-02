@@ -267,6 +267,14 @@ pub enum AuthorityOperationClass {
     /// after its exact receipt has already made the profile `RETIRED`, while
     /// rebind/schema maintenance must remain `DISABLED`-only.
     StreamAuthorityRetirement,
+    /// Read/query/status/export-only serving authority for an exact terminal
+    /// `DISABLED | RETIRED` profile revision.
+    ///
+    /// This is deliberately not runtime writer authority. It retains the same
+    /// process-local serving registration so offline cluster control cannot
+    /// race a checked export, but it can mint no fold delegation or mutation
+    /// capability.
+    StreamServedExport,
     StreamRuntime,
 }
 
@@ -279,6 +287,7 @@ impl AuthorityOperationClass {
             | Self::StreamBlockControl
             | Self::StreamDeadLetterControl
             | Self::StreamAuthorityRetirement
+            | Self::StreamServedExport
             | Self::StreamRuntime => None,
         }
     }
@@ -291,7 +300,7 @@ impl AuthorityOperationClass {
             | Self::StreamBlockControl
             | Self::StreamDeadLetterControl => Some("apply"),
             Self::StreamAuthorityRetirement => Some(STREAM_AUTHORITY_RETIREMENT_LOCK_OPERATION),
-            Self::StreamRuntime => None,
+            Self::StreamServedExport | Self::StreamRuntime => None,
         }
     }
 }
@@ -426,9 +435,10 @@ pub async fn validate_offline_guard<'lock>(
             | AuthorityOperationClass::StreamProfileDisable => {
                 "streaming profile changes require explicit confirm_stream_offline"
             }
-            AuthorityOperationClass::StreamRuntime => unreachable!(
-                "runtime operation was rejected before offline confirmation validation"
-            ),
+            AuthorityOperationClass::StreamServedExport
+            | AuthorityOperationClass::StreamRuntime => {
+                unreachable!("served operation was rejected before offline confirmation validation")
+            }
         };
         return Err(invalid_binding(message));
     }
@@ -557,6 +567,89 @@ impl RuntimeAuthorityBinding {
     }
 }
 
+/// Cloneable serving-snapshot evidence for a terminal stream profile.
+///
+/// This value is not export authority. Only [`mint_served_export_guard`]
+/// rereads the exact applied state and acquires the process-local serving
+/// registration consumed by the engine's checked export capability.
+#[derive(Clone)]
+pub struct ServedExportAuthorityBinding {
+    storage: StorageHandle,
+    cluster_root: String,
+    graph_id: String,
+    graph_store_uri: String,
+    expected_state_cas: String,
+    state_revision: u64,
+    terminal: ServedExportTerminalBinding,
+}
+
+#[derive(Clone, Debug)]
+enum ServedExportTerminalBinding {
+    Managed {
+        declaration_revision: String,
+        declaration_digest: String,
+        profile_mode: String,
+        profile_revision: u64,
+    },
+    UnmanagedTerminal {
+        graph_digest: String,
+    },
+}
+
+impl std::fmt::Debug for ServedExportAuthorityBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServedExportAuthorityBinding")
+            .field("cluster_root", &self.cluster_root)
+            .field("graph_id", &self.graph_id)
+            .field("graph_store_uri", &self.graph_store_uri)
+            .field("expected_state_cas", &self.expected_state_cas)
+            .field("state_revision", &self.state_revision)
+            .field("terminal", &self.terminal)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServedExportAuthorityBinding {
+    pub fn cluster_root(&self) -> &str {
+        &self.cluster_root
+    }
+
+    pub fn graph_id(&self) -> &str {
+        &self.graph_id
+    }
+
+    pub fn graph_store_uri(&self) -> &str {
+        &self.graph_store_uri
+    }
+
+    pub fn expected_state_cas(&self) -> &str {
+        &self.expected_state_cas
+    }
+
+    pub fn state_revision(&self) -> u64 {
+        self.state_revision
+    }
+
+    pub fn managed_profile(&self) -> Option<(&str, u64)> {
+        match &self.terminal {
+            ServedExportTerminalBinding::Managed {
+                profile_mode,
+                profile_revision,
+                ..
+            } => Some((profile_mode, *profile_revision)),
+            ServedExportTerminalBinding::UnmanagedTerminal { .. } => None,
+        }
+    }
+
+    pub fn is_unmanaged_terminal(&self) -> bool {
+        matches!(
+            &self.terminal,
+            ServedExportTerminalBinding::UnmanagedTerminal { .. }
+        )
+    }
+}
+
 pub struct RuntimeBindingRequest<'a> {
     pub graph_id: &'a str,
     pub graph_store_uri: &'a str,
@@ -566,6 +659,31 @@ pub struct RuntimeBindingRequest<'a> {
     pub declaration_digest: &'a str,
     pub profile_mode: &'a str,
     pub profile_revision: u64,
+}
+
+/// Terminal authority recorded in one exact applied serving snapshot.
+pub enum ServedExportTerminalRequest<'a> {
+    /// The managed streaming resource carries the exact terminal profile.
+    Managed {
+        declaration_revision: &'a str,
+        declaration_digest: &'a str,
+        profile_mode: &'a str,
+        profile_revision: u64,
+    },
+    /// A terminal graph may remain enrolled after its streaming declaration is
+    /// removed. The graph resource remains the exact cluster/store owner,
+    /// while the engine must independently prove manifest `RETIRED`, or
+    /// `DISABLED` with at least one enrolled lifecycle.
+    UnmanagedTerminal { graph_digest: &'a str },
+}
+
+/// Facts from one exact applied serving snapshot for a read/export-only graph.
+pub struct ServedExportBindingRequest<'a> {
+    pub graph_id: &'a str,
+    pub graph_store_uri: &'a str,
+    pub expected_state_cas: &'a str,
+    pub state_revision: u64,
+    pub terminal: ServedExportTerminalRequest<'a>,
 }
 
 /// Load and validate the canonical enabled runtime binding for one serving
@@ -617,6 +735,67 @@ pub async fn validate_runtime_binding(
     })
 }
 
+/// Load and validate the canonical `DISABLED | RETIRED` binding for one
+/// read/query/status/export-only served graph.
+pub async fn validate_served_export_binding(
+    storage: &StorageHandle,
+    cluster_root: &str,
+    request: ServedExportBindingRequest<'_>,
+) -> Result<ServedExportAuthorityBinding, AuthorityError> {
+    validate_graph_id(request.graph_id)?;
+    validate_nonempty("graph_store_uri", request.graph_store_uri)?;
+    validate_nonempty("cluster_root", cluster_root)?;
+    validate_state_cas(request.expected_state_cas)?;
+    let terminal = match request.terminal {
+        ServedExportTerminalRequest::Managed {
+            declaration_revision,
+            declaration_digest,
+            profile_mode,
+            profile_revision,
+        } => {
+            validate_nonempty("declaration_revision", declaration_revision)?;
+            validate_nonempty("declaration_digest", declaration_digest)?;
+            validate_nonempty("profile_mode", profile_mode)?;
+            if profile_revision == 0 {
+                return Err(invalid_binding("profile_revision must be nonzero"));
+            }
+            ServedExportTerminalBinding::Managed {
+                declaration_revision: declaration_revision.to_string(),
+                declaration_digest: declaration_digest.to_string(),
+                profile_mode: profile_mode.to_string(),
+                profile_revision,
+            }
+        }
+        ServedExportTerminalRequest::UnmanagedTerminal { graph_digest } => {
+            validate_nonempty("graph_digest", graph_digest)?;
+            ServedExportTerminalBinding::UnmanagedTerminal {
+                graph_digest: graph_digest.to_string(),
+            }
+        }
+    };
+    let cluster_root = normalize_root_uri(cluster_root)?;
+    let graph_store_uri =
+        validated_graph_store(&cluster_root, request.graph_id, request.graph_store_uri)?;
+    let state = read_canonical_state(&storage.adapter(), &cluster_root).await?;
+    validate_served_export_state(
+        &state,
+        request.graph_id,
+        request.expected_state_cas,
+        request.state_revision,
+        &terminal,
+    )?;
+
+    Ok(ServedExportAuthorityBinding {
+        storage: storage.clone(),
+        cluster_root,
+        graph_id: request.graph_id.to_string(),
+        graph_store_uri,
+        expected_state_cas: request.expected_state_cas.to_string(),
+        state_revision: request.state_revision,
+        terminal,
+    })
+}
+
 /// Non-cloneable live runtime authority with an exclusive process-local
 /// registration. The registration is not a distributed lease; it is the local
 /// half of the externally enforced single-writer topology.
@@ -627,6 +806,63 @@ pub struct ValidatedRuntimeGuard {
     operation: AuthorityOperationClass,
     actor: String,
     _registration: ExclusiveProcessRegistration,
+}
+
+/// Non-cloneable read/export-only serving authority with the same exclusive
+/// process registration as the live writer runtime.
+///
+/// Sharing the registration domain makes `stop server -> offline control ->
+/// restart` structural for terminal profiles too, while the distinct type and
+/// operation class prevent this guard from authorizing a writer.
+#[derive(Debug)]
+pub struct ValidatedServedExportGuard {
+    binding: ServedExportAuthorityBinding,
+    operation_id: String,
+    operation: AuthorityOperationClass,
+    actor: String,
+    _registration: ExclusiveProcessRegistration,
+}
+
+impl ValidatedServedExportGuard {
+    pub fn cluster_root(&self) -> &str {
+        self.binding.cluster_root()
+    }
+
+    pub fn graph_id(&self) -> &str {
+        self.binding.graph_id()
+    }
+
+    pub fn graph_store_uri(&self) -> &str {
+        self.binding.graph_store_uri()
+    }
+
+    pub fn expected_state_cas(&self) -> &str {
+        self.binding.expected_state_cas()
+    }
+
+    pub fn state_revision(&self) -> u64 {
+        self.binding.state_revision()
+    }
+
+    pub fn managed_profile(&self) -> Option<(&str, u64)> {
+        self.binding.managed_profile()
+    }
+
+    pub fn is_unmanaged_terminal(&self) -> bool {
+        self.binding.is_unmanaged_terminal()
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub fn operation(&self) -> AuthorityOperationClass {
+        self.operation
+    }
+
+    pub fn actor(&self) -> &str {
+        &self.actor
+    }
 }
 
 impl ValidatedRuntimeGuard {
@@ -704,6 +940,34 @@ pub async fn mint_runtime_guard(
         binding,
         operation_id: operation_id.to_string(),
         operation: AuthorityOperationClass::StreamRuntime,
+        actor: actor.to_string(),
+        _registration: registration,
+    })
+}
+
+/// Re-read the exact terminal applied state and register the sole in-process
+/// read/export-only serving owner.
+pub async fn mint_served_export_guard(
+    binding: ServedExportAuthorityBinding,
+    operation_id: &str,
+    actor: &str,
+) -> Result<ValidatedServedExportGuard, AuthorityError> {
+    validate_nonempty("operation_id", operation_id)?;
+    validate_nonempty("actor", actor)?;
+    let state = read_canonical_state(&binding.storage.adapter(), &binding.cluster_root).await?;
+    validate_served_export_state(
+        &state,
+        &binding.graph_id,
+        &binding.expected_state_cas,
+        binding.state_revision,
+        &binding.terminal,
+    )?;
+    let registration =
+        ExclusiveProcessRegistration::acquire_runtime(&binding.cluster_root, &binding.graph_id)?;
+    Ok(ValidatedServedExportGuard {
+        binding,
+        operation_id: operation_id.to_string(),
+        operation: AuthorityOperationClass::StreamServedExport,
         actor: actor.to_string(),
         _registration: registration,
     })
@@ -829,6 +1093,115 @@ fn validate_runtime_state(
     profile_mode: &str,
     profile_revision: u64,
 ) -> Result<(), AuthorityError> {
+    let streaming = validate_serving_state_common(
+        loaded,
+        graph_id,
+        expected_state_cas,
+        state_revision,
+        declaration_revision,
+        declaration_digest,
+    )?;
+    if streaming.profile_mode.as_deref() != Some(profile_mode) || profile_mode != "ENABLED" {
+        return Err(AuthorityError::RuntimeState(
+            "streaming runtime authority requires exact ENABLED profile-mode metadata".to_string(),
+        ));
+    }
+    if streaming.streaming_enabled != Some(true) {
+        return Err(AuthorityError::RuntimeState(
+            "streaming runtime authority requires an enabled applied profile".to_string(),
+        ));
+    }
+    if streaming.profile_revision != Some(profile_revision) {
+        return Err(AuthorityError::RuntimeState(
+            "streaming profile revision is missing or changed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_served_export_state(
+    loaded: &LoadedCanonicalState,
+    graph_id: &str,
+    expected_state_cas: &str,
+    state_revision: u64,
+    terminal: &ServedExportTerminalBinding,
+) -> Result<(), AuthorityError> {
+    match terminal {
+        ServedExportTerminalBinding::Managed {
+            declaration_revision,
+            declaration_digest,
+            profile_mode,
+            profile_revision,
+        } => {
+            let streaming = validate_serving_state_common(
+                loaded,
+                graph_id,
+                expected_state_cas,
+                state_revision,
+                declaration_revision,
+                declaration_digest,
+            )?;
+            if streaming.profile_mode.as_deref() != Some(profile_mode.as_str())
+                || !matches!(profile_mode.as_str(), "DISABLED" | "RETIRED")
+            {
+                return Err(AuthorityError::RuntimeState(
+                    "served export authority requires exact DISABLED or RETIRED profile-mode metadata"
+                        .to_string(),
+                ));
+            }
+            if streaming.streaming_enabled != Some(false) {
+                return Err(AuthorityError::RuntimeState(
+                    "served export authority requires a disabled applied profile".to_string(),
+                ));
+            }
+            if streaming.profile_revision != Some(*profile_revision) {
+                return Err(AuthorityError::RuntimeState(
+                    "streaming profile revision is missing or changed".to_string(),
+                ));
+            }
+        }
+        ServedExportTerminalBinding::UnmanagedTerminal { graph_digest } => {
+            validate_state_identity(loaded, expected_state_cas, state_revision)?;
+            let graph_address = format!("graph.{graph_id}");
+            let graph = loaded
+                .state
+                .applied_revision
+                .resources
+                .get(&graph_address)
+                .ok_or_else(|| {
+                    AuthorityError::RuntimeState(format!(
+                        "applied graph resource '{graph_address}' is missing"
+                    ))
+                })?;
+            if graph.digest != graph_digest.as_str() {
+                return Err(AuthorityError::RuntimeState(
+                    "graph digest does not match the serving snapshot".to_string(),
+                ));
+            }
+            let streaming_address = format!("streaming.{graph_id}");
+            if loaded
+                .state
+                .applied_revision
+                .resources
+                .contains_key(&streaming_address)
+            {
+                return Err(AuthorityError::RuntimeState(format!(
+                    "unmanaged terminal export authority requires applied resource '{streaming_address}' to be absent"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_serving_state_common<'a>(
+    loaded: &'a LoadedCanonicalState,
+    graph_id: &str,
+    expected_state_cas: &str,
+    state_revision: u64,
+    declaration_revision: &str,
+    declaration_digest: &str,
+) -> Result<&'a CanonicalStateResource, AuthorityError> {
     validate_state_identity(loaded, expected_state_cas, state_revision)?;
     let graph_address = format!("graph.{graph_id}");
     if !loaded
@@ -862,22 +1235,7 @@ fn validate_runtime_state(
             "streaming declaration revision is missing or changed".to_string(),
         ));
     }
-    if streaming.profile_mode.as_deref() != Some(profile_mode) || profile_mode != "ENABLED" {
-        return Err(AuthorityError::RuntimeState(
-            "streaming runtime authority requires exact ENABLED profile-mode metadata".to_string(),
-        ));
-    }
-    if streaming.streaming_enabled != Some(true) {
-        return Err(AuthorityError::RuntimeState(
-            "streaming runtime authority requires an enabled applied profile".to_string(),
-        ));
-    }
-    if streaming.profile_revision != Some(profile_revision) {
-        return Err(AuthorityError::RuntimeState(
-            "streaming profile revision is missing or changed".to_string(),
-        ));
-    }
-    Ok(())
+    Ok(streaming)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1555,5 +1913,173 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(runtime_after_unrelated_change.profile_revision(), 4);
+    }
+
+    #[tokio::test]
+    async fn served_export_guard_accepts_only_exact_terminal_state_and_registers_one_local_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = format!("file://{}", dir.path().display());
+        let terminal_state = |mode: &str, revision: u64| {
+            serde_json::json!({
+                "version": 1,
+                "state_revision": revision,
+                "applied_revision": {
+                    "config_digest": format!("config-{mode}"),
+                    "resources": {
+                        "graph.knowledge": {
+                            "digest": "graph-digest"
+                        },
+                        "streaming.knowledge": {
+                            "digest": "stream-declaration",
+                            "declaration_revision": "stream-declaration-v1",
+                            "streaming_enabled": false,
+                            "profile_mode": mode,
+                            "profile_revision": 7
+                        }
+                    }
+                }
+            })
+        };
+        let state_cas = write_state(&dir, terminal_state("DISABLED", 21));
+        let storage = storage_handle_for_uri(&root).unwrap();
+        let graph_store = format!("{}/graphs/knowledge.omni", dir.path().display());
+        let binding = validate_served_export_binding(
+            &storage,
+            &root,
+            ServedExportBindingRequest {
+                graph_id: "knowledge",
+                graph_store_uri: &graph_store,
+                expected_state_cas: &state_cas,
+                state_revision: 21,
+                terminal: ServedExportTerminalRequest::Managed {
+                    declaration_revision: "stream-declaration-v1",
+                    declaration_digest: "stream-declaration",
+                    profile_mode: "DISABLED",
+                    profile_revision: 7,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(binding.managed_profile(), Some(("DISABLED", 7)));
+
+        let first = mint_served_export_guard(binding.clone(), "server-export-1", "server")
+            .await
+            .unwrap();
+        assert_eq!(
+            first.operation(),
+            AuthorityOperationClass::StreamServedExport
+        );
+        assert_eq!(first.managed_profile(), Some(("DISABLED", 7)));
+        assert!(matches!(
+            mint_served_export_guard(binding.clone(), "server-export-2", "server").await,
+            Err(AuthorityError::RuntimeAlreadyRegistered { .. })
+        ));
+
+        let enabled_state_cas = write_state(
+            &dir,
+            serde_json::json!({
+                "version": 1,
+                "state_revision": 22,
+                "applied_revision": {
+                    "config_digest": "config-enabled",
+                    "resources": {
+                        "graph.knowledge": { "digest": "graph-digest" },
+                        "streaming.knowledge": {
+                            "digest": "stream-declaration",
+                            "declaration_revision": "stream-declaration-v1",
+                            "streaming_enabled": true,
+                            "profile_mode": "ENABLED",
+                            "profile_revision": 8
+                        }
+                    }
+                }
+            }),
+        );
+        let runtime_binding = validate_runtime_binding(
+            &storage,
+            &root,
+            RuntimeBindingRequest {
+                graph_id: "knowledge",
+                graph_store_uri: &graph_store,
+                expected_state_cas: &enabled_state_cas,
+                state_revision: 22,
+                declaration_revision: "stream-declaration-v1",
+                declaration_digest: "stream-declaration",
+                profile_mode: "ENABLED",
+                profile_revision: 8,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            mint_runtime_guard(runtime_binding, "server-runtime", "server").await,
+            Err(AuthorityError::RuntimeAlreadyRegistered { .. })
+        ));
+        drop(first);
+
+        let retired_state_cas = write_state(&dir, terminal_state("RETIRED", 23));
+        assert!(matches!(
+            mint_served_export_guard(binding, "stale-server-export", "server").await,
+            Err(AuthorityError::StateChanged)
+        ));
+        let retired_binding = validate_served_export_binding(
+            &storage,
+            &root,
+            ServedExportBindingRequest {
+                graph_id: "knowledge",
+                graph_store_uri: &graph_store,
+                expected_state_cas: &retired_state_cas,
+                state_revision: 23,
+                terminal: ServedExportTerminalRequest::Managed {
+                    declaration_revision: "stream-declaration-v1",
+                    declaration_digest: "stream-declaration",
+                    profile_mode: "RETIRED",
+                    profile_revision: 7,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let retired = mint_served_export_guard(retired_binding, "server-export-retired", "server")
+            .await
+            .unwrap();
+        assert_eq!(retired.managed_profile(), Some(("RETIRED", 7)));
+        drop(retired);
+
+        let unmanaged_state_cas = write_state(
+            &dir,
+            serde_json::json!({
+                "version": 1,
+                "state_revision": 24,
+                "applied_revision": {
+                    "config_digest": "config-unmanaged-retired",
+                    "resources": {
+                        "graph.knowledge": { "digest": "graph-digest" }
+                    }
+                }
+            }),
+        );
+        let unmanaged_binding = validate_served_export_binding(
+            &storage,
+            &root,
+            ServedExportBindingRequest {
+                graph_id: "knowledge",
+                graph_store_uri: &graph_store,
+                expected_state_cas: &unmanaged_state_cas,
+                state_revision: 24,
+                terminal: ServedExportTerminalRequest::UnmanagedTerminal {
+                    graph_digest: "graph-digest",
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(unmanaged_binding.is_unmanaged_terminal());
+        let unmanaged =
+            mint_served_export_guard(unmanaged_binding, "server-export-unmanaged", "server")
+                .await
+                .unwrap();
+        assert!(unmanaged.is_unmanaged_terminal());
     }
 }

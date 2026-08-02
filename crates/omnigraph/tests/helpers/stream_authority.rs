@@ -6,8 +6,10 @@ use omnigraph::db::{
 };
 use omnigraph::error::Result;
 use omnigraph_control_authority::{
-    AuthorityOperationClass, OfflineAuthorityRequest, RuntimeBindingRequest, StateLockAcquire,
-    acquire_state_lock, mint_runtime_guard, validate_offline_guard, validate_runtime_binding,
+    AuthorityOperationClass, OfflineAuthorityRequest, RuntimeBindingRequest,
+    ServedExportBindingRequest, ServedExportTerminalRequest, StateLockAcquire, acquire_state_lock,
+    mint_runtime_guard, mint_served_export_guard, validate_offline_guard, validate_runtime_binding,
+    validate_served_export_binding,
 };
 use omnigraph_storage::storage_handle_for_uri;
 use sha2::{Digest, Sha256};
@@ -419,4 +421,117 @@ pub async fn bind_checked_stream_runtime(db: Arc<Omnigraph>, cluster_uri: &str) 
         Err(_) => panic!("runtime fixture must own the sole engine handle"),
     };
     Arc::new(db.with_checked_cluster_stream_runtime(guard).await.unwrap())
+}
+
+pub async fn bind_checked_served_export(db: Arc<Omnigraph>, cluster_uri: &str) -> Arc<Omnigraph> {
+    bind_checked_served_export_kind(db, cluster_uri, true).await
+}
+
+pub async fn bind_checked_unmanaged_terminal_export(
+    db: Arc<Omnigraph>,
+    cluster_uri: &str,
+) -> Arc<Omnigraph> {
+    bind_checked_served_export_kind(db, cluster_uri, false).await
+}
+
+async fn bind_checked_served_export_kind(
+    db: Arc<Omnigraph>,
+    cluster_uri: &str,
+    managed: bool,
+) -> Arc<Omnigraph> {
+    let status = db.stream_status().await.unwrap();
+    assert!(
+        matches!(status.profile_mode, "DISABLED" | "RETIRED"),
+        "served-export fixture requires a terminal profile, got {}",
+        status.profile_mode
+    );
+    if !managed {
+        assert!(
+            status.profile_mode == "RETIRED"
+                || (status.profile_mode == "DISABLED" && !status.tables.is_empty()),
+            "an unmanaged export fixture requires RETIRED or enrolled DISABLED"
+        );
+    }
+    let mut resources = serde_json::Map::new();
+    resources.insert(
+        "graph.knowledge".to_string(),
+        serde_json::json!({ "digest": "memwal-stream-test-graph" }),
+    );
+    if managed {
+        resources.insert(
+            "streaming.knowledge".to_string(),
+            serde_json::json!({
+                "digest": STREAM_DECLARATION_DIGEST,
+                "declaration_revision": STREAM_DECLARATION_REVISION,
+                "streaming_enabled": false,
+                "profile_mode": status.profile_mode,
+                "profile_revision": status.profile_revision
+            }),
+        );
+    }
+    let value = serde_json::json!({
+        "version": 1,
+        "state_revision": 1,
+        "applied_revision": {
+            "config_digest": "memwal-stream-test-config",
+            "resources": resources
+        }
+    });
+    let text = serde_json::to_string_pretty(&value).unwrap();
+    let cluster_uri = cluster_uri.trim_end_matches('/');
+    let storage = storage_handle_for_uri(cluster_uri).unwrap();
+    storage
+        .adapter()
+        .write_text(&format!("{cluster_uri}/__cluster/state.json"), &text)
+        .await
+        .unwrap();
+    let state_cas = format!("sha256:{:x}", Sha256::digest(text.as_bytes()));
+    let binding = if managed {
+        validate_served_export_binding(
+            &storage,
+            cluster_uri,
+            ServedExportBindingRequest {
+                graph_id: GRAPH_ID,
+                graph_store_uri: db.uri(),
+                expected_state_cas: &state_cas,
+                state_revision: 1,
+                terminal: ServedExportTerminalRequest::Managed {
+                    declaration_revision: STREAM_DECLARATION_REVISION,
+                    declaration_digest: STREAM_DECLARATION_DIGEST,
+                    profile_mode: &status.profile_mode,
+                    profile_revision: status.profile_revision,
+                },
+            },
+        )
+        .await
+        .unwrap()
+    } else {
+        validate_served_export_binding(
+            &storage,
+            cluster_uri,
+            ServedExportBindingRequest {
+                graph_id: GRAPH_ID,
+                graph_store_uri: db.uri(),
+                expected_state_cas: &state_cas,
+                state_revision: 1,
+                terminal: ServedExportTerminalRequest::UnmanagedTerminal {
+                    graph_digest: "memwal-stream-test-graph",
+                },
+            },
+        )
+        .await
+        .unwrap()
+    };
+    let guard = mint_served_export_guard(
+        binding,
+        "memwal-stream-test-served-export",
+        "omnigraph:test-export",
+    )
+    .await
+    .unwrap();
+    let db = match Arc::try_unwrap(db) {
+        Ok(db) => db,
+        Err(_) => panic!("served-export fixture must own the sole engine handle"),
+    };
+    Arc::new(db.with_checked_cluster_served_export(guard).await.unwrap())
 }

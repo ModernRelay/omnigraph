@@ -2909,14 +2909,92 @@ graphs:
             .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn apply_executes_approved_graph_delete() {
+        struct PausingExportWriter {
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+            release: Option<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl std::io::Write for PausingExportWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Some(started) = self.started.take() {
+                    let _ = started.send(());
+                    self.release
+                        .take()
+                        .expect("first export write must own its release receiver")
+                        .recv()
+                        .map_err(std::io::Error::other)?;
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
         let dir = fixture();
         seed_deletable_state(dir.path()).await;
         let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
         assert!(approved.ok, "{:?}", approved.diagnostics);
         let approval_id = approved.approval_id.clone().unwrap();
 
+        let old_root = dir.path().join(CLUSTER_GRAPHS_DIR).join("old.omni");
+        let old_uri = derived_graph_uri(dir.path(), "old");
+        let export_db = Omnigraph::open(&old_uri).await.unwrap();
+        let mut seed_params = omnigraph_compiler::ir::ParamMap::new();
+        seed_params.insert(
+            "name".to_string(),
+            omnigraph_compiler::query::ast::Literal::String("export-cut".to_string()),
+        );
+        export_db
+            .mutate(
+                "main",
+                r#"
+query seed($name: String) {
+  insert Person { name: $name }
+}
+"#,
+                "seed",
+                &seed_params,
+            )
+            .await
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let export_task = tokio::spawn(async move {
+            let mut writer = PausingExportWriter {
+                started: Some(started_tx),
+                release: Some(release_rx),
+            };
+            export_db
+                .export_jsonl_to_writer("main", &[], &[], &mut writer)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await
+            .expect("export did not reach its first write")
+            .expect("export exited before its first write");
+        let blocked = apply_config_dir(dir.path()).await;
+        release_tx.send(()).unwrap();
+        export_task.await.unwrap().unwrap();
+        assert!(!blocked.ok && !blocked.converged, "{blocked:?}");
+        assert!(blocked.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "graph_delete_export_in_progress"
+                && diagnostic.path == "graph.old"
+        }));
+        assert!(
+            old_root.exists(),
+            "a live immutable export cut must preserve the exact graph root"
+        );
+        let blocked_state = read_state_json(dir.path());
+        assert!(
+            blocked_state["applied_revision"]["resources"]
+                .get("graph.old")
+                .is_some(),
+            "the blocked delete must leave the graph subtree authoritative"
+        );
         let out = apply_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
         assert!(out.converged, "{out:?}");
@@ -2929,7 +3007,7 @@ graphs:
         assert_eq!(by_resource["schema.old"].disposition, Some(ApplyDisposition::Applied));
         assert_eq!(by_resource["query.old.q"].disposition, Some(ApplyDisposition::Applied));
         // The root is gone; the subtree is tombstoned out of the ledger.
-        assert!(!dir.path().join(CLUSTER_GRAPHS_DIR).join("old.omni").exists());
+        assert!(!old_root.exists());
         let state = read_state_json(dir.path());
         let resources = state["applied_revision"]["resources"].as_object().unwrap();
         assert!(!resources.contains_key("graph.old"));
@@ -4107,6 +4185,7 @@ graphs:
             .stream_runtime_authority
             .as_ref()
             .expect("enabled served graph carries validated binding evidence");
+        assert!(serving.graphs[0].stream_served_export_authority.is_none());
         assert_eq!(binding.graph_id(), "knowledge");
         assert_eq!(binding.profile_revision(), 2);
         assert_eq!(binding.declaration_revision(), declaration_revision);
@@ -4141,6 +4220,7 @@ graphs:
             .stream_runtime_authority
             .as_ref()
             .expect("unrelated apply preserves the enabled runtime binding");
+        assert!(serving.graphs[0].stream_served_export_authority.is_none());
         assert_eq!(binding.declaration_revision(), declaration_revision);
         assert_eq!(binding.profile_revision(), 2);
 
@@ -4180,6 +4260,17 @@ graphs:
         let out = confirmed_streaming_apply(dir.path()).await;
         assert!(out.ok && out.converged, "{out:?}");
         assert!(!live_streaming_enabled(dir.path()).await);
+        let serving = read_serving_snapshot(dir.path()).await.unwrap();
+        assert!(serving.graphs[0].stream_runtime_authority.is_none());
+        let terminal = serving.graphs[0]
+            .stream_served_export_authority
+            .as_ref()
+            .expect("disabled served graph carries checked export binding evidence");
+        assert_eq!(terminal.graph_id(), "knowledge");
+        assert_eq!(
+            terminal.managed_profile().map(|(mode, _)| mode),
+            Some("DISABLED")
+        );
 
         // Removing an active declaration cannot bypass the durable disable.
         write_streaming_cluster(dir.path(), Some(true));
@@ -4206,6 +4297,17 @@ graphs:
         write_streaming_cluster(dir.path(), Some(false));
         let disabled = confirmed_streaming_apply(dir.path()).await;
         assert!(disabled.ok && disabled.converged, "{disabled:?}");
+        let serving = read_serving_snapshot(dir.path()).await.unwrap();
+        assert!(serving.graphs[0].stream_runtime_authority.is_none());
+        assert_eq!(
+            serving.graphs[0]
+                .stream_served_export_authority
+                .as_ref()
+                .expect("terminal managed graph keeps served export evidence")
+                .managed_profile()
+                .map(|(mode, _)| mode),
+            Some("DISABLED")
+        );
         write_streaming_cluster(dir.path(), None);
         let out = confirmed_streaming_apply(dir.path()).await;
         assert!(out.ok && out.converged, "{out:?}");
@@ -4219,6 +4321,15 @@ graphs:
         assert!(
             !live_streaming_enabled(dir.path()).await,
             "unmanaging after explicit disable must preserve DISABLED"
+        );
+        let serving = read_serving_snapshot(dir.path()).await.unwrap();
+        assert!(serving.graphs[0].stream_runtime_authority.is_none());
+        assert!(
+            serving.graphs[0]
+                .stream_served_export_authority
+                .as_ref()
+                .is_some_and(|binding| binding.is_unmanaged_terminal()),
+            "an unmanaged graph keeps exact graph/state evidence so server startup can bind it only for RETIRED or enrolled DISABLED"
         );
     }
 
@@ -5041,6 +5152,249 @@ policies: {}
             !dir.path().join(CLUSTER_LOCK_FILE).exists(),
             "engine refusal must release the dedicated retirement lock"
         );
+    }
+
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn authority_retirement_confirm_converges_applied_state_to_retired() {
+        on_big_stack(|| async {
+        let _scenario = fail::FailScenario::setup();
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(false));
+        write_state_resources(dir.path(), &[]);
+        let created = confirmed_streaming_apply(dir.path()).await;
+        assert!(created.ok && created.converged, "{created:?}");
+
+        let graph_root = dir.path().join("graphs/knowledge.omni");
+        let db = Arc::new(Omnigraph::open(graph_root.to_str().unwrap()).await.unwrap());
+        db.failpoint_enroll_stream_table_for_test("node:Person")
+            .await
+            .unwrap();
+        drop(db);
+
+        write_streaming_cluster(dir.path(), Some(true));
+        let enabled = confirmed_streaming_apply(dir.path()).await;
+        assert!(enabled.ok && enabled.converged, "{enabled:?}");
+        let serving = read_serving_snapshot(dir.path()).await.unwrap();
+        let runtime_binding = serving.graphs[0]
+            .stream_runtime_authority
+            .clone()
+            .expect("enabled graph carries checked runtime authority");
+        let runtime_guard = mint_runtime_guard(
+            runtime_binding,
+            "cluster-retirement-state-fixture",
+            "stream-operator",
+        )
+        .await
+        .unwrap();
+        let db = Arc::new(
+            Omnigraph::open(graph_root.to_str().unwrap())
+                .await
+                .unwrap()
+                .with_checked_cluster_stream_runtime(runtime_guard)
+                .await
+                .unwrap(),
+        );
+        let incarnation = db
+            .failpoint_stream_incarnation_for_test("node:Person")
+            .await
+            .unwrap();
+        let row = serde_json::to_vec(&serde_json::json!({
+            "$stream": {
+                "stream_incarnation_id": incarnation,
+                "write_id": "71717171-7171-4171-8171-717171717171",
+                "predecessor_token": null,
+            },
+            "id": "retire-state-row",
+            "name": "retire-state-row",
+            "age": 42,
+        }))
+        .unwrap();
+        db.failpoint_stream_ingest_one_as_for_test(
+            "node:Person",
+            &row,
+            0,
+            "stream-operator",
+        )
+        .await
+        .unwrap();
+        db.shutdown_stream_fold_driver().await.unwrap();
+        drop(db);
+
+        write_streaming_cluster(dir.path(), Some(false));
+        let disabled = confirmed_streaming_apply(dir.path()).await;
+        assert!(disabled.ok && disabled.converged, "{disabled:?}");
+        let before = read_state_json(dir.path());
+        let before_state_revision = before["state_revision"].as_u64().unwrap();
+        let before_streaming =
+            &before["applied_revision"]["resources"]["streaming.knowledge"];
+        assert_eq!(before_streaming["profile_mode"], json!("DISABLED"));
+        let declaration_digest = before_streaming["digest"].clone();
+        let declaration_revision = before_streaming["declaration_revision"].clone();
+
+        let db = Omnigraph::open(graph_root.to_str().unwrap()).await.unwrap();
+        db.failpoint_withdraw_stream_token_for_retirement_test(
+            "node:Person",
+            "retire-state-row",
+            "72727272-7272-4272-8272-727272727272",
+        )
+        .await
+        .unwrap();
+        drop(db);
+
+        let options = StreamAuthorityRetirementOptions {
+            actor: Some("stream-operator".to_string()),
+            confirm_stream_offline: true,
+        };
+        let plan = plan_stream_authority_retirement_config_dir(
+            dir.path(),
+            "knowledge",
+            options.clone(),
+        )
+        .await;
+        assert!(plan.ok, "{plan:?}");
+        let plan = plan.plan.expect("successful retirement plan");
+        let retirement_id = "73737373-7373-4373-8373-737373737373";
+        let raced_state_revision = before_state_revision + 50;
+        let race_path = dir.path().join(CLUSTER_STATE_FILE);
+        let state_race = omnigraph::failpoints::ScopedFailPoint::with_callback(
+            crate::failpoints::names::CLUSTER_STREAM_RETIREMENT_BEFORE_STATE_WRITE,
+            move || {
+                let mut concurrent: serde_json::Value = serde_json::from_str(
+                    &fs::read_to_string(&race_path).unwrap(),
+                )
+                .unwrap();
+                concurrent["state_revision"] = json!(raced_state_revision);
+                concurrent["applied_revision"]["resources"]["streaming.knowledge"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("declaration_revision");
+                fs::write(
+                    &race_path,
+                    serde_json::to_string_pretty(&concurrent).unwrap(),
+                )
+                .unwrap();
+            },
+        );
+        let raced = confirm_stream_authority_retirement_config_dir(
+            dir.path(),
+            "knowledge",
+            retirement_id,
+            &plan.plan_digest,
+            options.clone(),
+        )
+        .await;
+        drop(state_race);
+        assert!(!raced.ok, "the stale cluster-state CAS must fail closed");
+        assert!(raced.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "state_cas_mismatch"
+        }));
+        let raced_result = raced
+            .result
+            .as_ref()
+            .expect("the manifest retirement effect remains explicit");
+        assert!(raced_result.changed);
+        let raced_profile_revision = raced_result.profile_revision;
+        let raced_state = read_state_json(dir.path());
+        assert_eq!(raced_state["state_revision"], json!(raced_state_revision));
+        assert!(
+            raced_state["applied_revision"]["resources"]["streaming.knowledge"]
+                .get("declaration_revision")
+                .is_none(),
+            "the concurrent malformed row makes the retry prove deterministic backfill"
+        );
+        assert_eq!(
+            raced_state["applied_revision"]["resources"]["streaming.knowledge"]
+                ["profile_mode"],
+            json!("DISABLED")
+        );
+        assert_eq!(
+            Omnigraph::open(graph_root.to_str().unwrap())
+                .await
+                .unwrap()
+                .stream_status()
+                .await
+                .unwrap()
+                .profile_mode,
+            "RETIRED"
+        );
+
+        let confirmed = confirm_stream_authority_retirement_config_dir(
+            dir.path(),
+            "knowledge",
+            retirement_id,
+            &plan.plan_digest,
+            options,
+        )
+        .await;
+        assert!(confirmed.ok, "{confirmed:?}");
+        let result = confirmed.result.expect("successful retirement result");
+        assert!(!result.changed, "retry must replay the exact durable receipt");
+        assert_eq!(result.profile_revision, raced_profile_revision);
+
+        let after = read_state_json(dir.path());
+        let after_streaming =
+            &after["applied_revision"]["resources"]["streaming.knowledge"];
+        assert_eq!(after["state_revision"], json!(raced_state_revision + 1));
+        assert_eq!(after_streaming["digest"], declaration_digest);
+        assert_eq!(
+            after_streaming["declaration_revision"],
+            declaration_revision
+        );
+        assert_eq!(after_streaming["streaming_enabled"], json!(false));
+        assert_eq!(after_streaming["profile_mode"], json!("RETIRED"));
+        assert_eq!(
+            after_streaming["profile_revision"],
+            json!(result.profile_revision)
+        );
+        assert_eq!(
+            confirmed.state_observations.state_revision,
+            raced_state_revision + 1
+        );
+        let serving = read_serving_snapshot(dir.path()).await.unwrap();
+        assert!(serving.graphs[0].stream_runtime_authority.is_none());
+        assert_eq!(
+            serving.graphs[0]
+                .stream_served_export_authority
+                .as_ref()
+                .and_then(|binding| binding.managed_profile()),
+            Some(("RETIRED", result.profile_revision))
+        );
+
+        assert!(streaming_mode_matches_desired("RETIRED", false));
+        let refreshed = refresh_config_dir(dir.path()).await;
+        assert!(refreshed.ok, "{refreshed:?}");
+        assert_eq!(
+            refreshed.resource_statuses["streaming.knowledge"].status,
+            ResourceLifecycleStatus::Applied
+        );
+        let refreshed_state = read_state_json(dir.path());
+        let refreshed_streaming =
+            &refreshed_state["applied_revision"]["resources"]["streaming.knowledge"];
+        assert_eq!(refreshed_streaming["digest"], declaration_digest);
+        assert_eq!(
+            refreshed_streaming["declaration_revision"],
+            declaration_revision
+        );
+        assert_eq!(refreshed_streaming["profile_mode"], json!("RETIRED"));
+        assert_eq!(
+            refreshed_streaming["profile_revision"],
+            json!(result.profile_revision)
+        );
+        assert_eq!(
+            refreshed_state["observations"]["graph.knowledge"]
+                ["streaming_matches_desired"],
+            json!(true)
+        );
+        let next_plan = plan_config_dir(dir.path()).await;
+        assert!(
+            next_plan
+                .changes
+                .iter()
+                .all(|change| change.resource != "streaming.knowledge"),
+            "RETIRED must remain converged with desired streaming:false: {next_plan:?}"
+        );
+        });
     }
 
     #[tokio::test]

@@ -39,6 +39,7 @@ use crate::storage_layer::{SnapshotHandle, StagedHandle};
 use lance_index::mem_wal::ShardId;
 use omnigraph_control_authority::{
     AuthorityOperationClass, ValidatedOfflineGuard, ValidatedRuntimeGuard,
+    ValidatedServedExportGuard,
 };
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -194,6 +195,38 @@ impl CheckedClusterDeadLetterAuthority<'_> {
 #[doc(hidden)]
 pub struct CheckedClusterStreamRuntimeAuthority {
     guard: ValidatedRuntimeGuard,
+}
+
+/// Engine-checked authority for one cluster-served, stream-aware export owner.
+///
+/// The lower guard keeps the process-local serving registration alive for the
+/// complete engine-handle lifetime. This capability is deliberately distinct
+/// from writer runtime authority and can authorize only exact terminal
+/// `DISABLED | RETIRED` export cuts.
+#[doc(hidden)]
+pub struct CheckedClusterServedExportAuthority {
+    _guard: ValidatedServedExportGuard,
+    profile_mode: StreamProfileMode,
+    profile_revision: u64,
+}
+
+impl CheckedClusterServedExportAuthority {
+    pub(super) fn validate_profile(&self, profile: &StreamProfileEntry) -> Result<()> {
+        if profile.mode() != self.profile_mode
+            || profile.profile_revision != self.profile_revision
+        {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: format!(
+                    "served export authority is bound to {} revision {}, but the graph is {} revision {}",
+                    self.profile_mode.as_str(),
+                    self.profile_revision,
+                    profile.mode().as_str(),
+                    profile.profile_revision
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Outcome of the checked cluster stream-profile reconciler.
@@ -371,6 +404,59 @@ fn validate_runtime_profile_binding(
             reason: "runtime cluster/declaration binding differs from the active fold delegation"
                 .to_string(),
         });
+    }
+    Ok(())
+}
+
+fn validate_served_export_profile_binding(
+    profile: &StreamProfileEntry,
+    guard: &ValidatedServedExportGuard,
+    has_enrollment: bool,
+) -> Result<()> {
+    if !matches!(
+        profile.mode(),
+        StreamProfileMode::Disabled | StreamProfileMode::Retired
+    ) {
+        return Err(OmniError::StreamingRequiresClusterRuntime {
+            mode: profile.mode().as_str().to_string(),
+        });
+    }
+    match guard.managed_profile() {
+        Some((mode, revision)) => {
+            if profile.mode().as_str() != mode {
+                return Err(OmniError::StreamingAuthorityMismatch {
+                    reason: format!(
+                        "served export profile mode {mode} does not match graph mode {}",
+                        profile.mode().as_str()
+                    ),
+                });
+            }
+            if profile.profile_revision != revision {
+                return Err(OmniError::StreamingAuthorityMismatch {
+                    reason: format!(
+                        "served export profile revision {revision} does not match graph revision {}",
+                        profile.profile_revision
+                    ),
+                });
+            }
+        }
+        None if guard.is_unmanaged_terminal() => {
+            if profile.mode() != StreamProfileMode::Retired
+                && !(profile.mode() == StreamProfileMode::Disabled && has_enrollment)
+            {
+                return Err(OmniError::StreamingAuthorityMismatch {
+                    reason: format!(
+                        "unmanaged served export authority requires RETIRED or enrolled DISABLED, got {} with enrollment={has_enrollment}",
+                        profile.mode().as_str(),
+                    ),
+                });
+            }
+        }
+        None => {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: "served export guard carries no terminal binding".to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -666,6 +752,48 @@ impl Omnigraph {
         validate_runtime_profile_binding(&profile, &guard)?;
         self.stream_runtime_authority = Some(CheckedClusterStreamRuntimeAuthority { guard });
         Ok(self)
+    }
+
+    /// Attach the checked read/export-only serving authority for one terminal
+    /// stream profile to this engine handle.
+    #[doc(hidden)]
+    pub async fn with_checked_cluster_served_export(
+        mut self,
+        guard: ValidatedServedExportGuard,
+    ) -> Result<Self> {
+        if guard.graph_store_uri() != self.uri() {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: format!(
+                    "validated served-export store '{}' does not match opened graph '{}'",
+                    guard.graph_store_uri(),
+                    self.uri()
+                ),
+            });
+        }
+        if guard.operation() != AuthorityOperationClass::StreamServedExport {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: "served-export guard has the wrong operation class".to_string(),
+            });
+        }
+
+        let _profile_gate = self.write_queue().acquire_stream_profile_shared().await;
+        let main = self.open_coordinator_for_branch(None).await?;
+        let snapshot = main.snapshot();
+        let profile = snapshot.stream_profile().clone();
+        let has_enrollment = snapshot.stream_lifecycles().next().is_some();
+        validate_served_export_profile_binding(&profile, &guard, has_enrollment)?;
+        self.stream_served_export_authority = Some(CheckedClusterServedExportAuthority {
+            _guard: guard,
+            profile_mode: profile.mode(),
+            profile_revision: profile.profile_revision,
+        });
+        Ok(self)
+    }
+
+    pub(super) fn checked_cluster_served_export_authority(
+        &self,
+    ) -> Option<&CheckedClusterServedExportAuthority> {
+        self.stream_served_export_authority.as_ref()
     }
 
     /// Final graph-profile preflight for Mutation/Load/delete.

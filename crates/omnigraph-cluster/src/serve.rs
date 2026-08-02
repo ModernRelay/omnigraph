@@ -2,7 +2,10 @@
 //! boots from (moved verbatim from lib.rs in the modularization).
 
 use super::*;
-use omnigraph_control_authority::{RuntimeBindingRequest, validate_runtime_binding};
+use omnigraph_control_authority::{
+    RuntimeBindingRequest, ServedExportBindingRequest, ServedExportTerminalRequest,
+    validate_runtime_binding, validate_served_export_binding,
+};
 
 /// One graph in a serving snapshot: its id and on-disk root.
 #[derive(Debug, Clone)]
@@ -15,6 +18,11 @@ pub struct ServingGraph {
     /// must consume it through `mint_runtime_guard`, which rereads state and
     /// acquires the non-cloneable process registration.
     pub stream_runtime_authority: Option<RuntimeAuthorityBinding>,
+    /// Canonical terminal-profile binding, or a previously-unmanaged terminal
+    /// candidate, validated from the exact applied state. This is cloneable
+    /// evidence, not export authority; server startup must also prove the
+    /// manifest profile before consuming it through `mint_served_export_guard`.
+    pub stream_served_export_authority: Option<ServedExportAuthorityBinding>,
 }
 
 /// One stored query: its graph binding, registry name, and verified source.
@@ -121,11 +129,16 @@ pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Option<String> {
 ///
 /// `cluster` is a config directory or a storage-root URI (`s3://…`, config-free),
 /// mirroring the server's `--cluster` dispatch.
-pub async fn resolve_graph_storage_uri(cluster: &str, graph_id: &str) -> Result<String, Diagnostic> {
+pub async fn resolve_graph_storage_uri(
+    cluster: &str,
+    graph_id: &str,
+) -> Result<String, Diagnostic> {
     let backend = open_cluster_backend(cluster)?;
     let mut observations = backend.observations();
     let snapshot = backend.read_state(&mut observations).await?;
-    let state = snapshot.state.ok_or_else(|| missing_state_diagnostic(cluster))?;
+    let state = snapshot
+        .state
+        .ok_or_else(|| missing_state_diagnostic(cluster))?;
     let address = format!("graph.{graph_id}");
     if !state.applied_revision.resources.contains_key(&address) {
         let applied = applied_graph_ids(&state);
@@ -150,7 +163,9 @@ pub async fn cluster_graph_ids(cluster: &str) -> Result<Vec<String>, Diagnostic>
     let backend = open_cluster_backend(cluster)?;
     let mut observations = backend.observations();
     let snapshot = backend.read_state(&mut observations).await?;
-    let state = snapshot.state.ok_or_else(|| missing_state_diagnostic(cluster))?;
+    let state = snapshot
+        .state
+        .ok_or_else(|| missing_state_diagnostic(cluster))?;
     Ok(applied_graph_ids(&state))
 }
 
@@ -346,7 +361,7 @@ async fn read_snapshot_with_store(
                 };
                 let graph_root = backend.graph_root(&graph_id);
                 let streaming_address = format!("streaming.{graph_id}");
-                let stream_runtime_authority = match state
+                let (stream_runtime_authority, stream_served_export_authority) = match state
                     .applied_revision
                     .resources
                     .get(&streaming_address)
@@ -385,8 +400,7 @@ async fn read_snapshot_with_store(
                             ));
                             continue;
                         };
-                        let Some(declaration_revision) =
-                            streaming.declaration_revision.as_deref()
+                        let Some(declaration_revision) = streaming.declaration_revision.as_deref()
                         else {
                             quarantined_graphs.insert(graph_id.clone());
                             startup_diagnostics.push(Diagnostic::warning(
@@ -414,7 +428,7 @@ async fn read_snapshot_with_store(
                         )
                         .await
                         {
-                            Ok(binding) => Some(binding),
+                            Ok(binding) => (Some(binding), None),
                             Err(err) => {
                                 quarantined_graphs.insert(graph_id.clone());
                                 startup_diagnostics.push(Diagnostic::warning(
@@ -434,10 +448,10 @@ async fn read_snapshot_with_store(
                             Some("DISABLED" | "RETIRED")
                         ) =>
                     {
-                        if streaming.streaming_enabled == Some(true) {
+                        if streaming.streaming_enabled != Some(false) {
                             quarantined_graphs.insert(graph_id.clone());
                             startup_diagnostics.push(Diagnostic::warning(
-                                "stream_runtime_profile_state_inconsistent",
+                                "stream_served_export_profile_state_inconsistent",
                                 streaming_address.clone(),
                                 format!(
                                     "graph `{graph_id}` is quarantined because terminal profile metadata disagrees with the compatibility flag; run `cluster refresh` then `cluster apply`"
@@ -445,7 +459,63 @@ async fn read_snapshot_with_store(
                             ));
                             continue;
                         }
-                        None
+                        let Some(profile_revision) = streaming.profile_revision else {
+                            quarantined_graphs.insert(graph_id.clone());
+                            startup_diagnostics.push(Diagnostic::warning(
+                                "stream_served_export_profile_revision_missing",
+                                streaming_address.clone(),
+                                format!(
+                                    "graph `{graph_id}` is quarantined because terminal streaming state has no exact profile revision; run `cluster refresh` then `cluster apply`, and restart"
+                                ),
+                            ));
+                            continue;
+                        };
+                        let Some(declaration_revision) = streaming.declaration_revision.as_deref()
+                        else {
+                            quarantined_graphs.insert(graph_id.clone());
+                            startup_diagnostics.push(Diagnostic::warning(
+                                "stream_served_export_declaration_revision_missing",
+                                streaming_address.clone(),
+                                format!(
+                                    "graph `{graph_id}` is quarantined because terminal streaming state has no per-stream declaration revision; run `cluster refresh` then `cluster apply`, and restart"
+                                ),
+                            ));
+                            continue;
+                        };
+                        let profile_mode = streaming.profile_mode.as_deref().expect(
+                            "terminal-profile match already proved exact profile-mode metadata",
+                        );
+                        match validate_served_export_binding(
+                            backend.storage_handle(),
+                            backend.root(),
+                            ServedExportBindingRequest {
+                                graph_id: &graph_id,
+                                graph_store_uri: &graph_root,
+                                expected_state_cas: &state_cas,
+                                state_revision: state.state_revision,
+                                terminal: ServedExportTerminalRequest::Managed {
+                                    declaration_revision,
+                                    declaration_digest: &streaming.digest,
+                                    profile_mode,
+                                    profile_revision,
+                                },
+                            },
+                        )
+                        .await
+                        {
+                            Ok(binding) => (None, Some(binding)),
+                            Err(err) => {
+                                quarantined_graphs.insert(graph_id.clone());
+                                startup_diagnostics.push(Diagnostic::warning(
+                                    "stream_served_export_authority_invalid",
+                                    streaming_address,
+                                    format!(
+                                        "graph `{graph_id}` is quarantined because its served export binding could not be validated: {err}; run `cluster refresh` then `cluster apply`, and restart"
+                                    ),
+                                ));
+                                continue;
+                            }
+                        }
                     }
                     Some(_) => {
                         quarantined_graphs.insert(graph_id.clone());
@@ -458,13 +528,43 @@ async fn read_snapshot_with_store(
                         ));
                         continue;
                     }
-                    None => None,
+                    None => {
+                        let binding = validate_served_export_binding(
+                            backend.storage_handle(),
+                            backend.root(),
+                            ServedExportBindingRequest {
+                                graph_id: &graph_id,
+                                graph_store_uri: &graph_root,
+                                expected_state_cas: &state_cas,
+                                state_revision: state.state_revision,
+                                terminal: ServedExportTerminalRequest::UnmanagedTerminal {
+                                    graph_digest: &entry.digest,
+                                },
+                            },
+                        )
+                        .await;
+                        match binding {
+                            Ok(binding) => (None, Some(binding)),
+                            Err(err) => {
+                                quarantined_graphs.insert(graph_id.clone());
+                                startup_diagnostics.push(Diagnostic::warning(
+                                    "stream_unmanaged_served_export_authority_invalid",
+                                    address.clone(),
+                                    format!(
+                                        "graph `{graph_id}` is quarantined because its unmanaged served-export candidate could not be validated: {err}; run `cluster refresh` then `cluster apply`, and restart"
+                                    ),
+                                ));
+                                continue;
+                            }
+                        }
+                    }
                 };
                 graphs.push(ServingGraph {
                     root: PathBuf::from(graph_root),
                     graph_id,
                     embedding,
                     stream_runtime_authority,
+                    stream_served_export_authority,
                 });
             }
             ResourceKind::Schema(_) => {}

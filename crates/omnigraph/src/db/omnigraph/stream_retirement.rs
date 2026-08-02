@@ -67,15 +67,24 @@ const DEAD_LETTER_CURSOR_MAX_DECODED_BYTES: usize = 4 * 1024;
 const DEAD_LETTER_CURSOR_MAX_ENCODED_BYTES: usize =
     DEAD_LETTER_CURSOR_MAX_DECODED_BYTES.div_ceil(3) * 4;
 
-/// Complete in-process writer envelope retained through retirement planning or
-/// publication. The durable cluster lock remains the cross-process fence.
-struct StreamAuthorityRetirementGates {
+/// Complete in-process full-root cut envelope shared by authority retirement
+/// and checked stream-aware export capture. The checked cluster guard remains
+/// the cross-process fence; these gates provide the canonical in-process lock
+/// order and one accepted catalog view.
+pub(super) struct StreamExclusiveCutGates {
     _profile: OwnedRwLockWriteGuard<()>,
     _admission: Vec<OwnedRwLockWriteGuard<()>>,
     _schema: OwnedMutexGuard<()>,
     _branches: Vec<OwnedMutexGuard<()>>,
     _token: OwnedMutexGuard<()>,
     _tables: Vec<OwnedMutexGuard<()>>,
+    catalog: Arc<omnigraph_compiler::catalog::Catalog>,
+}
+
+impl StreamExclusiveCutGates {
+    pub(super) fn catalog(&self) -> Arc<omnigraph_compiler::catalog::Catalog> {
+        Arc::clone(&self.catalog)
+    }
 }
 
 /// Deterministic, read-only preflight returned by the offline cluster command.
@@ -742,7 +751,9 @@ impl Omnigraph {
         authority: CheckedClusterRetirementAuthority<'_>,
     ) -> Result<StreamAuthorityRetirementPlan> {
         self.heal_pending_recovery_sidecars_outcome().await?;
-        let _gates = self.acquire_stream_authority_retirement_gates().await?;
+        let _gates = self
+            .acquire_stream_exclusive_cut_gates("stream_authority_retirement")
+            .await?;
         self.capture_stream_authority_retirement_plan(&authority)
             .await
     }
@@ -758,7 +769,9 @@ impl Omnigraph {
         expected_plan_digest: &str,
     ) -> Result<StreamAuthorityRetirementResult> {
         self.heal_pending_recovery_sidecars_outcome().await?;
-        let _gates = self.acquire_stream_authority_retirement_gates().await?;
+        let _gates = self
+            .acquire_stream_exclusive_cut_gates("stream_authority_retirement")
+            .await?;
         if authority.operation_id() != retirement_id {
             return Err(OmniError::StreamingAuthorityMismatch {
                 reason: "retirement confirmation guard operation id differs from retirement id"
@@ -974,9 +987,10 @@ impl Omnigraph {
         ))
     }
 
-    async fn acquire_stream_authority_retirement_gates(
+    pub(super) async fn acquire_stream_exclusive_cut_gates(
         &self,
-    ) -> Result<StreamAuthorityRetirementGates> {
+        operation: &str,
+    ) -> Result<StreamExclusiveCutGates> {
         let profile = self.write_queue().acquire_stream_profile_exclusive().await;
         self.ensure_schema_state_valid().await?;
 
@@ -1021,8 +1035,7 @@ impl Omnigraph {
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        self.ensure_schema_apply_not_locked("stream_authority_retirement")
-            .await?;
+        self.ensure_schema_apply_not_locked(operation).await?;
         self.ensure_schema_state_valid().await?;
         let catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
 
@@ -1046,16 +1059,17 @@ impl Omnigraph {
         if let Some(sidecar) = pending.first() {
             return Err(OmniError::recovery_required(
                 sidecar.operation_id.clone(),
-                "authority retirement requires all recovery to be settled",
+                format!("{operation} requires all recovery to be settled"),
             ));
         }
-        Ok(StreamAuthorityRetirementGates {
+        Ok(StreamExclusiveCutGates {
             _profile: profile,
             _admission: admission,
             _schema: schema,
             _branches: branches,
             _token: token,
             _tables: tables,
+            catalog,
         })
     }
 
@@ -1155,11 +1169,10 @@ impl Omnigraph {
     /// Preflight the existing logical export surface. Ordinary export refuses
     /// terminal sequencing authority; a retired export instead returns the
     /// exact selected provenance receipt after re-proving its immutable cut.
-    pub(super) async fn export_stream_authority_preflight(
+    pub(super) async fn export_stream_authority_preflight_at(
         &self,
+        snapshot: &crate::db::Snapshot,
     ) -> Result<Option<AuthorityRetirementReceiptV2>> {
-        let main = self.open_coordinator_for_branch(None).await?;
-        let snapshot = main.snapshot();
         if let crate::db::manifest::StreamProfileState::Retired {
             authority_retirement_receipt_id,
             ..
@@ -1179,7 +1192,7 @@ impl Omnigraph {
                     "RETIRED profile does not select its immutable authority-retirement receipt",
                 ));
             };
-            self.validate_visible_retirement_receipt(&snapshot, &receipt)
+            self.validate_visible_retirement_receipt(snapshot, &receipt)
                 .await?;
             return Ok(Some(receipt));
         }
@@ -1204,7 +1217,7 @@ impl Omnigraph {
             }
         }
         let (_, withdrawn, dead_lettered) =
-            validate_current_token_base_parity_and_counts(self, &snapshot).await?;
+            validate_current_token_base_parity_and_counts(self, snapshot).await?;
         if withdrawn != 0 || dead_lettered != 0 {
             return Err(OmniError::StreamExportBlocked {
                 withdrawn_token_count: withdrawn,
