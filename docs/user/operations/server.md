@@ -10,6 +10,17 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. **Cluster-only boot**: the server a
 omnigraph-server --cluster <dir | s3://…> --bind 0.0.0.0:8080
 ```
 
+Passing port `0` lets the operating system select an available port. After the
+listener binds, the server writes the actual address to stdout as one
+machine-readable line:
+
+```text
+OMNIGRAPH_LISTEN_ADDR=127.0.0.1:54321
+```
+
+Process supervisors and test harnesses can use this record instead of
+reserving and releasing a port before starting the server.
+
 `omnigraph-server --cluster <dir-or-uri>` boots from the cluster catalog's
 **applied revision**. The server resolves that revision into per-graph
 startup configs (id, URI, optional per-graph policy, stored-query

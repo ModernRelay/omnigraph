@@ -58,6 +58,7 @@ pub use policy::{
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::io::{self, Write};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -69,6 +70,11 @@ use utoipa::openapi::schema::{Object, Type};
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 
 type BearerTokenHash = [u8; 32];
+
+/// Machine-readable stdout record emitted after the HTTP listener owns its
+/// requested address. In particular, this exposes the OS-selected port for a
+/// `--bind 127.0.0.1:0` process without a reserve-and-rebind race.
+pub const LISTEN_ADDR_PREFIX: &str = "OMNIGRAPH_LISTEN_ADDR=";
 
 fn hash_bearer_token(token: &str) -> BearerTokenHash {
     let digest = Sha256::digest(token.as_bytes());
@@ -1425,6 +1431,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     };
 
     let listener = TcpListener::bind(&bind).await?;
+    let listen_addr = listener.local_addr()?;
+    {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        writeln!(stdout, "{LISTEN_ADDR_PREFIX}{listen_addr}")?;
+        stdout.flush()?;
+    }
 
     // The registry and listener are both authoritative before any resident
     // task starts. A graph discarded by strict startup, URI collision, or a
