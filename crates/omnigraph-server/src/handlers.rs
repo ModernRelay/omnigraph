@@ -593,6 +593,10 @@ pub(crate) async fn server_query(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Export authority conflict", body = ErrorOutput),
+        (status = 413, description = "Export cut or transport capacity exhausted", body = ErrorOutput),
+        (status = 404, description = "Branch not found", body = ErrorOutput),
+        (status = 503, description = "Recovery required", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -603,6 +607,7 @@ pub(crate) async fn server_query(
 /// streams the entire branch. Suitable for large exports — the response is
 /// streamed, not buffered. Read-only.
 pub(crate) async fn server_export(
+    State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<ExportRequest>,
@@ -617,24 +622,56 @@ pub(crate) async fn server_export(
             target_branch: None,
         },
     )?;
-    let engine = Arc::clone(&handle.engine);
-    let type_names = request.type_names.clone();
-    let table_keys = request.table_keys.clone();
-    let (tx, rx) = mpsc::unbounded_channel::<std::result::Result<Bytes, io::Error>>();
+    // Reserve the bounded response transport before capturing the root cut so
+    // a saturated client population can never hold graph authority while it
+    // waits for process memory. Both operations finish before the 200 headers.
+    let queue_lease = state
+        .export_transport
+        .reserve()
+        .await
+        .map_err(ApiError::from_omni)?;
+    let cut = handle
+        .engine
+        .capture_served_export_cut(&branch, &request.type_names, &request.table_keys)
+        .await
+        .map_err(ApiError::from_omni)?;
+    let producer_queue_lease = Arc::clone(&queue_lease);
+    let (tx, body_stream) = export_transport::channel(queue_lease);
     tokio::spawn(async move {
-        let result = {
-            let mut writer = ExportStreamWriter { sender: tx.clone() };
-            engine
-                .export_jsonl_to_writer(&branch, &type_names, &table_keys, &mut writer)
-                .await
-        };
-        if let Err(err) = result {
-            let _ = tx.send(Err(io::Error::other(err.to_string())));
+        // The producer half prevents disconnect from recycling queue bytes
+        // until every pending send/scan future owned by this task is gone.
+        let _producer_queue_lease = producer_queue_lease;
+        let closed_tx = tx.clone();
+        let data_tx = tx.clone();
+        let export = cut.write_chunks(move |chunk| {
+            let data_tx = data_tx.clone();
+            async move {
+                data_tx
+                    .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
+                    .await
+                    .map_err(|_| {
+                        OmniError::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "served export response closed",
+                        ))
+                    })
+            }
+        });
+        tokio::pin!(export);
+        tokio::select! {
+            biased;
+            _ = closed_tx.closed() => {
+                // Cancelling the pinned export future drops its move-only cut.
+            }
+            (cut, result) = &mut export => {
+                let error = result.err().map(|error| std::io::Error::other(error.to_string()));
+                let _ = tx
+                    .send(export_transport::ExportFrame::Terminal { cut, error })
+                    .await;
+            }
         }
     });
-    let body = Body::from_stream(stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    }));
+    let body = Body::from_stream(body_stream);
     Ok((
         StatusCode::OK,
         [(CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],

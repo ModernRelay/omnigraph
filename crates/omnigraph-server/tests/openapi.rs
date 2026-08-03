@@ -236,6 +236,23 @@ fn openapi_export_is_post() {
 }
 
 #[test]
+fn stream_aware_export_documents_pre_header_failures() {
+    let doc = openapi_json();
+    let responses = &doc["paths"]["/graphs/{graph_id}/export"]["post"]["responses"];
+    for status in ["400", "401", "403", "404", "409", "413", "503"] {
+        assert!(
+            responses[status].is_object(),
+            "export must document {status}"
+        );
+        assert_eq!(
+            responses[status]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ErrorOutput",
+            "export {status} must use ErrorOutput"
+        );
+    }
+}
+
+#[test]
 fn openapi_change_is_post() {
     let doc = openapi_json();
     assert!(doc["paths"]["/graphs/{graph_id}/change"]["post"].is_object());

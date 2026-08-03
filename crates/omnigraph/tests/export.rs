@@ -1,6 +1,7 @@
 mod helpers;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 
@@ -308,6 +309,51 @@ async fn export_jsonl_round_trips_branch_snapshot() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn served_export_chunks_are_bounded_and_match_direct_export() {
+    const WIDE_SCHEMA: &str = r#"
+node Document {
+    key: String @key
+    body: String
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        Omnigraph::init(dir.path().to_str().unwrap(), WIDE_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let wide = serde_json::json!({
+        "type": "Document",
+        "data": { "key": "wide", "body": "λ".repeat(40_000) }
+    })
+    .to_string();
+    load_jsonl(db.as_ref(), &wide, LoadMode::Append)
+        .await
+        .unwrap();
+    let expected = db.export_jsonl("main", &[], &[]).await.unwrap();
+    let cut = db
+        .capture_served_export_cut("main", &[], &[])
+        .await
+        .unwrap();
+    let mut chunks = Vec::new();
+    let (cut, result) = cut
+        .write_chunks(|chunk| {
+            assert!(!chunk.is_empty());
+            assert!(chunk.len() <= omnigraph::db::EXPORT_CHUNK_MAX_BYTES);
+            chunks.push(chunk);
+            std::future::ready(Ok(()))
+        })
+        .await;
+    result.unwrap();
+    drop(cut);
+
+    assert!(chunks.len() > 1, "wide row must exercise chunk splitting");
+    let joined = chunks.concat();
+    assert_eq!(joined, expected.as_bytes());
+    assert!(std::str::from_utf8(&joined).is_ok());
 }
 
 #[tokio::test]

@@ -34,12 +34,19 @@ the isolated production-size dead-letter byte/capacity/timing and peak-RSS
 evidence behind one new source-guarded, doc-hidden failpoints-only measurement
 seam. It changes no format, recovery, or production route; its stopped/offline
 Rust payload DTO now retains raw JSON instead of a `serde_json::Value`, a
-source-shape change described below.
+source-shape change described below. F6b5 implements bounded-transport,
+stream-aware
+served export on the existing HTTP/remote-CLI/OpenAPI export surface, with
+pre-header cut validation, incremental exact-version scans using approximate
+Lance targets, strict chunks/queue ownership, complete per-response/process
+queue-envelope reservation, and disconnect-safe ownership. It
+also changes no format or recovery grammar.
 Public row streaming, public enrollment, general lifecycle/rebind verbs,
 `AuthorityBlock` repair,
 exclusive-cut physical/public driver status, the F6b-remainder guardrail
-acceptance, and
-SDK/HTTP/OpenAPI streaming or maintenance surfaces remain inactive.
+acceptance, and SDK/HTTP/OpenAPI row-ingress, lifecycle, status, or maintenance
+surfaces remain inactive. Stream-aware served export is the narrow activated
+transport exception.
 Retirement, DataBlock show/correct, and current dead-letter list/export are
 exposed only by narrow stopped/offline cluster controls.
 **Date:** 2026-07-10
@@ -236,8 +243,9 @@ manifest-only. This slice adds no format/recovery or public API/SDK/HTTP/CLI/
 OpenAPI contract and does not complete F6. Later F6b2 closes the named process,
 fairness, and maintenance/rebind/resume cells, and F6b3 closes the uncovered-
 tail current-token hit/miss and terminal-page instrument. The remaining
-covered/reconciled token curve, transport, status, and guardrails keep F7
-forbidden; F6b4 separately closes the isolated dead-letter envelope evidence.
+covered/reconciled token curve, status, and guardrails keep F7 forbidden;
+F6b4 separately closes the isolated dead-letter envelope evidence and F6b5
+closes bounded served export.
 **F6b1 checked immutable export-cut slice implemented:** 2026-08-02 — an exact
 managed `DISABLED | RETIRED` applied row, or exact graph/state evidence which
 the engine accepts only for unmanaged `RETIRED` or enrolled `DISABLED`, can
@@ -246,10 +254,10 @@ the sole process-local serving registration without authorizing a writer.
 Retirement confirmation CAS-converges a managed row to its exact `RETIRED`
 revision; refresh preserves declaration identity and treats it as satisfying
 `streaming: false`. Ambient enrolled ordinary `DISABLED` export refuses before
-output. The existing receipt-verified `RETIRED` direct/server export remains as
-the irreversible-retirement rebuild bridge until F7 switches its transport to
-the checked cut, and retains the exclusive side of the same root gate through
-output. The doc-hidden capture seam nonwaitingly reserves that exclusive gate,
+output. F6b1 retained the receipt-verified `RETIRED` direct/server export as
+the irreversible-retirement rebuild bridge; F6b5 now switches served transport
+to the checked cut. Both retain the exclusive side of the same root gate
+through output. The doc-hidden capture seam nonwaitingly reserves that exclusive gate,
 settles recovery, and closes profile/admission/schema/branch/token/table gates
 while it validates terminal authority and filters and freezes
 the accepted catalog, selected branch snapshot's exact table versions, and
@@ -263,8 +271,8 @@ Terminal/refusal errors precede bytes; a
 post-start storage/writer failure remains that stream error. This changes no
 format or recovery grammar and activates no HTTP, SDK, remote CLI, OpenAPI,
 bounded channel/byte reservation, deadline, stall/disconnect handling,
-measurement, or public status surface. Those plus the remaining matrix stay in
-the F6b remainder/F7 boundary.
+measurement, or public status surface. F6b5 subsequently closed the transport terms;
+the remaining matrix stays in the F6b remainder/F7 boundary.
 **F6b2 process/lifecycle acceptance slice implemented:** 2026-08-02 — green existing
 server and hidden engine cells cover Unix `SIGTERM` through the shared
 graceful-shutdown path; sequential OS-process exit/reopen with persisted
@@ -288,8 +296,9 @@ sequential sole-writer evidence, not a distributed fence.
 Productive SchemaApply stays refused on enrolled graphs: EXP schema evolution
 is checked sealed/retired export followed by fresh init/load, while physical
 rebind keeps accepted schema unchanged. Covered/reconciled token evidence,
-bounded public export transport, public status, and served parity remain later
-F6b/F7 work. F6b4 separately closes the isolated dead-letter envelope evidence.
+F6b5 closes bounded stream-aware served export; public status and the other
+served surfaces remain later F6b/F7 work. F6b4 separately closes the isolated
+dead-letter envelope evidence.
 **F6b3 exact-selected uncovered-tail evidence implemented:** 2026-08-02 — a
 fixed-cardinality fixture grows immutable token-ledger receipt history through
 zero-lane profile cycles before enrollment; graph-manifest history also
@@ -340,6 +349,28 @@ value/schema, changes the Rust DTO field from `serde_json::Value` to
 `Box<serde_json::value::RawValue>`, and may therefore preserve a different
 lexical object-member order when serialized. It also adds one source-guarded,
 doc-hidden failpoints-only measurement seam.
+**F6b5 bounded served-export transport implemented:** 2026-08-03 — the
+existing `POST /graphs/{graph_id}/export` route now authorizes and reserves its
+complete transport-queue envelope before capturing F6b1's immutable cut and
+sending `200`. Pristine graphs retain ordinary export; cluster-served enrolled
+graphs require exact terminal `DISABLED | RETIRED` authority. Invalid filters,
+nonterminal/stale authority, current `WITHDRAWN | DEAD_LETTERED` tokens, a
+second root cut, and transport saturation remain typed JSON pre-header errors.
+Exact-version scans use an initial 8,192-row estimate and Lance's approximate
+32-MiB decoded-byte target. Lance may emit a larger batch, so the scan settings
+are not allocator admission. Blob descriptor batches are explicitly sliced to
+one logical row before its complete Blob-property set is materialized; that
+set and the row's encoded JSON remain indivisible scratch. JSONL emission
+splits independently owned chunks at 64 KiB. The server queue holds two chunks
+and reserves a complete 256-KiB queue envelope per response plus a 2-MiB
+process queue total under a 250-ms deadline. This is not a whole-response or
+RSS bound. The response body and producer jointly retain the permit; the cut
+stays in the in-flight producer or a terminal frame behind all data, so stall
+backpressures and completion/disconnect/error release both owners. A
+missing producer terminal is a body error rather than clean EOF. Remote CLI
+streams the same response and OpenAPI pins `409 | 413 | 503`. This changes no
+persisted grammar and activates no row-ingress, lifecycle, maintenance, or
+public status surface.
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s unified write and
 generic recovery-sidecar protocol, plus
@@ -3744,24 +3775,26 @@ selected path/version until the cut is consumed or dropped.
 Ambient `Omnigraph::export_jsonl[_to_writer]`, embedded SDK, and direct
 `--store` export of an enrolled ordinary `DISABLED` graph return
 `StreamingRequiresClusterRuntime` before any byte. The existing
-receipt-verified `RETIRED` direct/server route remains the rebuild bridge until
-F7 and owns the same exclusive root gate through output. Under an ordinary
+receipt-verified `RETIRED` ambient route remains a compatibility rebuild bridge
+alongside F6b5's checked served route and owns the same exclusive root gate
+through output. Under an ordinary
 `DISABLED` profile, current terminal token authority returns
 `StreamExportBlocked` before output; a post-start storage/writer failure remains
 that stream error. No format or recovery grammar changed.
 
-F7 still owns `POST /graphs/{graph_id}/export`, `export --server`, and the rest
-of the public half. Before constructing a response or sending HTTP `200`, the
-served route must authorize and call that checked seam while reserving the
-complete configured queue bytes under a bounded deadline. It must map
-preflight/slot refusal to the ordinary typed JSON error before headers, replace
-the current unbounded export channel with a measured bounded chunk/byte queue,
-backpressure a stalled receiver, stop promptly on disconnect, avoid whole-
-graph retention, and release every byte reservation on completion, disconnect,
-or error. Those queue/root limits and the preflight, stall, and disconnect
-handler cells co-land with HTTP/SDK/remote-CLI/OpenAPI parity; none is active in
-F6b1. The resulting artifact may initialize a fresh target through normal
-cluster control, never load over the enrolled source.
+F6b5 now owns `POST /graphs/{graph_id}/export`, `export --server`, and the
+public export half. Before constructing a response or sending HTTP `200`, the
+served route authorizes, reserves its complete queue/producer/consumer envelope
+under a bounded deadline, and captures the checked cut. Preflight and slot
+refusal remain ordinary typed JSON before headers; exact Lance versions scan
+incrementally using approximate batch targets and feed a strict bounded chunk
+queue; a stalled receiver backpressures production; and completion, disconnect,
+and error release every reservation. The queue/root limits and
+preflight/stall/disconnect handler cells
+co-land with HTTP/remote-CLI/OpenAPI export parity. F7 still owns public row
+ingress, lifecycle, maintenance, status, and the rest of their served parity.
+The resulting artifact may initialize a fresh target through normal cluster
+control, never load over the enrolled source.
 
 #### Surface retained, trimmed, and non-trimmable
 
@@ -3792,12 +3825,11 @@ while fold cadence, dead-letter object layout, and status field shapes are
 declared unstable.
 
 By the time F7 executes, F2 will already have landed
-`cluster apply --confirm-stream-offline` and its profile adapter. F7 co-lands
-the served maintenance/export routes and remote commands above plus the narrow
-offline `cluster stream` support commands, their
+`cluster apply --confirm-stream-offline` and its profile adapter, and F6b5 will
+already own exact-terminal served export. F7 co-lands the remaining served row,
+lifecycle, maintenance, and status routes plus their remote commands,
 DTO/authorization/audit tests, and the existing stream surface. F6 proves the
-hidden candidate runtime first; it does not require HTTP or remote routes that
-F7 has not introduced.
+hidden candidate runtime first; export is its narrow HTTP/remote exception.
 
 That activation PR extends F2's already-public cluster-ownership,
 direct-mutation-refusal, and v10→v11 rebuild baseline with the activated stream
@@ -5660,8 +5692,9 @@ ordinary writers refuse but cannot be corrected, quiesced, or rebuilt.
   active only under stopped/offline cluster control and walks the selected
   token version rather than object prefixes. F6b1 lets exact terminal cluster/
   server boot mint a checked export-only authority and exposes only a doc-
-  hidden immutable engine cut; there is no served export route or public SDK,
-  CLI, OpenAPI, or status addition. The remaining minimum controls—full
+  hidden immutable engine cut. F6b5 routes that cut through the existing served
+  HTTP/remote-CLI/OpenAPI export surface; it adds no status fields. The remaining
+  minimum controls—full
   exclusive-cut status, explicit fold, persistent quiesce, resume/abort-drain,
   rebuild preflight, general data correction, and authority repair—remain inactive.
   Embedded durable-only status is already active. F6a adds a separate typed,
@@ -5748,9 +5781,9 @@ this activates `AuthorityBlock` repair.
   repeated export of the recorded cut remain available.
 - Ambient ordinary export of an enrolled `DISABLED` graph now returns
   `StreamingRequiresClusterRuntime` before output. The existing receipt-
-  verified `RETIRED` direct/server export remains the temporary rebuild bridge,
-  serialized by the same exclusive root gate, until F7 routes it through the
-  checked cut.
+  verified `RETIRED` ambient export remains a compatibility rebuild bridge,
+  serialized by the same exclusive root gate alongside F6b5's checked served
+  route.
   Through F6b1's checked
   terminal seam, an ordinary `DISABLED` graph with current terminal authority
   returns `StreamExportBlocked` before output, while a `RETIRED` graph can
@@ -5777,9 +5810,9 @@ this activates `AuthorityBlock` repair.
   previously unmanaged enrolled `DISABLED` graph can mint the narrow
   `CheckedClusterServedExportAuthority`; no fold delegation, supervisor, or
   admission authority is implied. This evidence is
-  engine/control-authority only: F7 still owns the public handler, bounded
-  channel/byte reservation, deadline, stall/disconnect behavior, and transport
-  parity.
+  engine/control-authority only in F6b1; F6b5 owns the existing public export
+  handler, bounded chunk queue/reservation, deadline, stall/disconnect behavior,
+  and HTTP/remote-CLI/OpenAPI parity.
 - F5 repeats the matrix with `WITHDRAWN | DEAD_LETTERED` and activates
   `DEAD_LETTERED` only after the following exact cells are green:
   1. exact retry after restart returns the same `DEAD_LETTERED` result while
@@ -5965,7 +5998,7 @@ remain concurrent with one another.
 | B2a | selected unbounded retain-all/no-GC profile on stock Lance | **Private gate implemented 2026-07-21 (§12.5):** no OmniGraph byte/object/file/history quota; zero canonical `_mem_wal` deletion; complete/partial provider residue remains retained, unreferenced, and untouched below its root through retry/reopen; provider failures are loud; local/configured-RustFS history sweeps are advisory. This gate itself activated no schema or product surface; the later private B2-common slice activates v9 |
 | B2b | candidate managed-reclamation retention profile | Inactive. Requires the Lance-owned durable inspect/plan/execute + receipt, post-success fencing, bounded checkpoint/inventory/accounting, local/RustFS enforced-bound validation, and the profile-specific crash matrix (§4.5.2/§12.6). Passing it alone activates no product surface |
 | B2-common | schema v9/config-v3/state-v2, compare-and-chain token/attribution, graph-global token authority, recovery-v12 base+token fold; then explicit enrollment, revision-fenced lifecycle/correction/full status, SDK row/control methods, HTTP, CLI, and OpenAPI | **Private row/fold subset implemented 2026-07-22 (§11/§12.6):** canonical digests, hidden attribution, stale-authority revalidation after shared admission, same-generation chains, exact two-participant recovery/publication, durable fold attribution, retain-all, and genuine v8↔v9 refusal/rebuild are green. Explicit production enrollment, general lifecycle mutation, exclusive-cut physical status, public row admission, cancellation/shutdown, API compatibility, and transport parity remain inactive. The Cedar vocabulary, embedded manifest-only status, and narrow stopped/offline F3f DataBlock correction shipped in later EXP slices. `GraphHistoryBudget` belongs only to a future bounded/managed profile |
-| EXP | experimental cluster-only activation of the §4.7 profile: capability-bound manifest enablement via offline `cluster apply`; lazy graph-wide enrollment; caller-supplied vectors; terminal per-key object-form dead letter plus recovery-bound structural-authority correction; irreversible same-format authority retirement for fresh-root rebuild; explicit lifecycle-aware content-preserving `SEALED` same-binding maintenance and terminal-disabled physical rebind; schema evolution only through checked fresh-root rebuild; no read-your-writes bridge; starvation-free serial dependency-prioritized fold core with non-overlapping resident-enabled and offline-disable owners; upsert-only; hidden-first ingress followed by atomic served HTTP/remote-client/CLI/OpenAPI activation with direct mutation refused | **Selected 2026-07-27 and protocol choices amended 2026-07-29 (§4.7); v10 P1, v11 profile authority, hidden v12/lifecycle-v3/recovery-v14, F3a v13/recovery-v15, F3b EnsureIndices v14/recovery-v16, F3c Optimize v15/recovery-v17, F3d physical rebind v16/recovery-v18, F3e authority retirement v17/recovery-v19, F3f DataBlock correction v18/recovery-v20, hidden F4 ingest/prepare, format-neutral F5a automatic `OPEN` folding, F5b0 operational convergence, F5b terminal diversion in v19/recovery-v21, F6a in-process acceptance, F6b1 checked immutable export-cut authority, F6b2 process/lifecycle acceptance, F6b3 exact-selected uncovered-tail cost evidence, and F6b4 production-size dead-letter envelope evidence are implemented.** V11–v18 retain the profile, lifecycle, maintenance, rebind, retirement, and DataBlock contracts described above. F4 closes the caller-shaped private request path; F5a adds coalesced timer/cap triggers, cold `OPEN` backlog discovery, finite node-before-edge rounds, and bounded shutdown over recovery-v14 authority. F5b0 adds exact-`ENABLED` goal-`SEALED` restart continuation and checked offline `DISABLING` convergence, including `OPEN_AFTER_FOLD` adoption and loud `DataBlock` park/correct/rerun. Current v19/token-schema-v3/recovery-v21 deterministically publishes valid winners, records all losing terminal candidates in one bounded canonical object, makes each losing key current `DEAD_LETTERED`, supports exact retry plus a fresh ordinary successor, exposes stopped/offline selected-token list/export, and extends retirement to `WITHDRAWN | DEAD_LETTERED`. F6a adds only a typed failpoints-only process-local advisory driver snapshot and one hidden in-process composed acceptance; public durable status stays manifest-only. F6b1 adds lower/engine exact-terminal export-only authority plus a doc-hidden move-only cut that freezes the accepted catalog, selected exact table versions, and retired provenance under full gates, then retains one nonwaiting root slot through output after dropping those gates. It changes no format/recovery grammar and activates no public route. Public driver/exclusive-cut status, public ingress/enrollment/lifecycle/rebind control, every served row/lifecycle streaming transport, and unreachable `AuthorityBlock` repair remain inactive. Covered/reconciled token evidence and threshold, bounded export transport, public status, and the remaining guardrail matrix stay open; public activation still requires F7-co-landed bounded export transport plus served/remote DTO/OpenAPI parity after every F6 gate passes. |
+| EXP | experimental cluster-only activation of the §4.7 profile: offline capability-bound enablement, lazy enrollment, caller-supplied vectors, terminal per-key dead letter plus correction, irreversible authority retirement for fresh-root rebuild, SEALED maintenance/rebind, starvation-free serial folding, and upsert-only hidden ingress | **Selected 2026-07-27 and amended 2026-07-29 (§4.7); F3a–F3f, hidden F4, F5a/F5b0/F5b, and F6a–F6b5 are implemented.** Current v19/token-schema-v3/recovery-v21 publishes deterministic mixed/all-diverted folds, current `DEAD_LETTERED` authority, exact retry/ordinary successor, stopped/offline inspection, and three-disposition retirement. F6b1 freezes an exact-terminal move-only cut; F6b5 connects it to existing served HTTP/remote-client/CLI/OpenAPI export with incremental exact-version scans using approximate Lance targets, strict 64-KiB chunks, complete queue-envelope reservation, pre-header typed refusal, backpressure, and disconnect-safe body-plus-producer ownership. Public driver/exclusive-cut status, public ingress/enrollment/lifecycle/rebind control, every served row/lifecycle/maintenance transport, and unreachable `AuthorityBlock` repair remain inactive. Covered/reconciled token evidence and threshold, public status, and the remaining guardrail matrix stay open; full row/control activation still requires the remaining F6 evidence before F7. |
 | C | restart-stable reject-row identity, atomic dead letter, richer status, and evidence-backed configurable bounds | reject crash matrix; reject-retention proof; backpressure and RSS/latency evidence. The §4.7 profile pulls a bounded object-form dead-letter subset forward using the §4.1 token as reject identity |
 | D | automatic operation drain, broader schema/branch/upgrade integration, and orchestrated rematerialization rebind beyond P7's explicit bridge | two-coordinator race, old/new physical-binding crash matrix, and format-transition suite |
 | E | fresh cuts and maintained-index reads; cross-process `Fresh` ships only if the substrate generation-retention guard exists (§9), otherwise same-process only | cut consistency; merged-generation exclusion |

@@ -343,7 +343,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ),
     (
         "db/omnigraph/export.rs",
-        "capture_checked_stream_export_cut",
+        "capture_served_export_cut",
     ),
     (
         "db/omnigraph/stream_ingest.rs",
@@ -2213,7 +2213,7 @@ fn public_graph_surfaces(src: &Path) -> BTreeSet<(String, String)> {
 }
 
 #[test]
-fn checked_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
+fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
     let path = engine_src_root().join("db/omnigraph/export.rs");
     let contents = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
@@ -2287,7 +2287,7 @@ fn checked_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
                     let syn::ImplItem::Fn(function) = member else {
                         continue;
                     };
-                    if function.sig.ident != "capture_checked_stream_export_cut" {
+                    if function.sig.ident != "capture_served_export_cut" {
                         continue;
                     }
                     capture_methods += 1;
@@ -2310,12 +2310,16 @@ fn checked_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
     );
     assert_eq!(
         capture_methods, 1,
-        "exactly one checked export-cut capture surface is allowed"
+        "exactly one served export-cut capture surface is allowed"
     );
     assert_eq!(
         cut_methods,
-        BTreeSet::from(["into_jsonl".to_string(), "write_to".to_string()]),
-        "the hidden cut may only be consumed through its two output conveniences"
+        BTreeSet::from([
+            "into_jsonl".to_string(),
+            "write_chunks".to_string(),
+            "write_to".to_string(),
+        ]),
+        "the hidden cut may only be consumed through its bounded output conveniences"
     );
     assert!(
         !contents.contains("impl Clone for StreamExportCut"),

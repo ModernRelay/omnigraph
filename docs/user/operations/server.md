@@ -158,12 +158,45 @@ the request body and response handling alone.
 
 ## Streaming
 
-Only `/export` streams (`application/x-ndjson`, MPSC channel + `Body::from_stream`). Everything else is buffered JSON.
+Only `/export` streams (`application/x-ndjson`); everything else is buffered
+JSON. Export authorization, relevant checked recovery settlement/validation,
+branch/filter validation, and stream-authority validation all finish before the
+server sends `200`. A pristine graph may export normally. An enrolled
+`DISABLED` graph must be cluster-served at that exact terminal cut; ordinary
+embedded/direct export still refuses because it cannot mint served authority.
+The receipt-verified ambient `RETIRED` rebuild bridge remains compatible, while
+cluster serving normally supplies checked `RETIRED` authority too. `DISABLED`
+export additionally requires every lane `SEALED`, exact
+base/token parity, and no current `WITHDRAWN | DEAD_LETTERED` token. `RETIRED`
+export includes its verified rebuild provenance.
+
+The engine incrementally scans exact pinned Lance versions using an initial
+8,192-row estimate and Lance's approximate 32-MiB decoded-byte target; these
+are scheduling targets, not hard scanner-memory ceilings. Blob descriptors are
+explicitly sliced to one logical row before its complete Blob-property set is
+materialized. One row's Blob values and encoded JSON are indivisible scratch
+outside the transport reservation. Encoded JSONL is split into independently
+owned chunks of at most 64 KiB.
+
+Each response uses a two-chunk bounded queue and reserves 256 KiB for the two
+queued chunks, one producer chunk awaiting admission, and one consumer-current
+chunk. This is a complete transport-queue envelope, not a cap on the whole
+response or process RSS. The production process holds a 2-MiB aggregate queue
+budget (eight reservations) and waits at most 250 ms for one. An occupied graph
+export cut or saturated transport returns the ordinary structured HTTP 413
+response before success headers. A stalled client backpressures production;
+the response body and producer jointly retain the queue lease, so disconnect
+closes the receiver immediately but does not recycle the permit until the
+producer has unwound. The immutable cut remains in the producer or a terminal
+frame queued after all data. A storage failure after `200` terminates the
+response body as a stream error; it cannot be rewritten into a JSON error after
+headers. Clients must discard a partial artifact whenever body consumption
+fails.
 
 ## Error model
 
 Uniform
-`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, read_set_conflict?, recovery_required? }`
+`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, read_set_conflict?, recovery_required?, resource_limit? }`
 with
 `code ∈ unauthorized | forbidden | bad_request | not_found | method_not_allowed | conflict | too_many_requests | internal`.
 Merge conflicts attach structured

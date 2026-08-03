@@ -897,10 +897,12 @@ impl TableStore {
         Self::scan_stream_with(ds, projection, filter, order_by, with_row_id, |_| Ok(())).await
     }
 
-    /// Streaming scan with explicit row and decoded-byte ceilings per emitted
-    /// batch. Callers that retain or transform batches as part of a bounded
-    /// write plan must use this instead of inheriting Lance's environment-
-    /// controlled defaults.
+    /// Streaming scan with an explicit initial row estimate and approximate
+    /// decoded-byte target. Lance's byte target overrides the row setting;
+    /// neither setting is a hard limit, and Lance may emit a larger batch.
+    /// Callers that retain or
+    /// transform batches must charge the actual batch against their own hard
+    /// budget instead of treating these scanner settings as admission.
     pub async fn scan_stream_bounded(
         ds: &Dataset,
         projection: Option<&[&str]>,
@@ -912,7 +914,7 @@ impl TableStore {
     ) -> Result<DatasetRecordBatchStream> {
         if batch_rows == 0 || batch_bytes == 0 {
             return Err(OmniError::manifest_internal(
-                "bounded scan requires non-zero row and byte ceilings",
+                "bounded scan requires non-zero row estimate and byte target",
             ));
         }
         Self::scan_stream_with(ds, projection, filter, order_by, with_row_id, |scanner| {

@@ -13,6 +13,12 @@ This file is the always-on map of the test surface. **Consult it before every ta
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | Per-area suites (post-modularization): `auth_policy.rs`, `data_routes.rs`, `schema_routes.rs`, `stored_queries.rs`, `multi_graph.rs` (cluster-mode boot — converged serving, policy binding wiring, boot refusals — + the concurrent branch-ops matrix), `boot_settings.rs` (mode inference, PolicySource), `s3.rs` (bucket-gated: single-graph serving + config-free `--cluster s3://` boot), `openapi.rs` (OpenAPI drift / regeneration); share `tests/support/mod.rs`. F5a changes no route: `serve` starts checked-runtime resident fold supervisors only after listener bind and joins every selected graph concurrently after Axum graceful shutdown; engine/failpoint owners pin the scheduler behavior. F6b1 boot consumes the terminal served-export guard and installs the hidden engine authority; it adds no handler, route, or OpenAPI surface |
 | `omnigraph-compiler` | mostly in-source `#[cfg(test)] mod tests` | Parser, type-checker, IR lowering, lint. Schema parser and SchemaIR validation tests both reject the five exact Lance virtual system-column property names while preserving near-miss identifiers |
 
+**F6b5 amendment:** the F6b1 phrases in the table are historical slice
+boundaries. F6b5 later activates the existing served HTTP/remote-CLI/OpenAPI
+export route using that exact-terminal binding and doc-hidden move-only engine
+cut; it does not activate row ingress or lifecycle/maintenance/status surfaces.
+The dedicated F6b5 ownership section below lists the current tests.
+
 The engine's `tests/` is the principal coverage surface; most graph-shaped behavior is exercised there.
 
 ## CI control-plane tests
@@ -724,7 +730,7 @@ remaining evidence, transport, status, and guardrails keep F7 closed.
 F6b1 extends existing owners rather than adding a transport test silo. Control-
 authority tests accept only exact terminal `DISABLED | RETIRED` state and pin
 the shared process-local registration; cluster/server tests pin binding and boot
-installation without a route. `forbidden_apis.rs` keeps `StreamExportCut`
+installation. `forbidden_apis.rs` keeps `StreamExportCut`
 doc-hidden, private-field, move-only, and non-forgeable.
 
 `memwal_stream.rs` proves ambient enrolled ordinary `DISABLED` export refuses
@@ -740,10 +746,33 @@ and a cut keeps its exact snapshot/catalog/table versions while a writer commits
 after capture. The cluster delete owner separately proves the same normalized
 root exclusion preserves the graph until release. A later storage error remains
 the provider error and releases the slot. F6b1 changes no format or recovery
-grammar. It does not cover a public HTTP/SDK/CLI/OpenAPI handler, bounded channel
-or byte reservation, deadline, stall/disconnect behavior, or measurement. F6b3
-later closes only the exact-selected uncovered-tail token instrument; transport
-and the remaining correctness/performance matrix stay in F6b/F7.
+grammar. F6b1 itself did not cover an HTTP/remote-CLI/OpenAPI handler, bounded
+channel, queue reservation, deadline, or stall/disconnect behavior; F6b5 now
+owns those cells. F6b3 closes only the exact-selected uncovered-tail token
+instrument; the remaining correctness/performance matrix stays in F6b/F7.
+
+### RFC-026 implemented F6b5 served-export ownership
+
+F6b5 extends the existing export owners. `export.rs` proves a JSON row wider
+than 64 KiB is split into strict independently owned chunks whose concatenation
+is byte-identical and valid UTF-8. Blob export keeps its existing value tests;
+the implementation explicitly slices Lance descriptor batches to one logical
+row before materializing that row's complete Blob-property set.
+
+`export_transport.rs` pins the two-chunk queue, 256-KiB queue-envelope and
+2-MiB process budget arithmetic, 250-ms typed saturation/recovery, body-plus-
+producer lease ownership, queue backpressure, missing-terminal body error, and
+deterministic transfer of the move-only root cut into an unpolled terminal
+frame. `data_routes.rs` pins filter refusal before success headers, stalled-body
+root-cut exclusion, disconnect release, and direct/served byte parity.
+`multi_graph.rs` pins exact checked `DISABLED` served export, refuses an
+`ENABLED` writer runtime as export authority, and holds eight graph responses
+to prove the ninth receives typed `stream_export_transport_bytes` refusal before
+release/retry. `openapi.rs` pins `400 | 401 | 403 | 404 | 409 | 413 | 503`
+error schemas and the generated artifact. Existing `memwal_stream.rs` cells
+remain the owner for terminal-token refusal, retired provenance, immutable-cut
+versioning, and post-start provider errors. The queue reservation covers only
+owned transport chunks, not scanner memory, a complete response, or RSS.
 
 ### RFC-026 implemented F6b2 acceptance scope
 
@@ -780,8 +809,8 @@ F6b2 deliberately does **not** accept in-place productive SchemaApply on an
 enrolled graph. Schema-change acceptance is a separate checked sealed/retired
 export → initialize fresh graph with the desired schema → ordinary load
 workflow; physical rebind keeps the accepted schema unchanged. Covered/
-reconciled token evidence, bounded public export transport, public status, and
-served SDK/HTTP/CLI/OpenAPI parity remain later F6b/F7 owners. F6b4 separately
+reconciled token evidence, public status, and the remaining served row/control
+parity remain later F6b/F7 owners. F6b4 separately
 closes the isolated dead-letter envelope evidence.
 
 ### RFC-026 implemented F6b3 selected-token cost evidence

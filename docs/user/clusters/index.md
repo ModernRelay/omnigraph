@@ -291,6 +291,14 @@ transfer live sequencing authority. A graph with only `PRESENT`
 tokens uses ordinary export. See the [upgrade guide](../operations/upgrade.md)
 for the full procedure.
 
+For an enrolled source, terminal state is necessary but direct storage access
+is not sufficient authority. Keep `streaming: false` applied, restart
+`omnigraph-server` from that exact cluster directory, and run `omnigraph export
+--server <name-or-url> --graph <id> > graph.jsonl`. The server re-proves the
+`DISABLED | RETIRED` cut before `200`; `RETIRED` emits its provenance first.
+Discard any partial file if body streaming fails. Initialize and load a fresh
+target root—never load the artifact back over the enrolled source.
+
 ## 3. Inspect: status, refresh, drift
 
 ```bash
