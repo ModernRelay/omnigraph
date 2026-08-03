@@ -32,10 +32,16 @@ use crate::db::manifest::stream::{
     DrainGoal, RetainedShardInventoryCommitment, StrictBlockEvidence, stream_graph_identity_digest,
 };
 use crate::db::manifest::stream_token::StreamTokenDisposition;
-#[cfg(feature = "failpoints")]
-use crate::db::manifest::token_store::lookup_stream_token_row;
 use crate::db::manifest::token_store::stream_token_lookup_index_coverage;
+#[cfg(feature = "failpoints")]
+use crate::db::manifest::token_store::{
+    lookup_profile_management_receipt, lookup_stream_token_row,
+};
 use crate::db::manifest::{RecoverySidecar, StreamLifecycle, StreamProfileMode, TableIdentity};
+#[cfg(feature = "failpoints")]
+use crate::db::manifest::{
+    stream_profile_cluster_root_digest, stream_profile_graph_identity_digest,
+};
 use crate::db::write_queue::StreamAdmissionKey;
 use crate::db::{Omnigraph, ReadTarget, Snapshot};
 use crate::error::{OmniError, Result};
@@ -1554,6 +1560,34 @@ impl Omnigraph {
             selected_version,
             selected.map(|row| row.current_token.to_string()),
         ))
+    }
+
+    /// Measure one exact profile-management receipt probe against the same
+    /// manifest-selected token cut used by the production retry path.
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    pub async fn failpoint_stream_profile_receipt_lookup_for_cost_test(
+        &self,
+        cluster_root: &str,
+        graph_id: &str,
+        operation_id: &str,
+    ) -> Result<(u64, Option<String>)> {
+        let snapshot = self.snapshot_of(ReadTarget::branch("main")).await?;
+        let authority = snapshot.stream_token_authority();
+        let selected_version = authority.current_head_witness.table_version;
+        let cluster_root_digest =
+            stream_profile_cluster_root_digest(cluster_root.trim_end_matches('/'))?;
+        let graph_identity_digest =
+            stream_profile_graph_identity_digest(&cluster_root_digest, graph_id, self.uri())?;
+        let dataset = snapshot.open_stream_token_authority().await?;
+        let selected = lookup_profile_management_receipt(
+            &dataset,
+            authority,
+            &graph_identity_digest,
+            operation_id,
+        )
+        .await?;
+        Ok((selected_version, selected.map(|receipt| receipt.record_id)))
     }
 
     /// Measure physical lookup-index coverage on the exact selected token cut.

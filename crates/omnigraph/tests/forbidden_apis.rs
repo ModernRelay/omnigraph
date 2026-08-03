@@ -281,6 +281,7 @@ write_surfaces! {
         "confirm_stream_authority_retirement",
     ],
     "db/omnigraph/stream_retirement.rs" => WriteProtocol::TestOnly => [
+        "failpoint_reconcile_stream_token_lookup_index_for_cost_test",
         "failpoint_withdraw_stream_token_for_retirement_test",
     ],
     "db/omnigraph/stream_correction.rs" => STREAM_CORRECTION_V20 => [
@@ -394,6 +395,10 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     (
         "db/omnigraph/stream_status.rs",
         "failpoint_stream_token_lookup_for_cost_test",
+    ),
+    (
+        "db/omnigraph/stream_status.rs",
+        "failpoint_stream_profile_receipt_lookup_for_cost_test",
     ),
     (
         "db/omnigraph/stream_status.rs",
@@ -929,6 +934,7 @@ durable_calls! {
     ("db/manifest/recovery.rs", "recover_schema_state_files(", 1, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/optimize.rs", "compact_files(", 2, WriteProtocol::Composed("Optimize v9 data + physical manifest compaction")),
     ("db/omnigraph/optimize.rs", ".optimize_indices(", 1, OPTIMIZE_V9),
+    ("db/manifest/token_store.rs", ".optimize_indices(", 1, WriteProtocol::TestOnly),
     ("db/omnigraph/optimize.rs", ".update_config(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/optimize.rs", "cleanup_old_versions(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/schema_apply.rs", "cleanup_old_versions(", 1, WriteProtocol::Composed("SchemaApply hard-drop GC")),
@@ -1232,6 +1238,45 @@ fn cfg_has_exact_feature(attributes: &[Attribute], expected: &str) -> bool {
                             )
                     )
         )
+    })
+}
+
+fn cfg_has_exact_test_or_feature(attributes: &[Attribute], expected: &str) -> bool {
+    let is_expected_feature = |meta: &Meta| {
+        matches!(
+            meta,
+            Meta::NameValue(feature)
+                if feature.path.is_ident("feature")
+                    && matches!(
+                        &feature.value,
+                        syn::Expr::Lit(expression)
+                            if matches!(
+                                &expression.lit,
+                                syn::Lit::Str(value) if value.value() == expected
+                            )
+                    )
+        )
+    };
+    attributes.iter().any(|attribute| {
+        let Meta::List(cfg) = &attribute.meta else {
+            return false;
+        };
+        if !cfg.path.is_ident("cfg") {
+            return false;
+        }
+        let predicates = nested_meta(cfg);
+        let [Meta::List(any)] = predicates.as_slice() else {
+            return false;
+        };
+        if !any.path.is_ident("any") {
+            return false;
+        }
+        let alternatives = nested_meta(any);
+        alternatives.len() == 2
+            && alternatives
+                .iter()
+                .any(|meta| matches!(meta, Meta::Path(path) if path.is_ident("test")))
+            && alternatives.iter().any(is_expected_feature)
     })
 }
 
@@ -2499,6 +2544,84 @@ fn stream_dead_letter_cost_seam_remains_hidden_and_failpoints_only() {
                 "{relative} reexport '{expected}' must stay out of generated SDK docs"
             );
         }
+    }
+}
+
+#[test]
+fn token_index_cost_seams_remain_hidden_and_failpoints_only() {
+    for (relative, expected) in [
+        (
+            "db/omnigraph/stream_retirement.rs",
+            "failpoint_reconcile_stream_token_lookup_index_for_cost_test",
+        ),
+        (
+            "db/omnigraph/stream_status.rs",
+            "failpoint_stream_profile_receipt_lookup_for_cost_test",
+        ),
+    ] {
+        let path = engine_src_root().join(relative);
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let ast = parse_rust_source(&contents, relative);
+        let functions = ast
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Impl(implementation) if is_omnigraph_type(&implementation.self_ty) => {
+                    implementation.items.iter().find_map(|item| match item {
+                        syn::ImplItem::Fn(function) if function.sig.ident == expected => {
+                            Some(function)
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            functions.len(),
+            1,
+            "{relative} must own exactly one F6b7 cost seam '{expected}'"
+        );
+        let function = functions[0];
+        assert!(matches!(function.vis, Visibility::Public(_)));
+        assert!(function.sig.asyncness.is_some());
+        assert!(
+            cfg_has_exact_feature(&function.attrs, "failpoints"),
+            "F6b7 seam '{expected}' must compile only with failpoints"
+        );
+        assert!(
+            has_doc_hidden(&function.attrs),
+            "F6b7 seam '{expected}' must stay out of generated SDK docs"
+        );
+    }
+
+    let relative = "db/manifest/token_store.rs";
+    let path = engine_src_root().join(relative);
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let ast = parse_rust_source(&contents, relative);
+    for expected in [
+        "StreamTokenLookupIndexCostProof",
+        "prepare_stream_token_lookup_index_reconciliation_for_cost_test",
+        "reconcile_stream_token_lookup_index_for_cost_test",
+        "prove_stream_token_lookup_index_reconciliation_for_cost_test",
+    ] {
+        let attributes = ast.items.iter().filter_map(|item| match item {
+            Item::Struct(item) if item.ident == expected => Some(&item.attrs),
+            Item::Fn(item) if item.sig.ident == expected => Some(&item.attrs),
+            _ => None,
+        });
+        let attributes = attributes.collect::<Vec<_>>();
+        assert_eq!(
+            attributes.len(),
+            1,
+            "{relative} must own exactly one F6b7 low-level cost item '{expected}'"
+        );
+        assert!(
+            cfg_has_exact_test_or_feature(attributes[0], "failpoints"),
+            "F6b7 low-level cost item '{expected}' must use exactly cfg(any(test, feature = \"failpoints\"))"
+        );
     }
 }
 

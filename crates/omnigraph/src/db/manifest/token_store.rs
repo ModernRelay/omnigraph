@@ -17,6 +17,8 @@ use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::refs::BranchIdentifier;
 use lance::dataset::scanner::DatasetRecordBatchStream;
+#[cfg(any(test, feature = "failpoints"))]
+use lance::dataset::transaction::Operation;
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
@@ -24,7 +26,11 @@ use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::mem_wal::ShardId;
+#[cfg(any(test, feature = "failpoints"))]
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
+#[cfg(any(test, feature = "failpoints"))]
+use lance_table::format::Fragment;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -933,6 +939,147 @@ pub(crate) async fn stream_token_lookup_index_coverage(
             OmniError::manifest_internal("stream-token uncovered fragment count exceeds u64")
         })?),
     ))
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+pub(crate) struct StreamTokenLookupIndexCostProof {
+    total_fragments: u64,
+    prior_fragments: Vec<Fragment>,
+    prior_schema: Schema,
+    prior_rows: usize,
+}
+
+/// Prove the exact selected pre-maintenance cut outside the F6b7 cost window.
+#[cfg(any(test, feature = "failpoints"))]
+pub(crate) async fn prepare_stream_token_lookup_index_reconciliation_for_cost_test(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+) -> Result<StreamTokenLookupIndexCostProof> {
+    validate_exact_dataset(&dataset, authority).await?;
+    let (total_fragments, uncovered_fragments) =
+        stream_token_lookup_index_coverage(&dataset, authority).await?;
+    let uncovered_fragments = uncovered_fragments.ok_or_else(|| {
+        OmniError::manifest_internal(
+            "F6b7 token-index evidence requires exact pre-maintenance coverage",
+        )
+    })?;
+    if uncovered_fragments == 0 {
+        return Err(OmniError::manifest_internal(
+            "F6b7 token-index evidence requires a non-empty uncovered tail",
+        ));
+    }
+    if dataset
+        .config()
+        .keys()
+        .any(|key| key.starts_with("lance.auto_cleanup."))
+    {
+        return Err(OmniError::manifest_internal(
+            "F6b7 token-index evidence refuses stored Lance auto-cleanup configuration",
+        ));
+    }
+
+    Ok(StreamTokenLookupIndexCostProof {
+        total_fragments,
+        prior_fragments: dataset.fragments().to_vec(),
+        prior_schema: Schema::from(dataset.schema()),
+        prior_rows: dataset
+            .count_rows(None)
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?,
+    })
+}
+
+/// Build one named-index successor and classify its exact Lance effect.
+///
+/// The caller measures this operation together with manifest selection. The
+/// content proof runs separately so evidence-only scans cannot distort the
+/// maintenance decision.
+#[cfg(any(test, feature = "failpoints"))]
+pub(crate) async fn reconcile_stream_token_lookup_index_for_cost_test(
+    mut dataset: Dataset,
+    authority: &StreamTokenAuthorityEntry,
+) -> Result<(Dataset, StreamTokenAuthorityEntry)> {
+    let mut options = OptimizeOptions::default();
+    options.index_names = Some(vec![STREAM_TOKEN_LOOKUP_INDEX_NAME.to_string()]);
+    dataset.optimize_indices(&options).await.map_err(|error| {
+        OmniError::Lance(format!(
+            "F6b7 test-only token lookup-index reconciliation: {error}"
+        ))
+    })?;
+
+    let next = stream_token_authority_entry_for_dataset(&dataset).await?;
+    let expected_next_version = authority
+        .current_head_witness
+        .table_version
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("stream-token version overflow"))?;
+    if next.current_head_witness.table_version != expected_next_version {
+        return Err(OmniError::manifest_internal(
+            "F6b7 token-index maintenance must advance authority by exactly one version",
+        ));
+    }
+    let transaction = dataset
+        .read_transaction()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?
+        .ok_or_else(|| {
+            OmniError::manifest_internal(
+                "F6b7 reconciled token HEAD is missing its Lance transaction",
+            )
+        })?;
+    let index_effect_is_exact = match &transaction.operation {
+        Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } => {
+            !new_indices.is_empty()
+                && new_indices
+                    .iter()
+                    .chain(removed_indices)
+                    .all(|index| index.name == STREAM_TOKEN_LOOKUP_INDEX_NAME)
+        }
+        _ => false,
+    };
+    if transaction.read_version != authority.current_head_witness.table_version
+        || transaction.uuid != next.current_head_witness.transaction_uuid
+        || !index_effect_is_exact
+    {
+        return Err(OmniError::manifest_internal(
+            "F6b7 token-index maintenance did not produce the exact selected-head CreateIndex effect",
+        ));
+    }
+
+    Ok((dataset, next))
+}
+
+/// Prove the reconciled cut is content-identical and fully covered outside the
+/// F6b7 cost window.
+#[cfg(any(test, feature = "failpoints"))]
+pub(crate) async fn prove_stream_token_lookup_index_reconciliation_for_cost_test(
+    dataset: &Dataset,
+    next: &StreamTokenAuthorityEntry,
+    proof: &StreamTokenLookupIndexCostProof,
+) -> Result<()> {
+    let next_rows = dataset
+        .count_rows(None)
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    if dataset.fragments().as_ref() != &proof.prior_fragments
+        || Schema::from(dataset.schema()) != proof.prior_schema
+        || next_rows != proof.prior_rows
+    {
+        return Err(OmniError::manifest_internal(
+            "F6b7 token-index maintenance changed logical token-table content",
+        ));
+    }
+    let (next_total_fragments, next_uncovered_fragments) =
+        stream_token_lookup_index_coverage(&dataset, &next).await?;
+    if next_total_fragments != proof.total_fragments || next_uncovered_fragments != Some(0) {
+        return Err(OmniError::manifest_internal(
+            "F6b7 token-index maintenance did not cover the exact selected fragment set",
+        ));
+    }
+    Ok(())
 }
 
 /// Look up one logical graph key from an already exact-pinned token dataset.
@@ -3115,6 +3262,49 @@ mod tests {
             lookup_stream_token_row(&achieved, &next, row.identity, &row.logical_id)
                 .await
                 .unwrap(),
+            Some(row.clone())
+        );
+        let prior_fragments = achieved.fragments().to_vec();
+        let prior_schema = Schema::from(achieved.schema());
+        let prior_rows = achieved.count_rows(None).await.unwrap();
+        let content_proof =
+            prepare_stream_token_lookup_index_reconciliation_for_cost_test(&achieved, &next)
+                .await
+                .unwrap();
+        let (reconciled, reconciled_authority) =
+            reconcile_stream_token_lookup_index_for_cost_test(achieved, &next)
+                .await
+                .unwrap();
+        prove_stream_token_lookup_index_reconciliation_for_cost_test(
+            &reconciled,
+            &reconciled_authority,
+            &content_proof,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reconciled_authority.current_head_witness.table_version,
+            next.current_head_witness.table_version + 1
+        );
+        assert_eq!(
+            stream_token_lookup_index_coverage(&reconciled, &reconciled_authority)
+                .await
+                .unwrap(),
+            (1, Some(0)),
+            "the evidence-only reconciled cut covers the exact selected fragments"
+        );
+        assert_eq!(reconciled.fragments().as_ref(), &prior_fragments);
+        assert_eq!(Schema::from(reconciled.schema()), prior_schema);
+        assert_eq!(reconciled.count_rows(None).await.unwrap(), prior_rows);
+        assert_eq!(
+            lookup_stream_token_row(
+                &reconciled,
+                &reconciled_authority,
+                row.identity,
+                &row.logical_id,
+            )
+            .await
+            .unwrap(),
             Some(row)
         );
     }
