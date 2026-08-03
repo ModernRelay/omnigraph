@@ -53,7 +53,7 @@ mod stream_status;
 mod table_ops;
 
 #[doc(hidden)]
-pub use export::StreamExportCut;
+pub use export::{EXPORT_CHUNK_MAX_BYTES, StreamExportCut};
 pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
 pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,

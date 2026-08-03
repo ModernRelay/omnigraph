@@ -805,7 +805,7 @@ async fn checked_export_jsonl(
     db: &Arc<Omnigraph>,
     branch: &str,
 ) -> std::result::Result<String, OmniError> {
-    db.capture_checked_stream_export_cut(branch, &[], &[])
+    db.capture_served_export_cut(branch, &[], &[])
         .await?
         .into_jsonl()
         .await
@@ -816,7 +816,7 @@ async fn checked_export_jsonl_to_bytes(
     branch: &str,
     output: &mut Vec<u8>,
 ) -> std::result::Result<(), OmniError> {
-    db.capture_checked_stream_export_cut(branch, &[], &[])
+    db.capture_served_export_cut(branch, &[], &[])
         .await?
         .write_to(output)
         .await
@@ -941,6 +941,15 @@ fn dead_letter_list_payload_retirement_and_export_form_one_operational_exit() {
             OmniError::StreamingRequiresClusterRuntime { ref mode } if mode == "DISABLED"
         ));
         assert!(ambient_output.is_empty());
+
+        let ambient_cut = match offline.capture_served_export_cut("main", &[], &[]).await {
+            Ok(_) => panic!("an unbound enrolled cut must refuse before output"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            ambient_cut,
+            OmniError::StreamingRequiresClusterRuntime { ref mode } if mode == "DISABLED"
+        ));
 
         let checked_export =
             bind_checked_served_export(reopen_enrolled(&dir).await, &cluster_uri).await;
@@ -1124,7 +1133,9 @@ async fn confirm_retirement_and_export_frozen_cut(
     db
         .export_jsonl_to_writer("main", &[], &[], &mut ambient_output)
         .await
-        .expect("the receipt-verified ambient RETIRED bridge must remain until F7 activates transport");
+        .expect(
+            "the receipt-verified ambient RETIRED compatibility bridge must remain alongside served export",
+        );
     let ambient_export = String::from_utf8(ambient_output).unwrap();
     let ambient_provenance: serde_json::Value =
         serde_json::from_str(ambient_export.lines().next().unwrap()).unwrap();
@@ -1561,7 +1572,7 @@ async fn checked_export_cut_is_immutable_single_slot_and_releases_writer_gates()
         bind_checked_unmanaged_terminal_export(reopen_enrolled(&dir).await, &cluster_uri).await;
 
     let unknown = match export_db
-        .capture_checked_stream_export_cut("main", &["Missing".to_string()], &[])
+        .capture_served_export_cut("main", &["Missing".to_string()], &[])
         .await
     {
         Ok(_) => panic!("an unknown export filter must fail during cut capture"),
@@ -1579,7 +1590,7 @@ async fn checked_export_cut_is_immutable_single_slot_and_releases_writer_gates()
     let capture_db = Arc::clone(&export_db);
     let capture = tokio::spawn(async move {
         capture_db
-            .capture_checked_stream_export_cut("frozen-export", &[], &[])
+            .capture_served_export_cut("frozen-export", &[], &[])
             .await
     });
     rendezvous.wait_until_reached().await;
@@ -1592,7 +1603,7 @@ async fn checked_export_cut_is_immutable_single_slot_and_releases_writer_gates()
         .expect("the terminal checked cut must capture");
 
     let second = match export_db
-        .capture_checked_stream_export_cut("main", &[], &[])
+        .capture_served_export_cut("main", &[], &[])
         .await
     {
         Ok(_) => panic!("a live immutable cut must own the sole root export slot"),
@@ -1736,7 +1747,7 @@ async fn checked_pristine_export_cut_retains_versions_until_consumed() {
     let cluster_uri = format!("file://{}", cluster.path().display());
     let export_db = bind_checked_served_export(db, &cluster_uri).await;
     let cut = export_db
-        .capture_checked_stream_export_cut("main", &[], &[])
+        .capture_served_export_cut("main", &[], &[])
         .await
         .expect("managed pristine DISABLED state may capture a checked cut");
 
@@ -1802,7 +1813,7 @@ async fn checked_export_preserves_post_start_storage_error_and_releases_slot() {
     with_query_io_probes(probes, async {
         let export_db = bind_checked_served_export(reopen_enrolled(&dir).await, &cluster_uri).await;
         let cut = export_db
-            .capture_checked_stream_export_cut("main", &[], &[])
+            .capture_served_export_cut("main", &[], &[])
             .await
             .expect("checked two-table export cut must capture before failure is armed");
         let mut writer = ArmBaseReadFailureAfterFirstLine::new(failure.clone());

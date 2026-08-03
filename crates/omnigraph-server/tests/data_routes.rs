@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
@@ -88,6 +89,91 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert_eq!(text, expected);
+}
+
+fn export_request(type_names: Vec<String>) -> Request<Body> {
+    Request::builder()
+        .uri(g("/export"))
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&ExportRequest {
+                branch: Some("main".to_string()),
+                type_names,
+                table_keys: Vec::new(),
+            })
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_invalid_filter_refuses_before_success_headers() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let response = app
+        .oneshot(export_request(vec!["Missing".to_string()]))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+    assert!(error.error.contains("unknown export type 'Missing'"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    // Keep the first response body completely unpolled. Its bounded channel
+    // may fill, but the queued terminal frame or in-flight producer must keep
+    // ownership of the sole immutable root cut.
+    let first = app
+        .clone()
+        .oneshot(export_request(Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .clone()
+        .oneshot(export_request(Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+    let error: ErrorOutput = serde_json::from_slice(&second_body).unwrap();
+    let limit = error.resource_limit.expect("typed root-cut ceiling");
+    assert_eq!(limit.resource, "stream_export_slots");
+    assert_eq!((limit.limit, limit.actual), (1, 2));
+
+    // Dropping the body is the HTTP disconnect analogue. The producer's
+    // cancellation path must release the cut and the body's byte reservation
+    // without waiting for another output write.
+    drop(first);
+    let response = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = app
+                .clone()
+                .oneshot(export_request(Vec::new()))
+                .await
+                .unwrap();
+            if response.status() == StatusCode::OK {
+                break response;
+            }
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            drop(response);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnect must promptly release served-export ownership");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(!body.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

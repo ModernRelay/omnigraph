@@ -295,6 +295,23 @@ read/query/status/export-only; export carries the selected root receipt plus a
 closed witness for the selected frozen branch member as provenance for a
 fresh-root rebuild. A fully `PRESENT` graph uses ordinary
 export. See the [upgrade guide](../operations/upgrade.md).
+
+After any enrolled graph reaches exact terminal `DISABLED`, direct
+`omnigraph export --store ...` deliberately refuses: an embedded opener cannot
+prove that it is the cluster-selected served owner. Restart the server from the
+same applied cluster directory with `streaming: false`, then export through that
+checked process:
+
+```bash
+omnigraph export --server <name-or-url> --graph <graph-id> > graph.jsonl
+```
+
+The same served route handles `RETIRED` and writes its verified provenance row
+first. It streams stdout; if the command reports a response-body error after
+writing some bytes, delete the partial file and retry from the beginning. Load
+only a completely successful artifact into a different, freshly initialized
+graph root.
+
 `refresh` requires an existing `state.json`; `import` creates one only when it
 is missing. Both observe declared graphs read-only at
 `<config-dir>/graphs/<graph-id>.omni`. External state backends, automatic

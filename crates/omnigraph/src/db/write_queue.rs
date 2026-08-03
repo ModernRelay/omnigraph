@@ -367,9 +367,9 @@ impl WriteQueueManager {
 
     /// Try to reserve the sole root-wide stream-aware export cut.
     ///
-    /// This is deliberately non-waiting in F6b1: exhaustion must refuse before
-    /// another cut is captured. F7 may place a bounded transport deadline in
-    /// front of this same reservation; it must not create a second slot owner.
+    /// This remains deliberately non-waiting: F6b5 places its bounded
+    /// transport-reservation deadline before this same slot and never creates
+    /// a second cut owner.
     pub(crate) fn try_acquire_stream_export_cut(
         self: &Arc<Self>,
     ) -> Option<StreamExportCutPermit> {

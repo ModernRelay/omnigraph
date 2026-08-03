@@ -774,9 +774,11 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         with_row_id: bool,
     ) -> Result<DatasetRecordBatchStream>;
 
-    /// Streaming sibling with explicit per-batch row and decoded-byte limits.
-    /// This is the read-side primitive for operations that retain batches under
-    /// a fixed resource budget instead of inheriting Lance's process defaults.
+    /// Streaming sibling with an explicit initial row estimate and approximate
+    /// decoded-byte target. Lance's byte target overrides the row setting;
+    /// neither setting is a hard limit, and Lance may emit a larger batch.
+    /// Callers with a retained
+    /// resource budget must charge the actual emitted batch before keeping it.
     async fn scan_stream_bounded(
         &self,
         snapshot: &SnapshotHandle,

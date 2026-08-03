@@ -107,6 +107,22 @@ columns including vectors and blobs) of the chosen branch (default `main`; pass
 `--branch` for another) to stdout. `omnigraph load --mode overwrite` replaces the
 target graph's contents with that snapshot.
 
+The direct command above is for an unenrolled source. Once a graph has stream
+enrollment history, direct `--store` export refuses even when the profile is
+`DISABLED`, because an embedded opener cannot prove cluster serving ownership.
+With the source binary, apply `streaming: false`, stop old writers, restart the
+server from that exact cluster directory, and use the checked route instead:
+
+```bash
+old-omnigraph export --server <name-or-url> --graph <graph-id> > graph.jsonl
+```
+
+The served binary requires the exact terminal `DISABLED | RETIRED` cut;
+`RETIRED` emits its verified provenance row first. Export is streamed. If the
+client reports a response-body error after writing partial output, discard that
+file and retry from the beginning. Only a completely successful artifact may
+be loaded into a different, freshly initialized root.
+
 Once you have verified the rebuilt graph, retire the old one. If you rebuilt
 through a storage-format boundary, the target must be a different URI: keep the
 source root intact until row/vector/blob verification and fleet cutover are
@@ -124,8 +140,11 @@ complete. Do not use force-init to turn the old root into the new format.
   URI and the documented rebuild uses `--mode overwrite`, so verify that the new
   fleet can still read the referenced object before cutover. Later keyed
   `append`/`merge` writes copy external payloads instead, as described below.
-- **Server deployments**: take the graph out of the serving set, rebuild it offline
-  with the CLI, then point the cluster at the rebuilt graph (`cluster apply`).
+- **Server deployments**: unenrolled graphs may be taken out of the serving set
+  and exported directly. An enrolled graph must remain declared at exact
+  terminal `streaming: false`, be restarted under the old binary, and be
+  exported through `--server`. Rebuild a fresh root, verify it, then point the
+  cluster at that target (`cluster apply`).
 
 ## Migrating from internal schema v18 to v19
 
@@ -196,6 +215,12 @@ exact `PRESENT | WITHDRAWN | DEAD_LETTERED` counts and the selected token cut.
 Once `RETIRED`, the source remains read/query/status/export-only and its export
 carries the verified retirement provenance. The rebuild does not import WAL,
 token, receipt, or dead-letter authority.
+
+Restart the v19 server from the exact applied cluster directory and run the
+export through `--server`; do not use direct `--store` for an enrolled
+`DISABLED` source. Treat any post-header/body failure as an incomplete artifact,
+discard it, and retry. Initialize a new root before loading the successful
+artifact; never overwrite the retired source.
 
 ## Migrating from internal schema v17 to v18
 

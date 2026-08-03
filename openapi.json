@@ -776,6 +776,46 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "Branch not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Export authority conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Export cut or transport capacity exhausted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Recovery required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [

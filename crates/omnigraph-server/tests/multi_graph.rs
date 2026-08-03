@@ -7,7 +7,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_server::api::{ChangeRequest, ErrorOutput, ReadRequest};
+use omnigraph_server::api::{ChangeRequest, ErrorOutput, ExportRequest, ReadRequest};
 use omnigraph_server::{AppState, build_app};
 use serde_json::Value;
 use serial_test::serial;
@@ -463,6 +463,7 @@ async fn cluster_boot_serves_applied_state() {
 }
 
 #[tokio::test]
+#[serial]
 async fn cluster_boot_installs_enabled_stream_runtime_authority() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(
@@ -523,6 +524,31 @@ graphs:
     .await
     .unwrap();
     let app = build_app(state);
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/graphs/knowledge/export")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&ExportRequest {
+                    branch: Some("main".to_string()),
+                    type_names: Vec::new(),
+                    table_keys: Vec::new(),
+                })
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("streaming profile is ENABLED")),
+        "{body}"
+    );
+
     let request = ChangeRequest {
         query: "query insert_person($name: String) { insert Person { name: $name } }".to_string(),
         name: Some("insert_person".to_string()),
@@ -543,6 +569,7 @@ graphs:
 }
 
 #[tokio::test]
+#[serial]
 async fn cluster_boot_installs_disabled_stream_served_export_authority() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(
@@ -596,7 +623,7 @@ graphs:
         Some("DISABLED")
     );
 
-    omnigraph_server::open_multi_graph_state(
+    let state = omnigraph_server::open_multi_graph_state(
         graphs,
         Vec::new(),
         server_policy.as_ref(),
@@ -605,6 +632,112 @@ graphs:
     )
     .await
     .expect("server startup consumes terminal binding into checked authority");
+    let response = build_app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/graphs/knowledge/export")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&ExportRequest {
+                        branch: Some("main".to_string()),
+                        type_names: Vec::new(),
+                        table_keys: Vec::new(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("checked DISABLED export body must finish");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn served_export_process_queue_budget_refuses_then_releases() {
+    let temp = tempfile::tempdir().unwrap();
+    let schema = "\nnode Person {\n  name: String @key\n}\n";
+    let mut graphs = Vec::new();
+    for index in 0..9 {
+        let graph_id = format!("g{index}");
+        let uri = temp.path().join(format!("{graph_id}.omni"));
+        Omnigraph::init(uri.to_string_lossy().as_ref(), schema)
+            .await
+            .unwrap();
+        graphs.push(omnigraph_server::GraphStartupConfig {
+            graph_id,
+            uri: uri.to_string_lossy().to_string(),
+            policy: None,
+            stream_runtime_authority: None,
+            stream_served_export_authority: None,
+            embedding: None,
+            queries: stored_query_registry(&[]),
+        });
+    }
+    let state = omnigraph_server::open_multi_graph_state(
+        graphs,
+        Vec::new(),
+        None,
+        temp.path().join("cluster.yaml"),
+        false,
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+    let request = |graph_id: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/graphs/{graph_id}/export"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&ExportRequest {
+                    branch: Some("main".to_string()),
+                    type_names: Vec::new(),
+                    table_keys: Vec::new(),
+                })
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+
+    let mut held = Vec::new();
+    for index in 0..8 {
+        let response = app
+            .clone()
+            .oneshot(request(&format!("g{index}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
+
+    let refused = app.clone().oneshot(request("g8")).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+    let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+    let limit = error.resource_limit.expect("typed process queue ceiling");
+    assert_eq!(limit.resource, "stream_export_transport_bytes");
+    assert_eq!((limit.limit, limit.actual), (2_097_152, 2_359_296));
+
+    drop(held);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let response = app.clone().oneshot(request("g8")).await.unwrap();
+            if response.status() == StatusCode::OK {
+                break response;
+            }
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            drop(response);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnecting every held body must release the process queue budget");
+    to_bytes(response.into_body(), usize::MAX).await.unwrap();
 }
 
 #[tokio::test]

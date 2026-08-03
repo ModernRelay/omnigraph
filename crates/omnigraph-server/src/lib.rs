@@ -1,4 +1,5 @@
 pub mod api;
+mod export_transport;
 mod handlers;
 mod settings;
 use handlers::*;
@@ -20,8 +21,6 @@ use crate::queries::{QueryRegistry, check, format_check_breakages};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -45,7 +44,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
-use futures::stream;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
 use omnigraph::storage::normalize_root_uri;
@@ -62,7 +60,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -278,6 +275,9 @@ pub struct AppState {
     /// `AppState` construction (including router tests) never creates a
     /// background task.
     stream_fold_drivers: StreamFoldDrivers,
+    /// Bounded process-wide ownership for queued served-export bytes. The
+    /// response body and detached producer jointly retain each reservation.
+    export_transport: export_transport::ExportTransport,
 }
 
 #[derive(Clone)]
@@ -357,23 +357,6 @@ impl StreamFoldDrivers {
 struct OpenedGraph {
     handle: Arc<GraphHandle>,
     stream_fold_driver: Option<StreamFoldDriverTarget>,
-}
-
-struct ExportStreamWriter {
-    sender: mpsc::UnboundedSender<std::result::Result<Bytes, io::Error>>,
-}
-
-impl Write for ExportStreamWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.sender
-            .send(Ok(Bytes::copy_from_slice(buf)))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "export stream closed"))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
@@ -637,6 +620,7 @@ impl AppState {
             bearer_tokens,
             server_policy: None,
             stream_fold_drivers: StreamFoldDrivers::default(),
+            export_transport: export_transport::ExportTransport::with_defaults(),
         }
     }
 
@@ -664,6 +648,7 @@ impl AppState {
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
             stream_fold_drivers: StreamFoldDrivers::default(),
+            export_transport: export_transport::ExportTransport::with_defaults(),
         })
     }
 
@@ -1205,6 +1190,13 @@ mod api_error_tests {
                     block_token: "sha256:block-token".to_string(),
                 },
                 "stream fold is strict-blocked; correction requires block token sha256:block-token",
+            ),
+            (
+                OmniError::StreamExportBlocked {
+                    withdrawn_token_count: 2,
+                    dead_lettered_token_count: 3,
+                },
+                "stream export is blocked by 2 current WITHDRAWN and 3 current DEAD_LETTERED token(s); retire authority for rebuild or install PRESENT successors",
             ),
         ];
 
