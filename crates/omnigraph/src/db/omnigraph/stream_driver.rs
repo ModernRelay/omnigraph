@@ -290,8 +290,9 @@ impl StreamFoldDriverRegistry {
     /// Re-read the finite round after the exclusive producer fence closes.
     /// A producer that began before the fence may have installed the one
     /// resident writer while its ordinary timer is not due yet. Include that
-    /// exact pending identity so the round frees the slot before attempting a
-    /// previously ready cold lane; unrelated failures retain their backoff.
+    /// exact pending identity; the empty-owner housekeeping prepass releases
+    /// the sole root slot before the ordinary node-before-edge round.
+    /// Unrelated failures retain their backoff.
     fn fenced_round(
         &self,
         now: Instant,
@@ -495,9 +496,6 @@ impl StreamFoldDriverRegistry {
             .shared
             .lock()
             .expect("stream fold driver state poisoned");
-        let (mut nodes, mut edges): (Vec<_>, Vec<_>) = candidates
-            .into_iter()
-            .partition(|candidate| candidate.kind == StreamLaneKind::Node);
         fn rotate_after(candidates: &mut Vec<DriverCandidate>, cursor: Option<TableIdentity>) {
             candidates.sort_by_key(|candidate| candidate.identity);
             let Some(cursor) = cursor else {
@@ -509,10 +507,26 @@ impl StreamFoldDriverRegistry {
                 .unwrap_or(0);
             candidates.rotate_left(start);
         }
+        let (mut nodes, mut edges): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|candidate| candidate.kind == StreamLaneKind::Node);
         rotate_after(&mut nodes, shared.last_node);
         rotate_after(&mut edges, shared.last_edge);
         nodes.extend(edges);
         nodes
+    }
+
+    fn split_empty_owner_cleanup(
+        candidates: Vec<DriverCandidate>,
+        idle_resident: &BTreeSet<TableIdentity>,
+    ) -> (Vec<DriverCandidate>, Vec<DriverCandidate>) {
+        let (mut cleanup, remaining): (Vec<_>, Vec<_>) =
+            candidates.into_iter().partition(|candidate| {
+                candidate.action == DriverCandidateAction::FoldOpen
+                    && idle_resident.contains(&candidate.identity)
+            });
+        cleanup.sort_by_key(|candidate| candidate.identity);
+        (cleanup, remaining)
     }
 
     fn mark_attempted(&self, kind: StreamLaneKind, identity: TableIdentity) {
@@ -735,10 +749,17 @@ async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegist
         // while we wait; the fresh selection below includes that resident
         // identity even when its ordinary timer is not due yet. Later puts
         // remain queued until every captured node and edge has had one attempt.
+        maybe_fail(names::STREAM_DRIVER_BEFORE_ROUND_ACQUIRE)?;
         let _round_admission = db.stream_workers.acquire_stream_fold_round().await;
         let resident = db
             .stream_workers
             .served_runtime_resident_identities()
+            .await
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let idle_resident = db
+            .stream_workers
+            .driver_idle_resident_identities()
             .await
             .into_iter()
             .collect::<BTreeSet<_>>();
@@ -747,8 +768,12 @@ async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegist
             drop(db);
             continue;
         }
-        let candidates = match db.stream_driver_candidates(&due).await {
-            Ok(candidates) => driver.order_round(candidates),
+        let (empty_cleanup, candidates) = match db.stream_driver_candidates(&due).await {
+            Ok(candidates) => {
+                let (empty_cleanup, candidates) =
+                    StreamFoldDriverRegistry::split_empty_owner_cleanup(candidates, &idle_resident);
+                (empty_cleanup, driver.order_round(candidates))
+            }
             Err(error) => {
                 let stopping = driver.stop.load(Ordering::Acquire);
                 for (identity, observed_sequence) in &due {
@@ -761,8 +786,9 @@ async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegist
                 continue;
             }
         };
-        let active = candidates
+        let active = empty_cleanup
             .iter()
+            .chain(candidates.iter())
             .map(|candidate| candidate.identity)
             .collect::<std::collections::BTreeSet<_>>();
         for (identity, sequence) in &due {
@@ -777,7 +803,7 @@ async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegist
 
         if let Err(error) = db.heal_pending_recovery_sidecars_for_write(&[None]).await {
             let stopping = driver.stop.load(Ordering::Acquire);
-            for candidate in candidates {
+            for candidate in empty_cleanup.iter().chain(candidates.iter()) {
                 driver.failed(candidate.identity, candidate.observed_sequence, &error);
             }
             if stopping {
@@ -787,10 +813,55 @@ async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegist
             continue;
         }
 
-        // The ordered candidate vector is the complete finite round. This
-        // failpoints-only rendezvous proves that a trigger arriving after this
-        // cut cannot enter ahead of an edge already selected below.
+        // Empty-owner housekeeping plus the ordered candidate vector are the
+        // complete finite round. This failpoints-only rendezvous proves that a
+        // trigger arriving after this cut cannot enter ahead of an edge already
+        // selected below.
         maybe_fail(names::STREAM_DRIVER_POST_ROUND_FREEZE)?;
+
+        // Resume publishes OPEN with an intentionally empty writer. Retire
+        // only owners observed empty under the root producer fence before the
+        // semantic candidate order, so a cold lane can claim the sole slot
+        // without allowing a productive edge to overtake a runnable node.
+        let mut cleanup_failed = false;
+        for candidate in empty_cleanup {
+            match db
+                .stream_retire_empty_from_resident_driver(candidate.identity, &candidate.table_key)
+                .await
+            {
+                Ok(ResidentFoldOutcome::Idle) => driver.complete(
+                    candidate.identity,
+                    candidate.observed_sequence,
+                    StreamFoldCompletionOutcome::Idle,
+                ),
+                Ok(ResidentFoldOutcome::Inactive) => driver.complete(
+                    candidate.identity,
+                    candidate.observed_sequence,
+                    StreamFoldCompletionOutcome::Inactive,
+                ),
+                Ok(ResidentFoldOutcome::Published) => {
+                    let error = OmniError::manifest_internal(
+                        "empty stream owner housekeeping unexpectedly published a fold",
+                    );
+                    driver.failed(candidate.identity, candidate.observed_sequence, &error);
+                    if driver.stop.load(Ordering::Acquire) {
+                        return Err(error);
+                    }
+                    cleanup_failed = true;
+                }
+                Err(error) => {
+                    driver.failed(candidate.identity, candidate.observed_sequence, &error);
+                    if driver.stop.load(Ordering::Acquire) {
+                        return Err(error);
+                    }
+                    cleanup_failed = true;
+                }
+            }
+        }
+        if cleanup_failed {
+            drop(db);
+            continue;
+        }
 
         // `candidates` is one finite manifest-derived round. New triggers do
         // not enter it, so continuously active node lanes cannot starve an edge
@@ -1149,6 +1220,36 @@ mod tests {
         assert_eq!(
             second.iter().map(|item| item.identity).collect::<Vec<_>>(),
             vec![identity(2), identity(1), identity(4), identity(3)]
+        );
+    }
+
+    #[test]
+    fn empty_owner_cleanup_does_not_reorder_productive_candidates() {
+        let driver = driver();
+        let idle_resident = BTreeSet::from([identity(4)]);
+        let (cleanup, candidates) = StreamFoldDriverRegistry::split_empty_owner_cleanup(
+            vec![
+                candidate(1, StreamLaneKind::Node),
+                candidate(4, StreamLaneKind::Edge),
+                candidate(2, StreamLaneKind::Node),
+            ],
+            &idle_resident,
+        );
+        let ordered = driver.order_round(candidates);
+
+        assert_eq!(
+            cleanup
+                .iter()
+                .map(|candidate| candidate.identity)
+                .collect::<Vec<_>>(),
+            vec![identity(4)]
+        );
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|candidate| candidate.identity)
+                .collect::<Vec<_>>(),
+            vec![identity(1), identity(2)]
         );
     }
 

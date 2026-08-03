@@ -3064,6 +3064,19 @@ async fn wait_for_visible_rows(db: &Omnigraph, expected: &[(String, i32)]) {
     .expect("resident stream fold driver did not publish the expected rows");
 }
 
+async fn wait_for_visible_score_rows(db: &Omnigraph, table_key: &str, expected: &[(String, i32)]) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if visible_score_rows(db, table_key).await == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("resident stream fold driver did not publish the expected table rows");
+}
+
 fn stream_fold_driver_status(db: &Omnigraph) -> serde_json::Value {
     serde_json::from_str(&db.failpoint_stream_fold_driver_status_for_test())
         .expect("stream fold driver status must be valid JSON")
@@ -3077,6 +3090,23 @@ fn assert_process_local_driver_state(status: &serde_json::Value, expected_state:
         status["pending_triggers"].is_array(),
         "process-local pending triggers remain advisory diagnostics: {status}"
     );
+}
+
+async fn wait_for_stream_fold_driver_idle(db: &Omnigraph) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let status = stream_fold_driver_status(db);
+            if status["pending_triggers"]
+                .as_array()
+                .is_some_and(|entries| entries.is_empty())
+            {
+                return status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("resident stream fold driver did not clear its finite-round work")
 }
 
 async fn wait_for_published_open_fold(db: &Omnigraph, minimum_count: u64) -> serde_json::Value {
@@ -3182,6 +3212,33 @@ async fn init_f6b2_node_edge_fixture() -> (EnrolledGraphDir, Arc<Omnigraph>) {
     (dir, db)
 }
 
+async fn init_f6b8_resume_driver_fixture() -> (EnrolledGraphDir, Arc<Omnigraph>, StreamTableStatus)
+{
+    init_f6b8_resume_driver_fixture_for(TABLE, "f6b80000-0000-4000-8000-000000000001").await
+}
+
+async fn init_f6b8_resume_driver_fixture_for(
+    table_key: &str,
+    quiesce_id: &str,
+) -> (EnrolledGraphDir, Arc<Omnigraph>, StreamTableStatus) {
+    let (dir, db) = init_f6b2_node_edge_fixture().await;
+    let cluster_uri = dir.cluster_uri();
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let open = stream_lane_for(&db, table_key).await;
+    db.failpoint_stream_quiesce_for_test(
+        table_key,
+        quiesce_id,
+        open.lifecycle_revision,
+        "operator:f6b8-fixture",
+    )
+    .await
+    .expect("the selected empty lane must seal before the resume/driver race");
+    let sealed = stream_lane_for(&db, table_key).await;
+    assert_eq!(sealed.lifecycle, "SEALED");
+    assert_no_recovery_sidecars(&dir);
+    (dir, db, sealed)
+}
+
 fn spawn_f6b2_process(mode: &str, graph: &Path, cluster_uri: &str, ready_path: &Path) -> Child {
     Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
@@ -3258,9 +3315,17 @@ fn wait_for_process_exit(child: &mut Child, mode: &str) -> ExitStatus {
 }
 
 async fn wait_for_stream_lifecycle(db: &Omnigraph, expected: &str) -> StreamTableStatus {
+    wait_for_stream_lifecycle_for(db, TABLE, expected).await
+}
+
+async fn wait_for_stream_lifecycle_for(
+    db: &Omnigraph,
+    table_key: &str,
+    expected: &str,
+) -> StreamTableStatus {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let lane = stream_lane(db).await;
+            let lane = stream_lane_for(db, table_key).await;
             if lane.lifecycle == expected {
                 return lane;
             }
@@ -6138,6 +6203,246 @@ async fn sealed_resume_advances_epoch_replays_its_receipt_and_installs_the_write
         .await
         .expect("the selected resume receipt remains idempotent after a later fold");
     assert_eq!(stream_lane(&db).await, after_fold);
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn frozen_driver_round_fences_resume_then_releases_its_empty_root_slot() {
+    let _scenario = FailScenario::setup();
+    let (dir, db, sealed) = init_f6b8_resume_driver_fixture().await;
+    let rounds = TwoRoundRendezvous::new();
+    db.start_stream_fold_driver()
+        .await
+        .expect("the checked runtime starts its finite-round driver");
+    rounds.wait_for(0).await;
+
+    let install = helpers::failpoint::Rendezvous::park_first(names::STREAM_RESUME_INSTALL_OWNER);
+    let resume_db = Arc::clone(&db);
+    let mut resume = tokio::spawn(async move {
+        resume_db
+            .failpoint_stream_resume_for_test(
+                TABLE,
+                "f6b80000-0000-4000-8000-000000000002",
+                sealed.lifecycle_revision,
+                false,
+                "operator:f6b8-driver-first",
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut resume)
+            .await
+            .is_err()
+            && !install.reached(),
+        "the frozen finite round must fence resume before detached installation"
+    );
+
+    rounds.release(0);
+    install.wait_until_reached().await;
+    install.release();
+    tokio::time::timeout(Duration::from_secs(20), &mut resume)
+        .await
+        .expect("resume stayed fenced after the prior finite round")
+        .expect("resume task must join")
+        .expect("resume must install its empty writer");
+    let open = stream_lane_for(&db, TABLE).await;
+    assert_eq!(open.lifecycle, "OPEN");
+
+    rounds.wait_for(1).await;
+    rounds.release(1);
+    let idle = wait_for_stream_fold_driver_idle(&db).await;
+    assert_eq!(idle["last_error"], serde_json::Value::Null);
+
+    let company =
+        physical_score_batch(&db, COMPANY_TABLE, &[("after-resume-slot".to_string(), 8)]).await;
+    db.failpoint_stream_b1_for_test(COMPANY_TABLE, Some(company), 8)
+        .await
+        .expect("the resumed empty writer must release the sole root slot");
+    wait_for_visible_score_rows(&db, COMPANY_TABLE, &[("after-resume-slot".to_string(), 8)]).await;
+    wait_for_published_open_fold(&db, 1).await;
+
+    let body = ndjson_score_line(
+        &open.stream_incarnation_id,
+        "caller-shaped-after-resume",
+        9,
+        "f6b80000-0000-4000-8000-000000000003",
+        None,
+    );
+    let outcomes = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_ndjson_as_for_test(TABLE, vec![body], "agent:f6b8-driver-first")
+            .await
+            .expect("caller-shaped ingress must cold-claim after empty retirement"),
+    );
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["status"], "durable");
+    wait_for_visible_rows(
+        &db,
+        &[
+            ("Alice".to_string(), 1),
+            ("caller-shaped-after-resume".to_string(), 9),
+        ],
+    )
+    .await;
+    let completed = wait_for_published_open_fold(&db, 2).await;
+    assert_eq!(completed["last_error"], serde_json::Value::Null);
+
+    db.shutdown_stream_fold_driver()
+        .await
+        .expect("the resumed runtime must join cleanly");
+    let stopped = stream_fold_driver_status(&db);
+    assert_process_local_driver_state(&stopped, "stopped");
+    assert!(stopped["pending_triggers"].as_array().unwrap().is_empty());
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn resume_empty_housekeeping_precedes_lower_sorted_cold_lane_in_same_round() {
+    let _scenario = FailScenario::setup();
+    let (dir, db, sealed) = init_f6b8_resume_driver_fixture().await;
+    let company = stream_lane_for(&db, COMPANY_TABLE).await;
+    assert!(
+        (company.stable_table_id, company.table_incarnation_id)
+            < (sealed.stable_table_id, sealed.table_incarnation_id),
+        "the cold Company lane must sort before the resumed Person lane"
+    );
+
+    let cold =
+        physical_score_batch(&db, COMPANY_TABLE, &[("cold-before-resume".to_string(), 7)]).await;
+    db.failpoint_stream_b1_for_test(COMPANY_TABLE, Some(cold), 0)
+        .await
+        .expect("the lower-sorted lane must own one durable unmerged tail");
+    db.shutdown_stream_fold_driver()
+        .await
+        .expect("runtime shutdown must leave the durable tail cold");
+    assert!(visible_score_rows(&db, COMPANY_TABLE).await.is_empty());
+
+    let install = helpers::failpoint::Rendezvous::park_first(names::STREAM_RESUME_INSTALL_OWNER);
+    let resume_db = Arc::clone(&db);
+    let sealed_revision = sealed.lifecycle_revision;
+    let mut resume = tokio::spawn(async move {
+        resume_db
+            .failpoint_stream_resume_for_test(
+                TABLE,
+                "f6b80000-0000-4000-8000-000000000006",
+                sealed_revision,
+                false,
+                "operator:f6b8-same-round",
+            )
+            .await
+    });
+    install.wait_until_reached().await;
+
+    let rounds = TwoRoundRendezvous::new();
+    db.start_stream_fold_driver()
+        .await
+        .expect("cold discovery must queue the lower-sorted Company lane");
+    install.release();
+    tokio::time::timeout(Duration::from_secs(20), &mut resume)
+        .await
+        .expect("resume installation did not settle")
+        .expect("resume task must join")
+        .expect("Person resume must publish OPEN");
+
+    rounds.wait_for(0).await;
+    rounds.release(0);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if visible_score_rows(&db, COMPANY_TABLE).await
+                == vec![("cold-before-resume".to_string(), 7)]
+            {
+                return;
+            }
+            if rounds.reached[1].load(Ordering::SeqCst) {
+                rounds.release(1);
+                panic!("the lower-sorted cold lane required a retry round");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first finite round did not publish the cold tail");
+    rounds.release(1);
+
+    let idle = wait_for_stream_fold_driver_idle(&db).await;
+    assert!(idle["published_open_folds"].as_u64().unwrap() >= 1);
+    assert_eq!(idle["last_error"], serde_json::Value::Null);
+    db.shutdown_stream_fold_driver()
+        .await
+        .expect("the same-round handoff fixture must shut down cleanly");
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn cancelled_resume_transfers_its_root_fence_until_driver_handoff_and_shutdown() {
+    let _scenario = FailScenario::setup();
+    let (dir, db, sealed) = init_f6b8_resume_driver_fixture().await;
+    let sealed_revision = sealed.lifecycle_revision;
+    let install = helpers::failpoint::Rendezvous::park_first(names::STREAM_RESUME_INSTALL_OWNER);
+    let resume_db = Arc::clone(&db);
+    let resume = tokio::spawn(async move {
+        resume_db
+            .failpoint_stream_resume_for_test(
+                TABLE,
+                "f6b80000-0000-4000-8000-000000000004",
+                sealed_revision,
+                false,
+                "operator:f6b8-cancelled",
+            )
+            .await
+    });
+    install.wait_until_reached().await;
+    resume.abort();
+    assert!(
+        resume
+            .await
+            .expect_err("the caller task must be cancelled")
+            .is_cancelled(),
+        "cancelling the caller must detach rather than cancel resume ownership"
+    );
+
+    let before_round =
+        helpers::failpoint::Rendezvous::park_first(names::STREAM_DRIVER_BEFORE_ROUND_ACQUIRE);
+    let rounds = TwoRoundRendezvous::new();
+    db.start_stream_fold_driver()
+        .await
+        .expect("the checked runtime starts with cold eligible lanes");
+    before_round.wait_until_reached().await;
+    before_round.release();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rounds.wait_for(0))
+            .await
+            .is_err(),
+        "the detached resume installer must retain the root fence"
+    );
+
+    let shutdown_db = Arc::clone(&db);
+    let mut shutdown = tokio::spawn(async move { shutdown_db.shutdown_stream_fold_driver().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown must wait for the detached resume installation"
+    );
+
+    install.release();
+    let open = wait_for_stream_lifecycle_for(&db, TABLE, "OPEN").await;
+    assert_eq!(open.lifecycle_revision, sealed_revision + 1);
+    rounds.wait_for(0).await;
+    rounds.release(0);
+    tokio::time::timeout(Duration::from_secs(30), &mut shutdown)
+        .await
+        .expect("shutdown did not join the resumed writer and driver")
+        .expect("shutdown task must join")
+        .expect("shutdown must settle every detached owner");
+
+    let stopped = stream_fold_driver_status(&db);
+    assert_process_local_driver_state(&stopped, "stopped");
+    assert!(stopped["pending_triggers"].as_array().unwrap().is_empty());
+    assert_eq!(stopped["last_error"], serde_json::Value::Null);
+    assert_eq!(visible_rows(&db).await, vec![("Alice".to_string(), 1)]);
     assert_no_recovery_sidecars(&dir);
 }
 
