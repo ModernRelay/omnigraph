@@ -49,6 +49,10 @@ mod stream_profile;
 mod stream_rebind;
 mod stream_request;
 mod stream_retirement;
+// F6b6 is production-compiled but remains engine-internal until F7 attaches
+// the reviewed SDK/HTTP/CLI transport; suppress only that staged module's
+// reachability warnings in the interim.
+#[allow(dead_code)]
 mod stream_status;
 mod table_ops;
 
@@ -84,6 +88,17 @@ pub(crate) use stream_retirement::{
 pub use stream_retirement::{
     StreamAuthorityRetirementPlan, StreamAuthorityRetirementResult, StreamDeadLetterEntry,
     StreamDeadLetterPage, StreamDeadLetterPayloadEntry, StreamDeadLetterPayloadPage,
+};
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+pub use stream_status::{
+    StreamDrainOperationalStatus, StreamDriverAdvisoryStatus, StreamDriverEventStatus,
+    StreamDriverPendingStatus, StreamLastFoldOperationalStatus, StreamOldestUncoveredAgeStatus,
+    StreamOperationalStatus, StreamPendingGenerationStatus, StreamRebuildBlockReason,
+    StreamRebuildReadiness, StreamReceiptHeadsStatus, StreamRecoveryOperationalStatus,
+    StreamShardOperationalStatus, StreamStrictBlockOperationalStatus, StreamTableOperationalStatus,
+    StreamTablePhysicalOperationalStatus, StreamTerminalTokenOperationalStatus,
+    StreamTokenIndexCoverageStatus, StreamTokenLedgerOperationalStatus,
 };
 pub use stream_status::{StreamStatus, StreamTableStatus};
 pub use table_ops::PendingIndex;
@@ -4387,7 +4402,7 @@ mod tests {
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
 
-    use crate::storage::{ObjectStorageAdapter, StorageAdapter, join_uri};
+    use crate::storage::{ListDirBounds, ObjectStorageAdapter, StorageAdapter, join_uri};
 
     const TEST_SCHEMA: &str = r#"
 node Person {
@@ -4567,6 +4582,17 @@ edge WorksAt: Person -> Company
             self.inner.list_dir(dir_uri).await
         }
 
+        async fn list_dir_bounded(
+            &self,
+            dir_uri: &str,
+            matching_suffix: &str,
+            bounds: ListDirBounds,
+        ) -> Result<Vec<String>> {
+            self.inner
+                .list_dir_bounded(dir_uri, matching_suffix, bounds)
+                .await
+        }
+
         async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
             self.inner.read_text_versioned(uri).await
         }
@@ -4638,6 +4664,17 @@ edge WorksAt: Person -> Company
 
         async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
             self.inner.list_dir(dir_uri).await
+        }
+
+        async fn list_dir_bounded(
+            &self,
+            dir_uri: &str,
+            matching_suffix: &str,
+            bounds: ListDirBounds,
+        ) -> Result<Vec<String>> {
+            self.inner
+                .list_dir_bounded(dir_uri, matching_suffix, bounds)
+                .await
         }
 
         async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {

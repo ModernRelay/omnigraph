@@ -50,16 +50,16 @@ struct PendingFold {
 
 /// Process-local supervisor state is operational evidence only. It must never
 /// be used as lifecycle, recovery, or MemWAL authority.
-#[cfg(any(test, feature = "failpoints"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum StreamFoldDriverSnapshotScope {
+#[allow(dead_code)] // Production-compiled F6b6 status is attached by F7.
+pub(super) enum StreamFoldDriverSnapshotScope {
     ProcessLocalAdvisory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum StreamFoldDriverRunState {
+pub(super) enum StreamFoldDriverRunState {
     Stopped,
     Running,
     Stopping,
@@ -68,7 +68,7 @@ enum StreamFoldDriverRunState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum StreamFoldCompletionOutcome {
+pub(super) enum StreamFoldCompletionOutcome {
     PublishedOpenFold,
     Idle,
     Inactive,
@@ -78,7 +78,7 @@ enum StreamFoldCompletionOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum StreamFoldDriverErrorKind {
+pub(super) enum StreamFoldDriverErrorKind {
     RetryScheduled,
     StaleAttemptFailed,
     DataBlocked,
@@ -86,43 +86,43 @@ enum StreamFoldDriverErrorKind {
     UnexpectedStop,
 }
 
-#[cfg(any(test, feature = "failpoints"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct StreamFoldPendingTriggerSnapshot {
-    table_identity: TableIdentity,
-    trigger_sequence: u64,
-    consecutive_failures: u32,
-    due_in_ms: u64,
+#[allow(dead_code)] // Production-compiled F6b6 status is attached by F7.
+pub(super) struct StreamFoldPendingTriggerSnapshot {
+    pub(super) table_identity: TableIdentity,
+    pub(super) trigger_sequence: u64,
+    pub(super) consecutive_failures: u32,
+    pub(super) due_in_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct StreamFoldCompletionEvent {
-    event_sequence: u64,
-    table_identity: TableIdentity,
-    trigger_sequence: u64,
-    outcome: StreamFoldCompletionOutcome,
+pub(super) struct StreamFoldCompletionEvent {
+    pub(super) event_sequence: u64,
+    pub(super) table_identity: TableIdentity,
+    pub(super) trigger_sequence: u64,
+    pub(super) outcome: StreamFoldCompletionOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct StreamFoldDriverErrorEvent {
-    event_sequence: u64,
-    kind: StreamFoldDriverErrorKind,
-    table_identity: Option<TableIdentity>,
-    trigger_sequence: Option<u64>,
-    retry_in_ms: Option<u64>,
-    message: String,
+pub(super) struct StreamFoldDriverErrorEvent {
+    pub(super) event_sequence: u64,
+    pub(super) kind: StreamFoldDriverErrorKind,
+    pub(super) table_identity: Option<TableIdentity>,
+    pub(super) trigger_sequence: Option<u64>,
+    pub(super) retry_in_ms: Option<u64>,
+    pub(super) message: String,
 }
 
-#[cfg(any(test, feature = "failpoints"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct StreamFoldDriverSnapshot {
-    scope: StreamFoldDriverSnapshotScope,
-    authoritative: bool,
-    state: StreamFoldDriverRunState,
-    pending_triggers: Vec<StreamFoldPendingTriggerSnapshot>,
-    published_open_folds: u64,
-    last_completion: Option<StreamFoldCompletionEvent>,
-    last_error: Option<StreamFoldDriverErrorEvent>,
+#[allow(dead_code)] // Production-compiled F6b6 status is attached by F7.
+pub(super) struct StreamFoldDriverSnapshot {
+    pub(super) scope: StreamFoldDriverSnapshotScope,
+    pub(super) authoritative: bool,
+    pub(super) state: StreamFoldDriverRunState,
+    pub(super) pending_triggers: Vec<StreamFoldPendingTriggerSnapshot>,
+    pub(super) published_open_folds: u64,
+    pub(super) last_completion: Option<StreamFoldCompletionEvent>,
+    pub(super) last_error: Option<StreamFoldDriverErrorEvent>,
 }
 
 #[derive(Debug)]
@@ -630,8 +630,7 @@ impl StreamFoldDriverRegistry {
 
     /// Capture process-local advisory state without consulting the task lock,
     /// manifest, MemWAL, or any other authority-bearing source.
-    #[cfg(any(test, feature = "failpoints"))]
-    fn snapshot(&self) -> StreamFoldDriverSnapshot {
+    pub(super) fn snapshot(&self) -> StreamFoldDriverSnapshot {
         let now = Instant::now();
         let shared = self
             .shared

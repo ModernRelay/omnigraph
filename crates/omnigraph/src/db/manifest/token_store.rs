@@ -877,7 +877,6 @@ pub(crate) async fn scan_current_stream_token_batches(
 /// does not publish a fragment bitmap; callers must not reinterpret that as
 /// complete coverage. Multiple physical segments are treated as one logical
 /// index by taking the union of their reported fragment bitmaps.
-#[cfg(any(test, feature = "failpoints"))]
 pub(crate) async fn stream_token_lookup_index_coverage(
     dataset: &Dataset,
     authority: &StreamTokenAuthorityEntry,

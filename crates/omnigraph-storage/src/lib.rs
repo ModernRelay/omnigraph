@@ -16,6 +16,24 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
+/// Resource envelope for one suffix-filtered directory listing.
+///
+/// The bounds apply while the backend listing stream is consumed, before the
+/// adapter can accumulate an unbounded `Vec`. `max_irrelevant_entries` counts
+/// both direct children that do not match the requested suffix and recursive
+/// descendants, which keeps unrelated prefix residue from turning a small
+/// filtered inventory into an unbounded scan. `max_uri_bytes` counts the
+/// input-anchored URI bytes for every encountered object, matching or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListDirBounds {
+    /// Maximum direct children that may match the requested suffix.
+    pub max_matching_entries: usize,
+    /// Maximum other objects encountered beneath the directory prefix.
+    pub max_irrelevant_entries: usize,
+    /// Maximum cumulative input-anchored URI bytes across all encountered objects.
+    pub max_uri_bytes: u64,
+}
+
 /// Backend-neutral failure from the shared control-object storage boundary.
 ///
 /// `Internal` preserves the engine's historical manifest-internal message
@@ -28,6 +46,13 @@ pub enum StorageError {
     Internal(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("storage resource '{resource}' for '{uri}' exceeds limit {limit} (actual {actual})")]
+    ResourceLimit {
+        resource: String,
+        limit: u64,
+        actual: u64,
+        uri: String,
+    },
 }
 
 impl StorageError {
@@ -81,6 +106,21 @@ pub trait StorageAdapter: Debug + Send + Sync {
     /// of any future producer may not be) — filter by suffix, never assume
     /// every entry is yours.
     async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>>;
+    /// Stream a non-recursive directory inventory and retain only direct files
+    /// whose names end with `matching_suffix`.
+    ///
+    /// The first entry beyond any [`ListDirBounds`] member fails with typed
+    /// [`StorageError::ResourceLimit`]; the method never returns a truncated
+    /// success. Backends may retain one implementation-defined listing page,
+    /// but this adapter does not collect the complete prefix before enforcing
+    /// the bounds. Results use the same input-anchored URI shape and unordered
+    /// contract as [`StorageAdapter::list_dir`]. A missing directory is empty.
+    async fn list_dir_bounded(
+        &self,
+        dir_uri: &str,
+        matching_suffix: &str,
+        bounds: ListDirBounds,
+    ) -> Result<Vec<String>>;
     /// Read a text object together with its backend version token (stores
     /// with conditional-update support: the object's ETag; local: sha256 of
     /// the content). The token is opaque — valid only for
@@ -344,9 +384,12 @@ impl StorageAdapter for ObjectStorageAdapter {
             ))
         })?;
         if actual > max_bytes {
-            return Err(StorageError::internal(format!(
-                "bounded storage read for '{uri}' exceeds {max_bytes} bytes"
-            )));
+            return Err(StorageError::ResourceLimit {
+                resource: "storage_text_bytes".to_string(),
+                limit: max_bytes,
+                actual,
+                uri: uri.to_string(),
+            });
         }
         let text = String::from_utf8(bytes.to_vec()).map_err(|err| {
             StorageError::internal(format!("storage read failed for '{uri}': {err}"))
@@ -459,6 +502,131 @@ impl StorageAdapter for ObjectStorageAdapter {
         for meta in listing.objects {
             if let Some(name) = meta.location.filename() {
                 out.push(format!("{}/{}", anchor, name));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_dir_bounded(
+        &self,
+        dir_uri: &str,
+        matching_suffix: &str,
+        bounds: ListDirBounds,
+    ) -> Result<Vec<String>> {
+        // `list_with_delimiter` collects every result page before returning.
+        // The recursive `list` stream lets us stop at the first over-limit
+        // entry instead. Descendants are classified as irrelevant so nested
+        // residue cannot evade the scan bounds; only direct suffix matches
+        // reach the returned inventory.
+        let anchor = dir_uri.trim_end_matches('/');
+        let prefix = self.object_path(anchor)?;
+        let mut listing = self.store.list(Some(&prefix));
+        let mut matching_entries = 0_u64;
+        let mut irrelevant_entries = 0_u64;
+        let mut uri_bytes = 0_u64;
+        let max_matching_entries = u64::try_from(bounds.max_matching_entries).unwrap_or(u64::MAX);
+        let max_irrelevant_entries =
+            u64::try_from(bounds.max_irrelevant_entries).unwrap_or(u64::MAX);
+        let limit_error = |resource: &str, limit: u64, actual: u64| StorageError::ResourceLimit {
+            resource: resource.to_string(),
+            limit,
+            actual,
+            uri: dir_uri.to_string(),
+        };
+        let anchor_bytes = u64::try_from(anchor.len())
+            .map_err(|_| limit_error("storage_list_uri_bytes", bounds.max_uri_bytes, u64::MAX))?;
+        let prefix_bytes = u64::try_from(prefix.as_ref().len())
+            .map_err(|_| limit_error("storage_list_uri_bytes", bounds.max_uri_bytes, u64::MAX))?;
+        let mut out = Vec::with_capacity(bounds.max_matching_entries.min(1024));
+
+        while let Some(meta) = listing
+            .try_next()
+            .await
+            .map_err(|err| storage_backend_error("bounded_list_dir", dir_uri, err))?
+        {
+            let mut parts = meta.location.prefix_match(&prefix).ok_or_else(|| {
+                StorageError::internal(format!(
+                    "bounded directory list for '{dir_uri}' returned out-of-prefix object '{}'",
+                    meta.location
+                ))
+            })?;
+            let Some(first_part) = parts.next() else {
+                // ObjectStore::list excludes the exact prefix itself. Stay
+                // defensive if a custom backend violates that contract
+                // without charging or returning a phantom child.
+                continue;
+            };
+            let is_direct_child = parts.next().is_none();
+            let location_bytes = u64::try_from(meta.location.as_ref().len()).map_err(|_| {
+                limit_error("storage_list_uri_bytes", bounds.max_uri_bytes, u64::MAX)
+            })?;
+            let relative_bytes = location_bytes
+                .checked_sub(prefix_bytes)
+                .and_then(|bytes| {
+                    if prefix_bytes == 0 {
+                        Some(bytes)
+                    } else {
+                        bytes.checked_sub(1)
+                    }
+                })
+                .ok_or_else(|| {
+                    StorageError::internal(format!(
+                        "bounded directory list for '{dir_uri}' returned malformed child '{}'",
+                        meta.location
+                    ))
+                })?;
+
+            let entry_uri_bytes = anchor_bytes
+                .checked_add(1)
+                .and_then(|bytes| bytes.checked_add(relative_bytes))
+                .ok_or_else(|| {
+                    limit_error("storage_list_uri_bytes", bounds.max_uri_bytes, u64::MAX)
+                })?;
+            uri_bytes = uri_bytes.checked_add(entry_uri_bytes).ok_or_else(|| {
+                limit_error("storage_list_uri_bytes", bounds.max_uri_bytes, u64::MAX)
+            })?;
+            if uri_bytes > bounds.max_uri_bytes {
+                return Err(limit_error(
+                    "storage_list_uri_bytes",
+                    bounds.max_uri_bytes,
+                    uri_bytes,
+                ));
+            }
+
+            let direct_matching_name = is_direct_child
+                .then_some(first_part.as_ref())
+                .filter(|name| name.ends_with(matching_suffix));
+            if let Some(name) = direct_matching_name {
+                matching_entries = matching_entries.checked_add(1).ok_or_else(|| {
+                    limit_error(
+                        "storage_list_matching_entries",
+                        max_matching_entries,
+                        u64::MAX,
+                    )
+                })?;
+                if matching_entries > max_matching_entries {
+                    return Err(limit_error(
+                        "storage_list_matching_entries",
+                        max_matching_entries,
+                        matching_entries,
+                    ));
+                }
+                out.push(format!("{anchor}/{name}"));
+            } else {
+                irrelevant_entries = irrelevant_entries.checked_add(1).ok_or_else(|| {
+                    limit_error(
+                        "storage_list_irrelevant_entries",
+                        max_irrelevant_entries,
+                        u64::MAX,
+                    )
+                })?;
+                if irrelevant_entries > max_irrelevant_entries {
+                    return Err(limit_error(
+                        "storage_list_irrelevant_entries",
+                        max_irrelevant_entries,
+                        irrelevant_entries,
+                    ));
+                }
             }
         }
         Ok(out)
@@ -832,7 +1000,15 @@ mod tests {
             .read_text_if_exists_bounded(&a, 1)
             .await
             .expect_err("the bounded reader must refuse before reading the full body");
-        assert!(bounded.to_string().contains("exceeds 1 bytes"), "{bounded}");
+        assert!(matches!(
+            bounded,
+            StorageError::ResourceLimit {
+                ref resource,
+                limit: 1,
+                actual: 2,
+                ref uri,
+            } if resource == "storage_text_bytes" && uri == &a
+        ));
         assert_eq!(
             adapter
                 .read_text_if_exists_bounded(&format!("{root}/contract/missing-bounded.json"), 2,)
@@ -968,6 +1144,263 @@ mod tests {
         // strong-CAS path (ETag tokens + PutMode::Update) without a bucket.
         let adapter = ObjectStorageAdapter::in_memory();
         contract_suite(&adapter, "mem-root").await;
+    }
+
+    #[tokio::test]
+    async fn bounded_list_returns_only_direct_suffix_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ObjectStorageAdapter::local();
+        let dir_uri = format!("{}/bounded-filter", dir.path().display());
+        let matching = format!("{dir_uri}/one.json");
+        let irrelevant = format!("{dir_uri}/residue.tmp");
+        adapter.write_text(&matching, "1").await.unwrap();
+        adapter.write_text(&irrelevant, "r").await.unwrap();
+        adapter
+            .write_text(&format!("{dir_uri}/nested/two.json"), "2")
+            .await
+            .unwrap();
+
+        let listed = adapter
+            .list_dir_bounded(
+                &dir_uri,
+                ".json",
+                ListDirBounds {
+                    max_matching_entries: 1,
+                    max_irrelevant_entries: 2,
+                    max_uri_bytes: u64::MAX,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed, vec![matching.clone()]);
+
+        // The existing unbounded API keeps its direct-child, unfiltered
+        // contract; introducing the bounded path must not change it.
+        let mut unbounded = adapter.list_dir(&dir_uri).await.unwrap();
+        unbounded.sort();
+        assert_eq!(unbounded, vec![matching, irrelevant]);
+        assert!(
+            adapter
+                .list_dir_bounded(
+                    &format!("{}/bounded-filter-missing", dir.path().display()),
+                    ".json",
+                    ListDirBounds {
+                        max_matching_entries: 0,
+                        max_irrelevant_entries: 0,
+                        max_uri_bytes: 0,
+                    },
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_list_refuses_the_first_excess_matching_entry() {
+        let adapter = ObjectStorageAdapter::in_memory();
+        let dir_uri = "bounded-matches";
+        for index in 0..257 {
+            let name = format!("{index:03}.json");
+            adapter
+                .write_text(&format!("{dir_uri}/{name}"), &name)
+                .await
+                .unwrap();
+        }
+
+        let error = adapter
+            .list_dir_bounded(
+                dir_uri,
+                ".json",
+                ListDirBounds {
+                    max_matching_entries: 256,
+                    max_irrelevant_entries: 0,
+                    max_uri_bytes: u64::MAX,
+                },
+            )
+            .await
+            .expect_err("the 257th match must refuse instead of returning a truncated list");
+        assert!(matches!(
+            error,
+            StorageError::ResourceLimit {
+                ref resource,
+                limit: 256,
+                actual: 257,
+                ref uri,
+            } if resource == "storage_list_matching_entries" && uri == dir_uri
+        ));
+        assert_eq!(adapter.list_dir(dir_uri).await.unwrap().len(), 257);
+    }
+
+    #[tokio::test]
+    async fn bounded_list_counts_direct_and_nested_residue_as_irrelevant() {
+        let adapter = ObjectStorageAdapter::in_memory();
+        let dir_uri = "bounded-residue";
+        adapter
+            .write_text(&format!("{dir_uri}/keep.json"), "k")
+            .await
+            .unwrap();
+        adapter
+            .write_text(&format!("{dir_uri}/direct.tmp"), "d")
+            .await
+            .unwrap();
+        adapter
+            .write_text(&format!("{dir_uri}/nested/residue.json"), "n")
+            .await
+            .unwrap();
+
+        let error = adapter
+            .list_dir_bounded(
+                dir_uri,
+                ".json",
+                ListDirBounds {
+                    max_matching_entries: 1,
+                    max_irrelevant_entries: 1,
+                    max_uri_bytes: u64::MAX,
+                },
+            )
+            .await
+            .expect_err("nested objects must not evade the irrelevant-entry bound");
+        assert!(matches!(
+            error,
+            StorageError::ResourceLimit {
+                ref resource,
+                limit: 1,
+                actual: 2,
+                ref uri,
+            } if resource == "storage_list_irrelevant_entries" && uri == dir_uri
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_list_caps_cumulative_input_anchored_uri_bytes() {
+        let adapter = ObjectStorageAdapter::in_memory();
+        let dir_uri = "bounded-uri-bytes";
+        let first = format!("{dir_uri}/one.json");
+        let second = format!("{dir_uri}/two.json");
+        adapter.write_text(&first, "1").await.unwrap();
+        adapter.write_text(&second, "2").await.unwrap();
+        let exact_bytes = u64::try_from(first.len() + second.len()).unwrap();
+        let bounds = |max_uri_bytes| ListDirBounds {
+            max_matching_entries: 2,
+            max_irrelevant_entries: 0,
+            max_uri_bytes,
+        };
+
+        let mut listed = adapter
+            .list_dir_bounded(dir_uri, ".json", bounds(exact_bytes))
+            .await
+            .unwrap();
+        listed.sort();
+        assert_eq!(listed, vec![first, second]);
+
+        let error = adapter
+            .list_dir_bounded(dir_uri, ".json", bounds(exact_bytes - 1))
+            .await
+            .expect_err("the aggregate URI bytes must include every encountered object");
+        assert!(matches!(
+            error,
+            StorageError::ResourceLimit {
+                ref resource,
+                limit,
+                actual,
+                ref uri,
+            } if resource == "storage_list_uri_bytes"
+                && limit == exact_bytes - 1
+                && actual == exact_bytes
+                && uri == dir_uri
+        ));
+    }
+
+    async fn assert_bounded_list_prefix_and_uri_contract(
+        adapter: &ObjectStorageAdapter,
+        dir_uri: &str,
+        sibling_dir_uri: &str,
+    ) {
+        let matching = format!("{dir_uri}/one.json");
+        let direct_residue = format!("{dir_uri}/direct.tmp");
+        let nested_residue = format!("{dir_uri}/nested/two.json");
+        let sibling = format!("{sibling_dir_uri}/must-not-bleed.json");
+        adapter.write_text(&matching, "1").await.unwrap();
+        adapter.write_text(&direct_residue, "d").await.unwrap();
+        adapter.write_text(&nested_residue, "n").await.unwrap();
+        adapter.write_text(&sibling, "s").await.unwrap();
+
+        // Every object genuinely below the requested directory is charged in
+        // its input-anchored URI form. The similarly named sibling is outside
+        // the path-delimited prefix and must neither be returned nor consume
+        // either bound.
+        let exact_uri_bytes =
+            u64::try_from(matching.len() + direct_residue.len() + nested_residue.len()).unwrap();
+        let bounds = |max_uri_bytes| ListDirBounds {
+            max_matching_entries: 1,
+            max_irrelevant_entries: 2,
+            max_uri_bytes,
+        };
+        let listed = adapter
+            .list_dir_bounded(dir_uri, ".json", bounds(exact_uri_bytes))
+            .await
+            .unwrap();
+        assert_eq!(listed, vec![matching.clone()]);
+        assert_eq!(adapter.read_text(&listed[0]).await.unwrap(), "1");
+
+        let error = adapter
+            .list_dir_bounded(dir_uri, ".json", bounds(exact_uri_bytes - 1))
+            .await
+            .expect_err("the exact input-anchored URI-byte boundary must be enforced");
+        assert!(matches!(
+            error,
+            StorageError::ResourceLimit {
+                ref resource,
+                limit,
+                actual,
+                ref uri,
+            } if resource == "storage_list_uri_bytes"
+                && limit == exact_uri_bytes - 1
+                && actual == exact_uri_bytes
+                && uri == dir_uri
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_list_is_path_delimited_and_uri_exact_for_local_file_and_s3_shapes() {
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain_adapter = ObjectStorageAdapter::local();
+        let plain_root = plain_dir.path().join("plain");
+        assert_bounded_list_prefix_and_uri_contract(
+            &plain_adapter,
+            &format!("{}/__recovery", plain_root.display()),
+            &format!("{}/__recovery_log", plain_root.display()),
+        )
+        .await;
+
+        let file_dir = tempfile::tempdir().unwrap();
+        let file_adapter = ObjectStorageAdapter::local();
+        let file_root = file_dir.path().join("file scheme with space");
+        assert_bounded_list_prefix_and_uri_contract(
+            &file_adapter,
+            &format!("file://{}/__recovery", file_root.display()),
+            &format!("file://{}/__recovery_log", file_root.display()),
+        )
+        .await;
+
+        // Exercise the S3 URI codec without credentials/network. InMemory has
+        // the same component-aware ObjectStore::list contract; the production
+        // S3 implementation additionally sends the wire prefix with a trailing
+        // slash before streaming pages.
+        let s3_adapter = ObjectStorageAdapter {
+            store: Arc::new(InMemory::new()),
+            codec: UriCodec::S3 {
+                bucket: "bounded-list-bucket".to_string(),
+            },
+            supports_conditional_update: true,
+        };
+        assert_bounded_list_prefix_and_uri_contract(
+            &s3_adapter,
+            "s3://bounded-list-bucket/graph/__recovery",
+            "s3://bounded-list-bucket/graph/__recovery_log",
+        )
+        .await;
     }
 
     #[tokio::test]

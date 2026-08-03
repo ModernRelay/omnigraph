@@ -94,9 +94,9 @@ pub(crate) use recovery::{
     confirm_stream_sealed_optimize_sidecar_v17, delete_sidecar, ensure_read_only_schema_coherent,
     finalize_effect_free_occ_sidecar, finalize_effect_free_stream_fold_sidecar_v12,
     finalize_effect_free_stream_fold_sidecar_v14, heal_pending_sidecars_roll_forward,
-    list_sidecars, lookup_stream_claim_continuation_v14, mint_recovery_operation_id,
-    new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
-    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9,
+    list_sidecars, list_sidecars_bounded, lookup_stream_claim_continuation_v14,
+    mint_recovery_operation_id, new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9,
+    new_occ_sidecar_v9, new_optimize_sidecar_v9, new_schema_apply_sidecar_v9,
     new_stream_authority_retirement_sidecar_v19, new_stream_authority_retirement_sidecar_v21,
     new_stream_claim_sidecar_v14, new_stream_correction_sidecar_v20,
     new_stream_dead_letter_fold_sidecar_v21, new_stream_drain_fold_sidecar_v14,
@@ -107,7 +107,8 @@ pub(crate) use recovery::{
     prepared_stream_claim_attempt_v14, prepared_stream_resume_attempt_v15,
     rearm_stream_claim_checkpoint_sidecar_v14, rearm_stream_resume_checkpoint_sidecar_v15,
     receipt_first_rearm_stream_claim_sidecar_v14, recover_manifest_drift,
-    schema_apply_serial_queue_key, write_sidecar,
+    recovery_sidecar_exactly_owns_canonical_main_base_head, schema_apply_serial_queue_key,
+    write_sidecar,
 };
 pub use state::SubTableEntry;
 #[cfg(test)]

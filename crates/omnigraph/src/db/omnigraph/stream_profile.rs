@@ -59,6 +59,33 @@ pub struct CheckedClusterApplyAuthority<'lock> {
     guard: ValidatedOfflineGuard<'lock>,
 }
 
+impl CheckedClusterApplyAuthority<'_> {
+    /// Validate the durable continuation which owns an interrupted disable.
+    /// A later checked apply may finish an older continuation, so the stable
+    /// authority is the retained cluster lock/root plus the plan itself—not
+    /// the newer request's operation or declaration identifiers.
+    pub(super) fn validate_disabling_status_profile(
+        &self,
+        profile: &StreamProfileEntry,
+    ) -> Result<()> {
+        let StreamProfileState::Disabling { disable_plan } = &profile.state else {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: format!(
+                    "offline disabling-status authority requires DISABLING, graph is {}",
+                    profile.mode().as_str()
+                ),
+            });
+        };
+        let cluster_root_digest = stream_profile_cluster_root_digest(self.guard.cluster_root())?;
+        if disable_plan.fold_continuation.cluster_root_digest != cluster_root_digest {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: "durable disable continuation belongs to another cluster root".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Engine-checked stopped-writer authority for stream-aware offline
 /// maintenance on one exact `DISABLED` profile revision.
 ///
@@ -197,6 +224,13 @@ pub struct CheckedClusterStreamRuntimeAuthority {
     guard: ValidatedRuntimeGuard,
 }
 
+impl CheckedClusterStreamRuntimeAuthority {
+    #[allow(dead_code)] // Production-compiled F6b6 status is attached by F7.
+    pub(super) fn validate_profile(&self, profile: &StreamProfileEntry) -> Result<()> {
+        validate_runtime_profile_binding(profile, &self.guard)
+    }
+}
+
 /// Engine-checked authority for one cluster-served, stream-aware export owner.
 ///
 /// The lower guard keeps the process-local serving registration alive for the
@@ -226,6 +260,50 @@ impl CheckedClusterServedExportAuthority {
             });
         }
         Ok(())
+    }
+}
+
+impl Omnigraph {
+    /// Full physical status is available only to the owner already responsible
+    /// for this profile state: the served writer, the served terminal-export
+    /// slot, or the checked offline cluster-apply continuation for DISABLING.
+    /// Ambient handles retain the manifest-only `stream_status` projection.
+    #[allow(dead_code)] // Production-compiled F6b6 status is attached by F7.
+    pub(super) fn validate_stream_operational_status_authority(
+        &self,
+        profile: &StreamProfileEntry,
+        offline_apply: Option<&CheckedClusterApplyAuthority<'_>>,
+    ) -> Result<()> {
+        match profile.mode() {
+            StreamProfileMode::Enabled => self
+                .stream_runtime_authority
+                .as_ref()
+                .ok_or_else(|| OmniError::StreamingRequiresClusterRuntime {
+                    mode: profile.mode().as_str().to_string(),
+                })?
+                .validate_profile(profile),
+            StreamProfileMode::Disabled | StreamProfileMode::Retired => self
+                .stream_served_export_authority
+                .as_ref()
+                .ok_or_else(|| OmniError::StreamingRequiresClusterRuntime {
+                    mode: profile.mode().as_str().to_string(),
+                })?
+                .validate_profile(profile),
+            StreamProfileMode::Disabling => {
+                let authority =
+                    offline_apply.ok_or_else(|| OmniError::StreamingRequiresClusterRuntime {
+                        mode: profile.mode().as_str().to_string(),
+                    })?;
+                if authority.guard.graph_store_uri() != self.uri() {
+                    return Err(OmniError::StreamingAuthorityMismatch {
+                        reason:
+                            "offline disabling-status authority was retargeted to another graph"
+                                .to_string(),
+                    });
+                }
+                authority.validate_disabling_status_profile(profile)
+            }
+        }
     }
 }
 

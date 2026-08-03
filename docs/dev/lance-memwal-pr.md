@@ -136,9 +136,9 @@ selected-branch-member export exit; v18/recovery-v20 adds exact DataBlock
 correction; and v19/token-schema-v3/recovery-v21 adds terminal dead-letter
 folds, selected-token inspection/export, and three-disposition retirement.
 Checked offline disable is the supported quiescence owner. Public enrollment,
-general resume/abort, exclusive-cut physical status, physical rebind,
-SDK/HTTP/OpenAPI row streaming, and every other streaming product surface
-remain inactive.
+general resume/abort, physical rebind, SDK/HTTP/OpenAPI row streaming, public
+operational-status transport, and every other streaming product surface remain
+inactive. F6b6's checked read-only operational cut is implemented internally.
 
 ## The missing Lance capabilities
 
