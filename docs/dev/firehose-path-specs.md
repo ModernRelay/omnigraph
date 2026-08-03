@@ -50,8 +50,15 @@ projection rather than a movement error. Cold-replay and flushed-LWW pending acc
 exact oldest-uncovered-token age remain explicit unavailable values; the public
 `stream_status` stays nonblocking and manifest-only, and CLI/HTTP/OpenAPI/SDK
 transport remains F7. Covered/reconciled evidence, the scheduling threshold,
-and the rest of the guardrail matrix remain later; F7
-remains forbidden until all of F6 passes.
+and the rest of the guardrail matrix remain later. F6b8 closes the resume-to-
+driver handoff without changing format or recovery: resume transfers its root
+producer permit into detached writer installation, arms an urgent driver turn
+before that transfer can release, and performs an exact empty-owner
+housekeeping prepass before the unchanged node-before-edge round so the sole
+root slot is released promptly. Driver-first, resume-first/caller-cancelled,
+cross-lane reuse, and clean-shutdown cells are green. The broader post-claim
+install/retirement-failure matrix remains in F6; F7 remains forbidden until
+all of F6 passes.
 **Design authority:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) — this
 file never overrides it. Where they disagree, the RFC wins and this file is
 wrong. §4.7 records the selected experimental profile; §4.3/§4.6 record the
@@ -308,6 +315,7 @@ byte/capacity/timing and isolated peak-RSS acceptance described below.
 | ~~F6b4 dead-letter envelope evidence~~ | Exact production 8,192-candidate one-under/exact/one-over encoding, cap-aware retained capacity, encode/verify timing, paired isolated peak RSS, and real overflow/no-partial-fold assertions | no format or recovery change | implemented behind failpoints-only cost/test seams; 192-MiB remeasurement tripwire, not admission or an SLO |
 | ~~F6b5 bounded served export~~ | Pre-header stream-aware cut capture; incremental Lance scans with approximate targets, strict 64-KiB chunks, two-chunk queue, complete per-response/process queue-envelope reservation, deadline, backpressure, and disconnect-safe cut ownership on the existing HTTP/remote CLI/OpenAPI export surface | no format or recovery change | implemented; embedded/direct enrolled export remains refused |
 | ~~F6b6 checked operational status~~ | One checked read-only multi-authority cut with physical lane/token/recovery/rebuild evidence, advisory driver projection, and typed `StreamStatusChanged` / `StreamStatusBusy` refusal | no format or recovery change | implemented behind an engine-internal seam; public manifest status unchanged |
+| ~~F6b8 resume/driver handoff~~ | Compile-enforced root-producer-permit transfer into detached resume installation, urgent trigger-before-release, exact empty-owner housekeeping before the unchanged node-before-edge round, cancellation-safe shutdown, and cross-lane root-slot reuse | no format or recovery change | implemented behind existing hidden lifecycle/driver seams; broader retirement-failure matrix remains in F6 |
 | **F6b remainder** | Covered/reconciled token curve and threshold plus the remaining guardrail matrix | — | later |
 | **F7** | Remaining served row ingress, lifecycle, maintenance, operational-status transport, and their SDK/HTTP/remote-CLI/OpenAPI parity | — | only after all F6 cells pass; export is already the F6b5 exception |
 
@@ -1037,11 +1045,14 @@ remain future work.
    floor**. The current hidden resume seam first acquires the graph-profile
    gate shared, binds the exact `ENABLED` profile and delegation, and retains
    that guard through claim, terminal-ledger confirmation, and manifest
-   publication. Unlike served row admission, an already-installed empty resume
-   writer does not yet join the root MemWAL opportunity fence; F6b2 therefore
-   claims no hard sub-60-second fairness handoff for that case. A broader
-   resume/driver handoff remains later work. F7's production wrapper must also
-   require matching checked serving-runtime authority before invoking it.
+   publication. F6b8 also transfers the root MemWAL producer permit into the
+   detached install owner and arms an urgent driver trigger before transfer.
+   Under the exclusive root fence, the finite round snapshots exact empty
+   owners and retires them under lane-exclusive authority in a housekeeping
+   prepass before the unchanged node-before-edge candidate order, so a resume
+   owner cannot occupy the sole root slot until the ordinary idle timeout. F7's production
+   wrapper must still require matching checked serving-runtime authority before
+   invoking it.
 2. **Two-phase epoch claim.** The achieved epoch is unknowable before the
    claim, so: claim under closed admission → durably record the exact
    sentinel/epoch plus one terminal `ClaimReceipt` + `ManagementReceipt`
@@ -2062,9 +2073,15 @@ table admission. The driver retains root opportunity exclusively across its
 frozen finite round, then takes profile/admission per candidate. Both permit
 kinds retain the worker-registry `Arc`, preventing weak-root fence ABA.
 Shutdown fences root opportunity exclusive and then profile exclusive, drops
-both, and only then joins the driver. This does not impose a hard sub-60-second
-fairness bound on an already-installed empty writer created by resume; that
-broader resume/driver handoff remains later.
+both, and only then joins the driver. F6b8 closes the previously excluded
+resume case: the non-clone root producer permit transfers into detached writer
+installation and every retained-retirement path, and an urgent trigger is
+armed before release. The driver snapshots and retires only exact empty owners
+under lane-exclusive authority before running its unchanged node-before-edge
+candidate order. Tests pin driver-first and resume-first/caller-cancelled
+races, prompt cross-lane slot reuse, and shutdown waiting for detached
+ownership. The broader post-claim
+install/retirement-failure matrix remains a later F6 acceptance owner.
 
 Productive SchemaApply is deliberately absent: an
 enrolled graph's schema changes only through checked sealed/retired export,

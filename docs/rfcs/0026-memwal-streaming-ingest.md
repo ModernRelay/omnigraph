@@ -55,6 +55,14 @@ flushed LWW projection accounting, and exact oldest-uncovered-token age are
 reported as unavailable rather than inferred. The already-public
 `Omnigraph::stream_status` remains the nonblocking manifest-only projection;
 CLI/HTTP/OpenAPI/SDK transport for the operational shape remains F7.
+F6b8 closes the format-neutral resume-to-driver ownership handoff: resume
+transfers its non-clone root producer permit into detached writer installation
+and arms an urgent trigger before that transfer can release. Under the
+exclusive root fence, the driver snapshots and retires only exact empty owners
+in a housekeeping prepass before its unchanged node-before-edge round. Driver-
+first, caller-cancelled resume-first, cross-lane reuse, and clean-shutdown cells
+are green. The broader post-claim install/retirement-failure matrix remains F6
+work.
 Public row streaming, public enrollment, general lifecycle/rebind verbs,
 `AuthorityBlock` repair,
 the F6b-remainder guardrail acceptance, and SDK/HTTP/OpenAPI row-ingress,
@@ -305,10 +313,14 @@ root opportunity exclusive across its frozen finite round and takes
 profile/admission per candidate; both permit kinds retain the worker-registry
 `Arc`, preventing weak-root fence ABA. Shutdown fences root opportunity
 exclusive and then profile exclusive, drops both, and joins the driver.
-An already-installed empty resume writer does not yet join this root fence, so
-F6b2 claims no hard sub-60-second fairness handoff for it; that broader
-resume/driver integration remains later. Process-local gates remain only
-sequential sole-writer evidence, not a distributed fence.
+F6b8 adds the previously excluded resume owner to this root fence. Its producer
+permit is a mandatory move-only input to detached installation and remains
+embedded in the exclusive authority through every retained-retirement path.
+Resume arms the urgent driver trigger before transfer; under the exclusive
+root fence the driver retires only exact empty owners before preserving the
+ordinary node-before-edge candidate order. Process-local gates remain only
+sequential sole-writer evidence, not a distributed fence. The broader post-
+claim install/retirement-failure matrix remains later F6 work.
 Productive SchemaApply stays refused on enrolled graphs: EXP schema evolution
 is checked sealed/retired export followed by fresh init/load, while physical
 rebind keeps accepted schema unchanged. Covered/reconciled token evidence,
@@ -423,6 +435,17 @@ because the selected cut has no exact fragment-creation timestamp. The
 existing public `Omnigraph::stream_status` remains manifest-only and
 nonblocking. This slice adds no CLI/HTTP/OpenAPI/SDK transport; F7 owns that
 wire contract.
+**F6b8 resume/driver handoff implemented:** 2026-08-03 — resume now moves the
+non-clone root producer permit into the detached install owner and its retained
+retirement authority, then arms an urgent trigger before making that transfer.
+Under the same exclusive root fence, the driver snapshots exact empty owners
+and retires them under lane-exclusive authority as housekeeping before the
+unchanged node-before-edge round. Productive residents cannot enter the
+prepass. Deterministic driver-first and caller-cancelled resume-first cells pin
+the fence transfer, a lower-sorted cold tail publishing in the same first round
+without a driver error, and shutdown waiting for detached ownership. The
+broader post-claim install/retirement-failure matrix remains in F6. This slice
+changes no persisted or wire grammar and activates no public surface.
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s unified write and
 generic recovery-sidecar protocol, plus

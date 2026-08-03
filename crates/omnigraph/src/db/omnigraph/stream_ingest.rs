@@ -1804,7 +1804,8 @@ impl Omnigraph {
         let db = Arc::clone(self);
         let table_key = table_key.to_string();
         match crate::instrumentation::spawn_with_query_io_probes(async move {
-            db.stream_fold_phase_b1_background(table_key, None).await
+            db.stream_fold_phase_b1_background(table_key, None, false)
+                .await
         })
         .await
         .map_err(|error| OmniError::Lance(format!("stream fold task failed: {error}")))??
@@ -1824,17 +1825,36 @@ impl Omnigraph {
         let db = Arc::clone(self);
         let table_key = table_key.to_string();
         crate::instrumentation::spawn_with_query_io_probes(async move {
-            db.stream_fold_phase_b1_background(table_key, Some(expected_identity))
+            db.stream_fold_phase_b1_background(table_key, Some(expected_identity), false)
                 .await
         })
         .await
         .map_err(|error| OmniError::Lance(format!("stream fold driver task failed: {error}")))?
     }
 
+    /// Retire one owner observed empty under the finite driver's exclusive
+    /// root producer fence. This housekeeping prepass cannot fold a productive
+    /// edge ahead of the normal node-before-edge candidate order.
+    pub(super) async fn stream_retire_empty_from_resident_driver(
+        self: &Arc<Self>,
+        expected_identity: TableIdentity,
+        table_key: &str,
+    ) -> Result<ResidentFoldOutcome> {
+        let db = Arc::clone(self);
+        let table_key = table_key.to_string();
+        crate::instrumentation::spawn_with_query_io_probes(async move {
+            db.stream_fold_phase_b1_background(table_key, Some(expected_identity), true)
+                .await
+        })
+        .await
+        .map_err(|error| OmniError::Lance(format!("empty stream owner task failed: {error}")))?
+    }
+
     async fn stream_fold_phase_b1_background(
         self: Arc<Self>,
         table_key: String,
         resident_identity: Option<TableIdentity>,
+        empty_only: bool,
     ) -> Result<ResidentFoldOutcome> {
         let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
         if resident_identity.is_some() {
@@ -1870,8 +1890,25 @@ impl Omnigraph {
         ensure_same_binding(key, &before_cut, "stream fold pre-cut authority")?;
         if resident_identity.is_some() {
             match self.stream_workers.resident_fold_readiness(key).await {
+                ResidentFoldReadiness::Ready if empty_only => {
+                    return Err(OmniError::Lance(format!(
+                        "empty stream owner for {table_key} became productive; retry the finite driver round"
+                    )));
+                }
                 ResidentFoldReadiness::Ready => {}
-                ResidentFoldReadiness::Idle => return Ok(ResidentFoldOutcome::Idle),
+                ResidentFoldReadiness::Idle => {
+                    self.stream_workers
+                        .retire_empty_resident_for_driver(
+                            key,
+                            CheckedExclusiveStreamAuthority::from_exclusive_admission(exclusive),
+                        )
+                        .await
+                        .map_err(worker_error)?;
+                    return Ok(ResidentFoldOutcome::Idle);
+                }
+                ResidentFoldReadiness::Missing if empty_only => {
+                    return Ok(ResidentFoldOutcome::Idle);
+                }
                 ResidentFoldReadiness::Missing => {
                     if !cold_stream_capture_has_unmerged_rows(&before_cut).await? {
                         return Ok(ResidentFoldOutcome::Idle);
@@ -4214,7 +4251,7 @@ impl Omnigraph {
         // Resume installs a fresh resident writer. Join the same outer
         // process-local producer fence as row admission so it cannot consume
         // the sole root slot during a frozen node/edge driver round.
-        let _driver_round_guard = self.acquire_stream_fold_producer_guard().await;
+        let driver_round_guard = self.acquire_stream_fold_producer_guard().await;
         let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
         let initial = self.open_write_txn(None).await?;
         let entry = initial.base.entry(&table_key).cloned().ok_or_else(|| {
@@ -4403,11 +4440,19 @@ impl Omnigraph {
                 .await
             }) as crate::table_store::mem_wal::WorkerOpenFuture
         };
+        // A successful resume installs an empty resident writer. Arm its
+        // finite-round handoff before transferring the root producer permit,
+        // so the driver cannot consume the trigger until installation (or a
+        // fail-closed retained retirement) has settled. The selected empty
+        // owner then receives one prompt turn instead of occupying the sole
+        // root resident slot until the ordinary idle timeout.
+        self.notify_stream_fold_pressure(key.identity);
         let open_result = self
             .stream_workers
             .install_resumed_writer(
                 key,
                 table_key.clone(),
+                driver_round_guard,
                 exclusive_authority,
                 Box::new(opener),
                 idle_authority,

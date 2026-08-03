@@ -207,6 +207,13 @@ pub mod names {
     /// this boundary to add a new node trigger and prove it cannot enter ahead
     /// of an edge already captured in the round.
     pub const STREAM_DRIVER_POST_ROUND_FREEZE: &str = "stream_driver.post_round_freeze";
+    /// The resident stream driver has selected due work but has not yet taken
+    /// the root-exclusive finite-round fence. Tests use this boundary to order
+    /// a resume-owned empty-writer installation ahead of the round.
+    pub const STREAM_DRIVER_BEFORE_ROUND_ACQUIRE: &str = "stream_driver.before_round_acquire";
+    /// The detached resume-install task owns the root producer permit plus the
+    /// lane-exclusive authority, before it observes or changes a worker slot.
+    pub const STREAM_RESUME_INSTALL_OWNER: &str = "stream_resume.install_owner";
     /// B1 completed every row-effect-free check and reservation but has not
     /// invoked `ShardWriter::put_no_wait` yet.
     pub const STREAM_B1_BEFORE_PUT_INVOKE: &str = "stream_b1.before_put_invoke";

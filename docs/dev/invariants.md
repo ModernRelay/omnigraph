@@ -555,8 +555,13 @@ them explicit.
   `MemWalWorkerRegistry` `Arc`; no weak-root reopen can create an independent
   fence while detached ownership lives. Shutdown fences root opportunity
   exclusive and then profile exclusive, drops both, and only then joins the
-  driver. This adds no hard sub-60-second fairness bound for an already-
-  installed empty resume writer; that broader handoff remains later.
+  driver. F6b8 closes the empty-resume exception without changing the
+  node-before-edge round: resume transfers its non-clone root producer permit
+  into detached installation and retained retirement, arms an urgent trigger
+  before release, and the driver retires only exact empty owners under lane-
+  exclusive authority in a housekeeping prepass. Productive residents remain
+  in the ordinary round. The broader post-claim install/retirement-failure
+  matrix remains later F6 work.
   Productive SchemaApply is not part of the physical-rebind authority;
   enrolled schema evolution uses checked export/rebuild into a fresh graph.
   Public operational-status and driver transport remains future. No active

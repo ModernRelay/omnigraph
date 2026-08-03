@@ -403,16 +403,29 @@ impl CheckedStreamAuthority {
     }
 }
 
-/// Opaque proof that a background-owned fold task owns the exclusive
-/// admission lease.  A successful cut carries this token onward so the fold
-/// sidecar/table/manifest sequence cannot reopen an admission gap.
+/// Opaque proof that a background-owned fold or lifecycle task owns the
+/// exclusive lane-admission lease. A successful cut carries this token onward
+/// so the fold sidecar/table/manifest sequence cannot reopen an admission gap.
+/// Resume also attaches its root producer permit: cancellation and every
+/// post-claim retirement path must retain both fences until writer ownership
+/// is installed or resolved fail-closed.
 pub(crate) struct CheckedExclusiveStreamAuthority {
     _guard: OwnedRwLockWriteGuard<()>,
+    _driver_round_guard: Option<StreamFoldProducerPermit>,
 }
 
 impl CheckedExclusiveStreamAuthority {
     pub(crate) fn from_exclusive_admission(guard: OwnedRwLockWriteGuard<()>) -> Self {
-        Self { _guard: guard }
+        Self {
+            _guard: guard,
+            _driver_round_guard: None,
+        }
+    }
+
+    fn with_resume_producer(mut self, guard: StreamFoldProducerPermit) -> Self {
+        debug_assert!(self._driver_round_guard.is_none());
+        self._driver_round_guard = Some(guard);
+        self
     }
 }
 
@@ -2666,6 +2679,39 @@ impl MemWalWorkerRegistry {
         identities.into_iter().collect()
     }
 
+    /// Snapshot exact empty resident owners while the finite driver holds the
+    /// root producer fence exclusively. This is scheduling information only:
+    /// lane-exclusive authority revalidates the mode before retirement.
+    pub(crate) async fn driver_idle_resident_identities(&self) -> Vec<TableIdentity> {
+        let slots = self
+            .slots
+            .lock()
+            .expect("MemWAL worker registry poisoned")
+            .iter()
+            .map(|(key, slot)| (*key, Arc::clone(slot)))
+            .collect::<Vec<_>>();
+        let mut identities = BTreeSet::new();
+        for (key, slot) in slots {
+            let worker = {
+                let state = slot.state.lock().await;
+                match &*state {
+                    RegistrySlotState::Active(worker) => Arc::clone(worker),
+                    RegistrySlotState::Vacant
+                    | RegistrySlotState::Opening(_)
+                    | RegistrySlotState::Retiring(_) => continue,
+                }
+            };
+            let mode = worker.mode.lock().await;
+            if matches!(
+                &*mode,
+                WorkerMode::Admit(accounting) if *accounting == GenerationAccounting::default()
+            ) {
+                identities.insert(key.identity);
+            }
+        }
+        identities.into_iter().collect()
+    }
+
     async fn join_idle_owners(slot: &RegistrySlot) -> Result<(), MemWalWorkerError> {
         let (tasks, mut first_failure) = {
             let mut owners = slot
@@ -2886,6 +2932,55 @@ impl MemWalWorkerRegistry {
             }
             WorkerMode::Retiring => ResidentFoldReadiness::Busy,
         }
+    }
+
+    /// Release one exact empty resident which the finite-round driver has
+    /// selected while holding this lane's exclusive admission lease.
+    ///
+    /// Resume must install its freshly claimed writer before publishing a
+    /// successful handoff, but that empty writer cannot occupy the sole root
+    /// slot until the ordinary idle timeout while another lane is ready. The
+    /// caller has already fenced every producer, so this recheck distinguishes
+    /// the empty resume owner from a generation which won the race and became
+    /// productive. Existing retained-retirement ownership keeps failures loud.
+    pub(crate) async fn retire_empty_resident_for_driver(
+        self: &Arc<Self>,
+        key: StreamWorkerKey,
+        authority: CheckedExclusiveStreamAuthority,
+    ) -> Result<(), MemWalWorkerError> {
+        let slot = self.slot(key);
+        let worker = {
+            let state = slot.state.lock().await;
+            match &*state {
+                RegistrySlotState::Active(worker) => Arc::clone(worker),
+                RegistrySlotState::Vacant => {
+                    return Err(MemWalWorkerError::state(
+                        "finite-round empty retirement lost its resident writer",
+                    ));
+                }
+                RegistrySlotState::Opening(_) | RegistrySlotState::Retiring(_) => {
+                    return Err(MemWalWorkerError::state(
+                        "finite-round empty retirement observed changing writer ownership",
+                    ));
+                }
+            }
+        };
+        let mode = worker.mode.lock().await;
+        if !matches!(
+            &*mode,
+            WorkerMode::Admit(accounting) if *accounting == GenerationAccounting::default()
+        ) {
+            return Err(MemWalWorkerError::state(
+                "finite-round empty retirement observed a productive generation",
+            ));
+        }
+        drop(mode);
+
+        let authority = self
+            .retire_current_owner_for_quiesce(&slot, key, authority)
+            .await?;
+        drop(authority);
+        Ok(())
     }
 
     /// Snapshot one already-resident worker without opening, claiming,
@@ -4819,18 +4914,22 @@ impl MemWalWorkerRegistry {
     /// Resume is unlike an ordinary cold put: its recovery owner publishes
     /// `OPEN` before there is a caller batch to drive the normal registry
     /// opener.  The claimed writer must nevertheless become registry-owned
-    /// before the exclusive gate is released.  Any post-claim failure is
-    /// transferred to the same exclusive retirement machinery used by
-    /// quiescence, so no raw writer is dropped outside the registry.
+    /// before the exclusive gate is released. The mandatory root producer
+    /// permit is transferred into the same detached authority owner, so the
+    /// finite driver cannot overlap installation. Any post-claim failure
+    /// retains both fences through the same exclusive retirement machinery
+    /// used by quiescence, so no raw writer is dropped outside the registry.
     pub(crate) async fn install_resumed_writer(
         self: &Arc<Self>,
         key: StreamWorkerKey,
         table_key: String,
+        producer_guard: StreamFoldProducerPermit,
         authority: CheckedExclusiveStreamAuthority,
         opener: WorkerOpener,
         idle_authority: IdleAuthorityCheck,
     ) -> Result<(), MemWalWorkerError> {
         let inflight = self.reserve_inflight_core()?;
+        let authority = authority.with_resume_producer(producer_guard);
         let registry = Arc::clone(self);
         crate::instrumentation::spawn_with_query_io_probes(async move {
             registry
@@ -4857,6 +4956,8 @@ impl MemWalWorkerRegistry {
         idle_authority: IdleAuthorityCheck,
         inflight: InFlightPermit,
     ) -> Result<(), MemWalWorkerError> {
+        crate::failpoints::maybe_fail(crate::failpoints::names::STREAM_RESUME_INSTALL_OWNER)
+            .map_err(|error| MemWalWorkerError::state(error.to_string()))?;
         let slot = self.slot(key);
         let authority = self
             .retire_current_owner_for_quiesce(&slot, key, authority)
@@ -6890,12 +6991,16 @@ mod tests {
             .install_resumed_writer(
                 fixture.key,
                 "node:Test".to_string(),
+                registry.acquire_stream_fold_producer().await,
                 CheckedExclusiveStreamAuthority::from_exclusive_admission(exclusive),
                 opener,
                 idle_authority,
             )
             .await
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), registry.acquire_stream_fold_round())
+            .await
+            .expect("successful resume installation must release its root producer permit");
         assert_eq!(registry.usage.lock().unwrap().resident_writers_root, 1);
 
         tokio::time::timeout(Duration::from_secs(2), async {
