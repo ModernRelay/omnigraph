@@ -1214,11 +1214,17 @@ mod tests {
         let error = create_or_verify_stream_dead_letter_object(&storage, root, &oversized)
             .await
             .expect_err("an oversized replacement must be capped before full materialization");
-        assert!(
-            error.to_string().contains("bounded storage read")
-                && error.to_string().contains("exceeds"),
-            "{error}"
-        );
+        let expected_limit = oversized.descriptor().encoded_length;
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit,
+                actual,
+            } if resource == "storage_text_bytes"
+                && limit == expected_limit
+                && actual == limit + 1
+        ));
     }
 
     #[test]
