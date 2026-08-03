@@ -1,5 +1,9 @@
 use std::sync::Arc;
+#[cfg(feature = "failpoints")]
+use std::time::Duration;
 
+#[cfg(feature = "failpoints")]
+use omnigraph::db::StreamOperationalStatus;
 use omnigraph::db::{
     Omnigraph, StreamAuthorityRetirementPlan, StreamAuthorityRetirementResult,
     StreamDeadLetterPage, StreamDeadLetterPayloadPage,
@@ -92,6 +96,47 @@ pub async fn disable_stream_profile(db: &Arc<Omnigraph>, cluster_uri: &str) {
 
 pub async fn try_disable_stream_profile(db: &Arc<Omnigraph>, cluster_uri: &str) -> Result<()> {
     disable_stream_profile_with_operation_id(db, cluster_uri, "memwal-stream-test-disable").await
+}
+
+#[cfg(feature = "failpoints")]
+pub async fn disabling_operational_status(
+    db: &Arc<Omnigraph>,
+    cluster_uri: &str,
+) -> Result<StreamOperationalStatus> {
+    let cluster_uri = cluster_uri.trim_end_matches('/');
+    let status = db.stream_status().await?;
+    assert_eq!(status.profile_mode, "DISABLING");
+    let state_cas = write_cluster_state(cluster_uri).await;
+    let storage = storage_handle_for_uri(cluster_uri).unwrap();
+    let lock_uri = format!("{cluster_uri}/__cluster/lock.json");
+    let lock = match acquire_state_lock(&storage, &lock_uri, "apply")
+        .await
+        .unwrap()
+    {
+        StateLockAcquire::Acquired(lock) => lock,
+        StateLockAcquire::Held => panic!("fresh status apply lock is already held"),
+    };
+    let guard = validate_offline_guard(
+        &lock,
+        OfflineAuthorityRequest {
+            graph_id: GRAPH_ID,
+            graph_store_uri: db.uri(),
+            expected_state_cas: &state_cas,
+            state_revision: 1,
+            declaration_revision: STREAM_DECLARATION_REVISION,
+            declaration_digest: STREAM_DECLARATION_DIGEST,
+            expected_profile_revision: status.profile_revision,
+            operation_id: "memwal-stream-test-disabling-status",
+            operation: AuthorityOperationClass::StreamProfileDisable,
+            actor: "operator:memwal-test",
+            confirm_stream_offline: true,
+        },
+    )
+    .await
+    .unwrap();
+    let authority = db.check_cluster_apply_authority(guard).await?;
+    db.failpoint_stream_operational_status_for_apply_for_test(&authority, Duration::from_secs(10))
+        .await
 }
 
 /// Disable with a caller-owned receipt identity. Cost fixtures use this to

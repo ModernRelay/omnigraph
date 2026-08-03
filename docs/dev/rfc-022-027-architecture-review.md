@@ -14,9 +14,10 @@ authority retirement/export, v18/recovery-v20 stopped/offline DataBlock
 correction, and v19/recovery-v21 terminal dead-letter folding plus
 three-disposition retirement implemented; public row streaming/enrollment,
 general lifecycle/rebind control,
-exclusive-cut status, and row/lifecycle transport surfaces inactive
+row/lifecycle/status transport surfaces inactive; F6b6 internal checked status
+implemented
 **Date:** 2026-07-11
-**Last updated:** 2026-08-02
+**Last updated:** 2026-08-03
 **Audience:** RFC authors, engine/storage maintainers, and release reviewers
 **Reviewed against:** OmniGraph 0.8.1; Lance 9.0.0-beta.15 at
 `f24e42c11a742581365e1cbe17c906ea2dac1bc6`; full Lance transaction,
@@ -92,9 +93,15 @@ v19/token-schema-v3/recovery-v21 adds deterministic terminal diversion and
 three-disposition retirement. Checked offline disable is the sole supported
 production quiescence owner; public/production rebind remains inactive.
 Historical recovery-v12 fold keeps its wire meaning and is refused rather than
-reinterpreted. Production/public enrollment, general resume/abort, full
-status, and product parity remain specified,
-required, and inactive. Two RC.1 surface guards prove generic cleanup
+reinterpreted. Production/public enrollment, general resume/abort, public
+status transport, and product parity remain specified, required, and inactive;
+F6b6's checked read-only operational core is implemented internally. Its
+complete pending-sidecar view is bounded to 256 matching direct `.json`
+sidecars, 256 irrelevant direct-or-nested objects encountered below the prefix,
+4 MiB of cumulative input-anchored URI bytes across all encountered objects,
+32 MiB per sidecar body, and 32 MiB of cumulative bodies; exceeding any bound
+is a typed whole-status refusal, never a partial inventory. Two RC.1 surface
+guards prove generic cleanup
 non-ownership and the stale-writer hazard created by deleting the successor's
 empty WAL fence sentinel; neither is an implementation of reclamation.
 The local RFC-024/025 decision instruments were rerun: both remain
@@ -588,8 +595,9 @@ internal schema v9, stream-config v3, stream-state protocol v2, and
 recovery-v12 to trusted hidden row metadata, canonical payload/token digests,
 the manifest-selected current-token participant, and exact base-plus-token fold
 publication. Genuine v8↔v9 refusal/rebuild evidence is green. Explicit public
-enrollment/general lifecycle control, full status, and product parity remain
-inactive; checked offline disable is the supported quiescence owner. Internal
+enrollment/general lifecycle control, public status transport, and product
+parity remain inactive; F6b6's checked operational core is internal and checked
+offline disable is the supported quiescence owner. Internal
 schema v11/profile-v2 and recovery-v13 own checked profile
 changes and their exact receipt. V12/lifecycle-v3 and recovery-v14 own
 the hidden enrollment, claim, ordinary/drain fold, and terminal management

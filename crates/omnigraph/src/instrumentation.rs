@@ -29,7 +29,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::io::{ObjectStoreParams, WrappingObjectStore};
 
 use crate::error::{OmniError, Result};
-use crate::storage::StorageAdapter;
+use crate::storage::{ListDirBounds, StorageAdapter};
 
 /// Per-query IO probes, installed for a query's task via [`with_query_io_probes`].
 ///
@@ -673,6 +673,18 @@ impl StorageAdapter for CountingStorageAdapter {
     async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
         self.counts.list_dir.fetch_add(1, Ordering::Relaxed);
         self.inner.list_dir(dir_uri).await
+    }
+
+    async fn list_dir_bounded(
+        &self,
+        dir_uri: &str,
+        matching_suffix: &str,
+        bounds: ListDirBounds,
+    ) -> Result<Vec<String>> {
+        self.counts.list_dir.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .list_dir_bounded(dir_uri, matching_suffix, bounds)
+            .await
     }
 
     async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {

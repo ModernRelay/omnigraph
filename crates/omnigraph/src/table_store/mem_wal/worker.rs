@@ -1268,6 +1268,25 @@ fn merged_generation_for_bound_shard(
     }
 }
 
+/// Read the base dataset's exact merge cut for its validated stream binding.
+///
+/// `dataset` is the caller's already-selected Lance version. This helper does
+/// not refresh it, open a writer, or inspect the WAL; it only reads that
+/// version's MemWAL index details and rejects any topology which is not the
+/// one-shard config-v3 binding before returning the bound shard's cursor.
+pub(crate) async fn read_bound_merged_generation(
+    dataset: &Dataset,
+    binding: &StreamPhysicalBinding,
+) -> Result<u64, MemWalWorkerError> {
+    let details = dataset
+        .mem_wal_index_details()
+        .await
+        .map_err(|error| MemWalWorkerError::lance("base merge-cut read", error))?
+        .ok_or_else(|| MemWalWorkerError::state("stream-bound table has no MemWAL index"))?;
+    let (_, shard_id) = validate_stream_config_v3_binding(&details, binding)?;
+    merged_generation_for_bound_shard(&details, shard_id)
+}
+
 fn validate_manifest_identity(
     manifest: &ShardManifest,
     writer: &ShardWriter,
@@ -1875,6 +1894,45 @@ pub(crate) enum ResidentFoldReadiness {
     Idle,
     Ready,
     Busy,
+}
+
+/// Process-local, side-effect-free view of one resident worker.
+///
+/// The caller must own the table's exclusive stream-admission lease. A
+/// `Missing` slot deliberately stays missing: this probe never opens or claims
+/// a writer merely to answer status. `Busy` covers an opener or retirement
+/// which has not settled despite that outer fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResidentWorkerStatus {
+    Missing,
+    Busy,
+    Active(ResidentWorkerSnapshot),
+}
+
+/// The resident worker's exact in-process generation disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResidentWorkerMode {
+    Admit,
+    FoldReplay,
+    FoldFlushed,
+}
+
+/// Exact state retained by one active resident worker.
+///
+/// `accounting` is present only where the worker retains OmniGraph's exact
+/// admitted logical Arrow accounting. A flushed generation intentionally does
+/// not keep that accounting or its batches resident, and Lance's read surface
+/// exposes only the LWW winner projection. Operational status must therefore
+/// report flushed admitted accounting as unavailable rather than substitute
+/// projection counts, estimated counters, or a false zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResidentWorkerSnapshot {
+    pub(crate) mode: ResidentWorkerMode,
+    pub(crate) accounting: Option<GenerationAccounting>,
+    pub(crate) writer_epoch: u64,
+    /// The admitted/replayed active generation, or the immutable pending
+    /// generation when `mode == FoldFlushed`.
+    pub(crate) generation: u64,
 }
 
 pub(crate) struct IdleAuthorityFailure {
@@ -2572,10 +2630,12 @@ impl MemWalWorkerRegistry {
         }
     }
 
-    /// Return the immutable table identities whose slots still own or are
-    /// settling a writer. The served runtime holds the profile gate while it
-    /// uses this snapshot to close every corresponding admission domain.
-    pub(crate) async fn served_runtime_resident_identities(&self) -> Vec<TableIdentity> {
+    /// Return every exact physical worker key whose slot still owns or is
+    /// settling a writer. This is a side-effect-free process-local snapshot:
+    /// it does not allocate a slot, open/claim a writer, or wait on an opener
+    /// or retirement. The caller closes the returned identities' admission
+    /// domains before treating a later snapshot as stable.
+    pub(crate) async fn served_runtime_resident_keys(&self) -> Vec<StreamWorkerKey> {
         let slots = self
             .slots
             .lock()
@@ -2583,12 +2643,26 @@ impl MemWalWorkerRegistry {
             .iter()
             .map(|(key, slot)| (*key, Arc::clone(slot)))
             .collect::<Vec<_>>();
-        let mut identities = BTreeSet::new();
+        let mut keys = Vec::new();
         for (key, slot) in slots {
             if !matches!(&*slot.state.lock().await, RegistrySlotState::Vacant) {
-                identities.insert(key.identity);
+                keys.push(key);
             }
         }
+        keys.sort_by_key(StreamWorkerKey::to_string);
+        keys
+    }
+
+    /// Return the immutable table identities whose slots still own or are
+    /// settling a writer. The served runtime holds the profile gate while it
+    /// uses this snapshot to close every corresponding admission domain.
+    pub(crate) async fn served_runtime_resident_identities(&self) -> Vec<TableIdentity> {
+        let identities = self
+            .served_runtime_resident_keys()
+            .await
+            .into_iter()
+            .map(|key| key.identity)
+            .collect::<BTreeSet<_>>();
         identities.into_iter().collect()
     }
 
@@ -2812,6 +2886,71 @@ impl MemWalWorkerRegistry {
             }
             WorkerMode::Retiring => ResidentFoldReadiness::Busy,
         }
+    }
+
+    /// Snapshot one already-resident worker without opening, claiming,
+    /// sealing, aborting, or reading its WAL.
+    ///
+    /// The admitted generation number comes from Lance's in-memory MemTable
+    /// state; replay and flushed generation identities are already retained in
+    /// the classified worker mode. The caller's exclusive stream-admission
+    /// lease makes this a stable operational cut rather than a new authority.
+    pub(crate) async fn resident_worker_status(
+        &self,
+        key: StreamWorkerKey,
+    ) -> Result<ResidentWorkerStatus, MemWalWorkerError> {
+        let slot = self
+            .slots
+            .lock()
+            .expect("MemWAL worker registry poisoned")
+            .get(&key)
+            .cloned();
+        let Some(slot) = slot else {
+            return Ok(ResidentWorkerStatus::Missing);
+        };
+        let worker = {
+            let state = slot.state.lock().await;
+            match &*state {
+                RegistrySlotState::Vacant => return Ok(ResidentWorkerStatus::Missing),
+                RegistrySlotState::Opening(_) | RegistrySlotState::Retiring(_) => {
+                    return Ok(ResidentWorkerStatus::Busy);
+                }
+                RegistrySlotState::Active(worker) => Arc::clone(worker),
+            }
+        };
+        let mode = worker.mode.lock().await;
+        let snapshot = match &*mode {
+            WorkerMode::Admit(accounting) => {
+                let generation = worker
+                    .writer
+                    .memtable_stats()
+                    .await
+                    .map_err(|error| {
+                        MemWalWorkerError::lance("resident MemTable status read", error)
+                    })?
+                    .generation;
+                ResidentWorkerSnapshot {
+                    mode: ResidentWorkerMode::Admit,
+                    accounting: Some(*accounting),
+                    writer_epoch: worker.writer.epoch(),
+                    generation,
+                }
+            }
+            WorkerMode::FoldReplay(replay) => ResidentWorkerSnapshot {
+                mode: ResidentWorkerMode::FoldReplay,
+                accounting: Some(replay.accounting),
+                writer_epoch: worker.writer.epoch(),
+                generation: replay.generation,
+            },
+            WorkerMode::FoldFlushed(flushed) => ResidentWorkerSnapshot {
+                mode: ResidentWorkerMode::FoldFlushed,
+                accounting: None,
+                writer_epoch: worker.writer.epoch(),
+                generation: flushed.generation,
+            },
+            WorkerMode::Retiring => return Ok(ResidentWorkerStatus::Busy),
+        };
+        Ok(ResidentWorkerStatus::Active(snapshot))
     }
 
     fn reserve_queued_charge(
@@ -6102,6 +6241,22 @@ mod tests {
         }
     }
 
+    fn test_stream_binding(key: StreamWorkerKey) -> StreamPhysicalBinding {
+        StreamPhysicalBinding {
+            stable_table_id: key.identity.stable_table_id,
+            table_incarnation_id: key.identity.table_incarnation_id,
+            table_location: format!(
+                "nodes/{}-{}",
+                key.identity.stable_table_id, key.identity.table_incarnation_id
+            ),
+            table_branch: None,
+            enrollment_id: key.enrollment_id.to_string(),
+            shard_ids: vec![key.shard_id.to_string()],
+            stream_config_version: STREAM_CONFIG_VERSION,
+            stream_config_hash: stream_config_v3_hash(),
+        }
+    }
+
     #[test]
     fn passive_binding_inventory_accepts_only_selected_exact_commitment() {
         let historical = ShardId::new_v4();
@@ -6397,6 +6552,199 @@ mod tests {
         assert!(matches!(&*state, RegistrySlotState::Vacant));
         *state = RegistrySlotState::Active(Arc::clone(&worker));
         worker
+    }
+
+    #[tokio::test]
+    async fn resident_worker_status_does_not_create_missing_or_busy_workers() {
+        let registry = MemWalWorkerRegistry::for_root(
+            &format!("memory://resident-status-empty/{}", ShardId::new_v4()),
+            limits(),
+        )
+        .unwrap();
+        let key = StreamWorkerKey::new(
+            TableIdentity::new(71, 73).unwrap(),
+            ShardId::new_v4(),
+            ShardId::new_v4(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            registry.resident_worker_status(key).await.unwrap(),
+            ResidentWorkerStatus::Missing
+        );
+        assert!(
+            !registry
+                .slots
+                .lock()
+                .expect("MemWAL worker slots poisoned")
+                .contains_key(&key),
+            "a read-only missing probe must not allocate a registry slot"
+        );
+
+        let slot = registry.slot(key);
+        *slot.state.lock().await = RegistrySlotState::Opening(Arc::new(tokio::sync::Notify::new()));
+        assert_eq!(
+            registry.resident_worker_status(key).await.unwrap(),
+            ResidentWorkerStatus::Busy
+        );
+        *slot.state.lock().await = RegistrySlotState::Vacant;
+        assert_eq!(
+            registry.resident_worker_status(key).await.unwrap(),
+            ResidentWorkerStatus::Missing
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resident_key_snapshot_preserves_stale_active_opening_and_retiring_bindings() {
+        let fixture = enrolled_worker_fixture("resident-key-snapshot").await;
+        let registry = MemWalWorkerRegistry::for_root(
+            &format!(
+                "memory://resident-key-snapshot/{}/{}",
+                fixture.key,
+                ShardId::new_v4()
+            ),
+            limits(),
+        )
+        .unwrap();
+        let opened = claim_opened_worker(
+            &fixture.dataset,
+            &fixture.uri,
+            &fixture.details,
+            &fixture.plan,
+            fixture.initial_epoch,
+        )
+        .await;
+        let active_worker = install_cached_worker(&registry, fixture.key, opened).await;
+        let identity = fixture.key.identity;
+        let selected_key =
+            StreamWorkerKey::new(identity, ShardId::new_v4(), ShardId::new_v4()).unwrap();
+        let opening_key =
+            StreamWorkerKey::new(identity, ShardId::new_v4(), ShardId::new_v4()).unwrap();
+        let retiring_key =
+            StreamWorkerKey::new(identity, ShardId::new_v4(), ShardId::new_v4()).unwrap();
+        let vacant_key =
+            StreamWorkerKey::new(identity, ShardId::new_v4(), ShardId::new_v4()).unwrap();
+        assert!(
+            [fixture.key, opening_key, retiring_key]
+                .into_iter()
+                .all(|key| key != selected_key),
+            "the synthetic resident slots must all belong to stale physical bindings"
+        );
+
+        let opening_slot = registry.slot(opening_key);
+        *opening_slot.state.lock().await =
+            RegistrySlotState::Opening(Arc::new(tokio::sync::Notify::new()));
+        let (_retirement_sender, retirement_receiver) = watch::channel(None);
+        let retiring_slot = registry.slot(retiring_key);
+        *retiring_slot.state.lock().await = RegistrySlotState::Retiring(RetirementHandle {
+            receiver: retirement_receiver,
+        });
+        let _vacant_slot = registry.slot(vacant_key);
+
+        let mut expected = vec![fixture.key, opening_key, retiring_key];
+        expected.sort_by_key(|key| key.to_string());
+        assert_eq!(
+            registry.served_runtime_resident_keys().await,
+            expected,
+            "status gating needs the full stale binding key for every non-vacant slot state"
+        );
+        assert_eq!(
+            registry.served_runtime_resident_identities().await,
+            vec![identity],
+            "the legacy identity projection remains deduplicated"
+        );
+
+        active_worker.writer.abort().await.unwrap();
+        *registry.slot(fixture.key).state.lock().await = RegistrySlotState::Vacant;
+        *opening_slot.state.lock().await = RegistrySlotState::Vacant;
+        *retiring_slot.state.lock().await = RegistrySlotState::Vacant;
+        registry.release_worker_usage(&active_worker);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resident_worker_status_reports_exact_retained_mode_accounting() {
+        let fixture = enrolled_worker_fixture("resident-status-active").await;
+        let registry = MemWalWorkerRegistry::for_root(
+            &format!(
+                "memory://resident-status-active/{}/{}",
+                fixture.key,
+                ShardId::new_v4()
+            ),
+            limits(),
+        )
+        .unwrap();
+        let opened = claim_opened_worker(
+            &fixture.dataset,
+            &fixture.uri,
+            &fixture.details,
+            &fixture.plan,
+            fixture.initial_epoch,
+        )
+        .await;
+        let worker = install_cached_worker(&registry, fixture.key, opened).await;
+        let writer_epoch = worker.writer.epoch();
+        let generation = worker.writer.memtable_stats().await.unwrap().generation;
+        let accounting = GenerationAccounting {
+            rows: 17,
+            arrow_bytes: 23,
+            batches: 5,
+        };
+
+        *worker.mode.lock().await = WorkerMode::Admit(accounting);
+        assert_eq!(
+            registry.resident_worker_status(fixture.key).await.unwrap(),
+            ResidentWorkerStatus::Active(ResidentWorkerSnapshot {
+                mode: ResidentWorkerMode::Admit,
+                accounting: Some(accounting),
+                writer_epoch,
+                generation,
+            })
+        );
+
+        *worker.mode.lock().await = WorkerMode::FoldReplay(ReplayGenerationState {
+            generation,
+            replay_after_wal_entry_position: 11,
+            accounting,
+            batch_store: Arc::new(BatchStore::with_capacity(1)),
+        });
+        assert_eq!(
+            registry.resident_worker_status(fixture.key).await.unwrap(),
+            ResidentWorkerStatus::Active(ResidentWorkerSnapshot {
+                mode: ResidentWorkerMode::FoldReplay,
+                accounting: Some(accounting),
+                writer_epoch,
+                generation,
+            })
+        );
+
+        let flushed_generation = generation.saturating_add(1);
+        *worker.mode.lock().await = WorkerMode::FoldFlushed(FlushedGenerationState {
+            shard_manifest_version: 19,
+            writer_epoch,
+            generation: flushed_generation,
+            path: "_mem_wal/test/flushed.lance".to_string(),
+            replay_after_wal_entry_position: 13,
+        });
+        assert_eq!(
+            registry.resident_worker_status(fixture.key).await.unwrap(),
+            ResidentWorkerStatus::Active(ResidentWorkerSnapshot {
+                mode: ResidentWorkerMode::FoldFlushed,
+                accounting: None,
+                writer_epoch,
+                generation: flushed_generation,
+            })
+        );
+
+        *worker.mode.lock().await = WorkerMode::Retiring;
+        assert_eq!(
+            registry.resident_worker_status(fixture.key).await.unwrap(),
+            ResidentWorkerStatus::Busy
+        );
+
+        worker.writer.abort().await.unwrap();
+        let slot = registry.slot(fixture.key);
+        *slot.state.lock().await = RegistrySlotState::Vacant;
+        registry.release_worker_usage(&worker);
     }
 
     async fn assert_real_empty_quiesce(
@@ -7342,8 +7690,27 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quiesce_folded_reopened_empty_shard_uses_fresh_empty_epoch() {
         let mut fixture = enrolled_worker_fixture("folded-reopened-empty-quiesce").await;
+        let binding = test_stream_binding(fixture.key);
+        assert_eq!(
+            read_bound_merged_generation(&fixture.dataset, &binding)
+                .await
+                .unwrap(),
+            0
+        );
+        let mut foreign_enrollment = binding.clone();
+        foreign_enrollment.enrollment_id = ShardId::new_v4().to_string();
+        assert!(matches!(
+            read_bound_merged_generation(&fixture.dataset, &foreign_enrollment).await,
+            Err(MemWalWorkerError::InvalidConfig { .. })
+        ));
         let cursor = fold_and_reopen_empty_fixture(&mut fixture).await;
         assert!(cursor > 0);
+        assert_eq!(
+            read_bound_merged_generation(&fixture.dataset, &binding)
+                .await
+                .unwrap(),
+            1
+        );
         let fresh_epoch = assert_real_empty_quiesce(&fixture, 2, cursor).await;
         assert!(
             fresh_epoch >= 4,

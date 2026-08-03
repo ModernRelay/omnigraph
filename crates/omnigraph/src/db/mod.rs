@@ -37,6 +37,17 @@ pub(crate) use omnigraph::{
 pub use omnigraph::{
     StreamDeadLetterEncodingCostForTest, failpoint_measure_stream_dead_letter_object_for_test,
 };
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+pub use omnigraph::{
+    StreamDrainOperationalStatus, StreamDriverAdvisoryStatus, StreamDriverEventStatus,
+    StreamDriverPendingStatus, StreamLastFoldOperationalStatus, StreamOldestUncoveredAgeStatus,
+    StreamOperationalStatus, StreamPendingGenerationStatus, StreamRebuildBlockReason,
+    StreamRebuildReadiness, StreamReceiptHeadsStatus, StreamRecoveryOperationalStatus,
+    StreamShardOperationalStatus, StreamStrictBlockOperationalStatus, StreamTableOperationalStatus,
+    StreamTablePhysicalOperationalStatus, StreamTerminalTokenOperationalStatus,
+    StreamTokenIndexCoverageStatus, StreamTokenLedgerOperationalStatus,
+};
 
 use crate::error::{OmniError, Result};
 
