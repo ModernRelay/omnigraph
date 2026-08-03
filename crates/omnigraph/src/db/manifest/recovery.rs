@@ -50,7 +50,7 @@ use crate::db::schema_state::{
     schema_source_staging_uri, schema_state_staging_uri,
 };
 use crate::error::{OmniError, Result};
-use crate::storage::StorageAdapter;
+use crate::storage::{ListDirBounds, StorageAdapter};
 use crate::table_store::StagedTransactionIdentity;
 use crate::table_store::mem_wal::{
     MemWalEnrollmentPlan, MemWalEnrollmentState, capture_current_head_witness, classify_enrollment,
@@ -760,6 +760,34 @@ impl SidecarKind {
                 | Self::StreamSealedMaintenance
                 | Self::StreamRebind
         )
+    }
+
+    /// Stable diagnostic spelling for read-only operational status. Recovery
+    /// dispatch continues to use the enum itself; this is presentation only.
+    #[allow(dead_code)] // Production-compiled F6b6 status is attached by F7.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mutation => "MUTATION",
+            Self::Load => "LOAD",
+            Self::SchemaApply => "SCHEMA_APPLY",
+            Self::BranchMerge => "BRANCH_MERGE",
+            Self::EnsureIndices => "ENSURE_INDICES",
+            Self::Optimize => "OPTIMIZE",
+            Self::StreamEnrollment => "STREAM_ENROLLMENT",
+            Self::StreamFold => "STREAM_FOLD",
+            Self::StreamProfileChange => "STREAM_PROFILE_CHANGE",
+            Self::StreamEnrollmentV2 => "STREAM_ENROLLMENT_V2",
+            Self::StreamClaim => "STREAM_CLAIM",
+            Self::StreamFoldV2 => "STREAM_FOLD_V2",
+            Self::StreamDrainFold => "STREAM_DRAIN_FOLD",
+            Self::StreamLifecycleReceipt => "STREAM_LIFECYCLE_RECEIPT",
+            Self::StreamResume => "STREAM_RESUME",
+            Self::StreamCorrection => "STREAM_CORRECTION",
+            Self::StreamAuthorityRetirement => "STREAM_AUTHORITY_RETIREMENT",
+            Self::StreamTokenLedgerIndexMaintenance => "STREAM_TOKEN_LEDGER_INDEX_MAINTENANCE",
+            Self::StreamSealedMaintenance => "STREAM_SEALED_MAINTENANCE",
+            Self::StreamRebind => "STREAM_REBIND",
+        }
     }
 
     /// Recovery intents whose unpublished physical state can change authority
@@ -2536,17 +2564,62 @@ pub(crate) async fn delete_sidecar(
 /// Sidecars whose `schema_version` is unsupported by this binary are NOT
 /// silently skipped — the function returns an error so an operator can
 /// investigate. Rationale: a sidecar with an unknown shape may encode
-/// state we don't know how to recover; better to fail open than guess.
+/// state we don't know how to recover; better to fail closed than guess.
 pub(crate) async fn list_sidecars(
     root_uri: &str,
     storage: &dyn StorageAdapter,
+) -> Result<Vec<RecoverySidecar>> {
+    list_sidecars_with_limits(root_uri, storage, None).await
+}
+
+#[derive(Clone, Copy)]
+struct SidecarListLimits {
+    list_bounds: ListDirBounds,
+    max_single_bytes: u64,
+    max_total_bytes: u64,
+}
+
+/// Status-only bounded inventory. Recovery itself must continue to inspect
+/// every sidecar, while an advisory operation may refuse a pathological
+/// inventory without multiplying its memory footprint across repeated cuts.
+pub(crate) async fn list_sidecars_bounded(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    list_bounds: ListDirBounds,
+    max_single_bytes: u64,
+    max_total_bytes: u64,
+) -> Result<Vec<RecoverySidecar>> {
+    list_sidecars_with_limits(
+        root_uri,
+        storage,
+        Some(SidecarListLimits {
+            list_bounds,
+            max_single_bytes,
+            max_total_bytes,
+        }),
+    )
+    .await
+}
+
+async fn list_sidecars_with_limits(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    limits: Option<SidecarListLimits>,
 ) -> Result<Vec<RecoverySidecar>> {
     // Failpoint: models a storage list failure (S3 ListObjectsV2) — every
     // consumer (open-time sweep, write-entry heal) must fail loudly
     // rather than silently skipping recovery.
     crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_LIST)?;
     let dir = recovery_dir_uri(root_uri);
-    let mut uris = storage.list_dir(&dir).await?;
+    let mut uris = if let Some(limits) = limits {
+        storage
+            .list_dir_bounded(&dir, ".json", limits.list_bounds)
+            .await?
+    } else {
+        let mut uris = storage.list_dir(&dir).await?;
+        uris.retain(|uri| uri.ends_with(".json"));
+        uris
+    };
     // Sort by URI so the sweep processes sidecars deterministically.
     // Sidecar filenames are ULIDs, which are lexicographically sortable
     // === chronologically sortable; the older sidecar is processed
@@ -2555,22 +2628,40 @@ pub(crate) async fn list_sidecars(
     // ordering-sensitive bugs.
     uris.sort();
     let mut out = Vec::with_capacity(uris.len());
+    let mut total_bytes = 0_u64;
     let mut before_first_json_read = true;
     for uri in uris {
-        // Skip non-JSON files defensively; the directory is ours but a
-        // future feature might leave other artifacts here.
-        if !uri.ends_with(".json") {
-            continue;
-        }
         if before_first_json_read {
             crate::failpoints::maybe_fail(
                 crate::failpoints::names::RECOVERY_POST_SIDECAR_LIST_PRE_READ,
             )?;
             before_first_json_read = false;
         }
-        let Some(body) = storage.read_text_if_exists(&uri).await? else {
+        let body = if let Some(limits) = limits {
+            storage
+                .read_text_if_exists_bounded(&uri, limits.max_single_bytes)
+                .await?
+        } else {
+            storage.read_text_if_exists(&uri).await?
+        };
+        let Some(body) = body else {
             continue;
         };
+        let body_bytes = u64::try_from(body.len()).map_err(|_| {
+            OmniError::manifest_internal("recovery sidecar body length exceeds u64")
+        })?;
+        total_bytes = total_bytes.checked_add(body_bytes).ok_or_else(|| {
+            OmniError::manifest_internal("recovery sidecar inventory byte count overflow")
+        })?;
+        if let Some(limits) = limits
+            && total_bytes > limits.max_total_bytes
+        {
+            return Err(OmniError::resource_limit(
+                "stream_recovery_sidecar_bytes",
+                limits.max_total_bytes,
+                total_bytes,
+            ));
+        }
         let sidecar = parse_sidecar(&uri, &body)?;
         validate_identity_aware_pin_paths(root_uri, &uri, &sidecar)?;
         out.push(sidecar);
@@ -8245,6 +8336,840 @@ fn validate_branch_merge_transaction_chain(
                 pin.table_key
             ))
         })
+}
+
+fn exactly_one_matching<T>(values: &[T], mut predicate: impl FnMut(&T) -> bool) -> Option<&T> {
+    let mut matching = values.iter().filter(|value| predicate(value));
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first)
+}
+
+fn exact_confirmed_base_update(
+    update: &RecoveryConfirmedTableUpdate,
+    observed_head: &super::CurrentHeadWitness,
+) -> bool {
+    update.table_version == observed_head.table_version && update.table_branch.is_none()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_single_transaction_base_effect(
+    pin: &SidecarTablePin,
+    selected_head: &super::CurrentHeadWitness,
+    observed_head: &super::CurrentHeadWitness,
+    prior_head: Option<&super::CurrentHeadWitness>,
+    effect_phase: RecoveryEffectPhase,
+    planned_transaction: &StagedTransactionIdentity,
+    confirmed_transaction: Option<&StagedTransactionIdentity>,
+    confirmed_head: Option<&super::CurrentHeadWitness>,
+    confirmed_update: Option<&RecoveryConfirmedTableUpdate>,
+    confirmation_carries_head: bool,
+) -> bool {
+    let Some(expected_successor) = selected_head.table_version.checked_add(1) else {
+        return false;
+    };
+    if prior_head.is_some_and(|prior| prior != selected_head)
+        || planned_transaction.read_version != selected_head.table_version
+        || planned_transaction.uuid.is_empty()
+        || planned_transaction.uuid == selected_head.transaction_uuid
+        || observed_head.table_version != expected_successor
+        || observed_head.table_version != pin.post_commit_pin
+        || observed_head.transaction_uuid != planned_transaction.uuid
+    {
+        return false;
+    }
+
+    match effect_phase {
+        RecoveryEffectPhase::Armed => {
+            confirmed_transaction.is_none()
+                && confirmed_head.is_none()
+                && confirmed_update.is_none()
+                && pin.confirmed_version.is_none()
+        }
+        RecoveryEffectPhase::EffectsConfirmed => {
+            confirmed_transaction == Some(planned_transaction)
+                && (!confirmation_carries_head || confirmed_head == Some(observed_head))
+                && confirmed_update
+                    .is_some_and(|update| exact_confirmed_base_update(update, observed_head))
+                && pin.confirmed_version == Some(observed_head.table_version)
+        }
+    }
+}
+
+fn exact_confirmed_recorded_base_effect(
+    selected_head: &super::CurrentHeadWitness,
+    observed_head: &super::CurrentHeadWitness,
+    prior_head: &super::CurrentHeadWitness,
+    confirmed_head: &super::CurrentHeadWitness,
+    confirmed_update: &RecoveryConfirmedTableUpdate,
+) -> bool {
+    prior_head == selected_head
+        && confirmed_head == observed_head
+        && observed_head.table_version > selected_head.table_version
+        && exact_confirmed_base_update(confirmed_update, observed_head)
+}
+
+/// Return true only when one validated recovery sidecar owns the exact moved
+/// canonical-main base HEAD observed by operational status.
+///
+/// Identity overlap or a graph-global recovery barrier is deliberately not
+/// evidence. The sidecar must carry the exact canonical-main pin/path and a
+/// protocol-specific planned transaction or complete confirmed output which
+/// binds both the selected predecessor and the observed successor. Unsupported
+/// loose/metadata-only protocols fail closed.
+fn recovery_sidecar_canonical_main_base_pin<'a>(
+    sidecar: &'a RecoverySidecar,
+    identity: TableIdentity,
+    table_path: &str,
+    selected_head: &super::CurrentHeadWitness,
+    observed_head: &super::CurrentHeadWitness,
+) -> Option<&'a SidecarTablePin> {
+    if sidecar.branch.is_some()
+        || selected_head.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
+        || observed_head.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
+        || observed_head.table_version <= selected_head.table_version
+    {
+        return None;
+    }
+    let pin = exactly_one_matching(&sidecar.tables, |pin| pin.identity == identity)?;
+    (pin.table_path == table_path && pin.table_branch.is_none()).then_some(pin)
+}
+
+fn recovery_rollback_audit_outcomes(sidecar: &RecoverySidecar) -> Option<&[TableOutcome]> {
+    sidecar
+        .protocol_v3
+        .as_ref()
+        .and_then(|protocol| protocol.rollback_audit_outcomes.as_deref())
+        .or_else(|| {
+            sidecar
+                .protocol_v4
+                .as_ref()
+                .and_then(|protocol| protocol.rollback_audit_outcomes.as_deref())
+        })
+        .or_else(|| {
+            sidecar
+                .protocol_v7
+                .as_ref()
+                .and_then(|protocol| protocol.rollback_audit_outcomes.as_deref())
+        })
+        .or_else(|| {
+            sidecar
+                .protocol_v8
+                .as_ref()
+                .and_then(|protocol| protocol.rollback_audit_outcomes.as_deref())
+        })
+        .or_else(|| {
+            stream_sealed_optimize_v17(sidecar)
+                .and_then(|protocol| protocol.rollback_audit_outcomes.as_deref())
+        })
+}
+
+async fn recovery_single_transaction_compensation_exactly_owns_base_head(
+    pin: &SidecarTablePin,
+    selected_head: &super::CurrentHeadWitness,
+    observed_head: &super::CurrentHeadWitness,
+    dataset: &lance::Dataset,
+    planned_transaction: &StagedTransactionIdentity,
+    require_create_index: bool,
+) -> Result<bool> {
+    let observation = classify_lance_dataset_head(
+        dataset,
+        Some((
+            pin.post_commit_pin,
+            planned_transaction,
+            selected_head.table_version,
+        )),
+    )
+    .await?;
+    if observation.version != observed_head.table_version
+        || observation.effect_ownership != EffectOwnership::OwnCompensatedAtHead
+    {
+        return Ok(false);
+    }
+    if require_create_index {
+        return prove_ensure_indices_create_index_operation(dataset, planned_transaction).await;
+    }
+    Ok(true)
+}
+
+async fn recovery_protocol_exact_compensation_owns_base_head(
+    sidecar: &RecoverySidecar,
+    pin: &SidecarTablePin,
+    selected_head: &super::CurrentHeadWitness,
+    observed_head: &super::CurrentHeadWitness,
+    dataset: &lance::Dataset,
+) -> Result<bool> {
+    let Some(outcomes) = recovery_rollback_audit_outcomes(sidecar) else {
+        return Ok(false);
+    };
+    let rollback_table_key = rollback_table_key(sidecar, pin);
+    let Some(outcome) =
+        exactly_one_matching(outcomes, |outcome| outcome.table_key == rollback_table_key)
+    else {
+        return Ok(false);
+    };
+    if outcome.to_version != selected_head.table_version
+        || dataset.version().version != observed_head.table_version
+    {
+        return Ok(false);
+    }
+    let branch_identifier = dataset
+        .branch_identifier()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    if branch_identifier != observed_head.branch_identifier {
+        return Ok(false);
+    }
+    let Some(restore_source) =
+        stream_optimize_compensating_restore_source_v17(dataset, selected_head.table_version)
+            .await?
+    else {
+        return Ok(false);
+    };
+    if outcome.from_version != restore_source
+        || restore_source <= selected_head.table_version
+        || restore_source.checked_add(1) != Some(observed_head.table_version)
+    {
+        return Ok(false);
+    }
+
+    match sidecar.writer_kind {
+        SidecarKind::Mutation | SidecarKind::Load => {
+            let Some(protocol) = sidecar.protocol_v3.as_ref() else {
+                return Ok(false);
+            };
+            let Some(effect) = exactly_one_matching(&protocol.effects, |effect| {
+                effect.identity == pin.identity && effect.table_key == pin.table_key
+            }) else {
+                return Ok(false);
+            };
+            recovery_single_transaction_compensation_exactly_owns_base_head(
+                pin,
+                selected_head,
+                observed_head,
+                dataset,
+                &effect.planned_transaction,
+                false,
+            )
+            .await
+        }
+        SidecarKind::SchemaApply => {
+            let Some(protocol) = sidecar.protocol_v7.as_ref() else {
+                return Ok(false);
+            };
+            let Some(effect) = exactly_one_matching(&protocol.effects, |effect| {
+                effect.identity == pin.identity && effect.table_key == pin.table_key
+            }) else {
+                return Ok(false);
+            };
+            let RecoverySchemaApplyEffectKind::ExistingOverwrite {
+                planned_transaction,
+                ..
+            } = &effect.kind
+            else {
+                return Ok(false);
+            };
+            recovery_single_transaction_compensation_exactly_owns_base_head(
+                pin,
+                selected_head,
+                observed_head,
+                dataset,
+                planned_transaction,
+                false,
+            )
+            .await
+        }
+        SidecarKind::EnsureIndices | SidecarKind::StreamSealedMaintenance
+            if sidecar.protocol_v8.is_some() =>
+        {
+            let protocol = sidecar
+                .protocol_v8
+                .as_ref()
+                .expect("match guard selected protocol_v8");
+            let Some(effect) = exactly_one_matching(&protocol.effects, |effect| {
+                effect.identity == pin.identity && effect.table_key == pin.table_key
+            }) else {
+                return Ok(false);
+            };
+            if effect.source_fork_version.is_some() || effect.confirmed_branch_identifier.is_some()
+            {
+                return Ok(false);
+            }
+            if sidecar.writer_kind == SidecarKind::StreamSealedMaintenance
+                && !stream_sealed_maintenance_v16(sidecar).is_some_and(|overlay| {
+                    exactly_one_matching(&overlay.prior_lifecycles, |prior| {
+                        prior.identity == pin.identity
+                    })
+                    .is_some_and(|prior| prior.current_head_witness == *selected_head)
+                })
+            {
+                return Ok(false);
+            }
+            recovery_single_transaction_compensation_exactly_owns_base_head(
+                pin,
+                selected_head,
+                observed_head,
+                dataset,
+                &effect.planned_transaction,
+                true,
+            )
+            .await
+        }
+        SidecarKind::BranchMerge => {
+            let Some(protocol) = sidecar.protocol_v4.as_ref() else {
+                return Ok(false);
+            };
+            let Some(effect) = exactly_one_matching(&protocol.effects, |effect| {
+                effect.identity == pin.identity && effect.table_key == pin.table_key
+            }) else {
+                return Ok(false);
+            };
+            let RecoveryBranchMergeEffectKind::MultiCommitHead {
+                source_fork_version,
+                planned_transactions,
+                confirmed_branch_identifier,
+                ..
+            } = &effect.kind
+            else {
+                return Ok(false);
+            };
+            if source_fork_version.is_some()
+                || confirmed_branch_identifier.is_some()
+                || planned_transactions.is_empty()
+            {
+                return Ok(false);
+            }
+            let observation = BranchMergeRefObservation {
+                dataset: dataset.clone(),
+                version: observed_head.table_version,
+                branch_identifier,
+                parent_version: None,
+            };
+            let proof = prove_branch_merge_multi_commit_effect(
+                &observation,
+                planned_transactions,
+                selected_head.table_version,
+                &pin.table_key,
+            )
+            .await?;
+            Ok(proof.unsafe_reason.is_none()
+                && proof.effect_ownership == EffectOwnership::OwnCompensatedAtHead)
+        }
+        SidecarKind::StreamSealedMaintenance if sidecar.protocol_v17.is_some() => {
+            // Optimize cannot pre-mint Lance's internally committing physical
+            // transaction. Full recovery first freezes the exact pre-Restore
+            // HEAD in `rollback_audit_outcomes`; the Restore transaction then
+            // binds that source and the manifest-selected target. This is the
+            // same exact compensation proof used by v17 recovery validation.
+            Ok(stream_sealed_optimize_v17(sidecar).is_some_and(|protocol| {
+                exactly_one_matching(&protocol.prior_lifecycles, |prior| {
+                    prior.identity == pin.identity
+                })
+                .is_some_and(|prior| prior.current_head_witness == *selected_head)
+            }))
+        }
+        _ => Ok(false),
+    }
+}
+
+pub(crate) async fn recovery_sidecar_exactly_owns_canonical_main_base_head(
+    sidecar: &RecoverySidecar,
+    identity: TableIdentity,
+    table_path: &str,
+    selected_head: &super::CurrentHeadWitness,
+    observed_head: &super::CurrentHeadWitness,
+    dataset: &lance::Dataset,
+) -> Result<bool> {
+    let Some(pin) = recovery_sidecar_canonical_main_base_pin(
+        sidecar,
+        identity,
+        table_path,
+        selected_head,
+        observed_head,
+    ) else {
+        return Ok(false);
+    };
+
+    if recovery_protocol_exact_compensation_owns_base_head(
+        sidecar,
+        pin,
+        selected_head,
+        observed_head,
+        dataset,
+    )
+    .await?
+    {
+        return Ok(true);
+    }
+    if pin.expected_version != selected_head.table_version {
+        return Ok(false);
+    }
+
+    match sidecar.writer_kind {
+        SidecarKind::EnsureIndices | SidecarKind::StreamSealedMaintenance
+            if sidecar.protocol_v8.is_some() =>
+        {
+            recovery_ensure_indices_protocol_exactly_owns_base_head(
+                sidecar,
+                pin,
+                selected_head,
+                observed_head,
+                dataset,
+            )
+            .await
+        }
+        SidecarKind::BranchMerge => {
+            recovery_branch_merge_protocol_exactly_owns_base_head(
+                sidecar,
+                pin,
+                selected_head,
+                observed_head,
+                dataset,
+            )
+            .await
+        }
+        _ => Ok(recovery_protocol_exactly_owns_base_head(
+            sidecar,
+            pin,
+            selected_head,
+            observed_head,
+        )),
+    }
+}
+
+#[cfg(test)]
+fn recovery_sidecar_head_only_exactly_owns_canonical_main_base_head(
+    sidecar: &RecoverySidecar,
+    identity: TableIdentity,
+    table_path: &str,
+    selected_head: &super::CurrentHeadWitness,
+    observed_head: &super::CurrentHeadWitness,
+) -> bool {
+    recovery_sidecar_canonical_main_base_pin(
+        sidecar,
+        identity,
+        table_path,
+        selected_head,
+        observed_head,
+    )
+    .is_some_and(|pin| {
+        recovery_protocol_exactly_owns_base_head(sidecar, pin, selected_head, observed_head)
+    })
+}
+
+async fn recovery_ensure_indices_protocol_exactly_owns_base_head(
+    sidecar: &RecoverySidecar,
+    pin: &SidecarTablePin,
+    selected_head: &super::CurrentHeadWitness,
+    observed_head: &super::CurrentHeadWitness,
+    dataset: &lance::Dataset,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v8
+        .as_ref()
+        .expect("caller selected a schema-v8 recovery protocol");
+    let identity = pin.identity;
+    let Some(effect) = exactly_one_matching(&protocol.effects, |effect| {
+        effect.identity == identity && effect.table_key == pin.table_key
+    }) else {
+        return Ok(false);
+    };
+    if effect.source_fork_version.is_some() || effect.confirmed_branch_identifier.is_some() {
+        return Ok(false);
+    }
+    let Some(slot) = exactly_one_matching(&protocol.intended_delta.table_updates, |slot| {
+        slot.identity == identity && slot.table_key == pin.table_key
+    }) else {
+        return Ok(false);
+    };
+    if !exact_single_transaction_base_effect(
+        pin,
+        selected_head,
+        observed_head,
+        None,
+        protocol.effect_phase,
+        &effect.planned_transaction,
+        effect.confirmed_transaction.as_ref(),
+        None,
+        slot.confirmed.as_ref(),
+        false,
+    ) || dataset.version().version != observed_head.table_version
+    {
+        return Ok(false);
+    }
+
+    let branch_identifier = dataset
+        .branch_identifier()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    if branch_identifier != observed_head.branch_identifier {
+        return Ok(false);
+    }
+
+    prove_ensure_indices_create_index_operation(dataset, &effect.planned_transaction).await
+}
+
+async fn recovery_branch_merge_protocol_exactly_owns_base_head(
+    sidecar: &RecoverySidecar,
+    pin: &SidecarTablePin,
+    selected_head: &super::CurrentHeadWitness,
+    observed_head: &super::CurrentHeadWitness,
+    dataset: &lance::Dataset,
+) -> Result<bool> {
+    let Some(protocol) = sidecar.protocol_v4.as_ref() else {
+        return Ok(false);
+    };
+    let identity = pin.identity;
+    let Some(effect) = exactly_one_matching(&protocol.effects, |effect| {
+        effect.identity == identity && effect.table_key == pin.table_key
+    }) else {
+        return Ok(false);
+    };
+    let RecoveryBranchMergeEffectKind::MultiCommitHead {
+        source_fork_version,
+        planned_transactions,
+        confirmed_version,
+        confirmed_branch_identifier,
+    } = &effect.kind
+    else {
+        return Ok(false);
+    };
+    if source_fork_version.is_some()
+        || confirmed_branch_identifier.is_some()
+        || planned_transactions.is_empty()
+        || pin.post_commit_pin != selected_head.table_version.saturating_add(1)
+        || dataset.version().version != observed_head.table_version
+    {
+        return Ok(false);
+    }
+    for (offset, planned) in planned_transactions.iter().enumerate() {
+        let Ok(offset) = u64::try_from(offset) else {
+            return Ok(false);
+        };
+        if planned.read_version != selected_head.table_version.saturating_add(offset)
+            || planned.uuid.is_empty()
+        {
+            return Ok(false);
+        }
+    }
+    let Some(slot) = exactly_one_matching(&protocol.intended_delta.table_updates, |slot| {
+        slot.identity == identity && slot.table_key == pin.table_key
+    }) else {
+        return Ok(false);
+    };
+    if slot.expected_version != selected_head.table_version || slot.table_branch.is_some() {
+        return Ok(false);
+    }
+
+    let branch_identifier = dataset
+        .branch_identifier()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    if branch_identifier != observed_head.branch_identifier {
+        return Ok(false);
+    }
+    let observation = BranchMergeRefObservation {
+        dataset: dataset.clone(),
+        version: observed_head.table_version,
+        branch_identifier,
+        parent_version: None,
+    };
+    let proof = prove_branch_merge_multi_commit_effect(
+        &observation,
+        planned_transactions,
+        selected_head.table_version,
+        &pin.table_key,
+    )
+    .await?;
+    if proof.unsafe_reason.is_some() {
+        return Ok(false);
+    }
+
+    match protocol.effect_phase {
+        RecoveryEffectPhase::Armed => Ok(proof.effect_ownership == EffectOwnership::OwnAtHead
+            && confirmed_version.is_none()
+            && pin.confirmed_version.is_none()
+            && slot.confirmed.is_none()),
+        RecoveryEffectPhase::EffectsConfirmed => Ok(proof.effect_ownership
+            == EffectOwnership::OwnAtHead
+            && proof.full_effect_at_head
+            && *confirmed_version == Some(observed_head.table_version)
+            && pin.confirmed_version == Some(observed_head.table_version)
+            && slot
+                .confirmed
+                .as_ref()
+                .is_some_and(|update| exact_confirmed_base_update(update, observed_head))),
+    }
+}
+
+fn recovery_protocol_exactly_owns_base_head(
+    sidecar: &RecoverySidecar,
+    pin: &SidecarTablePin,
+    selected_head: &super::CurrentHeadWitness,
+    observed_head: &super::CurrentHeadWitness,
+) -> bool {
+    let identity = pin.identity;
+    match sidecar.writer_kind {
+        SidecarKind::Mutation | SidecarKind::Load => {
+            let Some(protocol) = sidecar.protocol_v3.as_ref() else {
+                return false;
+            };
+            let Some(effect) = exactly_one_matching(&protocol.effects, |effect| {
+                effect.identity == identity && effect.table_key == pin.table_key
+            }) else {
+                return false;
+            };
+            let Some(slot) = exactly_one_matching(&protocol.intended_delta.table_updates, |slot| {
+                slot.identity == identity && slot.table_key == pin.table_key
+            }) else {
+                return false;
+            };
+            if slot.expected_version != selected_head.table_version || slot.table_branch.is_some() {
+                return false;
+            }
+            exact_single_transaction_base_effect(
+                pin,
+                selected_head,
+                observed_head,
+                None,
+                protocol.effect_phase,
+                &effect.planned_transaction,
+                effect.confirmed_transaction.as_ref(),
+                None,
+                slot.confirmed.as_ref(),
+                false,
+            )
+        }
+        SidecarKind::SchemaApply => {
+            let Some(protocol) = sidecar.protocol_v7.as_ref() else {
+                return false;
+            };
+            let Some(effect) = exactly_one_matching(&protocol.effects, |effect| {
+                effect.identity == identity && effect.table_key == pin.table_key
+            }) else {
+                return false;
+            };
+            let RecoverySchemaApplyEffectKind::ExistingOverwrite {
+                planned_transaction,
+                confirmed_transaction,
+            } = &effect.kind
+            else {
+                return false;
+            };
+            let Some(slot) = exactly_one_matching(&protocol.intended_delta.table_updates, |slot| {
+                slot.identity == identity && slot.table_key == pin.table_key
+            }) else {
+                return false;
+            };
+            if slot.expected_version != selected_head.table_version || slot.table_branch.is_some() {
+                return false;
+            }
+            exact_single_transaction_base_effect(
+                pin,
+                selected_head,
+                observed_head,
+                None,
+                protocol.effect_phase,
+                planned_transaction,
+                confirmed_transaction.as_ref(),
+                None,
+                slot.confirmed.as_ref(),
+                false,
+            )
+        }
+        SidecarKind::EnsureIndices | SidecarKind::BranchMerge => false,
+        SidecarKind::StreamSealedMaintenance if sidecar.protocol_v8.is_some() => false,
+        SidecarKind::StreamFold => {
+            // Recovery-v11/v12 are historical under the current graph format.
+            // Even exact physical attribution is not an executable recovery
+            // owner here, so operational status fails closed.
+            false
+        }
+        SidecarKind::StreamFoldV2 | SidecarKind::StreamDrainFold => {
+            if let Some(RecoveryProtocolV21::DeadLetterFold(protocol)) =
+                sidecar.protocol_v21.as_deref()
+            {
+                if protocol.admission_scope.identity != identity
+                    || protocol.admission_scope.table_branch.is_some()
+                    || (protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+                        && protocol.base.confirmed_merged_generation.as_ref()
+                            != Some(&protocol.merged_generation))
+                {
+                    return false;
+                }
+                return exact_single_transaction_base_effect(
+                    pin,
+                    selected_head,
+                    observed_head,
+                    Some(&protocol.prior_lifecycle.current_head_witness),
+                    protocol.effect_phase,
+                    &protocol.base.planned_transaction,
+                    protocol.base.confirmed_transaction.as_ref(),
+                    protocol.base.confirmed_head.as_ref(),
+                    protocol.base.confirmed_update.as_ref(),
+                    true,
+                );
+            }
+            let Some(
+                RecoveryProtocolV14::StreamFoldV2(protocol)
+                | RecoveryProtocolV14::StreamDrainFold(protocol),
+            ) = sidecar.protocol_v14.as_deref()
+            else {
+                return false;
+            };
+            if protocol.admission_scope.identity != identity
+                || protocol.admission_scope.table_branch.is_some()
+                || (protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+                    && protocol.base.confirmed_merged_generation.as_ref()
+                        != Some(&protocol.merged_generation))
+            {
+                return false;
+            }
+            exact_single_transaction_base_effect(
+                pin,
+                selected_head,
+                observed_head,
+                Some(&protocol.prior_lifecycle.current_head_witness),
+                protocol.effect_phase,
+                &protocol.base.planned_transaction,
+                protocol.base.confirmed_transaction.as_ref(),
+                protocol.base.confirmed_head.as_ref(),
+                protocol.base.confirmed_update.as_ref(),
+                true,
+            )
+        }
+        SidecarKind::StreamCorrection => {
+            let Some(RecoveryProtocolV20::StreamCorrection(protocol)) =
+                sidecar.protocol_v20.as_deref()
+            else {
+                return false;
+            };
+            if protocol.admission_scope.identity != identity
+                || protocol.admission_scope.table_branch.is_some()
+                || (protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+                    && protocol.base.confirmed_merged_generation.as_ref()
+                        != Some(&protocol.merged_generation))
+            {
+                return false;
+            }
+            exact_single_transaction_base_effect(
+                pin,
+                selected_head,
+                observed_head,
+                Some(&protocol.prior_lifecycle.current_head_witness),
+                protocol.effect_phase,
+                &protocol.base.planned_transaction,
+                protocol.base.confirmed_transaction.as_ref(),
+                protocol.base.confirmed_head.as_ref(),
+                protocol.base.confirmed_update.as_ref(),
+                true,
+            )
+        }
+        SidecarKind::StreamEnrollmentV2 => {
+            let Some(RecoveryProtocolV14::StreamEnrollmentV2(protocol)) =
+                sidecar.protocol_v14.as_deref()
+            else {
+                return false;
+            };
+            if protocol.effect_phase != RecoveryEffectPhase::EffectsConfirmed
+                || protocol.admission_scope.identity != identity
+                || protocol.admission_scope.table_branch.is_some()
+            {
+                return false;
+            }
+            let (Some(update), Some(next_lifecycle)) = (
+                protocol.confirmed_update.as_ref(),
+                protocol.next_lifecycle.as_ref(),
+            ) else {
+                return false;
+            };
+            pin.confirmed_version == Some(observed_head.table_version)
+                && pin.post_commit_pin == observed_head.table_version
+                && exact_confirmed_recorded_base_effect(
+                    selected_head,
+                    observed_head,
+                    &protocol.baseline_head,
+                    &next_lifecycle.current_head_witness,
+                    update,
+                )
+        }
+        SidecarKind::StreamSealedMaintenance => {
+            let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+                sidecar.protocol_v17.as_deref()
+            else {
+                return false;
+            };
+            if protocol.effect_phase != RecoveryEffectPhase::EffectsConfirmed {
+                return false;
+            }
+            let Some(prior) = exactly_one_matching(&protocol.prior_lifecycles, |lifecycle| {
+                lifecycle.identity == identity
+            }) else {
+                return false;
+            };
+            let Some(output) = protocol.confirmed_outputs.as_ref().and_then(|outputs| {
+                exactly_one_matching(outputs, |output| {
+                    output.identity == identity && output.table_key == pin.table_key
+                })
+            }) else {
+                return false;
+            };
+            let next_matches = protocol.next_lifecycles.as_ref().is_some_and(|lifecycles| {
+                exactly_one_matching(lifecycles, |lifecycle| lifecycle.identity == identity)
+                    .is_some_and(|lifecycle| lifecycle.current_head_witness == *observed_head)
+            });
+            next_matches
+                && pin.confirmed_version.is_none()
+                && exact_confirmed_recorded_base_effect(
+                    selected_head,
+                    observed_head,
+                    &prior.current_head_witness,
+                    &output.achieved_head,
+                    &output.update,
+                )
+        }
+        SidecarKind::StreamRebind => {
+            let Some(RecoveryProtocolV18::StreamRebind(protocol)) = sidecar.protocol_v18.as_deref()
+            else {
+                return false;
+            };
+            let Some(physical) = protocol.physical.as_ref() else {
+                return false;
+            };
+            let Some(drop_version) = selected_head.table_version.checked_add(1) else {
+                return false;
+            };
+            let Some(fresh_version) = drop_version.checked_add(1) else {
+                return false;
+            };
+            protocol.admission_scope.identity == identity
+                && protocol.admission_scope.table_branch.is_none()
+                && protocol.prior_lifecycle.current_head_witness == *selected_head
+                && physical.dropped_head.branch_identifier
+                    == lance::dataset::refs::BranchIdentifier::main()
+                && physical.dropped_head.table_version == drop_version
+                && physical.dropped_head.transaction_uuid != selected_head.transaction_uuid
+                && physical.fresh_index_head.table_version == fresh_version
+                && physical.fresh_index_head.transaction_uuid
+                    != physical.dropped_head.transaction_uuid
+                && pin.post_commit_pin == fresh_version
+                && pin.confirmed_version.is_none()
+                && exact_confirmed_recorded_base_effect(
+                    selected_head,
+                    observed_head,
+                    &protocol.prior_lifecycle.current_head_witness,
+                    &physical.fresh_index_head,
+                    &physical.confirmed_update,
+                )
+        }
+        SidecarKind::Optimize
+        | SidecarKind::StreamEnrollment
+        | SidecarKind::StreamProfileChange
+        | SidecarKind::StreamClaim
+        | SidecarKind::StreamLifecycleReceipt
+        | SidecarKind::StreamResume
+        | SidecarKind::StreamAuthorityRetirement
+        | SidecarKind::StreamTokenLedgerIndexMaintenance => false,
+    }
 }
 
 /// Classify one table's observed state vs. the sidecar's intent.
@@ -19216,6 +20141,15 @@ async fn open_lance_head_if_present(
         }
         _ => ds,
     };
+    Ok(Some(
+        classify_lance_dataset_head(&ds, planned_effect).await?,
+    ))
+}
+
+async fn classify_lance_dataset_head(
+    ds: &lance::Dataset,
+    planned_effect: Option<(u64, &StagedTransactionIdentity, u64)>,
+) -> Result<LanceHeadObservation> {
     let head_transaction = if planned_effect.is_some() {
         ds.read_transaction()
             .await
@@ -19242,11 +20176,11 @@ async fn open_lance_head_if_present(
                 .saturating_add(1)
                 > MAX_EFFECT_IDENTITY_SCAN_VERSIONS
             {
-                return Ok(Some(LanceHeadObservation {
+                return Ok(LanceHeadObservation {
                     version: ds.version().version,
                     transaction,
                     effect_ownership: EffectOwnership::Unverifiable,
-                }));
+                });
             }
             let mut unverifiable = false;
             for version in first_possible_version..=ds.version().version {
@@ -19286,11 +20220,11 @@ async fn open_lance_head_if_present(
             }
         }
     }
-    Ok(Some(LanceHeadObservation {
+    Ok(LanceHeadObservation {
         version: ds.version().version,
         transaction,
         effect_ownership,
-    }))
+    })
 }
 
 async fn delete_sidecar_by_operation_id(
@@ -24394,6 +25328,22 @@ mod tests {
     use lance::Dataset;
     use std::sync::Arc;
 
+    fn recovery_sidecar_exactly_owns_canonical_main_base_head(
+        sidecar: &RecoverySidecar,
+        identity: TableIdentity,
+        table_path: &str,
+        selected_head: &CurrentHeadWitness,
+        observed_head: &CurrentHeadWitness,
+    ) -> bool {
+        recovery_sidecar_head_only_exactly_owns_canonical_main_base_head(
+            sidecar,
+            identity,
+            table_path,
+            selected_head,
+            observed_head,
+        )
+    }
+
     fn person_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -25417,6 +26367,263 @@ mod tests {
             HashMap::from([(identity, planned)]),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn exact_recovery_base_head_ownership_requires_the_planned_main_successor() {
+        let sidecar = occ_sidecar();
+        let pin = &sidecar.tables[0];
+        let planned = &sidecar.protocol_v3.as_ref().unwrap().effects[0].planned_transaction;
+        let selected = CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 5,
+            transaction_uuid: "prior-transaction".to_string(),
+            manifest_e_tag: Some("prior-etag".to_string()),
+        };
+        let observed = CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 6,
+            transaction_uuid: planned.uuid.clone(),
+            manifest_e_tag: Some("planned-etag".to_string()),
+        };
+
+        assert!(recovery_sidecar_exactly_owns_canonical_main_base_head(
+            &sidecar,
+            pin.identity,
+            &pin.table_path,
+            &selected,
+            &observed,
+        ));
+
+        assert!(
+            !recovery_sidecar_exactly_owns_canonical_main_base_head(
+                &sidecar,
+                pin.identity,
+                &pin.table_path,
+                &selected,
+                &selected,
+            ),
+            "an Armed no-effect sidecar does not explain movement"
+        );
+
+        let mut foreign = observed.clone();
+        foreign.transaction_uuid = "foreign-transaction".to_string();
+        assert!(!recovery_sidecar_exactly_owns_canonical_main_base_head(
+            &sidecar,
+            pin.identity,
+            &pin.table_path,
+            &selected,
+            &foreign,
+        ));
+
+        let mut buried = observed.clone();
+        buried.table_version = 7;
+        assert!(!recovery_sidecar_exactly_owns_canonical_main_base_head(
+            &sidecar,
+            pin.identity,
+            &pin.table_path,
+            &selected,
+            &buried,
+        ));
+
+        assert!(!recovery_sidecar_exactly_owns_canonical_main_base_head(
+            &sidecar,
+            pin.identity,
+            "memory://another-graph/nodes/people.lance",
+            &selected,
+            &observed,
+        ));
+
+        let mut named = sidecar.clone();
+        named.branch = Some("feature".to_string());
+        named.tables[0].table_branch = Some("feature".to_string());
+        assert!(!recovery_sidecar_exactly_owns_canonical_main_base_head(
+            &named,
+            pin.identity,
+            &pin.table_path,
+            &selected,
+            &observed,
+        ));
+    }
+
+    #[test]
+    fn exact_recovery_base_head_ownership_ignores_graph_global_metadata_sidecars() {
+        let (sidecar, _) = stream_claim_sidecar_v14();
+        let identity = test_identity("node:Person");
+        let selected = CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 5,
+            transaction_uuid: "prior-transaction".to_string(),
+            manifest_e_tag: None,
+        };
+        let observed = CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 6,
+            transaction_uuid: "foreign-transaction".to_string(),
+            manifest_e_tag: None,
+        };
+
+        assert!(sidecar.writer_kind.is_graph_global_barrier());
+        assert!(!recovery_sidecar_exactly_owns_canonical_main_base_head(
+            &sidecar,
+            identity,
+            "memory://test-graph/nodes/people.lance",
+            &selected,
+            &observed,
+        ));
+    }
+
+    #[test]
+    fn exact_recovery_base_head_ownership_accepts_only_the_fold_plan_at_n_plus_one() {
+        let sidecar = stream_fold_sidecar_v14(false);
+        let pin = &sidecar.tables[0];
+        let protocol = stream_fold_protocol_v14(&sidecar);
+        let selected = protocol.prior_lifecycle.current_head_witness.clone();
+        let observed = CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: selected.table_version + 1,
+            transaction_uuid: protocol.base.planned_transaction.uuid.clone(),
+            manifest_e_tag: Some("fold-etag".to_string()),
+        };
+
+        assert!(recovery_sidecar_exactly_owns_canonical_main_base_head(
+            &sidecar,
+            pin.identity,
+            &pin.table_path,
+            &selected,
+            &observed,
+        ));
+
+        let mut unrelated = observed.clone();
+        unrelated.transaction_uuid = "ffffffff-ffff-4fff-8fff-ffffffffffff".to_string();
+        assert!(!recovery_sidecar_exactly_owns_canonical_main_base_head(
+            &sidecar,
+            pin.identity,
+            &pin.table_path,
+            &selected,
+            &unrelated,
+        ));
+
+        let mut later = observed.clone();
+        later.table_version += 1;
+        assert!(!recovery_sidecar_exactly_owns_canonical_main_base_head(
+            &sidecar,
+            pin.identity,
+            &pin.table_path,
+            &selected,
+            &later,
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_recovery_base_head_ownership_proves_armed_sealed_create_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sidecar, _) = stream_sealed_ensure_indices_sidecar_v16_fixture();
+        let table_location = crate::db::manifest::table_path_for_identity(
+            &sidecar.tables[0].table_key,
+            sidecar.tables[0].identity,
+        )
+        .unwrap();
+        let uri = format!("{}/{table_location}", dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
+        let mut dataset = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        for (id, age) in [("bob", 25), ("carol", 40), ("dave", 35), ("eve", 28)] {
+            store
+                .append_batch(&uri, &mut dataset, person_batch(&[(id, Some(age))]))
+                .await
+                .unwrap();
+        }
+        let selected = capture_current_head_witness(&dataset).await.unwrap();
+        assert_eq!(selected.table_version, 5);
+        let Some(RecoveryProtocolV16::StreamSealedEnsureIndices(overlay)) =
+            sidecar.protocol_v16.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        overlay.prior_lifecycles[0].current_head_witness = selected.clone();
+        overlay.prior_lifecycles[0]
+            .sealed_proof
+            .as_mut()
+            .unwrap()
+            .base_current_head_witness = selected.clone();
+
+        let staged = store
+            .stage_create_indices(
+                &dataset,
+                &[IndexBuildSpec::BTree {
+                    column: "id".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        let planned = staged.transaction_identity();
+        sidecar.tables[0].table_path = uri.clone();
+        sidecar.protocol_v8.as_mut().unwrap().effects[0].planned_transaction = planned.clone();
+        validate_sidecar_shape("<armed-sealed-index-status>", &sidecar).unwrap();
+
+        let (indexed, committed) = store
+            .commit_staged_exact(Arc::new(dataset), staged)
+            .await
+            .unwrap();
+        assert_eq!(committed, planned);
+        let observed = capture_current_head_witness(&indexed).await.unwrap();
+        assert!(
+            super::recovery_sidecar_exactly_owns_canonical_main_base_head(
+                &sidecar,
+                sidecar.tables[0].identity,
+                &uri,
+                &selected,
+                &observed,
+                &indexed,
+            )
+            .await
+            .unwrap(),
+            "an Armed SEALED maintenance sidecar must own its exact post-CreateIndex HEAD before confirmation"
+        );
+
+        let table_key = sidecar.tables[0].table_key.clone();
+        sidecar
+            .protocol_v8
+            .as_mut()
+            .unwrap()
+            .rollback_audit_outcomes = Some(vec![TableOutcome {
+            table_key,
+            from_version: observed.table_version,
+            to_version: selected.table_version,
+        }]);
+        validate_sidecar_shape("<sealed-index-rollback-plan>", &sidecar).unwrap();
+        let mut ordinary = sidecar.clone();
+        ordinary.schema_version = IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION;
+        ordinary.writer_kind = SidecarKind::EnsureIndices;
+        ordinary.protocol_v16 = None;
+        validate_sidecar_shape("<ordinary-index-rollback-plan>", &ordinary).unwrap();
+
+        restore_table_to_version(&uri, None, selected.table_version)
+            .await
+            .unwrap();
+        let compensated = Dataset::open(&uri).await.unwrap();
+        let compensated_head = capture_current_head_witness(&compensated).await.unwrap();
+        for candidate in [&sidecar, &ordinary] {
+            assert!(
+                super::recovery_sidecar_exactly_owns_canonical_main_base_head(
+                    candidate,
+                    candidate.tables[0].identity,
+                    &uri,
+                    &selected,
+                    &compensated_head,
+                    &compensated,
+                )
+                .await
+                .unwrap(),
+                "{:?} must retain exact ownership while its CreateIndex rollback Restore awaits publication",
+                candidate.writer_kind
+            );
+        }
     }
 
     fn stream_enrollment_sidecar_v10() -> RecoverySidecar {
@@ -28721,6 +29928,56 @@ mod tests {
             listed[0].schema_version,
             IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
         );
+
+        let sidecar_bytes = u64::try_from(
+            storage
+                .read_text(&sidecar_uri(root, &sidecar.operation_id))
+                .await
+                .unwrap()
+                .len(),
+        )
+        .unwrap();
+        let count_error = list_sidecars_bounded(
+            root,
+            &storage,
+            ListDirBounds {
+                max_matching_entries: 0,
+                max_irrelevant_entries: usize::MAX,
+                max_uri_bytes: u64::MAX,
+            },
+            sidecar_bytes + 1,
+            sidecar_bytes + 1,
+        )
+        .await
+        .expect_err("the bounded status inventory must reject excess sidecars before reads");
+        assert!(matches!(
+            count_error,
+            OmniError::ResourceLimitExceeded { ref resource, limit: 0, actual: 1 }
+                if resource == "storage_list_matching_entries"
+        ));
+
+        let one_sidecar = ListDirBounds {
+            max_matching_entries: 1,
+            max_irrelevant_entries: usize::MAX,
+            max_uri_bytes: u64::MAX,
+        };
+        let object_error = list_sidecars_bounded(root, &storage, one_sidecar, 1, u64::MAX - 1)
+            .await
+            .expect_err("one oversized sidecar must use the bounded storage reader");
+        assert!(matches!(
+            object_error,
+            OmniError::ResourceLimitExceeded { ref resource, limit: 1, actual: 2 }
+                if resource == "storage_text_bytes"
+        ));
+
+        let total_error = list_sidecars_bounded(root, &storage, one_sidecar, sidecar_bytes + 1, 1)
+            .await
+            .expect_err("the bounded status inventory must cap cumulative sidecar bytes");
+        assert!(matches!(
+            total_error,
+            OmniError::ResourceLimitExceeded { ref resource, limit: 1, actual }
+                if resource == "stream_recovery_sidecar_bytes" && actual > 1
+        ));
     }
 
     #[test]
@@ -29344,7 +30601,10 @@ mod tests {
     #[tokio::test]
     async fn exact_effect_observation_recognizes_interrupted_rollback_restore() {
         let dir = tempfile::tempdir().unwrap();
-        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let identity = test_identity("node:Person");
+        let table_location =
+            crate::db::manifest::table_path_for_identity("node:Person", identity).unwrap();
+        let uri = format!("{}/{table_location}", dir.path().to_str().unwrap());
         let store = TableStore::new(
             dir.path().to_str().unwrap(),
             Arc::new(lance::session::Session::default()),
@@ -29352,6 +30612,7 @@ mod tests {
         let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
             .await
             .unwrap();
+        let selected_head = capture_current_head_witness(&ds).await.unwrap();
         let staged = store
             .stage_append(&ds, person_batch(&[("bob", Some(25))]), &[])
             .await
@@ -29364,6 +30625,26 @@ mod tests {
         assert_eq!(observed, planned);
         assert_eq!(committed.version().version, 2);
 
+        let mut sidecar = occ_sidecar();
+        sidecar.tables[0] = SidecarTablePin {
+            identity,
+            table_key: "node:Person".to_string(),
+            table_path: uri.clone(),
+            expected_version: selected_head.table_version,
+            post_commit_pin: committed.version().version,
+            confirmed_version: None,
+            table_branch: None,
+        };
+        let protocol = sidecar.protocol_v3.as_mut().unwrap();
+        protocol.effects[0].planned_transaction = planned.clone();
+        protocol.intended_delta.table_updates[0].expected_version = selected_head.table_version;
+        protocol.rollback_audit_outcomes = Some(vec![TableOutcome {
+            table_key: "node:Person".to_string(),
+            from_version: committed.version().version,
+            to_version: selected_head.table_version,
+        }]);
+        validate_sidecar_shape("<interrupted-occ-compensation>", &sidecar).unwrap();
+
         // Model Full recovery crashing after Dataset::restore but before the
         // restored HEAD is published to __manifest.
         restore_table_to_version(&uri, None, 1).await.unwrap();
@@ -29374,6 +30655,48 @@ mod tests {
         assert_eq!(
             observation.effect_ownership,
             EffectOwnership::OwnCompensatedAtHead
+        );
+        let compensated = Dataset::open(&uri).await.unwrap();
+        let observed_head = capture_current_head_witness(&compensated).await.unwrap();
+        for writer_kind in [SidecarKind::Mutation, SidecarKind::Load] {
+            let mut candidate = sidecar.clone();
+            candidate.writer_kind = writer_kind;
+            validate_sidecar_shape("<interrupted-occ-compensation-kind>", &candidate).unwrap();
+            assert!(
+                super::recovery_sidecar_exactly_owns_canonical_main_base_head(
+                    &candidate,
+                    candidate.tables[0].identity,
+                    &uri,
+                    &selected_head,
+                    &observed_head,
+                    &compensated,
+                )
+                .await
+                .unwrap(),
+                "{writer_kind:?} must retain exact ownership while its rollback Restore awaits manifest publication"
+            );
+        }
+        let mut wrong_plan = sidecar.clone();
+        wrong_plan
+            .protocol_v3
+            .as_mut()
+            .unwrap()
+            .rollback_audit_outcomes
+            .as_mut()
+            .unwrap()[0]
+            .from_version -= 1;
+        assert!(
+            !super::recovery_sidecar_exactly_owns_canonical_main_base_head(
+                &wrong_plan,
+                wrong_plan.tables[0].identity,
+                &uri,
+                &selected_head,
+                &observed_head,
+                &compensated,
+            )
+            .await
+            .unwrap(),
+            "a Restore must match the durable pre-compensation audit source"
         );
 
         // A later/foreign Restore is not proof that recovery compensated to
@@ -29392,9 +30715,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_apply_status_recognizes_exact_interrupted_rollback_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_identity("node:Person");
+        let table_location =
+            crate::db::manifest::table_path_for_identity("node:Person", identity).unwrap();
+        let uri = format!("{}/{table_location}", dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
+        let dataset = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        let selected_head = capture_current_head_witness(&dataset).await.unwrap();
+        let staged = store
+            .stage_append(&dataset, person_batch(&[("bob", Some(25))]), &[])
+            .await
+            .unwrap();
+        let planned = staged.transaction_identity();
+        let (committed, committed_identity) = store
+            .commit_staged_exact(Arc::new(dataset), staged)
+            .await
+            .unwrap();
+        assert_eq!(committed_identity, planned);
+        let achieved_head = capture_current_head_witness(&committed).await.unwrap();
+        let update = RecoveryConfirmedTableUpdate {
+            table_version: achieved_head.table_version,
+            table_branch: None,
+            row_count: 2,
+            version_metadata: test_version_metadata(),
+        };
+        let mut sidecar = new_schema_apply_sidecar_v9(
+            Some("act-schema".to_string()),
+            vec![SidecarTablePin {
+                identity,
+                table_key: "node:Person".to_string(),
+                table_path: uri.clone(),
+                expected_version: selected_head.table_version,
+                post_commit_pin: achieved_head.table_version,
+                confirmed_version: None,
+                table_branch: None,
+            }],
+            RecoveryAuthorityToken {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                graph_head: Some("01H000000000000000000000SA".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
+                schema_ir_hash: "accepted-schema".to_string(),
+                schema_identity_version: 1,
+            },
+            RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000SB".to_string(),
+                branch: None,
+                actor_id: Some("act-schema".to_string()),
+                merged_parent_commit_id: None,
+                created_at: 901,
+                stream_fold_attribution_v2: None,
+            },
+            vec![RecoverySchemaApplyEffect {
+                identity,
+                table_key: "node:Person".to_string(),
+                kind: RecoverySchemaApplyEffectKind::ExistingOverwrite {
+                    planned_transaction: planned.clone(),
+                    confirmed_transaction: None,
+                },
+            }],
+            RecoveryManifestDelta {
+                table_updates: vec![RecoveryTableUpdateSlot {
+                    identity,
+                    table_key: "node:Person".to_string(),
+                    expected_version: selected_head.table_version,
+                    table_branch: None,
+                    confirmed: None,
+                }],
+                registrations: Vec::new(),
+                renames: Vec::new(),
+                tombstones: Vec::new(),
+            },
+            "target-schema".to_string(),
+        )
+        .unwrap();
+        sidecar.tables[0].confirmed_version = Some(achieved_head.table_version);
+        let protocol = sidecar.protocol_v7.as_mut().unwrap();
+        protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+        let RecoverySchemaApplyEffectKind::ExistingOverwrite {
+            confirmed_transaction,
+            ..
+        } = &mut protocol.effects[0].kind
+        else {
+            unreachable!();
+        };
+        *confirmed_transaction = Some(planned);
+        protocol.intended_delta.table_updates[0].confirmed = Some(update);
+        protocol.rollback_audit_outcomes = Some(vec![TableOutcome {
+            table_key: "node:Person".to_string(),
+            from_version: achieved_head.table_version,
+            to_version: selected_head.table_version,
+        }]);
+        validate_sidecar_shape("<interrupted-schema-compensation>", &sidecar).unwrap();
+
+        restore_table_to_version(&uri, None, selected_head.table_version)
+            .await
+            .unwrap();
+        let compensated = Dataset::open(&uri).await.unwrap();
+        let observed_head = capture_current_head_witness(&compensated).await.unwrap();
+        assert!(
+            super::recovery_sidecar_exactly_owns_canonical_main_base_head(
+                &sidecar,
+                identity,
+                &uri,
+                &selected_head,
+                &observed_head,
+                &compensated,
+            )
+            .await
+            .unwrap(),
+            "EffectsConfirmed SchemaApply recovery must own its exact Restore until rollback publication"
+        );
+    }
+
+    #[tokio::test]
     async fn branch_merge_v4_proves_exact_chain_and_interrupted_compensation() {
         let dir = tempfile::tempdir().unwrap();
-        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let identity = test_identity("node:Person");
+        let table_location =
+            crate::db::manifest::table_path_for_identity("node:Person", identity).unwrap();
+        let uri = format!("{}/{table_location}", dir.path().to_str().unwrap());
         let store = TableStore::new(
             dir.path().to_str().unwrap(),
             Arc::new(lance::session::Session::default()),
@@ -29402,6 +30848,7 @@ mod tests {
         let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
             .await
             .unwrap();
+        let selected_head = capture_current_head_witness(&ds).await.unwrap();
 
         let first_staged = store
             .stage_append(&ds, person_batch(&[("bob", Some(25))]), &[])
@@ -29425,6 +30872,7 @@ mod tests {
             .unwrap();
         assert_eq!(second_committed, second_planned);
         assert_eq!(after_second.version().version, 3);
+        let achieved_head = capture_current_head_witness(&after_second).await.unwrap();
 
         let observation = BranchMergeRefObservation {
             dataset: after_second.clone(),
@@ -29442,6 +30890,80 @@ mod tests {
         assert!(proof.unsafe_reason.is_none());
         drop(observation);
         drop(after_second);
+
+        let mut sidecar = new_branch_merge_sidecar_v9(
+            None,
+            Some("act-merge".to_string()),
+            vec![SidecarTablePin {
+                identity,
+                table_key: "node:Person".to_string(),
+                table_path: uri.clone(),
+                expected_version: selected_head.table_version,
+                post_commit_pin: selected_head.table_version + 1,
+                confirmed_version: None,
+                table_branch: None,
+            }],
+            RecoveryAuthorityToken {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                graph_head: Some("01H000000000000000000000C0".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
+                schema_ir_hash: "schema-hash".to_string(),
+                schema_identity_version: 1,
+            },
+            RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000C1".to_string(),
+                branch: None,
+                actor_id: Some("act-merge".to_string()),
+                merged_parent_commit_id: Some("01H000000000000000000000C2".to_string()),
+                created_at: 902,
+                stream_fold_attribution_v2: None,
+            },
+            vec![RecoveryBranchMergeEffect {
+                identity,
+                table_key: "node:Person".to_string(),
+                kind: RecoveryBranchMergeEffectKind::MultiCommitHead {
+                    source_fork_version: None,
+                    planned_transactions: planned.clone(),
+                    confirmed_version: None,
+                    confirmed_branch_identifier: None,
+                },
+            }],
+            RecoveryManifestDelta {
+                table_updates: vec![RecoveryTableUpdateSlot {
+                    identity,
+                    table_key: "node:Person".to_string(),
+                    expected_version: selected_head.table_version,
+                    table_branch: None,
+                    confirmed: None,
+                }],
+                registrations: Vec::new(),
+                renames: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        )
+        .unwrap();
+        sidecar.tables[0].confirmed_version = Some(achieved_head.table_version);
+        let protocol = sidecar.protocol_v4.as_mut().unwrap();
+        protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+        let RecoveryBranchMergeEffectKind::MultiCommitHead {
+            confirmed_version, ..
+        } = &mut protocol.effects[0].kind
+        else {
+            unreachable!();
+        };
+        *confirmed_version = Some(achieved_head.table_version);
+        protocol.intended_delta.table_updates[0].confirmed = Some(RecoveryConfirmedTableUpdate {
+            table_version: achieved_head.table_version,
+            table_branch: None,
+            row_count: 3,
+            version_metadata: test_version_metadata(),
+        });
+        protocol.rollback_audit_outcomes = Some(vec![TableOutcome {
+            table_key: "node:Person".to_string(),
+            from_version: achieved_head.table_version,
+            to_version: selected_head.table_version,
+        }]);
+        validate_sidecar_shape("<confirmed-branch-merge-rollback>", &sidecar).unwrap();
 
         // Model Full recovery crashing after it appended Restore(v1), before
         // it could publish that compensated HEAD through the manifest.
@@ -29463,6 +30985,22 @@ mod tests {
         );
         assert!(!proof.full_effect_at_head);
         assert!(proof.unsafe_reason.is_none());
+        let compensated_head = capture_current_head_witness(&observation.dataset)
+            .await
+            .unwrap();
+        assert!(
+            super::recovery_sidecar_exactly_owns_canonical_main_base_head(
+                &sidecar,
+                identity,
+                &uri,
+                &selected_head,
+                &compensated_head,
+                &observation.dataset,
+            )
+            .await
+            .unwrap(),
+            "EffectsConfirmed BranchMerge recovery must own its exact Restore until rollback publication"
+        );
     }
 
     #[tokio::test]
@@ -29503,7 +31041,10 @@ mod tests {
     #[tokio::test]
     async fn branch_merge_v4_accepts_only_one_derived_index_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let identity = test_identity("node:Person");
+        let table_location =
+            crate::db::manifest::table_path_for_identity("node:Person", identity).unwrap();
+        let uri = format!("{}/{table_location}", dir.path().to_str().unwrap());
         let store = TableStore::new(
             dir.path().to_str().unwrap(),
             Arc::new(lance::session::Session::default()),
@@ -29511,6 +31052,7 @@ mod tests {
         let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
             .await
             .unwrap();
+        let selected = capture_current_head_witness(&ds).await.unwrap();
         let staged = store
             .stage_append(&ds, person_batch(&[("bob", Some(25))]), &[])
             .await
@@ -29553,6 +31095,94 @@ mod tests {
         assert!(proof.full_effect_at_head);
         drop(observation);
 
+        let mut sidecar = new_branch_merge_sidecar_v9(
+            None,
+            Some("act-merge".to_string()),
+            vec![SidecarTablePin {
+                identity,
+                table_key: "node:Person".to_string(),
+                table_path: uri.clone(),
+                expected_version: selected.table_version,
+                post_commit_pin: selected.table_version + 1,
+                confirmed_version: None,
+                table_branch: None,
+            }],
+            RecoveryAuthorityToken {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                graph_head: Some("01H000000000000000000000M0".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
+                schema_ir_hash: "schema-hash".to_string(),
+                schema_identity_version: 1,
+            },
+            RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000M1".to_string(),
+                branch: None,
+                actor_id: Some("act-merge".to_string()),
+                merged_parent_commit_id: Some("01H000000000000000000000M2".to_string()),
+                created_at: 900,
+                stream_fold_attribution_v2: None,
+            },
+            vec![RecoveryBranchMergeEffect {
+                identity,
+                table_key: "node:Person".to_string(),
+                kind: RecoveryBranchMergeEffectKind::MultiCommitHead {
+                    source_fork_version: None,
+                    planned_transactions: vec![planned.clone()],
+                    confirmed_version: None,
+                    confirmed_branch_identifier: None,
+                },
+            }],
+            RecoveryManifestDelta {
+                table_updates: vec![RecoveryTableUpdateSlot {
+                    identity,
+                    table_key: "node:Person".to_string(),
+                    expected_version: selected.table_version,
+                    table_branch: None,
+                    confirmed: None,
+                }],
+                registrations: Vec::new(),
+                renames: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        )
+        .unwrap();
+        let observed = capture_current_head_witness(&after_one_index)
+            .await
+            .unwrap();
+        let confirmed_update = RecoveryConfirmedTableUpdate {
+            table_version: observed.table_version,
+            table_branch: None,
+            row_count: 2,
+            version_metadata: test_version_metadata(),
+        };
+        {
+            let protocol = sidecar.protocol_v4.as_mut().unwrap();
+            protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+            let RecoveryBranchMergeEffectKind::MultiCommitHead {
+                confirmed_version, ..
+            } = &mut protocol.effects[0].kind
+            else {
+                unreachable!();
+            };
+            *confirmed_version = Some(observed.table_version);
+            protocol.intended_delta.table_updates[0].confirmed = Some(confirmed_update);
+        }
+        sidecar.tables[0].confirmed_version = Some(observed.table_version);
+        validate_sidecar_shape("<confirmed-merge-index-tail-status>", &sidecar).unwrap();
+        assert!(
+            super::recovery_sidecar_exactly_owns_canonical_main_base_head(
+                &sidecar,
+                identity,
+                &uri,
+                &selected,
+                &observed,
+                &after_one_index,
+            )
+            .await
+            .unwrap(),
+            "the confirmed merge owns its one supported derived CreateIndex tail"
+        );
+
         let second_index = store
             .stage_create_indices(
                 &after_one_index,
@@ -29566,6 +31196,22 @@ mod tests {
             .commit_staged_exact(Arc::new(after_one_index), second_index)
             .await
             .unwrap();
+        let observed_after_two_indices = capture_current_head_witness(&after_two_indices)
+            .await
+            .unwrap();
+        assert!(
+            !super::recovery_sidecar_exactly_owns_canonical_main_base_head(
+                &sidecar,
+                identity,
+                &uri,
+                &selected,
+                &observed_after_two_indices,
+                &after_two_indices,
+            )
+            .await
+            .unwrap(),
+            "a second derived CreateIndex tail is not owned by BranchMerge"
+        );
         let observation = BranchMergeRefObservation {
             version: after_two_indices.version().version,
             branch_identifier: after_two_indices.branch_identifier().await.unwrap(),
@@ -29629,6 +31275,11 @@ node Person {
         let winner_snapshot = db.snapshot_of("main").await.unwrap();
         let winner_version = winner_snapshot.entry("node:Person").unwrap().table_version;
         assert_eq!(winner_version, planned.read_version + 1);
+        let winner_head = capture_current_head_witness(
+            &winner_snapshot.open_dataset("node:Person").await.unwrap(),
+        )
+        .await
+        .unwrap();
 
         let authority = RecoveryAuthorityToken {
             branch_identifier: txn.authority.branch_identifier.clone(),
@@ -29645,7 +31296,7 @@ node Person {
             created_at: lineage.created_at,
             stream_fold_attribution_v2: None,
         };
-        let sidecar = new_occ_sidecar_v9(
+        let mut sidecar = new_occ_sidecar_v9(
             SidecarKind::Mutation,
             None,
             None,
@@ -29677,7 +31328,21 @@ node Person {
             winner_version + 1,
             "the stale transaction must reproduce Lance's expected+2 preflight rebase"
         );
+        let own_head = rebased.version().version;
         drop(rebased);
+        sidecar
+            .protocol_v3
+            .as_mut()
+            .unwrap()
+            .rollback_audit_outcomes = Some(vec![TableOutcome {
+            table_key: "node:Person".to_string(),
+            from_version: own_head,
+            to_version: winner_version,
+        }]);
+        validate_sidecar_shape("<preflight-rebase-rollback-plan>", &sidecar).unwrap();
+        write_sidecar(root, db.storage_adapter(), &sidecar)
+            .await
+            .unwrap();
 
         // Model a first Full recovery pass that correctly compensates the
         // stale v3 effect to the CURRENT manifest pin v2, then crashes before
@@ -29699,6 +31364,23 @@ node Person {
         assert_eq!(
             compensated.effect_ownership,
             EffectOwnership::OwnCompensatedAtHead
+        );
+        let compensated_dataset = Dataset::open(&table_uri).await.unwrap();
+        let compensated_head = capture_current_head_witness(&compensated_dataset)
+            .await
+            .unwrap();
+        assert!(
+            super::recovery_sidecar_exactly_owns_canonical_main_base_head(
+                &sidecar,
+                entry.identity,
+                &table_uri,
+                &winner_head,
+                &compensated_head,
+                &compensated_dataset,
+            )
+            .await
+            .unwrap(),
+            "the durable rollback plan must attribute a compensated rebase even when its original pin predates the selected winner"
         );
 
         drop(txn);
@@ -31197,6 +32879,106 @@ query delete_person($name: String) {
                 .unwrap_err()
                 .to_string()
                 .contains("exact pre-Restore observation")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_sealed_optimize_status_recognizes_exact_interrupted_rollback_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sidecar, _) = stream_sealed_optimize_sidecar_v17_fixture();
+        let table_location = crate::db::manifest::table_path_for_identity(
+            &sidecar.tables[0].table_key,
+            sidecar.tables[0].identity,
+        )
+        .unwrap();
+        let uri = format!("{}/{table_location}", dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
+        let expected_version = sidecar.tables[0].expected_version;
+        let mut dataset = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        while dataset.version().version < expected_version {
+            let id = format!("seed-{}", dataset.version().version);
+            store
+                .append_batch(&uri, &mut dataset, person_batch(&[(&id, Some(20))]))
+                .await
+                .unwrap();
+        }
+        let selected_head = capture_current_head_witness(&dataset).await.unwrap();
+        assert_eq!(selected_head.table_version, expected_version);
+        sidecar.tables[0].table_path = uri.clone();
+        {
+            let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+                sidecar.protocol_v17.as_deref_mut()
+            else {
+                unreachable!();
+            };
+            protocol.prior_lifecycles[0].current_head_witness = selected_head.clone();
+            protocol.prior_lifecycles[0]
+                .sealed_proof
+                .as_mut()
+                .unwrap()
+                .base_current_head_witness = selected_head.clone();
+        }
+
+        store
+            .append_batch(
+                &uri,
+                &mut dataset,
+                person_batch(&[("optimize-output", Some(40))]),
+            )
+            .await
+            .unwrap();
+        let effect_head = capture_current_head_witness(&dataset).await.unwrap();
+        let table_key = sidecar.tables[0].table_key.clone();
+        let Some(RecoveryProtocolV17::StreamSealedOptimize(protocol)) =
+            sidecar.protocol_v17.as_deref_mut()
+        else {
+            unreachable!();
+        };
+        protocol.rollback_audit_outcomes = Some(vec![TableOutcome {
+            table_key,
+            from_version: effect_head.table_version,
+            to_version: selected_head.table_version,
+        }]);
+        validate_sidecar_shape("<v17-interrupted-optimize-compensation>", &sidecar).unwrap();
+
+        restore_table_to_version(&uri, None, selected_head.table_version)
+            .await
+            .unwrap();
+        let compensated = Dataset::open(&uri).await.unwrap();
+        let observed_head = capture_current_head_witness(&compensated).await.unwrap();
+        assert!(
+            super::recovery_sidecar_exactly_owns_canonical_main_base_head(
+                &sidecar,
+                sidecar.tables[0].identity,
+                &uri,
+                &selected_head,
+                &observed_head,
+                &compensated,
+            )
+            .await
+            .unwrap(),
+            "SEALED Optimize recovery must own its audit-bound Restore until rollback publication"
+        );
+
+        let mut foreign_selected = selected_head;
+        foreign_selected.transaction_uuid = "79797979-7979-4979-8979-797979797979".to_string();
+        assert!(
+            !super::recovery_sidecar_exactly_owns_canonical_main_base_head(
+                &sidecar,
+                sidecar.tables[0].identity,
+                &uri,
+                &foreign_selected,
+                &observed_head,
+                &compensated,
+            )
+            .await
+            .unwrap(),
+            "v17 compensation must remain bound to its exact prior lifecycle witness"
         );
     }
 

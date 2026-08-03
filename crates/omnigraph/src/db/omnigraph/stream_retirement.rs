@@ -28,8 +28,9 @@ use crate::db::manifest::stream_token::StreamTerminalCorrection;
 use crate::db::manifest::stream_token::{
     AUTHORITY_RETIREMENT_RECEIPT_V2_TAG, AuthorityRetirementReceiptV2,
     StreamDeadLetterObjectDescriptor, StreamDeadLetterReasonCode, StreamDeadLetterTerminalEvidence,
-    StreamTokenDisposition, TrustedStreamRowMetadata, decode_trusted_stream_metadata,
-    stream_authority_retirement_token_witness_digest_v2, validate_authority_base_pair,
+    StreamTokenAuthorityRow, StreamTokenDisposition, TrustedStreamRowMetadata,
+    decode_trusted_stream_metadata, stream_authority_retirement_token_witness_digest_v2,
+    validate_authority_base_pair,
 };
 #[cfg(feature = "failpoints")]
 use crate::db::manifest::token_store::stage_stream_token_upsert;
@@ -66,6 +67,7 @@ const DEAD_LETTER_PAGE_ENVELOPE_BYTES: usize = 64 * 1024;
 const DEAD_LETTER_CURSOR_MAX_DECODED_BYTES: usize = 4 * 1024;
 const DEAD_LETTER_CURSOR_MAX_ENCODED_BYTES: usize =
     DEAD_LETTER_CURSOR_MAX_DECODED_BYTES.div_ceil(3) * 4;
+const MAX_STREAM_TERMINAL_TOKEN_SAMPLE_ROWS: usize = 16;
 
 /// Complete in-process full-root cut envelope shared by authority retirement
 /// and checked stream-aware export capture. The checked cluster guard remains
@@ -1330,6 +1332,9 @@ impl Omnigraph {
         snapshot: &crate::db::Snapshot,
         receipt: &StreamAuthorityRetirementExportReceipt,
     ) -> Result<()> {
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::STREAM_RETIREMENT_RECEIPT_VALIDATE,
+        )?;
         receipt.validate()?;
         let schema_state =
             super::read_schema_state_identity(self.root_uri(), self.storage_adapter()).await?;
@@ -1952,10 +1957,29 @@ pub(crate) fn retirement_export_cut_digest(
     Ok(finish_digest(cut))
 }
 
-async fn validate_current_token_base_parity_and_counts(
+/// One bounded diagnostic projection produced by the same full parity walk
+/// retirement already trusts. Keeping the terminal sample in this pass avoids
+/// making operational status scan the current-token authority twice.
+pub(super) struct CurrentTokenBaseParityStatus {
+    pub(super) present_count: u64,
+    pub(super) withdrawn_count: u64,
+    pub(super) dead_lettered_count: u64,
+    pub(super) terminal_sample: Vec<StreamTokenAuthorityRow>,
+    pub(super) terminal_sample_has_more: bool,
+}
+
+pub(super) async fn inspect_current_token_base_parity(
     db: &Omnigraph,
     snapshot: &crate::db::Snapshot,
-) -> Result<(u64, u64, u64)> {
+    terminal_sample_limit: usize,
+) -> Result<CurrentTokenBaseParityStatus> {
+    if terminal_sample_limit > MAX_STREAM_TERMINAL_TOKEN_SAMPLE_ROWS {
+        return Err(OmniError::resource_limit(
+            "stream_terminal_token_sample_rows",
+            MAX_STREAM_TERMINAL_TOKEN_SAMPLE_ROWS as u64,
+            u64::try_from(terminal_sample_limit).unwrap_or(u64::MAX),
+        ));
+    }
     let token_authority = snapshot.stream_token_authority();
     if token_authority
         .current_head_witness
@@ -1971,6 +1995,9 @@ async fn validate_current_token_base_parity_and_counts(
     let mut present_token_count = 0_u64;
     let mut withdrawn_token_count = 0_u64;
     let mut dead_lettered_token_count = 0_u64;
+    let mut terminal_sample =
+        BTreeMap::<(TableIdentity, String), (StreamTokenAuthorityRow, u64)>::new();
+    let mut terminal_sample_retained_bytes = 0_u64;
     while let Some(batch) = batches
         .try_next()
         .await
@@ -2034,6 +2061,55 @@ async fn validate_current_token_base_parity_and_counts(
                         })?;
                 }
             }
+            if terminal_sample_limit != 0
+                && matches!(
+                    row.disposition,
+                    StreamTokenDisposition::Withdrawn | StreamTokenDisposition::DeadLettered
+                )
+            {
+                let retained_bytes = row
+                    .lookup_retained_bytes()
+                    .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+                let key = (row.identity, row.logical_id.clone());
+                if terminal_sample
+                    .insert(key, (row.clone(), retained_bytes))
+                    .is_some()
+                {
+                    return Err(OmniError::manifest_internal(
+                        "stream terminal-token sample found duplicate current authority",
+                    ));
+                }
+                terminal_sample_retained_bytes = terminal_sample_retained_bytes
+                    .checked_add(retained_bytes)
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "stream terminal-token retained-byte count overflow",
+                        )
+                    })?;
+                while terminal_sample.len() > terminal_sample_limit {
+                    let (_, (_, removed_bytes)) = terminal_sample.pop_last().ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "stream terminal-token bounded selection lost its largest row",
+                        )
+                    })?;
+                    terminal_sample_retained_bytes = terminal_sample_retained_bytes
+                        .checked_sub(removed_bytes)
+                        .ok_or_else(|| {
+                            OmniError::manifest_internal(
+                                "stream terminal-token retained-byte count underflow",
+                            )
+                        })?;
+                }
+                if terminal_sample_retained_bytes
+                    > crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES
+                {
+                    return Err(OmniError::resource_limit(
+                        "stream_terminal_token_sample_retained_bytes",
+                        crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES,
+                        terminal_sample_retained_bytes,
+                    ));
+                }
+            }
         }
         for (identity, logical_ids) in ids_by_identity {
             let entry = snapshot
@@ -2066,10 +2142,35 @@ async fn validate_current_token_base_parity_and_counts(
         }
     }
     validate_base_to_token_parity(db, snapshot, &token_dataset).await?;
+    let terminal_count = withdrawn_token_count
+        .checked_add(dead_lettered_token_count)
+        .ok_or_else(|| OmniError::manifest_internal("terminal token count overflow"))?;
+    let terminal_sample_has_more = terminal_count
+        > u64::try_from(terminal_sample_limit)
+            .map_err(|_| OmniError::manifest_internal("terminal sample limit exceeds u64"))?;
+    let mut terminal_sample = terminal_sample
+        .into_values()
+        .map(|(row, _)| row)
+        .collect::<Vec<_>>();
+    terminal_sample.truncate(terminal_sample_limit);
+    Ok(CurrentTokenBaseParityStatus {
+        present_count: present_token_count,
+        withdrawn_count: withdrawn_token_count,
+        dead_lettered_count: dead_lettered_token_count,
+        terminal_sample,
+        terminal_sample_has_more,
+    })
+}
+
+pub(super) async fn validate_current_token_base_parity_and_counts(
+    db: &Omnigraph,
+    snapshot: &crate::db::Snapshot,
+) -> Result<(u64, u64, u64)> {
+    let status = inspect_current_token_base_parity(db, snapshot, 0).await?;
     Ok((
-        present_token_count,
-        withdrawn_token_count,
-        dead_lettered_token_count,
+        status.present_count,
+        status.withdrawn_count,
+        status.dead_lettered_count,
     ))
 }
 

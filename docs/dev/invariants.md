@@ -251,7 +251,7 @@ shared side and remain concurrent with one another.
 | Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [writes.md](writes.md), [execution.md](execution.md) |
 | Keyed writes | Every current-format node/edge table declares exact non-null physical `id` as Lance's unenforced PK from creation, using the v6-introduced and later-preserved exact-`id` fence. General production strict insert and upsert use the sealed exact-`id`, forced-v2 MergeInsert adapter; strict insert exact-probes its pinned parent before minting `omnigraph.insert_absence=v1`, while an all-new upsert may mint it only when completed effect statistics prove one attempt inserted every source row with zero updates, deletes, or skipped duplicates. Certificate admission is optional: BranchMerge uses the shortcut only when every transaction in the complete contiguous source interval carries v1 and its persisted operation is the full pure-insert `Update` shape (exact parent, no removed or updated fragments, nonempty new fragments with `physical_rows`, no field or generation rewrites, `RewriteRows`, exact-`id` filter, full nested schema preorder, and matching physical-row total). It then rechecks both source and target native ref incarnations and passes owned batches through an opaque capability whose one production mint site is structurally guarded. The proven publisher stages immutable fragments with `InsertBuilder`, replaces the uncommitted Append operation with that filter-bearing `Update`, and performs zero target preflights, target merge joins, or committed Appends. Missing, cleaned, unknown, or malformed proof uses the general ordered diff. Mutation/Load remains one keyed transaction per table and rejects more than 8,192 rows or 32 MiB before arm; BranchMerge keeps its bounded v4 chain and exact-recovery limits. Raw Lance graph writers are unsupported, and the certificate is an internal non-cryptographic capability rather than an authenticity mechanism. The final production cost gate passed at 10K (3.875× median; 24,297,472-byte max paired RSS overhead) and 100K (~3.886×; 32,604,160 bytes) | [RFC-023](../rfcs/0023-key-conflict-fencing.md), [writes.md](writes.md), [execution.md](execution.md) |
 | Deletes | Staged like inserts/updates (`stage_delete` via Lance 7.0 `DeleteBuilder::execute_uncommitted`, MR-A) — no inline HEAD advance; mixed insert/update/delete in one query rejected by D2 as a deliberate boundary (constructive XOR destructive per query; compose via separate mutations or a branch) | [query-language.md](../user/queries/index.md), [writes.md](writes.md) |
-| Streaming ingest | RFC-026 adopts Lance MemWAL and remains Draft; public row ingress is inactive. V7–v9 established enrollment, the bounded worker, compare-and-chain token authority, and exact base/token fold; v10–v18 added checked profile/lifecycle authority plus recovery-owned profile, claim, drain, resume, maintenance, rebind, retirement, and DataBlock correction. Current v19/token-schema-v3/recovery-v21 adds deterministic mixed/all-diverted folds, one bounded dead-letter object, current `DEAD_LETTERED` sequencing, ordinary-successor correction, selected-token stopped/offline inspection/export, and three-disposition retirement. F4/F5 provide the hidden caller path, resident folding, deterministic disable, and terminal diversion. F6a–F6b4 provide composition, process/lifecycle, token-cost, and production dead-letter-envelope evidence. F6b1's checked exact-version move-only export cut blocks current terminal authority and owns one nonwaiting root slot; F6b5 now connects it to the existing served HTTP/remote-CLI/OpenAPI export route with pre-header validation, incremental exact-version scans using approximate Lance targets, strict 64-KiB chunks, a complete queue-envelope/process queue reservation under a deadline, backpressure, and disconnect-safe release. The queue reservation is not a whole-response or RSS bound. Embedded/direct export of an enrolled graph still refuses; the served graph must be exact terminal `DISABLED | RETIRED`, and `RETIRED` export carries verified provenance. Checked offline disable remains the supported production quiescence owner; same-schema rebind requires terminal `DISABLED` and exact `SEALED` authority, while enrolled schema evolution uses checked export into a fresh graph. There is still no public row ingress/enrollment, general lifecycle/rebind, driver/exclusive-cut status, fresh read, or generation GC. Covered/reconciled token evidence and threshold, public status, and the remaining guardrail matrix remain open. No active path produces reserved `AuthorityBlock`, so its repair stays fail-closed. | [RFC-026](../rfcs/0026-memwal-streaming-ingest.md), [writes.md](writes.md) |
+| Streaming ingest | RFC-026 adopts Lance MemWAL and remains Draft; public row ingress is inactive. V7–v9 established enrollment, the bounded worker, compare-and-chain token authority, and exact base/token fold; v10–v18 added checked profile/lifecycle authority plus recovery-owned profile, claim, drain, resume, maintenance, rebind, retirement, and DataBlock correction. Current v19/token-schema-v3/recovery-v21 adds deterministic mixed/all-diverted folds, one bounded dead-letter object, current `DEAD_LETTERED` sequencing, ordinary-successor correction, selected-token stopped/offline inspection/export, and three-disposition retirement. F4/F5 provide the hidden caller path, resident folding, deterministic disable, and terminal diversion. F6a–F6b4 provide composition, process/lifecycle, token-cost, and production dead-letter-envelope evidence. F6b1's checked exact-version move-only export cut blocks current terminal authority and owns one nonwaiting root slot; F6b5 now connects it to the existing served HTTP/remote-CLI/OpenAPI export route with pre-header validation, incremental exact-version scans using approximate Lance targets, strict 64-KiB chunks, a complete queue-envelope/process queue reservation under a deadline, backpressure, and disconnect-safe release. The queue reservation is not a whole-response or RSS bound. F6b6 adds an engine-internal checked read-only operational cut over physical lane, token, recovery, advisory-driver, and rebuild evidence. Expensive immutable token/base parity, the bounded sample, index coverage, and selected lifecycle-ledger proofs run once without writer gates; a short second phase validates the exact selected manifest/recovery cut and repeats only mutable witnesses under root/profile/lane fences. It binds the exact runtime owner for `ENABLED`, served-export owner for terminal `DISABLED | RETIRED`, or explicit checked cluster-apply status owner for `DISABLING`. Within the hard status envelope, every pending recovery sidecar is reported and rebuild-blocking; exceeding any discovery bound refuses the whole status; only exact canonical-main recovery ownership makes physical movement explicit unavailable evidence, while overlap or unexplained movement is `StreamStatusChanged`. Cold replay, flushed LWW projection accounting, and exact oldest-uncovered age are unavailable rather than inferred. The public nonblocking `stream_status` remains manifest-only and no CLI/HTTP/OpenAPI/SDK operational-status transport exists. Embedded/direct export of an enrolled graph still refuses; the served graph must be exact terminal `DISABLED | RETIRED`, and `RETIRED` export carries verified provenance. Checked offline disable remains the supported production quiescence owner; same-schema rebind requires terminal `DISABLED` and exact `SEALED` authority, while enrolled schema evolution uses checked export into a fresh graph. There is still no public row ingress/enrollment, general lifecycle/rebind, operational-status transport, fresh read, or generation GC. Covered/reconciled token evidence and threshold plus the remaining guardrail matrix remain open. No active path produces reserved `AuthorityBlock`, so its repair stays fail-closed. | [RFC-026](../rfcs/0026-memwal-streaming-ingest.md), [writes.md](writes.md) |
 | Branch create/delete | `__manifest` `BranchContents` is the single logical authority. Lance create is physically two-phase, so OmniGraph prevalidates names, enforces path-prefix-disjoint live graph names, reclaims an absent-ref clone-only tree, and uses a bounded completion classifier; delete removes authority before tree cleanup, so an absent ref is success and derived tree reclaim may converge later. Neither control emits graph lineage. Under schema/source-target/all-table gates, each control uses one operation-local post-gate manifest/namespace capture rather than refreshing the handle-local coordinator around table-gate acquisition; successful ref movement explicitly invalidates derived read caches. Per-table forks are derived state, reclaimed best-effort with `cleanup` as backstop. A target-scoped unresolved sidecar may be made unreachable by deletion and is then audit-discarded by recovery; graph-global SchemaApply still blocks. Public create/create-from/delete also acquire the stream-export root slot nonwaitingly, preventing native named-branch delete/recreate ABA while an immutable cut is live | [branches-commits.md](../user/branching/index.md), [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md) |
 | Cleanup retention | Explicit cleanup derives exact `keep` cutoffs from Lance's available version list, caps each main-table GC cutoff at the oldest exact main version inherited by any live lazy graph branch, and refuses uncovered main HEAD drift. Lance protects native per-table branch refs itself. The graph-wide live-reference preflight fails closed before the first table GC, after which individual table failures remain fault-isolated | [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md) |
 | Optimize visibility | One operation-local accepted catalog and fresh main snapshot are planned under schema → main → all-table gates. Every productive table shares one identity-bearing v9 recovery envelope; bounded-parallel physical effects become visible through at most one monotonic manifest/lineage CAS. Complete crash residuals roll forward together and partial residuals compensate before visibility. Optimize's payload remains a bounded maintenance adapter rather than an exact caller-minted Lance transaction proof, so it is supported within the single-writer-process recovery boundary. Exact provenance is deferred until Lance exposes a stable public caller-controlled maintenance transaction API and OmniGraph has distributed recovery fencing | [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md), [RFC-022](../rfcs/0022-unified-write-path.md) |
@@ -428,9 +428,12 @@ them explicit.
   Because production still has only the genesis
   lookup index and no recovery-owned token reconciler, these cells measure the
   uncovered-tail curve and never call raw `optimize_indices` on an unselected
-  HEAD. Before public activation, status must still expose uncovered
-  count/oldest age and a lookup-cost warning; covered/reconciled evidence and a
-  recorded threshold must schedule an authority-safe reconciler. Until that
+  HEAD. F6b6's internal checked status exposes exact uncovered count when Lance
+  exposes coverage and a lookup-cost diagnostic, but reports oldest age
+  explicitly unavailable because the selected cut has no exact fragment-
+  creation timestamp. It never substitutes a graph commit or wall-clock
+  estimate. Covered/reconciled evidence and a recorded threshold must still
+  schedule an authority-safe reconciler before public activation. Until that
   threshold is crossed, the reconciler is deliberately deferred rather than a
   correctness prerequisite. This is an instrumented exception to invariant
   15, not a claim of history-flat control-plane cost.
@@ -476,9 +479,8 @@ them explicit.
   never describe physical rebind as changing accepted schema.
   Public/production rebind remains inactive.
   Public enrollment, general resume/abort and lifecycle control,
-  exclusive-cut physical status,
-  row admission, and transport parity remain required before a public
-  profile. The
+  row admission, operational-status transport, and transport parity remain
+  required before a public profile. The
   `stream_ingest` / `stream_manage` Cedar vocabulary is already registered,
   `stream_manage` gates the enablement writer, and the embedded SDK already
   exposes durable manifest-only status;
@@ -502,6 +504,23 @@ them explicit.
   typed failpoints-only process-local advisory driver snapshot and one hidden
   in-process composition; pending triggers are not backlog, stopped state is
   not offline authority, and public durable status remains manifest-only.
+  F6b6 adds a separate engine-internal checked operational cut. `ENABLED`
+  binds the served-runtime owner, terminal `DISABLED | RETIRED` binds the
+  served-export owner, and `DISABLING` binds an explicit checked cluster-apply
+  status owner rather than ambient offline authority. Every pending recovery
+  sidecar is reported and blocks rebuild within a hard status envelope: 256
+  matching direct `.json` sidecars, 256 irrelevant direct-or-nested objects
+  encountered below the prefix, 4 MiB of cumulative input-anchored URI bytes
+  across all encountered objects, 32 MiB per sidecar body, and 32 MiB of
+  cumulative bodies. Exceeding any bound is a typed resource refusal rather
+  than a partial projection. If one of those
+  sidecars exactly explains a moved physical HEAD, that lane's physical projection is explicit
+  unavailable evidence while the sidecar remains visible; unexplained movement
+  is still typed `StreamStatusChanged`. Resident accounting and a verified-
+  empty `SEALED` proof can be exact, but cold replay and flushed LWW projection
+  accounting are explicit unavailable values. Exact oldest-uncovered-token age
+  is also unavailable. The operation remains read-only, and its public
+  CLI/HTTP/OpenAPI/SDK transport is F7 work.
   F6b1 adds managed-exact or unmanaged-terminal lower/engine served-export
   authority and a doc-hidden, move-only immutable cut. An unmanaged bind is
   accepted only for `RETIRED` or enrolled `DISABLED`; retirement confirmation
@@ -540,14 +559,14 @@ them explicit.
   installed empty resume writer; that broader handoff remains later.
   Productive SchemaApply is not part of the physical-rebind authority;
   enrolled schema evolution uses checked export/rebuild into a fresh graph.
-  Public
-  driver status remains future. No active path produces
+  Public operational-status and driver transport remains future. No active
+  path produces
   `AuthorityBlock`, so its repair remains fail-closed until a producer and
   evidence grammar exist. F6b3 owns the exact-selected uncovered-token lookup
   and terminal-scan harness; F6b4 owns the isolated production-size dead-letter
   byte/capacity/timing and peak-RSS envelope. The F6b remainder still owns
-  covered/reconciled token evidence and threshold, public status, and the
-  remaining guardrail matrix;
+  covered/reconciled token evidence and threshold plus the remaining guardrail
+  matrix;
   the v19 terminal protocol itself is active behind the hidden row path.
   The exact upstream receipt and cross-process seal remain required to broaden
   topology, not to run the existing private seam inside its current process

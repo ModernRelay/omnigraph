@@ -253,6 +253,11 @@ pub mod names {
     /// and the admission lease was dropped. This is a test-only quiescence
     /// witness for deterministic replay-open races.
     pub const STREAM_B1_AFTER_RETIREMENT_RELEASE: &str = "stream_b1.after_retirement_release";
+    /// The RETIRED profile selected its immutable authority-retirement receipt,
+    /// immediately before its profile/token/logical-cut provenance is proved.
+    /// Checked operational status must traverse this same proof as export
+    /// before it can report rebuild readiness.
+    pub const STREAM_RETIREMENT_RECEIPT_VALIDATE: &str = "stream_retirement.receipt_validate";
     /// The immutable generation cut is proven and the worker retired, before
     /// the schema-v12 recovery intent is armed.
     pub const STREAM_FOLD_POST_DRAIN_PRE_SIDECAR: &str = "stream_fold.post_drain_pre_sidecar";

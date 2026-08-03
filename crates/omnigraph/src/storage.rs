@@ -12,7 +12,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
-pub use omnigraph_storage::{StorageKind, join_uri};
+pub use omnigraph_storage::{ListDirBounds, StorageKind, join_uri};
 
 #[async_trait]
 pub trait StorageAdapter: Debug + Send + Sync {
@@ -56,6 +56,15 @@ pub trait StorageAdapter: Debug + Send + Sync {
     /// of any future producer may not be) — filter by suffix, never assume
     /// every entry is yours.
     async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>>;
+    /// Stream a suffix-filtered direct-child inventory while enforcing the
+    /// supplied matching-entry, irrelevant-entry, and URI-byte bounds before
+    /// the complete backend prefix can accumulate in memory.
+    async fn list_dir_bounded(
+        &self,
+        dir_uri: &str,
+        matching_suffix: &str,
+        bounds: ListDirBounds,
+    ) -> Result<Vec<String>>;
     /// Read a text object together with its backend version token (stores
     /// with conditional-update support: the object's ETag; local: sha256 of
     /// the content). The token is opaque — valid only for
@@ -173,6 +182,21 @@ impl StorageAdapter for ObjectStorageAdapter {
 
     async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
         Ok(omnigraph_storage::StorageAdapter::list_dir(&self.inner, dir_uri).await?)
+    }
+
+    async fn list_dir_bounded(
+        &self,
+        dir_uri: &str,
+        matching_suffix: &str,
+        bounds: ListDirBounds,
+    ) -> Result<Vec<String>> {
+        Ok(omnigraph_storage::StorageAdapter::list_dir_bounded(
+            &self.inner,
+            dir_uri,
+            matching_suffix,
+            bounds,
+        )
+        .await?)
     }
 
     async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {

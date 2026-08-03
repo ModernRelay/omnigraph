@@ -370,10 +370,27 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "branch_list"),
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "list_commits"),
-    // RFC-026 status is a pure projection of one manifest snapshot: no
-    // admission lease, no recovery resolution, no publication. Registering it
-    // read-only is the structural claim that it cannot move a lifecycle.
+    // RFC-026 status surfaces are read-only. The minimal call is a pure
+    // manifest projection; the full checked cut legitimately takes exclusive
+    // admission while it observes physical authority, but never resolves
+    // recovery, opens/claims a writer, or publishes anything.
     ("db/omnigraph/stream_status.rs", "stream_status"),
+    (
+        "db/omnigraph/stream_status.rs",
+        "failpoint_stream_operational_status_for_test",
+    ),
+    (
+        "db/omnigraph/stream_status.rs",
+        "failpoint_stream_operational_status_with_deadlines_for_test",
+    ),
+    (
+        "db/omnigraph/stream_status.rs",
+        "failpoint_hold_stream_status_root_for_test",
+    ),
+    (
+        "db/omnigraph/stream_status.rs",
+        "failpoint_stream_operational_status_for_apply_for_test",
+    ),
     (
         "db/omnigraph/stream_status.rs",
         "failpoint_stream_token_lookup_for_cost_test",
@@ -635,7 +652,7 @@ macro_rules! gateway_surfaces {
 gateway_surfaces! {
     "storage.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
         "read_text", "read_text_if_exists", "read_text_if_exists_bounded", "exists",
-        "list_dir", "read_text_versioned",
+        "list_dir", "list_dir_bounded", "read_text_versioned",
     ],
     "storage.rs" => "StorageAdapter" => GatewayDisposition::Durable(WriteProtocol::Composed("object storage primitive")) => [
         "write_text", "write_text_if_absent", "rename_text", "delete",
@@ -643,7 +660,7 @@ gateway_surfaces! {
     ],
     "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
         "read_text", "read_text_if_exists", "read_text_if_exists_bounded", "exists",
-        "list_dir", "read_text_versioned",
+        "list_dir", "list_dir_bounded", "read_text_versioned",
     ],
     "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::Durable(WriteProtocol::Composed("shared object storage primitive")) => [
         "write_text", "write_text_if_absent", "rename_text", "delete",
@@ -969,6 +986,7 @@ durable_calls! {
     ("db/omnigraph/stream_ingest.rs", ".dataset()", 40, STREAM_LIFECYCLE_V14_V15_V18),
     ("db/omnigraph/stream_rebind.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/stream_retirement.rs", ".dataset()", 3, STREAM_RETIREMENT_V19_V21),
+    ("db/omnigraph/stream_status.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/stream_correction.rs", ".dataset()", 7, STREAM_CORRECTION_V20),
     ("db/omnigraph/stream_correction.rs", ".stage_stream_correction(", 1, STREAM_CORRECTION_V20),
     ("db/omnigraph/stream_ingest.rs", ".stage_stream_dead_letter_fold(", 1, STREAM_DEAD_LETTER_V21),

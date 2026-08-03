@@ -1005,6 +1005,9 @@ impl ApiError {
             | OmniError::StreamBindingChanged { .. }
             | OmniError::StreamSequenceConflict { .. }
             | OmniError::StreamIdempotencyConflict { .. }) => Self::conflict(err.to_string()),
+            err @ (OmniError::StreamStatusBusy { .. } | OmniError::StreamStatusChanged { .. }) => {
+                Self::internal(err.to_string())
+            }
             err @ OmniError::AckUnknown { .. } => Self::internal(err.to_string()),
             OmniError::RecoveryRequired {
                 operation_id,

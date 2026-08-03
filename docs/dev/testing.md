@@ -612,8 +612,21 @@ pinning both the `lifecycle_revision` compare token and the logical
 `stream_incarnation_id` that fences every row request from a prior incarnation.
 The feature-gated `stream_status` unit test deliberately makes the lifecycle's
 diagnostic alias stale and proves status resolves the current registration by
-immutable identity. `forbidden_apis.rs` classifies `stream_status` read-only —
-the structural claim that status cannot move a lifecycle.
+immutable identity. `forbidden_apis.rs` registers `stream_status` as a named
+read-only surface and direct-call-count guards constrain its visible durable
+calls. That registry is an API-shape guard, not a transitive call-graph purity
+proof; the no-manifest/no-sidecar behavior tests supply the composed evidence
+that status does not move a lifecycle.
+
+F6b6 adds a second, engine-internal operational-status owner without changing
+that manifest-only, nonblocking public projection. Its runtime and checked-
+apply failpoint seams are also registered as named read-only surfaces;
+`forbidden_apis.rs` exact-counts the one direct Lance `.dataset()` handle read
+in `stream_status.rs` and guards the named surfaces' direct durable-call shape.
+It does not prove the full composed call graph contains no publication
+primitive. The operational-status cells' unchanged manifest version and absent
+sidecar/effect assertions own that behavioral claim. Public CLI/HTTP/OpenAPI/
+SDK transport is not covered because it does not exist yet.
 
 The v11 bounded profile-authority slice extends different existing owners.
 `omnigraph-control-authority` in-source tests pin lock-derived offline
@@ -723,7 +736,8 @@ Public durable `StreamStatus` remains manifest-only. F6a itself does not cover
 OS-process forced termination, the full node+edge/fairness matrix, cost
 evidence, or maintenance/rebind/resume composition. Later F6b2 closes the named
 acceptance cells and F6b3 closes the uncovered-tail token-cost harness; the
-remaining evidence, transport, status, and guardrails keep F7 closed.
+remaining evidence, public operational-status transport, and guardrails keep
+F7 closed.
 
 ### RFC-026 F6b1 checked export-cut evidence ownership
 
@@ -774,6 +788,97 @@ remain the owner for terminal-token refusal, retired provenance, immutable-cut
 versioning, and post-start provider errors. The queue reservation covers only
 owned transport chunks, not scanner memory, a complete response, or RSS.
 
+### RFC-026 implemented F6b6 operational-status evidence ownership
+
+`memwal_stream.rs::checked_operational_status_reports_one_coherent_read_only_physical_cut`
+owns the composed status proof. It admits one row without folding, captures an
+`ENABLED` checked-runtime cut, and pins the manifest version, durable lane,
+observed/authoritative epoch relationship, exact resident pending rows/bytes/
+batches, token counts and bounded sample, honest known-or-explained-unknown
+index coverage, non-authoritative driver projection, rebuild blockers, and a
+stable repeat observation. It also proves a zero deadline returns typed
+`StreamStatusBusy` without publishing a manifest version.
+The production path runs full token/base parity and the selected receipt proofs
+before the short writer fence; the terminal sample is retained by that same
+token scan. Only mutable physical/recovery/manifest witnesses are repeated
+under the five-second cut. The immutable preflight has its own 60-second
+observation budget, so a slow provider cannot be mislabeled as gate
+contention or make status hold ingestion closed for the duration of a graph
+scan.
+The `omnigraph-storage` in-source cells
+`bounded_list_refuses_the_first_excess_matching_entry`,
+`bounded_list_counts_direct_and_nested_residue_as_irrelevant`, and
+`bounded_list_caps_cumulative_input_anchored_uri_bytes` pin refusal at the
+257th matching direct `.json` object, the first excess direct-or-nested
+irrelevant object, and the first excess cumulative input-anchored URI byte.
+The recovery in-source
+`branch_merge_v9_arms_multi_commit_ref_only_and_pointer_slots` cell separately
+pins typed per-sidecar-body and cumulative-body enforcement through deliberately
+small bounds. Production status combines those owners as a hard envelope of
+256 matching direct `.json` sidecars, 256 irrelevant direct-or-nested objects
+encountered below the prefix, 4 MiB of cumulative input-anchored URI bytes
+across every encountered object, 32 MiB per sidecar body, and 32 MiB of
+cumulative bodies. Crossing any one bound must refuse the whole status; the
+bounded path never returns a truncated inventory.
+
+`memwal_stream.rs::operational_status_times_out_only_the_blocked_authority_cut_and_cancels_cleanly`
+proves the immutable preflight can succeed while a deterministic root owner
+blocks only the short authority cut. The cut returns `StreamStatusBusy` for
+`exclusive authority cut` without manifest movement, cancellation retains no
+partial gate ownership, and a later status plus ordinary writer both progress.
+`memwal_stream.rs::operational_status_terminal_sample_is_the_first_eight_current_keys_and_marks_more`
+creates nine current terminal keys and pins the deterministic first eight plus
+`terminal_sample_has_more = true` from the fused parity scan.
+
+`memwal_stream.rs::full_operational_status_requires_the_checked_serving_owner`
+proves an ambient `ENABLED` handle cannot obtain the checked cut while its
+public manifest-only `stream_status` still works. The authority validator also
+requires checked served-export ownership for terminal `DISABLED | RETIRED` and
+distinct checked cluster-apply status ownership for `DISABLING`.
+`disabling_operational_status_uses_the_checked_offline_apply_owner` exercises
+that exact owner against a persisted disable plan and pins its flushed
+projection as `UnavailableFlushed`.
+`operational_status_reports_recovery_before_and_after_its_base_effect` proves
+the sidecar is visible and rebuild-blocking both before and after physical
+effect; only the latter exact sidecar-owned HEAD movement makes the physical
+projection unavailable, and status leaves the sidecar untouched. The existing
+`operational_status_refuses_unowned_base_head_movement` pins
+`StreamStatusChanged` after exact recovery ownership is removed, while
+`operational_status_marks_unopened_durable_wal_as_cold_replay_unavailable`
+pins `UnavailableColdReplay` and its rebuild blocker. The retirement fixture
+pins both `DISABLED` plus terminal authority as blocked and receipt-verified
+`RETIRED` as rebuild-ready; it also proves a real uncovered tail has unavailable
+oldest age.
+The existing
+`flushed_unmerged_generation_resumes_fold_only_and_refuses_a_second_generation`
+cell also pins the LWW-projection explanation instead of invented original
+row/byte/batch counts. Worker in-source tests prove observation neither creates
+a missing/busy writer nor disturbs one,
+and prove exact retained accounting for resident admit/fold modes. Token-store
+in-source coverage pins exact selected-version fragment coverage. The same
+authority-retirement fixture pins the bounded terminal sample emitted by the
+fused parity scan.
+The existing driver unit suite owns deterministic advisory snapshot ordering;
+the snapshot is now production-internal but still not authoritative.
+
+No test may turn missing resident state into zero. Active/replayable cold state
+must remain `UnavailableColdReplay`, because exact counting would mutate Lance
+cursor state or claim a writer; flushed LWW projection accounting is also
+`UnavailableFlushed`. Every sidecar in an accepted bounded inventory must be
+reported and block rebuild. A sidecar-explained moved physical HEAD produces explicit physical-unavailable
+status, while unexplained movement remains `StreamStatusChanged`. Likewise, a
+nonempty uncovered token tail has no exact fragment-creation timestamp and
+must report oldest age unavailable.
+Recovery in this assertion means an exact canonical-main participant outcome,
+not writer kind or table-identity overlap: profile-only recovery, a named-
+branch pin, pre-effect/no-effect state, and unrelated later HEAD movement must
+all remain `StreamStatusChanged`. Worker-registry tests likewise use the full
+identity/enrollment/shard key and cover non-vacant Active, Opening, and Retiring
+entries so a stale physical binding cannot disappear behind identity-only
+projection.
+There are deliberately no CLI/HTTP/OpenAPI/SDK parity or generated-OpenAPI
+tests for this shape until F7 supplies that transport contract.
+
 ### RFC-026 implemented F6b2 acceptance scope
 
 F6b2 extends the existing server, worker, and `memwal_stream.rs` owners rather
@@ -809,7 +914,7 @@ F6b2 deliberately does **not** accept in-place productive SchemaApply on an
 enrolled graph. Schema-change acceptance is a separate checked sealed/retired
 export → initialize fresh graph with the desired schema → ordinary load
 workflow; physical rebind keeps the accepted schema unchanged. Covered/
-reconciled token evidence, public status, and the remaining served row/control
+reconciled token evidence, public operational-status transport, and the remaining served row/control
 parity remain later F6b/F7 owners. F6b4 separately
 closes the isolated dead-letter envelope evidence.
 
@@ -963,9 +1068,10 @@ and retries; measurement alone does not establish it. Until all of that is
 green, no B2b bounded/managed-reclamation route is active. This future matrix
 does not gate the selected unbounded retain-all profile; that profile remains
 private because public row admission, lifecycle mutation/correction,
-exclusive-cut physical status, and transport-parity contracts above are still
-inactive. The Cedar vocabulary, `stream_manage`-gated enablement, and embedded
-manifest-only status are already active. A
+and transport-parity contracts above are still inactive. The checked read-only
+operational-status core is implemented internally by F6b6, but its public
+transport is not. The Cedar vocabulary, `stream_manage`-gated enablement, and
+embedded manifest-only status are already active. A
 separate bounded-profile matrix initializes and validates the
 manifest-authoritative graph-global `GraphHistoryBudget`, then charges every
 manifest-writer class and its pending recovery sidecars through reserve, effect,

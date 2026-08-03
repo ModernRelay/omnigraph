@@ -40,7 +40,9 @@ use object_store::{
 };
 use omnigraph::db::{
     CleanupPolicyOptions, Omnigraph, ReadTarget, StreamAuthorityRetirementPlan,
-    StreamDataCorrectionAction, StreamDataCorrectionRequest, StreamTableStatus,
+    StreamDataCorrectionAction, StreamDataCorrectionRequest, StreamOldestUncoveredAgeStatus,
+    StreamPendingGenerationStatus, StreamRebuildBlockReason, StreamTablePhysicalOperationalStatus,
+    StreamTableStatus, StreamTokenIndexCoverageStatus,
 };
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
@@ -1093,6 +1095,45 @@ async fn prepare_authority_retirement_fixture() -> AuthorityRetirementFixture {
         blocked_output.is_empty(),
         "WITHDRAWN authority must refuse before any checked export byte"
     );
+    let operational = checked_export
+        .failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+        .await
+        .expect("checked terminal owner must observe the withdrawn authority");
+    assert_eq!(operational.token_ledger.present_count, 0);
+    assert_eq!(operational.token_ledger.withdrawn_count, 1);
+    assert_eq!(operational.token_ledger.dead_lettered_count, 0);
+    assert_eq!(operational.token_ledger.terminal_sample.len(), 1);
+    assert_eq!(
+        operational.token_ledger.terminal_sample[0].logical_id,
+        "ordinary-before-quiesce"
+    );
+    assert_eq!(
+        operational.token_ledger.terminal_sample[0].disposition,
+        "WITHDRAWN"
+    );
+    assert!(!operational.token_ledger.terminal_sample_has_more);
+    match operational.token_ledger.lookup_index_coverage {
+        StreamTokenIndexCoverageStatus::Known {
+            uncovered_fragments,
+            ..
+        } => assert!(
+            uncovered_fragments > 0,
+            "the post-index withdrawal must leave a real uncovered token fragment"
+        ),
+        ref other => panic!("withdrawal fixture must expose exact uncovered coverage: {other:?}"),
+    }
+    assert!(matches!(
+        operational.token_ledger.oldest_uncovered_age,
+        StreamOldestUncoveredAgeStatus::Unavailable { .. }
+    ));
+    assert!(!operational.rebuild.ready);
+    assert!(operational.rebuild.reasons.iter().any(|reason| matches!(
+        reason,
+        StreamRebuildBlockReason::TerminalTokenAuthority {
+            withdrawn_count: 1,
+            dead_lettered_count: 0,
+        }
+    )));
     drop(checked_export);
 
     let plan = plan_stream_authority_retirement(&db, &cluster_uri).await;
@@ -1146,6 +1187,31 @@ async fn confirm_retirement_and_export_frozen_cut(
 
     let checked_export =
         bind_checked_unmanaged_terminal_export(reopen_enrolled(dir).await, cluster_uri).await;
+    {
+        let _receipt_failure =
+            ScopedFailPoint::new(names::STREAM_RETIREMENT_RECEIPT_VALIDATE, "return");
+        let error = checked_export
+            .failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+            .await
+            .expect_err("status must not report RETIRED rebuild readiness without provenance");
+        assert!(
+            error
+                .to_string()
+                .contains(names::STREAM_RETIREMENT_RECEIPT_VALIDATE),
+            "{error:?}"
+        );
+    }
+    let operational = checked_export
+        .failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+        .await
+        .expect("RETIRED status must re-prove its selected retirement receipt");
+    assert_eq!(operational.durable.profile_mode, "RETIRED");
+    assert_eq!(operational.token_ledger.withdrawn_count, 1);
+    assert!(
+        operational.rebuild.ready,
+        "receipt-verified RETIRED authority releases the terminal-token rebuild block: {:?}",
+        operational.rebuild.reasons
+    );
     let main_export = checked_export_jsonl(&checked_export, "main").await.unwrap();
     assert_eq!(
         checked_export_jsonl(&checked_export, "main").await.unwrap(),
@@ -1602,10 +1668,7 @@ async fn checked_export_cut_is_immutable_single_slot_and_releases_writer_gates()
         .unwrap()
         .expect("the terminal checked cut must capture");
 
-    let second = match export_db
-        .capture_served_export_cut("main", &[], &[])
-        .await
-    {
+    let second = match export_db.capture_served_export_cut("main", &[], &[]).await {
         Ok(_) => panic!("a live immutable cut must own the sole root export slot"),
         Err(error) => error,
     };
@@ -8121,7 +8184,7 @@ async fn post_force_seal_failure_is_typed_recovery_and_restarts_from_exact_cut()
 #[serial]
 async fn flushed_unmerged_generation_resumes_fold_only_and_refuses_a_second_generation() {
     let _scenario = FailScenario::setup();
-    let (_dir, db) = init_enrolled().await;
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
     let first = physical_batch(&db, &[("first-generation".to_string(), 1)]).await;
     db.failpoint_stream_b1_for_test(TABLE, Some(first), 0)
         .await
@@ -8141,6 +8204,30 @@ async fn flushed_unmerged_generation_resumes_fold_only_and_refuses_a_second_gene
         "{error:?}"
     );
     assert!(visible_rows(&db).await.is_empty());
+
+    let status = db
+        .failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+        .await
+        .expect("status must observe the retained flushed generation without replaying it");
+    let shards = match &status.tables[0].physical {
+        StreamTablePhysicalOperationalStatus::Observed { shards } => shards,
+        other => panic!("flushed generation must retain an observable binding: {other:?}"),
+    };
+    let shard = &shards[0];
+    match shard.pending {
+        StreamPendingGenerationStatus::UnavailableFlushed { generation, reason } => {
+            assert_eq!(generation + 1, shard.current_generation);
+            assert!(reason.contains("LWW winner projection"), "{reason}");
+        }
+        ref other => panic!(
+            "a flushed LWW projection must not be mislabeled as exact admitted accounting: {other:?}"
+        ),
+    }
+    assert!(status.rebuild.reasons.iter().any(|reason| matches!(
+        reason,
+        StreamRebuildBlockReason::PendingGenerationUnavailable { table_key }
+            if table_key == TABLE
+    )));
 
     let second = physical_batch(&db, &[("second-generation".to_string(), 2)]).await;
     let second_error = db
@@ -11124,4 +11211,552 @@ async fn stream_status_reports_the_enrolled_lane_and_its_compare_token() {
 
     // Status is lifecycle-inert: re-reading it moves nothing.
     assert_eq!(db.stream_status().await.unwrap(), status);
+}
+
+#[tokio::test]
+#[serial]
+async fn checked_operational_status_reports_one_coherent_read_only_physical_cut() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let stream_incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    authorized_ingest_score(
+        &db,
+        &stream_incarnation,
+        "status-pending",
+        7,
+        1,
+        "74747474-7474-4474-8474-747474747474",
+        None,
+        "agent:status",
+    )
+    .await
+    .unwrap();
+    let manifest_before = db.version_of(ReadTarget::branch("main")).await.unwrap();
+
+    let status = db
+        .failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(status.cut_manifest_version, manifest_before);
+    assert_eq!(status.durable.profile_mode, "ENABLED");
+    assert_eq!(status.tables.len(), 1);
+    let table = &status.tables[0];
+    assert_eq!(table.durable.table_key, TABLE);
+    assert_eq!(table.durable.lifecycle, "OPEN");
+    let shards = match &table.physical {
+        StreamTablePhysicalOperationalStatus::Observed { shards } => shards,
+        other => panic!("resident generation must have an observed physical cut: {other:?}"),
+    };
+    assert_eq!(shards.len(), 1);
+    let shard = &shards[0];
+    assert!(shard.observed_writer_epoch >= shard.authoritative_epoch_floor);
+    assert_eq!(shard.current_generation, shard.base_merged_generation + 1);
+    match shard.pending {
+        StreamPendingGenerationStatus::Exact {
+            generation,
+            rows,
+            arrow_bytes,
+            batches,
+            source,
+        } => {
+            assert_eq!(generation, shard.current_generation);
+            assert_eq!(rows, 1);
+            assert!(arrow_bytes > 0);
+            assert_eq!(batches, 1);
+            assert_eq!(source, "RESIDENT_ADMIT");
+        }
+        ref other => panic!("resident pending generation must be exact: {other:?}"),
+    }
+    assert_eq!(status.token_ledger.present_count, 0);
+    assert_eq!(status.token_ledger.withdrawn_count, 0);
+    assert_eq!(status.token_ledger.dead_lettered_count, 0);
+    assert!(status.token_ledger.terminal_sample.is_empty());
+    assert!(!status.token_ledger.terminal_sample_has_more);
+    match &status.token_ledger.lookup_index_coverage {
+        StreamTokenIndexCoverageStatus::Known {
+            total_fragments,
+            covered_fragments,
+            uncovered_fragments,
+        } => assert_eq!(covered_fragments + uncovered_fragments, *total_fragments),
+        StreamTokenIndexCoverageStatus::Unknown { reason, .. } => {
+            assert!(!reason.is_empty(), "unknown coverage must stay explained")
+        }
+        other => panic!("unexpected token-index coverage status: {other:?}"),
+    }
+    assert!(!status.driver.authoritative);
+    assert_eq!(status.driver.scope, "PROCESS_LOCAL_ADVISORY");
+    assert!(!status.rebuild.ready);
+    assert!(status.rebuild.reasons.iter().any(|reason| matches!(
+        reason,
+        StreamRebuildBlockReason::ProfileNotTerminal { mode } if *mode == "ENABLED"
+    )));
+    assert!(status.rebuild.reasons.iter().any(|reason| matches!(
+        reason,
+        StreamRebuildBlockReason::PendingGeneration { table_key } if table_key == TABLE
+    )));
+    assert_eq!(
+        db.version_of(ReadTarget::branch("main")).await.unwrap(),
+        manifest_before,
+        "status must not publish a graph-manifest version"
+    );
+    let repeated = db
+        .failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(repeated.cut_manifest_version, status.cut_manifest_version);
+    assert_eq!(repeated.durable, status.durable);
+    assert_eq!(repeated.tables, status.tables);
+    assert_eq!(repeated.token_ledger, status.token_ledger);
+    assert_eq!(repeated.relevant_recovery, status.relevant_recovery);
+    assert_eq!(repeated.rebuild, status.rebuild);
+    assert_eq!(repeated.driver.state, status.driver.state);
+    assert_eq!(
+        repeated.driver.pending_triggers.len(),
+        status.driver.pending_triggers.len(),
+        "the advisory due-in countdown may move, but status must not add driver work"
+    );
+
+    let busy = db
+        .failpoint_stream_operational_status_for_test(Duration::ZERO)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        busy,
+        OmniError::StreamStatusBusy { ref phase }
+            if phase == "immutable rebuild preflight"
+    ));
+    assert_eq!(
+        db.version_of(ReadTarget::branch("main")).await.unwrap(),
+        manifest_before,
+        "deadline refusal is effect-free"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn operational_status_times_out_only_the_blocked_authority_cut_and_cancels_cleanly() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let manifest_before = db.version_of(ReadTarget::branch("main")).await.unwrap();
+    let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let blocker_db = Arc::clone(&db);
+    let blocker = tokio::spawn(async move {
+        blocker_db
+            .failpoint_hold_stream_status_root_for_test(acquired_tx, release_rx)
+            .await;
+    });
+    acquired_rx
+        .await
+        .expect("the deterministic root owner must close the status cut");
+
+    let busy = db
+        .failpoint_stream_operational_status_with_deadlines_for_test(
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("the deterministic root owner must hold the authority cut");
+    assert!(matches!(
+        busy,
+        OmniError::StreamStatusBusy { ref phase }
+            if phase == "exclusive authority cut"
+    ));
+    assert_eq!(
+        db.version_of(ReadTarget::branch("main")).await.unwrap(),
+        manifest_before,
+        "timing out a waiting status cut is effect-free"
+    );
+
+    release_tx
+        .send(())
+        .expect("the deterministic root owner must still be live");
+    blocker.await.unwrap();
+    db.failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+        .await
+        .expect("the canceled cut must retain no gate or queued ownership");
+    db.start_stream_fold_driver()
+        .await
+        .expect("the canceled cut must not prevent the resident driver from starting");
+    let batch = physical_batch(&db, &[("status-after-timeout".to_string(), 32)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
+        .await
+        .expect("ordinary admission must reacquire authority after cut cancellation");
+    wait_for_visible_rows(&db, &[("status-after-timeout".to_string(), 32)]).await;
+    db.shutdown_stream_fold_driver().await.unwrap();
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn operational_status_terminal_sample_is_the_first_eight_current_keys_and_marks_more() {
+    let _scenario = FailScenario::setup();
+    let (dir, served) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let rows = (0..9)
+        .map(|ordinal| (format!("status-terminal-{ordinal:02}"), ordinal))
+        .collect::<Vec<_>>();
+    let batch = physical_batch(&served, &rows).await;
+    served
+        .failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
+        .await
+        .expect("the terminal-sample fixture must acknowledge one bounded generation");
+    served
+        .failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the terminal-sample fixture must publish its base/token cut");
+    let folded = stream_lane(&served).await;
+    served
+        .failpoint_stream_quiesce_for_test(
+            TABLE,
+            "a0a0a0a0-a0a0-40a0-80a0-a0a0a0a0a0a0",
+            folded.lifecycle_revision,
+            "operator:status-terminal-sample",
+        )
+        .await
+        .expect("the terminal-sample fixture must seal cleanly");
+    drop(served);
+
+    let offline = reopen_enrolled(&dir).await;
+    let cluster_uri = dir.cluster_uri();
+    disable_stream_profile(&offline, &cluster_uri).await;
+    for ordinal in 0..9 {
+        offline
+            .failpoint_withdraw_stream_token_for_retirement_test(
+                TABLE,
+                &format!("status-terminal-{ordinal:02}"),
+                &format!("b0000000-0000-4000-8000-{ordinal:012}"),
+            )
+            .await
+            .expect("each current PRESENT token must become terminal authority");
+    }
+
+    let checked = bind_checked_served_export(reopen_enrolled(&dir).await, &cluster_uri).await;
+    let status = checked
+        .failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+        .await
+        .expect("checked terminal status must retain only its bounded sample");
+    assert_eq!(status.token_ledger.withdrawn_count, 9);
+    assert_eq!(status.token_ledger.dead_lettered_count, 0);
+    assert_eq!(status.token_ledger.terminal_sample.len(), 8);
+    assert!(status.token_ledger.terminal_sample_has_more);
+    assert_eq!(
+        status
+            .token_ledger
+            .terminal_sample
+            .iter()
+            .map(|entry| entry.logical_id.clone())
+            .collect::<Vec<_>>(),
+        (0..8)
+            .map(|ordinal| format!("status-terminal-{ordinal:02}"))
+            .collect::<Vec<_>>()
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn operational_status_marks_unopened_durable_wal_as_cold_replay_unavailable() {
+    let _scenario = FailScenario::setup();
+    let (dir, served) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let stream_incarnation = served
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    authorized_ingest_score(
+        &served,
+        &stream_incarnation,
+        "status-cold-replay",
+        29,
+        1,
+        "76767676-7676-4676-8676-767676767676",
+        None,
+        "agent:status",
+    )
+    .await
+    .unwrap();
+    served.shutdown_stream_fold_driver().await.unwrap();
+    drop(served);
+
+    let reopened = helpers::stream_authority::bind_checked_stream_runtime(
+        reopen_enrolled(&dir).await,
+        &dir.cluster_uri(),
+    )
+    .await;
+    let status = reopened
+        .failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+        .await
+        .unwrap();
+    let shards = match &status.tables[0].physical {
+        StreamTablePhysicalOperationalStatus::Observed { shards } => shards,
+        other => panic!("cold replay must retain an observable physical cut: {other:?}"),
+    };
+    assert!(matches!(
+        shards[0].pending,
+        StreamPendingGenerationStatus::UnavailableColdReplay { .. }
+    ));
+    assert!(status.rebuild.reasons.iter().any(|reason| matches!(
+        reason,
+        StreamRebuildBlockReason::PendingGenerationUnavailable { table_key }
+            if table_key == TABLE
+    )));
+    reopened.shutdown_stream_fold_driver().await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn full_operational_status_requires_the_checked_serving_owner() {
+    let _scenario = FailScenario::setup();
+    let (_dir, ambient) = init_enrolled().await;
+    let error = ambient
+        .failpoint_stream_operational_status_for_test(Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OmniError::StreamingRequiresClusterRuntime { ref mode } if mode == "ENABLED"
+    ));
+    assert_eq!(
+        ambient.stream_status().await.unwrap().profile_mode,
+        "ENABLED"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn disabling_operational_status_uses_the_checked_offline_apply_owner() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled().await;
+    let row = physical_batch(&db, &[("status-disabling".to_string(), 19)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+        .await
+        .unwrap();
+    let cluster_uri = dir.cluster_uri();
+    let error = {
+        let _after_drain =
+            ScopedFailPoint::new(names::STREAM_FOLD_POST_DRAIN_PRE_SIDECAR, "return");
+        try_disable_stream_profile(&db, &cluster_uri)
+            .await
+            .expect_err("fixture must stop after persisting DISABLING and its lane drain")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(names::STREAM_FOLD_POST_DRAIN_PRE_SIDECAR),
+        "{error:?}"
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    let status = helpers::stream_authority::disabling_operational_status(&db, &cluster_uri)
+        .await
+        .unwrap();
+    assert_eq!(status.durable.profile_mode, "DISABLING");
+    assert_eq!(status.tables.len(), 1);
+    let table = &status.tables[0];
+    assert_eq!(table.durable.lifecycle, "DRAINING");
+    let drain = table
+        .drain
+        .as_ref()
+        .expect("disable owns one durable drain");
+    assert_eq!(drain.goal, "SEALED");
+    assert_eq!(drain.phase, "DRAINING");
+    let shards = match &table.physical {
+        StreamTablePhysicalOperationalStatus::Observed { shards } => shards,
+        other => panic!("stable disabling cut must remain observable: {other:?}"),
+    };
+    assert!(matches!(
+        shards[0].pending,
+        StreamPendingGenerationStatus::UnavailableFlushed { .. }
+    ));
+    assert!(status.rebuild.reasons.iter().any(|reason| matches!(
+        reason,
+        StreamRebuildBlockReason::ProfileNotTerminal { mode } if *mode == "DISABLING"
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn operational_status_reports_recovery_before_and_after_its_base_effect() {
+    let _scenario = FailScenario::setup();
+    for (failpoint, physical_unavailable) in [
+        (names::STREAM_FOLD_POST_SIDECAR_PRE_BASE_COMMIT, false),
+        (names::STREAM_FOLD_POST_BASE_COMMIT_PRE_TOKEN_COMMIT, true),
+    ] {
+        let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+        let row = physical_batch(&db, &[(format!("status-recovery-{failpoint}"), 23)]).await;
+        db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+            .await
+            .unwrap();
+        let error = {
+            let _boundary = ScopedFailPoint::new(failpoint, "return");
+            db.failpoint_stream_b1_for_test(TABLE, None, 0)
+                .await
+                .expect_err("fold boundary must retain one recovery owner")
+        };
+        assert!(matches!(error, OmniError::RecoveryRequired { .. }));
+        assert_eq!(
+            helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+            1
+        );
+        let manifest_before = db.version_of(ReadTarget::branch("main")).await.unwrap();
+
+        let status = db
+            .failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(status.relevant_recovery.len(), 1);
+        let operation_id = status.relevant_recovery[0].operation_id.clone();
+        assert!(status.rebuild.reasons.iter().any(|reason| matches!(
+            reason,
+            StreamRebuildBlockReason::RelevantRecovery { operation_id: blocked }
+                if blocked == &operation_id
+        )));
+        match (&status.tables[0].physical, physical_unavailable) {
+            (
+                StreamTablePhysicalOperationalStatus::UnavailableRecovery {
+                    operation_ids,
+                    reason,
+                },
+                true,
+            ) => {
+                assert_eq!(operation_ids, &[operation_id]);
+                assert!(!reason.is_empty());
+            }
+            (StreamTablePhysicalOperationalStatus::Observed { .. }, false) => {}
+            (other, expected) => panic!(
+                "unexpected recovery physical status at {failpoint}: {other:?}, unavailable={expected}"
+            ),
+        }
+        assert_eq!(
+            db.version_of(ReadTarget::branch("main")).await.unwrap(),
+            manifest_before,
+            "status must not resolve or publish the retained recovery owner"
+        );
+        assert_eq!(
+            helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+            1,
+            "status must leave the sidecar untouched"
+        );
+        drop(db);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn operational_status_refuses_unowned_base_head_movement() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    let row = physical_batch(&db, &[("status-unowned-head".to_string(), 37)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+        .await
+        .unwrap();
+    let error = {
+        let _boundary = ScopedFailPoint::new(
+            names::STREAM_FOLD_POST_BASE_COMMIT_PRE_TOKEN_COMMIT,
+            "return",
+        );
+        db.failpoint_stream_b1_for_test(TABLE, None, 0)
+            .await
+            .expect_err("the base participant must move under retained recovery")
+    };
+    assert!(matches!(error, OmniError::RecoveryRequired { .. }));
+    let operation_id = helpers::recovery::single_sidecar_operation_id(dir.path());
+    std::fs::remove_file(
+        dir.path()
+            .join("__recovery")
+            .join(format!("{operation_id}.json")),
+    )
+    .unwrap();
+
+    let error = db
+        .failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+        .await
+        .expect_err("movement without its exact recovery owner must never become a status cut");
+    assert!(matches!(
+        error,
+        OmniError::StreamStatusChanged { ref member }
+            if member.contains("base table HEAD")
+    ));
+    db.shutdown_stream_fold_driver().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn operational_status_reports_and_rebuild_blocks_on_named_branch_mutation_recovery() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_served_with_schema(TWO_TABLE_STREAM_SCHEMA).await;
+    let open = stream_lane(&db).await;
+    db.failpoint_stream_quiesce_for_test(
+        TABLE,
+        "75757575-7575-4575-8575-757575757575",
+        open.lifecycle_revision,
+        "operator:status-recovery",
+    )
+    .await
+    .expect("the empty enrolled lane must seal before named-branch creation");
+    const RECOVERY_BRANCH: &str = "status-recovery";
+    db.branch_create(RECOVERY_BRANCH)
+        .await
+        .expect("SEALED stream authority permits the named recovery fixture branch");
+
+    // Leave one ordinary Mutation recovery owner on the unenrolled sibling
+    // table of a named branch. The checked stream cut must inventory every
+    // graph writer, not only stream protocols, canonical-main sidecars, or
+    // sidecars overlapping an enrolled lane.
+    let mutation_error = {
+        let _after_effect = ScopedFailPoint::new(names::MUTATION_POST_TABLE_COMMIT, "return");
+        db.mutate(
+            RECOVERY_BRANCH,
+            INSERT_COMPANY,
+            "insert_company",
+            &helpers::int_params(&[("$score", 31)]),
+        )
+        .await
+        .expect_err("ordinary mutation must retain its post-effect recovery owner")
+    };
+    let operation_id = match mutation_error {
+        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+        other => panic!("expected ordinary Mutation recovery, got {other:?}"),
+    };
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()),
+        vec![operation_id.clone()]
+    );
+    let manifest_before = db.version_of(ReadTarget::branch("main")).await.unwrap();
+
+    let status = db
+        .failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+        .await
+        .expect("checked status must report ordinary recovery without resolving it");
+    assert_eq!(status.relevant_recovery.len(), 1);
+    let recovery = &status.relevant_recovery[0];
+    assert_eq!(recovery.operation_id, operation_id);
+    assert_eq!(recovery.operation_kind, "MUTATION");
+    assert_eq!(recovery.schema_version, 9);
+    assert_eq!(recovery.branch.as_deref(), Some(RECOVERY_BRANCH));
+    assert!(recovery.state_digest.starts_with("sha256:"));
+    assert!(status.rebuild.reasons.iter().any(|reason| matches!(
+        reason,
+        StreamRebuildBlockReason::RelevantRecovery { operation_id: blocked }
+            if blocked == &operation_id
+    )));
+    assert!(
+        matches!(
+            status.tables[0].physical,
+            StreamTablePhysicalOperationalStatus::Observed { .. }
+        ),
+        "an ordinary sidecar on the unenrolled sibling blocks rebuild without falsifying the enrolled lane's physical cut"
+    );
+    assert_eq!(
+        db.version_of(ReadTarget::branch("main")).await.unwrap(),
+        manifest_before,
+        "status must not publish while reporting ordinary recovery"
+    );
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()),
+        vec![operation_id],
+        "status must leave the ordinary sidecar untouched"
+    );
 }

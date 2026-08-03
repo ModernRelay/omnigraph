@@ -171,6 +171,17 @@ pub enum OmniError {
     /// protocol text.
     #[error("checked streaming authority does not match current graph authority: {reason}")]
     StreamingAuthorityMismatch { reason: String },
+    /// The read-only full stream-status observation could not obtain one
+    /// stable cut during the named phase. This covers both bounded waiting and
+    /// an immediately busy resident transition without pretending every case
+    /// exhausted the same deadline. Retrying is effect-free.
+    #[error("stream operational status could not obtain a stable cut during {phase}")]
+    StreamStatusBusy { phase: String },
+    /// An authority-bearing member moved between the first observation and
+    /// the mandatory trailing reread. Returning a hybrid status would lie, so
+    /// the entire read is refused and the caller must retry from a fresh cut.
+    #[error("stream operational status changed while observing {member}")]
+    StreamStatusChanged { member: String },
     /// An externally initiated stream-management request named a lifecycle
     /// revision which is no longer current. This is an effect-free CAS
     /// refusal: the caller must reread status and must not retarget the
@@ -333,6 +344,16 @@ impl From<omnigraph_storage::StorageError> for OmniError {
         match error {
             omnigraph_storage::StorageError::Internal(message) => Self::manifest_internal(message),
             omnigraph_storage::StorageError::Io(error) => Self::Io(error),
+            omnigraph_storage::StorageError::ResourceLimit {
+                resource,
+                limit,
+                actual,
+                ..
+            } => Self::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            },
         }
     }
 }
