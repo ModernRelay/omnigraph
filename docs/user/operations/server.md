@@ -19,7 +19,10 @@ OMNIGRAPH_LISTEN_ADDR=127.0.0.1:54321
 ```
 
 Process supervisors and test harnesses can use this record instead of
-reserving and releasing a port before starting the server.
+reserving and releasing a port before starting the server. When the bind host
+is a wildcard such as `0.0.0.0` or `[::]`, the record identifies the listener
+but is not itself a portable client endpoint; use the selected port with a
+host that is reachable from the client.
 
 `omnigraph-server --cluster <dir-or-uri>` boots from the cluster catalog's
 **applied revision**. The server resolves that revision into per-graph
