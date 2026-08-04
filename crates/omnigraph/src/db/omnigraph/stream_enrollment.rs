@@ -209,6 +209,27 @@ impl Omnigraph {
             &omnigraph_policy::ResourceScope::Graph,
             Some(actor_id),
         )?;
+        self.prepare_stream_ingest_pre_authorized(
+            table_key,
+            enrollment_request_id,
+            witness,
+            actor_id,
+        )
+        .await
+    }
+
+    /// Existing recoverable lazy-enrollment coordinator after one outer
+    /// graph-level ingress authorization. This is not declaration-scoped
+    /// authorization: the graph-native request calls it so a mixed request has
+    /// exactly one Cedar decision while retaining every runtime, recovery, and
+    /// physical authority recheck below.
+    pub(super) async fn prepare_stream_ingest_pre_authorized(
+        &self,
+        table_key: &str,
+        enrollment_request_id: &str,
+        witness: Option<&StreamEligibilityWitness>,
+        actor_id: &str,
+    ) -> Result<PrepareStreamIngestOutcome> {
         if actor_id.is_empty() || actor_id.trim() != actor_id {
             return Err(OmniError::manifest(
                 "stream enrollment actor is not canonical",

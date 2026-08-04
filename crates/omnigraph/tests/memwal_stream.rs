@@ -2987,6 +2987,106 @@ fn ndjson_score_line(
     line
 }
 
+fn graph_node_line(
+    type_name: &str,
+    logical_id: &str,
+    score: i32,
+    write_id: &str,
+    predecessor_token: Option<&str>,
+) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "type": type_name,
+        "data": {"id": logical_id, "score": score},
+        "$stream": {
+            "write_id": write_id,
+            "predecessor_token": predecessor_token,
+        },
+    }))
+    .unwrap();
+    line.push(b'\n');
+    line
+}
+
+fn graph_edge_line(
+    type_name: &str,
+    logical_id: &str,
+    from: &str,
+    to: &str,
+    write_id: &str,
+    predecessor_token: Option<&str>,
+) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "edge": type_name,
+        "from": from,
+        "to": to,
+        "data": {"id": logical_id},
+        "$stream": {
+            "write_id": write_id,
+            "predecessor_token": predecessor_token,
+        },
+    }))
+    .unwrap();
+    line.push(b'\n');
+    line
+}
+
+fn assert_graph_stream_result_redacted(outcome: &serde_json::Value) {
+    const ALLOWED_KEYS: &[&str] = &[
+        "actual",
+        "blocking_ordinal",
+        "blocking_status",
+        "current_token",
+        "id",
+        "kind",
+        "limit",
+        "message",
+        "ordinal",
+        "scope",
+        "status",
+        "stream_token",
+        "type",
+        "unconfirmed_candidate_token",
+        "write_id",
+    ];
+    let object = outcome
+        .as_object()
+        .expect("graph stream result must be one flat tagged object");
+    for key in object.keys() {
+        assert!(
+            ALLOWED_KEYS.contains(&key.as_str()),
+            "graph result leaked unreviewed field '{key}': {outcome}"
+        );
+    }
+    assert!(
+        object
+            .values()
+            .all(|value| !value.is_null() && !value.is_object() && !value.is_array()),
+        "graph result must omit null fields and nested private evidence: {outcome}"
+    );
+    let encoded = outcome.to_string();
+    for forbidden in [
+        "node:",
+        "edge:",
+        "stream_incarnation_id",
+        "enrollment_id",
+        "shard_id",
+        "writer_epoch",
+        "admission_attempt_id",
+        "origin",
+        "terminal_correction",
+        "terminal_dead_letter",
+        "receipt",
+        "revision",
+        "digest",
+        "object_location",
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "graph result leaked '{forbidden}': {outcome}"
+        );
+    }
+}
+
 fn parse_ndjson_outcomes(outcomes: Vec<String>) -> Vec<serde_json::Value> {
     outcomes
         .into_iter()
@@ -9586,6 +9686,394 @@ rules:
         "authorization/runtime refusals must be graph-effect-free"
     );
     assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn graph_ndjson_authorizes_one_graph_not_each_lazy_lane() {
+    struct GraphDecisionCounter {
+        calls: AtomicUsize,
+    }
+
+    impl PolicyChecker for GraphDecisionCounter {
+        fn check(
+            &self,
+            action: omnigraph_policy::PolicyAction,
+            scope: &omnigraph_policy::ResourceScope,
+            actor: &str,
+        ) -> std::result::Result<(), omnigraph_policy::PolicyError> {
+            assert_eq!(action, omnigraph_policy::PolicyAction::StreamIngest);
+            assert_eq!(scope, &omnigraph_policy::ResourceScope::Graph);
+            assert_eq!(actor, "agent:graph-policy");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_unenrolled_served_with_schema(TWO_TABLE_STREAM_SCHEMA).await;
+    let checker = Arc::new(GraphDecisionCounter {
+        calls: AtomicUsize::new(0),
+    });
+    let policy: Arc<dyn PolicyChecker> = checker.clone();
+    let db = match Arc::try_unwrap(db) {
+        Ok(db) => Arc::new(db.with_policy(policy)),
+        Err(_) => panic!("graph policy fixture must own the sole engine handle"),
+    };
+    let body = [
+        graph_node_line(
+            "Person",
+            "policy-person",
+            1,
+            "40404040-4040-4040-8040-404040404040",
+            None,
+        ),
+        graph_node_line(
+            "Company",
+            "policy-company",
+            2,
+            "40404040-4040-4040-8040-404040404041",
+            None,
+        ),
+    ]
+    .concat();
+
+    let outcomes = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(vec![body], "agent:graph-policy")
+            .await
+            .expect("one graph-scoped decision authorizes both private lanes"),
+    );
+    assert_eq!(outcomes.len(), 2);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome["status"] == "durable"),
+        "{outcomes:#?}"
+    );
+    assert_eq!(
+        checker.calls.load(Ordering::SeqCst),
+        1,
+        "lazy per-declaration enrollment must not re-authorize physical tables"
+    );
+    let lanes = db
+        .stream_status()
+        .await
+        .unwrap()
+        .tables
+        .into_iter()
+        .map(|lane| lane.table_key)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        lanes,
+        BTreeSet::from([TABLE.to_string(), COMPANY_TABLE.to_string()])
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn graph_ndjson_alternates_node_edge_node_with_private_lazy_enrollment() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_unenrolled_served_with_schema(F6B2_NODE_EDGE_SCHEMA).await;
+    let body = [
+        graph_node_line(
+            "Person",
+            "graph-a",
+            11,
+            "41414141-4141-4141-8141-414141414141",
+            None,
+        ),
+        graph_edge_line(
+            "Knows",
+            "graph-edge",
+            "graph-a",
+            "graph-a",
+            "42424242-4242-4242-8242-424242424242",
+            None,
+        ),
+        graph_node_line(
+            "Person",
+            "graph-b",
+            12,
+            "43434343-4343-4343-8343-434343434343",
+            None,
+        ),
+    ]
+    .concat();
+
+    let outcomes = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+            vec![body[..31].to_vec(), body[31..].to_vec()],
+            "agent:graph-ingest",
+        )
+        .await
+        .expect("one graph request must route alternating logical declarations"),
+    );
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome["status"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["durable", "durable", "durable"],
+        "{outcomes:#?}"
+    );
+    assert_eq!(outcomes[0]["kind"], "node");
+    assert_eq!(outcomes[0]["type"], "Person");
+    assert_eq!(outcomes[0]["id"], "graph-a");
+    assert_eq!(outcomes[1]["kind"], "edge");
+    assert_eq!(outcomes[1]["type"], "Knows");
+    assert_eq!(outcomes[1]["id"], "graph-edge");
+    assert_eq!(outcomes[2]["kind"], "node");
+    assert_eq!(outcomes[2]["id"], "graph-b");
+    for (ordinal, outcome) in outcomes.iter().enumerate() {
+        assert_eq!(outcome["ordinal"], ordinal as u64);
+        assert_eq!(outcome["scope"], "row");
+        assert!(outcome["stream_token"].as_str().is_some());
+        assert_graph_stream_result_redacted(outcome);
+    }
+
+    let lanes = db
+        .stream_status()
+        .await
+        .unwrap()
+        .tables
+        .into_iter()
+        .map(|lane| lane.table_key)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        lanes,
+        BTreeSet::from([TABLE.to_string(), MIN_CARD_EDGE_TABLE.to_string()]),
+        "only declarations reached by valid rows are enrolled"
+    );
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("graph-a".to_string(), 11)],
+        "switching away from the first node lane reuses the resident fold coordinator"
+    );
+    assert_eq!(
+        visible_edge_rows(&db).await,
+        vec![(
+            "graph-edge".to_string(),
+            "graph-a".to_string(),
+            "graph-a".to_string(),
+        )],
+        "switching back to a node lane settles the edge lane through the same coordinator"
+    );
+
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the final resident node lane publishes its remaining occurrence");
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("graph-a".to_string(), 11), ("graph-b".to_string(), 12)]
+    );
+    assert_eq!(
+        visible_edge_rows(&db).await,
+        vec![(
+            "graph-edge".to_string(),
+            "graph-a".to_string(),
+            "graph-a".to_string(),
+        )]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn graph_ndjson_handoff_uses_the_driver_node_before_edge_round() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_f6b2_node_edge_fixture().await;
+    let cluster_uri = dir.cluster_uri();
+
+    let node_owner = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let bob = physical_batch(&node_owner, &[("Bob".to_string(), 2)]).await;
+    node_owner
+        .failpoint_stream_b1_for_test(TABLE, Some(bob), 0)
+        .await
+        .expect("Bob is durably acknowledged before the first runtime retires");
+    node_owner.shutdown_stream_fold_driver().await.unwrap();
+    drop(node_owner);
+
+    let db = reopen_enrolled(&dir).await;
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    assert_eq!(visible_rows(&db).await, vec![("Alice".to_string(), 1)]);
+    let body = [
+        graph_edge_line(
+            "Knows",
+            "graph-dependent-edge",
+            "Alice",
+            "Bob",
+            "48484848-4848-4848-8848-484848484848",
+            None,
+        ),
+        graph_node_line(
+            "Person",
+            "Carol",
+            3,
+            "49494949-4949-4949-8949-494949494949",
+            None,
+        ),
+    ]
+    .concat();
+
+    let outcomes = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(vec![body], "agent:graph-driver-round")
+            .await
+            .expect("the graph handoff reuses one finite driver round"),
+    );
+    assert_eq!(outcomes.len(), 2);
+    let visible_after_handoff = visible_rows(&db).await;
+    let visible_edges_after_handoff = visible_edge_rows(&db).await;
+    let driver = stream_fold_driver_status(&db);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome["status"] == "durable"),
+        "outcomes={outcomes:#?}\nvisible={visible_after_handoff:#?}\nedges={visible_edges_after_handoff:#?}\ndriver={driver:#?}"
+    );
+    assert_eq!(
+        visible_after_handoff,
+        vec![("Alice".to_string(), 1), ("Bob".to_string(), 2)],
+        "the cold acknowledged node must publish before the resident dependent edge"
+    );
+    assert_eq!(
+        visible_edges_after_handoff,
+        vec![(
+            "graph-dependent-edge".to_string(),
+            "Alice".to_string(),
+            "Bob".to_string(),
+        )]
+    );
+    assert_eq!(driver["published_open_folds"], 2);
+    assert_eq!(driver["last_completion"]["outcome"], "published_open_fold");
+    assert_eq!(driver["last_error"], serde_json::Value::Null);
+
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the final resident node lane publishes Carol");
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![
+            ("Alice".to_string(), 1),
+            ("Bob".to_string(), 2),
+            ("Carol".to_string(), 3),
+        ]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn graph_ndjson_invalid_and_blob_rows_do_not_enroll_private_lanes() {
+    let _scenario = FailScenario::setup();
+    let (_dir, malformed_db) = init_unenrolled_served_with_schema(F6B2_NODE_EDGE_SCHEMA).await;
+    let mut malformed = serde_json::to_vec(&serde_json::json!({
+        "type": "Company",
+        "data": {"id": "missing-score"},
+        "$stream": {
+            "write_id": "44444444-4444-4444-8444-444444444444",
+            "predecessor_token": null,
+        },
+    }))
+    .unwrap();
+    malformed.push(b'\n');
+    let malformed_outcomes = parse_ndjson_outcomes(
+        malformed_db
+            .failpoint_stream_ingest_graph_ndjson_as_for_test(
+                vec![malformed],
+                "agent:graph-invalid",
+            )
+            .await
+            .expect("schema-invalid graph rows are line-local"),
+    );
+    assert_eq!(malformed_outcomes[0]["status"], "invalid");
+    assert_eq!(malformed_outcomes[0]["scope"], "row");
+    assert_graph_stream_result_redacted(&malformed_outcomes[0]);
+    assert!(
+        malformed_db
+            .stream_status()
+            .await
+            .unwrap()
+            .tables
+            .is_empty()
+    );
+
+    let (_dir, blob_db) = init_unenrolled_served_with_schema(BLOB_STREAM_SCHEMA).await;
+    let blob_outcomes = parse_ndjson_outcomes(
+        blob_db
+            .failpoint_stream_ingest_graph_ndjson_as_for_test(
+                vec![graph_node_line(
+                    "Person",
+                    "blob-row",
+                    7,
+                    "45454545-4545-4545-8545-454545454545",
+                    None,
+                )],
+                "agent:graph-blob",
+            )
+            .await
+            .expect("unsupported Blob declarations are line-local"),
+    );
+    assert_eq!(blob_outcomes[0]["status"], "invalid");
+    assert_eq!(blob_outcomes[0]["scope"], "row");
+    assert_graph_stream_result_redacted(&blob_outcomes[0]);
+    assert!(blob_db.stream_status().await.unwrap().tables.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn graph_ndjson_ack_unknown_blocks_later_declarations_without_enrollment() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_unenrolled_served_with_schema(TWO_TABLE_STREAM_SCHEMA).await;
+    let body = [
+        graph_node_line(
+            "Person",
+            "ambiguous-person",
+            31,
+            "46464646-4646-4646-8646-464646464646",
+            None,
+        ),
+        graph_node_line(
+            "Company",
+            "must-not-enroll",
+            32,
+            "47474747-4747-4747-8747-474747474747",
+            None,
+        ),
+    ]
+    .concat();
+    let outcomes = {
+        let _after_durable = ScopedFailPoint::new(names::STREAM_B1_AFTER_WATCHER_SUCCESS, "return");
+        parse_ndjson_outcomes(
+            db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+                vec![body],
+                "agent:graph-ambiguous",
+            )
+            .await
+            .expect("AckUnknown is an ordered graph blocker"),
+        )
+    };
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes[0]["status"], "ack_unknown");
+    assert_eq!(outcomes[0]["scope"], "graph");
+    assert!(
+        outcomes[0]["unconfirmed_candidate_token"]
+            .as_str()
+            .is_some()
+    );
+    assert_eq!(outcomes[1]["status"], "stream_retry_required");
+    assert_eq!(outcomes[1]["scope"], "graph");
+    assert_eq!(outcomes[1]["blocking_ordinal"], 0);
+    assert_eq!(outcomes[1]["blocking_status"], "ack_unknown");
+    for outcome in &outcomes {
+        assert_graph_stream_result_redacted(outcome);
+    }
+
+    let lanes = db.stream_status().await.unwrap().tables;
+    assert_eq!(lanes.len(), 1);
+    assert_eq!(lanes[0].table_key, TABLE);
+    assert!(
+        lanes.iter().all(|lane| lane.table_key != COMPANY_TABLE),
+        "a graph-wide blocker must prevent lazy enrollment of later declarations"
+    );
 }
 
 #[tokio::test]
