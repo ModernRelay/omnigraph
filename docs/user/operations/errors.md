@@ -44,11 +44,18 @@
 - `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id`. Resolve the sidecar through a read-write reopen/server restart before retrying; this is intentionally not an ordinary OCC retry.
 - `StreamExportBlocked { withdrawn_token_count, dead_lettered_token_count }` —
   ordinary export found current `WITHDRAWN` or `DEAD_LETTERED` sequencing
-  authority that a row-only artifact cannot preserve. The hidden ingest path
-  can install a fresh ordinary `PRESENT` successor, but no public row-ingress
-  surface exposes it yet; the current operator exit is the stopped/offline
+  authority that a row-only artifact cannot preserve. Graph-native firehose
+  ingest can install a fresh ordinary `PRESENT` successor only while the
+  enabled declaration lane is absent or `OPEN`. A terminally disabled/
+  `SEALED` lane has no public resume in F7a; its operator exit is the stopped/offline
   `cluster stream retire-for-rebuild` handshake.
   The served export route returns this as HTTP **409** before `200`.
+- Graph-ingest HTTP preconditions are transport errors rather than new durable
+  engine states. Missing `If-Match` returns **428** plus the current opaque
+  graph-ingest ETag without polling the body. Malformed or stale `If-Match`
+  returns **412** without a replacement token, also before body polling. A
+  non-`application/x-ndjson` request returns **415**. None of these outcomes
+  enrolls a lane or invokes MemWAL.
 - `StreamRetirementPlanChanged` — graph/profile/lifecycle/token authority moved
   between retirement plan and confirm. No retirement effect is accepted; rerun
   the plan and review the new digest.

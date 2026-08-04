@@ -207,6 +207,19 @@ pub mod names {
     /// this boundary to add a new node trigger and prove it cannot enter ahead
     /// of an edge already captured in the round.
     pub const STREAM_DRIVER_POST_ROUND_FREEZE: &str = "stream_driver.post_round_freeze";
+    /// Startup has discovered the durable eligible lane set but has not yet
+    /// installed any of its process-local fold triggers. Graph dependency
+    /// settlement must not mistake this boundary for completed discovery.
+    pub const STREAM_DRIVER_POST_DISCOVERY_PRE_NOTIFY: &str =
+        "stream_driver.post_discovery_pre_notify";
+    /// A finite graph-routing round selected one empty resident owner but has
+    /// not attempted its retirement. Tests use this to prove the cleanup
+    /// failure is returned and the next lane is not physically invoked.
+    pub const STREAM_DRIVER_EMPTY_OWNER_CLEANUP: &str = "stream_driver.empty_owner_cleanup";
+    /// A selected productive driver candidate has not yet invoked its fold or
+    /// drain adapter. Tests use this to install a real retry deadline without
+    /// creating physical resident ownership.
+    pub const STREAM_DRIVER_CANDIDATE_ATTEMPT: &str = "stream_driver.candidate_attempt";
     /// The resident stream driver has selected due work but has not yet taken
     /// the root-exclusive finite-round fence. Tests use this boundary to order
     /// a resume-owned empty-writer installation ahead of the round.

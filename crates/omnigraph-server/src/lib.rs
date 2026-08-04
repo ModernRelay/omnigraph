@@ -30,15 +30,17 @@ use api::{
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
     HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
     QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
-    SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output,
-    snapshot_payload,
+    SchemaApplyRequest, SchemaOutput, SnapshotQuery, StreamIngestChallenge, ingest_output,
+    schema_apply_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
 use axum::http::StatusCode;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
+use axum::http::header::{
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, ETAG, HeaderName, HeaderValue, IF_MATCH,
+};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -98,6 +100,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         #[allow(deprecated)] handlers::server_read,
         handlers::server_query,
         handlers::server_export,
+        handlers::server_stream_ingest,
         #[allow(deprecated)] handlers::server_change,
         handlers::server_mutate,
         handlers::server_list_queries,
@@ -592,8 +595,9 @@ impl AppState {
     ) -> Self {
         // Engine-layer policy gate (MR-722). With a per-graph policy
         // installed, every `_as` writer on `Omnigraph` calls into the
-        // PolicyChecker. HTTP-layer `authorize_request` is the first
-        // gate; engine-layer is the redundant-but-correct backstop.
+        // PolicyChecker. Most handlers retain an HTTP-layer first gate;
+        // graph firehose deliberately uses the engine's single graph-scoped
+        // decision so lazy private-lane work cannot create policy drift.
         let db = if let Some(policy) = policy_engine.as_ref() {
             let checker = Arc::clone(policy) as Arc<dyn omnigraph_policy::PolicyChecker>;
             db.with_policy(checker)
@@ -781,6 +785,34 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
+            message: message.into(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            recovery_required: None,
+        }
+    }
+
+    fn precondition_failed(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_FAILED,
+            code: Some(ErrorCode::Conflict),
+            message: message.into(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            recovery_required: None,
+        }
+    }
+
+    fn unsupported_media_type(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            code: Some(ErrorCode::BadRequest),
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
@@ -982,11 +1014,11 @@ impl ApiError {
                     actual,
                 },
             ),
-            // There is no public stream row route yet. Keep the exhaustive
-            // engine translation conservative until that surface defines
-            // structured wire fields: fold-required and strict-blocked are
-            // retryable logical conflicts, while an invoked-but-unconfirmed
-            // append is unavailable/ambiguous.
+            // The graph firehose converts invoked row outcomes to its ordered
+            // NDJSON union inside the engine. Only request-level stream errors
+            // reach this ordinary JSON translation: fold-required and strict-
+            // blocked are retryable logical conflicts, while an invoked-but-
+            // unconfirmed append is unavailable/ambiguous.
             err @ (OmniError::FoldRequired { .. } | OmniError::StreamDataBlocked { .. }) => {
                 Self::conflict(err.to_string())
             }
@@ -1027,12 +1059,12 @@ impl ApiError {
                 Self::conflict(format!("retryable storage commit conflict: {message}"))
             }
             OmniError::Io(err) => Self::internal(format!("io: {err}")),
-            // Engine-layer policy enforcement (MR-722). All denials and
-            // evaluation failures surface here as 403. The HTTP-layer
-            // `authorize_request` already distinguishes 401 (missing
-            // bearer) from 403 (policy denial), so by the time the
-            // engine gate fires, the bearer is valid — any failure from
-            // the engine is a policy outcome, not an auth one.
+            // Engine-layer policy enforcement (MR-722). Authentication
+            // middleware has already distinguished a missing/invalid bearer
+            // (401); policy denials and evaluation failures surface as 403.
+            // Most legacy handlers also perform an HTTP-layer policy check,
+            // while graph firehose intentionally makes the engine's one
+            // graph-scoped decision authoritative.
             OmniError::Policy(message) => Self::forbidden(message),
             // `Omnigraph::init` against an existing graph URI in strict
             // mode. Not currently HTTP-reachable (POST /graphs was
@@ -1041,6 +1073,49 @@ impl ApiError {
             // create endpoint lands.
             err @ OmniError::AlreadyInitialized { .. } => Self::conflict(err.to_string()),
         }
+    }
+
+    /// Translate failures before the graph firehose owns its request body.
+    ///
+    /// Generic engine errors legitimately carry table keys, lifecycle IDs,
+    /// recovery operation IDs, block tokens, and storage diagnostics for
+    /// trusted control-plane callers. None of that is part of the graph-only
+    /// row-ingest contract. Preserve the useful HTTP class while removing
+    /// every structured/private detail at this transport boundary.
+    fn from_graph_stream_start(err: OmniError, precondition_supplied: bool) -> Self {
+        if precondition_supplied && matches!(&err, OmniError::StreamingAuthorityMismatch { .. }) {
+            return Self::precondition_failed("graph stream ingest precondition failed");
+        }
+
+        let acknowledgement_unknown = matches!(&err, OmniError::AckUnknown { .. });
+        let mut translated = Self::from_omni(err);
+        if acknowledgement_unknown {
+            // A startup fold may already have invoked storage. Keep that
+            // ambiguity retryable/unavailable rather than presenting it as a
+            // generic server fault, while still suppressing every physical
+            // acknowledgement coordinate below.
+            translated.status = StatusCode::SERVICE_UNAVAILABLE;
+            translated.code = None;
+        }
+        translated.message = match translated.status {
+            StatusCode::BAD_REQUEST => "graph stream ingest preflight was refused",
+            StatusCode::FORBIDDEN => "graph stream ingest is forbidden",
+            StatusCode::NOT_FOUND => "graph stream ingest target was not found",
+            StatusCode::CONFLICT => "graph stream ingest is not ready",
+            StatusCode::PAYLOAD_TOO_LARGE => "graph stream request capacity is unavailable",
+            StatusCode::SERVICE_UNAVAILABLE => {
+                "graph recovery must complete before stream ingest can begin"
+            }
+            _ => "graph stream ingest preflight failed",
+        }
+        .to_string();
+        translated.merge_conflicts.clear();
+        translated.manifest_conflict = None;
+        translated.read_set_conflict = None;
+        translated.key_conflict = None;
+        translated.resource_limit = None;
+        translated.recovery_required = None;
+        translated
     }
 }
 
@@ -1174,6 +1249,114 @@ mod api_error_tests {
     }
 
     #[tokio::test]
+    async fn graph_stream_start_errors_redact_private_engine_evidence() {
+        let cases = vec![
+            (
+                OmniError::FoldRequired {
+                    table_key: "node:PrivatePerson".to_string(),
+                    rows: 7,
+                    bytes: 11,
+                },
+                StatusCode::CONFLICT,
+                "PrivatePerson",
+            ),
+            (
+                OmniError::StreamDataBlocked {
+                    block_token: "private-block-token".to_string(),
+                },
+                StatusCode::CONFLICT,
+                "private-block-token",
+            ),
+            (
+                OmniError::RecoveryRequired {
+                    operation_id: "private-recovery-operation".to_string(),
+                    reason: "private recovery reason".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "private-recovery-operation",
+            ),
+            (
+                OmniError::StreamBindingChanged {
+                    stable_table_id: 41,
+                    table_incarnation_id: 43,
+                    current_stream_incarnation_id: "private-stream-incarnation".to_string(),
+                },
+                StatusCode::CONFLICT,
+                "private-stream-incarnation",
+            ),
+            (
+                OmniError::ResourceLimitExceeded {
+                    resource: "private-storage-scan-limit".to_string(),
+                    limit: 1,
+                    actual: 2,
+                },
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "private-storage-scan-limit",
+            ),
+            (
+                OmniError::Lance("private object-store URI".to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "private object-store URI",
+            ),
+            (
+                OmniError::AckUnknown {
+                    stable_table_id: 41,
+                    table_incarnation_id: 43,
+                    enrollment_id: "private-enrollment".to_string(),
+                    shard_id: "private-shard".to_string(),
+                    writer_epoch: 47,
+                    caller_ordinal_start: 0,
+                    caller_ordinal_end: 1,
+                    admission_attempt_id: Some("private-attempt".to_string()),
+                    logical_write_ids: vec!["private-write".to_string()],
+                    unconfirmed_candidate_token: Some("private-token".to_string()),
+                    reason: "private acknowledgement reason".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "private-enrollment",
+            ),
+            (
+                OmniError::StreamingAuthorityMismatch {
+                    reason: "private fold delegation".to_string(),
+                },
+                StatusCode::PRECONDITION_FAILED,
+                "private fold delegation",
+            ),
+        ];
+
+        for (engine_error, expected_status, private_evidence) in cases {
+            let response = ApiError::from_graph_stream_start(engine_error, true).into_response();
+            assert_eq!(response.status(), expected_status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            assert!(!error.error.contains(private_evidence), "{}", error.error);
+            assert!(error.merge_conflicts.is_empty());
+            assert!(error.manifest_conflict.is_none());
+            assert!(error.read_set_conflict.is_none());
+            assert!(error.key_conflict.is_none());
+            assert!(error.resource_limit.is_none());
+            assert!(error.recovery_required.is_none());
+        }
+
+        let response = ApiError::from_graph_stream_start(
+            OmniError::StreamingAuthorityMismatch {
+                reason: "private checked-runtime binding".to_string(),
+            },
+            false,
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.error, "graph stream ingest is not ready");
+        assert!(!error.error.contains("private checked-runtime binding"));
+    }
+
+    #[tokio::test]
     async fn stream_management_conflicts_serialize_as_409() {
         let cases = [
             (
@@ -1284,6 +1467,7 @@ pub fn build_app(state: AppState) -> Router {
     let per_graph_protected = Router::new()
         .route("/snapshot", get(server_snapshot))
         .route("/export", post(server_export))
+        .route("/stream/ingest", post(server_stream_ingest))
         // /read and /change are kept indefinitely for back-compat;
         // their handlers carry #[deprecated] so the OpenAPI operation is
         // flagged and their responses include RFC 9745 Deprecation +

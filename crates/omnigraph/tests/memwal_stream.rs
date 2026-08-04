@@ -39,10 +39,10 @@ use object_store::{
     UploadPart,
 };
 use omnigraph::db::{
-    CleanupPolicyOptions, Omnigraph, ReadTarget, StreamAuthorityRetirementPlan,
-    StreamDataCorrectionAction, StreamDataCorrectionRequest, StreamOldestUncoveredAgeStatus,
-    StreamPendingGenerationStatus, StreamRebuildBlockReason, StreamTablePhysicalOperationalStatus,
-    StreamTableStatus, StreamTokenIndexCoverageStatus,
+    CleanupPolicyOptions, GraphStreamChunkSource, GraphStreamIngestStart, Omnigraph, ReadTarget,
+    StreamAuthorityRetirementPlan, StreamDataCorrectionAction, StreamDataCorrectionRequest,
+    StreamOldestUncoveredAgeStatus, StreamPendingGenerationStatus, StreamRebuildBlockReason,
+    StreamTablePhysicalOperationalStatus, StreamTableStatus, StreamTokenIndexCoverageStatus,
 };
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
@@ -83,6 +83,7 @@ const F6B2_NODE_EDGE_SCHEMA: &str = r#"
 node Person { score: I32 }
 node Company { score: I32 }
 edge Knows: Person -> Person
+edge WorksAt: Company -> Person
 "#;
 const TYPED_STREAM_SCHEMA: &str = r#"
 node Person {
@@ -112,6 +113,7 @@ const PAYLOAD_STREAM_SCHEMA: &str = "node Person { payload: String }\n";
 const TABLE: &str = "node:Person";
 const COMPANY_TABLE: &str = "node:Company";
 const MIN_CARD_EDGE_TABLE: &str = "edge:Knows";
+const WORKS_AT_EDGE_TABLE: &str = "edge:WorksAt";
 const INSERT_PERSON: &str = r#"
 query insert_person($score: I32) {
     insert Person { score: $score }
@@ -2987,11 +2989,118 @@ fn ndjson_score_line(
     line
 }
 
+fn graph_node_line(
+    type_name: &str,
+    logical_id: &str,
+    score: i32,
+    write_id: &str,
+    predecessor_token: Option<&str>,
+) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "type": type_name,
+        "data": {"id": logical_id, "score": score},
+        "$stream": {
+            "write_id": write_id,
+            "predecessor_token": predecessor_token,
+        },
+    }))
+    .unwrap();
+    line.push(b'\n');
+    line
+}
+
+fn graph_edge_line(
+    type_name: &str,
+    logical_id: &str,
+    from: &str,
+    to: &str,
+    write_id: &str,
+    predecessor_token: Option<&str>,
+) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "edge": type_name,
+        "from": from,
+        "to": to,
+        "data": {"id": logical_id},
+        "$stream": {
+            "write_id": write_id,
+            "predecessor_token": predecessor_token,
+        },
+    }))
+    .unwrap();
+    line.push(b'\n');
+    line
+}
+
+fn assert_graph_stream_result_redacted(outcome: &serde_json::Value) {
+    const ALLOWED_KEYS: &[&str] = &[
+        "actual",
+        "blocking_ordinal",
+        "blocking_status",
+        "current_token",
+        "id",
+        "kind",
+        "limit",
+        "message",
+        "ordinal",
+        "scope",
+        "status",
+        "stream_token",
+        "type",
+        "unconfirmed_candidate_token",
+        "write_id",
+    ];
+    let object = outcome
+        .as_object()
+        .expect("graph stream result must be one flat tagged object");
+    for key in object.keys() {
+        assert!(
+            ALLOWED_KEYS.contains(&key.as_str()),
+            "graph result leaked unreviewed field '{key}': {outcome}"
+        );
+    }
+    assert!(
+        object
+            .values()
+            .all(|value| !value.is_null() && !value.is_object() && !value.is_array()),
+        "graph result must omit null fields and nested private evidence: {outcome}"
+    );
+    let encoded = outcome.to_string();
+    for forbidden in [
+        "node:",
+        "edge:",
+        "stream_incarnation_id",
+        "enrollment_id",
+        "shard_id",
+        "writer_epoch",
+        "admission_attempt_id",
+        "origin",
+        "terminal_correction",
+        "terminal_dead_letter",
+        "receipt",
+        "revision",
+        "digest",
+        "object_location",
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "graph result leaked '{forbidden}': {outcome}"
+        );
+    }
+}
+
 fn parse_ndjson_outcomes(outcomes: Vec<String>) -> Vec<serde_json::Value> {
     outcomes
         .into_iter()
         .map(|outcome| serde_json::from_str(&outcome).expect("outcome must be valid JSON"))
         .collect()
+}
+
+fn graph_body_poll_probe(polled: Arc<AtomicBool>) -> GraphStreamChunkSource {
+    Box::pin(futures::stream::poll_fn(move |_| {
+        polled.store(true, Ordering::SeqCst);
+        std::task::Poll::Ready(None::<Result<Vec<u8>, OmniError>>)
+    }))
 }
 
 async fn prepare_stream_ingest(
@@ -4153,6 +4262,55 @@ async fn resident_driver_empty_startup_is_effect_free_and_timer_folds_once() {
     db.shutdown_stream_fold_driver()
         .await
         .expect("resident driver joins after its finite round");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn resident_driver_same_handle_restart_installs_fresh_startup_discovery() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    db.start_stream_fold_driver()
+        .await
+        .expect("the first driver run establishes its discovery generation");
+    db.shutdown_stream_fold_driver()
+        .await
+        .expect("the first driver run stops cleanly");
+
+    let batch = physical_batch(&db, &[("between-runs".to_string(), 12)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
+        .await
+        .expect("a stopped driver can still receive one durable occurrence");
+    let before = stream_fold_driver_status(&db);
+    let before_trigger = before["pending_triggers"]
+        .as_array()
+        .unwrap()
+        .first()
+        .expect("the durable occurrence owns one ordinary timer trigger");
+    let before_sequence = before_trigger["trigger_sequence"].as_u64().unwrap();
+
+    let round =
+        helpers::failpoint::Rendezvous::park_first(names::STREAM_DRIVER_BEFORE_ROUND_ACQUIRE);
+    db.start_stream_fold_driver()
+        .await
+        .expect("the same handle starts a second driver generation");
+    round.wait_until_reached().await;
+    let restarted = stream_fold_driver_status(&db);
+    let restarted_trigger = restarted["pending_triggers"]
+        .as_array()
+        .unwrap()
+        .first()
+        .expect("startup discovery retains the cold lane until its parked round");
+    assert_eq!(
+        restarted_trigger["trigger_sequence"].as_u64().unwrap(),
+        before_sequence + 1,
+        "the second start must install an independent urgent discovery trigger"
+    );
+    round.release();
+
+    wait_for_visible_rows(&db, &[("between-runs".to_string(), 12)]).await;
+    db.shutdown_stream_fold_driver()
+        .await
+        .expect("the restarted driver joins after publishing the cold lane");
 }
 
 #[tokio::test]
@@ -9549,6 +9707,20 @@ rules:
             .await
             .expect_err("Cedar must reject an actor without stream_ingest");
         assert!(matches!(denied, OmniError::Policy(_)), "{denied:?}");
+        let denied_graph_polled = Arc::new(AtomicBool::new(false));
+        let denied_graph = db
+            .start_served_graph_stream_ingest_as(
+                "act-denied",
+                None,
+                graph_body_poll_probe(Arc::clone(&denied_graph_polled)),
+            )
+            .await
+            .expect_err("served graph ingress must authorize before challenging or polling");
+        assert!(
+            matches!(denied_graph, OmniError::Policy(_)),
+            "{denied_graph:?}"
+        );
+        assert!(!denied_graph_polled.load(Ordering::SeqCst));
 
         let no_runtime_prepare = prepare_stream_ingest(
             &db,
@@ -9576,6 +9748,23 @@ rules:
             ),
             "{no_runtime:?}"
         );
+        let no_runtime_graph_polled = Arc::new(AtomicBool::new(false));
+        let no_runtime_graph = db
+            .start_served_graph_stream_ingest_as(
+                "act-allowed",
+                None,
+                graph_body_poll_probe(Arc::clone(&no_runtime_graph_polled)),
+            )
+            .await
+            .expect_err("ambient graph ingress cannot mint a served challenge");
+        assert!(
+            matches!(
+                no_runtime_graph,
+                OmniError::StreamingRequiresClusterRuntime { ref mode } if mode == "ENABLED"
+            ),
+            "{no_runtime_graph:?}"
+        );
+        assert!(!no_runtime_graph_polled.load(Ordering::SeqCst));
     }
     assert_eq!(
         db.snapshot_of(ReadTarget::branch("main"))
@@ -9586,6 +9775,864 @@ rules:
         "authorization/runtime refusals must be graph-effect-free"
     );
     assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn served_graph_ndjson_challenges_before_body_and_streams_only_redacted_lines() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_unenrolled_served_with_schema(TWO_TABLE_STREAM_SCHEMA).await;
+    let manifest_before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+
+    let challenge_polled = Arc::new(AtomicBool::new(false));
+    let authority_token = match db
+        .start_served_graph_stream_ingest_as(
+            "agent:served-graph",
+            None,
+            graph_body_poll_probe(Arc::clone(&challenge_polled)),
+        )
+        .await
+        .expect("checked served ingest returns an authority challenge")
+    {
+        GraphStreamIngestStart::TokenRequired { authority_token } => authority_token,
+        GraphStreamIngestStart::Ready(_) => panic!("a missing token cannot start body polling"),
+    };
+    assert!(!challenge_polled.load(Ordering::SeqCst));
+    assert_eq!(authority_token.len(), "sha256:".len() + 64);
+    assert!(
+        authority_token
+            .strip_prefix("sha256:")
+            .is_some_and(|digest| digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_before,
+        "the challenge must not publish graph or enrollment state"
+    );
+    assert!(db.stream_status().await.unwrap().tables.is_empty());
+
+    let repeated_polled = Arc::new(AtomicBool::new(false));
+    let repeated = match db
+        .start_served_graph_stream_ingest_as(
+            "agent:served-graph",
+            None,
+            graph_body_poll_probe(Arc::clone(&repeated_polled)),
+        )
+        .await
+        .expect("unchanged authority returns the same challenge")
+    {
+        GraphStreamIngestStart::TokenRequired { authority_token } => authority_token,
+        GraphStreamIngestStart::Ready(_) => panic!("a repeated challenge cannot start a request"),
+    };
+    assert_eq!(repeated, authority_token);
+    assert!(!repeated_polled.load(Ordering::SeqCst));
+
+    for supplied in [
+        "not-a-token".to_string(),
+        format!("sha256:{}", "0".repeat(64)),
+    ] {
+        let refused_polled = Arc::new(AtomicBool::new(false));
+        let error = db
+            .start_served_graph_stream_ingest_as(
+                "agent:served-graph",
+                Some(&supplied),
+                graph_body_poll_probe(Arc::clone(&refused_polled)),
+            )
+            .await
+            .expect_err("malformed and stale tokens must refuse effect-free");
+        assert!(
+            matches!(error, OmniError::StreamingAuthorityMismatch { .. }),
+            "{error:?}"
+        );
+        assert!(!refused_polled.load(Ordering::SeqCst));
+        assert!(
+            !error.to_string().contains(&authority_token),
+            "a stale-token refusal must not disclose replacement authority"
+        );
+    }
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_before
+    );
+    assert!(db.stream_status().await.unwrap().tables.is_empty());
+
+    let body: GraphStreamChunkSource = Box::pin(futures::stream::iter([Ok(graph_node_line(
+        "Person",
+        "served-person",
+        17,
+        "50505050-5050-4050-8050-505050505050",
+        None,
+    ))]));
+    let mut handle = match db
+        .start_served_graph_stream_ingest_as("agent:served-graph", Some(&authority_token), body)
+        .await
+        .expect("an exact graph token starts the existing request owner")
+    {
+        GraphStreamIngestStart::Ready(handle) => handle,
+        GraphStreamIngestStart::TokenRequired { .. } => {
+            panic!("the exact token cannot be rechallenged")
+        }
+    };
+    let line = handle
+        .recv()
+        .await
+        .expect("served result receive succeeds")
+        .expect("one input produces one result");
+    assert_eq!(line.last(), Some(&b'\n'));
+    assert_eq!(line.iter().filter(|byte| **byte == b'\n').count(), 1);
+    let outcome: serde_json::Value =
+        serde_json::from_slice(&line[..line.len() - 1]).expect("result line is valid JSON");
+    assert_eq!(outcome["status"], "durable");
+    assert_eq!(outcome["scope"], "row");
+    assert_eq!(outcome["kind"], "node");
+    assert_eq!(outcome["type"], "Person");
+    assert_eq!(outcome["id"], "served-person");
+    assert_graph_stream_result_redacted(&outcome);
+    assert!(handle.recv().await.unwrap().is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn served_graph_ndjson_flushes_one_complete_run_before_body_eof() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_unenrolled_served_with_schema(TWO_TABLE_STREAM_SCHEMA).await;
+    let challenge_body: GraphStreamChunkSource = Box::pin(futures::stream::pending());
+    let authority_token = match db
+        .start_served_graph_stream_ingest_as("agent:low-rate", None, challenge_body)
+        .await
+        .expect("checked served ingest returns an authority challenge")
+    {
+        GraphStreamIngestStart::TokenRequired { authority_token } => authority_token,
+        GraphStreamIngestStart::Ready(_) => panic!("a missing token cannot start body polling"),
+    };
+
+    let (body_sender, body_receiver) =
+        futures::channel::mpsc::unbounded::<Result<Vec<u8>, OmniError>>();
+    body_sender
+        .unbounded_send(Ok(graph_node_line(
+            "Person",
+            "low-rate-person",
+            19,
+            "53535353-5353-4353-8353-535353535353",
+            None,
+        )))
+        .unwrap();
+    let body: GraphStreamChunkSource = Box::pin(body_receiver);
+    let mut handle = match db
+        .start_served_graph_stream_ingest_as("agent:low-rate", Some(&authority_token), body)
+        .await
+        .expect("the exact graph token starts the request")
+    {
+        GraphStreamIngestStart::Ready(handle) => handle,
+        GraphStreamIngestStart::TokenRequired { .. } => {
+            panic!("the exact token cannot be rechallenged")
+        }
+    };
+
+    // Keep `body_sender` alive: after delivering the complete line the source
+    // is Pending, not EOF. The fixed coalescing boundary must submit the run.
+    let line = tokio::time::timeout(Duration::from_secs(5), handle.recv())
+        .await
+        .expect("one low-rate graph row must acknowledge while the body remains pending")
+        .expect("served result receive succeeds")
+        .expect("one input produces one result");
+    assert_eq!(line.last(), Some(&b'\n'));
+    let outcome: serde_json::Value =
+        serde_json::from_slice(&line[..line.len() - 1]).expect("result line is valid JSON");
+    assert_eq!(outcome["status"], "durable");
+    assert_eq!(outcome["id"], "low-rate-person");
+    assert_graph_stream_result_redacted(&outcome);
+
+    drop(body_sender);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), handle.recv())
+            .await
+            .expect("request reaches EOF after the pending body is closed")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn graph_ndjson_authorizes_one_graph_not_each_lazy_lane() {
+    struct GraphDecisionCounter {
+        calls: AtomicUsize,
+    }
+
+    impl PolicyChecker for GraphDecisionCounter {
+        fn check(
+            &self,
+            action: omnigraph_policy::PolicyAction,
+            scope: &omnigraph_policy::ResourceScope,
+            actor: &str,
+        ) -> std::result::Result<(), omnigraph_policy::PolicyError> {
+            assert_eq!(action, omnigraph_policy::PolicyAction::StreamIngest);
+            assert_eq!(scope, &omnigraph_policy::ResourceScope::Graph);
+            assert_eq!(actor, "agent:graph-policy");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_unenrolled_served_with_schema(TWO_TABLE_STREAM_SCHEMA).await;
+    let checker = Arc::new(GraphDecisionCounter {
+        calls: AtomicUsize::new(0),
+    });
+    let policy: Arc<dyn PolicyChecker> = checker.clone();
+    let db = match Arc::try_unwrap(db) {
+        Ok(db) => Arc::new(db.with_policy(policy)),
+        Err(_) => panic!("graph policy fixture must own the sole engine handle"),
+    };
+    let body = [
+        graph_node_line(
+            "Person",
+            "policy-person",
+            1,
+            "40404040-4040-4040-8040-404040404040",
+            None,
+        ),
+        graph_node_line(
+            "Company",
+            "policy-company",
+            2,
+            "40404040-4040-4040-8040-404040404041",
+            None,
+        ),
+    ]
+    .concat();
+
+    let outcomes = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(vec![body], "agent:graph-policy")
+            .await
+            .expect("one graph-scoped decision authorizes both private lanes"),
+    );
+    assert_eq!(outcomes.len(), 2);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome["status"] == "durable"),
+        "{outcomes:#?}"
+    );
+    assert_eq!(
+        checker.calls.load(Ordering::SeqCst),
+        1,
+        "lazy per-declaration enrollment must not re-authorize physical tables"
+    );
+    let lanes = db
+        .stream_status()
+        .await
+        .unwrap()
+        .tables
+        .into_iter()
+        .map(|lane| lane.table_key)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        lanes,
+        BTreeSet::from([TABLE.to_string(), COMPANY_TABLE.to_string()])
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn graph_ndjson_alternates_node_edge_node_with_private_lazy_enrollment() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_unenrolled_served_with_schema(F6B2_NODE_EDGE_SCHEMA).await;
+    let body = [
+        graph_node_line(
+            "Person",
+            "graph-a",
+            11,
+            "41414141-4141-4141-8141-414141414141",
+            None,
+        ),
+        graph_edge_line(
+            "Knows",
+            "graph-edge",
+            "graph-a",
+            "graph-a",
+            "42424242-4242-4242-8242-424242424242",
+            None,
+        ),
+        graph_node_line(
+            "Person",
+            "graph-b",
+            12,
+            "43434343-4343-4343-8343-434343434343",
+            None,
+        ),
+    ]
+    .concat();
+
+    let outcomes = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+            vec![body[..31].to_vec(), body[31..].to_vec()],
+            "agent:graph-ingest",
+        )
+        .await
+        .expect("one graph request must route alternating logical declarations"),
+    );
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome["status"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["durable", "durable", "durable"],
+        "{outcomes:#?}"
+    );
+    assert_eq!(outcomes[0]["kind"], "node");
+    assert_eq!(outcomes[0]["type"], "Person");
+    assert_eq!(outcomes[0]["id"], "graph-a");
+    assert_eq!(outcomes[1]["kind"], "edge");
+    assert_eq!(outcomes[1]["type"], "Knows");
+    assert_eq!(outcomes[1]["id"], "graph-edge");
+    assert_eq!(outcomes[2]["kind"], "node");
+    assert_eq!(outcomes[2]["id"], "graph-b");
+    for (ordinal, outcome) in outcomes.iter().enumerate() {
+        assert_eq!(outcome["ordinal"], ordinal as u64);
+        assert_eq!(outcome["scope"], "row");
+        assert!(outcome["stream_token"].as_str().is_some());
+        assert_graph_stream_result_redacted(outcome);
+    }
+
+    let lanes = db
+        .stream_status()
+        .await
+        .unwrap()
+        .tables
+        .into_iter()
+        .map(|lane| lane.table_key)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        lanes,
+        BTreeSet::from([TABLE.to_string(), MIN_CARD_EDGE_TABLE.to_string()]),
+        "only declarations reached by valid rows are enrolled"
+    );
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("graph-a".to_string(), 11)],
+        "switching away from the first node lane reuses the resident fold coordinator"
+    );
+    assert_eq!(
+        visible_edge_rows(&db).await,
+        vec![(
+            "graph-edge".to_string(),
+            "graph-a".to_string(),
+            "graph-a".to_string(),
+        )],
+        "switching back to a node lane settles the edge lane through the same coordinator"
+    );
+
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the final resident node lane publishes its remaining occurrence");
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("graph-a".to_string(), 11), ("graph-b".to_string(), 12)]
+    );
+    assert_eq!(
+        visible_edge_rows(&db).await,
+        vec![(
+            "graph-edge".to_string(),
+            "graph-a".to_string(),
+            "graph-a".to_string(),
+        )]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn graph_ndjson_handoff_uses_the_driver_node_before_edge_round() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_f6b2_node_edge_fixture().await;
+    let cluster_uri = dir.cluster_uri();
+
+    let node_owner = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let bob = physical_batch(&node_owner, &[("Bob".to_string(), 2)]).await;
+    node_owner
+        .failpoint_stream_b1_for_test(TABLE, Some(bob), 0)
+        .await
+        .expect("Bob is durably acknowledged before the first runtime retires");
+    node_owner.shutdown_stream_fold_driver().await.unwrap();
+    drop(node_owner);
+
+    let db = reopen_enrolled(&dir).await;
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    assert_eq!(visible_rows(&db).await, vec![("Alice".to_string(), 1)]);
+    let startup =
+        helpers::failpoint::Rendezvous::park_first(names::STREAM_DRIVER_POST_DISCOVERY_PRE_NOTIFY);
+    let start_db = Arc::clone(&db);
+    let start = tokio::spawn(async move { start_db.start_stream_fold_driver().await });
+    startup.wait_until_reached().await;
+    let body = [
+        graph_edge_line(
+            "Knows",
+            "graph-dependent-edge",
+            "Alice",
+            "Bob",
+            "48484848-4848-4848-8848-484848484848",
+            None,
+        ),
+        graph_node_line(
+            "Person",
+            "Carol",
+            3,
+            "49494949-4949-4949-8949-494949494949",
+            None,
+        ),
+    ]
+    .concat();
+
+    let outcomes = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(vec![body], "agent:graph-driver-round")
+            .await
+            .expect("the graph handoff reuses one finite driver round"),
+    );
+    assert_eq!(outcomes.len(), 2);
+    let visible_after_handoff = visible_rows(&db).await;
+    let visible_edges_after_handoff = visible_edge_rows(&db).await;
+    let driver = stream_fold_driver_status(&db);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome["status"] == "durable"),
+        "outcomes={outcomes:#?}\nvisible={visible_after_handoff:#?}\nedges={visible_edges_after_handoff:#?}\ndriver={driver:#?}"
+    );
+    assert_eq!(
+        visible_after_handoff,
+        vec![("Alice".to_string(), 1), ("Bob".to_string(), 2)],
+        "the cold acknowledged node must publish before the resident dependent edge"
+    );
+    assert_eq!(
+        visible_edges_after_handoff,
+        vec![(
+            "graph-dependent-edge".to_string(),
+            "Alice".to_string(),
+            "Bob".to_string(),
+        )]
+    );
+    assert_eq!(driver["published_open_folds"], 2);
+    assert_eq!(driver["last_completion"]["outcome"], "published_open_fold");
+    assert_eq!(driver["last_error"], serde_json::Value::Null);
+
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the final resident node lane publishes Carol");
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![
+            ("Alice".to_string(), 1),
+            ("Bob".to_string(), 2),
+            ("Carol".to_string(), 3),
+        ]
+    );
+    startup.release();
+    start
+        .await
+        .expect("the parked driver startup task must join")
+        .expect("driver startup must finish after installing every discovered trigger");
+    db.shutdown_stream_fold_driver()
+        .await
+        .expect("the startup-race fixture must stop its driver");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn graph_ndjson_releases_resident_before_folding_distinct_endpoint_lanes() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_f6b2_node_edge_fixture().await;
+    let cluster_uri = dir.cluster_uri();
+
+    let company_owner =
+        helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let cold_company =
+        physical_score_batch(&company_owner, COMPANY_TABLE, &[("ColdCo".to_string(), 7)]).await;
+    company_owner
+        .failpoint_stream_b1_for_test(COMPANY_TABLE, Some(cold_company), 0)
+        .await
+        .expect("the Company endpoint is acknowledged before process restart");
+    company_owner.shutdown_stream_fold_driver().await.unwrap();
+    drop(company_owner);
+
+    let db = reopen_enrolled(&dir).await;
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let first = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+            vec![graph_edge_line(
+                "Knows",
+                "resident-knows",
+                "Alice",
+                "Alice",
+                "50505050-5050-4050-8050-505050505050",
+                None,
+            )],
+            "agent:graph-resident-first",
+        )
+        .await
+        .expect("the first request leaves one productive edge lane resident"),
+    );
+    assert_eq!(first[0]["status"], "durable");
+    assert!(
+        visible_score_rows(&db, COMPANY_TABLE).await.is_empty(),
+        "the unrelated cold Company endpoint must remain with its own trigger"
+    );
+
+    let node_switch = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+            vec![graph_node_line(
+                "Company",
+                "FreshCo",
+                8,
+                "51515151-5151-4151-8151-515151515151",
+                None,
+            )],
+            "agent:graph-resident-first",
+        )
+        .await
+        .expect("a fresh node-first request releases a foreign resident edge"),
+    );
+    assert_eq!(node_switch[0]["status"], "durable", "{node_switch:#?}");
+    assert_eq!(
+        visible_edge_rows(&db).await,
+        vec![(
+            "resident-knows".to_string(),
+            "Alice".to_string(),
+            "Alice".to_string(),
+        )],
+        "the foreign edge resident must publish before Company becomes resident"
+    );
+    assert_eq!(
+        visible_score_rows(&db, COMPANY_TABLE).await,
+        vec![("ColdCo".to_string(), 7)],
+        "the cold target tail must publish before the new Company occurrence is admitted"
+    );
+
+    let second = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+            vec![graph_edge_line(
+                "WorksAt",
+                "resident-then-endpoints",
+                "FreshCo",
+                "Alice",
+                "52525252-5252-4252-8252-525252525252",
+                None,
+            )],
+            "agent:graph-resident-first",
+        )
+        .await
+        .expect("the second request releases the resident before its two endpoint lanes"),
+    );
+    assert_eq!(second[0]["status"], "durable", "{second:#?}");
+    assert_eq!(
+        visible_score_rows(&db, COMPANY_TABLE).await,
+        vec![("ColdCo".to_string(), 7), ("FreshCo".to_string(), 8)],
+        "the Company target and its cold predecessor must publish before WorksAt admission"
+    );
+    assert_eq!(
+        visible_edge_rows(&db).await,
+        vec![(
+            "resident-knows".to_string(),
+            "Alice".to_string(),
+            "Alice".to_string(),
+        )],
+        "the prior resident edge must publish before the dependency fold"
+    );
+
+    db.failpoint_stream_b1_for_test(WORKS_AT_EDGE_TABLE, None, 0)
+        .await
+        .expect("the final heterogeneous edge lane folds cleanly");
+    assert_eq!(helpers::count_rows(&db, WORKS_AT_EDGE_TABLE).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn graph_ndjson_reports_empty_owner_cleanup_before_retrying_the_target() {
+    let _scenario = FailScenario::setup();
+    let (dir, db, sealed) = init_f6b8_resume_driver_fixture().await;
+    db.failpoint_stream_resume_for_test(
+        TABLE,
+        "f6b80000-0000-4000-8000-000000000008",
+        sealed.lifecycle_revision,
+        false,
+        "operator:graph-cleanup-failure",
+    )
+    .await
+    .expect("the fixture installs one empty foreign resident");
+
+    let line = graph_node_line(
+        "Company",
+        "AfterCleanup",
+        9,
+        "53535353-5353-4353-8353-535353535353",
+        None,
+    );
+    let first = {
+        let _cleanup = ScopedFailPoint::new(names::STREAM_DRIVER_EMPTY_OWNER_CLEANUP, "return");
+        parse_ndjson_outcomes(
+            db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+                vec![line.clone()],
+                "agent:graph-cleanup-failure",
+            )
+            .await
+            .expect("the cleanup failure is a logical line outcome"),
+        )
+    };
+    assert_eq!(first[0]["status"], "stream_authority_changed", "{first:#?}");
+    assert!(
+        visible_score_rows(&db, COMPANY_TABLE).await.is_empty(),
+        "the target lane must not be physically invoked after cleanup fails"
+    );
+    let failed = stream_fold_driver_status(&db);
+    let failed_triggers = failed["pending_triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|trigger| trigger["consecutive_failures"] == 1)
+        .count();
+    assert_eq!(failed_triggers, 1, "{failed:#?}");
+    assert!(
+        failed["last_error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(names::STREAM_DRIVER_EMPTY_OWNER_CLEANUP),
+        "the driver must retain the actual cleanup failure: {failed:#?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let retry = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+            vec![line],
+            "agent:graph-cleanup-failure",
+        )
+        .await
+        .expect("the exact logical retry proceeds after cleanup backoff"),
+    );
+    assert_eq!(retry[0]["status"], "durable", "{retry:#?}");
+    db.failpoint_stream_b1_for_test(COMPANY_TABLE, None, 0)
+        .await
+        .expect("the target lane folds after the successful retry");
+    assert_eq!(
+        visible_score_rows(&db, COMPANY_TABLE).await,
+        vec![("AfterCleanup".to_string(), 9)]
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn graph_ndjson_ignores_an_unrelated_nonresident_retry_backoff() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_f6b2_node_edge_fixture().await;
+    let cluster_uri = dir.cluster_uri();
+    let owner = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let cold = physical_score_batch(&owner, COMPANY_TABLE, &[("ColdBackoff".to_string(), 7)]).await;
+    owner
+        .failpoint_stream_b1_for_test(COMPANY_TABLE, Some(cold), 0)
+        .await
+        .expect("the unrelated Company tail is acknowledged before restart");
+    owner.shutdown_stream_fold_driver().await.unwrap();
+    drop(owner);
+
+    let db = reopen_enrolled(&dir).await;
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let failed = {
+        let _attempt = ScopedFailPoint::new(names::STREAM_DRIVER_CANDIDATE_ATTEMPT, "return");
+        parse_ndjson_outcomes(
+            db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+                vec![graph_node_line(
+                    "Company",
+                    "NotInvoked",
+                    8,
+                    "54545454-5454-4454-8454-545454545454",
+                    None,
+                )],
+                "agent:graph-unrelated-backoff",
+            )
+            .await
+            .expect("the injected target failure is a logical line outcome"),
+        )
+    };
+    assert_eq!(
+        failed[0]["status"], "stream_authority_changed",
+        "{failed:#?}"
+    );
+    let before_status = stream_fold_driver_status(&db);
+    let before = before_status["pending_triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|trigger| trigger["consecutive_failures"] == 1)
+        .expect("the Company driver attempt owns one retry deadline")
+        .clone();
+
+    let unrelated = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+            vec![graph_node_line(
+                "Person",
+                "Bob",
+                2,
+                "55555555-5555-4555-8555-555555555555",
+                None,
+            )],
+            "agent:graph-unrelated-backoff",
+        )
+        .await
+        .expect("an unrelated node route must not run the failed Company lane"),
+    );
+    assert_eq!(unrelated[0]["status"], "durable", "{unrelated:#?}");
+    assert!(
+        visible_score_rows(&db, COMPANY_TABLE).await.is_empty(),
+        "the unrelated request must not fold the backed-off Company tail"
+    );
+    let after_status = stream_fold_driver_status(&db);
+    let after = after_status["pending_triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|trigger| trigger["table_identity"] == before["table_identity"])
+        .expect("the unrelated request must preserve the Company trigger");
+    assert_eq!(after["trigger_sequence"], before["trigger_sequence"]);
+    assert_eq!(after["consecutive_failures"], 1);
+    assert_eq!(after_status["last_error"], before_status["last_error"]);
+
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the unrelated Person occurrence folds normally");
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("Alice".to_string(), 1), ("Bob".to_string(), 2)]
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn graph_ndjson_invalid_and_blob_rows_do_not_enroll_private_lanes() {
+    let _scenario = FailScenario::setup();
+    let (_dir, malformed_db) = init_unenrolled_served_with_schema(F6B2_NODE_EDGE_SCHEMA).await;
+    let mut malformed = serde_json::to_vec(&serde_json::json!({
+        "type": "Company",
+        "data": {"id": "missing-score"},
+        "$stream": {
+            "write_id": "44444444-4444-4444-8444-444444444444",
+            "predecessor_token": null,
+        },
+    }))
+    .unwrap();
+    malformed.push(b'\n');
+    let malformed_outcomes = parse_ndjson_outcomes(
+        malformed_db
+            .failpoint_stream_ingest_graph_ndjson_as_for_test(
+                vec![malformed],
+                "agent:graph-invalid",
+            )
+            .await
+            .expect("schema-invalid graph rows are line-local"),
+    );
+    assert_eq!(malformed_outcomes[0]["status"], "invalid");
+    assert_eq!(malformed_outcomes[0]["scope"], "row");
+    assert_graph_stream_result_redacted(&malformed_outcomes[0]);
+    assert!(
+        malformed_db
+            .stream_status()
+            .await
+            .unwrap()
+            .tables
+            .is_empty()
+    );
+
+    let (_dir, blob_db) = init_unenrolled_served_with_schema(BLOB_STREAM_SCHEMA).await;
+    let blob_outcomes = parse_ndjson_outcomes(
+        blob_db
+            .failpoint_stream_ingest_graph_ndjson_as_for_test(
+                vec![graph_node_line(
+                    "Person",
+                    "blob-row",
+                    7,
+                    "45454545-4545-4545-8545-454545454545",
+                    None,
+                )],
+                "agent:graph-blob",
+            )
+            .await
+            .expect("unsupported Blob declarations are line-local"),
+    );
+    assert_eq!(blob_outcomes[0]["status"], "invalid");
+    assert_eq!(blob_outcomes[0]["scope"], "row");
+    assert_graph_stream_result_redacted(&blob_outcomes[0]);
+    assert!(blob_db.stream_status().await.unwrap().tables.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn graph_ndjson_ack_unknown_blocks_later_declarations_without_enrollment() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_unenrolled_served_with_schema(TWO_TABLE_STREAM_SCHEMA).await;
+    let body = [
+        graph_node_line(
+            "Person",
+            "ambiguous-person",
+            31,
+            "46464646-4646-4646-8646-464646464646",
+            None,
+        ),
+        graph_node_line(
+            "Company",
+            "must-not-enroll",
+            32,
+            "47474747-4747-4747-8747-474747474747",
+            None,
+        ),
+    ]
+    .concat();
+    let outcomes = {
+        let _after_durable = ScopedFailPoint::new(names::STREAM_B1_AFTER_WATCHER_SUCCESS, "return");
+        parse_ndjson_outcomes(
+            db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+                vec![body],
+                "agent:graph-ambiguous",
+            )
+            .await
+            .expect("AckUnknown is an ordered graph blocker"),
+        )
+    };
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes[0]["status"], "ack_unknown");
+    assert_eq!(outcomes[0]["scope"], "graph");
+    assert!(
+        outcomes[0]["unconfirmed_candidate_token"]
+            .as_str()
+            .is_some()
+    );
+    assert_eq!(outcomes[1]["status"], "stream_retry_required");
+    assert_eq!(outcomes[1]["scope"], "graph");
+    assert_eq!(outcomes[1]["blocking_ordinal"], 0);
+    assert_eq!(outcomes[1]["blocking_status"], "ack_unknown");
+    for outcome in &outcomes {
+        assert_graph_stream_result_redacted(outcome);
+    }
+
+    let lanes = db.stream_status().await.unwrap().tables;
+    assert_eq!(lanes.len(), 1);
+    assert_eq!(lanes[0].table_key, TABLE);
+    assert!(
+        lanes.iter().all(|lane| lane.table_key != COMPANY_TABLE),
+        "a graph-wide blocker must prevent lazy enrollment of later declarations"
+    );
 }
 
 #[tokio::test]

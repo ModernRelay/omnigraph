@@ -48,6 +48,13 @@ struct PendingFold {
     failures: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingFoldPromotion {
+    Missing,
+    BackedOff,
+    Ready,
+}
+
 /// Process-local supervisor state is operational evidence only. It must never
 /// be used as lifecycle, recovery, or MemWAL authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -193,6 +200,7 @@ struct DriverShared {
     health: DriverHealth,
     last_node: Option<TableIdentity>,
     last_edge: Option<TableIdentity>,
+    initial_discovery_seeded: bool,
 }
 
 /// One weakly root-scoped supervisor registry. The task is deliberately
@@ -233,6 +241,17 @@ impl StreamFoldDriverRegistry {
             .shared
             .lock()
             .expect("stream fold driver state poisoned");
+        Self::arm_trigger_locked(&mut shared, identity, urgent, now);
+        drop(shared);
+        self.wake.notify_one();
+    }
+
+    fn arm_trigger_locked(
+        shared: &mut DriverShared,
+        identity: TableIdentity,
+        urgent: bool,
+        now: Instant,
+    ) {
         let (overflow, trigger_sequence) = {
             let pending = shared.pending.entry(identity).or_insert(PendingFold {
                 sequence: 0,
@@ -270,8 +289,88 @@ impl StreamFoldDriverRegistry {
                 "stream fold trigger sequence overflow"
             );
         }
+    }
+
+    /// Seed the startup-derived eligible set once for a synchronous caller
+    /// that may run before the detached supervisor is started. Existing B2
+    /// triggers retain their exact sequence; discovery supplies only a missing
+    /// process-local scheduling entry and makes the complete seed due now.
+    fn seed_initial_discovery(&self, identities: impl IntoIterator<Item = TableIdentity>) {
+        let now = Instant::now();
+        let mut shared = self
+            .shared
+            .lock()
+            .expect("stream fold driver state poisoned");
+        if shared.initial_discovery_seeded {
+            return;
+        }
+        for identity in identities {
+            let pending = shared.pending.entry(identity).or_insert(PendingFold {
+                sequence: 1,
+                due_at: now,
+                failures: 0,
+            });
+            // Discovery may race a failed synchronous graph attempt. It owns
+            // the missing trigger, but it must not erase an existing lane's
+            // scheduled retry merely because this process has not yet marked
+            // the current discovery generation complete.
+            if pending.failures == 0 {
+                pending.due_at = now;
+            }
+        }
+        shared.initial_discovery_seeded = true;
         drop(shared);
         self.wake.notify_one();
+    }
+
+    /// Install startup discovery and its independent trigger atomically with
+    /// the seeded marker. A synchronous graph route may have installed the
+    /// same complete discovery set while startup was doing manifest IO; in
+    /// that case startup must not manufacture another urgent trigger or erase
+    /// retry backoff established by the route's attempted fold.
+    fn install_startup_discovery(&self, identities: impl IntoIterator<Item = TableIdentity>) {
+        let now = Instant::now();
+        let mut shared = self
+            .shared
+            .lock()
+            .expect("stream fold driver state poisoned");
+        if shared.initial_discovery_seeded {
+            return;
+        }
+        for identity in identities {
+            Self::arm_trigger_locked(&mut shared, identity, true, now);
+        }
+        shared.initial_discovery_seeded = true;
+        drop(shared);
+        self.wake.notify_one();
+    }
+
+    fn initial_discovery_is_seeded(&self) -> bool {
+        self.shared
+            .lock()
+            .expect("stream fold driver state poisoned")
+            .initial_discovery_seeded
+    }
+
+    /// Promote the already-owned B2 trigger into the current finite round.
+    /// Route handoff is not a second acknowledgement and must not advance the
+    /// trigger sequence used by completion/failure accounting.
+    fn promote_pending_due_now(&self, identity: TableIdentity) -> PendingFoldPromotion {
+        let now = Instant::now();
+        let mut shared = self
+            .shared
+            .lock()
+            .expect("stream fold driver state poisoned");
+        let Some(pending) = shared.pending.get_mut(&identity) else {
+            return PendingFoldPromotion::Missing;
+        };
+        if pending.failures > 0 && pending.due_at > now {
+            return PendingFoldPromotion::BackedOff;
+        }
+        pending.due_at = now;
+        drop(shared);
+        self.wake.notify_one();
+        PendingFoldPromotion::Ready
     }
 
     fn due_round(&self, now: Instant) -> Vec<(TableIdentity, u64)> {
@@ -472,6 +571,10 @@ impl StreamFoldDriverRegistry {
             .expect("stream fold driver state poisoned");
         if shared.health.run_state != StreamFoldDriverRunState::Failed {
             shared.health.run_state = StreamFoldDriverRunState::Stopped;
+            // Startup discovery is owned by one driver run. A later start on
+            // this same root must install a fresh durable cut, just as a new
+            // process would, instead of inheriting the prior run's marker.
+            shared.initial_discovery_seeded = false;
         }
     }
 
@@ -481,6 +584,9 @@ impl StreamFoldDriverRegistry {
             .lock()
             .expect("stream fold driver state poisoned");
         shared.health.run_state = StreamFoldDriverRunState::Failed;
+        // A deliberate restart after acknowledging this failed task needs a
+        // fresh startup discovery generation as well.
+        shared.initial_discovery_seeded = false;
         shared.health.record_error(
             StreamFoldDriverErrorKind::UnexpectedStop,
             None,
@@ -576,9 +682,15 @@ impl StreamFoldDriverRegistry {
         let initial = db.stream_driver_eligible_identities().await?;
         self.stop.store(false, Ordering::Release);
         self.mark_running();
-        for identity in initial {
-            self.notify(identity, true);
+        if let Err(error) = maybe_fail(names::STREAM_DRIVER_POST_DISCOVERY_PRE_NOTIFY) {
+            self.mark_unexpected_stop(error.to_string());
+            return Err(error);
         }
+        // Discovery installation and its marker share one critical section.
+        // If synchronous graph routing seeded this same complete set while the
+        // manifest read was in flight, this becomes an idempotent no-op and
+        // preserves any retry deadline established by that route.
+        self.install_startup_discovery(initial);
         let weak_db = Arc::downgrade(db);
         let driver = Arc::clone(self);
         let task = tokio::spawn(async move {
@@ -725,6 +837,330 @@ fn driver_candidate_action(lifecycle: &StreamLifecycleEntry) -> Option<DriverCan
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RequiredResidentHandoff<'a> {
+    identity: TableIdentity,
+    table_key: &'a str,
+}
+
+#[derive(Debug)]
+enum RequiredResidentHandoffOutcome {
+    Completion(StreamFoldCompletionOutcome),
+    Failed(OmniError),
+}
+
+#[derive(Debug, Default)]
+struct DriverRoundExecution {
+    required_handoff: Option<RequiredResidentHandoffOutcome>,
+    first_non_target_failure: Option<OmniError>,
+}
+
+#[derive(Debug)]
+struct DriverRoundFailure {
+    error: OmniError,
+    fatal: bool,
+}
+
+impl DriverRoundFailure {
+    fn retryable(error: OmniError) -> Self {
+        Self {
+            error,
+            fatal: false,
+        }
+    }
+
+    fn fatal(error: OmniError) -> Self {
+        Self { error, fatal: true }
+    }
+}
+
+impl DriverRoundExecution {
+    fn record_completion(
+        &mut self,
+        required: Option<RequiredResidentHandoff<'_>>,
+        identity: TableIdentity,
+        outcome: StreamFoldCompletionOutcome,
+    ) {
+        if required.is_some_and(|required| required.identity == identity) {
+            self.required_handoff = Some(RequiredResidentHandoffOutcome::Completion(outcome));
+        }
+    }
+
+    fn record_failure(
+        &mut self,
+        required: Option<RequiredResidentHandoff<'_>>,
+        identity: TableIdentity,
+        error: OmniError,
+    ) {
+        if required.is_some_and(|required| required.identity == identity) {
+            self.required_handoff = Some(RequiredResidentHandoffOutcome::Failed(error));
+        } else if self.first_non_target_failure.is_none() {
+            self.first_non_target_failure = Some(error);
+        }
+    }
+}
+
+fn required_resident_handoff_result(
+    execution: DriverRoundExecution,
+    accept_sealed: bool,
+) -> Result<()> {
+    match execution.required_handoff {
+        Some(RequiredResidentHandoffOutcome::Completion(
+            StreamFoldCompletionOutcome::PublishedOpenFold
+            | StreamFoldCompletionOutcome::Idle,
+        )) => Ok(()),
+        Some(RequiredResidentHandoffOutcome::Completion(StreamFoldCompletionOutcome::Sealed))
+            if accept_sealed =>
+        {
+            Ok(())
+        }
+        Some(RequiredResidentHandoffOutcome::Completion(
+            StreamFoldCompletionOutcome::Inactive,
+        )) => Err(OmniError::StreamingAuthorityMismatch {
+            reason: "the resident stream lane became inactive during graph handoff".to_string(),
+        }),
+        Some(RequiredResidentHandoffOutcome::Completion(outcome)) => {
+            Err(OmniError::StreamingAuthorityMismatch {
+                reason: format!(
+                    "the resident stream lane did not produce a handoff disposition: {outcome:?}"
+                ),
+            })
+        }
+        Some(RequiredResidentHandoffOutcome::Failed(error)) => Err(error),
+        None => match execution.first_non_target_failure {
+            Some(error) => Err(error),
+            None => Err(OmniError::StreamingAuthorityMismatch {
+                reason: "the finite stream fold round did not settle the resident lane requested by graph handoff"
+                    .to_string(),
+            }),
+        },
+    }
+}
+
+fn retain_required_round(
+    due: &mut Vec<(TableIdentity, u64)>,
+    resident: &BTreeSet<TableIdentity>,
+    required: TableIdentity,
+) {
+    due.retain(|(identity, _)| *identity == required || resident.contains(identity));
+}
+
+/// Execute one complete manifest-derived fold round while the caller owns the
+/// exclusive root producer fence. Both the background supervisor and the
+/// synchronous graph handoff use this function, so selection, node-before-edge
+/// order, recovery healing, physical adapters, and advisory accounting cannot
+/// drift into two protocols.
+async fn execute_fenced_driver_round(
+    db: &Arc<Omnigraph>,
+    driver: &Arc<StreamFoldDriverRegistry>,
+    required: Option<RequiredResidentHandoff<'_>>,
+) -> std::result::Result<DriverRoundExecution, DriverRoundFailure> {
+    let resident = db
+        .stream_workers
+        .served_runtime_resident_identities()
+        .await
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let idle_resident = db
+        .stream_workers
+        .driver_idle_resident_identities()
+        .await
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut due = driver.fenced_round(Instant::now(), &resident);
+    if let Some(required) = required {
+        // A synchronous graph route is not a second global scheduler. Its
+        // finite cut contains only the lane the logical row depends on plus
+        // any lane that physically owns the sole resident slot. Every other
+        // pending deadline remains with the background driver.
+        retain_required_round(&mut due, &resident, required.identity);
+    }
+    let mut execution = DriverRoundExecution::default();
+    if due.is_empty() {
+        return Ok(execution);
+    }
+    let candidates = match db.stream_driver_candidates(&due).await {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            for (identity, observed_sequence) in &due {
+                driver.failed(*identity, *observed_sequence, &error);
+            }
+            return Err(DriverRoundFailure::retryable(error));
+        }
+    };
+    if let Some(required) = required
+        && let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.identity == required.identity)
+        && candidate.table_key != required.table_key
+    {
+        return Err(DriverRoundFailure::fatal(
+            OmniError::StreamingAuthorityMismatch {
+                reason: "the resident stream lane alias changed before graph handoff".to_string(),
+            },
+        ));
+    }
+    let (empty_cleanup, candidates) =
+        StreamFoldDriverRegistry::split_empty_owner_cleanup(candidates, &idle_resident);
+    let candidates = driver.order_round(candidates);
+    let active = empty_cleanup
+        .iter()
+        .chain(candidates.iter())
+        .map(|candidate| candidate.identity)
+        .collect::<BTreeSet<_>>();
+    for (identity, sequence) in &due {
+        if !active.contains(identity) {
+            let outcome = StreamFoldCompletionOutcome::NoLongerEligible;
+            driver.complete(*identity, *sequence, outcome);
+            execution.record_completion(required, *identity, outcome);
+        }
+    }
+
+    if let Err(error) = db.heal_pending_recovery_sidecars_for_write(&[None]).await {
+        for candidate in empty_cleanup.iter().chain(candidates.iter()) {
+            driver.failed(candidate.identity, candidate.observed_sequence, &error);
+        }
+        return Err(DriverRoundFailure::retryable(error));
+    }
+
+    // Empty-owner housekeeping plus the ordered candidate vector are the
+    // complete finite round. This failpoints-only rendezvous proves that a
+    // trigger arriving after this cut cannot enter ahead of an edge already
+    // selected below.
+    maybe_fail(names::STREAM_DRIVER_POST_ROUND_FREEZE).map_err(DriverRoundFailure::fatal)?;
+
+    // Resume publishes OPEN with an intentionally empty writer. Retire only
+    // owners observed empty under the root producer fence before the semantic
+    // candidate order, so a cold lane can claim the sole slot without allowing
+    // a productive edge to overtake a runnable node.
+    let mut cleanup_failed = false;
+    for candidate in empty_cleanup {
+        let cleanup = match maybe_fail(names::STREAM_DRIVER_EMPTY_OWNER_CLEANUP) {
+            Ok(()) => {
+                db.stream_retire_empty_from_resident_driver(
+                    candidate.identity,
+                    &candidate.table_key,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match cleanup {
+            Ok(ResidentFoldOutcome::Idle) => {
+                let outcome = StreamFoldCompletionOutcome::Idle;
+                driver.complete(candidate.identity, candidate.observed_sequence, outcome);
+                execution.record_completion(required, candidate.identity, outcome);
+            }
+            Ok(ResidentFoldOutcome::Inactive) => {
+                let outcome = StreamFoldCompletionOutcome::Inactive;
+                driver.complete(candidate.identity, candidate.observed_sequence, outcome);
+                execution.record_completion(required, candidate.identity, outcome);
+            }
+            Ok(ResidentFoldOutcome::Published) => {
+                let error = OmniError::manifest_internal(
+                    "empty stream owner housekeeping unexpectedly published a fold",
+                );
+                driver.failed(candidate.identity, candidate.observed_sequence, &error);
+                if driver.stop.load(Ordering::Acquire) {
+                    return Err(DriverRoundFailure::fatal(error));
+                }
+                execution.record_failure(required, candidate.identity, error);
+                cleanup_failed = true;
+            }
+            Err(error) => {
+                driver.failed(candidate.identity, candidate.observed_sequence, &error);
+                if driver.stop.load(Ordering::Acquire) {
+                    return Err(DriverRoundFailure::fatal(error));
+                }
+                execution.record_failure(required, candidate.identity, error);
+                cleanup_failed = true;
+            }
+        }
+    }
+    if cleanup_failed {
+        return Ok(execution);
+    }
+
+    // `candidates` is one finite manifest-derived round. New triggers do not
+    // enter it, so continuously active node lanes cannot starve an edge that
+    // was ready when this round began.
+    for candidate in candidates {
+        driver.mark_attempted(candidate.kind, candidate.identity);
+        if let Err(error) = maybe_fail(names::STREAM_DRIVER_CANDIDATE_ATTEMPT) {
+            driver.failed(candidate.identity, candidate.observed_sequence, &error);
+            if driver.stop.load(Ordering::Acquire) {
+                return Err(DriverRoundFailure::fatal(error));
+            }
+            execution.record_failure(required, candidate.identity, error);
+            continue;
+        }
+        match candidate.action {
+            DriverCandidateAction::FoldOpen => {
+                match db
+                    .stream_fold_from_resident_driver(candidate.identity, &candidate.table_key)
+                    .await
+                {
+                    Ok(ResidentFoldOutcome::Published) => {
+                        let outcome = StreamFoldCompletionOutcome::PublishedOpenFold;
+                        driver.complete(candidate.identity, candidate.observed_sequence, outcome);
+                        execution.record_completion(required, candidate.identity, outcome);
+                    }
+                    Ok(ResidentFoldOutcome::Idle) => {
+                        let outcome = StreamFoldCompletionOutcome::Idle;
+                        driver.complete(candidate.identity, candidate.observed_sequence, outcome);
+                        execution.record_completion(required, candidate.identity, outcome);
+                    }
+                    Ok(ResidentFoldOutcome::Inactive) => {
+                        let outcome = StreamFoldCompletionOutcome::Inactive;
+                        driver.complete(candidate.identity, candidate.observed_sequence, outcome);
+                        execution.record_completion(required, candidate.identity, outcome);
+                    }
+                    Err(error @ OmniError::StreamDataBlocked { .. }) => {
+                        driver.blocked(candidate.identity, candidate.observed_sequence, &error);
+                        execution.record_failure(required, candidate.identity, error);
+                    }
+                    Err(error) => {
+                        driver.failed(candidate.identity, candidate.observed_sequence, &error);
+                        if driver.stop.load(Ordering::Acquire) {
+                            return Err(DriverRoundFailure::fatal(error));
+                        }
+                        execution.record_failure(required, candidate.identity, error);
+                    }
+                }
+            }
+            DriverCandidateAction::ContinueDrain => {
+                match db
+                    .stream_quiesce_from_resident_driver(candidate.identity, &candidate.table_key)
+                    .await
+                {
+                    Ok(ResidentQuiesceOutcome::Sealed) => {
+                        let outcome = StreamFoldCompletionOutcome::Sealed;
+                        driver.complete(candidate.identity, candidate.observed_sequence, outcome);
+                        execution.record_completion(required, candidate.identity, outcome);
+                    }
+                    Ok(ResidentQuiesceOutcome::Inactive) => {
+                        let outcome = StreamFoldCompletionOutcome::Inactive;
+                        driver.complete(candidate.identity, candidate.observed_sequence, outcome);
+                        execution.record_completion(required, candidate.identity, outcome);
+                    }
+                    Err(error @ OmniError::StreamDataBlocked { .. }) => {
+                        driver.blocked(candidate.identity, candidate.observed_sequence, &error);
+                        execution.record_failure(required, candidate.identity, error);
+                    }
+                    Err(error) => {
+                        driver.failed(candidate.identity, candidate.observed_sequence, &error);
+                        if driver.stop.load(Ordering::Acquire) {
+                            return Err(DriverRoundFailure::fatal(error));
+                        }
+                        execution.record_failure(required, candidate.identity, error);
+                    }
+                }
+            }
+        }
+    }
+    Ok(execution)
+}
+
 async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegistry>) -> Result<()> {
     loop {
         if driver.stop.load(Ordering::Acquire) && driver.pending_is_empty() {
@@ -751,187 +1187,13 @@ async fn run_driver(weak_db: Weak<Omnigraph>, driver: Arc<StreamFoldDriverRegist
         // remain queued until every captured node and edge has had one attempt.
         maybe_fail(names::STREAM_DRIVER_BEFORE_ROUND_ACQUIRE)?;
         let _round_admission = db.stream_workers.acquire_stream_fold_round().await;
-        let resident = db
-            .stream_workers
-            .served_runtime_resident_identities()
-            .await
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let idle_resident = db
-            .stream_workers
-            .driver_idle_resident_identities()
-            .await
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let due = driver.fenced_round(Instant::now(), &resident);
-        if due.is_empty() {
-            drop(db);
-            continue;
-        }
-        let (empty_cleanup, candidates) = match db.stream_driver_candidates(&due).await {
-            Ok(candidates) => {
-                let (empty_cleanup, candidates) =
-                    StreamFoldDriverRegistry::split_empty_owner_cleanup(candidates, &idle_resident);
-                (empty_cleanup, driver.order_round(candidates))
-            }
-            Err(error) => {
-                let stopping = driver.stop.load(Ordering::Acquire);
-                for (identity, observed_sequence) in &due {
-                    driver.failed(*identity, *observed_sequence, &error);
-                }
-                if stopping {
-                    return Err(error);
-                }
-                drop(db);
-                continue;
-            }
-        };
-        let active = empty_cleanup
-            .iter()
-            .chain(candidates.iter())
-            .map(|candidate| candidate.identity)
-            .collect::<std::collections::BTreeSet<_>>();
-        for (identity, sequence) in &due {
-            if !active.contains(identity) {
-                driver.complete(
-                    *identity,
-                    *sequence,
-                    StreamFoldCompletionOutcome::NoLongerEligible,
-                );
-            }
-        }
-
-        if let Err(error) = db.heal_pending_recovery_sidecars_for_write(&[None]).await {
-            let stopping = driver.stop.load(Ordering::Acquire);
-            for candidate in empty_cleanup.iter().chain(candidates.iter()) {
-                driver.failed(candidate.identity, candidate.observed_sequence, &error);
-            }
-            if stopping {
-                return Err(error);
-            }
-            drop(db);
-            continue;
-        }
-
-        // Empty-owner housekeeping plus the ordered candidate vector are the
-        // complete finite round. This failpoints-only rendezvous proves that a
-        // trigger arriving after this cut cannot enter ahead of an edge already
-        // selected below.
-        maybe_fail(names::STREAM_DRIVER_POST_ROUND_FREEZE)?;
-
-        // Resume publishes OPEN with an intentionally empty writer. Retire
-        // only owners observed empty under the root producer fence before the
-        // semantic candidate order, so a cold lane can claim the sole slot
-        // without allowing a productive edge to overtake a runnable node.
-        let mut cleanup_failed = false;
-        for candidate in empty_cleanup {
-            match db
-                .stream_retire_empty_from_resident_driver(candidate.identity, &candidate.table_key)
-                .await
-            {
-                Ok(ResidentFoldOutcome::Idle) => driver.complete(
-                    candidate.identity,
-                    candidate.observed_sequence,
-                    StreamFoldCompletionOutcome::Idle,
-                ),
-                Ok(ResidentFoldOutcome::Inactive) => driver.complete(
-                    candidate.identity,
-                    candidate.observed_sequence,
-                    StreamFoldCompletionOutcome::Inactive,
-                ),
-                Ok(ResidentFoldOutcome::Published) => {
-                    let error = OmniError::manifest_internal(
-                        "empty stream owner housekeeping unexpectedly published a fold",
-                    );
-                    driver.failed(candidate.identity, candidate.observed_sequence, &error);
-                    if driver.stop.load(Ordering::Acquire) {
-                        return Err(error);
-                    }
-                    cleanup_failed = true;
-                }
-                Err(error) => {
-                    driver.failed(candidate.identity, candidate.observed_sequence, &error);
-                    if driver.stop.load(Ordering::Acquire) {
-                        return Err(error);
-                    }
-                    cleanup_failed = true;
-                }
-            }
-        }
-        if cleanup_failed {
-            drop(db);
-            continue;
-        }
-
-        // `candidates` is one finite manifest-derived round. New triggers do
-        // not enter it, so continuously active node lanes cannot starve an edge
-        // that was ready when this round began.
-        for candidate in candidates {
-            driver.mark_attempted(candidate.kind, candidate.identity);
-            match candidate.action {
-                DriverCandidateAction::FoldOpen => {
-                    match db
-                        .stream_fold_from_resident_driver(candidate.identity, &candidate.table_key)
-                        .await
-                    {
-                        Ok(ResidentFoldOutcome::Published) => driver.complete(
-                            candidate.identity,
-                            candidate.observed_sequence,
-                            StreamFoldCompletionOutcome::PublishedOpenFold,
-                        ),
-                        Ok(ResidentFoldOutcome::Idle) => driver.complete(
-                            candidate.identity,
-                            candidate.observed_sequence,
-                            StreamFoldCompletionOutcome::Idle,
-                        ),
-                        Ok(ResidentFoldOutcome::Inactive) => driver.complete(
-                            candidate.identity,
-                            candidate.observed_sequence,
-                            StreamFoldCompletionOutcome::Inactive,
-                        ),
-                        Err(error @ OmniError::StreamDataBlocked { .. }) => {
-                            driver.blocked(candidate.identity, candidate.observed_sequence, &error)
-                        }
-                        Err(error) => {
-                            driver.failed(candidate.identity, candidate.observed_sequence, &error);
-                            if driver.stop.load(Ordering::Acquire) {
-                                return Err(error);
-                            }
-                        }
-                    }
-                }
-                DriverCandidateAction::ContinueDrain => {
-                    match db
-                        .stream_quiesce_from_resident_driver(
-                            candidate.identity,
-                            &candidate.table_key,
-                        )
-                        .await
-                    {
-                        Ok(ResidentQuiesceOutcome::Sealed) => driver.complete(
-                            candidate.identity,
-                            candidate.observed_sequence,
-                            StreamFoldCompletionOutcome::Sealed,
-                        ),
-                        Ok(ResidentQuiesceOutcome::Inactive) => driver.complete(
-                            candidate.identity,
-                            candidate.observed_sequence,
-                            StreamFoldCompletionOutcome::Inactive,
-                        ),
-                        Err(error @ OmniError::StreamDataBlocked { .. }) => {
-                            driver.blocked(candidate.identity, candidate.observed_sequence, &error)
-                        }
-                        Err(error) => {
-                            driver.failed(candidate.identity, candidate.observed_sequence, &error);
-                            if driver.stop.load(Ordering::Acquire) {
-                                return Err(error);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let round = execute_fenced_driver_round(&db, &driver, None).await;
         drop(db);
+        if let Err(failure) = round
+            && (failure.fatal || driver.stop.load(Ordering::Acquire))
+        {
+            return Err(failure.error);
+        }
     }
 }
 
@@ -941,6 +1203,216 @@ impl Omnigraph {
     /// ownership so cancellation cannot reopen the scheduling race.
     pub(super) async fn acquire_stream_fold_producer_guard(&self) -> StreamFoldProducerPermit {
         self.stream_workers.acquire_stream_fold_producer().await
+    }
+
+    /// Synchronously settle one exact resident lane before an in-process
+    /// caller hands the sole resident slot to another lane.
+    ///
+    /// This is only a narrow route-switch bridge into the existing resident
+    /// driver protocol. The root fold-round fence excludes new producers, the
+    /// shared recovery healer settles any durable predecessor, and the normal
+    /// resident fold adapter remains the sole owner of the physical cut and
+    /// manifest publication. Both a published fold and a proven-empty lane
+    /// release the qualified resident slot. An inactive result cannot prove
+    /// that the caller's exact identity/key pair was settled and therefore
+    /// becomes a typed authority refusal.
+    pub(super) async fn fold_resident_stream_lane_for_handoff(
+        self: &Arc<Self>,
+        expected_identity: TableIdentity,
+        table_key: &str,
+    ) -> Result<()> {
+        self.settle_stream_lane_for_graph(expected_identity, table_key, false)
+            .await
+    }
+
+    /// Make one exact endpoint-node lane graph-visible before a logical edge
+    /// route can become resident. An unenrolled node lane has no hidden WAL
+    /// state and therefore needs no fold; an enrolled lane reuses the same
+    /// finite driver round as ordinary resident handoff.
+    pub(super) async fn settle_stream_node_lane_for_graph_edge(
+        self: &Arc<Self>,
+        expected_identity: TableIdentity,
+        table_key: &str,
+    ) -> Result<()> {
+        self.settle_stream_lane_for_graph(expected_identity, table_key, true)
+            .await
+    }
+
+    /// Settle any cold authority already owned by the newly selected target
+    /// lane before graph ingest appends another occurrence. An unenrolled or
+    /// already-settled target is a no-op; lifecycle admission remains the
+    /// subsequent lazy-enrollment step's authority.
+    pub(super) async fn settle_stream_target_lane_for_graph_route(
+        self: &Arc<Self>,
+        expected_identity: TableIdentity,
+        table_key: &str,
+    ) -> Result<()> {
+        self.settle_stream_lane_for_graph(expected_identity, table_key, true)
+            .await
+    }
+
+    async fn settle_stream_lane_for_graph(
+        self: &Arc<Self>,
+        expected_identity: TableIdentity,
+        table_key: &str,
+        allow_unenrolled: bool,
+    ) -> Result<()> {
+        maybe_fail(names::STREAM_DRIVER_BEFORE_ROUND_ACQUIRE)?;
+        let _round_admission = self.stream_workers.acquire_stream_fold_round().await;
+        self.seed_initial_stream_discovery_if_needed().await?;
+        self.release_foreign_stream_resident_under_graph_fence(expected_identity)
+            .await?;
+
+        self.settle_required_stream_lane_under_graph_fence(
+            expected_identity,
+            table_key,
+            allow_unenrolled,
+            allow_unenrolled,
+        )
+        .await
+    }
+
+    async fn seed_initial_stream_discovery_if_needed(&self) -> Result<()> {
+        if !self.stream_fold_driver.initial_discovery_is_seeded() {
+            let initial = self.stream_driver_eligible_identities().await?;
+            self.stream_fold_driver.seed_initial_discovery(initial);
+        }
+        Ok(())
+    }
+
+    async fn release_foreign_stream_resident_under_graph_fence(
+        self: &Arc<Self>,
+        target_identity: TableIdentity,
+    ) -> Result<()> {
+        // A required cold lane cannot claim the one root slot while another
+        // productive lane is resident. Release that physical owner first,
+        // then attempt the logical dependency, all under this same producer
+        // fence. A resident inside retry backoff is reported without changing
+        // its deadline.
+        for resident_identity in self
+            .stream_workers
+            .served_runtime_resident_identities()
+            .await
+        {
+            if resident_identity == target_identity {
+                continue;
+            }
+            let resident_table_key = {
+                let snapshot = self.snapshot_of(ReadTarget::branch("main")).await?;
+                snapshot
+                    .entries()
+                    .find(|entry| entry.identity == resident_identity)
+                    .map(|entry| entry.table_key.clone())
+                    .ok_or_else(|| OmniError::StreamingAuthorityMismatch {
+                        reason: format!(
+                            "resident stream lane {resident_identity} is no longer selected"
+                        ),
+                    })?
+            };
+            self.settle_required_stream_lane_under_graph_fence(
+                resident_identity,
+                &resident_table_key,
+                false,
+                true,
+            )
+            .await?;
+        }
+        if let Some(resident_identity) = self
+            .stream_workers
+            .served_runtime_resident_identities()
+            .await
+            .into_iter()
+            .find(|identity| *identity != target_identity)
+        {
+            return Err(OmniError::StreamingAuthorityMismatch {
+                reason: format!(
+                    "stream lane {resident_identity} retained the sole resident slot after graph handoff"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    async fn settle_required_stream_lane_under_graph_fence(
+        self: &Arc<Self>,
+        expected_identity: TableIdentity,
+        table_key: &str,
+        allow_unenrolled: bool,
+        accept_sealed: bool,
+    ) -> Result<()> {
+        match self
+            .stream_fold_driver
+            .promote_pending_due_now(expected_identity)
+        {
+            PendingFoldPromotion::BackedOff => {
+                return Err(OmniError::Lance(format!(
+                    "stream fold lane {expected_identity} is awaiting its scheduled retry before graph routing"
+                )));
+            }
+            PendingFoldPromotion::Ready => {}
+            PendingFoldPromotion::Missing => {
+                // The detached driver may have won the root fence and completed
+                // this exact trigger before the synchronous caller acquired it.
+                // Absence is success only when fresh durable authority and the
+                // process-local registry jointly prove the same OPEN, unblocked
+                // lane has no remaining resident owner. A blocked fold therefore
+                // cannot be mistaken for a successful slot release.
+                if self
+                    .stream_workers
+                    .served_runtime_resident_identities()
+                    .await
+                    .contains(&expected_identity)
+                {
+                    return Err(OmniError::StreamingAuthorityMismatch {
+                    reason:
+                        "the resident stream lane has no owned fold trigger during graph handoff"
+                            .to_string(),
+                });
+                }
+                let snapshot = self.snapshot_of(ReadTarget::branch("main")).await?;
+                let entry = snapshot.entry(table_key).ok_or_else(|| {
+                    OmniError::StreamingAuthorityMismatch {
+                        reason: "the graph handoff lane alias is no longer selected".to_string(),
+                    }
+                })?;
+                if entry.identity != expected_identity {
+                    return Err(OmniError::StreamingAuthorityMismatch {
+                        reason: "the graph handoff lane identity no longer matches its alias"
+                            .to_string(),
+                    });
+                }
+                let Some(lifecycle) = snapshot.stream_lifecycle(expected_identity) else {
+                    if allow_unenrolled {
+                        return Ok(());
+                    }
+                    return Err(OmniError::StreamingAuthorityMismatch {
+                        reason: "the graph handoff lane is no longer enrolled".to_string(),
+                    });
+                };
+                if let Some(block) = lifecycle.strict_block.as_ref() {
+                    return Err(OmniError::StreamDataBlocked {
+                        block_token: block.block_token.clone(),
+                    });
+                }
+                if allow_unenrolled && lifecycle.lifecycle == StreamLifecycle::Sealed {
+                    return Ok(());
+                }
+                if lifecycle.lifecycle != StreamLifecycle::Open {
+                    return Err(OmniError::StreamingAuthorityMismatch {
+                        reason: "the graph handoff lane is no longer OPEN".to_string(),
+                    });
+                }
+                return Ok(());
+            }
+        }
+        let required = RequiredResidentHandoff {
+            identity: expected_identity,
+            table_key,
+        };
+        let execution = execute_fenced_driver_round(self, &self.stream_fold_driver, Some(required))
+            .await
+            .map_err(|failure| failure.error)?;
+        required_resident_handoff_result(execution, accept_sealed)
     }
 
     pub(super) fn notify_stream_fold_pending(&self, identity: TableIdentity) {
@@ -1458,6 +1930,131 @@ mod tests {
             assert!(pending.due_at <= after + expected_wait);
         }
         assert_eq!(driver.shared.lock().unwrap().pending[&table].failures, 10);
+    }
+
+    #[test]
+    fn graph_route_promotion_preserves_an_owned_retry_deadline() {
+        let driver = driver();
+        let fresh = identity(20);
+        let failed = identity(21);
+        driver.notify(fresh, false);
+        driver.notify(failed, true);
+        let error = OmniError::manifest("transient fold failure");
+        let failed_sequence = driver.shared.lock().unwrap().pending[&failed].sequence;
+        driver.failed(failed, failed_sequence, &error);
+        let failed_before = driver.shared.lock().unwrap().pending[&failed];
+
+        assert_eq!(
+            driver.promote_pending_due_now(fresh),
+            PendingFoldPromotion::Ready
+        );
+        assert_eq!(
+            driver.promote_pending_due_now(failed),
+            PendingFoldPromotion::BackedOff
+        );
+        assert_eq!(
+            driver.promote_pending_due_now(identity(22)),
+            PendingFoldPromotion::Missing
+        );
+
+        let shared = driver.shared.lock().unwrap();
+        assert!(shared.pending[&fresh].due_at <= Instant::now());
+        assert_eq!(shared.pending[&failed].sequence, failed_before.sequence);
+        assert_eq!(shared.pending[&failed].failures, failed_before.failures);
+        assert_eq!(shared.pending[&failed].due_at, failed_before.due_at);
+    }
+
+    #[test]
+    fn startup_discovery_does_not_reset_a_graph_seeded_retry() {
+        let driver = driver();
+        let failed = identity(23);
+        driver.seed_initial_discovery([failed]);
+        let error = OmniError::manifest("transient graph dependency fold failure");
+        let sequence = driver.shared.lock().unwrap().pending[&failed].sequence;
+        driver.failed(failed, sequence, &error);
+        let before = driver.shared.lock().unwrap().pending[&failed];
+
+        driver.install_startup_discovery([failed]);
+        driver.seed_initial_discovery([failed]);
+
+        let shared = driver.shared.lock().unwrap();
+        assert_eq!(shared.pending[&failed].sequence, before.sequence);
+        assert_eq!(shared.pending[&failed].failures, before.failures);
+        assert_eq!(shared.pending[&failed].due_at, before.due_at);
+    }
+
+    #[test]
+    fn rediscovery_after_unexpected_stop_preserves_an_owned_retry() {
+        let driver = driver();
+        let failed = identity(24);
+        driver.notify(failed, true);
+        let error = OmniError::manifest("transient fold failure before driver exit");
+        let sequence = driver.shared.lock().unwrap().pending[&failed].sequence;
+        driver.failed(failed, sequence, &error);
+        let before = driver.shared.lock().unwrap().pending[&failed];
+
+        driver.mark_unexpected_stop("driver task exited".to_string());
+        driver.seed_initial_discovery([failed]);
+
+        let shared = driver.shared.lock().unwrap();
+        assert_eq!(shared.pending[&failed].sequence, before.sequence);
+        assert_eq!(shared.pending[&failed].failures, before.failures);
+        assert_eq!(shared.pending[&failed].due_at, before.due_at);
+        drop(shared);
+        assert_eq!(
+            driver.promote_pending_due_now(failed),
+            PendingFoldPromotion::BackedOff
+        );
+    }
+
+    #[test]
+    fn graph_route_round_excludes_unrelated_pending_lanes() {
+        let unrelated = identity(30);
+        let required = identity(31);
+        let resident = identity(32);
+        let mut due = vec![(unrelated, 4), (required, 5), (resident, 6)];
+        let resident_set = BTreeSet::from([resident]);
+
+        retain_required_round(&mut due, &resident_set, required);
+
+        assert_eq!(due, vec![(required, 5), (resident, 6)]);
+    }
+
+    #[test]
+    fn handoff_reports_the_cleanup_failure_that_prevented_its_attempt() {
+        let mut execution = DriverRoundExecution::default();
+        execution.record_failure(
+            Some(RequiredResidentHandoff {
+                identity: identity(41),
+                table_key: "node:Person",
+            }),
+            identity(40),
+            OmniError::Lance("empty-owner cleanup failed".to_string()),
+        );
+
+        let error = required_resident_handoff_result(execution, false)
+            .expect_err("a blocking cleanup failure must not become an authority mismatch");
+        assert!(error.to_string().contains("empty-owner cleanup failed"));
+    }
+
+    #[test]
+    fn sealed_is_success_only_for_an_endpoint_dependency() {
+        let execution = DriverRoundExecution {
+            required_handoff: Some(RequiredResidentHandoffOutcome::Completion(
+                StreamFoldCompletionOutcome::Sealed,
+            )),
+            first_non_target_failure: None,
+        };
+        required_resident_handoff_result(execution, true)
+            .expect("a sealed endpoint lane has made all accepted nodes visible");
+
+        let strict = DriverRoundExecution {
+            required_handoff: Some(RequiredResidentHandoffOutcome::Completion(
+                StreamFoldCompletionOutcome::Sealed,
+            )),
+            first_non_target_failure: None,
+        };
+        assert!(required_resident_handoff_result(strict, false).is_err());
     }
 
     #[test]

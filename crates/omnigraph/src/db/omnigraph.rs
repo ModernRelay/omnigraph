@@ -42,6 +42,7 @@ mod stream_correction;
 pub(crate) mod stream_dead_letter;
 mod stream_driver;
 mod stream_enrollment;
+mod stream_graph_ingest;
 mod stream_ingest;
 pub(crate) mod stream_lifecycle;
 mod stream_ndjson;
@@ -72,6 +73,8 @@ pub use stream_correction::{
 pub use stream_dead_letter::{
     StreamDeadLetterEncodingCostForTest, failpoint_measure_stream_dead_letter_object_for_test,
 };
+#[doc(hidden)]
+pub use stream_ndjson::{GraphStreamChunkSource, GraphStreamIngestHandle, GraphStreamIngestStart};
 #[doc(hidden)]
 pub use stream_profile::{
     CheckedClusterApplyAuthority, CheckedClusterBlockAuthority, CheckedClusterDeadLetterAuthority,

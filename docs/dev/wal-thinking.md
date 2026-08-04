@@ -1,6 +1,6 @@
 # WAL Thinking
 
-Working notes, updated 2026-08-01. Plain-language grounding for the WAL/streaming
+Working notes, updated 2026-08-04. Plain-language grounding for the WAL/streaming
 discussion ([RFC-018](../rfcs/0018-ingest-wal.md) →
 [RFC-026](../rfcs/0026-memwal-streaming-ingest.md)). Three parts: the
 contract difference between an interactive graph commit and durable stream
@@ -11,7 +11,9 @@ Current boundary: RFC-026 Phase A, the Phase-B1 private core, private B2a
 retain-all, the common-B2 compare-and-chain core, bounded profile authority,
 hidden lifecycle-v3 quiescence, private resume/maintenance, checked offline
 physical rebind, terminal authority retirement/export, and stopped/offline
-DataBlock correction are built, but public streaming is not. Gate R0 found
+DataBlock correction are built. F7a now exposes the graph-native served row
+path over absent or `OPEN` lanes; public lane enrollment, resume/status/
+maintenance transport, and embedded/direct SDK ingress are not active. Gate R0 found
 and the follow-up fixed the one known
 all-shape closure failure: a legal high-entropy near-cap generation is durably
 acknowledged, materialized, folded, and published without lowering the
@@ -32,19 +34,21 @@ batch, acknowledge only after its Lance durability watcher and the same
 writer's post-durability epoch check both succeed, route replay or one
 flushed-unmerged generation fold-only, and publish one exact fold at the
 `__manifest` CAS. It prevents MemTable rollover and retires the writer before a
-successor generation can put. This is implementation/evidence machinery, not a
-product surface. There is still no `@stream`, public enrollment or row
-admission, SDK/HTTP/CLI/OpenAPI route, operator drain/resume workflow, or fresh
-read. V9 adds config-v3/state-v2, the grammar-impossible trusted attribution
+successor generation can put. That seam remains implementation/evidence
+machinery; F7a reaches it only through the graph bridge. There is still no
+`@stream`, public lane enrollment, embedded/direct SDK row admission, operator
+drain/resume workflow, operational-status transport, or fresh read. V9 adds
+config-v3/state-v2, the grammar-impossible trusted attribution
 field, manifest-selected token authority, compare-and-chain admission, and
 recovery-v12's exact base-plus-token publication. V10 added graph profile
 enablement; v11 replaces its boolean with checked profile protocol v2 and adds
 exact recovery-v13 `StreamProfileChange`. V12 replaces inline lifecycle history
 with fixed-size ledger heads and recovery-v14 hidden enrollment, writer claims,
 ordinary/drain folds, and terminal management receipts. Its private seam can
-quiesce empty and non-empty lanes `OPEN → DRAINING → SEALED`. Public
-ingress/enrollment/quiesce, resume/abort, correction, retirement, and every
-product surface are still inactive. RFC-026 remains Draft.
+quiesce empty and non-empty lanes `OPEN → DRAINING → SEALED`. At that v12
+slice, every row/control product surface was inactive. F7a later activates only
+the served graph row path; quiesce/resume/abort and ordinary management remain
+private. RFC-026 remains Draft.
 
 RFC-026 selects **unbounded retain-all on stock Lance** as the first storage
 profile, and its private B2a gate is implemented. OmniGraph deletes no canonical
@@ -63,8 +67,8 @@ monotonic storage and loud provider-capacity exhaustion. Managed reclamation
 and the Lance patch are deferred optimizations. The compare-and-chain token and
 trusted attribution core, checked profile authority, and hidden lifecycle-v3
 claim/fold/quiesce path are implemented. The stopped/offline retirement/export
-exit is active; production lifecycle control, correction, and product-parity
-contracts remain inactive.
+exit is active; F7a graph row transport is active, while production lifecycle
+control and management/status parity remain inactive.
 
 ---
 

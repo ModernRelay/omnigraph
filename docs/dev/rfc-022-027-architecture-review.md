@@ -121,7 +121,8 @@ the full MemWAL table and system-index specifications, including the
 durability/fencing behavior carried forward from beta.17, are reflected in the
 RFC's survey and acceptance guards. Gate E0 passed at the explicit bounded
 process/topology profile and Phase A consumed it as described above; RFC-026
-remains draft and public row streaming is inactive. Gate R0's historical
+remains draft, and F7a now activates only graph-native served row streaming.
+Public lane management remains inactive. Gate R0's historical
 finite-retention no-go, the selected unbounded B2a disposition, the optional
 B2b route, and the common contract inventory are recorded in RFC-026 §0.2,
 §4.1–§4.6, and BLOCKER-14 below.
@@ -561,8 +562,9 @@ owner; v17/recovery-v19 adds terminal stopped/offline authority retirement and
 receipt-bearing export; v18/recovery-v20 adds stopped/offline exact DataBlock
 correction; current v19/token-schema-v3/recovery-v21 adds deterministic
 mixed/all-diverted terminal folding and three-disposition retirement while
-leaving public/production rebind inactive. RFC-026
-remains draft and public row streaming remains inactive.
+leaving public/production rebind inactive. RFC-026 remains draft; F7a exposes
+one graph-native served row route, while lane enrollment/control, rebind, and
+operational-status transport remain inactive.
 
 Enrollment creates persistent MemWAL metadata and `stream_state` changes the
 correctness preconditions for schema, branch, maintenance, and data operations.

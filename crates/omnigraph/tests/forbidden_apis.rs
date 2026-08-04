@@ -226,6 +226,9 @@ const STREAM_LIFECYCLE_V14_V15_V18: WriteProtocol =
     WriteProtocol::Composed("private firehose lifecycle recovery v14 + resume v15 + rebind v18");
 const STREAM_FOLD_DRIVER_V14: WriteProtocol =
     WriteProtocol::Composed("hidden resident stream fold driver + recovery v14");
+const SERVED_GRAPH_STREAM_INGEST_V14_V21: WriteProtocol = WriteProtocol::Composed(
+    "served graph ingress over enrollment/fold recovery v14 + dead-letter recovery v21",
+);
 /// RFC-026 checked profile authority: ENABLED/DISABLED terminal transitions
 /// pair one immutable token-ledger receipt with one profile/lineage publish
 /// under recovery-v13. Disable additionally persists the admission-cutoff
@@ -292,8 +295,12 @@ write_surfaces! {
         "failpoint_show_stream_data_block_for_test",
     ],
     "db/omnigraph/stream_ndjson.rs" => WriteProtocol::TestOnly => [
+        "failpoint_stream_ingest_graph_ndjson_as_for_test",
         "failpoint_stream_ingest_ndjson_as_for_test",
         "failpoint_stream_ingest_ndjson_cancel_for_test",
+    ],
+    "db/omnigraph/stream_ndjson.rs" => SERVED_GRAPH_STREAM_INGEST_V14_V21 => [
+        "start_served_graph_stream_ingest_as",
     ],
     "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],
     "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],

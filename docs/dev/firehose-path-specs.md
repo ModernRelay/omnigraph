@@ -13,7 +13,11 @@ same-binding `SEALED` EnsureIndices plus recovery-v17 same-binding `SEALED`
 Optimize, recovery-v18 private exact-`SEALED` physical rebind, recovery-v19
 lineage-neutral root-wide authority retirement, recovery-v20 exact DataBlock
 correction, and recovery-v21 mixed/all-diverted dead-letter folds plus
-three-disposition retirement. Public ingress, operator lifecycle/rebind verbs, and
+three-disposition retirement. F7a activates one graph-native served ingress
+surface (`POST /graphs/{graph_id}/stream/ingest`) plus its remote client/CLI
+path. It exposes logical node/edge rows only: declaration routing, lazy private
+lane preparation, MemWAL ownership, and folding remain behind the graph
+boundary. Operator lifecycle/rebind verbs, checked operational status, and
 every maintenance transport surface remain inactive; retirement and DataBlock
 inspection/correction are exposed only by narrow offline cluster controls.
 The format-neutral F4, F5a, and F5b0 hidden-path slices are also implemented:
@@ -50,8 +54,9 @@ short cut repeats only mutable witnesses. Only an exact canonical-main
 recovery participant outcome can explain physical movement as an unavailable
 projection rather than a movement error. Cold-replay and flushed-LWW pending accounting plus
 exact oldest-uncovered-token age remain explicit unavailable values; the public
-`stream_status` stays nonblocking and manifest-only, and CLI/HTTP/OpenAPI/SDK
-transport remains F7. F6b7 supplies covered/reconciled decision evidence; its
+`stream_status` stays nonblocking and manifest-only, and its
+CLI/HTTP/OpenAPI/SDK transport remains in the F7 remainder. F6b7 supplies
+covered/reconciled decision evidence; its
 configured-RustFS result is a bounded NO-GO only for the uncompacted profile-
 cycle fixture, so no standalone production reconciler is scheduled. F6b8 closes
 the resume-to-driver handoff without changing format or recovery: resume
@@ -61,7 +66,9 @@ empty-owner housekeeping prepass before the unchanged node-before-edge round
 so the sole root slot is released promptly. Driver-first, resume-first/caller-
 cancelled, cross-lane reuse, and clean-shutdown cells are green. The remaining
 guardrail matrix and the broader post-claim install/retirement-failure matrix
-remain in F6; F7 remains forbidden until all of F6 passes.
+remain in F6 before the remaining management surfaces activate. F7a does not
+weaken those gates because it exposes only the already-proved graph-ingest and
+resident-driver composition.
 **Design authority:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) — this
 file never overrides it. Where they disagree, the RFC wins and this file is
 wrong. §4.7 records the selected experimental profile; §4.3/§4.6 record the
@@ -274,8 +281,9 @@ until a reachable producer and finalized evidence grammar exist. Stopped/offline
 authority; it is not an import or replay surface. A typed failpoints-only
 snapshot now exposes process-local driver scheduling evidence to tests; it is
 explicitly advisory, and its pending triggers are not a durable backlog.
-Public durable `StreamStatus` remains manifest-only; public driver status and
-every served row/lifecycle/maintenance surface remain inactive. F6b6 adds a
+Public durable `StreamStatus` remains manifest-only. F7a activates one
+graph-native served row surface; public driver status and lifecycle/maintenance
+surfaces remain inactive. F6b6 adds a
 separate engine-internal checked operational cut over physical, token,
 recovery, advisory-driver, and rebuild evidence. It has no public transport;
 `DISABLING` uses explicit checked cluster-apply status authority. Every sidecar
@@ -325,7 +333,8 @@ byte/capacity/timing and isolated peak-RSS acceptance described below.
 | ~~F6b7 token-index decision evidence~~ | Paired current-token and profile-receipt hit/miss work before/after one content-identical exact-selected index refresh, with maintenance I/O and semantic-equivalence proof | no format or recovery change | bounded NO-GO only for the uncompacted profile-cycle fixture; failpoints-only and no standalone production reconciler |
 | ~~F6b8 resume/driver handoff~~ | Compile-enforced root-producer-permit transfer into detached resume installation, urgent trigger-before-release, exact empty-owner housekeeping before the unchanged node-before-edge round, cancellation-safe shutdown, and cross-lane root-slot reuse | no format or recovery change | implemented behind existing hidden lifecycle/driver seams; broader retirement-failure matrix remains in F6 |
 | **F6b remainder** | Remaining guardrail matrix, including F6b8's post-claim install/retirement-failure cells; token-index evidence reopens at greater depth, after a Lance/index-grammar change, or before considering graph-manifest-compacted / checked-Optimize-coupled maintenance | — | later |
-| **F7** | Remaining served row ingress, lifecycle, maintenance, operational-status transport, and their SDK/HTTP/remote-CLI/OpenAPI parity | — | only after all F6 cells pass; export is already the F6b5 exception |
+| ~~F7a served graph ingress~~ | One graph-native mixed node/edge NDJSON route, strong graph-authority precondition, remote client/CLI, OpenAPI, and direct-mode refusals over the existing checked runtime and resident driver | no format or recovery change | implemented; no public table/lane selector or management surface |
+| **F7 remainder** | Graph-level lifecycle, maintenance, operational-status transport, and their SDK/HTTP/remote-CLI/OpenAPI parity | — | only after their remaining F6 cells pass; export is already the F6b5 exception |
 
 These are dependency milestones, not mandates for giant PRs. Keep each PR
 reviewable behind the hidden seam: the next lifecycle tranche may land receipts,
@@ -2289,7 +2298,8 @@ selected-token inspection/export, and `WITHDRAWN | DEAD_LETTERED` retirement
 active; the genuine v18↔v19 adjacent-binary and frozen-receipt cell closes the
 format-boundary evidence. The broader
 retirement race/failpoint/freeze/export matrix below remains required before
-public ingress activates; `AuthorityBlock` repair remains separate.
+the remaining management surfaces activate; F7a's narrower ingress evidence
+is owned separately, and `AuthorityBlock` repair remains separate.
 
 - Failpoints through the hidden candidate-runtime path at acknowledgement, claim,
   lifecycle, maintenance, both fold participants, canonical dead-letter
@@ -2479,32 +2489,40 @@ surfaces and must pass before that activation PR merges.
 
 ---
 
-## 8. F7 — atomic public activation
+## 8. F7 — staged public activation
 
-The remaining server-owned row/control runtime, shared wire DTOs, HTTP/OpenAPI,
-remote `GraphClient`, and remote CLI arms land together. F6b5's export arm is
-already active, and F6b6's checked status core is ready internally; F7 defines
-and transports its unavailable-value/error shape rather than weakening that
-cut. The raw physical operations
-never become ambient `Omnigraph` writers in this cluster-only profile. By the
-time F7 executes, F2 will already have landed the profile adapter and
+F7a activates only the server-owned graph-ingest runtime, shared challenge DTO,
+HTTP/OpenAPI route, remote `GraphClient`, and remote CLI arm. The public seam is
+graph-first: callers submit mixed logical node and edge rows and never select a
+Lance dataset, table incarnation, lane, writer, shard, epoch, or generation.
+The engine resolves each declaration and reuses the existing lazy private-lane
+prepare, checked runtime, bounded request owner, and resident fold driver. It
+adds no coordinator, recovery owner, persisted authority, or format strand.
+
+F6b5's export arm is already active, and F6b6's checked status core remains
+internal. Lifecycle, status, and maintenance transport stay in the F7
+remainder and must not be exposed by weakening that cut. Raw physical
+operations never become ambient `Omnigraph` writers in this cluster-only
+profile. F2 already landed the profile adapter and
 `cluster apply --confirm-stream-offline`; F7 does not restage that control.
 
 | Capability | Owned cluster runtime | HTTP | Remote client / CLI |
 |---|---|---|---|
-| ingest preparation + rows | capability-bound prepare then hidden core | `POST /graphs/{graph_id}/streams/{type_name}/prepare` (JSON), then `POST .../ingest` (NDJSON in/out) | `stream ingest` performs prepare automatically |
-| status | F6b6 checked exclusive-cut status | `GET /graphs/{graph_id}/streams[/{type_name}]` | `stream status` |
-| fold | explicit operator fold + internal driver fold | `POST .../streams/{type_name}/fold` | `stream fold` |
-| quiesce | capability-bound quiesce | `POST .../streams/{type_name}/quiesce` | `stream quiesce` |
-| resume / abort | capability-bound resume | `POST .../streams/{type_name}/resume` | `stream resume [--abort-drain]` |
+| graph ingest | checked graph authority then the existing hidden core | `POST /graphs/{graph_id}/stream/ingest` (NDJSON in/out); missing `If-Match` returns a bodyless `428` challenge | `stream ingest --data <PATH\|-> [--graph-token <token>]` performs the challenge before opening input |
+| status | F6b6 checked exclusive-cut status | not exposed in F7a | later graph-level `stream status` |
+| fold | internal resident driver; explicit operator fold remains private | not exposed in F7a | later graph-level management surface |
+| quiesce | capability-bound quiesce remains private | not exposed in F7a | later graph-level management surface |
+| resume / abort | capability-bound resume remains private | not exposed in F7a | later graph-level management surface |
 | graph export / rebuild artifact | runtime-pinned exact sealed cut | existing `POST /graphs/{graph_id}/export` with stream-aware guards | existing `export --server`; direct `--store` refuses an enrolled graph |
-| same-binding maintenance | lifecycle-aware Optimize / EnsureIndices | `POST /graphs/{graph_id}/maintenance/optimize`, `POST /graphs/{graph_id}/maintenance/ensure-indices` | `optimize --server`, `maintenance ensure-indices --server` |
+| same-binding maintenance | lifecycle-aware Optimize / EnsureIndices remain private | not exposed in F7a | later graph-level maintenance surface |
 | physical rebind | no serving runtime; exact terminal `DISABLED` revision + `CheckedClusterMaintenanceAuthority`; accepted schema unchanged | none | disable to `DISABLED`, then `cluster apply --confirm-stream-offline`; later enable/restart/resume |
 | schema change | no in-place EXP writer; freeze one checked sealed/retired export cut | none | initialize a fresh graph with the desired schema and load the artifact; never load over the enrolled source |
 
-The table contains the five primary stream workflows plus existing export and
-maintenance integration. Bodyless prepare is an automatic ingest handshake,
-not a sixth workflow. Reachable terminal states retain narrow cluster/offline
+The table separates the activated graph row workflow from future graph-level
+management plus existing export and private maintenance integration. The strong-ETag
+challenge is an authority precondition, not a user-visible lane prepare verb.
+After the exact token is accepted, lazy lane preparation remains internal.
+Reachable terminal states retain narrow cluster/offline
 exits without served HTTP/OpenAPI parity:
 
 | Cluster/offline support | Command shape |
@@ -2514,9 +2532,9 @@ exits without served HTTP/OpenAPI parity:
 | exact AuthorityBlock repair (**future**) | `cluster stream block repair-authority --confirm-stream-offline` |
 | authority retirement / rebuild exit | `cluster stream retire-for-rebuild plan|confirm --confirm-stream-offline` |
 
-All request/response types live in `omnigraph-api-types`; pagination, canonical
-token/digest parsing, and tagged per-line dispositions are shared rather than
-reimplemented in handlers. Every single-lane mutating management call requires
+The challenge and HTTP error types live in `omnigraph-api-types`; the engine
+owns the canonical newline-terminated, redacted per-line result projection so
+handlers do not rederive private evidence. Every future single-lane mutating management call requires
 its operation ID and expected `lifecycle_revision`, with receipt-first replay;
 profile apply instead binds the expected profile revision.
 Root-wide authority retirement binds `(graph identity, AUTHORITY_RETIREMENT,
@@ -2529,8 +2547,9 @@ any armed plan before a retry replans against current graph/catalog/lifecycle
 authority. A no-work retry is therefore a true no-op rather than a replayed
 terminal receipt. EnsureIndices already implements that engine boundary;
 Optimize must match it before F7 exposes either route.
-Prepare and ingest use `stream_ingest`; lifecycle and fold use
-`stream_manage`. Cluster-only DataBlock correction, future AuthorityBlock repair, and
+Graph ingest uses one graph-scoped `stream_ingest` decision before body
+ownership; lazy private-lane preparation does not add per-table policy checks.
+Lifecycle and fold use `stream_manage`. Cluster-only DataBlock correction, future AuthorityBlock repair, and
 retirement require their exact offline checked authority plus
 `stream_manage`. Read-only status uses operational-metadata authorization.
 Dead-letter payload export additionally requires the existing `export` action.
@@ -2691,8 +2710,9 @@ advisory driver diagnostics; F6b1–F6b5 close export/process/cost ownership and
 F6b6 adds the checked read-only operational cut. F6b7 adds the failpoints-only
 paired token-index decision instrument and records a bounded NO-GO for the
 uncompacted profile-cycle fixture, so the F6b remainder owns only the remaining
-guardrails. F7 alone activates the
-remaining row/control/status surfaces.
+guardrails. F7a activates the proved graph-ingest composition without exposing
+its private lanes; the F7 remainder later owns graph-level control/status
+surfaces.
 
 This ordering makes every intermediate merge safe:
 
@@ -2711,9 +2731,11 @@ This ordering makes every intermediate merge safe:
 - after F6b7, tests can compare one exact selected uncovered cut with its
   content-identical reconciled successor, but no production maintenance owner or
   recovery protocol exists; the fixture-scoped bounded NO-GO schedules neither;
-- after F6, all gates are proved but no compatibility surface is committed;
-- F7 exposes the served SDK, HTTP, remote CLI, and OpenAPI together while
-  direct mutation remains a typed refusal.
+- after the ingest-owned F6 evidence, F7a exposes graph-native served SDK,
+  HTTP, remote CLI, and OpenAPI ingress together while direct mutation remains
+  a typed refusal;
+- the F7 remainder exposes only separately proved graph-level management and
+  status workflows; it does not turn private lanes into user resources.
 
 A performance spike may still invoke the hidden F4/F5a/F5b0 seam after F3. It never
 lands a production writer or claims an SLO before F6.

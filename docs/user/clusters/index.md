@@ -194,11 +194,14 @@ after the graph effect landed but the state CAS did not, use `cluster refresh`
 to reconcile the ledger from manifest truth before replanning under another
 actor; a different actor cannot adopt the original receipt directly.
 
-In this release, `streaming: true` is not additive: it makes embedded SDK and
-direct `--store` Mutation/Load/delete fail before input reads or durable
+In this release, `streaming: true` is not additive to the existing direct
+writer surfaces: it makes embedded SDK and direct `--store`
+Mutation/Load/delete fail before input reads or durable
 effects. Existing served mutations work only through the restarted
-cluster-booted server's checked runtime authority. There is no public firehose
-ingress yet. Branch merge remains refused while the profile is `ENABLED` or
+cluster-booted server's checked runtime authority. Graph-native producers use
+the served [`/stream/ingest` firehose](../operations/server.md#streaming), which
+keeps physical datasets and lanes private. F7a admits absent or `OPEN` lanes;
+it does not resume a `SEALED` lane after disable/re-enable. Branch merge remains refused while the profile is `ENABLED` or
 `DISABLING`, including through the checked server runtime. A later explicit
 `streaming: false` offline apply publishes `DISABLING`, derives one finite
 manifest lane cut, and serially drains `OPEN`, goal-`SEALED`, and adopted
@@ -257,9 +260,13 @@ omnigraph --graph knowledge --as andrew \
 Follow `next_cursor` with `--cursor` until it is absent. Both commands pin the
 manifest-selected token version; export verifies the recovery-owned object
 descriptor and does not prefix-list storage. Payload export is an inspection
-artifact, not replay or import. The hidden row path can restore `PRESENT` with
-a fresh ordinary stream occurrence naming the terminal token as predecessor;
-there is no public row-ingress command or HTTP/SDK surface yet.
+artifact, not replay or import. A fresh ordinary stream occurrence can restore
+`PRESENT` by naming the terminal token as predecessor.
+The graph-native `stream ingest` command and
+`POST /graphs/{graph_id}/stream/ingest` route can submit that occurrence while
+the enabled lane is absent or `OPEN`; payload export itself does not replay it
+automatically. Once the lane is terminally disabled/`SEALED`, retirement and
+rebuild remain the public exit until resume control ships.
 
 ### Terminal authority retirement: plan → confirm → rebuild
 
