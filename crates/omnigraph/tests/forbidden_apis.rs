@@ -292,6 +292,7 @@ write_surfaces! {
         "failpoint_show_stream_data_block_for_test",
     ],
     "db/omnigraph/stream_ndjson.rs" => WriteProtocol::TestOnly => [
+        "failpoint_stream_ingest_graph_ndjson_as_for_test",
         "failpoint_stream_ingest_ndjson_as_for_test",
         "failpoint_stream_ingest_ndjson_cancel_for_test",
     ],

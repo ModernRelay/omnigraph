@@ -7,14 +7,15 @@
 //! durability corridor; it does not define an HTTP, CLI, SDK, or OpenAPI
 //! surface.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use futures::{Stream, StreamExt};
+use lance_index::mem_wal::ShardId;
 use omnigraph_compiler::catalog::Catalog;
 
 use crate::db::manifest::TableIdentity;
@@ -31,10 +32,13 @@ use crate::table_store::mem_wal::{
 };
 
 use super::Omnigraph;
+use super::stream_enrollment::PrepareStreamIngestOutcome;
+use super::stream_graph_ingest::{ParsedGraphStreamJsonRow, parse_graph_stream_json_row};
 use super::stream_ingest::{
     NormalizedStreamJsonRow, STREAM_B2_CLASSIFICATION_WINDOW_ROWS, StreamB2AckUnknown,
     StreamB2BindingProof, StreamB2BoundaryDisposition, StreamB2PrefixOutcome,
-    StreamTokenAdmissionAck, normalize_stream_json_row_with_catalog,
+    StreamGraphIngestWitness, StreamTokenAdmissionAck, normalize_stream_json_parts_with_catalog,
+    normalize_stream_json_row_with_catalog,
 };
 use super::stream_request::{
     NdjsonFrame, NdjsonFramer, OrderedResultBuffer, STREAM_REQUEST_MAX_RESULT_STATUSES,
@@ -47,6 +51,7 @@ use super::stream_request::{
 /// when one logical id or validation message approaches the 32-MiB line cap.
 const STREAM_RESULT_CHANNEL_CAPACITY: usize = 1;
 const STREAM_SIZING_ATTEMPT_ID: &str = "00000000-0000-4000-8000-000000000001";
+const GRAPH_STREAM_SIZING_UUID: &str = "00000000-0000-4000-8000-000000000002";
 const STREAM_TAIL_SIZING_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 pub(super) type StreamChunkSource = Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send + 'static>>;
@@ -91,6 +96,47 @@ impl StreamRequestHandle {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GraphLineRoute {
+    kind: &'static str,
+    type_name: String,
+    logical_id: Option<String>,
+    write_id: String,
+}
+
+struct GraphStreamLineOutcome {
+    route: Option<GraphLineRoute>,
+    outcome: StreamLineOutcome,
+}
+
+/// Hidden graph-native request handle. The existing line outcome retains all
+/// private evidence needed for stop-tail safety, while this wrapper attaches
+/// only caller-logical row identity for the redacted graph projection.
+struct GraphStreamRequestHandle {
+    inner: StreamRequestHandle,
+    routes: Arc<Mutex<BTreeMap<u64, GraphLineRoute>>>,
+}
+
+impl GraphStreamRequestHandle {
+    async fn recv(&mut self) -> Result<Option<GraphStreamLineOutcome>> {
+        let Some(outcome) = self.inner.recv().await? else {
+            return Ok(None);
+        };
+        let route = self
+            .routes
+            .lock()
+            .map_err(|_| OmniError::manifest_internal("graph stream route registry was poisoned"))?
+            .remove(&outcome.ordinal);
+        Ok(Some(GraphStreamLineOutcome { route, outcome }))
+    }
+}
+
+struct GraphLaneContext {
+    table_key: String,
+    stream_incarnation_id: String,
+    sizing: IntrinsicSizingContext,
+}
+
 struct PendingRow {
     ordinal: u64,
     envelope: StreamWriteEnvelope,
@@ -123,15 +169,20 @@ struct AccumulatingRun {
     logical_bytes: u64,
     keys: BTreeSet<Arc<str>>,
     preprocessing: Option<B2PreprocessingPermit>,
+    expected_graph_witness: Option<StreamGraphIngestWitness>,
 }
 
 impl AccumulatingRun {
-    fn new(preprocessing: B2PreprocessingPermit) -> Self {
+    fn new(
+        preprocessing: B2PreprocessingPermit,
+        expected_graph_witness: Option<StreamGraphIngestWitness>,
+    ) -> Self {
         Self {
             rows: Vec::new(),
             logical_bytes: 0,
             keys: BTreeSet::new(),
             preprocessing: Some(preprocessing),
+            expected_graph_witness,
         }
     }
 
@@ -177,6 +228,7 @@ struct SubmittedRun {
     rows: Vec<PendingRow>,
     cursor: usize,
     preprocessing: Option<B2PreprocessingPermit>,
+    expected_graph_witness: Option<StreamGraphIngestWitness>,
 }
 
 impl SubmittedRun {
@@ -205,6 +257,7 @@ impl SubmittedRun {
             rows: run.rows,
             cursor: 0,
             preprocessing: run.preprocessing,
+            expected_graph_witness: run.expected_graph_witness,
         })
     }
 
@@ -268,6 +321,100 @@ impl Omnigraph {
         })
     }
 
+    /// Start one hidden graph-native mixed node/edge request.
+    ///
+    /// The graph is the caller-visible resource. Logical declarations are
+    /// resolved against one pinned accepted catalog, and compatible private
+    /// Lance lanes are enrolled lazily inside the request. No table key,
+    /// dataset identity, or stream incarnation crosses this boundary.
+    /// Rows retain firehose order rather than forming an atomic graph
+    /// transaction: an edge is checked against the graph made visible by
+    /// earlier settled lanes, and this slice does not buffer a later endpoint
+    /// node as a forward reference.
+    async fn stream_ingest_graph_ndjson_as(
+        self: &Arc<Self>,
+        actor_id: &str,
+        body: StreamChunkSource,
+    ) -> Result<GraphStreamRequestHandle> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::StreamIngest,
+            &omnigraph_policy::ResourceScope::Graph,
+            Some(actor_id),
+        )?;
+        let contributor_id = TrustedContributorId::new(actor_id.to_string())
+            .map_err(|error| OmniError::manifest(error.to_string()))?;
+        let permit = self.stream_requests.try_acquire(actor_id)?;
+
+        {
+            let initial_profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+            self.ensure_streaming_ingest_runtime_authorized().await?;
+            drop(initial_profile_guard);
+        }
+        // Settle the existing coordinator's cold startup cut before this
+        // request can make an edge lane resident. Otherwise the sole resident
+        // slot could make a previously acknowledged endpoint node lose the
+        // node-before-edge round and turn a valid edge into a dead letter.
+        self.settle_initial_stream_lanes_for_graph_ingest().await?;
+        // The root→profile lock order above deliberately opens a transition
+        // window. Reacquire profile authority and revalidate it before the
+        // request pins its graph witness/catalog or polls the body.
+        let profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+        self.ensure_streaming_ingest_runtime_authorized().await?;
+        let txn = self.open_write_txn(None).await?;
+        let expected_graph_witness = StreamGraphIngestWitness::capture(&txn)?;
+        let catalog = Arc::new(super::public_catalog_view(&txn.catalog)?);
+        drop(profile_guard);
+
+        let ownership = Arc::new(TransportOwnership { _permit: permit });
+        let task_ownership = Arc::clone(&ownership);
+        let routes = Arc::new(Mutex::new(BTreeMap::new()));
+        let task_routes = Arc::clone(&routes);
+        let (sender, receiver) = tokio::sync::mpsc::channel(STREAM_RESULT_CHANNEL_CAPACITY);
+        let db = Arc::clone(self);
+        let actor_id = actor_id.to_string();
+        let task = tokio::spawn(async move {
+            let _transport = task_ownership;
+            drive_graph_request(
+                db,
+                actor_id,
+                contributor_id,
+                catalog,
+                expected_graph_witness,
+                body,
+                sender,
+                task_routes,
+            )
+            .await;
+        });
+        Ok(GraphStreamRequestHandle {
+            inner: StreamRequestHandle {
+                receiver,
+                task: Some(task),
+                _transport: ownership,
+            },
+            routes,
+        })
+    }
+
+    /// Feature-gated graph-wire proof seam. It exercises mixed declaration
+    /// routing and real private lane durability while returning only the
+    /// redacted graph result vocabulary.
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    pub async fn failpoint_stream_ingest_graph_ndjson_as_for_test(
+        self: &Arc<Self>,
+        chunks: Vec<Vec<u8>>,
+        actor_id: &str,
+    ) -> Result<Vec<String>> {
+        let body = Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)));
+        let mut handle = self.stream_ingest_graph_ndjson_as(actor_id, body).await?;
+        let mut results = Vec::new();
+        while let Some(outcome) = handle.recv().await? {
+            results.push(graph_stream_line_outcome_json(&outcome).to_string());
+        }
+        Ok(results)
+    }
+
     /// Feature-gated wire-only proof seam. JSON strings keep all private
     /// protocol/result types out of the SDK while allowing integration tests
     /// to pin caller order and token safety.
@@ -308,6 +455,698 @@ impl Omnigraph {
             .await?;
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_graph_request(
+    db: Arc<Omnigraph>,
+    actor_id: String,
+    contributor_id: TrustedContributorId,
+    catalog: Arc<Catalog>,
+    expected_graph_witness: StreamGraphIngestWitness,
+    mut body: StreamChunkSource,
+    sender: tokio::sync::mpsc::Sender<StreamLineOutcome>,
+    routes: Arc<Mutex<BTreeMap<u64, GraphLineRoute>>>,
+) {
+    let mut framer = NdjsonFramer::new();
+    let mut lane: Option<GraphLaneContext> = None;
+    let mut run: Option<AccumulatingRun> = None;
+    let mut blocker: Option<StreamRequestBlocker> = None;
+    let mut results = OrderedResultBuffer::new(0);
+    let mut next_input_ordinal = 0_u64;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = sender.closed() => return,
+            next = body.next() => {
+                match next {
+                    Some(Ok(chunk)) => {
+                        let mut frames = match framer.push_chunk(chunk) {
+                            Ok(frames) => frames,
+                            Err(error) => {
+                                if !flush_graph_run(
+                                    &db,
+                                    &contributor_id,
+                                    lane.as_ref(),
+                                    &mut run,
+                                    &mut blocker,
+                                    &mut results,
+                                    &sender,
+                                ).await {
+                                    return;
+                                }
+                                let local = StreamLineOutcome::new(
+                                    next_input_ordinal,
+                                    StreamLineDetail::Invalid {
+                                        message: error.to_string(),
+                                    },
+                                );
+                                let outcome = apply_tail_precedence(local, blocker.as_ref());
+                                let _ = emit_ordered(outcome, &mut results, &sender).await;
+                                return;
+                            }
+                        };
+                        for frame in &mut frames {
+                            if sender.is_closed() {
+                                return;
+                            }
+                            next_input_ordinal = frame.ordinal().saturating_add(1);
+                            if !process_graph_frame(
+                                &db,
+                                &actor_id,
+                                &contributor_id,
+                                &catalog,
+                                &expected_graph_witness,
+                                frame,
+                                &mut lane,
+                                &mut run,
+                                &mut blocker,
+                                &mut results,
+                                &sender,
+                                &routes,
+                            ).await {
+                                return;
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        if !flush_graph_run(
+                            &db,
+                            &contributor_id,
+                            lane.as_ref(),
+                            &mut run,
+                            &mut blocker,
+                            &mut results,
+                            &sender,
+                        ).await {
+                            return;
+                        }
+                        let local = StreamLineOutcome::new(
+                            next_input_ordinal,
+                            StreamLineDetail::Invalid {
+                                message: format!("stream body failed: {error}"),
+                            },
+                        );
+                        let outcome = apply_tail_precedence(local, blocker.as_ref());
+                        let _ = emit_ordered(outcome, &mut results, &sender).await;
+                        return;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    if sender.is_closed() {
+        return;
+    }
+    for frame in framer.finish() {
+        if sender.is_closed() {
+            return;
+        }
+        if !process_graph_frame(
+            &db,
+            &actor_id,
+            &contributor_id,
+            &catalog,
+            &expected_graph_witness,
+            frame,
+            &mut lane,
+            &mut run,
+            &mut blocker,
+            &mut results,
+            &sender,
+            &routes,
+        )
+        .await
+        {
+            return;
+        }
+    }
+    let _ = flush_graph_run(
+        &db,
+        &contributor_id,
+        lane.as_ref(),
+        &mut run,
+        &mut blocker,
+        &mut results,
+        &sender,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_graph_frame(
+    db: &Arc<Omnigraph>,
+    actor_id: &str,
+    contributor_id: &TrustedContributorId,
+    catalog: &Catalog,
+    expected_graph_witness: &StreamGraphIngestWitness,
+    frame: NdjsonFrame,
+    lane: &mut Option<GraphLaneContext>,
+    run: &mut Option<AccumulatingRun>,
+    blocker: &mut Option<StreamRequestBlocker>,
+    results: &mut OrderedResultBuffer,
+    sender: &tokio::sync::mpsc::Sender<StreamLineOutcome>,
+    routes: &Arc<Mutex<BTreeMap<u64, GraphLineRoute>>>,
+) -> bool {
+    match frame {
+        NdjsonFrame::InputTooLarge {
+            ordinal,
+            limit,
+            actual,
+        } => {
+            if !flush_graph_run(
+                db,
+                contributor_id,
+                lane.as_ref(),
+                run,
+                blocker,
+                results,
+                sender,
+            )
+            .await
+            {
+                return false;
+            }
+            let local = StreamLineOutcome::new(
+                ordinal,
+                StreamLineDetail::StreamInputTooLarge {
+                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                    actual: u64::try_from(actual).unwrap_or(u64::MAX),
+                },
+            );
+            emit_ordered(
+                apply_tail_precedence(local, blocker.as_ref()),
+                results,
+                sender,
+            )
+            .await
+        }
+        NdjsonFrame::Line { ordinal, bytes } => {
+            // An accumulating run already owns the parsing envelope. A fresh
+            // reservation is needed only for an empty request, a stopped
+            // tail, or a declaration transition that must retain this row
+            // while the previous lane settles.
+            let mut next_preprocessing = if blocker.is_some() {
+                match reserve_tail_sizing_preprocessing(db, sender).await {
+                    Some(Ok(preprocessing)) => Some(preprocessing),
+                    Some(Err(_)) => {
+                        return emit_ordered(
+                            apply_tail_precedence(uninvoked_local(ordinal), blocker.as_ref()),
+                            results,
+                            sender,
+                        )
+                        .await;
+                    }
+                    None => return false,
+                }
+            } else if run.is_none() {
+                match db.stream_workers.reserve_b2_preprocessing() {
+                    Ok(preprocessing) => Some(preprocessing),
+                    Err(error) => {
+                        let outcome = b2_error_outcome(ordinal, error);
+                        *blocker = outcome.as_blocker();
+                        return emit_ordered(outcome, results, sender).await;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let parsed = match parse_graph_stream_json_row(&bytes) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    drop(next_preprocessing.take());
+                    if !flush_graph_run(
+                        db,
+                        contributor_id,
+                        lane.as_ref(),
+                        run,
+                        blocker,
+                        results,
+                        sender,
+                    )
+                    .await
+                    {
+                        return false;
+                    }
+                    return emit_ordered(
+                        apply_tail_precedence(
+                            adapter_error_outcome(ordinal, error),
+                            blocker.as_ref(),
+                        ),
+                        results,
+                        sender,
+                    )
+                    .await;
+                }
+            };
+            if !record_graph_route(routes, ordinal, graph_route(&parsed)) {
+                return false;
+            }
+            let (table_key, canonical_type_name) = match resolve_graph_declaration(catalog, &parsed)
+            {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    drop(parsed);
+                    drop(next_preprocessing.take());
+                    if !flush_graph_run(
+                        db,
+                        contributor_id,
+                        lane.as_ref(),
+                        run,
+                        blocker,
+                        results,
+                        sender,
+                    )
+                    .await
+                    {
+                        return false;
+                    }
+                    return emit_ordered(
+                        apply_tail_precedence(
+                            adapter_error_outcome(ordinal, error),
+                            blocker.as_ref(),
+                        ),
+                        results,
+                        sender,
+                    )
+                    .await;
+                }
+            };
+            let canonical_route = GraphLineRoute {
+                kind: parsed.kind(),
+                type_name: canonical_type_name,
+                logical_id: parsed.logical_id().map(ToOwned::to_owned),
+                write_id: parsed.write_id().to_string(),
+            };
+            if !record_graph_route(routes, ordinal, canonical_route.clone()) {
+                return false;
+            }
+
+            // Complete schema normalization and exact intrinsic sizing before
+            // lazy enrollment. The placeholder UUIDs are fixed-width private
+            // values; replacing the incarnation below cannot change the size
+            // proof.
+            let mut normalized = match normalize_graph_row_before_enrollment(
+                db,
+                catalog,
+                expected_graph_witness,
+                contributor_id,
+                &table_key,
+                ordinal,
+                parsed,
+            )
+            .await
+            {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    drop(next_preprocessing.take());
+                    if !flush_graph_run(
+                        db,
+                        contributor_id,
+                        lane.as_ref(),
+                        run,
+                        blocker,
+                        results,
+                        sender,
+                    )
+                    .await
+                    {
+                        return false;
+                    }
+                    return emit_ordered(
+                        apply_tail_precedence(
+                            adapter_error_outcome(ordinal, error),
+                            blocker.as_ref(),
+                        ),
+                        results,
+                        sender,
+                    )
+                    .await;
+                }
+            };
+            if !record_graph_route(
+                routes,
+                ordinal,
+                GraphLineRoute {
+                    kind: canonical_route.kind,
+                    type_name: canonical_route.type_name.clone(),
+                    logical_id: Some(normalized.logical_id.clone()),
+                    write_id: canonical_route.write_id.clone(),
+                },
+            ) {
+                return false;
+            }
+            if blocker.is_some() {
+                drop(normalized);
+                drop(next_preprocessing.take());
+                return emit_ordered(
+                    apply_tail_precedence(uninvoked_local(ordinal), blocker.as_ref()),
+                    results,
+                    sender,
+                )
+                .await;
+            }
+            let declaration_changed = lane
+                .as_ref()
+                .is_some_and(|active| active.table_key != table_key);
+            if declaration_changed {
+                if next_preprocessing.is_none() {
+                    match db.stream_workers.reserve_b2_preprocessing() {
+                        Ok(preprocessing) => next_preprocessing = Some(preprocessing),
+                        Err(error) => {
+                            // Without a second envelope the normalized row may
+                            // not remain resident while the prior lane flushes.
+                            drop(normalized);
+                            if !flush_graph_run(
+                                db,
+                                contributor_id,
+                                lane.as_ref(),
+                                run,
+                                blocker,
+                                results,
+                                sender,
+                            )
+                            .await
+                            {
+                                return false;
+                            }
+                            *lane = None;
+                            if blocker.is_some() {
+                                return emit_ordered(
+                                    apply_tail_precedence(
+                                        uninvoked_local(ordinal),
+                                        blocker.as_ref(),
+                                    ),
+                                    results,
+                                    sender,
+                                )
+                                .await;
+                            }
+                            let outcome = b2_error_outcome(ordinal, error);
+                            *blocker = outcome.as_blocker();
+                            return emit_ordered(outcome, results, sender).await;
+                        }
+                    }
+                }
+                if !flush_graph_run(
+                    db,
+                    contributor_id,
+                    lane.as_ref(),
+                    run,
+                    blocker,
+                    results,
+                    sender,
+                )
+                .await
+                {
+                    return false;
+                }
+                if blocker.is_some() {
+                    drop(normalized);
+                    drop(next_preprocessing.take());
+                    return emit_ordered(
+                        apply_tail_precedence(uninvoked_local(ordinal), blocker.as_ref()),
+                        results,
+                        sender,
+                    )
+                    .await;
+                }
+                let prior_lane = lane
+                    .as_ref()
+                    .expect("a declaration transition has one active private lane");
+                if let Err(error) = db
+                    .fold_resident_stream_lane_for_handoff(
+                        prior_lane.sizing.identity,
+                        &prior_lane.table_key,
+                    )
+                    .await
+                {
+                    drop(normalized);
+                    drop(next_preprocessing.take());
+                    let outcome = b2_error_outcome(ordinal, error);
+                    *blocker = outcome.as_blocker();
+                    return emit_ordered(outcome, results, sender).await;
+                }
+                *lane = None;
+            }
+
+            if lane.is_none() {
+                match ensure_graph_lane(db, actor_id, &table_key, expected_graph_witness).await {
+                    Ok(active) => *lane = Some(active),
+                    Err(error) => {
+                        drop(normalized);
+                        drop(next_preprocessing.take());
+                        let outcome = b2_error_outcome(ordinal, error);
+                        *blocker = outcome.as_blocker();
+                        return emit_ordered(outcome, results, sender).await;
+                    }
+                }
+            }
+            let active = lane.as_ref().expect("graph lane was installed");
+            normalized.envelope.stream_incarnation_id = active.stream_incarnation_id.clone();
+            if run.is_none() {
+                let Some(preprocessing) = next_preprocessing.take() else {
+                    drop(normalized);
+                    let outcome = StreamLineOutcome::new(
+                        ordinal,
+                        StreamLineDetail::Invalid {
+                            message: "graph stream row lost preprocessing ownership".to_string(),
+                        },
+                    );
+                    return emit_ordered(outcome, results, sender).await;
+                };
+                *run = Some(AccumulatingRun::new(
+                    preprocessing,
+                    Some(expected_graph_witness.clone()),
+                ));
+            }
+            debug_assert!(next_preprocessing.is_none());
+            process_normalized_row(
+                db,
+                &active.table_key,
+                contributor_id,
+                &active.sizing,
+                Some(expected_graph_witness),
+                ordinal,
+                normalized,
+                true,
+                run,
+                blocker,
+                results,
+                sender,
+            )
+            .await
+        }
+    }
+}
+
+fn graph_route(parsed: &ParsedGraphStreamJsonRow) -> GraphLineRoute {
+    GraphLineRoute {
+        kind: parsed.kind(),
+        type_name: parsed.type_name().to_string(),
+        logical_id: parsed.logical_id().map(ToOwned::to_owned),
+        write_id: parsed.write_id().to_string(),
+    }
+}
+
+fn record_graph_route(
+    routes: &Arc<Mutex<BTreeMap<u64, GraphLineRoute>>>,
+    ordinal: u64,
+    route: GraphLineRoute,
+) -> bool {
+    let Ok(mut routes) = routes.lock() else {
+        return false;
+    };
+    routes.insert(ordinal, route);
+    true
+}
+
+fn resolve_graph_declaration(
+    catalog: &Catalog,
+    parsed: &ParsedGraphStreamJsonRow,
+) -> Result<(String, String)> {
+    let (table_key, canonical_type_name) = match parsed.kind() {
+        "node" => {
+            let node = catalog.node_types.get(parsed.type_name()).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "unknown graph node declaration '{}'",
+                    parsed.type_name()
+                ))
+            })?;
+            (format!("node:{}", node.name), node.name.clone())
+        }
+        "edge" => {
+            let edge = catalog
+                .lookup_edge_by_name(parsed.type_name())
+                .ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "unknown graph edge declaration '{}'",
+                        parsed.type_name()
+                    ))
+                })?;
+            (format!("edge:{}", edge.name), edge.name.clone())
+        }
+        _ => {
+            return Err(OmniError::manifest_internal(
+                "graph stream parser returned an unknown logical kind",
+            ));
+        }
+    };
+    Omnigraph::ensure_stream_table_admission_supported(catalog, &table_key)?;
+    Ok((table_key, canonical_type_name))
+}
+
+async fn normalize_graph_row_before_enrollment(
+    db: &Arc<Omnigraph>,
+    catalog: &Catalog,
+    expected_graph_witness: &StreamGraphIngestWitness,
+    contributor_id: &TrustedContributorId,
+    table_key: &str,
+    ordinal: u64,
+    parsed: ParsedGraphStreamJsonRow,
+) -> Result<NormalizedStreamJsonRow> {
+    let (write_id, predecessor_token, body) = parsed.into_normalizer_parts();
+    let envelope = StreamWriteEnvelope {
+        stream_incarnation_id: GRAPH_STREAM_SIZING_UUID.to_string(),
+        write_id,
+        predecessor_token,
+    };
+    let normalized = normalize_stream_json_parts_with_catalog(table_key, envelope, body, catalog)?;
+    // Pin every single-row bound before enrollment. The later real
+    // incarnation/enrollment IDs have the same canonical UUID width.
+    let _ = b1_logical_batch_bytes(&normalized.batch)
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let sizing = IntrinsicSizingContext {
+        identity: graph_catalog_table_identity(catalog, table_key)?,
+        accepted_schema_hash: expected_graph_witness.schema_ir_hash().to_string(),
+        enrollment_id: GRAPH_STREAM_SIZING_UUID.to_string(),
+    };
+    validate_intrinsic_single_row_size(
+        db,
+        table_key,
+        contributor_id,
+        &sizing,
+        ordinal,
+        &normalized,
+    )
+    .await?;
+    Ok(normalized)
+}
+
+async fn ensure_graph_lane(
+    db: &Arc<Omnigraph>,
+    actor_id: &str,
+    table_key: &str,
+    expected_graph_witness: &StreamGraphIngestWitness,
+) -> Result<GraphLaneContext> {
+    let current = db.open_write_txn(None).await?;
+    expected_graph_witness.validate(&current, "graph stream lazy enrollment")?;
+
+    let enrollment_request_id = ShardId::new_v4().to_string();
+    let first = db
+        .prepare_stream_ingest_pre_authorized(table_key, &enrollment_request_id, None, actor_id)
+        .await?;
+    let completed = match first {
+        PrepareStreamIngestOutcome::WitnessRequired(witness) => {
+            db.prepare_stream_ingest_pre_authorized(
+                table_key,
+                &enrollment_request_id,
+                Some(&witness),
+                actor_id,
+            )
+            .await?
+        }
+        completed => completed,
+    };
+    if matches!(completed, PrepareStreamIngestOutcome::WitnessRequired(_)) {
+        return Err(OmniError::manifest_read_set_changed(
+            format!("graph_stream_lazy_enrollment:{table_key}"),
+            Some("echoed eligibility witness".to_string()),
+            Some("stream eligibility moved before enrollment".to_string()),
+        ));
+    }
+
+    let capture = db
+        .capture_stream_authority(table_key, "graph stream lazy enrollment result")
+        .await?;
+    expected_graph_witness.validate(&capture.txn, "graph stream lane capture")?;
+    Omnigraph::ensure_stream_table_admission_supported(&capture.txn.catalog, table_key)?;
+    Ok(GraphLaneContext {
+        table_key: table_key.to_string(),
+        stream_incarnation_id: capture
+            .lifecycle
+            .enrollment_receipt
+            .stream_incarnation_id
+            .clone(),
+        sizing: IntrinsicSizingContext {
+            identity: capture.entry.identity,
+            accepted_schema_hash: capture.txn.authority.schema_ir_hash.clone(),
+            enrollment_id: capture.binding.enrollment_id.clone(),
+        },
+    })
+}
+
+fn graph_catalog_table_identity(catalog: &Catalog, table_key: &str) -> Result<TableIdentity> {
+    let (stable, incarnation) = if let Some(name) = table_key.strip_prefix("node:") {
+        (
+            catalog.node_type_id(name),
+            catalog.node_table_incarnation_id(name),
+        )
+    } else if let Some(name) = table_key.strip_prefix("edge:") {
+        (
+            catalog.edge_type_id(name),
+            catalog.edge_table_incarnation_id(name),
+        )
+    } else {
+        return Err(OmniError::manifest_internal(
+            "invalid resolved graph stream table key",
+        ));
+    };
+    let stable = stable.ok_or_else(|| {
+        OmniError::manifest_internal("resolved graph stream declaration has no stable identity")
+    })?;
+    let incarnation = incarnation.ok_or_else(|| {
+        OmniError::manifest_internal("resolved graph stream declaration has no table incarnation")
+    })?;
+    TableIdentity::new(stable.get(), incarnation.get())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_graph_run(
+    db: &Arc<Omnigraph>,
+    contributor_id: &TrustedContributorId,
+    lane: Option<&GraphLaneContext>,
+    run: &mut Option<AccumulatingRun>,
+    blocker: &mut Option<StreamRequestBlocker>,
+    results: &mut OrderedResultBuffer,
+    sender: &tokio::sync::mpsc::Sender<StreamLineOutcome>,
+) -> bool {
+    if run.is_none() {
+        return true;
+    }
+    let Some(lane) = lane else {
+        let outcome = StreamLineOutcome::new(
+            0,
+            StreamLineDetail::Invalid {
+                message: "graph stream run lost its private lane".to_string(),
+            },
+        );
+        return emit_ordered(outcome, results, sender).await;
+    };
+    flush_run(
+        db,
+        &lane.table_key,
+        contributor_id,
+        run,
+        blocker,
+        results,
+        sender,
+    )
+    .await
 }
 
 async fn drive_request(
@@ -368,6 +1207,7 @@ async fn drive_request(
                                 &contributor_id,
                                 &catalog,
                                 &sizing,
+                                None,
                                 frame,
                                 &mut run,
                                 &mut blocker,
@@ -421,6 +1261,7 @@ async fn drive_request(
             &contributor_id,
             &catalog,
             &sizing,
+            None,
             frame,
             &mut run,
             &mut blocker,
@@ -451,6 +1292,7 @@ async fn process_frame(
     contributor_id: &TrustedContributorId,
     catalog: &Catalog,
     sizing: &IntrinsicSizingContext,
+    expected_graph_witness: Option<&StreamGraphIngestWitness>,
     frame: NdjsonFrame,
     run: &mut Option<AccumulatingRun>,
     blocker: &mut Option<StreamRequestBlocker>,
@@ -534,7 +1376,12 @@ async fn process_frame(
 
             if run.is_none() {
                 match db.stream_workers.reserve_b2_preprocessing() {
-                    Ok(preprocessing) => *run = Some(AccumulatingRun::new(preprocessing)),
+                    Ok(preprocessing) => {
+                        *run = Some(AccumulatingRun::new(
+                            preprocessing,
+                            expected_graph_witness.cloned(),
+                        ))
+                    }
                     Err(error) => {
                         let outcome = b2_error_outcome(ordinal, error);
                         *blocker = outcome.as_blocker();
@@ -561,101 +1408,136 @@ async fn process_frame(
                         .await;
                     }
                 };
-            let row_bytes = match b1_logical_batch_bytes(&normalized.batch) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    if !flush_run(db, table_key, contributor_id, run, blocker, results, sender)
-                        .await
-                    {
-                        return false;
-                    }
-                    let local = StreamLineOutcome::new(
-                        ordinal,
-                        StreamLineDetail::Invalid {
-                            message: error.to_string(),
-                        },
-                    );
-                    return emit_ordered(
-                        apply_tail_precedence(local, blocker.as_ref()),
-                        results,
-                        sender,
-                    )
-                    .await;
-                }
-            };
-            if let Err(error) = validate_intrinsic_single_row_size(
+            process_normalized_row(
                 db,
                 table_key,
                 contributor_id,
                 sizing,
+                expected_graph_witness,
                 ordinal,
-                &normalized,
+                normalized,
+                false,
+                run,
+                blocker,
+                results,
+                sender,
             )
             .await
-            {
-                if !flush_run(db, table_key, contributor_id, run, blocker, results, sender).await {
-                    return false;
-                }
-                let local = adapter_error_outcome(ordinal, error);
-                return emit_ordered(
-                    apply_tail_precedence(local, blocker.as_ref()),
-                    results,
-                    sender,
-                )
-                .await;
-            }
-
-            if run
-                .as_ref()
-                .is_some_and(|run| run.must_split_before(&normalized.logical_id, row_bytes))
-                && !flush_run(db, table_key, contributor_id, run, blocker, results, sender).await
-            {
-                return false;
-            }
-            if blocker.is_some() {
-                return emit_ordered(
-                    apply_tail_precedence(uninvoked_local(ordinal), blocker.as_ref()),
-                    results,
-                    sender,
-                )
-                .await;
-            }
-            if run.is_none() {
-                match db.stream_workers.reserve_b2_preprocessing() {
-                    Ok(preprocessing) => *run = Some(AccumulatingRun::new(preprocessing)),
-                    Err(error) => {
-                        let outcome = b2_error_outcome(ordinal, error);
-                        *blocker = outcome.as_blocker();
-                        return emit_ordered(outcome, results, sender).await;
-                    }
-                }
-            }
-            let pending = PendingRow {
-                ordinal,
-                envelope: normalized.envelope,
-                logical_id: Arc::<str>::from(normalized.logical_id),
-                batch: Some(normalized.batch),
-            };
-            if let Err(error) = run
-                .as_mut()
-                .expect("stream run was installed")
-                .push(pending, row_bytes)
-            {
-                let outcome = StreamLineOutcome::new(
-                    ordinal,
-                    StreamLineDetail::Invalid {
-                        message: error.to_string(),
-                    },
-                );
-                return emit_ordered(outcome, results, sender).await;
-            }
-            if run.as_ref().is_some_and(AccumulatingRun::is_full) {
-                return flush_run(db, table_key, contributor_id, run, blocker, results, sender)
-                    .await;
-            }
-            true
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_normalized_row(
+    db: &Arc<Omnigraph>,
+    table_key: &str,
+    contributor_id: &TrustedContributorId,
+    sizing: &IntrinsicSizingContext,
+    expected_graph_witness: Option<&StreamGraphIngestWitness>,
+    ordinal: u64,
+    normalized: NormalizedStreamJsonRow,
+    intrinsic_already_validated: bool,
+    run: &mut Option<AccumulatingRun>,
+    blocker: &mut Option<StreamRequestBlocker>,
+    results: &mut OrderedResultBuffer,
+    sender: &tokio::sync::mpsc::Sender<StreamLineOutcome>,
+) -> bool {
+    let row_bytes = match b1_logical_batch_bytes(&normalized.batch) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            if !flush_run(db, table_key, contributor_id, run, blocker, results, sender).await {
+                return false;
+            }
+            let local = StreamLineOutcome::new(
+                ordinal,
+                StreamLineDetail::Invalid {
+                    message: error.to_string(),
+                },
+            );
+            return emit_ordered(
+                apply_tail_precedence(local, blocker.as_ref()),
+                results,
+                sender,
+            )
+            .await;
+        }
+    };
+    if !intrinsic_already_validated
+        && let Err(error) = validate_intrinsic_single_row_size(
+            db,
+            table_key,
+            contributor_id,
+            sizing,
+            ordinal,
+            &normalized,
+        )
+        .await
+    {
+        if !flush_run(db, table_key, contributor_id, run, blocker, results, sender).await {
+            return false;
+        }
+        let local = adapter_error_outcome(ordinal, error);
+        return emit_ordered(
+            apply_tail_precedence(local, blocker.as_ref()),
+            results,
+            sender,
+        )
+        .await;
+    }
+
+    if run
+        .as_ref()
+        .is_some_and(|run| run.must_split_before(&normalized.logical_id, row_bytes))
+        && !flush_run(db, table_key, contributor_id, run, blocker, results, sender).await
+    {
+        return false;
+    }
+    if blocker.is_some() {
+        return emit_ordered(
+            apply_tail_precedence(uninvoked_local(ordinal), blocker.as_ref()),
+            results,
+            sender,
+        )
+        .await;
+    }
+    if run.is_none() {
+        match db.stream_workers.reserve_b2_preprocessing() {
+            Ok(preprocessing) => {
+                *run = Some(AccumulatingRun::new(
+                    preprocessing,
+                    expected_graph_witness.cloned(),
+                ))
+            }
+            Err(error) => {
+                let outcome = b2_error_outcome(ordinal, error);
+                *blocker = outcome.as_blocker();
+                return emit_ordered(outcome, results, sender).await;
+            }
+        }
+    }
+    let pending = PendingRow {
+        ordinal,
+        envelope: normalized.envelope,
+        logical_id: Arc::<str>::from(normalized.logical_id),
+        batch: Some(normalized.batch),
+    };
+    if let Err(error) = run
+        .as_mut()
+        .expect("stream run was installed")
+        .push(pending, row_bytes)
+    {
+        let outcome = StreamLineOutcome::new(
+            ordinal,
+            StreamLineDetail::Invalid {
+                message: error.to_string(),
+            },
+        );
+        return emit_ordered(outcome, results, sender).await;
+    }
+    if run.as_ref().is_some_and(AccumulatingRun::is_full) {
+        return flush_run(db, table_key, contributor_id, run, blocker, results, sender).await;
+    }
+    true
 }
 
 /// Temporarily enter the same root preprocessing corridor used by B2 before
@@ -839,6 +1721,7 @@ async fn flush_run(
                 Some(preprocessing),
                 driver_round_guard,
                 profile_guard,
+                submitted.expected_graph_witness.as_ref(),
             ) => outcome,
         };
         match outcome {
@@ -1430,6 +2313,140 @@ async fn emit_ordered(
         }
     }
     true
+}
+
+#[cfg(feature = "failpoints")]
+fn graph_stream_line_outcome_json(outcome: &GraphStreamLineOutcome) -> serde_json::Value {
+    let line = &outcome.outcome;
+    let status = graph_status_name(line.status());
+    let blocking = line.blocking.as_ref();
+    let mut value = serde_json::json!({
+        "ordinal": line.ordinal,
+        "status": status,
+        "scope": graph_status_scope(line.status()),
+    });
+    let object = value
+        .as_object_mut()
+        .expect("graph stream result starts as an object");
+    if let Some(route) = outcome.route.as_ref() {
+        object.insert("kind".to_string(), route.kind.into());
+        object.insert("type".to_string(), route.type_name.clone().into());
+    }
+    if let Some(logical_id) = outcome
+        .route
+        .as_ref()
+        .and_then(|route| route.logical_id.as_deref())
+        .or_else(|| line.logical_id())
+    {
+        object.insert("id".to_string(), logical_id.into());
+    }
+    if let Some(write_id) = outcome
+        .route
+        .as_ref()
+        .map(|route| route.write_id.as_str())
+        .or_else(|| line.write_id())
+    {
+        object.insert("write_id".to_string(), write_id.into());
+    }
+    if let Some(token) = line.confirmed_stream_token() {
+        object.insert("stream_token".to_string(), token.into());
+    }
+    if let Some(token) = line.unconfirmed_candidate_token() {
+        object.insert("unconfirmed_candidate_token".to_string(), token.into());
+    }
+    if let Some(token) = line.current_token() {
+        object.insert("current_token".to_string(), token.into());
+    }
+    if let Some(message) = graph_safe_message(line.status()) {
+        object.insert("message".to_string(), message.into());
+    }
+    if let StreamLineDetail::StreamInputTooLarge { limit, actual } = &line.detail {
+        object.insert("limit".to_string(), (*limit).into());
+        object.insert("actual".to_string(), (*actual).into());
+    }
+    if let Some(blocking) = blocking {
+        object.insert("blocking_ordinal".to_string(), blocking.ordinal.into());
+        object.insert(
+            "blocking_status".to_string(),
+            graph_status_name(blocking.status).into(),
+        );
+    }
+    value
+}
+
+#[cfg(feature = "failpoints")]
+fn graph_status_name(status: StreamLineStatus) -> &'static str {
+    match status {
+        StreamLineStatus::StreamBindingChanged
+        | StreamLineStatus::StreamLifecycleChanged
+        | StreamLineStatus::StreamAuthorityChanged
+        | StreamLineStatus::StreamResumeRequired => "stream_authority_changed",
+        other => status_name(other),
+    }
+}
+
+#[cfg(feature = "failpoints")]
+fn graph_status_scope(status: StreamLineStatus) -> &'static str {
+    match status {
+        StreamLineStatus::AckUnknown
+        | StreamLineStatus::StreamBindingChanged
+        | StreamLineStatus::StreamLifecycleChanged
+        | StreamLineStatus::StreamAuthorityChanged
+        | StreamLineStatus::StreamResumeRequired
+        | StreamLineStatus::StreamFoldRequired
+        | StreamLineStatus::StreamBackpressure
+        | StreamLineStatus::RecoveryRequired
+        | StreamLineStatus::StreamRetryRequired => "graph",
+        StreamLineStatus::Durable
+        | StreamLineStatus::AlreadyDurable
+        | StreamLineStatus::Withdrawn
+        | StreamLineStatus::DeadLettered
+        | StreamLineStatus::Invalid
+        | StreamLineStatus::StreamInputTooLarge
+        | StreamLineStatus::StreamSequenceConflict
+        | StreamLineStatus::StreamIdempotencyConflict => "row",
+    }
+}
+
+#[cfg(feature = "failpoints")]
+fn graph_safe_message(status: StreamLineStatus) -> Option<&'static str> {
+    match status {
+        StreamLineStatus::Durable
+        | StreamLineStatus::AlreadyDurable
+        | StreamLineStatus::StreamInputTooLarge => None,
+        StreamLineStatus::AckUnknown => {
+            Some("durability acknowledgement is unknown; retry the same logical write")
+        }
+        StreamLineStatus::Withdrawn => Some("the current logical occurrence is withdrawn"),
+        StreamLineStatus::DeadLettered => {
+            Some("the current logical occurrence was diverted by graph validation")
+        }
+        StreamLineStatus::Invalid => Some("row is invalid for the accepted graph schema"),
+        StreamLineStatus::StreamBindingChanged
+        | StreamLineStatus::StreamLifecycleChanged
+        | StreamLineStatus::StreamAuthorityChanged
+        | StreamLineStatus::StreamResumeRequired => {
+            Some("graph stream authority changed; retry the request")
+        }
+        StreamLineStatus::StreamSequenceConflict => {
+            Some("the predecessor token is not current for this logical row")
+        }
+        StreamLineStatus::StreamIdempotencyConflict => {
+            Some("the write id was reused with different logical content")
+        }
+        StreamLineStatus::StreamFoldRequired => {
+            Some("the graph stream must fold before this row can be retried")
+        }
+        StreamLineStatus::StreamBackpressure => {
+            Some("graph stream capacity is temporarily unavailable")
+        }
+        StreamLineStatus::RecoveryRequired => {
+            Some("graph recovery must complete before ingest can continue")
+        }
+        StreamLineStatus::StreamRetryRequired => {
+            Some("this row was not invoked; retry it after the graph blocker clears")
+        }
+    }
 }
 
 #[cfg(feature = "failpoints")]
