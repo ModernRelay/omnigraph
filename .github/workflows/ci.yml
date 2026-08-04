@@ -360,7 +360,6 @@ jobs:
       contents: read
     env:
       CARGO_TERM_COLOR: always
-      RUST_MIN_STACK: 16777216
     steps:
       - name: Skip for documentation-only changes
         if: needs.classify_changes.outputs.run_full_ci != 'true'
@@ -396,6 +395,8 @@ jobs:
 
       - name: Test omnigraph-server with aws feature
         if: needs.classify_changes.outputs.run_full_ci == 'true'
+        env:
+          RUST_MIN_STACK: 16777216
         run: cargo test --locked -p omnigraph-server --features aws
 
   rustfs_integration:
