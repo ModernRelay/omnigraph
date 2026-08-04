@@ -58,7 +58,8 @@ unavailable rather than falsely inconsistent. Cold-replay pending accounting,
 flushed LWW projection accounting, and exact oldest-uncovered-token age are
 reported as unavailable rather than inferred. The already-public
 `Omnigraph::stream_status` remains the nonblocking manifest-only projection;
-CLI/HTTP/OpenAPI/SDK transport for the operational shape remains F7.
+F6c replaces its product DTO with a redacted graph projection, and F7
+transports only that projection rather than the physical operational input.
 F6b8 closes the format-neutral resume-to-driver ownership handoff: resume
 transfers its non-clone root producer permit into detached writer installation
 and arms an urgent trigger before that transfer can release. Under the
@@ -67,7 +68,7 @@ in a housekeeping prepass before its unchanged node-before-edge round. Driver-
 first, caller-cancelled resume-first, cross-lane reuse, and clean-shutdown cells
 are green. The broader post-claim install/retirement-failure matrix remains F6
 work.
-Public row streaming, public enrollment, general lifecycle/rebind verbs,
+Public row streaming, graph ingress/control, general lifecycle/rebind verbs,
 `AuthorityBlock` repair,
 the standalone production token-index reconciler deferred by F6b7's uncompacted-
 profile-cycle bounded NO-GO, the F6b-remainder
@@ -113,7 +114,7 @@ at that checkpoint explicit production enrollment, lifecycle management,
 correction/status, and all product surfaces remained inactive (the
 authorization/status slice below changed that boundary on 2026-07-28)
 **Experimental activation profile selected:** 2026-07-27 — cluster-only,
-manifest-propagated enablement, lazy graph-wide enrollment, caller-supplied
+manifest-propagated enablement, private lazy per-row enrollment beneath graph ingress, caller-supplied
 vectors, terminal per-key object-form dead letter plus recovery-bound
 structural-authority correction, no read-your-writes bridge, starvation-free
 serial dependency-prioritized fold core with non-overlapping resident-enabled
@@ -140,16 +141,15 @@ registered (both graph-scoped; the main-only profile makes a branch dimension
 meaningless, so both scope qualifiers are rejected at validation), the P1
 enablement flip migrated from the reserved `Admin` action onto
 `stream_manage`, and `Omnigraph::stream_status` projects the durable
-enablement and per-lane authority read-only. Status deliberately ships before
-the management verbs because §4.6 makes it the compare-token source: it
-exposes the `lifecycle_revision` those verbs pass back as their expected
-revision, so they can be written as compare-and-set from the start. This is
-the §4.7 *minimal* status — the authoritative manifest row only; §4.3's
+enablement and per-lane authority read-only. That pre-activation ambient
+diagnostic is not the P8 product DTO or an F7 transport source: F6c replaces it
+with one redacted graph projection and opaque graph control token. Its current
+private-lane `lifecycle_revision` remains useful to the hidden verbs only and
+never crosses the graph boundary. §4.3's
 exclusive-cut physical observation (observed epoch, pending generation
 rows/bytes, `StatusChanged`/`StatusBusy`) arrives with the verbs that need
 it, as an additive observed-physical section. F6b6 later implemented that
-checked observation core internally without changing this public projection
-or adding a transport.
+checked observation core internally without adding a transport.
 **F2 entry scaffold implemented:** 2026-07-29 — `omnigraph-storage` now owns
 the one local/S3 control-object implementation and
 `omnigraph-control-authority` owns the unchanged persisted cluster lock below
@@ -270,12 +270,13 @@ candidate-runtime test composes prepare, ordered NDJSON, an automatic mixed
 visible/dead-letter fold, stopped/offline selected-token list/export, an
 ordinary corrected successor, driver restart, clean shutdown ownership, and
 checked offline disable. Public durable `Omnigraph::stream_status` remains
-manifest-only. This slice adds no format/recovery or public API/SDK/HTTP/CLI/
+manifest-only until F6c replaces its DTO with the redacted graph projection.
+This slice adds no format/recovery or public API/SDK/HTTP/CLI/
 OpenAPI contract and does not complete F6. Later F6b2 closes the named process,
 fairness, and maintenance/rebind/resume cells, and F6b3 closes the uncovered-
 tail current-token hit/miss and terminal-page instrument. F6b7 later adds the
 paired token-index decision instrument; public operational-status transport and
-the remaining guardrails keep F7 forbidden;
+the remaining guardrails keep F6c/F7 forbidden;
 F6b4 separately closes the isolated dead-letter envelope evidence and F6b5
 closes bounded served export.
 **F6b1 checked immutable export-cut slice implemented:** 2026-08-02 — an exact
@@ -335,7 +336,7 @@ rebind keeps accepted schema unchanged. F6b7 closes the paired failpoints-only
 token-index decision instrument and F6b5 closes bounded stream-aware served
 export. Its uncompacted-profile-cycle bounded NO-GO schedules no standalone
 production reconciler; public operational-status
-transport and the other served surfaces remain later F6b/F7 work. F6b4
+projection/transport and the other served surfaces remain later F6c/F7 work. F6b4
 separately closes the isolated dead-letter envelope evidence.
 **F6b3 exact-selected uncovered-tail evidence implemented:** 2026-08-02 — a
 fixed-cardinality fixture grows immutable token-ledger receipt history through
@@ -444,8 +445,8 @@ flushed LWW projection is `UnavailableFlushed`. Token-index uncovered counts
 are exact when Lance exposes coverage, but oldest-uncovered age is explicitly unavailable
 because the selected cut has no exact fragment-creation timestamp. The
 existing public `Omnigraph::stream_status` remains manifest-only and
-nonblocking. This slice adds no CLI/HTTP/OpenAPI/SDK transport; F7 owns that
-wire contract.
+nonblocking. This slice adds no CLI/HTTP/OpenAPI/SDK transport; F6c owns the
+redacted graph projection and F7 transports it.
 **F6b7 selected token-index decision instrument implemented:** 2026-08-03 — the
 F6b3 fixture now takes paired observations over the same logical authority. It
 measures current-token and profile-management-receipt hit/miss work on the
@@ -602,9 +603,9 @@ remains reachable only through feature-gated, doc-hidden engine test seams and
 is not a product surface. V11's profile protocol v2 and exact recovery-v13
 `StreamProfileChange` remain unchanged.
 
-The remaining public enrollment/quiesce, `AuthorityBlock` correction, physical
-status, rebind, and product-parity contracts in §4.1–§4.4 and §4.6 still
-apply. Narrow stopped/offline `DataBlock` correction, selected-current-token
+P8 supersedes the earlier per-declaration public enrollment/quiesce, correction,
+physical-status, and rebind sketches. Their protocol mechanics remain private
+inputs to F6c's graph coordinator. Narrow stopped/offline `DataBlock` correction, selected-current-token
 dead-letter list/export, and terminal authority retirement are the cluster-only
 operator exceptions.
 `GraphHistoryBudget`, physical-storage admission, and aggregate receipt-capacity
@@ -734,11 +735,14 @@ eventual-consistency modes.
 ## 2. Stream mode and key semantics
 
 Phase B1 has no schema syntax and uses one fixed internal
-`mode="upsert", on_reject="strict"` profile. Phase B2 initially exposes only
-`@stream(mode="upsert", on_reject="strict")` on a node or edge type.
-`on_reject="dead_letter"` remains a typed unsupported choice until Phase C
-proves a restart-stable reject-row identity, consumes B2's durable contributor
-attribution, and proves atomic rejection and retention.
+`mode="upsert", on_reject="strict"` profile. An older full-product sketch used
+per-type `@stream(mode="upsert", on_reject="strict")`; selected EXP P8 does
+not. The graph profile applies the fixed mode to every compatible declaration
+that appears in the graph ingress stream; callers cannot create independently
+managed per-type streams.
+`on_reject="dead_letter"` remains a typed unsupported schema choice; P4 instead
+owns one fixed terminal disposition whose identity, attribution, atomicity, and
+retention are proved by the experimental profile.
 It requires the table's immutable unenforced primary key to equal OmniGraph's
 merge key: `id` for nodes and edges. All occurrences of one key map to one shard
 and MemWAL applies last-write-wins ordering.
@@ -746,14 +750,16 @@ and MemWAL applies last-write-wins ordering.
 Initial B2 admission is self-contained and provider-free. The caller supplies
 every required physical value, including vectors; the engine may perform only
 version-pinned deterministic parsing, defaults, and normalization before token
-mint. `@stream` is rejected at accepted-schema validation for a type whose
-write path requires `@embed`, an external provider, or any other post-request
-derived-field materialization. Runtime rechecks the accepted capability before
-admission. A client may compute embeddings first and submit the physical vector,
-but streaming never acknowledges a provider-dependent promise and retries never
-re-call an external model under the same `write_id`.
+mint. A row whose declaration needs an unsupported physical shape or
+post-request materialization is refused locally before enrollment or WAL
+effect. P3 permits an
+`@embed` declaration only when each row already carries its vector; streaming
+never acknowledges a provider-dependent promise and retries never re-call an
+external model under the same `write_id`. Blob-bearing declarations remain
+unsupported row shapes until Lance's fold scanner can materialize them; their
+presence elsewhere in the graph does not disable compatible rows.
 
-Every stream contract is bound to RFC-028's
+Every private lane contract is bound to RFC-028's
 `(stable_table_id, incarnation_id)` pair. A rename preserves that pair, so the
 logical stream contract and ownership of reject history remain continuous.
 That continuity does **not** authorize adoption of physical WAL artifacts. A
@@ -776,13 +782,12 @@ resolves physical rows by generation/position LWW, but B2 does not expose
 unconstrained arrival-order LWW as its retry contract. §4.1 admits a physical
 row only when its predecessor token matches the current per-key stream token:
 
-- interactive same-key writes on an unenrolled table serialize or fail/retry
-  loudly. Once the table is enrolled, ordinary Mutation/Load remains refused
-  before effect for `OPEN`, `DRAINING`, **and `SEALED`** in B2. Draining enables
-  only the proved export/rebuild path plus §4.7 P7's explicitly integrated
-  non-content maintenance bridge; it does not let a direct write bypass
-  `_stream_tokens`. A later phase must define a token-aware direct-write
-  transition and witness/rebind update before relaxing this refusal;
+- once the graph profile is `ENABLED`, all served content mutation uses the
+  checked graph runtime; ambient/direct Mutation/Load refuses graph-wide.
+  `DISABLING` closes it entirely. Within the private core an enrolled child
+  remains fenced for `OPEN`, `DRAINING`, and **`SEALED`**. Draining enables only
+  the proved export/rebuild path plus §4.7 P7's integrated non-content
+  maintenance bridge; it never lets a direct write bypass `_stream_tokens`;
 - same-key public stream entries form an explicit compare-and-chain sequence;
   MemWAL generation/position order realizes only that already-validated chain;
 - duplicate keys inside one bulk-load input retain the existing load error.
@@ -791,13 +796,15 @@ The schema and user docs state all three together.
 
 ## 3. Enrollment is a recoverable multi-effect adapter
 
-In the eventual Phase-B2 public contract, SchemaApply records `@stream` intent
-and first stream use enrolls the physical table by creating the singleton
-`__lance_mem_wal` system index and its sharding configuration. Phase A does not
-yet parse or persist that intent. It implements the enrollment machinery behind
-a crate-private method and a feature-gated failpoint seam, using one fixed
-main-only/unsharded configuration so recovery and exclusion can be proven
-before a production caller exists.
+An older per-type public sketch let SchemaApply record `@stream` intent and
+first use enroll one physical table. P8 rejects that product boundary. Public
+ingress binds graph authority only through its pre-body graph-control-token
+check; after bounded validation of a compatible graph row, F6c drives this
+section's physical enrollment lazily as private child work before any WAL
+attempt or acknowledgement. Phase A implements that
+machinery behind a crate-private method and a feature-gated failpoint seam,
+using one fixed main-only/unsharded configuration so recovery and exclusion can
+be proven before a production caller exists.
 
 RFC-024 heads are optional. Every lifecycle row therefore carries two distinct
 classes of evidence:
@@ -878,10 +885,11 @@ writer satisfies neither general shape. Private-module access,
 compatible-looking index inference, and direct object-store emulation remain
 rejected. Gate E0 established that the public effects are nevertheless exact
 enough for the bounded profile. Internal schema v7 and the private Phase A
-adapter now activate the format/recovery foundation. `@stream`, production
-first use, WAL row admission, and acknowledgement remain publicly inactive.
+adapter now activate the format/recovery foundation. The rejected per-type
+`@stream` surface, graph ingress, WAL row admission, and acknowledgement remain
+publicly inactive.
 Implemented Phase B1 reaches row admission only through a feature-gated private
-engine seam; schema-declared first use remains Phase B2.
+engine seam; expected-token graph ingress and the lazy graph-row adapter remain F6c.
 
 With Gate E0 green, the implemented bounded enrollment uses one RFC-022
 multi-effect sidecar, not an ad-hoc state machine:
@@ -890,8 +898,8 @@ multi-effect sidecar, not an ad-hoc state machine:
 2. authorize, pin the manifest/schema/table state, and prepare a complete
    `ReadSet` containing schema identity, stable table ID and incarnation,
    location/main ref, exact pre-enrollment `CurrentHeadWitness`, PK metadata,
-   the fixed Phase A configuration, and lifecycle-row absence. Public
-   production schema-declared intent and supported `SEALED` physical rebind remain later phases;
+   the fixed Phase A configuration, and lifecycle-row absence. Graph-coordinator
+   ownership and supported `SEALED` physical rebind remain later phases;
 3. acquire any global claims and then the `(table, branch)` write queue in
    RFC-022 order, then freshly revalidate the complete `ReadSet`; a mismatch
    restarts before any physical effect;
@@ -968,24 +976,17 @@ branch-scoping question is proven by a surface guard and end-to-end test. Later
 overlapping-process enrollment/failover still requires the upstream receipt /
 admission lifecycle or a separately accepted distributed fence.
 
-Neither public profile hides enrollment inside the first ingest row. The full
-non-experimental B2 contract leaves an `@stream` table `UNENROLLED` until its
-standalone explicit enrollment request. The selected experimental profile
-amends that surface with §4.7 P2's automatic **bodyless prepare** handshake:
-the client obtains a complete `StreamEligibilityWitness`, sends a
-caller-minted non-nil `enrollment_request_id`, and receives the engine-minted
-logical `stream_incarnation_id` before any row body is owned. It reuses the
-physical mechanics above but arms only recovery-v14 `StreamEnrollmentV2`,
-whose fixed actor/witness intent and result are retained in actor-bound
-`EnrollmentReceiptV2`; historical `protocol_v10` is not reinterpreted.
-Same ID/actor/intent after a lost result returns that receipt; another actor or
-intent conflicts; concurrent prepare losers resolve through the winner's
-complete receipt and return bounded `already_enrolled`. A successful prepare
-with no subsequent body intentionally leaves an empty `OPEN` lane. Actual
-ingest still requires the exact returned incarnation on every row, and an
-absent lane returns request-level `StreamPrepareRequired` before body
-ownership. Thus row-body ingest never creates enrollment and there is no
-first-row exception.
+Enrollment remains a distinct recovered operation, but it is lazy beneath the
+first validated graph row for a compatible declaration. The row adapter holds
+that bounded row and invokes the bodyless private P2 child before any WAL call
+or acknowledgement. The private child still uses exact
+`StreamEligibilityWitness`, enrollment request, stream-incarnation, and
+recovery-v14 `StreamEnrollmentV2` mechanics; historical `protocol_v10` is not
+reinterpreted. The caller receives none of those child identities. Only after
+that one child settles does the adapter inject its private incarnation and hand
+the row to the WAL core. A successful enrollment may leave an empty private
+`OPEN` lane if later sequencing rejects the triggering row; normal
+quiesce/disable owns it. Public graph ingress has no pre-enrollment route.
 
 ## 4. B2 contract and future public activation
 
@@ -1008,10 +1009,10 @@ graph-scoped `stream_ingest` /
 `stream_manage` Cedar vocabulary and embedded manifest-only read-only status
 are active under §4.7; v11 profile mutation additionally requires checked
 cluster-control/runtime ownership.
-Supported enrollment/quiesce/rebind, general lifecycle control,
-`AuthorityBlock` repair, public operational-status transport, public row
-admission, and transport parity remain future gates. The checked read-only
-operational-status core itself is implemented internally by F6b6.
+Expected-token graph ingress, graph control over private quiesce/rebind children,
+lazy graph-row admission over private enrollment, `AuthorityBlock` repair, the
+redacted graph-status projection, and transport parity remain future gates. The checked read-only
+physical status input itself is implemented internally by F6b6.
 **B2a unbounded retain-all** is the selected first profile: it
 deletes no MemWAL object and performs no physical-storage admission or
 accounting. **B2b** is the deferred managed-reclamation profile through the
@@ -1030,8 +1031,8 @@ over the enrolled source.
 
 ### 4.1 Durable row identity and same-key retry safety
 
-B2 deliberately makes the public contract stricter than blind upsert. Every
-input row carries a client-owned logical write token:
+B2 deliberately makes the logical contract stricter than blind upsert. The
+private lane adapter consumes this envelope:
 
 ```text
 StreamWriteEnvelope {
@@ -1054,6 +1055,12 @@ TrustedStreamRowMetadata {
 }
 ```
 
+P8's graph-native public row carries only `write_id` and
+`predecessor_token` inside `$stream`; the request header carries the expected
+graph-control token that fences graph identity and catalog authority. After
+resolving the logical node/edge declaration, the trusted graph adapter injects
+`stream_incarnation_id` before calling this private seam.
+
 `write_id` is the caller's idempotency label and remains stable for an exact
 retry. The occurrence/idempotency key is `(table incarnation, stream
 incarnation, logical id, predecessor_token, write_id)`. Authenticated
@@ -1073,14 +1080,16 @@ no earlier stream token, which covers both an absent row and a row that predates
 public streaming. A blind wildcard predecessor is not supported because it
 recreates the stale-retry overwrite.
 
-`stream_incarnation_id` is minted when the logical token authority is created
-and returned by status/enrollment. It survives a same-table physical rebind but
-changes whenever a strict rebuild/re-enrollment resets token state. Every
-request compares it before Lance is called; a mismatch is effect-free
-`StreamBindingChanged`. This closes the null-predecessor ABA in which a delayed
-first-write retry from an old root/enrollment could otherwise enter a freshly
-empty token authority. Table drop/re-add is already fenced by the distinct
-stable table incarnation, and the stream incarnation is checked as well.
+`stream_incarnation_id` is minted when the private logical token authority is
+created. It survives a same-table physical rebind but changes whenever a strict
+rebuild/re-enrollment resets token state. The graph adapter compares its
+injected value before Lance is called; a mismatch returns effect-free
+`StreamAuthorityChanged`. A reset also remints the graph-control token. This
+closes the null-predecessor ABA in which a
+delayed first-write retry from an old root/enrollment could otherwise enter a
+freshly empty token authority. Table drop/re-add is already fenced by the
+distinct stable table incarnation, and the private stream incarnation is
+checked as well.
 
 `StreamToken` is an opaque 32-byte, versioned, domain-separated SHA-256 value
 computed by the trusted engine from the stable table/incarnation, logical key,
@@ -1166,9 +1175,10 @@ object/reason/candidate evidence; it does not add another row origin. Older
 formats reject the new disposition/evidence. A token row is
 current protocol state, not an admission log; there is at most one current row
 per logical graph key. Phase-D physical rebind does not rewrite every token row:
-responses report the separately revalidated current binding, while
-`origin_enrollment_id` remains attribution history. A token-authority reset
-instead mints a new stream incarnation.
+private recovery separately revalidates the current binding while
+`origin_enrollment_id` remains attribution history. The public graph result
+reports neither. A token-authority reset instead mints a new private stream
+incarnation and graph-control token.
 
 This internal table is not a competing authority:
 
@@ -1275,11 +1285,12 @@ and returns `StreamSequenceConflict` without calling Lance. The unsafe
 Two concurrent `X(P)` and `Y(P)` calls serialize: one wins and the other
 conflicts; `Y` is accepted after `X` only when it explicitly names `X`.
 
-No automatic retry follows invocation. `AckUnknown` carries its
-`admission_attempt_id`, caller ordinal range, binding, and logical write IDs but
-makes no durability claim. It may include the deterministic candidate stream
-token but must label it unconfirmed; generic stream status never resolves that
-attempt.
+No automatic retry follows invocation. Private recovery retains the admission
+attempt ID, caller ordinal range, binding, and logical write IDs, but the public
+`AckUnknown` carries only an opaque attempt token, ordinal range, and logical
+write IDs. It makes no durability claim. It may include the deterministic
+candidate stream token but must label it unconfirmed; graph status never
+resolves that attempt.
 A later explicit retry may report the exact write current or return a
 current-token sequence conflict; neither result retroactively claims whether
 the earlier physical attempt was durable.
@@ -1629,10 +1640,12 @@ authority after rebind. Rebind appends one fresh immutable ledger receipt and
 the sole manifest CAS atomically moves that pointer and chain commitment
 without rewriting history.
 
-Every externally initiated lane-scoped mutating management request **after
-enrollment** is compare-and-set, not "act on whatever is current." It carries a
-non-nil operation ID, the expected `lifecycle_revision`, and, when it addresses
-a drain or block, the expected `drain_id` or `block_token`. Quiesce uses its
+Every private lane-scoped mutating child **after enrollment** is
+compare-and-set, not "act on whatever is current." P8's caller submits one
+graph operation ID and expected `graph_control_token`; the graph coordinator
+derives these child IDs and supplies their private lifecycle revisions. A child
+carries a non-nil operation ID, the expected `lifecycle_revision`, and, when it
+addresses a drain or block, the expected `drain_id` or `block_token`. Quiesce uses its
 `drain_id` as the operation ID; explicit fold uses `fold_operation_id`;
 resume/abort-drain uses `resume_id`; data correction uses `correction_id`;
 authority correction uses `authority_correction_id`; rebind uses `rebind_id`.
@@ -1749,7 +1762,7 @@ stable field and never reopens. A `SealedProof` carries the final equal witness.
 “Preserve the drain” below always means preserve that stable operation identity
 and intent, including any disable override, not preserve stale descriptor bytes.
 
-The public state machine is:
+The private per-lane state machine beneath P8's graph coordinator is:
 
 ```text
 OPEN --quiesce or blocked fold--> DRAINING
@@ -1760,8 +1773,9 @@ SEALED --StreamResume recovery--> OPEN
 DRAINING --abort-drain recovery--> OPEN   // only after the rules below
 ```
 
-Quiesce requires a caller-minted non-nil `drain_id` and expected lifecycle
-revision, acquires the common stream-admission lease exclusively, runs the
+Each quiesce child receives a non-nil `drain_id` and expected lifecycle
+revision derived by the graph coordinator, acquires the common stream-admission
+lease exclusively, runs the
 recovery barrier, waits for every watcher/retirement owner, and CASes
 `OPEN -> DRAINING` before a new physical drain effect. The durable descriptor
 is the restart plan. Under it the worker advances the epoch through the
@@ -1916,8 +1930,9 @@ configuration, base witness, graph-branch topology, fixed actor/operation, an
 `OPEN` plan, minimum next epoch floor, and exact `ENABLED` profile/delegation
 authority. The current hidden seam acquires the graph-profile gate shared
 before the table gate and holds it through claim, terminal ledger effect, and
-manifest publication; F7's production wrapper must additionally require
-matching checked serving-runtime authority before invocation. The exact
+manifest publication; F6c's graph coordinator additionally requires matching
+checked serving-runtime authority before invoking a child, and F7 exposes only
+that graph wrapper. The exact
 achieved epoch is unknowable before the writer claim. After claiming, the
 adapter durably records the exact classified sentinel/epoch and one ledger
 transaction containing the terminal `ClaimReceipt` and `ManagementReceipt`,
@@ -1934,7 +1949,8 @@ residue fails closed.
 Plain resume accepts only `SEALED`, revalidates schema/PK/config/format, exact
 physical binding, sealed proof, and the bounded no-named-graph-branch topology.
 Abort-drain is explicit and accepts only `DRAINING`; both calls require a
-caller-minted `resume_id` and expected lifecycle revision. Abort additionally requires
+`resume_id` and expected lifecycle revision derived by the graph coordinator.
+Abort additionally requires
 that no guarded operation began, the binding and complete current DRAINING row
 (including its equal current witnesses) still match, every background
 seal/abort owner settled, and no unmerged or strict-blocked cut remains. It may
@@ -1955,15 +1971,16 @@ after residue is graph-visible and the block is cleared, an otherwise eligible
 unguarded drain may abort. A quiesce that keeps `goal = SEALED` may instead
 continue to the sealed proof. This rule is identical in §8 and the B2 gates.
 
-The full B2 status contract starts from one bounded current lifecycle row and
+The private B2 status input starts from one bounded current lifecycle row and
 its manifest-selected ledger references plus a bounded cut-consistent physical
 observation. It reports only current receipt identifiers and summaries; no
-public receipt-history scan or pagination contract is exposed. The
-experimental §4.7 slice currently exposes only the manifest projection through embedded
+receipt-history scan or pagination contract is exposed. The experimental
+§4.7 slice currently exposes only the manifest projection through embedded
 `Omnigraph::stream_status`; it takes no admission lease, reads no physical
 shard witness, and has no CLI/HTTP/OpenAPI surface. F6b6 implements the checked
-read-only operational core described below behind an engine-internal seam; it
-does not change that public method or add a CLI/HTTP/OpenAPI/SDK transport.
+read-only operational core described below behind an engine-internal seam. F6c
+replaces the ambient result with P8's redacted graph projection and F7
+transports only that projection, never this physical input.
 
 In the supported full B2 profile, status first proves the expensive immutable
 token/base and lifecycle-ledger evidence against one manifest-selected cut
@@ -2010,8 +2027,11 @@ billing truth. The read-only status call does not mutate lifecycle. Every later
 admission independently reruns the recovery, lifecycle, token, row, memory, and
 backpressure gates; there is no B2a storage-meter or receipt-capacity preflight.
 
-Rebuild preflight requires `SEALED` and re-runs under closed admission plus
-schema/branch/table gates. The sealed proof must still match the exact
+Each private export/rebuild-proof child requires `SEALED` and re-runs under
+closed admission plus schema/branch/table gates. Served export runs the complete
+deterministic member set and either captures one graph cut or returns a typed
+refusal; P8 adds no standalone preflight route. Each sealed
+proof must still match the exact
 base/shard state; no relevant sidecar, active/frozen/replayable authoritative
 tail, unmerged generation, unattributed winner, or unresolved token may remain.
 Unreferenced retained materialization output is inert and does not block the
@@ -2054,8 +2074,9 @@ attempt pre-mints a non-nil `failure_drain_id` and fixes the authenticated
 `stream_manage` actor, initiation time, binding, and current witness in its
 plan. The conditional failure CAS installs that exact engine-minted ID and
 actor in the new `DrainDescriptor`; a lost reply or retry reads the persisted
-descriptor and never mints a replacement. Caller-minted `drain_id` is required
-only for the public quiesce operation. If the fold already belongs to a
+descriptor and never mints a replacement. Under P8, the graph coordinator
+derives the private child `drain_id`; callers supply only the graph operation
+ID and expected graph control token. If the fold already belongs to a
 durable `DRAINING` operation, including quiesce, the CAS attaches the block to
 that complete row without changing its `drain_id` or goal; a quiesce therefore
 remains `goal = SEALED`. The same CAS writes the exact
@@ -2090,10 +2111,12 @@ block inspection. Consequently the early retry path may return a stored block
 token without reopening the physical WAL while still relying only on
 authenticated claim authority.
 
-A data correction is an operator-authorized management operation carrying the
-expected lifecycle revision and keyed by `(block_token, correction_id)`; the
-token hashes the immutable cut, base witness, violation, and correction
-revision. Its management receipt and correction receipt are published together.
+A private data-correction child carries the expected lifecycle revision and is
+keyed by `(block_token, correction_id)`; the token hashes the immutable cut,
+base witness, violation, and correction revision. P8's graph request instead
+carries the block token, correction ID, and expected `graph_control_token`; the
+coordinator resolves and supplies the private revision. Its management receipt
+and correction receipt are published together.
 Same operation occurrence plus the same plan is idempotent, the same occurrence
 with another digest is a conflict, and a stale revision/block token is
 `StreamLifecycleChanged`/`ReadSetChanged` before effect.
@@ -2102,7 +2125,10 @@ The active F3f entry point is deliberately narrow: `cluster stream block
 show|correct` requires the declared graph, actor, held cluster state lock,
 applied stream authority, and explicit `--confirm-stream-offline`. Both calls
 retain the cluster apply lock and stopped-process guard. There is no direct
-`--store`, served HTTP, remote SDK, or OpenAPI equivalent.
+`--store`, served HTTP, remote SDK, or OpenAPI equivalent. Its current
+pre-activation CLI/DTO still carries a declaration and lifecycle revision; F6c
+migrates that surface to graph + opaque block/control tokens and keeps no
+lane-addressed alias.
 
 For `DataBlock`, the retained immutable generation is also the authority for a
 bounded correction-planning view. That variant stores the validator-contract
@@ -2148,7 +2174,9 @@ count/digest equality. The current v19 binary returns at most 256 entries and
 cursor bound to `(block_token, correction_view_digest, lifecycle_revision,
 next_ordinal)`, then rereads the complete authority before release. The
 complete view remains bounded by the 8,192-entry/32-MiB evidence envelope
-above; each page also returns that bound revision.
+above. The current pre-activation DTO also returns that bound revision; P8's
+replacement keeps it inside the opaque cursor and returns only graph/block
+authority.
 Movement is `BlockChanged`; missing cut data or digest disagreement is fail-
 closed corruption. GC cannot reclaim the generation while the block exists.
 This makes the operator's predecessor tokens and action choices recoverable
@@ -2259,16 +2287,30 @@ publishes a stale witness and never opens admission.
 After correction, a `SEALED` drain goal—including one set by exact
 `DisableDrainAdoption`—continues to the empty proof. An unadopted
 `OPEN_AFTER_FOLD` goal still uses the `StreamResume` recovery kind through the
-explicit `stream resume --abort-drain` operation after all residue is visible;
-plain `stream resume` continues to accept only `SEALED`. The fold/correction CAS
-never opens admission itself. Skip-invalid, implicit drop, whole-generation
-discard, base-row delete, and direct `DRAINING -> OPEN` CAS are forbidden.
+private child driven by graph-wide `stream resume --abort-drain` after all
+residue is visible; plain graph resume requires every enrolled child to satisfy
+its `SEALED` predicate. The graph coordinator evaluates that whole cut and
+derives child revisions; no public command targets this lane. The
+fold/correction CAS never opens admission itself. Skip-invalid, implicit drop,
+whole-generation discard, base-row delete, and direct `DRAINING -> OPEN` CAS
+are forbidden.
+
+At the graph layer, correction lets the original blocked fold occurrence
+settle terminally and release its singleton while leaving the corrected child
+`DRAINING(OPEN_AFTER_FOLD)`. A new graph abort-drain occurrence is then
+admissible only from `ENABLED/ACTIVE` with no active quiesce or other graph
+control. Its atomic `ACTIVE -> RESUMING` transition closes graph ingress,
+drives every eligible corrected `OPEN_AFTER_FOLD` child through its private
+recovery-v15 owner, and publishes `ACTIVE` only after the whole cut is open.
+Abort-drain cannot cancel or retarget an active graph quiesce; quiesce or
+disable continues its original seal goal after correction.
 
 An eligible `AuthorityBlock` uses a future finalized
 `StreamAuthorityCorrection` recovery owner. It must not reinterpret the frozen
 recovery-v14 scaffold. The request carries the block token, caller
-operation ID, expected lifecycle revision, and one complete reason-gated
-repair-plan digest over the authenticated evidence. It may adopt a
+operation ID, expected graph control token, and one complete reason-gated
+repair-plan digest over the authenticated evidence; the graph coordinator
+derives the private expected lifecycle revision. It may adopt a
 binding/witness only from exact transaction and content proof, create a fresh
 binding/base from the manifest-visible base plus an authenticated acknowledged
 cut, or replace affected current-token rows by exact expected-old/new
@@ -2465,7 +2507,7 @@ the supported idempotency/recovery horizon.
 
 Pending reclaim attempts are part of the mandatory B2b open/admission barrier,
 not optional maintenance metadata. Before any stream open, status, put, fold,
-quiesce, resume, correction, rebuild preflight, or later reclaim may claim a
+quiesce, resume, correction, export/rebuild proof, or later reclaim may claim a
 writer or touch shard state, it classifies the exact attempt set. Mutating
 operations resolve the sole recognized same-plan attempt or refuse; status
 reports it without mutation. Patched Lance itself refuses a shard-writer claim
@@ -2744,45 +2786,104 @@ or an advisory counter.
 ### 4.6 Public surface after the gates close
 
 The shipped `POST /graphs/{id}/ingest` path remains the deprecated, compatible
-alias of `/load`. Streaming receives a new, non-conflicting surface:
+alias of `/load`. Streaming receives a new graph-scoped surface. The graph is
+the only public resource; declarations select logical row shapes, not public
+datasets or independently managed streams:
 
 ```text
-POST /graphs/{graph_id}/streams/{type_name}/enroll
-POST /graphs/{graph_id}/streams/{type_name}/ingest?branch=main
-GET  /graphs/{graph_id}/streams
-GET  /graphs/{graph_id}/streams/{type_name}
-GET  /graphs/{graph_id}/streams/{type_name}/blocks/{block_token}
-POST /graphs/{graph_id}/streams/{type_name}/fold
-POST /graphs/{graph_id}/streams/{type_name}/quiesce
-POST /graphs/{graph_id}/streams/{type_name}/resume
-POST /graphs/{graph_id}/streams/{type_name}/correct
-POST /graphs/{graph_id}/streams/{type_name}/rebuild-preflight
+POST /graphs/{graph_id}/stream/ingest
+GET  /graphs/{graph_id}/stream
+POST /graphs/{graph_id}/stream/fold
+POST /graphs/{graph_id}/stream/quiesce
+POST /graphs/{graph_id}/stream/resume
 ```
 
 The ingest request and response use `Content-Type: application/x-ndjson` and
-`Accept: application/x-ndjson`.
+`Accept: application/x-ndjson`. The request presents an expected opaque
+`graph_control_token` in `X-Omnigraph-Graph-Control-Token`. That token is a
+domain-separated commitment to graph identity, accepted catalog, profile, and
+one fresh no-reuse control generation. Every control-authority change rotates
+it, and rebuild/reset always remints the domain. Only while current authority is
+`ENABLED/ACTIVE`, a **missing** value returns an effect-free
+`graph_control_token_required` challenge under `stream_ingest` before the
+handler polls one body byte. Any supplied non-exact value returns terminal
+effect-free `StreamAuthorityChanged` without a replacement token; supported
+clients never strip and auto-retry it. A non-active state returns its typed
+profile/control refusal, not a challenge that cannot authorize progress.
+Supported clients use `Expect: 100-continue` and follow at most one missing-
+token challenge only after the server proves it polled no body byte; no client
+automatically replays an owned body.
 
-Each input line is one row payload plus the compare-and-chain envelope. The
-contributor is never accepted from the body:
+Exact-token validation and request registration are one atomic graph-gate
+operation that also pins the authenticated actor, catalog, recovery readiness,
+and active authority. Before touching that gate, quiesce transfers one
+non-clone close owner, including actor, operation ID, canonical intent, and
+expected graph-control token, to the graph coordinator. Under the same graph
+gate, the coordinator receipt-first joins or replays an exact occurrence,
+refuses a stale/non-active/conflicting new request without closing, or
+atomically claims the new occurrence, marks the gate closing, and bumps its in-memory generation.
+Only that winning occurrence signals owners, so a later ingest owns zero
+request bytes. Disconnecting the HTTP waiter cannot abandon or
+reopen the gate: the coordinator continues the same occurrence through durable
+arm, and clean shutdown joins it. Process loss before durable arm leaves no
+durable control effect; reopen starts `ACTIVE` and the same operation ID may be
+retried. Each input line is one logical node or edge payload plus the
+compare-and-chain envelope.
+Logical kind/type labels are row data and diagnostics; they never select a
+dataset, lane, binding, or control scope. The contributor is never accepted
+from the body:
 
 ```json
-{"$stream":{"stream_incarnation_id":"d288f7a0-38b4-4e63-a841-60f323df0dd8","write_id":"8a880f0a-3f41-4a42-9b0e-f34af0a9a4df","predecessor_token":null},"id":"n-17","name":"Ada"}
+{"type":"Person","data":{"id":"n-17","name":"Ada"},"$stream":{"write_id":"8a880f0a-3f41-4a42-9b0e-f34af0a9a4df","predecessor_token":null}}
+{"edge":"Knows","from":"n-17","to":"n-18","data":{"id":"e-17"},"$stream":{"write_id":"591d698c-9fc5-4673-af1a-d39fdba8ded0","predecessor_token":null}}
 ```
 
-Each output line corresponds to the same input ordinal:
+After bounded parse and complete row validation, the graph adapter resolves the
+logical declaration. An unknown or currently unsupported declaration shape,
+including Blob, is a row-local effect-free validation result. For a compatible
+declaration with no private lifecycle, the adapter holds that bounded row and
+drives P2's existing recoverable enrollment child before any WAL attempt or
+acknowledgement. It then injects the private incarnation; no caller sees or
+supplies that value. Enrollment ambiguity is owned by its existing private
+recovery family, not by a new graph-wide prepare transaction.
+
+An ingest that registered first still cannot hold quiesce behind an unbounded
+producer. The close signal stops further body polling and settles only the
+current bounded tail. An active private enrollment settles or recovers; a
+validated row not yet passed to WAL receives `stream_retry_required`; an
+invoked WAL tail completes watcher/fence classification. The non-clone ingress
+permit transfers with either tail across disconnect or shutdown. After all
+owned row results, the response emits exactly one terminal record:
 
 ```json
-{"ordinal":17,"status":"durable","stream_incarnation_id":"d288f7a0-38b4-4e63-a841-60f323df0dd8","write_id":"8a880f0a-3f41-4a42-9b0e-f34af0a9a4df","stream_token":"sha256:...","origin":{"kind":"admission","admission_attempt_id":"...","caller_ordinal":17},"enrollment_id":"...","shard_id":"...","writer_epoch":8}
+{"status":"stream_quiescing","scope":"graph","next_unread_ordinal":42}
+```
+
+Every lower ordinal has exactly one row result. No equal-or-higher ordinal was
+accepted; a partially buffered line is discarded and must be replayed at
+`next_unread_ordinal`. The client also retries any lower ordinal whose ordinary
+result requires retry. After the terminal record the request releases its gate
+registration, allowing quiesce to arm durable graph control.
+Close-time result enqueue/flush has a bounded send deadline. On expiry or
+disconnect, the server drops the response, releases result/transport/gate
+ownership, and lets quiesce proceed; the missing response remains ambiguous and
+the caller uses the ordinary idempotent retry contract. Quiesce correctness
+never depends on a client consuming the terminal record.
+
+Each ordinary output line corresponds to the same input ordinal:
+
+```json
+{"ordinal":17,"status":"durable","kind":"node","type":"Person","id":"n-17","write_id":"8a880f0a-3f41-4a42-9b0e-f34af0a9a4df","stream_token":"sha256:..."}
 ```
 
 The response union is tagged rather than pretending every outcome created a
 new admission attempt. Exact JSON `status` values are `durable`,
 `ack_unknown`, `already_durable`, `withdrawn`, `dead_lettered`, `invalid`,
-`stream_input_too_large`, `stream_binding_changed`,
-`stream_lifecycle_changed`, `stream_authority_changed`,
+`stream_input_too_large`, `stream_authority_changed`,
 `stream_sequence_conflict`, `stream_idempotency_conflict`,
 `stream_resume_required`, `stream_fold_required`, `stream_backpressure`,
-`recovery_required`, and `stream_retry_required`;
+`recovery_required`, `stream_retry_required`, and the stream-terminal
+`stream_quiescing`;
 CamelCase names below denote the corresponding engine error/disposition types.
 An unresolved recovery found by the request-level barrier before any body line
 is admitted may return the ordinary HTTP 503 `RecoveryRequired` envelope. Once
@@ -2790,60 +2891,53 @@ the adapter has accepted an ordinal or emitted any line, the same condition is
 represented only by per-line `recovery_required` plus the stop-tail rule below;
 partial success never changes into an HTTP error.
 
-For variants that reach the engine's authoritative binding capture, response
-`enrollment_id`, `shard_id`, and `writer_epoch` describe that freshly
-revalidated current physical binding. They are not copied from a token row's
-immutable `origin_enrollment_id`, so a later Phase-D rebind does not make an
-`already_durable` response advertise a stale writer. An adapter-level `invalid`
-before binding capture omits those fields. A tail `stream_retry_required`
-identifies the blocking attempt's captured binding under explicitly named
-`blocking_binding`; it does not pretend to have revalidated a new per-line
-binding. OpenAPI makes presence variant-specific rather than nullable-by-habit.
+Public row results contain logical row identity, opaque tokens, and typed
+status only. They never serialize a dataset/table/lane/incarnation/binding,
+shard/epoch/generation, witness, receipt/revision, or physical object
+descriptor, location, digest, or length. In particular:
 
-- `durable` returns the confirmed token and its new `Admission` origin;
-- `ack_unknown` / `AckUnknown` returns that attempt plus an explicitly
-  `candidate_stream_token_unconfirmed`; it never labels the token current;
-- `already_durable` returns the persisted token and its persisted
-  `Admission | Correction` origin, with no new attempt;
-- `withdrawn` returns the current terminal token and its original persisted
-  `Admission | Correction` origin plus the separate withdrawal correction
-  actor, operation, and receipt, with no new attempt;
+- `durable` returns the confirmed token;
+- `ack_unknown` / `AckUnknown` may return an opaque attempt token and an
+  explicitly unconfirmed candidate stream token; it never labels that token
+  current;
+- `already_durable` returns the persisted current token, with no new attempt;
+- `withdrawn` returns the current terminal token plus opaque terminal evidence,
+  with no new attempt;
 - `dead_lettered` (activated only by §4.7 F5's new format) returns the current
-  terminal token, persisted tagged origin, violation/object candidate
-  reference, and fold operation with no WAL attempt. The object contains only
-  that key's canonical final LWW candidate; superseded occurrences are outside
-  the §4.2 audit contract and are never response identities;
+  terminal token and opaque block evidence with no WAL attempt. A separate
+  authorized offline listing may issue an artifact token for that key's
+  canonical final LWW candidate; the ingest response never exposes an object
+  locator. Superseded occurrences are outside the §4.2 audit contract and are
+  never response identities;
 - `invalid` is the effect-free per-line parse/schema/normalization error and
   creates no attempt;
 - `stream_input_too_large` means the exact normalized single row cannot fit an
   otherwise empty legal generation. It is terminal for that line, creates no
   attempt, and does not ask the caller to fold and retry an impossible row;
-- `stream_binding_changed`, `stream_lifecycle_changed`,
-  `stream_authority_changed`, `stream_sequence_conflict`, and
-  `stream_idempotency_conflict` are effect-free and return only the
-  authoritative binding/lifecycle/current-token evidence safe for the
-  corresponding typed error, with no fabricated attempt. Lifecycle change
-  covers `OPEN -> DRAINING/SEALED` between request runs; authority change covers
-  an exhausted pre-invocation reprepare after schema/main/token movement;
-- `stream_resume_required` is the effect-free result for an existing `SEALED`
-  lane under an `ENABLED` profile. It carries the current lifecycle revision
-  needed by the separate authorized resume and never resumes under the ingest
-  actor;
+- `stream_authority_changed`, `stream_sequence_conflict`, and
+  `stream_idempotency_conflict` are effect-free and return only safe logical
+  evidence and opaque current tokens, with no fabricated attempt;
+- `stream_resume_required` is an effect-free graph blocker under an `ENABLED`
+  profile. It carries the current graph control token needed by the separate
+  authorized graph resume and never resumes under the ingest actor;
 - `stream_fold_required` is an effect-free admission refusal with no attempt.
   It means the next legal row/run fits an empty generation but not the bounded
-  resident generation and must be folded before retry. B2a defines no retained-
-  storage, control-headroom, aggregate-receipt-capacity, or graph-history-budget
-  refusal;
+  private resident generation, so the graph must be folded before retry. B2a
+  defines no retained-storage, control-headroom, aggregate-receipt-capacity, or
+  graph-history-budget refusal;
 - `stream_backpressure` is an effect-free admission/queue deadline reached
   before `put_no_wait`; it carries retry guidance but no durability claim or
   attempt;
 - `recovery_required` means a pre-invocation recovery/retirement operation
   remains authoritative and could not finish within the request deadline. It
-  carries that recovery operation ID, no new admission attempt, and no token
-  claim; and
+  carries only an opaque graph block token, no new admission attempt, and no
+  token claim; and
 - `stream_retry_required` means the line was not invoked because an earlier
-  physical run became `AckUnknown`; it carries that blocking attempt ID but no
-  attempt or token claim for this line.
+  private run became `AckUnknown` or graph quiesce closed a validated but
+  uninvoked tail. It carries the blocker reason/ordinal and may carry an earlier
+  opaque attempt token, but no attempt or token claim for this line; and
+- `stream_quiescing` is the single request-terminal control record defined
+  above, never a per-row result or durability claim.
 
 RC.1 exposes a durability completion, not an exact per-put WAL receipt.
 `BatchDurableWatcher::wait()` returns only `Result<()>`;
@@ -2889,8 +2983,9 @@ so fold/retry cannot loop forever on an intrinsically oversized payload.
 - disconnecting does not cancel entries whose durability waiter resolved;
 - cancellation or failure after `put_no_wait` but before a successful watcher
   result is `AckUnknown`, not proof of non-durability;
-- a missing response is ambiguous. Retrying the same stream incarnation,
-  authenticated actor, `write_id`, predecessor, and payload follows §4.1:
+- a missing response is ambiguous. After registering under the exact current
+  graph-control token, retrying the same authenticated actor, logical row, `write_id`,
+  predecessor, and payload follows §4.1:
   exact current `X` returns `already_durable`, absent `X` may be submitted again
   against its still-current predecessor, and a newer `Y` yields
   `StreamSequenceConflict` before any Lance call;
@@ -2898,7 +2993,7 @@ so fold/retry cannot loop forever on an intrinsically oversized payload.
   reports any unacknowledged tail as unknown to the client.
 
 Token dispositions are physical-run boundaries too. A row that is
-`already_durable`, `withdrawn`, F5 `dead_lettered`, binding-conflicted,
+`already_durable`, `withdrawn`, F5 `dead_lettered`, authority-conflicted,
 sequence-conflicted, or
 idempotency-conflicted first waits for the preceding submitted run, then is
 evaluated against the resulting confirmed overlay without entering that run.
@@ -2910,81 +3005,87 @@ deterministic. Fresh same-key successors may share one
 generation after separate durable calls, but never one physical run: tokens are
 opaque, so the later caller cannot name an unconfirmed predecessor. A physical
 run contains at most one fresh candidate per key. `AckUnknown` retires that
-worker and stops further physical admission for the stream request; rows not
-yet invoked receive an effect-free `stream_retry_required` result.
+private worker and produces a graph-scoped blocker; rows not yet invoked
+receive an effect-free `stream_retry_required` result.
 `on_reject="strict"` describes fold validation—it does not turn the NDJSON
 response stream into an atomic request.
 
-An `AckUnknown`, effect-free capacity/backpressure refusal,
-`stream_lifecycle_changed`, `stream_authority_changed`, or
-`recovery_required` stops further physical admission for that request. The
-blocking line receives its exact status; each later otherwise-admissible,
-uninvoked line receives the appropriate tail status plus `blocking_ordinal`
-(`stream_retry_required` for an `AckUnknown`, otherwise the same blocking
-status). The adapter nevertheless continues effect-free parsing, schema
-validation, normalization, and intrinsic single-row sizing after the blocker.
-A later parse/schema/normalization failure remains `invalid`, and a later row
-that cannot fit an empty generation remains `stream_input_too_large`; those
-adapter-local terminal results take precedence over any inherited tail blocker.
-Every other uninvoked line inherits the blocker. No such line gets an
-admission-attempt ID. This rule is identical when the blocker appears after
-earlier `durable` output, so the handler never converts partial NDJSON success
-into an HTTP-level error or confuses capacity/recovery with `AckUnknown`.
+Every refused or blocked result has public scope `row` or `graph`. Per-line
+parse, payload/schema validation, unsupported declaration shape, normalization,
+exact single-row size, sequence, and idempotency outcomes are `row`. Any
+authority, recovery, lifecycle, capacity,
+backpressure, fold/resume, `AckUnknown`, transport, or shutdown condition that
+affects later work is `graph`; there is no public entity-type blocker. Internal
+declaration-local evidence is insufficient to create a third control boundary.
+
+The blocking line receives its exact status and scope. Each later otherwise-
+admissible uninvoked line inherits the graph blocker plus `blocking_ordinal`.
+The adapter may continue effect-free parsing, validation, normalization, and
+intrinsic sizing, so a later row-local terminal result takes precedence. No
+uninvoked line gets an attempt token. The handler never converts partial NDJSON
+success into an HTTP-level error.
 
 CLI commands mirror the new namespace rather than overloading deprecated
 `omnigraph ingest`:
 
 ```text
-omnigraph stream enroll <type> --enrollment-request-id <uuid> ...
-omnigraph stream ingest <type> --data <ndjson> ...
-omnigraph stream status [<type>] ...
-omnigraph stream block show <type> --block-token <token> ...
-omnigraph stream fold [<type>] --operation-id <uuid> --expected-lifecycle-revision <n> ...
-omnigraph stream quiesce [<type>] --drain-id <uuid> --expected-lifecycle-revision <n> ...
-omnigraph stream resume [<type>] --resume-id <uuid> --expected-lifecycle-revision <n> ...
-omnigraph stream resume [<type>] --abort-drain --resume-id <uuid> --expected-lifecycle-revision <n> ...
-omnigraph stream correct <type> --block-token <token> --correction-id <uuid> --expected-lifecycle-revision <n> --plan <json> ...
-omnigraph stream rebuild-preflight [<type>] ...
+omnigraph stream ingest --data <ndjson> ...
+omnigraph stream status ...
+omnigraph stream fold --operation-id <uuid> --expected-graph-control-token <token> ...
+omnigraph stream quiesce --operation-id <uuid> --expected-graph-control-token <token> ...
+omnigraph stream resume --operation-id <uuid> --expected-graph-control-token <token> ...
+omnigraph stream resume --abort-drain --operation-id <uuid> --expected-graph-control-token <token> ...
 ```
 
-HTTP fold, quiesce, resume/abort-drain, and correction bodies likewise require
-their operation ID plus expected lifecycle revision; status and block-view
-responses expose the revision to use as the compare token. Exact occurrence
-plus intent is retry-safe after a lost response, while stale revision refuses
-without retargeting. `enroll` requires caller-minted
-`enrollment_request_id` and returns tagged `enrolled | already_enrolled` with
-the durable stream incarnation/current binding; ingest on a declared but
-unenrolled table returns request-level typed `StreamNotEnrolled` before reading
-or acknowledging body rows. `correct` requires `block_token`,
-caller-minted `correction_id`, and explicit ordered `REPLACE | WITHDRAW`
-actions. The engine derives the canonical plan digest from §4.4; an optional
-client digest is only an equality assertion. It returns the immutable
-correction receipt. `block show`/the block endpoint returns the digest-verified,
-paginated planning view needed to construct those actions; it never returns
-whole blocked rows. `rebuild-preflight` is a fresh under-gate proof, not a cached
-status alias.
+HTTP fold, quiesce, and resume/abort-drain bodies likewise require one graph
+operation ID plus the expected opaque `graph_control_token`. Their bounded
+result is `completed | in_progress | blocked | cancelled`. `blocked` retains a
+repairable active descriptor; disable cancellation is terminal
+`cancelled(reason = cancelled_by_disable, achieved_progress = ...)`, never an
+omitted outcome. Exact occurrence plus actor and intent is retry-safe after a
+lost response. In every control mode, that occurrence lookup precedes current-
+token comparison: the same occurrence joins, continues, or replays under its
+original token after authority rotates; only a new occurrence must match the
+current token, and a reused ID with different actor or canonical intent
+conflicts. Internal child work is deterministic and may remain per
+declaration, but the caller receives one graph result and no child identity or
+receipt. Export always reruns a fresh graph-wide rebuild proof; status is not a
+cached substitute.
+
+Status is one bounded logical graph projection: profile/control mode,
+aggregate health and progress, safe logical node/edge action summaries, the
+current `graph_control_token`, opaque block tokens, and explicit unavailable
+values where checked physical evidence cannot be projected safely. It exposes
+none of the private fields forbidden above and never claims to resolve one
+caller's `AckUnknown`.
+
+Stopped/offline DataBlock correction, dead-letter inspection/export, future
+AuthorityBlock repair, and authority retirement address the graph plus opaque
+block/artifact tokens. The engine resolves private declaration and storage
+authority internally. Correction still carries explicit ordered
+`REPLACE | WITHDRAW` actions and an optional equality assertion over the
+engine-derived plan digest; no public command accepts a type or physical
+selector, lifecycle revision, receipt, or object location.
 
 Every endpoint has a dedicated OpenAPI operation and handler tests. Ingest
 passes the engine `stream_ingest` Cedar action and per-actor admission
-accounting before acquiring a shard writer; fold, quiesce, resume/abort-drain,
-enroll, block inspection, correct, and rebuild-preflight use the separate
-`stream_manage` action. Status is authorized like other graph operational
-metadata. The full non-experimental surface applies the same engine gates to
+accounting before acquiring private writer authority; fold, quiesce,
+resume/abort-drain, block inspection, and correction use the
+separate `stream_manage` action. Status is authorized like other graph
+operational metadata. The full non-experimental surface applies the same engine gates to
 embedded and remote CLI use; §4.7 deliberately narrows mutation to the owned
 cluster runtime and keeps the direct arm as a typed refusal.
 
 Phase B2 initially exposes only strict compare-and-chain upsert. The full
 product surface described in this section requires the full exclusive-cut
-`status`, explicit `fold`, persistent `quiesce`, `resume`/abort-drain, rebuild
-preflight, a bounded strict-correction workflow, durable
+`status`, explicit `fold`, persistent `quiesce`, `resume`/abort-drain, a fresh
+served-export rebuild proof, a bounded strict-correction workflow, durable
 authenticated-contributor attribution, a same-key `AckUnknown`
 sequencing/idempotency contract, and one proved physical-retention profile.
-Full status includes lifecycle and
-binding/revision, current epoch, pending generations/bytes, last fold error,
-current receipt identifiers/summaries, and whether strict fold is blocked. It
-does not expose receipt-history pagination and never claims to resolve one
-caller's `AckUnknown`. A future permanent management-audit product requires a
-separate retention/cost decision.
+The engine may inspect private lifecycle, binding, epoch, generation, receipt,
+and recovery facts to compute status; the public result remains the aggregate
+graph projection above. A future permanent management-audit product requires a
+separate retention/cost decision rather than widening this DTO.
 For the full non-experimental surface, dead-letter row identity and operation,
 richer status, and configurable policy remain Phase C, while automatic
 operation-scoped drain, SchemaApply/branch integration, upgrade orchestration,
@@ -3024,10 +3125,11 @@ The bounded tranche requires
 genuine v10↔v11 old-binary/new-format refusal and rebuild evidence.
 
 This section records the selected parameters for the first public activation
-of the streaming lane as an explicitly experimental, cluster-only feature. It
-narrows §4.6 and amends §7 as stated below; where this profile and an earlier
-section disagree, this profile governs the experimental activation and the
-earlier text continues to describe the full product surface.
+of streaming as an explicitly experimental, cluster-only feature. P8 and
+§4.6 govern the public boundary wherever an earlier section disagrees. Earlier
+per-declaration routes, selectors, witnesses, and control DTOs are rejected
+sketches, not an alternate future product surface; their physical protocol
+mechanics remain useful only beneath the graph coordinator.
 
 **Implementation status (2026-07-29): P1, the authorization/status split, and
 the bounded profile-authority tranche are implemented.** The
@@ -3046,10 +3148,10 @@ v9↔v10 refusal/rebuild fence is pinned in CI (`OMNIGRAPH_V9_BIN`).
 `stream_ingest` and `stream_manage` are registered graph-scoped actions; both
 reject branch and target-branch qualifiers. Embedded
 `Omnigraph::stream_status` reads the enablement and per-lane durable authority
-from one canonical-main manifest snapshot, including the lifecycle revision
-future management verbs pass back as their compare token. It is read-only,
-takes no admission lease, resolves no recovery, and deliberately omits
-physical observations. F6b6 later added a separate engine-internal checked
+from one canonical-main manifest snapshot. It is a pre-activation diagnostic,
+not the P8 DTO or compare-token source; its private lifecycle revisions never
+cross F7. It is read-only, takes no admission lease, resolves no recovery, and
+deliberately omits physical observations. F6b6 later added a separate engine-internal checked
 operational cut with physical, token, recovery, advisory-driver, and rebuild
 evidence plus typed movement/deadline refusal. It remains read-only and has no
 public transport; exact cold-replay pending accounting and oldest uncovered
@@ -3071,9 +3173,10 @@ strict compare-and-chain upsert only. Stream deletes remain Phase F, and this
 profile confirms upsert-only as a deliberate lane boundary rather than an
 interim limitation: high-rate producers emit facts, removal is a decision that
 needs the future token-aware delete transition, and one-directional
-constructive folds keep P6's ordering stable. Both streamed deletes and direct
-deletes on an enrolled table are refused in this profile; an ordinary direct
-delete is possible only before enrollment. No fresh reads (Phase E); no automatic
+constructive folds keep P6's ordering stable. Streamed deletes are refused in
+this profile. Once the graph has entered the streaming format, direct deletes
+are refused graph-wide; the direct path returns only after a strict whole-graph
+rebuild into a non-streaming format. No fresh reads (Phase E); no automatic
 operation drain (Phase D). While the profile is `ENABLED` or `DISABLING`,
 operator-only Cedar policy is not sufficient process ownership. While the
 profile is `ENABLED`, streaming admission and ordinary Mutation/Load/delete
@@ -3152,7 +3255,10 @@ non-serializable, non-cloneable fields and borrow or own those guards; their
 only production factories perform the validation and acquire the appropriate
 guard. The served-export factory accepts a checked cluster server boot with the
 exact graph/store mapping and manifest profile `DISABLED | RETIRED`; it is
-distinct from the live runtime capability and grants no writer operation.
+distinct from the live runtime capability and grants no writer operation. Its
+only control-path exception is receipt-first read-only replay of an already-
+terminal graph operation under the exact original ID, actor, and intent; it
+cannot start or continue work.
 Because Rust has no
 friend-crate visibility and the cluster/server crates already depend on the
 engine, engine adapters used across that boundary are `#[doc(hidden)] pub` and
@@ -3183,10 +3289,10 @@ single-writer precondition. It is not a distributed lease, and the
 process-local gates do not claim to discover a foreign process. Plan and apply
 output must additionally state that this release has no public firehose
 ingress and that enabling the profile disables embedded/direct content
-mutation. Explicit disable can reach `DISABLED` with no lanes or only
-already-`SEALED` lanes, but it restores the embedded/direct lane only while the
-graph remains unenrolled; after any table is enrolled, a strict rebuild is
-required to restore that physical path. F2
+mutation. Explicit disable can reach `DISABLED` with no private children or
+only already-`SEALED` children, but it restores the graph-wide embedded/direct
+path only while the graph remains unenrolled; after any private enrollment, a
+strict graph rebuild is required to restore that path. F2
 updates the operator guide to make concurrent server/apply execution
 unsupported for profile changes.
 
@@ -3222,10 +3328,12 @@ path. This is the same engine-enforced-everywhere principle as Cedar: a
 graph-wide safety property (the §5/§8 freeze depends on knowing streams may
 exist) cannot live in per-process configuration. Enabling is metadata-only;
 apart from its immutable control-ledger receipt, no stream table, shard, or WAL
-is created until the first successful prepare for intended stream ingest (P2).
-A client that prepares and then abandons or sends no rows may therefore leave
-an empty enrolled `OPEN` lane; quiesce/disable must handle that lane through
-the dedicated empty path.
+is created until the first bounded, fully validated compatible row drives P2's
+private enrollment child. If enrollment settles and that held row is then
+rejected or retried before any WAL invocation, it may leave an empty enrolled
+`OPEN` lane; quiesce/disable must handle that lane through the dedicated empty
+path. A missing-token challenge or abandoned request before such a row creates
+nothing.
 
 V11 replaces the boolean profile with a discriminated state. Its enable CAS
 installs a bounded immutable
@@ -3333,14 +3441,14 @@ fresh operation reconciles the latest declaration. `DISABLING` has no
 cancel/re-enable transition. An enable CAS does not rewrite lifecycle rows or
 silently reopen a previously sealed lane. Its bounded receipt/result retains
 only the exact profile/lifecycle cut, `resume_required_count`, and canonical
-digest of ordered sealed identities. After serving starts, paginated status
-lists the currently remaining sealed identities from one manifest snapshot;
-its cursor binds that revision and becomes stale instead of mixing pages if
-lifecycle moves. Receipt-first replay returns the same bounded original
-summary even if lanes later resume; it does not reconstruct the original
-identity list. An operator runs ordinary revision-fenced resume for each; a
-table with no lifecycle remains eligible for lazy enrollment. `cluster apply`
-therefore distinguishes profile enablement from “all enrolled lanes open.”
+digest of ordered sealed identities. Those identities remain private recovery
+evidence. After serving starts, P8 graph status reports the aggregate remaining
+count and safe logical diagnostics from one snapshot. Receipt-first profile
+replay returns the same bounded original summary even if children later
+resume. An operator runs one graph resume, whose coordinator drives the
+revision-fenced private children; a compatible declaration with no lifecycle
+remains eligible for lazy enrollment by the next graph ingress. `cluster apply` therefore
+distinguishes profile enablement from “all enrolled lanes open.”
 
 The lifecycle strand's same-format terminal exit is a distinct two-step offline cluster
 management operation, not another meaning of disable or export:
@@ -3437,8 +3545,9 @@ BranchMerge, branch create/delete, every profile transition/refinement,
 Optimize/EnsureIndices/Repair/Cleanup, and every other graph-content, schema,
 branch-ref, profile, lifecycle, recovery, maintenance, writer-claim/fold,
 correction, enrollment, or rebind writer refuses before body admission or
-effect with
-`StreamAuthorityRetired { retirement_id, export_cut_digest }`. Export emits
+effect with `StreamAuthorityRetired { retirement_id, export_cut_digest }`.
+Those fields are graph-level provenance rather than a physical selector and
+remain public. Export emits
 the exact selected root receipt plus a recomputable, cut-membership-proved
 witness for the selected frozen branch member beside each logical artifact.
 `RETIRED` export
@@ -3447,8 +3556,9 @@ logical-cut match; it trusts that committed cut proof and does not rerun or
 override it with the ordinary terminal-token refusal. The receipt is
 provenance, not an import of sequencing state: init/load creates a fresh graph
 identity; any later enrollment creates a fresh stream incarnation, and a
-delayed request carrying the retired incarnation remains effect-free
-`StreamBindingChanged`.
+delayed public request carries a stale graph-control token and returns
+effect-free `StreamAuthorityChanged`; the private classification still proves
+the retired incarnation mismatch.
 The operation never deletes, ages out, rewrites, or labels a `WITHDRAWN` token
 `PRESENT`. F3e landed this command, source freeze, recovery-v19 owner, focused
 engine/cluster/CLI/export evidence, upgrade guidance, errors, and release-note
@@ -3471,13 +3581,15 @@ returns `StreamAuthorityRetired`. Server startup also
 refuses an absent declaration beside `ENABLED`/`DISABLING`; it never derives a
 runtime capability from stale ledger state. For manifest `RETIRED`,
 declaration presence or prior unmanagement may mint only the checked
-read/query/status/export-only boot capability below, never a fold delegation,
-supervisor, admission, mutation, or other stream runtime authority. F2 updates the current operator
+read/query/status/export boot capability below, never a fold delegation,
+supervisor, admission, mutation, or other stream runtime authority. F6c later
+extends that capability with receipt-only replay owned by its new graph-control
+strand. F2 updates the current operator
 documentation that otherwise permits removal to mean “stop managing.”
-Unmanaging a terminally disabled declaration does not erase a physical
-enrollment, consume its sealed proof, or make direct Mutation/Load valid for
-that table; returning to a non-streaming physical format requires the strict
-export/init/load rebuild.
+Unmanaging a terminally disabled declaration does not erase any private child
+enrollment, consume its sealed proof, or restore direct Mutation/Load for the
+graph; returning to a non-streaming physical format requires the strict
+whole-graph export/init/load rebuild.
 
 The supported production topology has no concurrent first enrollment during
 the disable CAS: graceful shutdown settles every admission owner before the
@@ -3490,28 +3602,40 @@ this explicit plan; repeated `StreamingDisablePending` without a durable freeze
 is not the protocol. The offline owner and recovery audit the fixed system
 actor plus delegation/continuation ID. They do not re-check a mutable user
 grant after acknowledgement, and a policy/config refresh cannot strand durable
-work or open admission behind disable. Embedded read-only status additively reports profile
-mode, disabling operation/revision, and manifest-derived undrained tables; it
-does not infer physical progress without the later exclusive-cut status.
+work or open admission behind disable. The implemented pre-activation embedded
+status is one unpaginated, ordered, manifest-only table vector with profile
+mode/revision; the disable operation remains in profile plan/receipt authority.
+It does not infer physical progress without the later exclusive cut. F6c
+replaces that product shape with an aggregate count and safe logical
+diagnostics; physical table identities stay private.
 Rejected: a server/boot flag (a per-process opinion of a graph-wide property;
 restarts and second processes disagree silently) and a cluster-state-only
 flag (a direct writer bypassing the serving path would be blind to the
 freeze). Cluster-only scope is accepted deliberately: an embedded graph has
 no operator, no resident fold driver, and no lifecycle owner.
 
-#### P2 — Enrollment (selected: lazy, graph-wide)
+#### P2 — Private declaration enrollment beneath graph ingress
 
-With the profile exactly `ENABLED`, every graph table is stream-eligible; no
-per-table opt-in exists. The experimental profile amends §3's standalone
-enrollment surface, but not §4.1's exact wire incarnation. A table with no
-lifecycle uses an automatic bodyless prepare handshake before its first row:
+There is no public enrollment or prepare route. With the profile exactly
+`ENABLED`, ingest atomically validates its expected graph-control token and
+registers under exactly `ACTIVE` graph control, then boundedly parses and fully
+validates each logical row. A currently unsupported declaration shape,
+including Blob, is a row-local effect-free result; its presence elsewhere in
+the accepted catalog does not disable compatible rows. Public callers never
+select a declaration as a control resource or receive the witnesses,
+incarnations, bindings, or lifecycle revisions used below.
 
-1. Status returns no stream incarnation for the absent lane, but returns a
+For a validated compatible row whose declaration has no lifecycle, the graph
+adapter holds that bounded row and drives this bodyless private child before
+any WAL attempt or acknowledgement:
+
+1. The private child capture finds no stream incarnation for the absent lane
+   and returns a
    canonical `StreamEligibilityWitness` over graph identity, stable table and
    table-incarnation IDs, accepted-catalog digest, profile revision, and live
    fold-delegation ID, plus the exact canonical-main table/ref
    `CurrentHeadWitness` and lifecycle-slot-absent compare evidence. An
-   ingest-only actor need not hold status permission. Prepare resolves retained
+   ingest-only actor need not hold status permission. The child resolves retained
    receipt/current lifecycle authority first: under exact `ENABLED`, an
    existing `OPEN | DRAINING | SEALED` lane returns bounded
    `already_enrolled` with current stream incarnation, binding digest,
@@ -3519,16 +3643,12 @@ lifecycle uses an automatic bodyless prepare handshake before its first row:
    eligible lane with no/stale witness returns effect-free
    `witness_required` plus the current bounded witness under `stream_ingest`;
    neither result retains a new operation occurrence.
-2. `POST /graphs/{graph_id}/streams/{type_name}/prepare` carries a
-   caller-minted non-nil `enrollment_request_id`; the witness is optional only
-   for an effect-free challenge and mandatory before arming. It requires
-   `stream_ingest` and checked server-runtime authority. The remote
-   `GraphClient`/CLI uses a cached/status witness when available or performs
-   witness challenge → prepare automatically. One `stream ingest` call follows
-   at most one fresh challenge within its bounded deadline; another movement
-   returns typed `StreamAuthorityChanged`/retry guidance before body ownership
-   instead of polling. There is no manual `stream enroll` command or per-table
-   policy decision. Under the enrollment
+2. The graph adapter mints and retains one private non-nil enrollment request
+   ID. The witness is optional only for an effect-free challenge and mandatory
+   before arming. The outer ingress request already holds `stream_ingest` and
+   checked server-runtime authority; there is no
+   public child route, manual `stream enroll` command, status-witness cache, or
+   per-declaration policy decision. Under the enrollment
    ReadSet it byte-revalidates the whole witness. Concurrent lifecycle creation
    restarts at the current-authority branch and returns `already_enrolled`.
    `DISABLED`, `DISABLING`, a changed graph/table incarnation, or a no-longer-
@@ -3536,7 +3656,7 @@ lifecycle uses an automatic bodyless prepare handshake before its first row:
    Only a still-`ENABLED`, still-absent lane whose HEAD/ref/catalog/profile
    witness moved returns effect-free `witness_required` with a fresh witness
    and does not arm.
-3. For an absent lane, prepare feeds the existing §3 recovery adapter. Before
+3. For an absent lane, the child feeds the existing §3 recovery adapter. Before
    its first effect, recovery fixes the request/witness intent, authenticated
    actor, and engine-minted stream incarnation/binding. The durable
    `EnrollmentReceiptV2` retains that actor. The same request ID may be reused
@@ -3548,25 +3668,29 @@ lifecycle uses an automatic bodyless prepare handshake before its first row:
    pre-arm freshness evidence because the receipt does not persist them.
    Concurrent IDs resolve through the one-winner lifecycle
    CAS, and a loser returns `already_enrolled` only after revalidating the
-   winner's complete receipt and current authority. A successful prepare
-   followed by no body leaves an empty enrolled `OPEN` lane; the F2 empty-lane
-   drain path owns its quiesce/disable. If recovery proves that an armed
+   winner's complete receipt and current authority. A successful enrollment
+   may leave an empty `OPEN` lane if later token sequencing rejects the held
+   row; the F2 empty-lane drain path owns its quiesce/disable. If recovery proves that an armed
    sidecar had zero participant effects, it may retire that sidecar and re-arm
    the same request with new engine-minted result IDs; no receipt or
    acknowledgement existed at that boundary.
-4. Only a later ingest request whose every `$stream` envelope carries that
-   exact incarnation may own or read NDJSON. Ingest against an absent lane
-   returns request-level `StreamPrepareRequired` before body admission. There
-   is no omitted-incarnation first-row exception. A supported client never
-   overwrites an explicitly supplied stale incarnation or automatically
-   reprepares/replays that body after `StreamBindingChanged`; crossing a strict
-   rebuild/re-enrollment requires the caller to choose a new occurrence and
-   predecessor.
+   Once the child invokes any sidecar or Lance effect, the ingress registration,
+   row ordinal, and bounded row ownership transfer to a joined enrollment task.
+   Disconnect, shutdown, and quiesce cannot release/arm past that owner until
+   exact recovery/classification settles it; quiesce then recaptures the
+   enrolled-member cut before draining children.
+4. After the child is exactly `OPEN`, the graph adapter injects its private
+   incarnation and hands the held row to the existing seam. Enrollment alone
+   does not invalidate the graph-control token because that token binds graph
+   control, profile, catalog, and identity—not a physical child inventory. The
+   client never supplies or overwrites an incarnation. A strict graph rebuild
+   changes graph authority and requires a fresh graph-control-token challenge
+   plus a new row occurrence/predecessor decision.
 
-Before the table lease, prepare—an enrollment control rather than a
+Before the table lease, private enrollment—rather than a
 resident-producing row put—acquires the graph-profile gate shared. Under the
 same exclusive table admission lease and existing schema/main/token/table
-gates, prepare reruns the recovery barrier and rereads canonical-main
+gates, it reruns the recovery barrier and rereads canonical-main
 `stream_profile`; the eligibility witness, enabled revision, live
 `FoldDelegation`, and checked runtime must all match.
 `DISABLED`, `DISABLING`, a changed graph/table identity, ineligibility, or a
@@ -3577,17 +3701,20 @@ preprocessing/inflight ownership, then takes root MemWAL opportunity shared,
 graph-profile shared, and table admission before performing the same final
 profile/delegation/runtime match and handing off a run. Those permits remain
 through invocation, watcher durability, and same-writer fence classification;
-a disconnected request transfers them with the bounded invoked tail. The
+a disconnected request transfers them with either the bounded enrollment or
+WAL tail. The
 offline disable owner takes its own process's
 gate exclusively only for the first profile CAS and releases it before
 per-table drains. The supported production race is closed by the
 server-exit/apply-start handoff, not a cross-process lock.
 
-An existing `OPEN` lane may admit; an existing `SEALED` lane returns typed
-`StreamResumeRequired` and never auto-resumes under an ingest actor. The
-prepare exchange is binding negotiation hidden by supported clients, not an
-operator opt-in: the graph remains one connected model without requiring
-external producers to choose which tables participate.
+An existing `OPEN` private lane may admit. `DRAINING` or `SEALED` beside
+`ACTIVE` graph control is a fail-closed authority/recovery blocker; ingest never
+auto-resumes it. Under the paired F6c authority, ordinary quiescing/quiesced
+state is already visible at the graph control boundary, so graph ingress
+refuses before body ownership. The child exchange is private binding
+negotiation, not an operator opt-in: the graph remains one connected model
+without requiring producers to manage declaration resources.
 
 #### P3 — Embedding-bearing tables (selected: caller-supplied vectors)
 
@@ -3693,8 +3820,8 @@ cause, reason-gated data correction, or proof-bound authority repair.
 Cluster/offline block inspection, correction, repair, payload export, and
 retirement are supported before public ingress activates, but EXP gives them
 no served HTTP/OpenAPI parity. The five primary workflows are ingest, status,
-fold, quiesce, and resume; bodyless prepare remains an automatic ingest
-handshake.
+fold, quiesce, and resume; the pre-body expected-token challenge is part of
+ingest rather than a separate workflow.
 
 The selected profile adds no new attribution history merely because an object
 exists. It reuses the authenticated contributor/payload identity needed for
@@ -3886,8 +4013,8 @@ A same-schema physical rebind does not rely on an operator-timed
 quiesce/shutdown gap. It follows `graceful server shutdown -> offline disable
 to terminal DISABLED -> cluster apply --confirm-stream-offline -> separate
 enable apply -> server restart -> explicit resume`. The durable disable plan
-captures and drains any prepare, put, or resume that won before transport
-closed. Only after terminal `DISABLED` may the apply process hold the mandatory
+captures and drains any registered-ingest, lazy-enrollment, WAL, or resume tail
+that won before transport closed. Only after terminal `DISABLED` may the apply process hold the mandatory
 cluster state lock and mint `CheckedClusterMaintenanceAuthority` bound to the
 exact disabled profile revision, validated declaration, and graph/store
 mapping. It then runs the graph-global recovery barrier before any rebind
@@ -3912,7 +4039,8 @@ two-stage stream-aware export seam. An exact managed `DISABLED | RETIRED`
 applied row, or exact graph/state evidence which the engine accepts only for
 unmanaged `RETIRED` or enrolled `DISABLED`, can mint only
 `CheckedClusterServedExportAuthority`, sharing the one process-local serving
-registration without gaining writer authority. Retirement confirmation
+registration without gaining writer authority. It has no control-path
+exception in F6b1. Retirement confirmation
 CAS-converges a managed row to its exact `RETIRED` revision and refresh
 preserves that declaration identity. Its doc-hidden capture method nonwaitingly
 reserves the exclusive root export gate, settles recovery, and closes profile
@@ -3949,48 +4077,179 @@ ingress, lifecycle, maintenance, status, and the rest of their served parity.
 The resulting artifact may initialize a fresh target through normal cluster
 control, never load over the enrolled source.
 
+#### P8 — Public scope (selected: the graph is the resource)
+
+P8 makes §4.6's graph surface authoritative for EXP. Existing per-declaration
+lanes, lifecycle rows, MemWAL shards, and recovery owners remain private
+mechanics; they do not become addressable product resources.
+
+- One graph-native NDJSON request carries mixed node/edge rows. Logical
+  kind/type labels identify accepted graph data only. Public row results expose
+  logical identity and opaque tokens, never physical authority. One expected
+  domain-bound `graph_control_token` is checked atomically with pre-body
+  registration; only a missing token beside `ENABLED/ACTIVE` returns the
+  effect-free challenge. A supplied non-exact token returns terminal
+  effect-free `StreamAuthorityChanged` without a replacement token. After
+  bounded validation, a compatible row lazily
+  drives its private enrollment before any WAL attempt; an unsupported
+  declaration shape is row-local and effect-free. Quiesce closes registration
+  first and each prior owner releases after one bounded tail plus the terminal
+  `stream_quiescing { next_unread_ordinal }` record.
+- Public blockers are only `row | graph`. Per-line payload/schema failures
+  and unsupported declaration shapes remain local; every authority, recovery,
+  lifecycle, capacity, fold/resume, transport,
+  shutdown, or ambiguous-invocation blocker is graph-scoped. There is no
+  declaration-scoped operational boundary.
+- Status is one bounded graph projection: profile/control mode, aggregate
+  logical health/progress, bounded logical action summaries,
+  `graph_control_token`, opaque block tokens, and explicit unavailable values.
+  Checked code may inspect physical evidence to derive it but never serialize
+  datasets, tables, lanes, incarnations, bindings, shards, epochs, generations,
+  witnesses, receipts, revisions, or object descriptors, locations, digests,
+  or lengths. Status never returns a dead-letter artifact token.
+- Fold, quiesce, and resume/abort-drain are whole-graph operations with
+  one caller operation ID and expected graph control token. Their bounded result is
+  `completed | in_progress | blocked | cancelled`.
+  Exact ID + actor + canonical intent lookup precedes state/token comparison in
+  every mode: an existing occurrence joins, continues, or replays under its
+  original expected token after authority rotates. Only a new occurrence must
+  present the current token; a reused ID with different identity conflicts.
+  Control moves `ACTIVE -> QUIESCING -> QUIESCED -> RESUMING -> ACTIVE`; after
+  correction, abort-drain additionally owns `ACTIVE -> RESUMING -> ACTIVE`.
+  The original blocked fold first settles terminally and releases its
+  singleton while corrected children remain `OPEN_AFTER_FOLD`; the new abort
+  occurrence requires no active quiesce/control, closes ingress, and reopens
+  the whole eligible cut. It cannot cancel or retarget quiesce. Only `ACTIVE`
+  admits rows. The F6c strand atomically pairs
+  `DISABLED | RETIRED` only with `QUIESCED`, `DISABLING` only with
+  `QUIESCING`, and `ENABLED` with a valid control mode. Historical
+  recovery-v13 remains profile-only and is never reinterpreted.
+  `blocked` retains a repairable descriptor and continues only under the same
+  operation ID after repair. The singleton covers fold/quiesce/resume control
+  occurrences only: the exact reason-gated correction or authority repair
+  named by its active block may run as a subordinate support occurrence with
+  its own ID, without replacing or continuing the descriptor. All unrelated
+  controls remain busy; after support completes, only the original control ID
+  resumes it. Disable records terminal
+  `cancelled(reason = cancelled_by_disable, achieved_progress = ...)` for a
+  superseded fold or resume occurrence instead of dropping it. Fold finishes
+  only its invoked child; quiesce is adopted into the disable drain; and resume
+  drains any reopened children without ever publishing `ACTIVE`. The disable
+  control publication makes cached ingest tokens stale.
+  Failure while settling a child, persisting adoption, or draining a reopened
+  child returns typed `RecoveryRequired`, retains the descriptor plus
+  fail-closed paired profile/control authority, and resumes when cluster apply
+  retries the disable-plan ID. The adopted occurrence keeps its own ID only for
+  eventual terminal replay; it is never falsely `completed` or `cancelled`.
+  Under terminal `DISABLED | RETIRED`, the same control endpoint performs
+  receipt lookup before state/token refusal using the narrow served-export
+  authority. Exact operation ID, actor, and intent returns only the recorded
+  terminal result; absent/mismatched identity refuses and no work may start.
+- Offline operations address only the graph and opaque block/artifact tokens.
+  Authorized `block show` returns both the block token and current
+  `graph_control_token` from one checked graph cut, making correction callable
+  while server boot is refused for `DISABLING`; neither token exposes a child.
+
+Authorization is one graph-level matrix; no child operation weakens it:
+
+| Operation | Cedar | Additional authority |
+|---|---|---|
+| ingest | `stream_ingest` | checked served runtime; expected `graph_control_token` or pre-body challenge |
+| status | graph operational-metadata authorization | checked evidence may be unavailable, never inferred |
+| fold / quiesce / resume | `stream_manage` | checked runtime/owner; operation ID + `graph_control_token` |
+| terminal fold / quiesce / resume result replay | `stream_manage` | checked served-export authority; exact same ID/actor/intent; read-only receipt lookup only |
+| profile enable / disable | `stream_manage` | checked stopped/offline cluster-apply authority |
+| Optimize / EnsureIndices | existing operation action | checked served owner and graph `QUIESCED` |
+| graph export / rebuild artifact | `export` | checked served-export authority for terminal state, or checked runtime plus exact `ENABLED/QUIESCED` |
+| block show/correct, authority repair, dead-letter list, retirement | `stream_manage` | reason-specific stopped/offline checked authority; correction also requires its ID + `graph_control_token` |
+| dead-letter payload export | `stream_manage` **and** `export` | stopped/offline checked authority + opaque artifact token |
+
+F6c also migrates the already-active pre-activation table-shaped status,
+block/correction, and dead-letter list/export CLI/DTOs. Internal proof structs
+stay private; those migrated DTOs retain no table/incarnation/revision selector,
+object URI/digest/length, storage version, private receipt identifier, or
+transaction UUID. Existing graph-level retirement provenance—including the
+root receipt artifact, `retirement_id`, and `export_cut_digest`—remains public.
+
+This boundary is not a transport-only facade. F6c takes a new strict graph and
+recovery strand for graph control occurrences, admission mode, terminal result,
+and control-token authority. Historical recovery-v13 through recovery-v21
+retain their exact meanings and are never reinterpreted. Ingest's token
+challenge is effect-free; each lazy enrollment remains owned by its existing
+private recovery family. The F6c owner must carry graph-control
+descriptor and terminal-receipt arm/effect/CAS/lost-response replay,
+disable-cancellation, quiesced-export/resume races, redaction, blocker-scope,
+and genuine predecessor-refusal evidence before F7 exposes a served route.
+
+That strand adds an immutable graph-scoped `GraphControlTerminalReceipt`
+family rather than reusing a lane management receipt or recovery-v13 profile
+receipt. Every `completed | cancelled` terminal transition pre-mints one
+receipt transaction keyed by graph, operation kind, and operation ID and binds
+actor, canonical intent, original expected control token, terminal
+result/progress, and final control generation. Recovery owns that transaction;
+the sole manifest CAS selects its version/chain commitment with the paired
+profile/control state. Receipts remain retained for this EXP format across
+later controls, disable, and retirement, while status does not enumerate them.
+Occurrence lookup checks the selected receipt family, then the active
+descriptor, before current-token comparison. F6c—not F6b1—extends
+`CheckedClusterServedExportAuthority` for exact receipt-only replay in terminal
+`DISABLED | RETIRED`.
+
+F6c also adds the nonterminal capture arm needed by graph export. Under checked
+served-runtime authority, exact `ENABLED/QUIESCED`, and the same graph gate, it
+reuses F6b1's root export slot, recovery barrier, exact-version capture, and
+move-only cut. Capture freshly proves every enrolled child sealed, base/token
+parity, and no rebuild blocker; `QUIESCING | RESUMING` refuse. Resume may
+proceed only after the cut is pinned, whose immutable selected versions remain
+stable. F6b1's terminal served-export capability itself is not widened.
+
 #### Surface retained, trimmed, and non-trimmable
 
-Retained from §4.6: the automatic bodyless prepare handshake plus NDJSON
-`ingest` with its full per-line response union and ordering/cancellation rules
-(plus P4's `dead_lettered` terminal result); full
-status needed by lifecycle and operations; operator `fold`; persistent
-revision-fenced `quiesce` and `resume`; post-`SEALED` rebuild preflight;
-stream-aware export and same-binding maintenance; and the `stream_ingest` /
+Retained from §4.6: graph-native NDJSON `ingest` with its expected-token
+pre-body challenge, full per-line response union, and ordering/cancellation rules
+(plus P4's `dead_lettered` terminal result); the aggregate graph status needed
+by lifecycle and operations; whole-graph operator `fold`; persistent
+graph-control-token-fenced `quiesce` and `resume`; stream-aware export with its
+fresh rebuild proof; same-binding maintenance; and the `stream_ingest` /
 `stream_manage` Cedar split. Narrow cluster/offline support owns current
 dead-letter list/payload export, block inspection/data correction, exact
 authority repair, and authority retirement. These emergency exits do not
 receive served HTTP/OpenAPI parity; payload export additionally requires
-`export`. Trimmed by this profile: the standalone
-operator `enroll` verb/per-table opt-in (not prepare's retry identity),
-producer-facing per-token barriers, fresh reads, and configurable per-stream
-policy. Non-trimmable regardless of experimental status: Cedar enforcement,
+`export`, and all address the graph through opaque tokens. Permanently absent
+from the product boundary are a standalone enrollment verb, per-declaration
+opt-in or controls, producer-facing physical tokens, fresh reads, and
+configurable lane policy. Non-trimmable regardless of experimental status:
+Cedar enforcement,
 typed bounded failures, shutdown ownership, durable attribution, terminal
 dead-letter sequencing, safe export, OpenAPI/parity/failpoint/genuine-rebuild
 evidence, and the no-raw-GC boundary. Because this profile is cluster-only, the
 server-owned runtime, HTTP/OpenAPI, remote `GraphClient`, and remote CLI
-activate together only after the hidden ingress/driver path and acceptance
-evidence pass. Ambient embedded SDK and direct `--store` mutation remain a
-typed `StreamingRequiresClusterRuntime` refusal before body/effect; embedded
-manifest-only status remains. The experimental designation is also an explicit
-Hyrum boundary: acknowledgement and P4/P5 terminal semantics are committed,
-while fold cadence, dead-letter object layout, and status field shapes are
-declared unstable.
+activate together only after F6c's hidden graph boundary and the remaining
+acceptance evidence pass. Ambient embedded SDK and direct `--store` mutation
+remain a typed `StreamingRequiresClusterRuntime` refusal before body/effect;
+F6c replaces the embedded manifest-only status result with the same redacted
+graph projection before F7 transports it. The experimental designation is also
+an explicit Hyrum boundary: acknowledgement and P4/P5 terminal semantics are
+committed, while fold cadence, dead-letter object layout, and status field
+shapes are declared unstable.
 
 By the time F7 executes, F2 will already have landed
 `cluster apply --confirm-stream-offline` and its profile adapter, and F6b5 will
 already own exact-terminal served export. F7 co-lands the remaining served row,
 lifecycle, maintenance, and status routes plus their remote commands,
-DTO/authorization/audit tests, and the existing stream surface. F6 proves the
-hidden candidate runtime first; export is its narrow HTTP/remote exception.
+DTO/authorization/audit tests, and the existing stream surface. F6c first
+proves expected-token graph ingress, lazy row enrollment, and the graph
+control/status strand behind hidden seams; F7 transports those semantics without reintroducing a
+declaration-addressed route. Export is the narrow earlier HTTP/remote exception.
 
 That activation PR extends F2's already-public cluster-ownership,
 direct-mutation-refusal, and v10→v11 rebuild baseline with the activated stream
 operating contract. CLI reference, server, policy, and error docs add
-prepare/ingest, status/lifecycle, maintenance/export, authorization, tagged
+ingest, status/lifecycle, maintenance/export, authorization, tagged
 results, and the stream/export-specific extension of the
 served-only/direct-refusal boundary. Cluster docs separately cover the narrow
-offline dead-letter, correction, authority-repair, and retirement exits.
+graph-scoped offline dead-letter, correction, authority-repair, and retirement
+exits through opaque tokens; they publish no physical selector or authority.
 Maintenance docs show exact
 `quiesce -> served Optimize/EnsureIndices -> resume`; cluster and upgrade docs
 show the distinct `graceful stop -> offline disable to terminal DISABLED ->
@@ -4005,16 +4264,19 @@ byte and RSS envelopes, driver cadence/backoff, bounded current-terminal scan
 pages, export slot/queue/deadline, and shutdown bounds. No active safety
 workflow or default remains internal-only.
 
-Logical export has exactly two admissible source profiles:
+Logical export has exactly three admissible source states:
 
-1. ordinary `DISABLED`, with exact `SEALED` proof, token/base parity, and a
-   bounded streamed proof of zero current non-`PRESENT` token authority; or
-2. `RETIRED`, with an exact selected authority-retirement receipt,
+1. `ENABLED/QUIESCED` under checked served-runtime authority, with a fresh
+   graph-wide proof that every enrolled child is `SEALED`, token/base parity,
+   and zero current non-`PRESENT` token authority;
+2. ordinary `DISABLED/QUIESCED` under checked served-export authority, with
+   that same fresh ordinary proof; or
+3. `RETIRED/QUIESCED`, with an exact selected authority-retirement receipt,
    profile-chain commitment, and matching recorded logical cut.
 
-The second case trusts the committed retirement cut and does not rerun the
+The third case trusts the committed retirement cut and does not rerun the
 ordinary terminal-token rejection. Dead-letter payload export is an inspection
-artifact, not an import contract. In the first case terminal authority returns
+artifact, not an import contract. In the first two cases terminal authority returns
 typed `StreamExportBlocked`. An exact retry returns the recorded
 `DEAD_LETTERED` result only while that token remains current. Repair is a fresh
 ordinary correction that publishes a `PRESENT` successor; no special replay
@@ -4081,8 +4343,8 @@ real overflow integration separately proves the durable operational
 terminal-disposition transition, permits only the manifest/token-ledger movement
 needed to record that block, and leaves no recovery sidecar or partial fold.
 
-The remaining evidence covers prepare witness/actor/lost-response/no-body
-ordering; concurrent first prepare and first writers; stale incarnation and
+The remaining evidence covers the private-child enrollment witness, actor,
+lost-response, and no-effect ordering; concurrent first enrollments and first writers; stale incarnation and
 authority movement; shutdown and transport-close races; cross-process
 profile-CAS recovery; physical-rebind refusal before terminal `DISABLED`;
 productive SchemaApply refusal plus checked fresh-target rebuild;
@@ -4591,7 +4853,7 @@ sidecar that can move the token participant is graph-global relevant to
 operations, Mutation/Load, SchemaApply, BranchMerge, branch controls,
 EnsureIndices, Optimize, Repair, Cleanup, recovery, and future writers all
 resolve or refuse it before base capture even when its graph table is disjoint.
-Quiesce and rebuild preflight use the same barrier. If final relisting discovers
+Quiesce and the export/rebuild proof use the same barrier. If final relisting discovers
 a late global sidecar, stream lifecycle, required admission lease, or same-key
 authority, the caller releases every held root-opportunity, graph-profile,
 stream-admission, schema, branch, token, table, and same-key guard and restarts
@@ -4727,7 +4989,7 @@ The bounded-profile drain sequence is:
 6. publish `DRAINING -> SEALED` with the verified generation cut and exact
    achieved per-shard epoch map;
 7. for an operation-scoped drain, perform the guarded operation; persistent
-   public quiesce stops after step 6.
+   private quiesce children driven by P8 graph quiesce stop after step 6.
 
 `OPEN -> DRAINING` and `DRAINING -> SEALED` are RFC-022 authority-first
 metadata writes; each drain-mode fold is a separate graph write in the future
@@ -4741,14 +5003,14 @@ covers the higher-epoch claim while the gate remains exclusively closed and is
 resolved before any ack path proceeds. The drain itself is not one giant
 sidecar spanning multiple commits.
 
-`DRAINING` is not allowed to become an operator trap. Public B2 must implement the
-protocol-v2 descriptor and future lifecycle-strand recovery transition
-specified in §4.3, including a
-crash-safe abort transition for a quiesce that cannot finish: only when no
-guarded schema/maintenance operation has begun, the exact current DRAINING row
-and its equal witnesses still match, every owner has settled, and no unmerged
-or strict-blocked cut remains may `stream resume --abort-drain` arm a resume
-sidecar, claim a higher epoch under the closed gate, and CAS
+`DRAINING` is not allowed to become an operator trap. The private lifecycle
+core must implement the protocol-v2 descriptor and recovery transition
+specified in §4.3, including a crash-safe abort transition for a quiesce that
+cannot finish. The graph coordinator may drive this child's abort-drain
+transition only when no guarded schema/maintenance operation has begun, the
+exact current `DRAINING` row and its equal witnesses still match, every owner
+has settled, and no unmerged or strict-blocked cut remains. It then arms a
+resume sidecar, claims a higher epoch under the closed gate, and CASes
 `DRAINING -> OPEN`. A blocked/unmerged cut
 must first fold, complete exact bounded `DataBlock` correction, or, once that
 future owner exists, complete the reason-gated `AuthorityBlock` correction
@@ -4778,23 +5040,25 @@ There are two dispositions after the drain reaches `SEALED`:
   ref, it must complete `stream_rebind` to a freshly proved `SEALED` binding
   and then run the separate resume transition instead of applying this
   transition directly;
-- **persistent quiesce (Phase B2)** — the public `quiesce` command leaves the stream
-  `SEALED`. It never auto-reopens. `stream resume` explicitly revalidates schema,
-  PK, configuration, MemWAL format, physical binding, current-HEAD witness,
-  every same-shard epoch, and the exact graph-branch topology under the same
-  closed admission/schema/branch gates, then publishes `OPEN`. In the bounded
-  profile any named graph branch keeps the stream `SEALED`. Stream teardown
-  deletes intent only from `SEALED`.
+- **persistent quiesce (Phase B2)** — public graph `quiesce` leaves graph
+  control `QUIESCED` only after every private child is `SEALED`; no caller can
+  select one stream. Graph `resume` revalidates schema, PK, configuration,
+  MemWAL format, every physical binding/current-HEAD witness/epoch, and the
+  exact graph-branch topology under closed gates, then publishes `ACTIVE` only
+  after every child is `OPEN`. In the bounded profile any named graph branch
+  keeps the graph `QUIESCED`. Private teardown removes physical intent only
+  from a `SEALED` child.
 
 The barrier never holds the table write queue while waiting for a fold that
 needs that queue. The separate admission gate closes first; fold commit then
 acquires the normal table queue. Crash recovery resumes from the durable state,
 current-HEAD witness, and per-shard epoch map.
 
-Future Phase-D schema apply must drain every affected enrolled type before
-changing fields, constraints, PK, embeddings, or `@stream` and resumes only
-when compatible. That writer is inactive in EXP, where schema change requires
-checked export and rebuild into a fresh graph. RFC-028's current pure type
+Any future in-place Phase-D schema apply must run one graph quiesce before
+changing fields, constraints, PK, or embeddings, re-evaluate the complete
+catalog, and resume the graph only when every declaration remains compatible.
+It cannot add per-type stream intent. That writer is inactive in EXP, where
+schema change requires checked export and rebuild into a fresh graph. RFC-028's current pure type
 rename retains the same dataset, identity, path, and Lance version, so it does
 not by itself rebind the physical enrollment. If a future schema feature
 supports a rematerializing rename while preserving the logical pair, it cannot
@@ -4821,7 +5085,7 @@ counters. A rebind never reuses an old shard UUID; pinned-Lance surface guards p
 that OmniGraph supplies a fresh UUID v4 to `mem_wal_writer` and that the new
 namespace is disjoint from every prior binding for the logical table lifetime.
 
-A Lance version upgrade requires persistent `stream quiesce --all`, but empty
+A Lance version upgrade requires persistent graph `stream quiesce`, but empty
 generations alone are insufficient: the MemWAL system index, shard manifests,
 epoch records, and generation directories may still use the old format. Before
 the bump, the implementation must prove one of: (a) upstream guarantees and
@@ -4892,23 +5156,26 @@ those limits wherever the tier is exposed.
 ## 10. Observability and resource contracts
 
 Phase B1 keeps row/fold observability internal. The later §4.7 slice exposes
-only durable manifest authority through embedded `Omnigraph::stream_status`;
-it does not expose physical worker state or create a CLI/HTTP/OpenAPI status
-contract. F6b6 adds a separate checked operational observation internally,
-but the public method remains manifest-only and no CLI/HTTP/OpenAPI/SDK
-transport exists. The private implementation exposes test seams at its durability,
+only a pre-activation durable-manifest diagnostic through embedded
+`Omnigraph::stream_status`; it does not expose physical worker state or create
+a CLI/HTTP/OpenAPI status contract. F6b6 adds a separate checked operational
+observation internally. F6c replaces the ambient result with P8's redacted
+graph projection, and F7 transports only that projection. The private
+implementation exposes test seams at its durability,
 replay, fencing, resource, cut, fold, visibility, and recovery boundaries. The
 2026-07-21 dense-scan repair and near-cap/RSS cell in §12.3 re-prove closure for
 the widest admitted shape. That evidence is not a public latency SLO,
 group-commit multiplier, current object-store result, physical-storage bound,
 or claim that retained metadata work is history-flat.
 
-B2's full status surface is the authority-plus-observation contract in §4.3.
-It includes the exact lifecycle/binding, active epoch, drain operation,
+B2's checked physical status input is the authority-plus-observation contract
+in §4.3. Internally it includes the exact lifecycle/binding, active epoch, drain operation,
 pending generation/row/byte accounting when observable without cold replay,
 merged progress, last fold outcome, strict
 block, current operation summaries, lifecycle revision, all pending recovery, and
-rebuild readiness. It does not expose public receipt-history pagination.
+rebuild readiness. P8 projects only graph modes, safe aggregates, logical
+summaries, unavailable markers, and opaque graph/block tokens; it exposes no
+physical fields or receipt-history pagination.
 Cold-replay and flushed-LWW pending accounting plus exact oldest-uncovered-token
 age remain explicitly unavailable; none is inferred from weaker timestamps or
 cursor hints. `DISABLING` uses an explicit checked cluster-apply status owner.
@@ -4916,8 +5183,10 @@ All pending recovery sidecars are reported and block rebuild; a sidecar that
 explains physical HEAD movement makes that projection unavailable rather than
 manufacturing a mixed cut or a false movement error.
 Optional retained-object counts/bytes are advisory current-listing diagnostics,
-not admission or provider-billing truth.
-Richer **user-table** index-catchup and reject detail may follow in Phase C;
+not admission or provider-billing truth. They remain internal and P8 never
+serializes object counts, locations, digests, or lengths. Richer logical
+index-catchup and reject diagnostics may follow in Phase C only through the
+same redacted graph projection;
 the internal token-ledger covered/uncovered-fragment diagnostic required by
 §4.3 is part of the activation profile. F6b7's failpoints-only bounded NO-GO
 applies only to the uncompacted profile-cycle fixture and schedules no standalone
@@ -4970,9 +5239,11 @@ generation metadata. The shared graph-manifest publisher retains its separately
 documented uncompacted-history term. No metadata term is relabeled
 history-flat here.
 
-Phase-B2/Phase-C `stream status` resolves the exact lifecycle rows and MemWAL metadata through a
-structured, bounded access path; it may reuse RFC-024's scalar-index machinery
-but cannot claim history-flat cost while scanning manifest history.
+The Phase-B2/Phase-C private checked status input resolves exact lifecycle rows
+and MemWAL metadata through a structured, bounded access path; it may reuse
+RFC-024's scalar-index machinery but cannot claim history-flat cost while
+scanning manifest history. P8's public graph status receives only its redacted
+aggregate projection.
 
 ## 11. Format activation and rebuild
 
@@ -5029,9 +5300,10 @@ V7 activation followed Gate E0 and the bounded enrollment/recovery,
 writer-exclusion, lifecycle, crash, and refusal/rebuild evidence. It is not
 activation of row streaming. The ordinary SDK, CLI, server, schema parser, and
 OpenAPI contain no enrollment or stream entry point; only the feature-gated
-fault-injection suite can call the private adapter. The public exact-enrollment
-and cross-process admission-seal surface remains required before expanding
-beyond the bounded profile.
+fault-injection suite can call the private adapter. Exact enrollment remains a
+private child; expanding beyond the bounded profile requires the graph-scoped
+ingress coordinator plus a cross-process admission seal, never a public
+enrollment surface.
 
 Phase B1 is a second, explicit format gate rather than an in-place
 reinterpretation of v7. The private implementation uses internal schema v8,
@@ -5152,7 +5424,8 @@ requires exact `DISABLED`, every enrolled lane `SEALED`, settled recovery,
 base/token parity, and at least one current `WITHDRAWN` token. Actor-bound
 confirmation appends the immutable retirement receipt and selects it with
 `RETIRED` in one lineage-neutral manifest CAS. The source then permits only
-read/query/status/export, and export includes the selected root receipt plus a
+read/query/status/export and, after F6c, receipt-only replay of an already-
+terminal graph-control result. Export includes the selected root receipt plus a
 recomputable selected-member witness and the ordered proof needed to recover
 the receipt-bound cut. The frozen recovery-v14
 retirement scaffold is not reinterpreted.
@@ -5189,13 +5462,14 @@ runtime; while it is `DISABLING`, those writers are closed. BranchMerge is
 closed under both modes even through the served runtime, and an embedded SDK
 or direct `--store` caller refuses even before public firehose ingress exists.
 Those docs
-also state that unmanaging after terminal disable does not de-enroll a table or
-restore the direct lane. The F2 release note repeats—not merely links—the
+also state that unmanaging after terminal disable does not erase private
+enrollment or restore the graph-wide direct path. The F2 release note repeats—not merely links—the
 warning that `streaming: true` is non-additive in that release: it disables
 embedded/direct Mutation/Load/delete while no public firehose ingress exists,
 and it gives the explicit-disable escape for an unenrolled graph, documents
-that already-`SEALED` lanes permit the profile transition without restoring
-the direct lane, and retains the rebuild requirement after enrollment. F7
+that already-`SEALED` private children permit the profile transition without
+restoring the direct path, and retains the whole-graph rebuild requirement
+after enrollment. F7
 later adds the firehose endpoints and remote
 surface; it does not postpone documentation of F2 behavior.
 
@@ -5255,9 +5529,9 @@ MemWAL rows, so the stream-specific quiesce steps below are vacuous for those
 transitions; they become load-bearing for any later rebuild from a format that
 exposes durable admission:
 
-1. persistently quiesce every enrolled stream, fold every acknowledged row
-   into the manifest-visible base tables, and drive the profile to ordinary
-   `DISABLED`;
+1. run one persistent graph quiesce, whose coordinator seals every private
+   child and folds every acknowledged row into the manifest-visible base
+   tables, then drive the profile to ordinary `DISABLED`;
 2. verify `SEALED`, empty-generation, merged-generation, sidecar, and uncovered
    drift invariants on the source graph and exact PRESENT/base parity; then
    either prove zero current terminal `DEAD_LETTERED | WITHDRAWN` authority or
@@ -5283,8 +5557,10 @@ row-only export with terminal authority still recorded, because its sole
 manifest CAS has already made the entire source permanently read/export-only
 at the exact cut. The receipt is provenance and does not become target
 sequencing authority.
-The new graph starts with no physical stream enrollment. Phase B2 must wire
-declared first use through §3 before production can enroll after cutover. The
+The new graph starts with no physical stream enrollment. Before ingest, the
+client's missing-token request receives the new graph-control token before any
+body byte is polled. The first validated compatible row for a declaration
+drives §3's private child enrollment before any WAL attempt or acknowledgement. The
 rebuild also loses branches not separately exported, commit DAG, snapshots,
 tombstones, recovery history, and time travel, as specified by RFC-028's
 common format strand.
@@ -5625,8 +5901,8 @@ RFC remains draft.
   the completed private no-delete, single-live-writer-process B2a gate, which
   retains the wrapper's post-watcher fence check. The later private v9
   token/fold slice passed independently; public row activation still waits on
-  the remaining lifecycle/correction, public operational-status, and
-  transport gates. F6b6 has implemented the checked status core internally;
+  the remaining lifecycle/correction gates, F6c's redacted graph status/control
+  boundary, and F7 transport. F6b6 has implemented the checked status input internally;
   the authorization vocabulary and embedded durable-only
   status are already active.
 
@@ -5772,12 +6048,11 @@ genuine v8↔v9 refusal/rebuild. F3e later activated the cluster/offline
 retirement/export escape for a verified current-`WITHDRAWN` cut; F3f adds
 exact stopped/offline `DataBlock` show/correct with recovery-v20, and F5b adds
 current `DEAD_LETTERED`, selected-token inspection/export, ordinary successors,
-and three-disposition retirement through recovery-v21. Public
-row activation still waits for explicit
-production enrollment in the full profile or §4.7 P2's selected automatic
-prepare handshake, general lifecycle controls, `AuthorityBlock` repair,
-public operational-status transport, cancellation/shutdown, API compatibility,
-and transport parity. F6b6 implements the checked operational-status core
+and three-disposition retirement through recovery-v21. Public row activation
+still waits for F6c's expected-token graph ingress, lazy row adapter, graph-control
+strand, general lifecycle controls, `AuthorityBlock` repair, the redacted graph-status
+projection, cancellation/shutdown, API compatibility, and transport parity.
+F6b6 implements the checked operational-status input
 internally. Cold-replay and flushed-LWW accounting plus exact oldest-uncovered
 age are explicitly unavailable. `DISABLING` uses explicit checked cluster-
 apply status authority; all within-envelope sidecars are reported and rebuild-
@@ -5789,45 +6064,36 @@ manifest-only status are already active under §4.7. This section also
 owns B2b's optional managed-reclamation gates; B2a does not need any B2b-only
 bullet.
 The design does not waive the
-persistent escape requirement: a user must never be left with a table that
+persistent escape requirement: a user must never be left with a graph that
 ordinary writers refuse but cannot be corrected, quiesced, or rebuilt.
 
-- **Inactive row/control product surface:** `@stream(mode="upsert",
-  on_reject="strict")`, production first use, SDK row/control methods, HTTP,
-  CLI, and OpenAPI must all route through the same private core. The Cedar
-  actions are registered, but `stream_ingest` has no production caller and
-  `stream_manage` currently reaches only profile enablement and the separate
-  stopped/offline retirement handshake. Existing
-  `/ingest` behavior must remain
-  compatible. The full surface requires embedded/remote command parity; the
-  selected §4.7 profile instead tests served/remote success against the exact
-  embedded/direct refusal.
-  Accepted-schema and runtime guards must refuse `@stream` on a type requiring
-  `@embed` or any external/provider-derived field; caller-supplied physical
-  vectors must round-trip without provider invocation.
-- **Private prepare proof; inactive enrollment product surface:** the full
-  non-experimental profile retains
-  §3/§4.6's explicit `/enroll`, `stream_manage`, and request-level
-  `StreamNotEnrolled` contract. The selected experimental profile instead
-  requires P2's `stream_ingest`-authorized bodyless prepare: complete
-  `StreamEligibilityWitness` including exact current HEAD/ref and lifecycle
-  absence; effect-free witness challenge; actor-bound request ID/intent;
-  same/different-intent and lost-result receipt replay; bounded
-  `already_enrolled` for an existing lane; concurrent first-prepare CAS;
-  returned stream incarnation before body ownership; stale explicit
-  incarnation refusal; and request-level `StreamPrepareRequired` when body
-  ingest finds no lane. Row-body ingest itself never creates physical
-  enrollment. Tests cover every selected-profile
-  bootstrap/shard/lifecycle crash boundary plus Cedar/served/remote success and
-  embedded/direct refusal. B2b additionally covers every genesis
-  body/pointer/new-details crash boundary. The feature-gated engine proof now
-  covers the bodyless challenge and recovery-v14 enrollment subset; public
-  enrollment, transport, and row-body activation remain inactive.
+- **Inactive graph row/control product surface:** F6c and F7 route
+  expected-token mixed node/edge graph ingress, graph controls, and graph status
+  through the same private core. No schema annotation, route, or command lets
+  a caller select declarations. The Cedar actions are registered, but
+  `stream_ingest` has no production caller and `stream_manage` currently
+  reaches only profile enablement and narrow stopped/offline controls. Existing
+  `/ingest` behavior remains compatible. The selected §4.7 profile tests
+  served/remote success against exact embedded/direct refusal. A row for an
+  unsupported declaration shape is refused locally before enrollment or WAL
+  effect; caller-supplied vectors round-trip without provider invocation.
+- **Private enrollment proof; inactive graph ingress surface:** P2's existing
+  `stream_ingest`-authorized child proof covers the complete private
+  `StreamEligibilityWitness`, effect-free witness challenge, actor-bound
+  request/intent, receipt replay, concurrent first-enrollment CAS, and exact
+  incarnation refusal. F6c adds a domain-bound graph-control-token challenge,
+  then invokes that child only after bounded validation of a compatible row and
+  before any WAL attempt. The child's existing recovery owns enrollment ambiguity; F6c
+  adds no N-child prepare transaction or partial-prefix recovery. Tests cover
+  every child bootstrap/shard/lifecycle crash boundary plus lazy-row ownership,
+  no-WAL-before-enrollment, Cedar/served/remote success, and embedded/direct refusal. B2b
+  additionally covers every genesis body/pointer/new-details crash boundary.
+  Public transport and row-body activation remain inactive.
 - **Inactive public acknowledgement adapter:** the response must be status-only
   and caller-ordered. It must map the private durable batch result back to each
-  caller ordinal and report the
-  stream incarnation, write ID, and current binding, not a WAL position,
-  generation, or Lance `batch_positions` value. Only durable/current outcomes
+  caller ordinal and report logical row identity, write ID, and opaque logical
+  tokens—not a stream incarnation, binding, WAL position, generation, or Lance
+  `batch_positions` value. Only durable/current outcomes
   may report a confirmed token and persisted tagged origin; `ack_unknown` must label
   its candidate unconfirmed, while invalid/conflict/not-invoked outcomes mint
   neither. Every exact response variant in §4.6, including `invalid`,
@@ -5872,29 +6138,30 @@ ordinary writers refuse but cannot be corrected, quiesced, or rebuilt.
   server boot mint a checked export-only authority and exposes only a doc-
   hidden immutable engine cut. F6b5 routes that cut through the existing served
   HTTP/remote-CLI/OpenAPI export surface; it adds no status fields. The remaining
-  minimum controls—public operational-status transport, explicit fold,
-  persistent quiesce, resume/abort-drain, rebuild execution, general data
+  minimum graph controls—redacted operational-status transport, explicit fold,
+  persistent quiesce, resume/abort-drain, general data
   correction, and authority repair—remain inactive. F6b6 implements the
   checked read-only operational-status core internally.
-  Embedded durable-only status is already active. F6a adds a separate typed,
+  Embedded durable-only status is an active pre-activation diagnostic. F6a adds a separate typed,
   failpoints-only process-local advisory driver snapshot for tests; it does not
   add fields to that durable projection, and pending triggers are not backlog.
-  Full status must take an
-  exclusive cut, settle
-  owners without mutating recovery, and
-  include exact lifecycle/binding/revision, epoch, advisory pending
-  generations/bytes, a bounded current block view, current operation/claim
-  summaries, last fold summary, and strict-blocked state. Every lane-scoped
-  externally initiated mutating call after enrollment must carry an operation
-  ID and expected lifecycle revision; root-wide authority retirement instead
-  carries `retirement_id`, expected profile revision, and the exact plan digest.
+  The private checked status input takes an exclusive cut, settles owners
+  without mutating recovery, and includes exact lifecycle/binding/revision,
+  epoch, pending generations/bytes, block evidence, operation/claim summaries,
+  and last-fold state. P8 projects only graph modes, safe aggregates, logical
+  summaries, unavailable markers, and opaque graph/block tokens. Every public
+  mutating control carries one graph operation ID and expected
+  `graph_control_token`; the coordinator derives private lane IDs and
+  revisions. Root-wide authority retirement instead retains its existing
+  `retirement_id`, expected profile revision, and exact plan digest.
   Same-ID/same-digest must return the complete bounded terminal receipt,
-  same-ID/different-digest must conflict, and a stale revision must never
-  retarget. Quiesce must require a caller drain ID, have a
+  same-ID/different-digest must conflict, and a stale graph token must never
+  retarget. Graph quiesce must require its caller operation ID, have a
   crash-safe cut, never record terminal success at the initial
   `DRAINING` CAS, never auto-reopen, and
-  prove the empty cut plus token/base parity and zero current terminal authority
-  before normal ordinary export/cutover. Retirement instead requires terminal
+  drive every private child to an empty cut before returning `completed`.
+  Ordinary export/cutover additionally proves token/base parity and zero
+  current terminal authority. Retirement instead requires terminal
   `DISABLED`, the complete exact root cut, and its irreversible receipt before
   row-only export with terminal authority. Resume
   must revalidate the same binding, no-named-branch topology, and epoch authority
@@ -5906,7 +6173,7 @@ ordinary writers refuse but cannot be corrected, quiesced, or rebuilt.
   authority-correction response after its
   block disappears and recover the terminal receipt before revision/block
   lookup. They must delay a quiesce/resume retry across a later cycle and prove
-  receipt/stale-revision handling. They must hold two streams strict-blocked
+  receipt/stale-token handling. They must hold two private lanes strict-blocked
   simultaneously, then close one while preserving the other's independent
   block/correction/abort-drain/requiesce/`SEALED` authority. The WAL watermark
   must never be reported as a whole-graph history bound.
@@ -5954,10 +6221,13 @@ this activates `AuthorityBlock` repair.
   Mutation/Load/delete and `_as`, SchemaApply, BranchMerge, branch
   create/delete, every profile transition/refinement,
   Optimize/EnsureIndices/Repair/Cleanup,
-  prepare/admission, quiesce/resume, correction/fold,
+  prepare/admission, new quiesce/resume/fold work, correction,
   enrollment/rebind, and every new recovery arm; only exact finalization of the
   already-armed authority-retirement sidecar is allowed. Read/query/status and
-  repeated export of the recorded cut remain available.
+  repeated export of the recorded cut remain available. After F6c, the sole
+  control exception is receipt-first, read-only replay of an already-terminal
+  graph-control result under exact ID, actor, and intent through the F6c-
+  extended checked served-export authority; it cannot start or continue work.
 - Ambient ordinary export of an enrolled `DISABLED` graph now returns
   `StreamingRequiresClusterRuntime` before output. The existing receipt-
   verified `RETIRED` ambient export remains a compatibility rebuild bridge,
@@ -5983,12 +6253,14 @@ this activates `AuthorityBlock` repair.
   distinct, recomputable `branch_member` witness and selected index for the
   chosen frozen branch. Any later enrollment
   of the fresh
-  graph mints a new stream incarnation; an old-incarnation request is effect-free
-  `StreamBindingChanged`.
+  graph mints a new private stream incarnation; a public request with the old
+  graph-control token is effect-free `StreamAuthorityChanged`.
   A declared terminal graph, previously unmanaged `RETIRED` graph, or
   previously unmanaged enrolled `DISABLED` graph can mint the narrow
   `CheckedClusterServedExportAuthority`; no fold delegation, supervisor, or
-  admission authority is implied. This evidence is
+  admission or control-replay authority is implied. F6c later extends that
+  capability only for exact read-only replay owned by its new graph-control
+  receipt. This evidence is
   engine/control-authority only in F6b1; F6b5 owns the existing public export
   handler, bounded chunk queue/reservation, deadline, stall/disconnect behavior,
   and HTTP/remote-CLI/OpenAPI parity.
@@ -6118,12 +6390,14 @@ this activates `AuthorityBlock` repair.
   unintegrated writer remain refused. EXP schema evolution uses checked
   export/rebuild into a fresh graph. Phase D still owns automatic operation
   drain and any broader token-aware direct-write/schema integration.
-- `SEALED` alone does not authorize export/rebuild after public terminal
-  disposition. Preflight accepts only ordinary `DISABLED` plus token/base
-  parity and zero current `DEAD_LETTERED | WITHDRAWN`, or `RETIRED` plus the
-  exact selected authority-retirement receipt/profile-chain/logical-cut match.
-  The retired case verifies its committed cut without rerunning the ordinary
-  terminal-token rejection. Any terminal token in the ordinary case returns
+- `SEALED` alone does not authorize export/rebuild. Preflight accepts only
+  checked-runtime `ENABLED/QUIESCED` with a fresh all-child `SEALED` proof,
+  checked served-export `DISABLED/QUIESCED` with the same ordinary proof, or
+  `RETIRED/QUIESCED` with the exact selected authority-retirement
+  receipt/profile-chain/logical-cut match. Both ordinary cases also require
+  token/base parity and zero current `DEAD_LETTERED | WITHDRAWN`. The retired
+  case verifies its committed cut without rerunning the ordinary terminal-
+  token rejection. Any terminal token in an ordinary case returns
   `StreamExportBlocked`. Dead-letter payload export is not a rebuild import
   contract.
 - **Implemented v8↔v9 gate:** CI builds the immutable final-v8 binary, proves
@@ -6158,8 +6432,9 @@ this activates `AuthorityBlock` repair.
   cross-table consistency boundary.
 - Phase F multi-shard support requires a one-key-one-shard proof and a fresh
   Lance audit. Phase G overlapping-process ownership/failover still requires a
-  public exact enrollment receipt plus cross-process seal/reopen, or a
-  separately accepted distributed fence with adversarial recovery evidence.
+  graph-scoped exact coordinator/failover receipt plus cross-process
+  seal/reopen, or a separately accepted distributed fence with adversarial
+  recovery evidence. Physical enrollment receipts remain private.
 - Surface, format, and S3/RustFS guards rerun before every Lance bump.
 
 ## 13. Phasing
@@ -6176,10 +6451,10 @@ remain concurrent with one another.
 | R0 | production-neutral retained-growth/source audit; current-object census; referenced-cut retry; legal high-entropy near-cap materialize/fold cell; no schema, public caller, or deletion | **Historical bounded-retention no-go 2026-07-20; disposition amended 2026-07-21 (§0.2/§12.4):** RC.1 still exposes neither a complete reserve-first physical envelope/receipt nor a durable cross-open randomized-attempt cap. Those facts prohibit a finite storage promise but do not block selected unbounded retain-all. The formerly red widest cell is now green locally and on the configured-RustFS CI path; current-object observations remain advisory retention evidence, not provider billing/accounting |
 | B2a | selected unbounded retain-all/no-GC profile on stock Lance | **Private gate implemented 2026-07-21 (§12.5):** no OmniGraph byte/object/file/history quota; zero canonical `_mem_wal` deletion; complete/partial provider residue remains retained, unreferenced, and untouched below its root through retry/reopen; provider failures are loud; local/configured-RustFS history sweeps are advisory. This gate itself activated no schema or product surface; the later private B2-common slice activates v9 |
 | B2b | candidate managed-reclamation retention profile | Inactive. Requires the Lance-owned durable inspect/plan/execute + receipt, post-success fencing, bounded checkpoint/inventory/accounting, local/RustFS enforced-bound validation, and the profile-specific crash matrix (§4.5.2/§12.6). Passing it alone activates no product surface |
-| B2-common | schema v9/config-v3/state-v2, compare-and-chain token/attribution, graph-global token authority, recovery-v12 base+token fold; then explicit enrollment, revision-fenced lifecycle/correction/full status, SDK row/control methods, HTTP, CLI, and OpenAPI | **Private row/fold subset implemented 2026-07-22 (§11/§12.6):** canonical digests, hidden attribution, stale-authority revalidation after shared admission, same-generation chains, exact two-participant recovery/publication, durable fold attribution, retain-all, and genuine v8↔v9 refusal/rebuild are green. Explicit production enrollment, general lifecycle mutation, public row admission, cancellation/shutdown, API compatibility, and transport parity remain inactive. The later F6b6 slice implements the checked read-only operational-status core internally; its public transport remains inactive. The Cedar vocabulary, embedded manifest-only status, and narrow stopped/offline F3f DataBlock correction shipped in later EXP slices. `GraphHistoryBudget` belongs only to a future bounded/managed profile |
-| EXP | experimental cluster-only activation of the §4.7 profile: offline capability-bound enablement, lazy enrollment, caller-supplied vectors, terminal per-key dead letter plus correction, irreversible authority retirement for fresh-root rebuild, SEALED maintenance/rebind, starvation-free serial folding, and upsert-only hidden ingress | **Selected 2026-07-27 and amended 2026-07-29 (§4.7); F3a–F3f, hidden F4, F5a/F5b0/F5b, and F6a–F6b7 evidence subsets are implemented.** Current v19/token-schema-v3/recovery-v21 publishes deterministic mixed/all-diverted folds, current `DEAD_LETTERED` authority, exact retry/ordinary successor, stopped/offline inspection, and three-disposition retirement. F6b1 freezes an exact-terminal move-only cut; F6b5 connects it to existing served HTTP/remote-client/CLI/OpenAPI export with incremental exact-version scans using approximate Lance targets, strict 64-KiB chunks, complete queue-envelope reservation, pre-header typed refusal, backpressure, and disconnect-safe body-plus-producer ownership. F6b6 adds the engine-internal checked operational cut with explicit checked `DISABLING` cluster-apply status authority. F6b7 adds a paired failpoints-only exact-selected token-index decision instrument without recovery or production maintenance. Within the hard status envelope it reports every sidecar as rebuild-blocking, while an over-bound discovery refuses the whole status; it makes only exact sidecar-owned base-HEAD movement physically unavailable, and reports cold-replay/flushed-LWW accounting plus exact oldest-uncovered age as unavailable; the public manifest-only status is unchanged. Public ingress/enrollment/lifecycle/rebind control, every served row/lifecycle/maintenance/status transport, and unreachable `AuthorityBlock` repair remain inactive. F6b7's bounded NO-GO applies only to the uncompacted profile-cycle fixture and schedules no standalone production token-index reconciler; remeasurement begins beyond 260 uncovered fragments, after a Lance/index-grammar change, or before considering graph-manifest-compacted or checked-Optimize-coupled maintenance, while the remaining guardrail matrix stays open; full row/control activation still requires the remaining F6 evidence before F7. |
+| B2-common | schema v9/config-v3/state-v2, compare-and-chain token/attribution, graph-global token authority, recovery-v12 base+token fold; then expected-token graph ingress, private lazy row enrollment, graph controls/status, SDK row/control methods, HTTP, CLI, and OpenAPI | **Private row/fold subset implemented 2026-07-22 (§11/§12.6):** canonical digests, hidden attribution, stale-authority admission revalidation, same-generation chains, exact two-participant recovery/publication, durable fold attribution, retain-all, and genuine v8↔v9 refusal/rebuild are green. The private enrollment/lifecycle mechanics exist, but public graph ingress/control, row admission, cancellation/shutdown, API compatibility, and transport parity remain inactive. The later F6b6 slice implements the checked read-only operational-status input internally; its graph projection/transport remains inactive. The Cedar vocabulary, pre-activation embedded manifest status, and narrow stopped/offline F3f DataBlock correction shipped in later EXP slices. `GraphHistoryBudget` belongs only to a future bounded/managed profile |
+| EXP | experimental cluster-only activation of the §4.7 profile: offline capability-bound enablement, expected-token mixed node/edge graph ingress with private lazy enrollment, caller-supplied vectors, terminal per-key dead letter/correction, authority retirement, SEALED maintenance/rebind, and serial folding | **Selected 2026-07-27; graph-only P8 selected 2026-08-04.** F3a–F3f, hidden F4/F5a/F5b0/F5b, and F6a–F6b8 are implemented; current v19/token-schema-v3/recovery-v21 owns dead-letter and three-disposition retirement. F6b1/F6b5 own exact-terminal served export, F6b6 owns the internal checked operational cut, and F6b7 records only its bounded fixture-specific token-index NO-GO. Public graph ingress/control/status transport remains inactive. F6c takes a new strict graph/recovery strand for graph control/status, immutable graph terminal receipts, opaque-token redaction, `row | graph` blockers, disable cancellation, and the checked-runtime `ENABLED/QUIESCED` reuse of the existing export cut; ingest challenge is effect-free and private enrollment keeps its existing recovery. Historical recovery families are not reinterpreted. F7 remains forbidden until F6c and the remaining guardrail matrix pass. |
 | C | restart-stable reject-row identity, atomic dead letter, richer status, and evidence-backed configurable bounds | reject crash matrix; reject-retention proof; backpressure and RSS/latency evidence. The §4.7 profile pulls a bounded object-form dead-letter subset forward using the §4.1 token as reject identity |
 | D | automatic operation drain, broader schema/branch/upgrade integration, and orchestrated rematerialization rebind beyond P7's explicit bridge | two-coordinator race, old/new physical-binding crash matrix, and format-transition suite |
 | E | fresh cuts and maintained-index reads; cross-process `Fresh` ships only if the substrate generation-retention guard exists (§9), otherwise same-process only | cut consistency; merged-generation exclusion |
 | F | multi-shard upsert and stream deletes | one-key-one-shard proof; Lance re-audit |
-| G | overlapping-process ownership/failover | public exact enrollment receipt plus cross-process seal/reopen, or a separately accepted distributed fence; adversarial multi-process recovery evidence |
+| G | overlapping-process ownership/failover | graph-scoped exact coordinator/failover receipt plus cross-process seal/reopen, or a separately accepted distributed fence; physical enrollment receipts stay private; adversarial multi-process recovery evidence |
