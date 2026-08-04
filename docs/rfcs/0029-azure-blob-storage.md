@@ -199,8 +199,10 @@ and that platform maintenance can temporarily pre-warm extra replicas.
 assertions only. They are not part of the correctness proof.
 
 Both the serving app and every bootstrap/job execution enter through the same
-PID-1 wrapper. Before any child can open the cluster or run recovery, the
-wrapper derives one canonical lock Blob from the exact storage account,
+PID-1 admission path: Tini forwards process-group signals and subreaps orphaned
+descendants, while its supervised wrapper owns the lease protocol. Before any
+OmniGraph child can open the cluster or run recovery, the wrapper derives one
+canonical lock Blob from the exact storage account,
 container, and normalized cluster root. It stores that permanent object at
 `__omnigraph_azure_admission/v1/<normalized-prefix>/writer.lock`, a reserved
 container-level namespace outside the cluster root and its lifecycle cleanup,
