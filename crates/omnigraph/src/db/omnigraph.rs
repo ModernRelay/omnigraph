@@ -103,6 +103,13 @@ pub use stream_status::{
     StreamTablePhysicalOperationalStatus, StreamTerminalTokenOperationalStatus,
     StreamTokenIndexCoverageStatus, StreamTokenLedgerOperationalStatus,
 };
+#[doc(hidden)]
+pub use stream_status::{
+    GraphStreamDeclaration, GraphStreamDeclarationStatus, GraphStreamDrainStatus,
+    GraphStreamDriverErrorStatus, GraphStreamDriverStatus, GraphStreamLastFoldStatus,
+    GraphStreamOperationalStatus, GraphStreamPendingStatus, GraphStreamRebuildBlocker,
+    GraphStreamRebuildStatus, GraphStreamStrictBlockStatus, GraphStreamTokenCounts,
+};
 pub use stream_status::{StreamStatus, StreamTableStatus};
 pub use table_ops::PendingIndex;
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};

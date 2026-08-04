@@ -56,6 +56,15 @@
   returns **412** without a replacement token, also before body polling. A
   non-`application/x-ndjson` request returns **415**. None of these outcomes
   enrolls a lane or invokes MemWAL.
+- Checked stream status may return a redacted **503** when its bounded
+  observation cannot obtain one coherent authority cut (`StreamStatusBusy` or
+  `StreamStatusChanged`). The response intentionally omits the private gate,
+  physical member, and recovery identity that moved; retry the read. A **409**
+  means the served graph does not own checked operational-status authority for
+  its current profile, including an unmanaged graph that never established
+  checked serving authority. A **413** means the bounded observation inventory exceeded
+  its hard envelope; the server refuses the whole response instead of returning
+  partial recovery evidence. None of these responses mutates or heals the graph.
 - `StreamRetirementPlanChanged` — graph/profile/lifecycle/token authority moved
   between retirement plan and confirm. No retirement effect is accepted; rerun
   the plan and review the new digest.

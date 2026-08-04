@@ -33,8 +33,9 @@ use omnigraph_api_types::{
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
     ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest,
     InvokeStoredQueryRequest, ReadOutput,
-    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
-    ingest_output, read_output, schema_apply_output, snapshot_payload,
+    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
+    StreamStatusOutput, commit_output, ingest_output, read_output, schema_apply_output,
+    snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::Method;
@@ -323,6 +324,34 @@ impl GraphClient {
         profile: Option<&str>,
         store: Option<&str>,
     ) -> Result<Self> {
+        Self::resolve_selected_served_graph("stream ingest", server, graph, cli_as, profile, store)
+            .await
+    }
+
+    /// Resolve the served graph selected by read-only `stream status`.
+    /// Like ingest, status has no flat-server fallback: the checked runtime is
+    /// owned by one graph selected explicitly or by operator configuration.
+    pub(crate) async fn resolve_stream_status(
+        server: Option<&str>,
+        graph: Option<&str>,
+        profile: Option<&str>,
+        store: Option<&str>,
+    ) -> Result<Self> {
+        Self::resolve_selected_served_graph("stream status", server, graph, None, profile, store)
+            .await
+    }
+
+    /// Shared graph-selection owner for the served-only stream family.
+    /// `command` is threaded only into the observable missing-graph error;
+    /// keeping the ingest spelling here preserves its existing contract.
+    async fn resolve_selected_served_graph(
+        command: &str,
+        server: Option<&str>,
+        graph: Option<&str>,
+        cli_as: Option<&str>,
+        profile: Option<&str>,
+        store: Option<&str>,
+    ) -> Result<Self> {
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             crate::planes::Capability::Served,
@@ -337,7 +366,7 @@ impl GraphClient {
         )?;
         if scope.graph.is_none() {
             bail!(
-                "`stream ingest` requires one selected graph; pass --graph <id> with \
+                "`{command}` requires one selected graph; pass --graph <id> with \
                  --server, or configure default_graph on the selected server profile"
             );
         }
@@ -1016,6 +1045,32 @@ impl GraphClient {
         Ok(())
     }
 
+    /// `stream status` — obtain one checked, graph-logical operational cut
+    /// from the selected served graph. The wire DTO is deliberately redacted;
+    /// the CLI never receives physical lane, dataset, or recovery identities.
+    pub(crate) async fn stream_operational_status(&self) -> Result<StreamStatusOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                remote_json(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["stream", "status"], &[])?,
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { .. } => bail!(
+                "internal error: `stream status` reached an embedded client — stream status \
+                 addressing always resolves a server"
+            ),
+        }
+    }
+
     /// `export` — stream the branch as JSONL into `writer`. The streaming
     /// shape (a `W: Write`, not a returned DTO) is why this lands in 3c
     /// rather than 3b. Opens WITHOUT policy (like reads), so it is reached
@@ -1395,7 +1450,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_ingest_requires_and_resolves_a_selected_graph_without_network_io() {
+    async fn stream_status_gets_the_selected_graph_and_decodes_the_redacted_cut() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/graphs/knowledge", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            assert!(
+                request
+                    .head
+                    .starts_with("GET /graphs/knowledge/stream/status HTTP/1.1")
+            );
+            assert!(
+                request
+                    .head
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer status-token")
+            );
+            assert!(request.body.is_empty());
+            write_response(
+                &mut stream,
+                "200 OK",
+                &[("Content-Type", "application/json")],
+                br#"{
+                    "manifest_version":7,
+                    "profile_mode":"enabled",
+                    "profile_revision":3,
+                    "enrolled_declarations":[{
+                        "kind":"node",
+                        "type":"Person",
+                        "lifecycle":"open",
+                        "lifecycle_revision":2,
+                        "pending":{"state":"exact","rows":1,"arrow_bytes":64,"batches":1}
+                    }],
+                    "token_counts":{"present":1,"withdrawn":0,"dead_lettered":0},
+                    "recovery_pending_count":0,
+                    "driver":{
+                        "scope":"checked_runtime",
+                        "authoritative":false,
+                        "state":"running",
+                        "pending_count":1,
+                        "published_open_folds":0
+                    },
+                    "rebuild":{"ready":false,"blockers":[{"reason":"profile_not_terminal"}]}
+                }"#,
+            )
+            .await;
+        });
+
+        let client = GraphClient::Remote {
+            http: reqwest::Client::new(),
+            base_url,
+            token: Some("status-token".to_string()),
+        };
+        let output = client.stream_operational_status().await.unwrap();
+        assert_eq!(output.manifest_version, 7);
+        assert_eq!(output.profile_revision, 3);
+        assert_eq!(output.enrolled_declarations.len(), 1);
+        assert_eq!(
+            output.enrolled_declarations[0].declaration.type_name,
+            "Person"
+        );
+        assert_eq!(output.token_counts.present, 1);
+        assert!(!output.rebuild.ready);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_commands_require_and_resolve_a_selected_graph_without_network_io() {
         let error = match GraphClient::resolve_stream_ingest(
             Some("http://127.0.0.1:9"),
             None,
@@ -1414,6 +1536,28 @@ mod tests {
             Some("http://127.0.0.1:9"),
             Some("knowledge"),
             None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.uri(), "http://127.0.0.1:9/graphs/knowledge");
+
+        let error =
+            match GraphClient::resolve_stream_status(Some("http://127.0.0.1:9"), None, None, None)
+                .await
+            {
+                Ok(_) => panic!("stream status accepted a server without a selected graph"),
+                Err(error) => error.to_string(),
+            };
+        assert!(
+            error.contains("`stream status` requires one selected graph"),
+            "{error}"
+        );
+
+        let client = GraphClient::resolve_stream_status(
+            Some("http://127.0.0.1:9"),
+            Some("knowledge"),
             None,
             None,
         )

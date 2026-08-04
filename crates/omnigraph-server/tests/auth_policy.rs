@@ -69,6 +69,19 @@ async fn protected_routes_require_bearer_token() {
         Some(omnigraph_server::api::ErrorCode::Unauthorized)
     );
 
+    let status_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/stream/status"))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), StatusCode::UNAUTHORIZED);
+
     let stream_body_polled = Arc::new(AtomicBool::new(false));
     let body_probe = Arc::clone(&stream_body_polled);
     let response = app

@@ -2,6 +2,7 @@
 //! main.rs in the modularization).
 
 use super::*;
+use std::fmt::Write as _;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct LoadOutput {
@@ -164,6 +165,219 @@ pub(crate) fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<
 pub(crate) fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn stream_profile_mode_label(mode: StreamProfileModeOutput) -> &'static str {
+    match mode {
+        StreamProfileModeOutput::Disabled => "disabled",
+        StreamProfileModeOutput::Enabled => "enabled",
+        StreamProfileModeOutput::Disabling => "disabling",
+        StreamProfileModeOutput::Retired => "retired",
+    }
+}
+
+fn stream_lifecycle_label(lifecycle: StreamLifecycleOutput) -> &'static str {
+    match lifecycle {
+        StreamLifecycleOutput::Open => "open",
+        StreamLifecycleOutput::Draining => "draining",
+        StreamLifecycleOutput::Sealed => "sealed",
+    }
+}
+
+fn stream_driver_state_label(state: StreamDriverStateOutput) -> &'static str {
+    match state {
+        StreamDriverStateOutput::Stopped => "stopped",
+        StreamDriverStateOutput::Running => "running",
+        StreamDriverStateOutput::Stopping => "stopping",
+        StreamDriverStateOutput::Failed => "failed",
+    }
+}
+
+fn stream_declaration_label(kind: StreamIngestKindOutput, type_name: &str) -> String {
+    let kind = match kind {
+        StreamIngestKindOutput::Node => "node",
+        StreamIngestKindOutput::Edge => "edge",
+    };
+    format!("{kind} {type_name}")
+}
+
+fn render_stream_rebuild_blocker(rendered: &mut String, blocker: &StreamRebuildBlockerOutput) {
+    let declaration =
+        |kind: StreamIngestKindOutput, type_name: &str| stream_declaration_label(kind, type_name);
+    let result = match blocker {
+        StreamRebuildBlockerOutput::ProfileNotTerminal => {
+            writeln!(rendered, "    - streaming profile is not terminal")
+        }
+        StreamRebuildBlockerOutput::DeclarationNotSealed { declaration: item } => writeln!(
+            rendered,
+            "    - {} is not sealed",
+            declaration(item.kind, &item.type_name)
+        ),
+        StreamRebuildBlockerOutput::StrictBlock { declaration: item } => writeln!(
+            rendered,
+            "    - {} has a strict validation block",
+            declaration(item.kind, &item.type_name)
+        ),
+        StreamRebuildBlockerOutput::PendingWork { declaration: item } => writeln!(
+            rendered,
+            "    - {} has pending work",
+            declaration(item.kind, &item.type_name)
+        ),
+        StreamRebuildBlockerOutput::PendingWorkUnavailable { declaration: item } => writeln!(
+            rendered,
+            "    - {} pending work is unavailable",
+            declaration(item.kind, &item.type_name)
+        ),
+        StreamRebuildBlockerOutput::RecoveryPending { count } => {
+            writeln!(rendered, "    - {count} recovery operation(s) pending")
+        }
+        StreamRebuildBlockerOutput::TerminalTokenAuthority {
+            withdrawn_count,
+            dead_lettered_count,
+        } => writeln!(
+            rendered,
+            "    - terminal sequencing authority: {withdrawn_count} withdrawn, \
+             {dead_lettered_count} dead-lettered"
+        ),
+    };
+    result.expect("writing stream status to a String cannot fail");
+}
+
+pub(crate) fn render_stream_status_human(output: &StreamStatusOutput) -> String {
+    let mut rendered = String::new();
+    writeln!(
+        rendered,
+        "stream profile: {} (revision {}, manifest {})",
+        stream_profile_mode_label(output.profile_mode),
+        output.profile_revision,
+        output.manifest_version
+    )
+    .expect("writing stream status to a String cannot fail");
+    if output.enrolled_declarations.is_empty() {
+        writeln!(
+            rendered,
+            "  enrolled declarations: none (streaming state initializes lazily on first ingest)"
+        )
+        .expect("writing stream status to a String cannot fail");
+    } else {
+        writeln!(rendered, "  enrolled declarations:")
+            .expect("writing stream status to a String cannot fail");
+        for status in &output.enrolled_declarations {
+            let declaration =
+                stream_declaration_label(status.declaration.kind, &status.declaration.type_name);
+            let pending = match &status.pending {
+                StreamPendingStatusOutput::Exact {
+                    rows,
+                    arrow_bytes,
+                    batches,
+                } => format!("{rows} row(s), {arrow_bytes} Arrow byte(s), {batches} batch(es)"),
+                StreamPendingStatusOutput::Unavailable {
+                    cold_replay,
+                    flushed,
+                    recovery,
+                } => {
+                    let mut reasons = Vec::new();
+                    if *cold_replay {
+                        reasons.push("cold replay");
+                    }
+                    if *flushed {
+                        reasons.push("flushed state");
+                    }
+                    if *recovery {
+                        reasons.push("recovery");
+                    }
+                    if reasons.is_empty() {
+                        "unavailable".to_string()
+                    } else {
+                        format!("unavailable ({})", reasons.join(", "))
+                    }
+                }
+            };
+            writeln!(
+                rendered,
+                "    {declaration}: {} (revision {}), pending {pending}",
+                stream_lifecycle_label(status.lifecycle),
+                status.lifecycle_revision
+            )
+            .expect("writing stream status to a String cannot fail");
+            if let Some(block) = status.strict_block.as_ref() {
+                writeln!(
+                    rendered,
+                    "      strict block: {} / {}",
+                    block.kind, block.violation_code
+                )
+                .expect("writing stream status to a String cannot fail");
+            }
+            if let Some(drain) = status.drain.as_ref() {
+                writeln!(rendered, "      drain: {} / {}", drain.goal, drain.phase)
+                    .expect("writing stream status to a String cannot fail");
+            }
+        }
+    }
+    writeln!(
+        rendered,
+        "  sequencing authority: {} present, {} withdrawn, {} dead-lettered",
+        output.token_counts.present,
+        output.token_counts.withdrawn,
+        output.token_counts.dead_lettered
+    )
+    .expect("writing stream status to a String cannot fail");
+    writeln!(
+        rendered,
+        "  recovery: {} pending",
+        output.recovery_pending_count
+    )
+    .expect("writing stream status to a String cannot fail");
+    writeln!(
+        rendered,
+        "  driver: {} ({}; {} pending, {} open fold(s) published)",
+        stream_driver_state_label(output.driver.state),
+        if output.driver.authoritative {
+            "authoritative"
+        } else {
+            "advisory"
+        },
+        output.driver.pending_count,
+        output.driver.published_open_folds
+    )
+    .expect("writing stream status to a String cannot fail");
+    if let Some(error) = output.driver.last_error.as_ref() {
+        let result = match error.retry_in_ms {
+            Some(retry_in_ms) => {
+                writeln!(
+                    rendered,
+                    "    last error: {} (retry in {retry_in_ms} ms)",
+                    error.kind
+                )
+            }
+            None => writeln!(rendered, "    last error: {}", error.kind),
+        };
+        result.expect("writing stream status to a String cannot fail");
+    }
+    if output.rebuild.ready {
+        writeln!(rendered, "  rebuild: ready")
+            .expect("writing stream status to a String cannot fail");
+    } else {
+        writeln!(rendered, "  rebuild: blocked")
+            .expect("writing stream status to a String cannot fail");
+        for blocker in &output.rebuild.blockers {
+            render_stream_rebuild_blocker(&mut rendered, blocker);
+        }
+    }
+    rendered
+}
+
+pub(crate) fn print_stream_status_human(output: &StreamStatusOutput) {
+    print!("{}", render_stream_status_human(output));
+}
+
+pub(crate) fn finish_stream_status(output: &StreamStatusOutput, json: bool) -> Result<()> {
+    if json {
+        print_json(output)
+    } else {
+        print_stream_status_human(output);
+        Ok(())
+    }
 }
 
 pub(crate) fn print_cluster_validate_human(output: &ValidateOutput) {
@@ -1230,11 +1444,16 @@ pub(crate) fn resolve_table_render_options() -> ReadRenderOptions {
 
 #[cfg(test)]
 mod tests {
+    use omnigraph_api_types::{
+        StreamDriverErrorOutput, StreamDriverStateOutput, StreamDriverStatusOutput,
+        StreamProfileModeOutput, StreamRebuildBlockerOutput, StreamRebuildStatusOutput,
+        StreamStatusOutput, StreamTokenCountsOutput,
+    };
     use omnigraph_compiler::schema::ast::Annotation;
     use omnigraph_compiler::schema::parser::parse_schema;
     use std::collections::BTreeMap;
 
-    use super::render_annotations;
+    use super::{render_annotations, render_stream_status_human};
 
     #[test]
     fn render_annotations_quotes_values_so_embed_round_trips() {
@@ -1265,5 +1484,64 @@ mod tests {
             "rendered @embed must re-parse: {:?}",
             parsed.err()
         );
+    }
+
+    #[test]
+    fn stream_status_human_output_stays_graph_logical() {
+        let output = StreamStatusOutput {
+            manifest_version: 42,
+            profile_mode: StreamProfileModeOutput::Retired,
+            profile_revision: 7,
+            enrolled_declarations: Vec::new(),
+            token_counts: StreamTokenCountsOutput {
+                present: 3,
+                withdrawn: 1,
+                dead_lettered: 2,
+            },
+            recovery_pending_count: 4,
+            driver: StreamDriverStatusOutput {
+                scope: "graph".to_string(),
+                authoritative: false,
+                state: StreamDriverStateOutput::Failed,
+                pending_count: 5,
+                published_open_folds: 6,
+                last_completion_kind: Some("folded".to_string()),
+                last_error: Some(StreamDriverErrorOutput {
+                    kind: "retryable".to_string(),
+                    retry_in_ms: Some(250),
+                }),
+            },
+            rebuild: StreamRebuildStatusOutput {
+                ready: false,
+                blockers: vec![StreamRebuildBlockerOutput::TerminalTokenAuthority {
+                    withdrawn_count: 1,
+                    dead_lettered_count: 2,
+                }],
+            },
+        };
+
+        let rendered = render_stream_status_human(&output);
+        assert!(rendered.contains("stream profile: retired (revision 7, manifest 42)"));
+        assert!(rendered.contains(
+            "enrolled declarations: none (streaming state initializes lazily on first ingest)"
+        ));
+        assert!(
+            rendered.contains("driver: failed (advisory; 5 pending, 6 open fold(s) published)")
+        );
+        assert!(rendered.contains("terminal sequencing authority: 1 withdrawn, 2 dead-lettered"));
+        for forbidden in [
+            "dataset",
+            "table_key",
+            "lane",
+            "binding",
+            "shard",
+            "generation",
+            "recovery_id",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "human output leaked private vocabulary: {forbidden}"
+            );
+        }
     }
 }

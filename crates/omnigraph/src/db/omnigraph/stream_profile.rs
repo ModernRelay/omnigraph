@@ -268,7 +268,6 @@ impl Omnigraph {
     /// for this profile state: the served writer, the served terminal-export
     /// slot, or the checked offline cluster-apply continuation for DISABLING.
     /// Ambient handles retain the manifest-only `stream_status` projection.
-    #[allow(dead_code)] // Production-compiled F6b6 status is attached by F7.
     pub(super) fn validate_stream_operational_status_authority(
         &self,
         profile: &StreamProfileEntry,

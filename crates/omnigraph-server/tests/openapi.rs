@@ -170,6 +170,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/query",
     "/graphs/{graph_id}/export",
+    "/graphs/{graph_id}/stream/status",
     "/graphs/{graph_id}/stream/ingest",
     "/graphs/{graph_id}/change",
     "/graphs/{graph_id}/mutate",
@@ -234,6 +235,25 @@ fn openapi_read_is_post() {
 fn openapi_export_is_post() {
     let doc = openapi_json();
     assert!(doc["paths"]["/graphs/{graph_id}/export"]["post"].is_object());
+}
+
+#[test]
+fn graph_stream_status_documents_checked_json_cut() {
+    let doc = openapi_json();
+    let operation = &doc["paths"]["/graphs/{graph_id}/stream/status"]["get"];
+    assert!(operation.is_object());
+    assert_eq!(
+        operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/StreamStatusOutput"
+    );
+    assert!(operation["responses"]["200"]["headers"]["Cache-Control"].is_object());
+    for status in ["401", "403", "409", "413", "500", "503"] {
+        assert_eq!(
+            operation["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ErrorOutput",
+            "stream status {status} must use ErrorOutput"
+        );
+    }
 }
 
 #[test]
@@ -461,11 +481,26 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "SchemaApplyRequest",
     "SnapshotOutput",
     "SnapshotTableOutput",
+    "StreamDeclarationOutput",
+    "StreamDeclarationStatusOutput",
+    "StreamDrainStatusOutput",
+    "StreamDriverErrorOutput",
+    "StreamDriverStateOutput",
+    "StreamDriverStatusOutput",
     "StreamIngestChallenge",
     "StreamIngestKindOutput",
     "StreamIngestLineOutput",
     "StreamIngestScopeOutput",
     "StreamIngestStatusOutput",
+    "StreamLastFoldStatusOutput",
+    "StreamLifecycleOutput",
+    "StreamPendingStatusOutput",
+    "StreamProfileModeOutput",
+    "StreamRebuildBlockerOutput",
+    "StreamRebuildStatusOutput",
+    "StreamStatusOutput",
+    "StreamStrictBlockStatusOutput",
+    "StreamTokenCountsOutput",
 ];
 
 #[test]
@@ -860,6 +895,7 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
         ("/graphs/{graph_id}/export", "post"),
+        ("/graphs/{graph_id}/stream/status", "get"),
         ("/graphs/{graph_id}/stream/ingest", "post"),
         ("/graphs/{graph_id}/snapshot", "get"),
         ("/graphs/{graph_id}/branches", "get"),
@@ -1234,6 +1270,7 @@ async fn auth_mode_spec_has_security_on_protected_operations() {
     let protected_paths = [
         ("/graphs/{graph_id}/read", "post"),
         ("/graphs/{graph_id}/change", "post"),
+        ("/graphs/{graph_id}/stream/status", "get"),
         ("/graphs/{graph_id}/stream/ingest", "post"),
         ("/graphs/{graph_id}/snapshot", "get"),
         ("/graphs/{graph_id}/branches", "get"),
@@ -1314,6 +1351,7 @@ const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/snapshot",
     "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/export",
+    "/graphs/{graph_id}/stream/status",
     "/graphs/{graph_id}/stream/ingest",
     "/graphs/{graph_id}/change",
     "/graphs/{graph_id}/schema",
@@ -1389,6 +1427,7 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
         "/snapshot",
         "/read",
         "/export",
+        "/stream/status",
         "/stream/ingest",
         "/change",
         "/schema",
@@ -1586,6 +1625,7 @@ async fn served_spec_always_nests_under_cluster_prefix() {
         "/read",
         "/query",
         "/export",
+        "/stream/status",
         "/stream/ingest",
         "/change",
         "/mutate",

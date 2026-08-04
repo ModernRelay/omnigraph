@@ -9,7 +9,9 @@ use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
     ChangeOutput, CommitOutput, ErrorOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
-    SnapshotTableOutput,
+    SnapshotTableOutput, StreamDriverStateOutput, StreamIngestKindOutput, StreamLifecycleOutput,
+    StreamPendingStatusOutput, StreamProfileModeOutput, StreamRebuildBlockerOutput,
+    StreamStatusOutput,
 };
 use omnigraph_cluster::{
     ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput,
@@ -745,6 +747,17 @@ async fn main() -> Result<()> {
                 client
                     .stream_ingest(&data, graph_token.as_deref(), &mut stdout)
                     .await?;
+            }
+            StreamCommand::Status { json } => {
+                let client = client::GraphClient::resolve_stream_status(
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let output = client.stream_operational_status().await?;
+                finish_stream_status(&output, json)?;
             }
         },
         Command::Query {
