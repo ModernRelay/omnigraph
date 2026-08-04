@@ -18,6 +18,7 @@ use futures::TryStreamExt;
 use lance::dataset::mem_wal::scanner::LsmScanner;
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardManifestStore, ShardWriter, WalTailer};
 use lance_index::mem_wal::{MemWalIndexDetails, MergedGeneration, ShardId, ShardStatus};
+use sha2::{Digest, Sha256};
 
 #[cfg(feature = "failpoints")]
 use crate::db::ReadTarget;
@@ -162,8 +163,8 @@ pub(super) struct NormalizedStreamJsonRow {
 /// manifest version and graph head, so neither is part of this witness. The
 /// accepted graph identity/catalog and active profile delegation are the
 /// stable authority that must remain exact while a logical row is routed to a
-/// private lane. This is an internal-v19 compare witness, not the later public
-/// graph-control token.
+/// private lane. F7 derives the opaque served-ingest precondition token from
+/// this witness; the witness itself remains internal and non-serialized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StreamGraphIngestWitness {
     graph_identity_digest: String,
@@ -211,6 +212,30 @@ impl StreamGraphIngestWitness {
 
     pub(super) fn schema_ir_hash(&self) -> &str {
         &self.schema_ir_hash
+    }
+
+    /// Derive the opaque served-ingest compare token from this exact witness.
+    ///
+    /// This is deliberately a projection of existing manifest authority, not
+    /// a persisted token or a second source of truth. Every variable-width
+    /// field is length framed and every integer is big endian, so the v1
+    /// domain has one canonical byte representation without relying on JSON
+    /// object ordering or a serializer version.
+    pub(super) fn authority_token(&self) -> String {
+        fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+            hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(bytes);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"omnigraph.graph-stream-ingest-authority.v1\0");
+        hash_bytes(&mut hasher, self.graph_identity_digest.as_bytes());
+        hash_bytes(&mut hasher, self.schema_ir_hash.as_bytes());
+        hasher.update(self.schema_identity_version.to_be_bytes());
+        hasher.update(self.profile_revision.to_be_bytes());
+        hash_bytes(&mut hasher, self.fold_delegation_id.as_bytes());
+        hash_bytes(&mut hasher, self.fold_delegation_digest.as_bytes());
+        format!("sha256:{:x}", hasher.finalize())
     }
 }
 
@@ -8489,6 +8514,26 @@ pub(super) fn exact_merged_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_ingest_authority_token_pins_canonical_witness_encoding() {
+        let witness = StreamGraphIngestWitness {
+            graph_identity_digest: format!("sha256:{}", "1".repeat(64)),
+            schema_ir_hash: format!("sha256:{}", "2".repeat(64)),
+            schema_identity_version: 2,
+            profile_revision: 7,
+            fold_delegation_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            fold_delegation_digest: format!("sha256:{}", "3".repeat(64)),
+        };
+
+        assert_eq!(
+            witness.authority_token(),
+            "sha256:e7662e871c1eb31a2cc86098cdf5bb13a767c3aff852fb1db2999c272eadfda1"
+        );
+        let mut changed = witness.clone();
+        changed.profile_revision += 1;
+        assert_ne!(changed.authority_token(), witness.authority_token());
+    }
 
     #[test]
     fn data_block_error_preserves_typed_correction_token() {

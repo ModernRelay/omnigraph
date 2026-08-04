@@ -485,10 +485,10 @@ V16/recovery-v18 adds the separate private physical-rebind owner for an exact
 `SEALED` lane. V17/recovery-v19 adds the narrow stopped/offline, cluster-only
 authority-retirement and receipt-bearing export exit. Current
 v18/recovery-v20 adds exact stopped/offline `DataBlock` correction through the
-cluster-only `stream block show|correct` commands. Public ingress, enrollment,
-ordinary lifecycle control, authority repair, rebind, and public maintenance
-surfaces remain inactive; retirement and DataBlock control are the two narrow
-CLI exceptions.
+cluster-only `stream block show|correct` commands. Graph-native served ingress
+is active; explicit enrollment, ordinary lifecycle control, authority repair,
+rebind, and public maintenance surfaces remain inactive. Retirement and
+DataBlock control remain the two narrow cluster-control CLI exceptions.
 None of the later formats reinterprets or
 backfills v5 in place. A v5
 graph was never served with a

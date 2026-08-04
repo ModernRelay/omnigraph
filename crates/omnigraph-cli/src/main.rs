@@ -729,6 +729,24 @@ async fn main() -> Result<()> {
                 .export(&branch, &type_names, &table_keys, &mut stdout)
                 .await?;
         }
+        Command::Stream { command } => match command {
+            StreamCommand::Ingest { data, graph_token } => {
+                let client = client::GraphClient::resolve_stream_ingest(
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                echo_write_target(cli.quiet, "stream ingest", client.uri(), true);
+                let stdout = io::stdout();
+                let mut stdout = stdout.lock();
+                client
+                    .stream_ingest(&data, graph_token.as_deref(), &mut stdout)
+                    .await?;
+            }
+        },
         Command::Query {
             name,
             query,

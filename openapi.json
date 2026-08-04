@@ -1773,6 +1773,161 @@
         ]
       }
     },
+    "/graphs/{graph_id}/stream/ingest": {
+      "post": {
+        "tags": [
+          "streaming"
+        ],
+        "summary": "Ingest a graph-native NDJSON firehose through the checked served runtime.",
+        "description": "A request without `If-Match` is authorized and preflighted without polling\nits body, then receives a 428 challenge. A malformed or stale precondition\nreceives 412 without replacement authority. An exact strong ETag transfers\nthe Axum body stream directly into the engine and streams one redacted\nnewline-delimited result per input row; neither direction is buffered as a\ncomplete request or response.",
+        "operationId": "cluster_stream_ingest",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "Strong ETag containing the opaque graph token returned by the 428 challenge.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Graph-native node and edge rows, one JSON object per line. Results are emitted in caller order and the request is not atomic.",
+          "content": {
+            "application/x-ndjson": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Ordered graph-native ingest results",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamIngestLineOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Checked streaming runtime or lifecycle conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Malformed or stale graph token; no replacement token is disclosed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Streaming request admission capacity exhausted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request Content-Type is not application/x-ndjson",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "Graph token required; retry with the strong ETag in If-Match",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Always `no-store`; the challenge is authority-bearing"
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong ETag containing the current opaque graph token"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamIngestChallenge"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Overlapping durable recovery must resolve before ingest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/healthz": {
       "get": {
         "tags": [
@@ -2895,6 +3050,165 @@
             "minimum": 0
           }
         }
+      },
+      "StreamIngestChallenge": {
+        "type": "object",
+        "description": "Effect-free precondition challenge for graph-native streaming ingest.\n\nThe same value is returned as a strong `ETag` response header. Clients\nretry the request with that tag in `If-Match`; this convenience copy keeps\nthe graph authority token distinct from the per-row sequencing\n[`StreamIngestLineOutput::stream_token`].",
+        "required": [
+          "graph_token"
+        ],
+        "properties": {
+          "graph_token": {
+            "type": "string"
+          }
+        }
+      },
+      "StreamIngestKindOutput": {
+        "type": "string",
+        "description": "Logical declaration kind selected by one graph-native stream row.",
+        "enum": [
+          "node",
+          "edge"
+        ]
+      },
+      "StreamIngestLineOutput": {
+        "type": "object",
+        "description": "One ordered, newline-delimited result from graph-native streaming ingest.\n\nEvery field is caller-logical or directly actionable retry evidence.\nPhysical table and MemWAL identities are deliberately absent.",
+        "required": [
+          "ordinal",
+          "status",
+          "scope"
+        ],
+        "properties": {
+          "actual": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "blocking_ordinal": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "blocking_status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StreamIngestStatusOutput"
+              }
+            ]
+          },
+          "current_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Current per-row token returned with a sequencing or terminal outcome."
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StreamIngestKindOutput"
+              }
+            ]
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ordinal": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "scope": {
+            "$ref": "#/components/schemas/StreamIngestScopeOutput"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StreamIngestStatusOutput"
+          },
+          "stream_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Confirmed per-row sequencing token. This is not the graph-level ETag."
+          },
+          "type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unconfirmed_candidate_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Candidate token whose durability acknowledgement is unknown."
+          },
+          "write_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "StreamIngestScopeOutput": {
+        "type": "string",
+        "description": "Whether one stream result applies to a single row or blocks the graph-wide\nremainder of the request.",
+        "enum": [
+          "row",
+          "graph"
+        ]
+      },
+      "StreamIngestStatusOutput": {
+        "type": "string",
+        "description": "Stable, graph-logical status vocabulary for one streaming-ingest line.\n\nSeveral private physical-authority transitions intentionally collapse to\n`stream_authority_changed`; the transport never exposes lane, binding,\nshard, epoch, generation, dataset, or recovery-sidecar identity.",
+        "enum": [
+          "durable",
+          "ack_unknown",
+          "already_durable",
+          "withdrawn",
+          "dead_lettered",
+          "invalid",
+          "stream_input_too_large",
+          "stream_authority_changed",
+          "stream_sequence_conflict",
+          "stream_idempotency_conflict",
+          "stream_fold_required",
+          "stream_backpressure",
+          "recovery_required",
+          "stream_retry_required"
+        ]
       }
     },
     "securitySchemes": {

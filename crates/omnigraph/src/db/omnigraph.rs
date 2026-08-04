@@ -74,6 +74,8 @@ pub use stream_dead_letter::{
     StreamDeadLetterEncodingCostForTest, failpoint_measure_stream_dead_letter_object_for_test,
 };
 #[doc(hidden)]
+pub use stream_ndjson::{GraphStreamChunkSource, GraphStreamIngestHandle, GraphStreamIngestStart};
+#[doc(hidden)]
 pub use stream_profile::{
     CheckedClusterApplyAuthority, CheckedClusterBlockAuthority, CheckedClusterDeadLetterAuthority,
     CheckedClusterMaintenanceAuthority, CheckedClusterRetirementAuthority,

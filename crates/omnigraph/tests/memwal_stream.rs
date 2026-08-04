@@ -39,10 +39,10 @@ use object_store::{
     UploadPart,
 };
 use omnigraph::db::{
-    CleanupPolicyOptions, Omnigraph, ReadTarget, StreamAuthorityRetirementPlan,
-    StreamDataCorrectionAction, StreamDataCorrectionRequest, StreamOldestUncoveredAgeStatus,
-    StreamPendingGenerationStatus, StreamRebuildBlockReason, StreamTablePhysicalOperationalStatus,
-    StreamTableStatus, StreamTokenIndexCoverageStatus,
+    CleanupPolicyOptions, GraphStreamChunkSource, GraphStreamIngestStart, Omnigraph, ReadTarget,
+    StreamAuthorityRetirementPlan, StreamDataCorrectionAction, StreamDataCorrectionRequest,
+    StreamOldestUncoveredAgeStatus, StreamPendingGenerationStatus, StreamRebuildBlockReason,
+    StreamTablePhysicalOperationalStatus, StreamTableStatus, StreamTokenIndexCoverageStatus,
 };
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
@@ -3092,6 +3092,13 @@ fn parse_ndjson_outcomes(outcomes: Vec<String>) -> Vec<serde_json::Value> {
         .into_iter()
         .map(|outcome| serde_json::from_str(&outcome).expect("outcome must be valid JSON"))
         .collect()
+}
+
+fn graph_body_poll_probe(polled: Arc<AtomicBool>) -> GraphStreamChunkSource {
+    Box::pin(futures::stream::poll_fn(move |_| {
+        polled.store(true, Ordering::SeqCst);
+        std::task::Poll::Ready(None::<Result<Vec<u8>, OmniError>>)
+    }))
 }
 
 async fn prepare_stream_ingest(
@@ -9649,6 +9656,20 @@ rules:
             .await
             .expect_err("Cedar must reject an actor without stream_ingest");
         assert!(matches!(denied, OmniError::Policy(_)), "{denied:?}");
+        let denied_graph_polled = Arc::new(AtomicBool::new(false));
+        let denied_graph = db
+            .start_served_graph_stream_ingest_as(
+                "act-denied",
+                None,
+                graph_body_poll_probe(Arc::clone(&denied_graph_polled)),
+            )
+            .await
+            .expect_err("served graph ingress must authorize before challenging or polling");
+        assert!(
+            matches!(denied_graph, OmniError::Policy(_)),
+            "{denied_graph:?}"
+        );
+        assert!(!denied_graph_polled.load(Ordering::SeqCst));
 
         let no_runtime_prepare = prepare_stream_ingest(
             &db,
@@ -9676,6 +9697,23 @@ rules:
             ),
             "{no_runtime:?}"
         );
+        let no_runtime_graph_polled = Arc::new(AtomicBool::new(false));
+        let no_runtime_graph = db
+            .start_served_graph_stream_ingest_as(
+                "act-allowed",
+                None,
+                graph_body_poll_probe(Arc::clone(&no_runtime_graph_polled)),
+            )
+            .await
+            .expect_err("ambient graph ingress cannot mint a served challenge");
+        assert!(
+            matches!(
+                no_runtime_graph,
+                OmniError::StreamingRequiresClusterRuntime { ref mode } if mode == "ENABLED"
+            ),
+            "{no_runtime_graph:?}"
+        );
+        assert!(!no_runtime_graph_polled.load(Ordering::SeqCst));
     }
     assert_eq!(
         db.snapshot_of(ReadTarget::branch("main"))
@@ -9686,6 +9724,194 @@ rules:
         "authorization/runtime refusals must be graph-effect-free"
     );
     assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn served_graph_ndjson_challenges_before_body_and_streams_only_redacted_lines() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_unenrolled_served_with_schema(TWO_TABLE_STREAM_SCHEMA).await;
+    let manifest_before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+
+    let challenge_polled = Arc::new(AtomicBool::new(false));
+    let authority_token = match db
+        .start_served_graph_stream_ingest_as(
+            "agent:served-graph",
+            None,
+            graph_body_poll_probe(Arc::clone(&challenge_polled)),
+        )
+        .await
+        .expect("checked served ingest returns an authority challenge")
+    {
+        GraphStreamIngestStart::TokenRequired { authority_token } => authority_token,
+        GraphStreamIngestStart::Ready(_) => panic!("a missing token cannot start body polling"),
+    };
+    assert!(!challenge_polled.load(Ordering::SeqCst));
+    assert_eq!(authority_token.len(), "sha256:".len() + 64);
+    assert!(
+        authority_token
+            .strip_prefix("sha256:")
+            .is_some_and(|digest| digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_before,
+        "the challenge must not publish graph or enrollment state"
+    );
+    assert!(db.stream_status().await.unwrap().tables.is_empty());
+
+    let repeated_polled = Arc::new(AtomicBool::new(false));
+    let repeated = match db
+        .start_served_graph_stream_ingest_as(
+            "agent:served-graph",
+            None,
+            graph_body_poll_probe(Arc::clone(&repeated_polled)),
+        )
+        .await
+        .expect("unchanged authority returns the same challenge")
+    {
+        GraphStreamIngestStart::TokenRequired { authority_token } => authority_token,
+        GraphStreamIngestStart::Ready(_) => panic!("a repeated challenge cannot start a request"),
+    };
+    assert_eq!(repeated, authority_token);
+    assert!(!repeated_polled.load(Ordering::SeqCst));
+
+    for supplied in [
+        "not-a-token".to_string(),
+        format!("sha256:{}", "0".repeat(64)),
+    ] {
+        let refused_polled = Arc::new(AtomicBool::new(false));
+        let error = db
+            .start_served_graph_stream_ingest_as(
+                "agent:served-graph",
+                Some(&supplied),
+                graph_body_poll_probe(Arc::clone(&refused_polled)),
+            )
+            .await
+            .expect_err("malformed and stale tokens must refuse effect-free");
+        assert!(
+            matches!(error, OmniError::StreamingAuthorityMismatch { .. }),
+            "{error:?}"
+        );
+        assert!(!refused_polled.load(Ordering::SeqCst));
+        assert!(
+            !error.to_string().contains(&authority_token),
+            "a stale-token refusal must not disclose replacement authority"
+        );
+    }
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_before
+    );
+    assert!(db.stream_status().await.unwrap().tables.is_empty());
+
+    let body: GraphStreamChunkSource = Box::pin(futures::stream::iter([Ok(graph_node_line(
+        "Person",
+        "served-person",
+        17,
+        "50505050-5050-4050-8050-505050505050",
+        None,
+    ))]));
+    let mut handle = match db
+        .start_served_graph_stream_ingest_as("agent:served-graph", Some(&authority_token), body)
+        .await
+        .expect("an exact graph token starts the existing request owner")
+    {
+        GraphStreamIngestStart::Ready(handle) => handle,
+        GraphStreamIngestStart::TokenRequired { .. } => {
+            panic!("the exact token cannot be rechallenged")
+        }
+    };
+    let line = handle
+        .recv()
+        .await
+        .expect("served result receive succeeds")
+        .expect("one input produces one result");
+    assert_eq!(line.last(), Some(&b'\n'));
+    assert_eq!(line.iter().filter(|byte| **byte == b'\n').count(), 1);
+    let outcome: serde_json::Value =
+        serde_json::from_slice(&line[..line.len() - 1]).expect("result line is valid JSON");
+    assert_eq!(outcome["status"], "durable");
+    assert_eq!(outcome["scope"], "row");
+    assert_eq!(outcome["kind"], "node");
+    assert_eq!(outcome["type"], "Person");
+    assert_eq!(outcome["id"], "served-person");
+    assert_graph_stream_result_redacted(&outcome);
+    assert!(handle.recv().await.unwrap().is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn served_graph_ndjson_flushes_one_complete_run_before_body_eof() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_unenrolled_served_with_schema(TWO_TABLE_STREAM_SCHEMA).await;
+    let challenge_body: GraphStreamChunkSource = Box::pin(futures::stream::pending());
+    let authority_token = match db
+        .start_served_graph_stream_ingest_as("agent:low-rate", None, challenge_body)
+        .await
+        .expect("checked served ingest returns an authority challenge")
+    {
+        GraphStreamIngestStart::TokenRequired { authority_token } => authority_token,
+        GraphStreamIngestStart::Ready(_) => panic!("a missing token cannot start body polling"),
+    };
+
+    let (body_sender, body_receiver) =
+        futures::channel::mpsc::unbounded::<Result<Vec<u8>, OmniError>>();
+    body_sender
+        .unbounded_send(Ok(graph_node_line(
+            "Person",
+            "low-rate-person",
+            19,
+            "53535353-5353-4353-8353-535353535353",
+            None,
+        )))
+        .unwrap();
+    let body: GraphStreamChunkSource = Box::pin(body_receiver);
+    let mut handle = match db
+        .start_served_graph_stream_ingest_as("agent:low-rate", Some(&authority_token), body)
+        .await
+        .expect("the exact graph token starts the request")
+    {
+        GraphStreamIngestStart::Ready(handle) => handle,
+        GraphStreamIngestStart::TokenRequired { .. } => {
+            panic!("the exact token cannot be rechallenged")
+        }
+    };
+
+    // Keep `body_sender` alive: after delivering the complete line the source
+    // is Pending, not EOF. The fixed coalescing boundary must submit the run.
+    let line = tokio::time::timeout(Duration::from_secs(5), handle.recv())
+        .await
+        .expect("one low-rate graph row must acknowledge while the body remains pending")
+        .expect("served result receive succeeds")
+        .expect("one input produces one result");
+    assert_eq!(line.last(), Some(&b'\n'));
+    let outcome: serde_json::Value =
+        serde_json::from_slice(&line[..line.len() - 1]).expect("result line is valid JSON");
+    assert_eq!(outcome["status"], "durable");
+    assert_eq!(outcome["id"], "low-rate-person");
+    assert_graph_stream_result_redacted(&outcome);
+
+    drop(body_sender);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), handle.recv())
+            .await
+            .expect("request reaches EOF after the pending body is closed")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

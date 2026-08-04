@@ -1,13 +1,15 @@
-#![allow(dead_code)] // Hidden F4 engine seam; production transport activation is intentionally deferred.
+#![allow(dead_code)] // Table-scoped F4 seams remain private; F7 exposes only the graph bridge.
 
-//! Hidden RFC-026 F4 NDJSON request driver.
+//! RFC-026 F4 NDJSON request driver and F7 served graph bridge.
 //!
-//! This is deliberately transport-neutral and crate-private. It composes the
+//! The table/lane driver remains crate-private. F7 exposes only a doc-hidden,
+//! transport-neutral graph request seam; HTTP, CLI, SDK, and OpenAPI contracts
+//! are defined by their respective transport crates. Both layers compose the
 //! bounded framing/result primitives with the existing B2 authority and
-//! durability corridor; it does not define an HTTP, CLI, SDK, or OpenAPI
-//! surface.
+//! durability corridor.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -54,7 +56,41 @@ const STREAM_SIZING_ATTEMPT_ID: &str = "00000000-0000-4000-8000-000000000001";
 const GRAPH_STREAM_SIZING_UUID: &str = "00000000-0000-4000-8000-000000000002";
 const STREAM_TAIL_SIZING_RETRY_DELAY: Duration = Duration::from_millis(1);
 
-pub(super) type StreamChunkSource = Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send + 'static>>;
+/// Publicly observable maximum coalescing dwell for one non-full graph
+/// request run. Storage, authority, and backpressure can add acknowledgement
+/// latency after submission; this bound only prevents a complete row from
+/// waiting indefinitely for another body chunk, a lane switch, or EOF.
+const GRAPH_STREAM_RUN_MAX_COALESCE_DELAY: Duration = Duration::from_millis(50);
+
+fn served_graph_authority_mismatch() -> OmniError {
+    OmniError::StreamingAuthorityMismatch {
+        reason: "supplied graph stream ingest authority token is malformed or stale".to_string(),
+    }
+}
+
+fn normalize_token_bound_start_error(error: OmniError, token_bound: bool) -> OmniError {
+    if token_bound
+        && matches!(
+            &error,
+            OmniError::StreamingRequiresClusterRuntime { .. }
+                | OmniError::StreamingAuthorityMismatch { .. }
+                | OmniError::StreamAuthorityRetired { .. }
+        )
+    {
+        served_graph_authority_mismatch()
+    } else {
+        error
+    }
+}
+
+/// Transport-neutral chunk source accepted by the served graph firehose.
+///
+/// Each item is one bounded transport chunk, not necessarily one NDJSON line.
+/// The engine's existing framer retains the 32-MiB chunk/line limits.
+#[doc(hidden)]
+pub type GraphStreamChunkSource = Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send + 'static>>;
+
+pub(super) type StreamChunkSource = GraphStreamChunkSource;
 
 struct TransportOwnership {
     _permit: StreamRequestPermit,
@@ -109,16 +145,41 @@ struct GraphStreamLineOutcome {
     outcome: StreamLineOutcome,
 }
 
-/// Hidden graph-native request handle. The existing line outcome retains all
-/// private evidence needed for stop-tail safety, while this wrapper attaches
-/// only caller-logical row identity for the redacted graph projection.
-struct GraphStreamRequestHandle {
+/// Move-only served graph-ingest request.
+///
+/// The existing line outcome retains all private evidence needed for stop-tail
+/// safety, while this wrapper attaches only caller-logical row identity for the
+/// redacted graph projection.
+///
+/// Dropping the handle closes the bounded result receiver. The existing
+/// request task observes that closure before polling more body input while any
+/// already-invoked durable call remains owned until it settles.
+#[doc(hidden)]
+pub struct GraphStreamIngestHandle {
     inner: StreamRequestHandle,
     routes: Arc<Mutex<BTreeMap<u64, GraphLineRoute>>>,
 }
 
-impl GraphStreamRequestHandle {
-    async fn recv(&mut self) -> Result<Option<GraphStreamLineOutcome>> {
+impl GraphStreamIngestHandle {
+    /// Receive one newline-terminated, graph-logical NDJSON result.
+    ///
+    /// The projection deliberately omits table, dataset, lane, binding,
+    /// writer, shard, epoch, generation, and recovery-sidecar identities.
+    pub async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+        let Some(outcome) = self.recv_inner().await? else {
+            return Ok(None);
+        };
+        let mut encoded =
+            serde_json::to_vec(&graph_stream_line_outcome_json(&outcome)).map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "graph stream result serialization failed: {error}"
+                ))
+            })?;
+        encoded.push(b'\n');
+        Ok(Some(encoded))
+    }
+
+    async fn recv_inner(&mut self) -> Result<Option<GraphStreamLineOutcome>> {
         let Some(outcome) = self.inner.recv().await? else {
             return Ok(None);
         };
@@ -128,6 +189,28 @@ impl GraphStreamRequestHandle {
             .map_err(|_| OmniError::manifest_internal("graph stream route registry was poisoned"))?
             .remove(&outcome.ordinal);
         Ok(Some(GraphStreamLineOutcome { route, outcome }))
+    }
+}
+
+/// Effect-free served-ingest start disposition.
+#[doc(hidden)]
+pub enum GraphStreamIngestStart {
+    /// The caller must retry the request with this exact graph authority token.
+    /// The supplied body was never polled.
+    TokenRequired { authority_token: String },
+    /// The supplied token matched current checked-runtime graph authority and
+    /// the bounded request task now owns body polling.
+    Ready(GraphStreamIngestHandle),
+}
+
+impl fmt::Debug for GraphStreamIngestStart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TokenRequired { .. } => {
+                formatter.write_str("TokenRequired { authority_token: <opaque> }")
+            }
+            Self::Ready(_) => formatter.write_str("Ready(<graph-stream-ingest-handle>)"),
+        }
     }
 }
 
@@ -335,7 +418,7 @@ impl Omnigraph {
         self: &Arc<Self>,
         actor_id: &str,
         body: StreamChunkSource,
-    ) -> Result<GraphStreamRequestHandle> {
+    ) -> Result<GraphStreamIngestHandle> {
         self.enforce(
             omnigraph_policy::PolicyAction::StreamIngest,
             &omnigraph_policy::ResourceScope::Graph,
@@ -343,25 +426,97 @@ impl Omnigraph {
         )?;
         let contributor_id = TrustedContributorId::new(actor_id.to_string())
             .map_err(|error| OmniError::manifest(error.to_string()))?;
+
+        self.start_graph_stream_ingest_after_token(actor_id, contributor_id, None, body)
+            .await
+    }
+
+    /// Start one checked-runtime graph-native served firehose request.
+    ///
+    /// Authorization, runtime validation, and the exact graph-authority
+    /// challenge complete before `body` is polled. A missing token returns the
+    /// current opaque token. A malformed or stale token refuses without
+    /// returning replacement authority and before lazy enrollment, recovery,
+    /// folding, or MemWAL invocation. An exact token transfers the body into
+    /// the existing bounded F4 request owner.
+    #[doc(hidden)]
+    pub async fn start_served_graph_stream_ingest_as(
+        self: &Arc<Self>,
+        actor_id: &str,
+        supplied_authority_token: Option<&str>,
+        body: GraphStreamChunkSource,
+    ) -> Result<GraphStreamIngestStart> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::StreamIngest,
+            &omnigraph_policy::ResourceScope::Graph,
+            Some(actor_id),
+        )?;
+        let contributor_id = TrustedContributorId::new(actor_id.to_string())
+            .map_err(|error| OmniError::manifest(error.to_string()))?;
+
+        let expected_graph_witness = {
+            let profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+            self.ensure_streaming_ingest_runtime_authorized().await?;
+            let txn = self.open_write_txn(None).await?;
+            let witness = StreamGraphIngestWitness::capture(&txn)?;
+            drop(profile_guard);
+            witness
+        };
+        let authority_token = expected_graph_witness.authority_token();
+        let Some(supplied) = supplied_authority_token else {
+            return Ok(GraphStreamIngestStart::TokenRequired { authority_token });
+        };
+        if supplied != authority_token {
+            return Err(served_graph_authority_mismatch());
+        }
+
+        let handle = self
+            .start_graph_stream_ingest_after_token(
+                actor_id,
+                contributor_id,
+                Some(&expected_graph_witness),
+                body,
+            )
+            .await?;
+        Ok(GraphStreamIngestStart::Ready(handle))
+    }
+
+    async fn start_graph_stream_ingest_after_token(
+        self: &Arc<Self>,
+        actor_id: &str,
+        contributor_id: TrustedContributorId,
+        expected_graph_witness: Option<&StreamGraphIngestWitness>,
+        body: GraphStreamChunkSource,
+    ) -> Result<GraphStreamIngestHandle> {
+        let token_bound = expected_graph_witness.is_some();
         let permit = self.stream_requests.try_acquire(actor_id)?;
 
         {
             let initial_profile_guard = self.write_queue().acquire_stream_profile_shared().await;
-            self.ensure_streaming_ingest_runtime_authorized().await?;
+            self.ensure_streaming_ingest_runtime_authorized()
+                .await
+                .map_err(|error| normalize_token_bound_start_error(error, token_bound))?;
             drop(initial_profile_guard);
         }
         // Settle the existing coordinator's cold startup cut before this
         // request can make an edge lane resident. Otherwise the sole resident
         // slot could make a previously acknowledged endpoint node lose the
         // node-before-edge round and turn a valid edge into a dead letter.
-        self.settle_initial_stream_lanes_for_graph_ingest().await?;
+        self.settle_initial_stream_lanes_for_graph_ingest()
+            .await
+            .map_err(|error| normalize_token_bound_start_error(error, token_bound))?;
         // The root→profile lock order above deliberately opens a transition
         // window. Reacquire profile authority and revalidate it before the
         // request pins its graph witness/catalog or polls the body.
         let profile_guard = self.write_queue().acquire_stream_profile_shared().await;
-        self.ensure_streaming_ingest_runtime_authorized().await?;
+        self.ensure_streaming_ingest_runtime_authorized()
+            .await
+            .map_err(|error| normalize_token_bound_start_error(error, token_bound))?;
         let txn = self.open_write_txn(None).await?;
-        let expected_graph_witness = StreamGraphIngestWitness::capture(&txn)?;
+        let current_graph_witness = StreamGraphIngestWitness::capture(&txn)?;
+        if expected_graph_witness.is_some_and(|expected| expected != &current_graph_witness) {
+            return Err(served_graph_authority_mismatch());
+        }
         let catalog = Arc::new(super::public_catalog_view(&txn.catalog)?);
         drop(profile_guard);
 
@@ -379,14 +534,14 @@ impl Omnigraph {
                 actor_id,
                 contributor_id,
                 catalog,
-                expected_graph_witness,
+                current_graph_witness,
                 body,
                 sender,
                 task_routes,
             )
             .await;
         });
-        Ok(GraphStreamRequestHandle {
+        Ok(GraphStreamIngestHandle {
             inner: StreamRequestHandle {
                 receiver,
                 task: Some(task),
@@ -409,8 +564,10 @@ impl Omnigraph {
         let body = Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)));
         let mut handle = self.stream_ingest_graph_ndjson_as(actor_id, body).await?;
         let mut results = Vec::new();
-        while let Some(outcome) = handle.recv().await? {
-            results.push(graph_stream_line_outcome_json(&outcome).to_string());
+        while let Some(line) = handle.recv().await? {
+            let line = std::str::from_utf8(&line)
+                .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+            results.push(line.trim_end_matches('\n').to_string());
         }
         Ok(results)
     }
@@ -474,11 +631,26 @@ async fn drive_graph_request(
     let mut blocker: Option<StreamRequestBlocker> = None;
     let mut results = OrderedResultBuffer::new(0);
     let mut next_input_ordinal = 0_u64;
+    let mut run_flush_deadline = None;
 
     loop {
         tokio::select! {
             biased;
             _ = sender.closed() => return,
+            _ = wait_for_graph_run_flush(run_flush_deadline.map(|(_, deadline)| deadline)) => {
+                if !flush_graph_run(
+                    &db,
+                    &contributor_id,
+                    lane.as_ref(),
+                    &mut run,
+                    &mut blocker,
+                    &mut results,
+                    &sender,
+                ).await {
+                    return;
+                }
+                sync_graph_run_flush_deadline(&mut run_flush_deadline, run.as_ref());
+            }
             next = body.next() => {
                 match next {
                     Some(Ok(chunk)) => {
@@ -512,7 +684,7 @@ async fn drive_graph_request(
                                 return;
                             }
                             next_input_ordinal = frame.ordinal().saturating_add(1);
-                            if !process_graph_frame(
+                            let keep_driving = process_graph_frame(
                                 &db,
                                 &actor_id,
                                 &contributor_id,
@@ -525,7 +697,12 @@ async fn drive_graph_request(
                                 &mut results,
                                 &sender,
                                 &routes,
-                            ).await {
+                            ).await;
+                            sync_graph_run_flush_deadline(
+                                &mut run_flush_deadline,
+                                run.as_ref(),
+                            );
+                            if !keep_driving {
                                 return;
                             }
                         }
@@ -594,6 +771,35 @@ async fn drive_graph_request(
         &sender,
     )
     .await;
+}
+
+async fn wait_for_graph_run_flush(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn sync_graph_run_flush_deadline(
+    deadline: &mut Option<(u64, tokio::time::Instant)>,
+    run: Option<&AccumulatingRun>,
+) {
+    let first_ordinal = run.and_then(|run| run.rows.first()).map(|row| row.ordinal);
+    sync_graph_run_flush_deadline_at(deadline, first_ordinal, tokio::time::Instant::now());
+}
+
+fn sync_graph_run_flush_deadline_at(
+    deadline: &mut Option<(u64, tokio::time::Instant)>,
+    first_ordinal: Option<u64>,
+    now: tokio::time::Instant,
+) {
+    match (first_ordinal, deadline.as_ref()) {
+        (Some(first_ordinal), Some((current_ordinal, _))) if first_ordinal == *current_ordinal => {}
+        (Some(first_ordinal), _) => {
+            *deadline = Some((first_ordinal, now + GRAPH_STREAM_RUN_MAX_COALESCE_DELAY));
+        }
+        (None, _) => *deadline = None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2315,7 +2521,6 @@ async fn emit_ordered(
     true
 }
 
-#[cfg(feature = "failpoints")]
 fn graph_stream_line_outcome_json(outcome: &GraphStreamLineOutcome) -> serde_json::Value {
     let line = &outcome.outcome;
     let status = graph_status_name(line.status());
@@ -2374,7 +2579,6 @@ fn graph_stream_line_outcome_json(outcome: &GraphStreamLineOutcome) -> serde_jso
     value
 }
 
-#[cfg(feature = "failpoints")]
 fn graph_status_name(status: StreamLineStatus) -> &'static str {
     match status {
         StreamLineStatus::StreamBindingChanged
@@ -2385,7 +2589,6 @@ fn graph_status_name(status: StreamLineStatus) -> &'static str {
     }
 }
 
-#[cfg(feature = "failpoints")]
 fn graph_status_scope(status: StreamLineStatus) -> &'static str {
     match status {
         StreamLineStatus::AckUnknown
@@ -2408,7 +2611,6 @@ fn graph_status_scope(status: StreamLineStatus) -> &'static str {
     }
 }
 
-#[cfg(feature = "failpoints")]
 fn graph_safe_message(status: StreamLineStatus) -> Option<&'static str> {
     match status {
         StreamLineStatus::Durable
@@ -2525,6 +2727,38 @@ const _: () = assert!(STREAM_REQUEST_MAX_RESULT_STATUSES >= STREAM_RESULT_CHANNE
 #[cfg(all(test, feature = "failpoints"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_run_coalescing_deadline_is_non_resetting() {
+        let start = tokio::time::Instant::now();
+        let mut deadline = None;
+
+        sync_graph_run_flush_deadline_at(&mut deadline, Some(7), start);
+        let original = deadline.expect("a first row starts one deadline");
+        assert_eq!(original.0, 7);
+        assert_eq!(original.1, start + GRAPH_STREAM_RUN_MAX_COALESCE_DELAY);
+
+        sync_graph_run_flush_deadline_at(
+            &mut deadline,
+            Some(7),
+            start + Duration::from_millis(40),
+        );
+        assert_eq!(
+            deadline,
+            Some(original),
+            "more rows in the same run cannot extend its first-row deadline"
+        );
+
+        let next_start = start + Duration::from_millis(60);
+        sync_graph_run_flush_deadline_at(&mut deadline, Some(8), next_start);
+        assert_eq!(
+            deadline,
+            Some((8, next_start + GRAPH_STREAM_RUN_MAX_COALESCE_DELAY))
+        );
+
+        sync_graph_run_flush_deadline_at(&mut deadline, None, next_start);
+        assert!(deadline.is_none(), "an empty run owns no timer");
+    }
 
     fn test_request_handle(
         receiver: tokio::sync::mpsc::Receiver<StreamLineOutcome>,
