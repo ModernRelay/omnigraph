@@ -10811,13 +10811,16 @@ pub(crate) async fn complete_stream_enrollment_sidecar_v14(
     snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
 ) -> Result<()> {
-    process_stream_enrollment_sidecar_v14(
+    // Keep the deep recovery-and-manifest-publish future on the heap. Lazy
+    // graph enrollment runs on a Tokio worker, and the nested debug Lance
+    // planning stack otherwise overflows the default 2 MiB worker stack.
+    Box::pin(process_stream_enrollment_sidecar_v14(
         root_uri,
         &storage,
         snapshot,
         sidecar,
         StreamEnrollmentCleanup::BestEffortAfterVisible,
-    )
+    ))
     .await
     .map(|_| ())
 }
