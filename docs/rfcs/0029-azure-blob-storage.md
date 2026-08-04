@@ -147,8 +147,9 @@ az://<container>[/<object-prefix>]
 - The object prefix may be empty, although a dedicated cluster prefix is
   recommended.
 - The storage backend accepts an empty prefix, but the Container Apps reference
-  deployment requires a non-empty dedicated prefix so its reserved admission
-  object stays unambiguous and outside graph-root cleanup.
+  deployment requires a non-empty dedicated prefix and rejects the reserved
+  top-level `__omnigraph_azure_admission/` namespace so its admission object
+  stays unambiguous and outside graph-root cleanup.
 - A trailing slash on a root is normalized away, matching S3 root behavior.
 - Joining graph and control paths appends slash-delimited object keys beneath
   the captured root.
