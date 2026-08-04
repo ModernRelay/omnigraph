@@ -22,9 +22,11 @@
 //! Same one-body-two-impls collapse, less ceremony.
 
 use std::io::Write;
+use std::path::Path;
 
 use color_eyre::Result;
-use color_eyre::eyre::bail;
+use color_eyre::eyre::{bail, eyre};
+use futures::stream;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
@@ -36,7 +38,9 @@ use omnigraph_api_types::{
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::Method;
+use reqwest::header::{ACCEPT, CONTENT_TYPE, ETAG, HeaderValue, IF_MATCH};
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::cli::CliLoadMode;
 use crate::helpers::{
@@ -46,6 +50,74 @@ use crate::helpers::{
     resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_result, load_output_from_tables};
+
+const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
+const STREAM_INPUT_CHUNK_BYTES: usize = 64 * 1024;
+
+fn strong_etag_from_bare_graph_token(token: &str) -> Result<HeaderValue> {
+    if token.is_empty()
+        || token.starts_with("W/")
+        || token
+            .chars()
+            .any(|character| character.is_whitespace() || matches!(character, '"' | ',' | '*'))
+    {
+        bail!(
+            "graph token must be one non-empty bare opaque token, without whitespace, quotes, \
+             wildcard, or comma syntax"
+        );
+    }
+    Ok(HeaderValue::from_str(&format!("\"{token}\""))?)
+}
+
+fn validate_strong_etag(value: &HeaderValue) -> Result<()> {
+    let value = value
+        .to_str()
+        .map_err(|_| eyre!("stream ingest preflight returned a non-text ETag"))?;
+    if value.starts_with("W/")
+        || value.len() < 2
+        || !value.starts_with('"')
+        || !value.ends_with('"')
+    {
+        bail!("stream ingest preflight returned a malformed or weak ETag");
+    }
+    strong_etag_from_bare_graph_token(&value[1..value.len() - 1])?;
+    Ok(())
+}
+
+async fn stream_request_error(response: reqwest::Response) -> color_eyre::Report {
+    let status = response.status();
+    match response.text().await {
+        Ok(text) => {
+            if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
+                eyre!(error.error)
+            } else {
+                eyre!("server returned {status}: {text}")
+            }
+        }
+        Err(error) => eyre!("server returned {status}; failed to read error body: {error}"),
+    }
+}
+
+fn streaming_request_body(reader: Box<dyn AsyncRead + Send + Unpin>) -> reqwest::Body {
+    let chunks = stream::try_unfold(reader, |mut reader| async move {
+        let mut chunk = vec![0_u8; STREAM_INPUT_CHUNK_BYTES];
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok::<_, std::io::Error>(None);
+        }
+        chunk.truncate(read);
+        Ok(Some((chunk, reader)))
+    });
+    reqwest::Body::wrap_stream(chunks)
+}
+
+async fn open_stream_input(path: &Path) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
+    if path == Path::new("-") {
+        Ok(Box::new(tokio::io::stdin()))
+    } else {
+        Ok(Box::new(tokio::fs::File::open(path).await?))
+    }
+}
 
 pub(crate) enum GraphClient {
     /// Local engine at `uri`. Reads (`resolve()`) leave `actor` empty;
@@ -237,6 +309,45 @@ impl GraphClient {
             capability,
             crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
         )?;
+        Self::resolve_with_policy_scope(scope, cli_as).await
+    }
+
+    /// Resolve the served graph selected by `stream ingest`. Unlike the
+    /// legacy data-command resolver, this surface has no flat/single-graph
+    /// server fallback: OmniGraph servers are cluster-only, so the route must
+    /// include one graph selected explicitly or by configuration.
+    pub(crate) async fn resolve_stream_ingest(
+        server: Option<&str>,
+        graph: Option<&str>,
+        cli_as: Option<&str>,
+        profile: Option<&str>,
+        store: Option<&str>,
+    ) -> Result<Self> {
+        let scope = crate::scope::resolve_scope(
+            &crate::operator::load_operator_config()?,
+            crate::planes::Capability::Served,
+            crate::scope::ScopeFlags {
+                profile,
+                store,
+                server,
+                cluster: None,
+                graph,
+                uri: None,
+            },
+        )?;
+        if scope.graph.is_none() {
+            bail!(
+                "`stream ingest` requires one selected graph; pass --graph <id> with \
+                 --server, or configure default_graph on the selected server profile"
+            );
+        }
+        Self::resolve_with_policy_scope(scope, cli_as).await
+    }
+
+    async fn resolve_with_policy_scope(
+        scope: crate::scope::ResolvedScope,
+        cli_as: Option<&str>,
+    ) -> Result<Self> {
         require_graph_for_multi_graph_server(&scope).await?;
         let (server, graph, uri) = (
             scope.server.as_deref(),
@@ -817,6 +928,94 @@ impl GraphClient {
         }
     }
 
+    /// `stream ingest` — send one incremental NDJSON request to a served
+    /// graph and copy its ordered NDJSON outcomes directly into `writer`.
+    ///
+    /// With no caller-supplied graph token, the client first makes one empty
+    /// request and requires the server's 428 strong-ETag challenge. Only then
+    /// does it open `data`, so a refused preflight cannot consume stdin or
+    /// touch a file. A supplied token skips the preflight. In either case the
+    /// input body is opened and invoked at most once: 412 and every other
+    /// response error are surfaced without replacing the token or replaying
+    /// an owned body.
+    pub(crate) async fn stream_ingest<W: Write>(
+        &self,
+        data: &Path,
+        graph_token: Option<&str>,
+        writer: &mut W,
+    ) -> Result<()> {
+        let GraphClient::Remote {
+            http,
+            base_url,
+            token,
+        } = self
+        else {
+            bail!(
+                "`stream ingest` requires a served graph; address it with --server <name|url> \
+                 or a server-backed --profile"
+            );
+        };
+
+        let url = remote_url(base_url, &["stream", "ingest"], &[])?;
+        let graph_etag = match graph_token {
+            Some(token) => strong_etag_from_bare_graph_token(token)?,
+            None => {
+                let preflight =
+                    apply_bearer_token(http.request(Method::POST, url.clone()), token.as_deref())
+                        .header(CONTENT_TYPE, NDJSON_CONTENT_TYPE)
+                        .header(ACCEPT, NDJSON_CONTENT_TYPE)
+                        .send()
+                        .await?;
+                if preflight.status() != reqwest::StatusCode::PRECONDITION_REQUIRED {
+                    return Err(stream_request_error(preflight).await);
+                }
+                let etag =
+                    preflight.headers().get(ETAG).cloned().ok_or_else(|| {
+                        eyre!("stream ingest preflight omitted its ETag challenge")
+                    })?;
+                validate_strong_etag(&etag)?;
+                // The ETag is authoritative. Drop rather than buffer an
+                // untrusted challenge body; the exact request may use a fresh
+                // connection.
+                drop(preflight);
+                etag
+            }
+        };
+
+        // This is deliberately below the successful preflight. The resulting
+        // Body is single-use and no response branch reconstructs it.
+        let body = streaming_request_body(open_stream_input(data).await?);
+        let request = apply_bearer_token(http.request(Method::POST, url), token.as_deref())
+            .header(CONTENT_TYPE, NDJSON_CONTENT_TYPE)
+            .header(ACCEPT, NDJSON_CONTENT_TYPE)
+            .header(IF_MATCH, graph_etag)
+            .body(body);
+        let mut response = request.send().await?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(stream_request_error(response).await);
+        }
+        let response_is_ndjson = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|media_type| {
+                media_type
+                    .trim()
+                    .eq_ignore_ascii_case(NDJSON_CONTENT_TYPE)
+            });
+        if !response_is_ndjson {
+            bail!(
+                "stream ingest requires an exact 200 application/x-ndjson response from the server"
+            );
+        }
+        while let Some(chunk) = response.chunk().await? {
+            writer.write_all(&chunk)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
     /// `export` — stream the branch as JSONL into `writer`. The streaming
     /// shape (a `W: Write`, not a returned DTO) is why this lands in 3c
     /// rather than 3b. Opens WITHOUT policy (like reads), so it is reached
@@ -902,6 +1101,93 @@ impl GraphClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    struct CapturedRequest {
+        head: String,
+        body: Vec<u8>,
+    }
+
+    async fn ensure_buffered(stream: &mut TcpStream, bytes: &mut Vec<u8>, needed: usize) {
+        while bytes.len() < needed {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(read, 0, "connection closed before the request completed");
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    async fn read_http_request(stream: &mut TcpStream) -> CapturedRequest {
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            if let Some(pos) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let needed = bytes.len() + 1;
+            ensure_buffered(stream, &mut bytes, needed).await;
+        };
+        let head = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+        let mut remaining = bytes.split_off(header_end);
+        let lowercase = head.to_ascii_lowercase();
+        let body = if lowercase.contains("transfer-encoding: chunked") {
+            let mut body = Vec::new();
+            loop {
+                let line_end = loop {
+                    if let Some(pos) = remaining.windows(2).position(|window| window == b"\r\n") {
+                        break pos;
+                    }
+                    let needed = remaining.len() + 1;
+                    ensure_buffered(stream, &mut remaining, needed).await;
+                };
+                let size_text = std::str::from_utf8(&remaining[..line_end]).unwrap();
+                let size =
+                    usize::from_str_radix(size_text.split(';').next().unwrap().trim(), 16).unwrap();
+                remaining.drain(..line_end + 2);
+                if size == 0 {
+                    ensure_buffered(stream, &mut remaining, 2).await;
+                    assert_eq!(&remaining[..2], b"\r\n");
+                    break;
+                }
+                ensure_buffered(stream, &mut remaining, size + 2).await;
+                body.extend_from_slice(&remaining[..size]);
+                assert_eq!(&remaining[size..size + 2], b"\r\n");
+                remaining.drain(..size + 2);
+            }
+            body
+        } else {
+            let content_length = lowercase
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map(|value| value.trim().parse::<usize>().unwrap())
+                .unwrap_or(0);
+            ensure_buffered(stream, &mut remaining, content_length).await;
+            remaining[..content_length].to_vec()
+        };
+        CapturedRequest { head, body }
+    }
+
+    async fn write_response(
+        stream: &mut TcpStream,
+        status: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) {
+        let mut head = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(value);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
 
     #[test]
     fn resolve_registry_is_sync_and_yields_the_bare_base_url() {
@@ -916,5 +1202,223 @@ mod tests {
             GraphClient::resolve_registry(Some("http://server.invalid:9/"), None).unwrap();
         assert_eq!(client.uri(), "http://server.invalid:9");
         assert!(client.is_remote());
+    }
+
+    #[tokio::test]
+    async fn stream_ingest_preflights_before_opening_input_and_copies_jsonl() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("created-after-preflight.ndjson");
+        assert!(!data.exists());
+        let server_data = data.clone();
+        let input = b"{\"type\":\"Person\",\"data\":{\"name\":\"Alice\"}}\n".to_vec();
+        let expected_input = input.clone();
+        let output =
+            b"{\"ordinal\":0,\"status\":\"durable\"}\n{\"ordinal\":1,\"status\":\"invalid\"}\n"
+                .to_vec();
+        let expected_output = output.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut preflight, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut preflight).await;
+            assert!(request.head.starts_with("POST /stream/ingest HTTP/1.1"));
+            assert!(!request.head.to_ascii_lowercase().contains("if-match:"));
+            assert!(request.body.is_empty());
+            tokio::fs::write(&server_data, &input).await.unwrap();
+            write_response(
+                &mut preflight,
+                "428 Precondition Required",
+                &[
+                    ("Content-Type", "application/json"),
+                    ("ETag", "\"sha256:graph-a\""),
+                ],
+                br#"{"graph_token":"sha256:graph-a"}"#,
+            )
+            .await;
+
+            let (mut ingest, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut ingest).await;
+            assert!(request.head.starts_with("POST /stream/ingest HTTP/1.1"));
+            let lowercase = request.head.to_ascii_lowercase();
+            assert!(lowercase.contains("content-type: application/x-ndjson"));
+            assert!(lowercase.contains("accept: application/x-ndjson"));
+            assert!(lowercase.contains("if-match: \"sha256:graph-a\""));
+            write_response(
+                &mut ingest,
+                "200 OK",
+                &[("Content-Type", "application/x-ndjson")],
+                &output,
+            )
+            .await;
+            request.body
+        });
+
+        let client = GraphClient::Remote {
+            http: reqwest::Client::new(),
+            base_url,
+            token: None,
+        };
+        let mut actual_output = Vec::new();
+        client
+            .stream_ingest(&data, None, &mut actual_output)
+            .await
+            .unwrap();
+        assert_eq!(server.await.unwrap(), expected_input);
+        assert_eq!(actual_output, expected_output);
+    }
+
+    #[tokio::test]
+    async fn supplied_graph_token_is_sent_once_and_never_replaced_on_412() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("input.ndjson");
+        let input = b"{\"type\":\"Person\",\"data\":{\"name\":\"Alice\"}}\n";
+        tokio::fs::write(&data, input).await.unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut ingest, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut ingest).await;
+            let lowercase = request.head.to_ascii_lowercase();
+            assert!(lowercase.contains("if-match: \"sha256:stale\""));
+            assert_eq!(request.body, input);
+            write_response(
+                &mut ingest,
+                "412 Precondition Failed",
+                &[("Content-Type", "application/json")],
+                br#"{"error":"stale graph token"}"#,
+            )
+            .await;
+            tokio::time::timeout(std::time::Duration::from_millis(150), listener.accept())
+                .await
+                .is_err()
+        });
+
+        let client = GraphClient::Remote {
+            http: reqwest::Client::new(),
+            base_url,
+            token: None,
+        };
+        let error = client
+            .stream_ingest(&data, Some("sha256:stale"), &mut Vec::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stale graph token"));
+        assert!(server.await.unwrap(), "the client retried a consumed body");
+    }
+
+    #[tokio::test]
+    async fn stream_ingest_requires_exact_200_ndjson_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("input.ndjson");
+        tokio::fs::write(&data, b"{}\n").await.unwrap();
+
+        for (status, content_type) in [
+            ("204 No Content", "application/x-ndjson"),
+            ("206 Partial Content", "application/x-ndjson"),
+            ("200 OK", "application/json"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut ingest, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut ingest).await;
+                assert_eq!(request.body, b"{}\n");
+                write_response(
+                    &mut ingest,
+                    status,
+                    &[("Content-Type", content_type)],
+                    &[],
+                )
+                .await;
+            });
+            let client = GraphClient::Remote {
+                http: reqwest::Client::new(),
+                base_url,
+                token: None,
+            };
+            let error = client
+                .stream_ingest(&data, Some("sha256:graph-a"), &mut Vec::new())
+                .await
+                .unwrap_err()
+                .to_string();
+            if status == "200 OK" {
+                assert!(error.contains("exact 200 application/x-ndjson"), "{error}");
+            } else {
+                assert!(error.contains(status.split_whitespace().next().unwrap()), "{error}");
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn graph_token_is_always_bare_and_strong_quoted() {
+        assert_eq!(
+            strong_etag_from_bare_graph_token("sha256:abc")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "\"sha256:abc\""
+        );
+        for invalid in [
+            "",
+            "*",
+            "W/sha256:abc",
+            "\"sha256:abc\"",
+            "sha256:a,sha256:b",
+            "sha256:a b",
+            "a\nb",
+        ] {
+            assert!(strong_etag_from_bare_graph_token(invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_graph_token_is_rejected_before_input_open_or_network() {
+        let client = GraphClient::Remote {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:9".to_string(),
+            token: None,
+        };
+        let error = client
+            .stream_ingest(
+                Path::new("/must-not-open.ndjson"),
+                Some("*"),
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("graph token must be one"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn stream_ingest_requires_and_resolves_a_selected_graph_without_network_io() {
+        let error = match GraphClient::resolve_stream_ingest(
+            Some("http://127.0.0.1:9"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("stream ingest accepted a server without a selected graph"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("requires one selected graph"), "{error}");
+
+        let client = GraphClient::resolve_stream_ingest(
+            Some("http://127.0.0.1:9"),
+            Some("knowledge"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.uri(), "http://127.0.0.1:9/graphs/knowledge");
     }
 }

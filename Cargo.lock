@@ -5026,6 +5026,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "color-eyre",
+ "futures",
  "lance",
  "lance-index",
  "omnigraph-api-types",

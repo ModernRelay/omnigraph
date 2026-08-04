@@ -902,9 +902,10 @@ deletable. Measurements validate those bounds; they do not create them. Generic
 Lance cleanup does not reclaim `_mem_wal`, and OmniGraph must never delete its
 raw paths. Internal schema v9/config-v3/state-v2/recovery-v12 is active for the
 private row/fold slice; v11/profile-v2/recovery-v13 adds only checked profile
-authority and its exact receipt. Every public wire surface remains inactive
-until cancellation, enrolled-lane lifecycle/correction/status, compatibility,
-and parity evidence passes in a later strict strand. The selected
+authority and its exact receipt. F7a exposes only graph-native served row
+ingress over absent or `OPEN` lanes and reuses that private core. Public lane
+enrollment, resume/correction/status/maintenance transport, and embedded/direct
+SDK row ingress remain inactive pending their own evidence. The selected
 unbounded retain-all profile has no physical watermark and no graph-history
 quota. If a future B2b bounded/managed profile is pursued, its physical
 watermark is per binding and does not bound base/token or shared manifest
@@ -1471,8 +1472,8 @@ recovery-v16 private SEALED EnsureIndices; v15 activates the distinct
   are not supported general lifecycle APIs. Historical
   v10 enrollment, v12 fold, and v14 resume/maintenance/correction/retirement
   sidecars are refused, not reinterpreted. Checked offline disable is the sole
-  active quiescence owner; public ingress/enrollment and general
-  resume/abort/rebind integration remain inactive.
+  active quiescence owner. Graph-native served ingress is active; explicit
+  enrollment and general resume/abort/rebind integration remain inactive.
 
 The stamp history (v1 PK-less, v2 unenforced-PK, v3 `__run__*` sweep, v4 lineage
 in `__manifest` with the commit-graph tables retired, v5 stable table identity,

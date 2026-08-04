@@ -1,11 +1,12 @@
-#![allow(dead_code)] // Hidden F4 request vocabulary; production transport activation is intentionally deferred.
+#![allow(dead_code)] // Shared private vocabulary includes controls not activated by F7a.
 
 //! Private, transport-neutral request mechanics for RFC-026 F4.
 //!
 //! This module deliberately owns no HTTP, CLI, or public DTO shape. It provides
-//! only the bounded pieces shared by a future transport adapter: incremental
+//! only the bounded pieces shared by the graph transport adapter: incremental
 //! NDJSON framing, per-line result classification, request admission, and
-//! caller-order result buffering.
+//! caller-order result buffering. F7a's graph-native served adapter reuses
+//! these mechanics; table/lane controls and physical evidence remain private.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, Weak};

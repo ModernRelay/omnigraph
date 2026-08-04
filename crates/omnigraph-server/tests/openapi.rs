@@ -170,6 +170,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/query",
     "/graphs/{graph_id}/export",
+    "/graphs/{graph_id}/stream/ingest",
     "/graphs/{graph_id}/change",
     "/graphs/{graph_id}/mutate",
     "/graphs/{graph_id}/queries",
@@ -233,6 +234,48 @@ fn openapi_read_is_post() {
 fn openapi_export_is_post() {
     let doc = openapi_json();
     assert!(doc["paths"]["/graphs/{graph_id}/export"]["post"].is_object());
+}
+
+#[test]
+fn graph_stream_ingest_documents_ndjson_and_token_preconditions() {
+    let doc = openapi_json();
+    let operation = &doc["paths"]["/graphs/{graph_id}/stream/ingest"]["post"];
+    assert!(operation.is_object());
+
+    let request_body = &operation["requestBody"];
+    assert!(request_body.is_object());
+    assert!(request_body["content"]["application/x-ndjson"].is_object());
+    assert!(
+        request_body["content"].get("application/json").is_none(),
+        "graph streaming input is NDJSON, not a buffered JSON document"
+    );
+    assert!(
+        operation["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|parameter| parameter["name"] == "If-Match" && parameter["in"] == "header"),
+        "graph stream ingest must document its strong graph-token precondition"
+    );
+
+    let responses = &operation["responses"];
+    assert_eq!(
+        responses["200"]["content"]["application/x-ndjson"]["schema"]["$ref"],
+        "#/components/schemas/StreamIngestLineOutput"
+    );
+    for status in ["401", "403", "409", "412", "413", "415", "503"] {
+        assert_eq!(
+            responses[status]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ErrorOutput",
+            "stream ingest {status} must use ErrorOutput"
+        );
+    }
+    assert_eq!(
+        responses["428"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/StreamIngestChallenge"
+    );
+    assert!(responses["428"]["headers"]["ETag"].is_object());
+    assert!(responses["428"]["headers"]["Cache-Control"].is_object());
 }
 
 #[test]
@@ -418,6 +461,11 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "SchemaApplyRequest",
     "SnapshotOutput",
     "SnapshotTableOutput",
+    "StreamIngestChallenge",
+    "StreamIngestKindOutput",
+    "StreamIngestLineOutput",
+    "StreamIngestScopeOutput",
+    "StreamIngestStatusOutput",
 ];
 
 #[test]
@@ -812,6 +860,7 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
         ("/graphs/{graph_id}/export", "post"),
+        ("/graphs/{graph_id}/stream/ingest", "post"),
         ("/graphs/{graph_id}/snapshot", "get"),
         ("/graphs/{graph_id}/branches", "get"),
         ("/graphs/{graph_id}/branches", "post"),
@@ -999,6 +1048,7 @@ fn recovery_barrier_write_endpoints_document_recovery_required() {
         ("/graphs/{graph_id}/queries/{name}", "post"),
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
+        ("/graphs/{graph_id}/stream/ingest", "post"),
         ("/graphs/{graph_id}/branches", "post"),
         ("/graphs/{graph_id}/branches/{branch}", "delete"),
         ("/graphs/{graph_id}/branches/merge", "post"),
@@ -1025,6 +1075,7 @@ fn bounded_keyed_write_endpoints_document_resource_limit() {
         ("/graphs/{graph_id}/queries/{name}", "post"),
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
+        ("/graphs/{graph_id}/stream/ingest", "post"),
         ("/graphs/{graph_id}/branches/merge", "post"),
     ] {
         let response = &doc["paths"][path][method]["responses"]["413"];
@@ -1183,6 +1234,7 @@ async fn auth_mode_spec_has_security_on_protected_operations() {
     let protected_paths = [
         ("/graphs/{graph_id}/read", "post"),
         ("/graphs/{graph_id}/change", "post"),
+        ("/graphs/{graph_id}/stream/ingest", "post"),
         ("/graphs/{graph_id}/snapshot", "get"),
         ("/graphs/{graph_id}/branches", "get"),
         ("/graphs/{graph_id}/commits", "get"),
@@ -1262,6 +1314,7 @@ const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/snapshot",
     "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/export",
+    "/graphs/{graph_id}/stream/ingest",
     "/graphs/{graph_id}/change",
     "/graphs/{graph_id}/schema",
     "/graphs/{graph_id}/schema/apply",
@@ -1336,6 +1389,7 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
         "/snapshot",
         "/read",
         "/export",
+        "/stream/ingest",
         "/change",
         "/schema",
         "/schema/apply",
@@ -1532,6 +1586,7 @@ async fn served_spec_always_nests_under_cluster_prefix() {
         "/read",
         "/query",
         "/export",
+        "/stream/ingest",
         "/change",
         "/mutate",
         "/queries",

@@ -16,7 +16,7 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
 URI): query, mutate, load, branch, snapshot, export, commit, schema show/apply.\n  \
-served — require a server (registry scope, --server/--profile only): graphs.\n  \
+served — require a server: stream ingest (graph scope) and graphs (registry scope).\n  \
 direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
 schema plan, lint).\n  \
 control — manage or inspect a cluster (cluster via --config; policy & queries via \
@@ -247,6 +247,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: GraphsCommand,
     },
+    /// Stream graph rows durably through a served firehose.
+    Stream {
+        #[command(subcommand)]
+        command: StreamCommand,
+    },
 
     // ── Storage / local graph ops ── direct storage or local files; reject --server.
     /// Initialize a new graph from a schema
@@ -369,6 +374,20 @@ pub(crate) enum Command {
     },
     /// Print the CLI version
     Version,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum StreamCommand {
+    /// Stream newline-delimited graph rows to the served graph.
+    Ingest {
+        /// NDJSON input path, or `-` for stdin.
+        #[arg(long, value_name = "PATH|-", default_value = "-")]
+        data: PathBuf,
+        /// Opaque graph-ingest eligibility token. Omit it to obtain one with a
+        /// bodyless preflight before the input is opened.
+        #[arg(long, value_name = "TOKEN")]
+        graph_token: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

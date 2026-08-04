@@ -543,6 +543,96 @@ pub struct ExportRequest {
     pub table_keys: Vec<String>,
 }
 
+/// Effect-free precondition challenge for graph-native streaming ingest.
+///
+/// The same value is returned as a strong `ETag` response header. Clients
+/// retry the request with that tag in `If-Match`; this convenience copy keeps
+/// the graph authority token distinct from the per-row sequencing
+/// [`StreamIngestLineOutput::stream_token`].
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StreamIngestChallenge {
+    pub graph_token: String,
+}
+
+/// Logical declaration kind selected by one graph-native stream row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamIngestKindOutput {
+    Node,
+    Edge,
+}
+
+/// Whether one stream result applies to a single row or blocks the graph-wide
+/// remainder of the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamIngestScopeOutput {
+    Row,
+    Graph,
+}
+
+/// Stable, graph-logical status vocabulary for one streaming-ingest line.
+///
+/// Several private physical-authority transitions intentionally collapse to
+/// `stream_authority_changed`; the transport never exposes lane, binding,
+/// shard, epoch, generation, dataset, or recovery-sidecar identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamIngestStatusOutput {
+    Durable,
+    AckUnknown,
+    AlreadyDurable,
+    Withdrawn,
+    DeadLettered,
+    Invalid,
+    StreamInputTooLarge,
+    StreamAuthorityChanged,
+    StreamSequenceConflict,
+    StreamIdempotencyConflict,
+    StreamFoldRequired,
+    StreamBackpressure,
+    RecoveryRequired,
+    StreamRetryRequired,
+}
+
+/// One ordered, newline-delimited result from graph-native streaming ingest.
+///
+/// Every field is caller-logical or directly actionable retry evidence.
+/// Physical table and MemWAL identities are deliberately absent.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StreamIngestLineOutput {
+    pub ordinal: u64,
+    pub status: StreamIngestStatusOutput,
+    pub scope: StreamIngestScopeOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<StreamIngestKindOutput>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_id: Option<String>,
+    /// Confirmed per-row sequencing token. This is not the graph-level ETag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_token: Option<String>,
+    /// Candidate token whose durability acknowledgement is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unconfirmed_candidate_token: Option<String>,
+    /// Current per-row token returned with a sequencing or terminal outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocking_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocking_status: Option<StreamIngestStatusOutput>,
+}
+
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct SnapshotQuery {
     pub branch: Option<String>,

@@ -167,8 +167,11 @@ profile is enabled, Mutation/Load/delete through an embedded SDK handle or
 direct `--store` CLI handle fail before input-file reads, staging, recovery
 arming, or Lance effects. Existing served Mutation/Load operations continue
 only through the one cluster-booted server carrying the exact checked runtime
-authority. There is not yet a public firehose-ingest endpoint in this release.
-Do not set `streaming: true` expecting an additional input route.
+authority. The graph-native served firehose is available through
+`POST /graphs/{graph_id}/stream/ingest` and remote `stream ingest`, but only an
+absent lane (prepared lazily) or an existing `OPEN` lane can admit rows in F7a.
+An existing `SEALED` lane after disable/re-enable needs the later public resume
+surface; repeated ingest requests do not reopen it.
 Branch merge is stricter: it is refused while the profile is `ENABLED` or
 `DISABLING`, even through that checked served runtime, because this release has
 no token-aware merge transition.

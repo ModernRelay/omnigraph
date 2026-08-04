@@ -172,8 +172,59 @@ the request body and response handling alone.
 
 ## Streaming
 
-Only `/export` streams (`application/x-ndjson`); everything else is buffered
-JSON. Export authorization, relevant checked recovery settlement/validation,
+The experimental graph-native firehose is
+`POST /graphs/{graph_id}/stream/ingest`. Its request and successful response
+are both `application/x-ndjson`; logical node and edge declarations may be
+mixed in one ordered request. The request is a firehose, not one graph
+transaction: earlier durable rows are not rolled back by a later failure, and
+an edge must follow the endpoint nodes it needs because forward references are
+not buffered. The URL never names a table, dataset, lane, or stream
+incarnation. Each response line reports only caller-logical identity, the
+acknowledgement disposition, and safe sequencing evidence.
+
+```json
+{"type":"Person","data":{"id":"p1","name":"Ada"},"$stream":{"write_id":"8a880f0a-3f41-4a42-9b0e-f34af0a9a4df","predecessor_token":null}}
+{"edge":"Knows","from":"p1","to":"p2","data":{},"$stream":{"write_id":"83ed1d92-87bb-489f-a64a-202e8369b46f","predecessor_token":null}}
+```
+
+Ingest uses an opaque graph-authority ETag to prevent a producer from writing
+an owned body into a rebuilt or reconfigured graph at the same URL. A request
+without `If-Match` is authorized and preflighted without polling its body, then
+returns HTTP **428** with the current strong `ETag`, `Cache-Control: no-store`,
+and a small JSON challenge. Retry once with that exact value in `If-Match`. A malformed or stale value
+returns HTTP **412** without a replacement token; the caller must re-check its
+target and must not automatically replay an already-owned body. The CLI
+performs the missing-token handshake before opening its input. With bearer
+authentication but no applied policy bundle, default-deny mode returns **403**
+before polling the body; an explicit graph-level `stream_ingest` grant is
+required.
+
+```http
+ETag: "sha256:…"
+Cache-Control: no-store
+
+{"graph_token":"sha256:…"}
+```
+
+After the exact precondition passes, input and results stream incrementally
+through bounded queues. Acknowledgement means the row is durable in Lance
+MemWAL, not yet graph-visible. The resident server driver later validates and
+publishes folds through the ordinary atomic graph publication path. A row-local
+shape/value error does not invalidate earlier acknowledgements. An ambiguous
+acknowledgement or graph-authority/backpressure failure stops later physical
+invocation. For `ack_unknown`, retry the exact same logical row with the same
+`write_id`, predecessor, and payload; the unconfirmed candidate token is not
+valid as a successor predecessor. Uninvoked rows may be retried only after the
+graph blocker is resolved. Disconnect
+stops future body polling while already-invoked work remains owned until its
+durability result is classified.
+
+F7a admits an absent declaration lane (prepared lazily) or an existing `OPEN`
+lane. It does not expose resume: a `SEALED` lane after disable/re-enable returns
+`stream_authority_changed` until a later graph-level resume surface exists.
+
+The existing `/export` route also streams `application/x-ndjson`; other routes
+remain buffered JSON. Export authorization, relevant checked recovery settlement/validation,
 branch/filter validation, and stream-authority validation all finish before the
 server sends `200`. A pristine graph may export normally. An enrolled
 `DISABLED` graph must be cluster-served at that exact terminal cut; ordinary
@@ -238,7 +289,9 @@ structured field is additive and rolling-safe.
 Do not blindly resubmit the write: let a read-write open or the recovery sweep
 resolve that operation first, then retry from a fresh snapshot.
 
-HTTP status codes used: 200, 400, 401, 403, 404, 405, 409, 429, 500, 503.
+HTTP status codes used include 200, 400, 401, 403, 404, 405, 409, 412, 413,
+415, 428, 429, 500, and 503. The firehose-specific 412/415/428 meanings are
+defined in [Streaming](#streaming).
 
 ## Per-actor admission control
 
@@ -274,6 +327,12 @@ deprecated alias `/change`), `/load` (and its deprecated alias `/ingest`),
 and `/schema/apply`. Read-only endpoints (`/snapshot`, `/query`, `/read`,
 `/export`, `/branches` GET, `/commits`, `/schema` GET) are not
 admission-gated.
+
+Graph firehose uses the engine's separate bounded per-actor and per-graph
+stream-request registry because its body is incremental rather than a buffered
+request with an up-front byte estimate. That permit is acquired before body
+polling and remains owned by the request task through invoked-tail settlement;
+saturation returns structured HTTP **413** without consuming the body.
 
 ## Body limits
 

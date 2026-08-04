@@ -2,12 +2,20 @@
 //! Moved verbatim from tests/server.rs in the modularization.
 
 use std::fs;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
+use axum::http::header::{CACHE_CONTROL, ETAG, HeaderValue, IF_MATCH};
 use axum::http::{Method, Request, StatusCode};
+use futures::StreamExt;
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_server::api::{ChangeRequest, ErrorOutput, ExportRequest, ReadRequest};
+use omnigraph_server::api::{
+    ChangeRequest, ErrorOutput, ExportRequest, QueryRequest, ReadRequest, StreamIngestChallenge,
+    StreamIngestKindOutput, StreamIngestLineOutput, StreamIngestStatusOutput,
+};
 use omnigraph_server::{AppState, build_app};
 use serde_json::Value;
 use serial_test::serial;
@@ -462,13 +470,50 @@ async fn cluster_boot_serves_applied_state() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-#[tokio::test]
-#[serial]
-async fn cluster_boot_installs_enabled_stream_runtime_authority() {
+fn stream_body_poll_probe(polled: Arc<AtomicBool>) -> Body {
+    Body::from_stream(futures::stream::once(async move {
+        polled.store(true, Ordering::SeqCst);
+        Ok::<_, std::io::Error>(Bytes::from_static(b"{}\n"))
+    }))
+}
+
+fn served_graph_node_line(type_name: &str, id: &str, score: i32, write_id: &str) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "type": type_name,
+        "data": {"id": id, "score": score},
+        "$stream": {"write_id": write_id, "predecessor_token": null},
+    }))
+    .unwrap();
+    line.push(b'\n');
+    line
+}
+
+fn served_graph_edge_line(
+    type_name: &str,
+    id: &str,
+    from: &str,
+    to: &str,
+    write_id: &str,
+) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "edge": type_name,
+        "from": from,
+        "to": to,
+        "data": {"id": id},
+        "$stream": {"write_id": write_id, "predecessor_token": null},
+    }))
+    .unwrap();
+    line.push(b'\n');
+    line
+}
+
+async fn enabled_stream_state(
+    tokens: Vec<(String, String)>,
+) -> (tempfile::TempDir, AppState, Arc<Omnigraph>) {
     let temp = tempfile::tempdir().unwrap();
     fs::write(
         temp.path().join("people.pg"),
-        "\nnode Person {\n  name: String @key\n}\n",
+        "\nnode Person {\n  score: I32\n}\nedge Knows: Person -> Person\n",
     )
     .unwrap();
     fs::write(
@@ -516,13 +561,34 @@ graphs:
 
     let state = omnigraph_server::open_multi_graph_state(
         graphs,
-        Vec::new(),
+        tokens,
         server_policy.as_ref(),
         config_path,
         false,
     )
     .await
     .unwrap();
+    let engine = Arc::clone(
+        &state
+            .routing()
+            .registry
+            .list()
+            .into_iter()
+            .next()
+            .expect("enabled cluster graph must be registered")
+            .engine,
+    );
+    engine
+        .start_stream_fold_driver()
+        .await
+        .expect("served graph starts its resident fold driver");
+    (temp, state, engine)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn cluster_boot_installs_enabled_stream_runtime_authority() {
+    let (_temp, state, engine) = enabled_stream_state(Vec::new()).await;
     let app = build_app(state);
     let (status, body) = json_response(
         &app,
@@ -550,9 +616,9 @@ graphs:
     );
 
     let request = ChangeRequest {
-        query: "query insert_person($name: String) { insert Person { name: $name } }".to_string(),
+        query: "query insert_person($score: I32) { insert Person { score: $score } }".to_string(),
         name: Some("insert_person".to_string()),
-        params: Some(serde_json::json!({ "name": "served-runtime" })),
+        params: Some(serde_json::json!({ "score": 7 })),
         branch: Some("main".to_string()),
     };
     let (status, body) = json_response(
@@ -566,6 +632,322 @@ graphs:
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+
+    let challenge_polled = Arc::new(AtomicBool::new(false));
+    let challenge_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/graphs/knowledge/stream/ingest")
+                .header("content-type", "application/x-ndjson")
+                .body(stream_body_poll_probe(Arc::clone(&challenge_polled)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        challenge_response.status(),
+        StatusCode::PRECONDITION_REQUIRED
+    );
+    assert!(
+        !challenge_polled.load(Ordering::SeqCst),
+        "the graph-token challenge must not poll the request body"
+    );
+    assert_eq!(
+        challenge_response.headers().get(CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+    let etag = challenge_response
+        .headers()
+        .get(ETAG)
+        .cloned()
+        .expect("428 challenge carries a strong ETag");
+    let etag_text = etag.to_str().unwrap();
+    assert!(
+        etag_text.starts_with("\"sha256:") && etag_text.ends_with('"'),
+        "challenge must carry the opaque graph token as a strong ETag: {etag_text}"
+    );
+    let authority_token = etag_text
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap()
+        .to_string();
+    let challenge: StreamIngestChallenge = serde_json::from_slice(
+        &to_bytes(challenge_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(challenge.graph_token, authority_token);
+    assert!(
+        engine.stream_status().await.unwrap().tables.is_empty(),
+        "an effect-free graph-token challenge cannot enroll a table"
+    );
+
+    let weak_etag = HeaderValue::from_str(&format!("W/{etag_text}")).unwrap();
+    let stale_etag = HeaderValue::from_str(&format!("\"sha256:{}\"", "0".repeat(64))).unwrap();
+    for (label, supplied) in [
+        ("wildcard", HeaderValue::from_static("*")),
+        ("weak", weak_etag),
+        ("stale", stale_etag),
+    ] {
+        let refused_polled = Arc::new(AtomicBool::new(false));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/graphs/knowledge/stream/ingest")
+                    .header("content-type", "application/x-ndjson")
+                    .header(IF_MATCH, supplied)
+                    .body(stream_body_poll_probe(Arc::clone(&refused_polled)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::PRECONDITION_FAILED,
+            "{label} precondition"
+        );
+        assert!(
+            response.headers().get(ETAG).is_none(),
+            "{label} refusal must not disclose replacement authority"
+        );
+        assert!(
+            !refused_polled.load(Ordering::SeqCst),
+            "{label} refusal must not poll the request body"
+        );
+        let refusal = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let refusal: Value = serde_json::from_slice(&refusal).unwrap();
+        assert!(refusal.get("graph_token").is_none(), "{label}: {refusal}");
+        assert!(
+            !refusal.to_string().contains(&authority_token),
+            "{label} refusal leaked replacement authority: {refusal}"
+        );
+    }
+
+    let multiple_polled = Arc::new(AtomicBool::new(false));
+    let mut multiple = Request::builder()
+        .method(Method::POST)
+        .uri("/graphs/knowledge/stream/ingest")
+        .header("content-type", "application/x-ndjson")
+        .body(stream_body_poll_probe(Arc::clone(&multiple_polled)))
+        .unwrap();
+    multiple.headers_mut().append(IF_MATCH, etag.clone());
+    multiple.headers_mut().append(IF_MATCH, etag.clone());
+    let response = app.clone().oneshot(multiple).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert!(response.headers().get(ETAG).is_none());
+    assert!(!multiple_polled.load(Ordering::SeqCst));
+    let refusal = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(!String::from_utf8_lossy(&refusal).contains(&authority_token));
+
+    let (input_sender, input_receiver) =
+        futures::channel::mpsc::unbounded::<std::result::Result<Bytes, std::io::Error>>();
+    let mut first_chunk = served_graph_node_line(
+        "Person",
+        "served-alice",
+        11,
+        "50505050-5050-4050-8050-505050505050",
+    );
+    first_chunk.extend(served_graph_node_line(
+        "Person",
+        "served-bob",
+        12,
+        "51515151-5151-4151-8151-515151515151",
+    ));
+    first_chunk.extend(served_graph_edge_line(
+        "Knows",
+        "served-alice-knows-bob",
+        "served-alice",
+        "served-bob",
+        "52525252-5252-4252-8252-525252525252",
+    ));
+    input_sender
+        .unbounded_send(Ok(Bytes::from(first_chunk)))
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/graphs/knowledge/stream/ingest")
+                .header("content-type", "application/x-ndjson")
+                .header(IF_MATCH, etag)
+                .body(Body::from_stream(input_receiver))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/x-ndjson; charset=utf-8"
+    );
+    let mut response_stream = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(Duration::from_secs(30), response_stream.next())
+        .await
+        .expect("the first result must stream before request EOF")
+        .expect("the exact request produces a first result")
+        .expect("the first response chunk is readable");
+    let mut result_bytes = first.to_vec();
+    drop(input_sender);
+    while let Some(chunk) = response_stream.next().await {
+        result_bytes.extend_from_slice(&chunk.unwrap());
+    }
+    let result_lines = result_bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        result_lines.len(),
+        3,
+        "{}",
+        String::from_utf8_lossy(&result_bytes)
+    );
+    let outcomes = result_lines
+        .iter()
+        .map(|line| {
+            let raw: Value = serde_json::from_slice(line).unwrap();
+            const ALLOWED_KEYS: &[&str] = &[
+                "actual",
+                "blocking_ordinal",
+                "blocking_status",
+                "current_token",
+                "id",
+                "kind",
+                "limit",
+                "message",
+                "ordinal",
+                "scope",
+                "status",
+                "stream_token",
+                "type",
+                "unconfirmed_candidate_token",
+                "write_id",
+            ];
+            for key in raw.as_object().unwrap().keys() {
+                assert!(
+                    ALLOWED_KEYS.contains(&key.as_str()),
+                    "served graph result leaked physical evidence '{key}': {raw}"
+                );
+            }
+            assert!(
+                !raw.to_string().contains("enrollment_id")
+                    && !raw.to_string().contains("shard_id")
+                    && !raw.to_string().contains("writer_epoch")
+                    && !raw.to_string().contains("dataset"),
+                "served graph result leaked physical evidence: {raw}"
+            );
+            serde_json::from_value::<StreamIngestLineOutput>(raw).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes.iter().map(|line| line.ordinal).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert!(
+        outcomes
+            .iter()
+            .all(|line| line.status == StreamIngestStatusOutput::Durable),
+        "all three streamed graph rows must be durable: {}",
+        String::from_utf8_lossy(&result_bytes)
+    );
+    assert_eq!(outcomes[0].kind, Some(StreamIngestKindOutput::Node));
+    assert_eq!(outcomes[1].kind, Some(StreamIngestKindOutput::Node));
+    assert_eq!(outcomes[2].kind, Some(StreamIngestKindOutput::Edge));
+    assert_eq!(outcomes[0].type_name.as_deref(), Some("Person"));
+    assert_eq!(outcomes[2].type_name.as_deref(), Some("Knows"));
+    assert!(outcomes.iter().all(|line| line.stream_token.is_some()));
+
+    let query = QueryRequest {
+        query: r#"
+query streamed_edge() {
+    match {
+        $p: Person { score: 11 }
+        $p knows $f
+    }
+    return { $p.score, $f.score }
+}
+"#
+        .to_string(),
+        name: Some("streamed_edge".to_string()),
+        params: None,
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, body) = json_response(
+            &app,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/graphs/knowledge/query")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&query).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if body["row_count"] == 1 {
+            assert_eq!(body["rows"][0]["p.score"], 11);
+            assert_eq!(body["rows"][0]["f.score"], 12);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "resident fold driver did not make streamed edge queryable: {body}"
+        );
+        tokio::task::yield_now().await;
+    }
+    engine
+        .shutdown_stream_fold_driver()
+        .await
+        .expect("served graph fold driver shuts down cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn authenticated_default_deny_refuses_stream_ingest_before_body_ownership() {
+    let (_temp, state, engine) = enabled_stream_state(vec![(
+        "stream-actor".to_string(),
+        "stream-secret".to_string(),
+    )])
+    .await;
+    let app = build_app(state);
+    let body_polled = Arc::new(AtomicBool::new(false));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/graphs/knowledge/stream/ingest")
+                .header("authorization", "Bearer stream-secret")
+                .header("content-type", "application/x-ndjson")
+                .body(stream_body_poll_probe(Arc::clone(&body_polled)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !body_polled.load(Ordering::SeqCst),
+        "default-deny authorization must run before graph ingest owns the body"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+    assert!(error.error.contains("default-deny mode"), "{error:?}");
+    assert!(
+        engine.stream_status().await.unwrap().tables.is_empty(),
+        "a default-denied request cannot lazily enroll a private lane"
+    );
+    engine
+        .shutdown_stream_fold_driver()
+        .await
+        .expect("served graph fold driver shuts down cleanly");
 }
 
 #[tokio::test]

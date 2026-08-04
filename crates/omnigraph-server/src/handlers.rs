@@ -3,6 +3,7 @@
 //! verbatim from lib.rs in the modularization).
 
 use super::*;
+use futures::StreamExt;
 
 /// Liveness probe.
 ///
@@ -678,6 +679,192 @@ pub(crate) async fn server_export(
         body,
     )
         .into_response())
+}
+
+enum GraphIfMatch {
+    Missing,
+    Strong(String),
+    Malformed,
+}
+
+fn graph_stream_if_match(headers: &axum::http::HeaderMap) -> GraphIfMatch {
+    let mut values = headers.get_all(IF_MATCH).iter();
+    let Some(value) = values.next() else {
+        return GraphIfMatch::Missing;
+    };
+    if values.next().is_some() {
+        return GraphIfMatch::Malformed;
+    }
+    let Ok(value) = value.to_str() else {
+        return GraphIfMatch::Malformed;
+    };
+    let value = value.trim();
+    if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"') {
+        return GraphIfMatch::Malformed;
+    }
+    let opaque = &value[1..value.len() - 1];
+    if opaque.is_empty()
+        || !opaque
+            .bytes()
+            .all(|byte| byte == b'!' || (b'#'..=b'~').contains(&byte))
+    {
+        return GraphIfMatch::Malformed;
+    }
+    GraphIfMatch::Strong(opaque.to_string())
+}
+
+fn graph_stream_etag(authority_token: &str) -> std::result::Result<HeaderValue, ApiError> {
+    HeaderValue::try_from(format!("\"{authority_token}\""))
+        .map_err(|_| ApiError::internal("graph stream authority token is not a valid ETag"))
+}
+
+fn require_graph_stream_content_type(
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<(), ApiError> {
+    let accepted = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| {
+            media_type
+                .trim()
+                .eq_ignore_ascii_case("application/x-ndjson")
+        });
+    if accepted {
+        Ok(())
+    } else {
+        Err(ApiError::unsupported_media_type(
+            "graph stream ingest requires Content-Type application/x-ndjson",
+        ))
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/stream/ingest",
+    tag = "streaming",
+    operation_id = "stream_ingest",
+    params(
+        ("If-Match" = Option<String>, Header, description = "Strong ETag containing the opaque graph token returned by the 428 challenge."),
+    ),
+    request_body(
+        content = String,
+        description = "Graph-native node and edge rows, one JSON object per line. Results are emitted in caller order and the request is not atomic.",
+        content_type = "application/x-ndjson",
+    ),
+    responses(
+        (status = 200, description = "Ordered graph-native ingest results", body = api::StreamIngestLineOutput, content_type = "application/x-ndjson"),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Checked streaming runtime or lifecycle conflict", body = ErrorOutput),
+        (status = 412, description = "Malformed or stale graph token; no replacement token is disclosed", body = ErrorOutput),
+        (status = 413, description = "Streaming request admission capacity exhausted", body = ErrorOutput),
+        (status = 415, description = "Request Content-Type is not application/x-ndjson", body = ErrorOutput),
+        (status = 428, description = "Graph token required; retry with the strong ETag in If-Match", body = StreamIngestChallenge,
+            headers(
+                ("ETag" = String, description = "Strong ETag containing the current opaque graph token"),
+                ("Cache-Control" = String, description = "Always `no-store`; the challenge is authority-bearing"),
+            )),
+        (status = 503, description = "Overlapping durable recovery must resolve before ingest", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Ingest a graph-native NDJSON firehose through the checked served runtime.
+///
+/// A request without `If-Match` is authorized and preflighted without polling
+/// its body, then receives a 428 challenge. A malformed or stale precondition
+/// receives 412 without replacement authority. An exact strong ETag transfers
+/// the Axum body stream directly into the engine and streams one redacted
+/// newline-delimited result per input row; neither direction is buffered as a
+/// complete request or response.
+pub(crate) async fn server_stream_ingest(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    headers: axum::http::HeaderMap,
+    body: Body,
+) -> std::result::Result<Response, ApiError> {
+    require_graph_stream_content_type(&headers)?;
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    if handle.policy.is_none() {
+        // With a graph policy installed, the engine's graph-scoped check is
+        // the sole Cedar decision for this request. Without one the engine
+        // intentionally has no checker, so preserve the server's open-mode /
+        // authenticated-default-deny contract here before body ownership.
+        authorize_request(
+            actor,
+            None,
+            PolicyRequest {
+                action: PolicyAction::StreamIngest,
+                branch: None,
+                target_branch: None,
+            },
+        )?;
+    }
+
+    let supplied = graph_stream_if_match(&headers);
+    let precondition_supplied = !matches!(&supplied, GraphIfMatch::Missing);
+    // A malformed header still enters the checked engine preflight with an
+    // impossible token. This preserves policy/runtime ordering while keeping
+    // strong-ETag syntax part of the HTTP contract.
+    let supplied_token = match &supplied {
+        GraphIfMatch::Missing => None,
+        GraphIfMatch::Strong(token) => Some(token.as_str()),
+        GraphIfMatch::Malformed => Some(""),
+    };
+    let chunks = body.into_data_stream().map(|chunk| {
+        chunk.map(|bytes| bytes.to_vec()).map_err(|error| {
+            OmniError::Io(std::io::Error::other(format!(
+                "graph stream request body failed: {error}"
+            )))
+        })
+    });
+    let start = handle
+        .engine
+        .start_served_graph_stream_ingest_as(
+            actor.map_or("anonymous", |actor| actor.actor_id.as_ref()),
+            supplied_token,
+            Box::pin(chunks),
+        )
+        .await;
+    let start = start
+        .map_err(|error| ApiError::from_graph_stream_start(error, precondition_supplied))?;
+
+    match start {
+        omnigraph::db::GraphStreamIngestStart::TokenRequired { authority_token } => {
+            let etag = graph_stream_etag(&authority_token)?;
+            Ok((
+                StatusCode::PRECONDITION_REQUIRED,
+                [
+                    (ETAG, etag),
+                    (CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                ],
+                Json(StreamIngestChallenge {
+                    graph_token: authority_token,
+                }),
+            )
+                .into_response())
+        }
+        omnigraph::db::GraphStreamIngestStart::Ready(result_handle) => {
+            if matches!(supplied, GraphIfMatch::Malformed | GraphIfMatch::Missing) {
+                return Err(ApiError::internal(
+                    "graph stream engine accepted a missing or malformed precondition",
+                ));
+            }
+            let results = futures::stream::try_unfold(result_handle, |mut result_handle| async {
+                match result_handle.recv().await {
+                    Ok(Some(line)) => Ok(Some((Bytes::from(line), result_handle))),
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(std::io::Error::other(error.to_string())),
+                }
+            });
+            Ok((
+                StatusCode::OK,
+                [(CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
+                Body::from_stream(results),
+            )
+                .into_response())
+        }
+    }
 }
 
 /// Shared implementation behind `POST /mutate` (canonical) and

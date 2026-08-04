@@ -83,11 +83,12 @@ are implemented and evidence-green at a deliberately narrow boundary:
   and v9 lifecycle-v2/recovery-v12 state cross that boundary only through
   export/init/load.
 
-The core is intentionally reachable only through a feature-gated, doc-hidden
-engine seam. Checked profile control exists, including restart-stable
-`DISABLING`, but there is no `@stream` schema intent, public enrollment, SDK
-ingest method, HTTP route, CLI ingest command, OpenAPI surface, or enrolled-lane
-operator workflow. The hidden core implements recovery-covered empty/non-empty
+The lane core remains private and feature-gated tests own its fault matrix.
+F7a reaches it through one doc-hidden graph bridge plus the checked HTTP,
+remote-CLI, and OpenAPI row surface. Checked profile control exists, including
+restart-stable `DISABLING`, but there is no `@stream` schema intent, public lane
+enrollment, embedded/direct SDK ingest method, or enrolled-lane operator
+workflow. The hidden core implements recovery-covered empty/non-empty
 `OPEN → DRAINING → SEALED` plus crate-private `SEALED → OPEN` resume and
 guarded `DRAINING → OPEN` abort, checked `SEALED` maintenance, and checked
 offline physical rebind. Public/production rebind and control/transport
@@ -106,7 +107,7 @@ retention. The measured one-exclusive-fold RSS delta was 286,441,472 bytes
 (about 273 MiB); CI's 384-MiB threshold is a remeasurement tripwire, not a
 runtime allocator limit.
 
-### Public streaming is still specified but inactive
+### Graph row streaming is active; controls remain staged
 
 RFC-026 Phase B2 specifies the remaining public contract:
 
@@ -135,10 +136,12 @@ cluster-only authority-retirement and root-receipt plus closed
 selected-branch-member export exit; v18/recovery-v20 adds exact DataBlock
 correction; and v19/token-schema-v3/recovery-v21 adds terminal dead-letter
 folds, selected-token inspection/export, and three-disposition retirement.
-Checked offline disable is the supported quiescence owner. Public enrollment,
-general resume/abort, physical rebind, SDK/HTTP/OpenAPI row streaming, public
-operational-status transport, and every other streaming product surface remain
-inactive. F6b6's checked read-only operational cut is implemented internally.
+Checked offline disable is the supported quiescence owner. F7a activates
+graph-native HTTP/remote-CLI/OpenAPI row streaming over absent or `OPEN` lanes.
+Public lane enrollment, general resume/abort, physical rebind,
+embedded/direct SDK row ingress, operational-status transport, and every other
+streaming management surface remain inactive. F6b6's checked read-only
+operational cut is implemented internally.
 
 ## The missing Lance capabilities
 
