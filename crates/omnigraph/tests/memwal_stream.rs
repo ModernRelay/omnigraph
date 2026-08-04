@@ -83,6 +83,7 @@ const F6B2_NODE_EDGE_SCHEMA: &str = r#"
 node Person { score: I32 }
 node Company { score: I32 }
 edge Knows: Person -> Person
+edge WorksAt: Company -> Person
 "#;
 const TYPED_STREAM_SCHEMA: &str = r#"
 node Person {
@@ -112,6 +113,7 @@ const PAYLOAD_STREAM_SCHEMA: &str = "node Person { payload: String }\n";
 const TABLE: &str = "node:Person";
 const COMPANY_TABLE: &str = "node:Company";
 const MIN_CARD_EDGE_TABLE: &str = "edge:Knows";
+const WORKS_AT_EDGE_TABLE: &str = "edge:WorksAt";
 const INSERT_PERSON: &str = r#"
 query insert_person($score: I32) {
     insert Person { score: $score }
@@ -4260,6 +4262,55 @@ async fn resident_driver_empty_startup_is_effect_free_and_timer_folds_once() {
     db.shutdown_stream_fold_driver()
         .await
         .expect("resident driver joins after its finite round");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn resident_driver_same_handle_restart_installs_fresh_startup_discovery() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
+    db.start_stream_fold_driver()
+        .await
+        .expect("the first driver run establishes its discovery generation");
+    db.shutdown_stream_fold_driver()
+        .await
+        .expect("the first driver run stops cleanly");
+
+    let batch = physical_batch(&db, &[("between-runs".to_string(), 12)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
+        .await
+        .expect("a stopped driver can still receive one durable occurrence");
+    let before = stream_fold_driver_status(&db);
+    let before_trigger = before["pending_triggers"]
+        .as_array()
+        .unwrap()
+        .first()
+        .expect("the durable occurrence owns one ordinary timer trigger");
+    let before_sequence = before_trigger["trigger_sequence"].as_u64().unwrap();
+
+    let round =
+        helpers::failpoint::Rendezvous::park_first(names::STREAM_DRIVER_BEFORE_ROUND_ACQUIRE);
+    db.start_stream_fold_driver()
+        .await
+        .expect("the same handle starts a second driver generation");
+    round.wait_until_reached().await;
+    let restarted = stream_fold_driver_status(&db);
+    let restarted_trigger = restarted["pending_triggers"]
+        .as_array()
+        .unwrap()
+        .first()
+        .expect("startup discovery retains the cold lane until its parked round");
+    assert_eq!(
+        restarted_trigger["trigger_sequence"].as_u64().unwrap(),
+        before_sequence + 1,
+        "the second start must install an independent urgent discovery trigger"
+    );
+    round.release();
+
+    wait_for_visible_rows(&db, &[("between-runs".to_string(), 12)]).await;
+    db.shutdown_stream_fold_driver()
+        .await
+        .expect("the restarted driver joins after publishing the cold lane");
 }
 
 #[tokio::test]
@@ -10103,7 +10154,7 @@ async fn graph_ndjson_alternates_node_edge_node_with_private_lazy_enrollment() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn graph_ndjson_handoff_uses_the_driver_node_before_edge_round() {
     let _scenario = FailScenario::setup();
@@ -10122,6 +10173,11 @@ async fn graph_ndjson_handoff_uses_the_driver_node_before_edge_round() {
     let db = reopen_enrolled(&dir).await;
     let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
     assert_eq!(visible_rows(&db).await, vec![("Alice".to_string(), 1)]);
+    let startup =
+        helpers::failpoint::Rendezvous::park_first(names::STREAM_DRIVER_POST_DISCOVERY_PRE_NOTIFY);
+    let start_db = Arc::clone(&db);
+    let start = tokio::spawn(async move { start_db.start_stream_fold_driver().await });
+    startup.wait_until_reached().await;
     let body = [
         graph_edge_line(
             "Knows",
@@ -10184,6 +10240,283 @@ async fn graph_ndjson_handoff_uses_the_driver_node_before_edge_round() {
             ("Carol".to_string(), 3),
         ]
     );
+    startup.release();
+    start
+        .await
+        .expect("the parked driver startup task must join")
+        .expect("driver startup must finish after installing every discovered trigger");
+    db.shutdown_stream_fold_driver()
+        .await
+        .expect("the startup-race fixture must stop its driver");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn graph_ndjson_releases_resident_before_folding_distinct_endpoint_lanes() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_f6b2_node_edge_fixture().await;
+    let cluster_uri = dir.cluster_uri();
+
+    let company_owner =
+        helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let cold_company =
+        physical_score_batch(&company_owner, COMPANY_TABLE, &[("ColdCo".to_string(), 7)]).await;
+    company_owner
+        .failpoint_stream_b1_for_test(COMPANY_TABLE, Some(cold_company), 0)
+        .await
+        .expect("the Company endpoint is acknowledged before process restart");
+    company_owner.shutdown_stream_fold_driver().await.unwrap();
+    drop(company_owner);
+
+    let db = reopen_enrolled(&dir).await;
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let first = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+            vec![graph_edge_line(
+                "Knows",
+                "resident-knows",
+                "Alice",
+                "Alice",
+                "50505050-5050-4050-8050-505050505050",
+                None,
+            )],
+            "agent:graph-resident-first",
+        )
+        .await
+        .expect("the first request leaves one productive edge lane resident"),
+    );
+    assert_eq!(first[0]["status"], "durable");
+    assert!(
+        visible_score_rows(&db, COMPANY_TABLE).await.is_empty(),
+        "the unrelated cold Company endpoint must remain with its own trigger"
+    );
+
+    let node_switch = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+            vec![graph_node_line(
+                "Company",
+                "FreshCo",
+                8,
+                "51515151-5151-4151-8151-515151515151",
+                None,
+            )],
+            "agent:graph-resident-first",
+        )
+        .await
+        .expect("a fresh node-first request releases a foreign resident edge"),
+    );
+    assert_eq!(node_switch[0]["status"], "durable", "{node_switch:#?}");
+    assert_eq!(
+        visible_edge_rows(&db).await,
+        vec![(
+            "resident-knows".to_string(),
+            "Alice".to_string(),
+            "Alice".to_string(),
+        )],
+        "the foreign edge resident must publish before Company becomes resident"
+    );
+    assert_eq!(
+        visible_score_rows(&db, COMPANY_TABLE).await,
+        vec![("ColdCo".to_string(), 7)],
+        "the cold target tail must publish before the new Company occurrence is admitted"
+    );
+
+    let second = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+            vec![graph_edge_line(
+                "WorksAt",
+                "resident-then-endpoints",
+                "FreshCo",
+                "Alice",
+                "52525252-5252-4252-8252-525252525252",
+                None,
+            )],
+            "agent:graph-resident-first",
+        )
+        .await
+        .expect("the second request releases the resident before its two endpoint lanes"),
+    );
+    assert_eq!(second[0]["status"], "durable", "{second:#?}");
+    assert_eq!(
+        visible_score_rows(&db, COMPANY_TABLE).await,
+        vec![("ColdCo".to_string(), 7), ("FreshCo".to_string(), 8)],
+        "the Company target and its cold predecessor must publish before WorksAt admission"
+    );
+    assert_eq!(
+        visible_edge_rows(&db).await,
+        vec![(
+            "resident-knows".to_string(),
+            "Alice".to_string(),
+            "Alice".to_string(),
+        )],
+        "the prior resident edge must publish before the dependency fold"
+    );
+
+    db.failpoint_stream_b1_for_test(WORKS_AT_EDGE_TABLE, None, 0)
+        .await
+        .expect("the final heterogeneous edge lane folds cleanly");
+    assert_eq!(helpers::count_rows(&db, WORKS_AT_EDGE_TABLE).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn graph_ndjson_reports_empty_owner_cleanup_before_retrying_the_target() {
+    let _scenario = FailScenario::setup();
+    let (dir, db, sealed) = init_f6b8_resume_driver_fixture().await;
+    db.failpoint_stream_resume_for_test(
+        TABLE,
+        "f6b80000-0000-4000-8000-000000000008",
+        sealed.lifecycle_revision,
+        false,
+        "operator:graph-cleanup-failure",
+    )
+    .await
+    .expect("the fixture installs one empty foreign resident");
+
+    let line = graph_node_line(
+        "Company",
+        "AfterCleanup",
+        9,
+        "53535353-5353-4353-8353-535353535353",
+        None,
+    );
+    let first = {
+        let _cleanup = ScopedFailPoint::new(names::STREAM_DRIVER_EMPTY_OWNER_CLEANUP, "return");
+        parse_ndjson_outcomes(
+            db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+                vec![line.clone()],
+                "agent:graph-cleanup-failure",
+            )
+            .await
+            .expect("the cleanup failure is a logical line outcome"),
+        )
+    };
+    assert_eq!(first[0]["status"], "stream_authority_changed", "{first:#?}");
+    assert!(
+        visible_score_rows(&db, COMPANY_TABLE).await.is_empty(),
+        "the target lane must not be physically invoked after cleanup fails"
+    );
+    let failed = stream_fold_driver_status(&db);
+    let failed_triggers = failed["pending_triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|trigger| trigger["consecutive_failures"] == 1)
+        .count();
+    assert_eq!(failed_triggers, 1, "{failed:#?}");
+    assert!(
+        failed["last_error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(names::STREAM_DRIVER_EMPTY_OWNER_CLEANUP),
+        "the driver must retain the actual cleanup failure: {failed:#?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let retry = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+            vec![line],
+            "agent:graph-cleanup-failure",
+        )
+        .await
+        .expect("the exact logical retry proceeds after cleanup backoff"),
+    );
+    assert_eq!(retry[0]["status"], "durable", "{retry:#?}");
+    db.failpoint_stream_b1_for_test(COMPANY_TABLE, None, 0)
+        .await
+        .expect("the target lane folds after the successful retry");
+    assert_eq!(
+        visible_score_rows(&db, COMPANY_TABLE).await,
+        vec![("AfterCleanup".to_string(), 9)]
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn graph_ndjson_ignores_an_unrelated_nonresident_retry_backoff() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_f6b2_node_edge_fixture().await;
+    let cluster_uri = dir.cluster_uri();
+    let owner = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let cold = physical_score_batch(&owner, COMPANY_TABLE, &[("ColdBackoff".to_string(), 7)]).await;
+    owner
+        .failpoint_stream_b1_for_test(COMPANY_TABLE, Some(cold), 0)
+        .await
+        .expect("the unrelated Company tail is acknowledged before restart");
+    owner.shutdown_stream_fold_driver().await.unwrap();
+    drop(owner);
+
+    let db = reopen_enrolled(&dir).await;
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let failed = {
+        let _attempt = ScopedFailPoint::new(names::STREAM_DRIVER_CANDIDATE_ATTEMPT, "return");
+        parse_ndjson_outcomes(
+            db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+                vec![graph_node_line(
+                    "Company",
+                    "NotInvoked",
+                    8,
+                    "54545454-5454-4454-8454-545454545454",
+                    None,
+                )],
+                "agent:graph-unrelated-backoff",
+            )
+            .await
+            .expect("the injected target failure is a logical line outcome"),
+        )
+    };
+    assert_eq!(
+        failed[0]["status"], "stream_authority_changed",
+        "{failed:#?}"
+    );
+    let before_status = stream_fold_driver_status(&db);
+    let before = before_status["pending_triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|trigger| trigger["consecutive_failures"] == 1)
+        .expect("the Company driver attempt owns one retry deadline")
+        .clone();
+
+    let unrelated = parse_ndjson_outcomes(
+        db.failpoint_stream_ingest_graph_ndjson_as_for_test(
+            vec![graph_node_line(
+                "Person",
+                "Bob",
+                2,
+                "55555555-5555-4555-8555-555555555555",
+                None,
+            )],
+            "agent:graph-unrelated-backoff",
+        )
+        .await
+        .expect("an unrelated node route must not run the failed Company lane"),
+    );
+    assert_eq!(unrelated[0]["status"], "durable", "{unrelated:#?}");
+    assert!(
+        visible_score_rows(&db, COMPANY_TABLE).await.is_empty(),
+        "the unrelated request must not fold the backed-off Company tail"
+    );
+    let after_status = stream_fold_driver_status(&db);
+    let after = after_status["pending_triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|trigger| trigger["table_identity"] == before["table_identity"])
+        .expect("the unrelated request must preserve the Company trigger");
+    assert_eq!(after["trigger_sequence"], before["trigger_sequence"]);
+    assert_eq!(after["consecutive_failures"], 1);
+    assert_eq!(after_status["last_error"], before_status["last_error"]);
+
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the unrelated Person occurrence folds normally");
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("Alice".to_string(), 1), ("Bob".to_string(), 2)]
+    );
+    assert_no_recovery_sidecars(&dir);
 }
 
 #[tokio::test]

@@ -220,6 +220,18 @@ struct GraphLaneContext {
     sizing: IntrinsicSizingContext,
 }
 
+struct GraphNodeDependency {
+    identity: TableIdentity,
+    table_key: String,
+}
+
+struct ResolvedGraphDeclaration {
+    identity: TableIdentity,
+    table_key: String,
+    canonical_type_name: String,
+    node_dependencies: Vec<GraphNodeDependency>,
+}
+
 struct PendingRow {
     ordinal: u64,
     envelope: StreamWriteEnvelope,
@@ -491,23 +503,6 @@ impl Omnigraph {
         let token_bound = expected_graph_witness.is_some();
         let permit = self.stream_requests.try_acquire(actor_id)?;
 
-        {
-            let initial_profile_guard = self.write_queue().acquire_stream_profile_shared().await;
-            self.ensure_streaming_ingest_runtime_authorized()
-                .await
-                .map_err(|error| normalize_token_bound_start_error(error, token_bound))?;
-            drop(initial_profile_guard);
-        }
-        // Settle the existing coordinator's cold startup cut before this
-        // request can make an edge lane resident. Otherwise the sole resident
-        // slot could make a previously acknowledged endpoint node lose the
-        // node-before-edge round and turn a valid edge into a dead letter.
-        self.settle_initial_stream_lanes_for_graph_ingest()
-            .await
-            .map_err(|error| normalize_token_bound_start_error(error, token_bound))?;
-        // The root→profile lock order above deliberately opens a transition
-        // window. Reacquire profile authority and revalidate it before the
-        // request pins its graph witness/catalog or polls the body.
         let profile_guard = self.write_queue().acquire_stream_profile_shared().await;
         self.ensure_streaming_ingest_runtime_authorized()
             .await
@@ -684,7 +679,10 @@ async fn drive_graph_request(
                                 return;
                             }
                             next_input_ordinal = frame.ordinal().saturating_add(1);
-                            let keep_driving = process_graph_frame(
+                            // Heap-own the large per-frame state machine so
+                            // graph recovery coordination does not inflate the
+                            // spawned request task's poll stack.
+                            let keep_driving = Box::pin(process_graph_frame(
                                 &db,
                                 &actor_id,
                                 &contributor_id,
@@ -697,7 +695,8 @@ async fn drive_graph_request(
                                 &mut results,
                                 &sender,
                                 &routes,
-                            ).await;
+                            ))
+                            .await;
                             sync_graph_run_flush_deadline(
                                 &mut run_flush_deadline,
                                 run.as_ref(),
@@ -742,7 +741,7 @@ async fn drive_graph_request(
         if sender.is_closed() {
             return;
         }
-        if !process_graph_frame(
+        if !Box::pin(process_graph_frame(
             &db,
             &actor_id,
             &contributor_id,
@@ -755,7 +754,7 @@ async fn drive_graph_request(
             &mut results,
             &sender,
             &routes,
-        )
+        ))
         .await
         {
             return;
@@ -912,8 +911,7 @@ async fn process_graph_frame(
             if !record_graph_route(routes, ordinal, graph_route(&parsed)) {
                 return false;
             }
-            let (table_key, canonical_type_name) = match resolve_graph_declaration(catalog, &parsed)
-            {
+            let resolved = match resolve_graph_declaration(catalog, &parsed) {
                 Ok(resolved) => resolved,
                 Err(error) => {
                     drop(parsed);
@@ -942,6 +940,12 @@ async fn process_graph_frame(
                     .await;
                 }
             };
+            let ResolvedGraphDeclaration {
+                identity,
+                table_key,
+                canonical_type_name,
+                node_dependencies,
+            } = resolved;
             let canonical_route = GraphLineRoute {
                 kind: parsed.kind(),
                 type_name: canonical_type_name,
@@ -1101,6 +1105,36 @@ async fn process_graph_frame(
             }
 
             if lane.is_none() {
+                // A logical edge depends only on its accepted endpoint node
+                // declarations. Settle those exact hidden lanes now, after
+                // the first dependency's coordinator releases any prior
+                // resident, instead of making an unrelated failing lane a
+                // graph-wide request preflight. Node routes take the same
+                // handoff through the target settlement immediately below.
+                for dependency in &node_dependencies {
+                    if let Err(error) = Box::pin(db.settle_stream_node_lane_for_graph_edge(
+                        dependency.identity,
+                        &dependency.table_key,
+                    ))
+                    .await
+                    {
+                        drop(normalized);
+                        drop(next_preprocessing.take());
+                        let outcome = b2_error_outcome(ordinal, error);
+                        *blocker = outcome.as_blocker();
+                        return emit_ordered(outcome, results, sender).await;
+                    }
+                }
+                if let Err(error) =
+                    Box::pin(db.settle_stream_target_lane_for_graph_route(identity, &table_key))
+                        .await
+                {
+                    drop(normalized);
+                    drop(next_preprocessing.take());
+                    let outcome = b2_error_outcome(ordinal, error);
+                    *blocker = outcome.as_blocker();
+                    return emit_ordered(outcome, results, sender).await;
+                }
                 match ensure_graph_lane(db, actor_id, &table_key, expected_graph_witness).await {
                     Ok(active) => *lane = Some(active),
                     Err(error) => {
@@ -1174,8 +1208,8 @@ fn record_graph_route(
 fn resolve_graph_declaration(
     catalog: &Catalog,
     parsed: &ParsedGraphStreamJsonRow,
-) -> Result<(String, String)> {
-    let (table_key, canonical_type_name) = match parsed.kind() {
+) -> Result<ResolvedGraphDeclaration> {
+    let (table_key, canonical_type_name, node_dependencies) = match parsed.kind() {
         "node" => {
             let node = catalog.node_types.get(parsed.type_name()).ok_or_else(|| {
                 OmniError::manifest(format!(
@@ -1183,7 +1217,7 @@ fn resolve_graph_declaration(
                     parsed.type_name()
                 ))
             })?;
-            (format!("node:{}", node.name), node.name.clone())
+            (format!("node:{}", node.name), node.name.clone(), Vec::new())
         }
         "edge" => {
             let edge = catalog
@@ -1194,7 +1228,25 @@ fn resolve_graph_declaration(
                         parsed.type_name()
                     ))
                 })?;
-            (format!("edge:{}", edge.name), edge.name.clone())
+            let mut node_dependencies = Vec::with_capacity(2);
+            for node_type in [&edge.from_type, &edge.to_type] {
+                let table_key = format!("node:{node_type}");
+                let identity = graph_catalog_table_identity(catalog, &table_key)?;
+                if !node_dependencies
+                    .iter()
+                    .any(|dependency: &GraphNodeDependency| dependency.identity == identity)
+                {
+                    node_dependencies.push(GraphNodeDependency {
+                        identity,
+                        table_key,
+                    });
+                }
+            }
+            (
+                format!("edge:{}", edge.name),
+                edge.name.clone(),
+                node_dependencies,
+            )
         }
         _ => {
             return Err(OmniError::manifest_internal(
@@ -1203,7 +1255,13 @@ fn resolve_graph_declaration(
         }
     };
     Omnigraph::ensure_stream_table_admission_supported(catalog, &table_key)?;
-    Ok((table_key, canonical_type_name))
+    let identity = graph_catalog_table_identity(catalog, &table_key)?;
+    Ok(ResolvedGraphDeclaration {
+        identity,
+        table_key,
+        canonical_type_name,
+        node_dependencies,
+    })
 }
 
 async fn normalize_graph_row_before_enrollment(
@@ -2445,12 +2503,12 @@ fn b2_error_outcome(ordinal: u64, error: OmniError) -> StreamLineOutcome {
         },
         OmniError::StreamingAuthorityMismatch { .. }
         | OmniError::StreamingRequiresClusterRuntime { .. }
-        | OmniError::StreamingContentOperationUnsupported { .. } => {
-            StreamLineDetail::StreamAuthorityChanged {
-                current_stream_incarnation_id: None,
-                message: error.to_string(),
-            }
-        }
+        | OmniError::StreamingContentOperationUnsupported { .. }
+        | OmniError::StreamAuthorityRetired { .. }
+        | OmniError::StreamDataBlocked { .. } => StreamLineDetail::StreamAuthorityChanged {
+            current_stream_incarnation_id: None,
+            message: error.to_string(),
+        },
         OmniError::StreamSequenceConflict {
             logical_id,
             current_token,
@@ -2758,6 +2816,29 @@ mod tests {
 
         sync_graph_run_flush_deadline_at(&mut deadline, None, next_start);
         assert!(deadline.is_none(), "an empty run owns no timer");
+    }
+
+    #[test]
+    fn durable_authority_failures_are_not_reported_as_backpressure() {
+        let errors = [
+            OmniError::StreamAuthorityRetired {
+                retirement_id: "retirement-1".to_string(),
+                export_cut_digest: "cut-1".to_string(),
+            },
+            OmniError::StreamDataBlocked {
+                block_token: "block-1".to_string(),
+            },
+        ];
+
+        for (ordinal, error) in errors.into_iter().enumerate() {
+            let outcome = b2_error_outcome(ordinal as u64, error);
+            assert_eq!(outcome.status(), StreamLineStatus::StreamAuthorityChanged);
+            assert!(outcome.current_stream_incarnation_id().is_none());
+            assert!(
+                outcome.as_blocker().is_some(),
+                "durable authority state must stop later physical admission"
+            );
+        }
     }
 
     fn test_request_handle(
