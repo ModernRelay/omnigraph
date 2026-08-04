@@ -15,6 +15,7 @@ use color_eyre::eyre::bail;
 use crate::cli::{
     Cli, ClusterCommand, ClusterStreamCommand, Command, GraphsCommand, QueriesCommand,
     SchemaCommand, StreamBlockCommand, StreamCommand, StreamDeadLetterCommand,
+    StreamMaintenanceCommand,
     StreamRetireForRebuildCommand,
 };
 
@@ -346,6 +347,13 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Stream { command } => match command {
             StreamCommand::Ingest { .. } => "stream ingest",
             StreamCommand::Status { .. } => "stream status",
+            StreamCommand::Resume { .. } => "stream resume",
+            StreamCommand::Maintenance { command } => match command {
+                StreamMaintenanceCommand::EnsureIndices { .. } => {
+                    "stream maintenance ensure-indices"
+                }
+                StreamMaintenanceCommand::Optimize { .. } => "stream maintenance optimize",
+            },
         },
     }
 }
@@ -547,7 +555,6 @@ mod tests {
                     "stream",
                     "block",
                     "show",
-                    "node:Person",
                     "--block-token",
                     "block-1",
                 ]),
@@ -579,6 +586,15 @@ mod tests {
         assert_eq!(cap(&["omnigraph", "graphs", "list"]), Capability::Served);
         assert_eq!(cap(&["omnigraph", "stream", "ingest"]), Capability::Served);
         assert_eq!(cap(&["omnigraph", "stream", "status"]), Capability::Served);
+        assert_eq!(cap(&["omnigraph", "stream", "resume"]), Capability::Served);
+        assert_eq!(
+            cap(&["omnigraph", "stream", "maintenance", "ensure-indices"]),
+            Capability::Served
+        );
+        assert_eq!(
+            cap(&["omnigraph", "stream", "maintenance", "optimize"]),
+            Capability::Served
+        );
         assert_eq!(cap(&["omnigraph", "alias", "who"]), Capability::Local);
         assert_eq!(
             cap(&["omnigraph", "optimize", "graph.omni"]),
@@ -606,7 +622,6 @@ mod tests {
                 "stream",
                 "block",
                 "correct",
-                "node:Person",
                 "--block-token",
                 "block-1",
                 "--correction-id",
@@ -719,6 +734,42 @@ mod tests {
             } => assert!(json),
             other => panic!("expected stream status, got {other:?}"),
         }
+
+        for args in [
+            vec!["omnigraph", "stream", "resume"],
+            vec!["omnigraph", "stream", "maintenance", "ensure-indices"],
+            vec!["omnigraph", "stream", "maintenance", "optimize"],
+        ] {
+            let mut served = args.clone();
+            served.extend([
+                "--server",
+                "http://server.invalid:9",
+                "--graph",
+                "knowledge",
+                "--json",
+            ]);
+            let cli = Cli::try_parse_from(served).unwrap();
+            guard_addressing(&cli).unwrap();
+
+            let mut direct = args;
+            direct.extend(["--store", "file:///must-not-open.omni"]);
+            let cli = Cli::try_parse_from(direct).unwrap();
+            let error = guard_addressing(&cli).unwrap_err().to_string();
+            assert!(error.contains("is a served command"), "{error}");
+            assert!(error.contains("--store addresses"), "{error}");
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "omnigraph",
+                "stream",
+                "resume",
+                "--type",
+                "Person",
+            ])
+            .is_err(),
+            "graph resume must not accept a declaration selector"
+        );
     }
 
     #[test]

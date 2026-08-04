@@ -7,7 +7,7 @@ This file is the always-on map of the test surface. **Consult it before every ta
 | Crate | Path | Style |
 |---|---|---|
 | `omnigraph` (engine) | `crates/omnigraph/tests/` | Integration tests (one file per behavior area — see the table below), fixture-driven, share `tests/helpers/mod.rs` |
-| `omnigraph-cli` | `crates/omnigraph-cli/tests/` | Per-area suites (post-modularization): `cli_cluster.rs` (cluster command surface + operator-actor cascade, including strict stream-block/dead-letter grammar, scope, plan parsing, and effect-free offline preflight), `cli_cluster_e2e.rs` (spawned-binary lifecycle compositions — lost-state re-import recovery, out-of-band drift, graph-root destruction, multi-graph mixed-disposition convergence), `cli_data.rs` (load/read/change/branch/commit/export/snapshot/policy/embed/maintenance + operator format cascade), `cli_schema_config.rs` (init/config, schema plan/apply), `cli_queries.rs`, `parity_matrix.rs` (RFC-009 Phase 1: the embedded-vs-remote referee — every forked verb run against both arms with matched Cedar policy and the same actor, scrubbed-JSON + exit-code equality; divergences are pinned in its `KNOWN_DIVERGENCES` ledger, never silently repaired), `system_local.rs` (full-cycle cluster lifecycle with a spawned `--cluster` server, applied-policy enforcement over HTTP, keyed-credential auth, operator aliases), `system_remote.rs`, `crossversion_upgrade.rs` (genuine historical source→CURRENT rebuild/refusal cells plus the required adjacent harness — see below); share `tests/support/mod.rs` (hermetic `OMNIGRAPH_HOME` by default) |
+| `omnigraph-cli` | `crates/omnigraph-cli/tests/` | Per-area suites (post-modularization): `cli_cluster.rs` (cluster command surface + operator-actor cascade, including strict stream-block/dead-letter grammar, scope, plan parsing, and effect-free offline preflight), `cli_cluster_e2e.rs` (spawned-binary lifecycle compositions — lost-state re-import recovery, out-of-band drift, graph-root destruction, multi-graph mixed-disposition convergence), `cli_data.rs` (load/read/change/branch/commit/export/snapshot/policy/embed/maintenance + operator format cascade), `cli_schema_config.rs` (init/config, schema plan/apply), `cli_queries.rs`, `parity_matrix.rs` (RFC-009 Phase 1: the embedded-vs-remote referee — every forked verb run against both arms with matched Cedar policy and the same actor, scrubbed-JSON + exit-code equality; divergences are pinned in its `KNOWN_DIVERGENCES` ledger, never silently repaired), `system_local.rs` (full-cycle cluster lifecycle with a spawned `--cluster` server, applied-policy enforcement over HTTP, keyed-credential auth, operator aliases, and the real-binary graph-first firehose golden journey), `system_remote.rs`, `crossversion_upgrade.rs` (genuine historical source→CURRENT rebuild/refusal cells plus the required adjacent harness — see below); share `tests/support/mod.rs` (hermetic `OMNIGRAPH_HOME` by default) |
 | `omnigraph-control-authority` | in-source `#[cfg(test)] mod tests` | Concrete-storage, lock-derived checked authority: offline confirmation/actor/operation binding, state-CAS and graph/declaration/profile-revision validation, normalized graph-root binding, non-cloneable runtime guards, and one process-local writer registration per cluster graph. F6b1 pins a distinct served-export guard for exact terminal `DISABLED | RETIRED` state and proves it shares that registration without becoming writer authority |
 | `omnigraph-cluster` | mostly in-source `#[cfg(test)] mod tests`; `tests/failpoints.rs` (feature-gated); `tests/s3_cluster.rs` (bucket-gated full lifecycle on object storage) | Cluster config parser, local JSON state diff, state CAS/lock handling/recovery, read-only validate/plan/status plus explicit refresh/import graph observations, config-only apply (content-addressed payload publish, disposition gating, composite-digest convergence, idempotent re-apply), catalog payload verification (status read-only, refresh drift + self-heal), failpoint crash-mid-apply / CAS-race coverage, graph create/schema/delete lifecycle, policy binding and serving snapshots, v11 streaming-profile ownership, authority-retirement preflight, and stopped/offline stream-control preflight. The current dead-letter owner pins actor/offline/applied-streaming/declaration/state-lock binding before selected-token list or payload export; it is inspection-only and exposes no served route. F6b1 adds only the exact-terminal served-export binding consumed at boot |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | Per-area suites (post-modularization): `auth_policy.rs`, `data_routes.rs`, `schema_routes.rs`, `stored_queries.rs`, `multi_graph.rs` (cluster-mode boot — converged serving, policy binding wiring, boot refusals — + the concurrent branch-ops matrix), `boot_settings.rs` (mode inference, PolicySource), `s3.rs` (bucket-gated: single-graph serving + config-free `--cluster s3://` boot), `openapi.rs` (OpenAPI drift / regeneration); share `tests/support/mod.rs`. F5a changes no route: `serve` starts checked-runtime resident fold supervisors only after listener bind and joins every selected graph concurrently after Axum graceful shutdown; engine/failpoint owners pin the scheduler behavior. F6b1 boot consumes the terminal served-export guard and installs the hidden engine authority; it adds no handler, route, or OpenAPI surface |
@@ -648,8 +648,9 @@ apply failpoint seams are also registered as named read-only surfaces;
 in `stream_status.rs` and guards the named surfaces' direct durable-call shape.
 It does not prove the full composed call graph contains no publication
 primitive. The operational-status cells' unchanged manifest version and absent
-sidecar/effect assertions own that behavioral claim. Public CLI/HTTP/OpenAPI/
-SDK transport is not covered because it does not exist yet.
+sidecar/effect assertions own that behavioral claim. The served F7b
+route/CLI/OpenAPI projection is covered by the server and CLI owners below; a
+direct-SDK checked-runtime transport remains intentionally absent.
 
 The v11 bounded profile-authority slice extends different existing owners.
 `omnigraph-control-authority` in-source tests pin lock-derived offline
@@ -683,16 +684,29 @@ test in the v11 profile-authority slice activated ingress, enrollment, claim,
 or ordinary lifecycle mutation. The current v19 hidden lifecycle owners are
 `memwal_stream.rs` plus the v14/v15/v16/v17/v18/v19/v20/v21 in-source
 recovery/lifecycle suites described above. F7a extends the existing graph-row
-owner and adds server/CLI/OpenAPI coverage; those tests still do not activate
-an ordinary lifecycle transport surface.
+owner and adds server/CLI/OpenAPI coverage. F7c adds only graph-wide controls:
+`memwal_stream.rs` owns all-OPEN no-op, mixed OPEN/SEALED convergence,
+multi-declaration resume, and DRAINING/strict-block preflight-before-effect;
+the existing F3b/F3c cells remain the recovery-v16/v17 maintenance authority.
+`forbidden_apis.rs` classifies the three doc-hidden graph bridges by their
+frozen recovery owners. Server auth/multi-graph/OpenAPI tests own bodyless
+routes, graph-scoped `stream_manage`, default deny, aggregate DTOs, and error
+redaction. CLI client/plane/output tests own selector-free grammar, exact POST
+paths, bearer propagation, aggregate rendering, and status next-action hints.
+`system_local.rs::local_cluster_firehose_golden_journey_uses_graph_only_controls`
+closes the public composition through the real CLI and server binaries:
+cluster-owned enablement, four independently visible mixed node/edge folds,
+checked status, stopped/offline disable and re-enable, productive sealed
+EnsureIndices and Optimize, convergent graph-wide resume, and a visible
+successor ingest. It never names a table, dataset, or lane.
 
 The historical B1/B2a and private B2-common slices added no
 parser/server/ingest-CLI tests because they had no public row surface. F7a now
 extends the existing server/OpenAPI, CLI, Cedar, shutdown, no-raw-GC, and
-provider-failure ownership for graph ingress without activating lane controls.
-Future public management must additionally cover persistent revisioned
-status/quiesce/resume/abort-drain, bounded terminal management receipts,
-attribution, and strict correction. The selected retain-all profile has no byte/object/file/history
+provider-failure ownership for graph ingress. F7c activates graph-wide resume
+and sealed maintenance without exposing a lane control; per-declaration
+enrollment/resume/abort-drain, public rebind, and direct-SDK checked control
+remain future work. The selected retain-all profile has no byte/object/file/history
 quota; its tests must instead prove that provider exhaustion is loud and cannot
 drop an acknowledgement or bypass recovery/manifest visibility. Storage
 watermarks and graph-history admission controls belong only to a future B2b

@@ -1251,6 +1251,25 @@ impl Omnigraph {
             .await
     }
 
+    /// Release a foreign resident before graph-level lifecycle control claims
+    /// the bounded profile's sole root slot.
+    ///
+    /// Unlike logical route settlement, this deliberately does not require a
+    /// disposition from the target lane itself: resume calls it while that
+    /// target is still SEALED, and a stale pre-seal driver trigger must not be
+    /// mistaken for a failed resume. The subsequent recovery-v15 adapter and
+    /// its exact post-open handoff own the target's disposition.
+    pub(super) async fn release_foreign_stream_resident_for_graph_control(
+        self: &Arc<Self>,
+        target_identity: TableIdentity,
+    ) -> Result<()> {
+        maybe_fail(names::STREAM_DRIVER_BEFORE_ROUND_ACQUIRE)?;
+        let _round_admission = self.stream_workers.acquire_stream_fold_round().await;
+        self.seed_initial_stream_discovery_if_needed().await?;
+        self.release_foreign_stream_resident_under_graph_fence(target_identity)
+            .await
+    }
+
     async fn settle_stream_lane_for_graph(
         self: &Arc<Self>,
         expected_identity: TableIdentity,

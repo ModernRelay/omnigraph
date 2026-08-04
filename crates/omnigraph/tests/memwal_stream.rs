@@ -24,6 +24,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
+use base64::Engine;
 use fail::FailScenario;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -3607,7 +3608,8 @@ struct F6aCandidateRuntimeFixture {
 }
 
 #[inline(never)]
-async fn f6a_publish_mixed_candidate_cut() -> F6aCandidateRuntimeFixture {
+async fn f6a_publish_mixed_candidate_cut(dead_letter_count: usize) -> F6aCandidateRuntimeFixture {
+    assert!(dead_letter_count > 0);
     let cluster = tempfile::tempdir().unwrap();
     let graph = cluster.path().join("graphs/knowledge.omni");
     let db = Arc::new(
@@ -3662,36 +3664,44 @@ async fn f6a_publish_mixed_candidate_cut() -> F6aCandidateRuntimeFixture {
     assert!(next_witness.is_none());
     let incarnation = incarnation.expect("lazy enrollment returns its durable incarnation");
 
-    let body = [
-        ndjson_score_line(
+    let mut body = Vec::new();
+    for ordinal in 0..dead_letter_count {
+        let logical_id = if dead_letter_count == 1 {
+            "loser".to_string()
+        } else {
+            format!("loser-{ordinal:04}")
+        };
+        body.extend(ndjson_score_line(
             &incarnation,
-            "loser",
+            &logical_id,
             7,
-            "f6a10000-0000-4000-8000-000000000001",
+            &format!("{:08x}-0000-4000-8000-{:012x}", ordinal + 1, ordinal + 1),
             None,
-        ),
-        ndjson_score_line(
-            &incarnation,
-            "winner",
-            9,
-            "f6a10000-0000-4000-8000-000000000002",
-            None,
-        ),
-    ]
-    .concat();
+        ));
+    }
+    body.extend(ndjson_score_line(
+        &incarnation,
+        "winner",
+        9,
+        "f6a10000-0000-4000-8000-000000000002",
+        None,
+    ));
     let outcomes = parse_ndjson_outcomes(
         served
             .failpoint_stream_ingest_ndjson_as_for_test(TABLE, vec![body], "agent:f6a-candidate")
             .await
             .expect("the mixed candidate batch crosses the durable NDJSON boundary"),
     );
-    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes.len(), dead_letter_count + 1);
     for (ordinal, outcome) in outcomes.iter().enumerate() {
         assert_eq!(outcome["ordinal"], ordinal as u64);
         assert_eq!(outcome["status"], "durable");
         assert!(outcome["stream_token"].as_str().is_some());
     }
-    assert_ne!(outcomes[0]["stream_token"], outcomes[1]["stream_token"]);
+    assert_ne!(
+        outcomes[0]["stream_token"],
+        outcomes[dead_letter_count]["stream_token"]
+    );
     let acknowledged = stream_fold_driver_status(&served);
     assert_process_local_driver_state(&acknowledged, "running");
 
@@ -3855,9 +3865,119 @@ async fn f6a_publish_correction_and_disable(
 fn candidate_runtime_composes_lazy_prepare_mixed_fold_terminal_correction_and_disable() {
     on_big_stack(|| async {
         let _scenario = FailScenario::setup();
-        let fixture = f6a_publish_mixed_candidate_cut().await;
+        let fixture = f6a_publish_mixed_candidate_cut(1).await;
         let terminal_token = f6a_inspect_terminal_candidate(&fixture).await;
         f6a_publish_correction_and_disable(&fixture, &terminal_token).await;
+    });
+}
+
+#[test]
+#[serial]
+fn dead_letter_logical_cursor_paginates_list_and_export_and_refuses_tampering() {
+    on_big_stack(|| async {
+        let _scenario = FailScenario::setup();
+        let fixture = f6a_publish_mixed_candidate_cut(257).await;
+        let offline = reopen_enrolled(&fixture.dir).await;
+        let cluster_uri = fixture.dir.cluster_uri();
+
+        let first =
+            helpers::stream_authority::list_stream_dead_letters(&offline, &cluster_uri, None)
+                .await
+                .expect("the first bounded dead-letter page is readable");
+        assert_eq!(first.entries.len(), 256);
+        assert_eq!(first.entries.first().unwrap().logical_id, "loser-0000");
+        assert_eq!(first.entries.last().unwrap().logical_id, "loser-0255");
+        let cursor = first
+            .next_cursor
+            .as_deref()
+            .expect("257 current terminal keys require a second page");
+
+        let decoded_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cursor)
+            .expect("the bounded public cursor is canonical base64url");
+        let mut decoded: serde_json::Value = serde_json::from_slice(&decoded_bytes).unwrap();
+        let keys = decoded
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "authority_binding".to_string(),
+                "declaration_kind".to_string(),
+                "declaration_type".to_string(),
+                "format".to_string(),
+                "logical_id".to_string(),
+            ])
+        );
+        assert_eq!(decoded["declaration_kind"], "node");
+        assert_eq!(decoded["declaration_type"], "Person");
+        assert_eq!(decoded["logical_id"], "loser-0255");
+        let rendered = String::from_utf8(decoded_bytes).unwrap();
+        for forbidden in [
+            "source_manifest_version",
+            "source_profile_revision",
+            "token_table_version",
+            "token_transaction_uuid",
+            "stable_table_id",
+            "table_incarnation_id",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "public pagination cursor leaked {forbidden}: {rendered}"
+            );
+        }
+
+        decoded["logical_id"] = serde_json::json!("loser-0000");
+        let tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&decoded).unwrap());
+        let error = helpers::stream_authority::list_stream_dead_letters(
+            &offline,
+            &cluster_uri,
+            Some(&tampered),
+        )
+        .await
+        .expect_err("the hidden-cut binding must refuse a forged logical boundary");
+        assert!(
+            matches!(error, OmniError::StreamingAuthorityMismatch { .. }),
+            "{error:?}"
+        );
+
+        let second = helpers::stream_authority::list_stream_dead_letters(
+            &offline,
+            &cluster_uri,
+            Some(cursor),
+        )
+        .await
+        .expect("the authentic logical boundary selects the next page");
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.entries[0].logical_id, "loser-0256");
+        assert!(second.next_cursor.is_none());
+
+        let first_export = helpers::stream_authority::export_stream_dead_letter_payloads(
+            &offline,
+            &cluster_uri,
+            None,
+        )
+        .await
+        .expect("payload export uses the same bounded logical cursor");
+        assert_eq!(first_export.entries.len(), 256);
+        let export_cursor = first_export
+            .next_cursor
+            .as_deref()
+            .expect("payload export requires a second page");
+        let second_export = helpers::stream_authority::export_stream_dead_letter_payloads(
+            &offline,
+            &cluster_uri,
+            Some(export_cursor),
+        )
+        .await
+        .expect("payload export accepts its authentic next-page cursor");
+        assert_eq!(second_export.entries.len(), 1);
+        assert_eq!(second_export.entries[0].authority.logical_id, "loser-0256");
+        assert!(second_export.next_cursor.is_none());
     });
 }
 
@@ -4451,11 +4571,12 @@ async fn sealed_ensure_indices_refreshes_a_productive_lane_and_preserves_resume(
     assert_eq!(stream_lane(&db).await, sealed);
     assert_no_recovery_sidecars(&dir);
 
-    let pending = db
-        .failpoint_stream_sealed_ensure_indices_for_test("operator:sealed-indices")
+    let maintenance = db
+        .ensure_served_graph_stream_indices_as("operator:sealed-indices")
         .await
         .expect("checked SEALED maintenance must build the deferred id index");
-    assert!(pending.is_empty());
+    assert!(maintenance.changed);
+    assert_eq!(maintenance.pending_index_count, 0);
     let maintained = stream_lane(&db).await;
     let mut expected_maintained = sealed.clone();
     expected_maintained.lifecycle_revision += 1;
@@ -4478,11 +4599,12 @@ async fn sealed_ensure_indices_refreshes_a_productive_lane_and_preserves_resume(
 
     let before_no_work_status = db.stream_status().await.unwrap();
     let before_no_work_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let pending = db
-        .failpoint_stream_sealed_ensure_indices_for_test("operator:sealed-indices")
+    let maintenance = db
+        .ensure_served_graph_stream_indices_as("operator:sealed-indices")
         .await
         .expect("a repeated checked maintenance call must recognize no work");
-    assert!(pending.is_empty());
+    assert!(!maintenance.changed);
+    assert_eq!(maintenance.pending_index_count, 0);
     let after_no_work_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     assert_eq!(
         db.stream_status().await.unwrap(),
@@ -4830,18 +4952,13 @@ async fn sealed_indices_then_optimize_refresh_productive_authority_and_preserve_
     );
     assert_no_recovery_sidecars(&dir);
 
-    let stats = db
-        .failpoint_stream_sealed_optimize_for_test("operator:sealed-optimize")
+    let optimize = db
+        .optimize_served_graph_stream_as("operator:sealed-optimize")
         .await
         .expect("checked SEALED Optimize must compact the enrolled and ordinary siblings");
-    for table_key in [TABLE, "node:Company"] {
-        assert!(
-            stats
-                .iter()
-                .any(|stat| stat.table_key == table_key && stat.committed),
-            "{table_key} must complete productive Optimize work: {stats:?}"
-        );
-    }
+    assert!(optimize.changed);
+    assert_eq!(optimize.pending_index_count, 0);
+    assert!(!optimize.requires_repair);
     let maintained = stream_lane(&db).await;
     let mut expected_maintained = sealed.clone();
     expected_maintained.lifecycle_revision += 1;
@@ -4871,16 +4988,15 @@ async fn sealed_indices_then_optimize_refresh_productive_authority_and_preserve_
     let before_no_work_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let before_no_work_commit_count = db.list_commits(Some("main")).await.unwrap().len();
     let repeated = db
-        .failpoint_stream_sealed_optimize_for_test("operator:sealed-optimize")
+        .optimize_served_graph_stream_as("operator:sealed-optimize")
         .await
         .expect("a repeated checked Optimize must recognize no data-table work");
     assert!(
-        repeated
-            .iter()
-            .filter(|stat| stat.table_key == TABLE || stat.table_key == "node:Company")
-            .all(|stat| !stat.committed),
-        "the converged data tables must be true no-ops: {repeated:?}"
+        !repeated.changed,
+        "the converged graph must be a true no-op"
     );
+    assert_eq!(repeated.pending_index_count, 0);
+    assert!(!repeated.requires_repair);
     let after_no_work_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     assert_eq!(db.stream_status().await.unwrap(), before_no_work_status);
     assert_eq!(
@@ -5664,6 +5780,22 @@ async fn data_block_withdraw_uses_a_marker_only_base_effect_and_unstrands_the_dr
             .await;
     let cluster_uri = dir.cluster_uri();
     let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+    let resume_error = db
+        .resume_served_graph_stream_as("operator:blocked-graph-resume")
+        .await
+        .expect_err("graph resume must not bypass selected correction evidence");
+    assert!(
+        resume_error
+            .to_string()
+            .contains("blocked by unresolved validation evidence"),
+        "{resume_error:?}"
+    );
+    assert_eq!(
+        stream_lane(&db).await,
+        blocked,
+        "graph resume must leave the blocked drain untouched"
+    );
+    assert_no_recovery_sidecars(&dir);
     let blocked_manifest_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -6362,6 +6494,150 @@ async fn sealed_resume_advances_epoch_replays_its_receipt_and_installs_the_write
         .await
         .expect("the selected resume receipt remains idempotent after a later fold");
     assert_eq!(stream_lane(&db).await, after_fold);
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn graph_resume_converges_every_sealed_lane_without_exposing_a_selector() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_f6b2_node_edge_fixture().await;
+    let cluster_uri = dir.cluster_uri();
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+
+    for (table_key, drain_id) in [
+        (TABLE, "6a6a6a6a-6a6a-4a6a-8a6a-6a6a6a6a6a6a"),
+        (COMPANY_TABLE, "7a7a7a7a-7a7a-4a7a-8a7a-7a7a7a7a7a7a"),
+    ] {
+        let open = stream_lane_for(&db, table_key).await;
+        db.failpoint_stream_quiesce_for_test(
+            table_key,
+            drain_id,
+            open.lifecycle_revision,
+            "operator:graph-resume-fixture",
+        )
+        .await
+        .expect("the selected fixture lane must reach SEALED");
+    }
+
+    let resumed = db
+        .resume_served_graph_stream_as("operator:graph-resume")
+        .await
+        .expect("one graph operation must resume every SEALED declaration");
+    assert_eq!(resumed.enrolled_declarations, 3);
+    assert_eq!(resumed.resumed_declarations, 2);
+    assert_eq!(resumed.already_open_declarations, 1);
+    let status = db.stream_status().await.unwrap();
+    assert!(
+        status.tables.iter().all(|lane| lane.lifecycle == "OPEN"),
+        "graph resume must leave no caller-selected SEALED lane: {:?}",
+        status.tables
+    );
+
+    let retry = db
+        .resume_served_graph_stream_as("operator:graph-resume")
+        .await
+        .expect("an exact graph retry must observe the converged authority");
+    assert_eq!(retry.profile_revision, resumed.profile_revision);
+    assert_eq!(retry.enrolled_declarations, 3);
+    assert_eq!(retry.resumed_declarations, 0);
+    assert_eq!(retry.already_open_declarations, 3);
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn graph_resume_preflights_every_lane_before_resuming_a_sealed_lane() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_f6b2_node_edge_fixture().await;
+    let cluster_uri = dir.cluster_uri();
+    let db = helpers::stream_authority::bind_checked_stream_runtime(db, &cluster_uri).await;
+
+    let person_open = stream_lane_for(&db, TABLE).await;
+    db.failpoint_stream_quiesce_for_test(
+        TABLE,
+        "8a8a8a8a-8a8a-4a8a-8a8a-8a8a8a8a8a8a",
+        person_open.lifecycle_revision,
+        "operator:graph-resume-preflight",
+    )
+    .await
+    .expect("the first ordered lane must reach SEALED");
+    let sealed_before = stream_lane_for(&db, TABLE).await;
+    assert_eq!(sealed_before.lifecycle, "SEALED");
+
+    let company_open = stream_lane_for(&db, COMPANY_TABLE).await;
+    db.failpoint_start_stream_open_after_fold_drain_for_test(
+        COMPANY_TABLE,
+        "9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a",
+        company_open.lifecycle_revision,
+        "operator:graph-resume-preflight",
+    )
+    .await
+    .expect("the later ordered lane must remain DRAINING");
+    let draining_before = stream_lane_for(&db, COMPANY_TABLE).await;
+    assert_eq!(draining_before.lifecycle, "DRAINING");
+    assert_no_recovery_sidecars(&dir);
+
+    let error = db
+        .resume_served_graph_stream_as("operator:graph-resume-preflight")
+        .await
+        .expect_err("one DRAINING declaration must refuse the graph operation");
+    assert!(
+        error
+            .to_string()
+            .contains("every drain to reach SEALED first"),
+        "{error:?}"
+    );
+    assert_eq!(
+        stream_lane_for(&db, TABLE).await,
+        sealed_before,
+        "full preflight must precede the first per-lane resume effect"
+    );
+    assert_eq!(stream_lane_for(&db, COMPANY_TABLE).await, draining_before);
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn graph_resume_authorizes_the_graph_even_when_no_lane_is_enrolled() {
+    struct GraphManageDecisionCounter {
+        calls: AtomicUsize,
+    }
+
+    impl PolicyChecker for GraphManageDecisionCounter {
+        fn check(
+            &self,
+            action: omnigraph_policy::PolicyAction,
+            scope: &omnigraph_policy::ResourceScope,
+            actor: &str,
+        ) -> std::result::Result<(), omnigraph_policy::PolicyError> {
+            assert_eq!(action, omnigraph_policy::PolicyAction::StreamManage);
+            assert_eq!(scope, &omnigraph_policy::ResourceScope::Graph);
+            assert_eq!(actor, "operator:empty-graph-resume");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_unenrolled_served_with_schema(TWO_TABLE_STREAM_SCHEMA).await;
+    let checker = Arc::new(GraphManageDecisionCounter {
+        calls: AtomicUsize::new(0),
+    });
+    let policy: Arc<dyn PolicyChecker> = checker.clone();
+    let db = match Arc::try_unwrap(db) {
+        Ok(db) => Arc::new(db.with_policy(policy)),
+        Err(_) => panic!("empty graph policy fixture must own the sole engine handle"),
+    };
+
+    let result = db
+        .resume_served_graph_stream_as("operator:empty-graph-resume")
+        .await
+        .expect("the graph-scoped no-op remains authorized and observable");
+    assert_eq!(result.enrolled_declarations, 0);
+    assert_eq!(result.resumed_declarations, 0);
+    assert_eq!(result.already_open_declarations, 0);
+    assert_eq!(checker.calls.load(Ordering::SeqCst), 1);
     assert_no_recovery_sidecars(&dir);
 }
 

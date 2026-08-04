@@ -572,10 +572,13 @@ state-lock-held, stopped/offline cluster adapter can show and correct one exact
 `REPLACE`/`WITHDRAW`. V19 adds the similarly stopped/offline
 `cluster stream dead-letter list|export` inspector over manifest-selected
 current authority. Explicit production enrollment, general lifecycle control,
-`SEALED -> OPEN`, `AuthorityBlock` repair, direct SDK stream ingress/status,
-and SDK/HTTP/OpenAPI lifecycle/maintenance parity remain inactive. F7b exposes
+`AuthorityBlock` repair, direct SDK stream ingress/status/control, and public
+per-declaration abort/rebind remain inactive. F7b exposes
 F6b6's checked read-only operational cut through one graph-redacted served
-HTTP/OpenAPI route and remote CLI command. `ENABLED` uses runtime ownership,
+HTTP/OpenAPI route and remote CLI command. F7c exposes selector-free graph-wide
+`SEALED -> OPEN` resume and graph-wide checked `SEALED` EnsureIndices/Optimize
+through HTTP/OpenAPI and the remote CLI; it exposes no declaration, table, or
+lane selector. `ENABLED` uses runtime ownership,
 terminal `DISABLED | RETIRED`
 uses served-export ownership, and `DISABLING` uses explicit checked cluster-
 apply status authority. Immutable token/base parity, its bounded sample,
@@ -1112,7 +1115,9 @@ on the proposer.)
   Direct SDK row admission/status and lifecycle mutation remain inactive; the
   Cedar vocabulary, enablement flip, and embedded manifest-only status are
   active, while F7b exposes F6b6's checked cut only as a graph-redacted served
-  status route and remote CLI command.
+  status route and remote CLI command. F7c exposes only selector-free
+  graph-wide resume and checked `SEALED` EnsureIndices/Optimize over those
+  served transports, reusing the existing recovery owners.
   The selected profile forbids OmniGraph from deleting raw
   `_mem_wal` paths and accepts monotonic storage plus loud provider exhaustion;
   a future managed-reclamation profile would require the missing operation to
@@ -1206,7 +1211,8 @@ future bounded-storage claim, not blockers for this profile. B2a itself
 activated no schema or product surface.
 
 **Implemented B2 token/fold, bounded profile authority, graph-native served
-row ingress, and hidden lifecycle core; public lifecycle controls remain inactive:**
+row ingress, and hidden lifecycle core; bounded graph-wide controls active and
+per-declaration lifecycle controls inactive:**
 Internal schema v9/config-v3/state-v2 adds canonical payload and token digests,
 trusted hidden row metadata, exact compare-and-chain/idempotency classification,
 same-generation token overlays, and the manifest-selected graph-global
@@ -1233,10 +1239,12 @@ production quiescence owner. F7a exposes one graph-native mixed node/edge
 NDJSON route plus remote client/CLI/OpenAPI parity over the existing lazy
 private-lane prepare and resident driver; it adds no coordinator or format.
 Explicit public lane enrollment, general lifecycle control, `AuthorityBlock`
-repair, direct SDK stream ingress/status, and SDK/HTTP/OpenAPI
-lifecycle/maintenance parity remain inactive. F7b exposes F6b6's checked
+repair, direct SDK stream ingress/status/control, and public per-declaration
+abort/rebind remain inactive. F7b exposes F6b6's checked
 status core through a graph-redacted served HTTP/OpenAPI route and remote CLI
-command. The core observes one read-only authority cut and retains honest
+command. F7c exposes selector-free graph-wide resume plus graph-wide checked
+`SEALED` EnsureIndices/Optimize through HTTP/OpenAPI and the remote CLI without
+adding a coordinator, recovery grammar, or format strand. The core observes one read-only authority cut and retains honest
 unavailable states for cold replay, flushed LWW
 projection, exact canonical-main recovery-owned physical movement, and oldest uncovered age;
 all pending sidecars inside the accepted envelope remain visible and rebuild-
@@ -1290,7 +1298,9 @@ its uncompacted-profile-cycle bounded NO-GO schedules no standalone production
 reconciler. F6b4 closes isolated
 dead-letter
 envelope evidence, F6b5 closes served export, F6b6 closes the internal checked
-operational-status core, and F7b activates its graph-safe served transport.
+operational-status core, F7b activates its graph-safe served transport, and F7c
+activates graph-wide resume and checked `SEALED` maintenance without exposing a
+lane control.
 Dead-letter inspection/export,
 future `AuthorityBlock` repair, and
 retirement remain cluster/offline-only, with no replay mutation or public
@@ -1313,7 +1323,7 @@ resource budgets.
 | **R4: Manifest authority access grows with commit count.** Current-state resolution folds history; a selective index does not by itself bound the complete physical read. | Medium | `optimize` compacts internal tables (keeps periodically-optimized shipped paths flat where separately cost-gated). RFC-024 Gate A rejected durable heads because representative RustFS latest-manifest reads/bytes grow despite flat exact-BTREE row/range work. RFC-025 Gate 0 independently rejected checkpoint-registry activation: at local 10→1,000 on RC.1, uncompacted reconciled work and the eight-fragment tail stay flat, but compacted list/cleanup scan bytes grow 17,012→38,000 cold and 12,336→15,064 warm; exact-show bytes and operation counts also grow. Both RFCs are research-blocked; v8 retains the journal fold and internal-table *cleanup* remains deferred behind the resurrection watermark. |
 | **R5: Schema identity corruption or alias/identity drift.** Internal schema v5 introduced stable IDs/incarnation as durable authority; v6, v7, and v8 preserve them. | Medium | Open/init validate the SchemaIR domain and exact bidirectional IR↔manifest identity/path/alias contract; every active recovery envelope carries the identity pair; zero, duplicate, missing, or mismatched identity fails closed. |
 | **R6: Merge cost at divergence** — full-width classification and history-growing manifest folds. | Medium | Coherent coordinator scans plus retained probe handles reduced the pre-slice measured depth-5/depth-80 baseline from 59/651 manifest reads to 40/410 and cap the common fast-forward route at three internal opens and three scans, but the uncompacted-history slope remains. `merge_cost.rs` keeps both facts visible; O(delta) merge is blocked on a real deletion-delta source **(RFC-027)**; fragment adoption is **(draft RFC-0001)**. |
-| **R7: The public graph firehose has a deliberately narrow operating envelope** — F7a serves absent/`OPEN` lanes in the single-writer checked runtime and F7b serves a graph-redacted checked status cut, while lifecycle/maintenance transport and overlapping-process ownership remain incomplete. | Medium | MemWAL is the strategic substrate. The bounded worker provides watcher-plus-post-fence acknowledgement and conservative replay; its legal near-cap shape closes under logical dense-slice accounting. Schema v9–v18 establish compare-and-chain tokens, checked profile/lifecycle authority, maintenance/rebind, retirement, and exact DataBlock correction. Current v19/recovery-v21 adds bounded terminal folds, current `DEAD_LETTERED` authority, ordinary successors, cluster/offline inspection/export, and three-disposition retirement. F7a activates graph-native served row ingress by reusing that core and the resident driver; it adds no new coordinator or format. F6b5 separately activates exact-terminal served export; F6b6 implements checked operational status internally; F7b exposes only its logical graph projection over HTTP/OpenAPI and the remote CLI; F6b7 adds paired failpoints-only selected token-index evidence and records the uncompacted-profile-cycle bounded NO-GO. Exact evidence remains in [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) and the [testing map](testing.md). Public resume/rebind and maintenance transport, direct SDK parity, and the remaining guardrail acceptance stay open. Managed reclamation and a whole-root history budget are optional later work; a public exact enrollment receipt plus reversible admission seal gates broader overlapping-process topology. |
+| **R7: The public graph firehose has a deliberately narrow operating envelope** — F7a serves absent/`OPEN` lanes in the single-writer checked runtime, F7b serves a graph-redacted checked status cut, and F7c serves graph-wide resume and checked `SEALED` maintenance; per-declaration lifecycle/rebind, direct SDK control, and overlapping-process ownership remain incomplete. | Medium | MemWAL is the strategic substrate. The bounded worker provides watcher-plus-post-fence acknowledgement and conservative replay; its legal near-cap shape closes under logical dense-slice accounting. Schema v9–v18 establish compare-and-chain tokens, checked profile/lifecycle authority, maintenance/rebind, retirement, and exact DataBlock correction. Current v19/recovery-v21 adds bounded terminal folds, current `DEAD_LETTERED` authority, ordinary successors, cluster/offline inspection/export, and three-disposition retirement. F7a activates graph-native served row ingress by reusing that core and the resident driver; it adds no new coordinator or format. F6b5 separately activates exact-terminal served export; F6b6 implements checked operational status internally; F7b exposes only its logical graph projection over HTTP/OpenAPI and the remote CLI; F7c composes the frozen recovery-v15/v16/v17 owners behind selector-free graph controls; F6b7 adds paired failpoints-only selected token-index evidence and records the uncompacted-profile-cycle bounded NO-GO. Exact evidence remains in [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) and the [testing map](testing.md). Public per-declaration resume/abort/rebind, direct SDK parity, and the remaining guardrail acceptance stay open. Managed reclamation and a whole-root history budget are optional later work; a public exact enrollment receipt plus reversible admission seal gates broader overlapping-process topology. |
 | **R8: Some operations lack enforced memory/time budgets.** | Medium | Known gap, narrowed and accepted for RFC-023. Its direct-substrate instrument rejected the first whole-delta fenced adopt (~447 MB peak at 100K × 256 versus ~74 MB Append), and the first corrected production 10K series failed at 30.0× / 108,625,920 bytes overhead; both negative results remain evidence. Mutation/Load now refuses a keyed table above 8,192 rows / 32 MiB before arm, while BranchMerge uses a recovery-enrolled chain with the same per-chunk bounds and a 1,024-transaction ceiling. The inductive certificate route removes the general diff, temporary delta, target preflight, and target join without weakening that chain. Final five-pair production medians passed at 31/8 ms (3.875×) for 10K and 136/35 ms (~3.886×) for 100K; maximum signed paired RSS overheads were 24,297,472 and 32,604,160 bytes. Inclusive row/transaction ceilings, byte refusal (including materialized blobs), operation-wide validation retention, exact source/target incarnation revalidation, second-generation certificate composition, and both between-chunk recovery directions are pinned; other operations still need explicit bounds. |
 | **R9: Local-FS conditional-write emulation** (`write_text_if_match` check-then-act gap). | Low | All current callers sit behind the cluster lock protocol; S3 uses true conditional puts; close before admitting any lock-free caller. |
 | **R10: Doc/spec drift as the system grows** — this document included. | Low | Maintenance contract (same-PR doc updates, `check-agents-md.sh` link CI, "don't lie" stale markers); this canon defers to area docs by construction. |
@@ -1373,9 +1383,10 @@ Live design questions, each owned by an RFC or a known gap — not a wishlist:
    export, F6b6's internal checked operational status, and F6b7's failpoints-only
    paired token-index decision instrument are implemented. Its uncompacted-
    profile-cycle bounded NO-GO schedules no standalone production reconciler;
-   F7b's graph-redacted served status transport is implemented; direct-SDK
-   status, lifecycle/maintenance transport, and the F6 guardrail remainder stay
-   later.
+   F7b's graph-redacted served status transport and F7c's selector-free
+   graph-wide resume plus checked `SEALED` EnsureIndices/Optimize transports are
+   implemented; direct-SDK status/control, per-declaration lifecycle/rebind,
+   and the F6 guardrail remainder stay later.
    No active producer creates
    `AuthorityBlock`, so its repair stays fail-closed.
    RFC-024's heads, RFC-025's retention, and later RFC-026 phases remain
@@ -1410,7 +1421,7 @@ The plan of record is the RFC-022…028 family (all under
 | [0023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | Substrate-native keyed-write fencing via Lance's unenforced-PK filter; fleet/format activation barrier | **Implemented** (2026-07-15) |
 | [0024 — Durable table heads](../rfcs/0024-durable-table-heads.md) | Materialized head-row research; the first exact-BTREE candidate bounded scan work but failed the full latest-manifest/object-byte cost gate | **Research blocked** |
 | [0025 — Checkpoint-pinned retention](../rfcs/0025-checkpoint-retention.md) | Named checkpoints as authoritative retention roots, materialized as Lance tags; current in-manifest registry lookup rejected by Gate 0 | **Research-blocked** |
-| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: bounded watcher-plus-post-fence acknowledgement, compare-and-chain token authority, unbounded retain-all, checked profile/lifecycle control, recovery-v15–v20 maintenance/rebind/retirement/correction, and v19/recovery-v21 bounded terminal dead-letter folds plus three-disposition retirement. Hidden lifecycle/rebind/dead-letter, narrow cluster/offline inspection/correction/rebuild exits, F6b5 exact-terminal served export, F6b6 checked operational status, F7b's graph-redacted HTTP/OpenAPI/remote-CLI projection, and the F6b7 failpoints-only token-index decision instrument (uncompacted-profile-cycle bounded NO-GO; no standalone production reconciler) are implemented; F7a graph-native served row ingress is active, while public lane enrollment/lifecycle and maintenance transports remain inactive | **Draft; hidden protocol through F5b, F6 evidence, F7a graph row activation, and F7b graph status transport implemented; remaining lifecycle/maintenance activation stays staged** |
+| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: bounded watcher-plus-post-fence acknowledgement, compare-and-chain token authority, unbounded retain-all, checked profile/lifecycle control, recovery-v15–v20 maintenance/rebind/retirement/correction, and v19/recovery-v21 bounded terminal dead-letter folds plus three-disposition retirement. Hidden lifecycle/rebind/dead-letter, narrow cluster/offline inspection/correction/rebuild exits, F6b5 exact-terminal served export, F6b6 checked operational status, F7b's graph-redacted HTTP/OpenAPI/remote-CLI projection, F7c's selector-free graph-wide resume and checked `SEALED` EnsureIndices/Optimize transports, and the F6b7 failpoints-only token-index decision instrument (uncompacted-profile-cycle bounded NO-GO; no standalone production reconciler) are implemented; F7a graph-native served row ingress is active, while public lane enrollment, per-declaration/general lifecycle/abort/rebind, and direct SDK control remain inactive | **Draft; hidden protocol through F5b, F6 evidence, and F7a–F7c graph activation implemented; remaining per-declaration lifecycle/direct-SDK activation stays staged** |
 | [0027 — Lineage merge deltas](../rfcs/0027-lineage-merge-deltas.md) | O(delta) merge classification from row-version lineage | Research-blocked |
 
 Deliberately split, not one mega-format: identity, key fencing, head rows,

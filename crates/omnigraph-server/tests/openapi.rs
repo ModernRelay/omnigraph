@@ -299,6 +299,40 @@ fn graph_stream_ingest_documents_ndjson_and_token_preconditions() {
 }
 
 #[test]
+fn graph_stream_controls_are_bodyless_graph_wide_operations() {
+    let doc = openapi_json();
+    for (path, schema) in [
+        ("/graphs/{graph_id}/stream/resume", "StreamResumeOutput"),
+        (
+            "/graphs/{graph_id}/stream/maintenance/ensure-indices",
+            "StreamEnsureIndicesOutput",
+        ),
+        (
+            "/graphs/{graph_id}/stream/maintenance/optimize",
+            "StreamOptimizeOutput",
+        ),
+    ] {
+        let operation = &doc["paths"][path]["post"];
+        assert!(operation.is_object(), "missing graph stream control {path}");
+        assert!(
+            operation.get("requestBody").is_none(),
+            "graph stream control {path} must not accept a selector or actor body"
+        );
+        assert_eq!(
+            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            format!("#/components/schemas/{schema}")
+        );
+        for status in ["400", "401", "403", "409", "413", "500", "503"] {
+            assert_eq!(
+                operation["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/ErrorOutput",
+                "graph stream control {path} response {status}"
+            );
+        }
+    }
+}
+
+#[test]
 fn stream_aware_export_documents_pre_header_failures() {
     let doc = openapi_json();
     let responses = &doc["paths"]["/graphs/{graph_id}/export"]["post"]["responses"];
@@ -487,6 +521,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "StreamDriverErrorOutput",
     "StreamDriverStateOutput",
     "StreamDriverStatusOutput",
+    "StreamEnsureIndicesOutput",
     "StreamIngestChallenge",
     "StreamIngestKindOutput",
     "StreamIngestLineOutput",
@@ -494,10 +529,12 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "StreamIngestStatusOutput",
     "StreamLastFoldStatusOutput",
     "StreamLifecycleOutput",
+    "StreamOptimizeOutput",
     "StreamPendingStatusOutput",
     "StreamProfileModeOutput",
     "StreamRebuildBlockerOutput",
     "StreamRebuildStatusOutput",
+    "StreamResumeOutput",
     "StreamStatusOutput",
     "StreamStrictBlockStatusOutput",
     "StreamTokenCountsOutput",

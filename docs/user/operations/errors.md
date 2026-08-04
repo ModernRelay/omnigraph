@@ -46,9 +46,11 @@
   ordinary export found current `WITHDRAWN` or `DEAD_LETTERED` sequencing
   authority that a row-only artifact cannot preserve. Graph-native firehose
   ingest can install a fresh ordinary `PRESENT` successor only while the
-  enabled declaration lane is absent or `OPEN`. A terminally disabled/
-  `SEALED` lane has no public resume in F7a; its operator exit is the stopped/offline
-  `cluster stream retire-for-rebuild` handshake.
+  enabled declaration is absent or `OPEN`. For a disabled `SEALED`
+  declaration, re-enable streaming, restart the checked server, run the
+  selector-free graph-wide `omnigraph stream resume`, and then submit the
+  successor. If the authority must instead be discarded, use the stopped/
+  offline `cluster stream retire-for-rebuild` handshake.
   The served export route returns this as HTTP **409** before `200`.
 - Graph-ingest HTTP preconditions are transport errors rather than new durable
   engine states. Missing `If-Match` returns **428** plus the current opaque

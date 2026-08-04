@@ -28,9 +28,10 @@ pub use omnigraph::{
 pub use omnigraph::{
     GraphStreamChunkSource, GraphStreamDeclaration, GraphStreamDeclarationStatus,
     GraphStreamDrainStatus, GraphStreamDriverErrorStatus, GraphStreamDriverStatus,
-    GraphStreamIngestHandle, GraphStreamIngestStart, GraphStreamLastFoldStatus,
-    GraphStreamOperationalStatus, GraphStreamPendingStatus, GraphStreamRebuildBlocker,
-    GraphStreamRebuildStatus, GraphStreamStrictBlockStatus, GraphStreamTokenCounts,
+    GraphStreamEnsureIndicesResult, GraphStreamIngestHandle, GraphStreamIngestStart,
+    GraphStreamLastFoldStatus, GraphStreamOperationalStatus, GraphStreamOptimizeResult,
+    GraphStreamPendingStatus, GraphStreamRebuildBlocker, GraphStreamRebuildStatus,
+    GraphStreamResumeResult, GraphStreamStrictBlockStatus, GraphStreamTokenCounts,
 };
 pub(crate) use omnigraph::{
     DeferredTableFork, StreamAuthorityRetirementExportProvenance, WriteAuthorityToken, WriteTxn,

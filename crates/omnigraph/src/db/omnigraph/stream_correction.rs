@@ -27,11 +27,12 @@ use super::stream_lifecycle::{
 };
 use super::{CheckedClusterBlockAuthority, Omnigraph};
 use crate::db::manifest::stream::{
-    ManagementReceipt, STREAM_CORRECTION_OPERATION_KIND,
-    STREAM_DATA_BLOCK_VALIDATION_CONTRACT_VERSION, StreamCorrectionReceipt,
-    StreamCorrectionReceiptPreimage, StreamDataCorrectionOutcome, StreamLifecycle, StrictBlock,
-    StrictBlockEvidence, build_data_block_correction_successor, stream_correction_result_payload,
-    stream_graph_identity_digest, stream_lifecycle_authority_digest,
+    MANAGEMENT_RECEIPT_TAG, ManagementReceipt, STREAM_CORRECTION_OPERATION_KIND,
+    STREAM_CORRECTION_RECEIPT_TAG, STREAM_DATA_BLOCK_VALIDATION_CONTRACT_VERSION,
+    StreamCorrectionReceipt, StreamCorrectionReceiptPreimage, StreamDataCorrectionOutcome,
+    StreamLifecycle, StrictBlock, StrictBlockEvidence, build_data_block_correction_successor,
+    stream_correction_result_payload, stream_graph_identity_digest,
+    stream_lifecycle_authority_digest,
 };
 use crate::db::manifest::stream_token::{
     PayloadDigest, PayloadDigestInput, StreamFoldAttributionSummary, StreamTokenAuthorityRow,
@@ -39,9 +40,11 @@ use crate::db::manifest::stream_token::{
     stream_fold_attribution_commitment,
 };
 use crate::db::manifest::{
-    RecoveryAuthorityToken, RecoveryLineageIntent, RecoveryStreamFoldCut, SidecarTablePin,
+    LifecycleLedgerRecord, MAX_LIFECYCLE_LEDGER_LOOKUP_KEYS_PER_SCAN, RecoveryAuthorityToken,
+    RecoveryLineageIntent, RecoveryStreamFoldCut, SidecarTablePin,
     complete_stream_correction_sidecar_v20, confirm_stream_correction_sidecar_v20,
-    lookup_management_receipt, lookup_stream_correction_receipt, new_stream_correction_sidecar_v20,
+    lookup_lifecycle_ledger_records_batched, lookup_management_receipt,
+    lookup_stream_correction_receipt, new_stream_correction_sidecar_v20,
     open_stream_token_authority_head, stage_stream_correction_effect,
     stream_token_authority_entry_for_dataset, stream_token_authority_plan_digest,
     validate_stream_token_plan_bounds, write_sidecar,
@@ -338,14 +341,15 @@ fn validate_request_uuid(field: &str, value: &str) -> Result<()> {
 }
 
 impl Omnigraph {
-    /// Reconstruct one page from the exact retained generation named by a
-    /// durable `DataBlock`. No digest is trusted as a substitute for reopening
-    /// the cut and rerunning the validator.
+    /// Reconstruct one page for the graph's exact current `DataBlock` token.
+    ///
+    /// The token is the only public selector. Its current immutable table
+    /// lifetime is resolved from manifest authority and is never supplied by
+    /// the caller.
     #[doc(hidden)]
-    pub async fn show_stream_data_block(
+    pub async fn show_graph_stream_data_block(
         &self,
         authority: CheckedClusterBlockAuthority<'_>,
-        table_key: &str,
         block_token: &str,
         cursor: Option<&str>,
     ) -> Result<StreamDataBlockPage> {
@@ -355,7 +359,17 @@ impl Omnigraph {
                     .to_string(),
             });
         }
-        self.show_stream_data_block_inner(Some(&authority), table_key, block_token, cursor)
+        let table_key = {
+            let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+            let snapshot = self.open_write_txn(None).await?;
+            validate_optional_block_authority(Some(&authority), snapshot.base.stream_profile())?;
+            self.resolve_current_data_block_table_key(
+                &snapshot.base,
+                block_token,
+                "stream block show",
+            )?
+        };
+        self.show_stream_data_block_inner(Some(&authority), &table_key, block_token, cursor)
             .await
     }
 
@@ -430,14 +444,14 @@ impl Omnigraph {
         Ok(page)
     }
 
-    /// Apply one exact, bounded correction plan. Receipt lookup intentionally
-    /// precedes current block/revision checks so a response lost after the
-    /// terminal manifest CAS remains an ordinary idempotent retry.
+    /// Apply one graph-selected correction plan. Receipt lookup spans every
+    /// currently enrolled immutable table identity before current-block
+    /// resolution, so an exact retry remains possible after the block cleared
+    /// or the manifest moved. A caller never selects a physical stream lane.
     #[doc(hidden)]
-    pub async fn correct_stream_data_block(
+    pub async fn correct_graph_stream_data_block(
         &self,
         authority: CheckedClusterBlockAuthority<'_>,
-        table_key: &str,
         request: StreamDataCorrectionRequest,
     ) -> Result<StreamDataCorrectionResult> {
         request.validate_shape()?;
@@ -448,8 +462,207 @@ impl Omnigraph {
             });
         }
         let actor = authority.actor().to_string();
-        self.correct_stream_data_block_inner(Some(&authority), table_key, request, &actor)
+
+        // Shape and external authority checks intentionally precede recovery.
+        // Once admitted, recovery may settle an exact prior attempt before the
+        // receipt-first graph lookup classifies this invocation.
+        self.heal_pending_recovery_sidecars_outcome().await?;
+        let resolution = {
+            let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+            let txn = self.open_write_txn(None).await?;
+            validate_optional_block_authority(Some(&authority), txn.base.stream_profile())?;
+            if let Some((identity, result)) = self
+                .correction_receipt_result_across_enrolled_streams(&txn, &actor, &request)
+                .await?
+            {
+                self.notify_stream_fold_pressure(identity);
+                return Ok(result);
+            }
+            self.resolve_current_data_block_table_key(
+                &txn.base,
+                &request.block_token,
+                "stream block correct",
+            )?
+        };
+
+        self.correct_stream_data_block_inner(Some(&authority), &resolution, request, &actor)
             .await
+    }
+
+    async fn correction_receipt_result_across_enrolled_streams(
+        &self,
+        txn: &super::WriteTxn,
+        actor: &str,
+        request: &StreamDataCorrectionRequest,
+    ) -> Result<
+        Option<(
+            crate::db::manifest::TableIdentity,
+            StreamDataCorrectionResult,
+        )>,
+    > {
+        let graph_identity_digest =
+            stream_graph_identity_digest(&txn.authority.schema_identity_domain)?;
+        let token_dataset = txn.base.open_stream_token_authority().await?;
+        let mut selected = None;
+        let lanes = self.ordered_enrolled_stream_lanes(&txn.base)?;
+        let identities_per_scan = MAX_LIFECYCLE_LEDGER_LOOKUP_KEYS_PER_SCAN / 2;
+        if identities_per_scan == 0 {
+            return Err(OmniError::manifest_internal(
+                "lifecycle ledger batched lookup cannot fit one correction receipt pair",
+            ));
+        }
+
+        for lane_chunk in lanes.chunks(identities_per_scan) {
+            let mut requested = BTreeMap::new();
+            let mut candidates = Vec::with_capacity(lane_chunk.len());
+            for lane in lane_chunk {
+                let lifecycle = txn.base.stream_lifecycle(lane.identity).ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "ordered enrolled stream lane has no lifecycle authority",
+                    )
+                })?;
+                let stream_incarnation_id =
+                    lifecycle.enrollment_receipt.stream_incarnation_id.clone();
+                let correction_lookup_key = StreamCorrectionReceipt::lookup_key_for(
+                    &graph_identity_digest,
+                    lane.identity,
+                    &stream_incarnation_id,
+                    &request.block_token,
+                    &request.correction_id,
+                )?;
+                let management_lookup_key = ManagementReceipt::lookup_key_for(
+                    &graph_identity_digest,
+                    lane.identity,
+                    &stream_incarnation_id,
+                    STREAM_CORRECTION_OPERATION_KIND,
+                    &request.correction_id,
+                )?;
+                if requested
+                    .insert(correction_lookup_key.clone(), STREAM_CORRECTION_RECEIPT_TAG)
+                    .is_some()
+                    || requested
+                        .insert(management_lookup_key.clone(), MANAGEMENT_RECEIPT_TAG)
+                        .is_some()
+                {
+                    return Err(OmniError::manifest_internal(
+                        "graph correction receipt lookup derived a duplicate exact key",
+                    ));
+                }
+                candidates.push((
+                    lane.identity,
+                    lane.table_key.clone(),
+                    stream_incarnation_id,
+                    correction_lookup_key,
+                    management_lookup_key,
+                ));
+            }
+            let mut records = lookup_lifecycle_ledger_records_batched(
+                &token_dataset,
+                txn.base.stream_token_authority(),
+                &requested,
+            )
+            .await?;
+
+            for (
+                identity,
+                table_key,
+                stream_incarnation_id,
+                correction_lookup_key,
+                management_lookup_key,
+            ) in candidates
+            {
+                let correction_receipt = match records.remove(&correction_lookup_key) {
+                    Some(LifecycleLedgerRecord::StreamCorrectionReceipt(receipt)) => Some(receipt),
+                    Some(_) => {
+                        return Err(OmniError::manifest_internal(
+                            "graph correction lookup decoded another receipt family",
+                        ));
+                    }
+                    None => None,
+                };
+                let management_receipt = match records.remove(&management_lookup_key) {
+                    Some(LifecycleLedgerRecord::ManagementReceipt(receipt)) => Some(receipt),
+                    Some(_) => {
+                        return Err(OmniError::manifest_internal(
+                            "graph correction lookup decoded another management family",
+                        ));
+                    }
+                    None => None,
+                };
+                let (receipt, management) = match (correction_receipt, management_receipt) {
+                    (None, None) => continue,
+                    (None, Some(_)) | (Some(_), None) => {
+                        return Err(correction_idempotency_conflict(identity, request));
+                    }
+                    (Some(receipt), Some(management)) => (receipt, management),
+                };
+                validate_correction_receipt_pair(&receipt, &management)?;
+                let plan_digest = normalized_request_plan_digest(
+                    &txn.catalog,
+                    identity,
+                    &txn.authority.schema_ir_hash,
+                    &stream_incarnation_id,
+                    &table_key,
+                    actor,
+                    request,
+                )?;
+                validate_correction_receipt_retry(&receipt, actor, &plan_digest, request)?;
+                let result = StreamDataCorrectionResult {
+                    changed: false,
+                    correction_id: receipt.correction_id,
+                    plan_digest: receipt.correction_plan_digest,
+                    graph_commit_id: receipt.graph_commit_id,
+                    lifecycle_revision: receipt.resulting_lifecycle_revision,
+                    manifest_version: receipt.resulting_manifest_version,
+                };
+                if selected.replace((identity, result)).is_some() {
+                    return Err(OmniError::manifest_internal(
+                        "one graph correction id resolved to more than one enrolled stream identity",
+                    ));
+                }
+            }
+            if !records.is_empty() {
+                return Err(OmniError::manifest_internal(
+                    "graph correction receipt lookup left an unclassified exact record",
+                ));
+            }
+        }
+        Ok(selected)
+    }
+
+    fn resolve_current_data_block_table_key(
+        &self,
+        snapshot: &crate::db::manifest::Snapshot,
+        block_token: &str,
+        operation: &str,
+    ) -> Result<String> {
+        let mut selected = None;
+        for lane in self.ordered_enrolled_stream_lanes(snapshot)? {
+            let Some(lifecycle) = snapshot.stream_lifecycle(lane.identity) else {
+                continue;
+            };
+            let Some(block) = lifecycle.strict_block.as_ref() else {
+                continue;
+            };
+            if block.block_token != block_token {
+                continue;
+            }
+            if !matches!(block.evidence, StrictBlockEvidence::DataBlock { .. }) {
+                return Err(OmniError::manifest_conflict(
+                    "the selected stream authority block is not data-correctable",
+                ));
+            }
+            if selected.replace(lane.table_key).is_some() {
+                return Err(OmniError::manifest_internal(
+                    "one stream block token resolved to more than one enrolled stream identity",
+                ));
+            }
+        }
+        selected.ok_or_else(|| {
+            OmniError::manifest_not_found(format!(
+                "{operation} cannot resolve the supplied graph stream block token"
+            ))
+        })
     }
 
     async fn correct_stream_data_block_inner(

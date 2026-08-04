@@ -34,8 +34,8 @@ use omnigraph_api_types::{
     ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest,
     InvokeStoredQueryRequest, ReadOutput,
     ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
-    StreamStatusOutput, commit_output, ingest_output, read_output, schema_apply_output,
-    snapshot_payload,
+    StreamEnsureIndicesOutput, StreamOptimizeOutput, StreamResumeOutput, StreamStatusOutput,
+    commit_output, ingest_output, read_output, schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::Method;
@@ -339,6 +339,18 @@ impl GraphClient {
     ) -> Result<Self> {
         Self::resolve_selected_served_graph("stream status", server, graph, None, profile, store)
             .await
+    }
+
+    /// Resolve one graph-wide served stream control. The public surface has no
+    /// declaration/table selector and never accepts a client-supplied actor.
+    pub(crate) async fn resolve_stream_control(
+        command: &str,
+        server: Option<&str>,
+        graph: Option<&str>,
+        profile: Option<&str>,
+        store: Option<&str>,
+    ) -> Result<Self> {
+        Self::resolve_selected_served_graph(command, server, graph, None, profile, store).await
     }
 
     /// Shared graph-selection owner for the served-only stream family.
@@ -1071,6 +1083,79 @@ impl GraphClient {
         }
     }
 
+    /// Reopen every currently sealed declaration in the selected graph.
+    pub(crate) async fn stream_resume(&self) -> Result<StreamResumeOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                remote_json(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["stream", "resume"], &[])?,
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { .. } => bail!(
+                "internal error: `stream resume` reached an embedded client — stream controls \
+                 always resolve a server"
+            ),
+        }
+    }
+
+    /// Reconcile declared indexes across the graph. Any enrolled declaration
+    /// changed by the operation must be sealed; physical datasets stay private
+    /// behind the graph coordinator.
+    pub(crate) async fn stream_ensure_indices(&self) -> Result<StreamEnsureIndicesOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                remote_json(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["stream", "maintenance", "ensure-indices"], &[])?,
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { .. } => bail!(
+                "internal error: `stream maintenance ensure-indices` reached an embedded client"
+            ),
+        }
+    }
+
+    /// Compact the graph through the existing coordinated publish. Any
+    /// enrolled declaration changed by the operation must be sealed.
+    pub(crate) async fn stream_optimize(&self) -> Result<StreamOptimizeOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                remote_json(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["stream", "maintenance", "optimize"], &[])?,
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { .. } => bail!(
+                "internal error: `stream maintenance optimize` reached an embedded client"
+            ),
+        }
+    }
+
     /// `export` — stream the branch as JSONL into `writer`. The streaming
     /// shape (a `W: Write`, not a returned DTO) is why this lands in 3c
     /// rather than 3b. Opens WITHOUT policy (like reads), so it is reached
@@ -1517,6 +1602,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graph_stream_controls_post_bodyless_aggregate_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/graphs/knowledge", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (path, response) in [
+                (
+                    "/graphs/knowledge/stream/resume",
+                    r#"{"profile_revision":4,"enrolled_declarations":3,"resumed_declarations":2,"already_open_declarations":1}"#,
+                ),
+                (
+                    "/graphs/knowledge/stream/maintenance/ensure-indices",
+                    r#"{"changed":true,"pending_index_count":0}"#,
+                ),
+                (
+                    "/graphs/knowledge/stream/maintenance/optimize",
+                    r#"{"changed":false,"pending_index_count":1,"requires_repair":false}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                assert!(
+                    request
+                        .head
+                        .starts_with(&format!("POST {path} HTTP/1.1")),
+                    "{}",
+                    request.head
+                );
+                assert!(
+                    request
+                        .head
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer manage-token")
+                );
+                assert!(request.body.is_empty());
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    &[("Content-Type", "application/json")],
+                    response.as_bytes(),
+                )
+                .await;
+            }
+        });
+
+        let client = GraphClient::Remote {
+            http: reqwest::Client::new(),
+            base_url,
+            token: Some("manage-token".to_string()),
+        };
+        let resumed = client.stream_resume().await.unwrap();
+        assert_eq!(resumed.resumed_declarations, 2);
+        assert_eq!(resumed.already_open_declarations, 1);
+        let indexed = client.stream_ensure_indices().await.unwrap();
+        assert!(indexed.changed);
+        assert_eq!(indexed.pending_index_count, 0);
+        let optimized = client.stream_optimize().await.unwrap();
+        assert!(!optimized.changed);
+        assert_eq!(optimized.pending_index_count, 1);
+        assert!(!optimized.requires_repair);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn stream_commands_require_and_resolve_a_selected_graph_without_network_io() {
         let error = match GraphClient::resolve_stream_ingest(
             Some("http://127.0.0.1:9"),
@@ -1564,5 +1712,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(client.uri(), "http://127.0.0.1:9/graphs/knowledge");
+
+        let error = match GraphClient::resolve_stream_control(
+            "stream resume",
+            Some("http://127.0.0.1:9"),
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("stream resume accepted a server without a selected graph"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("`stream resume` requires one selected graph"),
+            "{error}"
+        );
     }
 }

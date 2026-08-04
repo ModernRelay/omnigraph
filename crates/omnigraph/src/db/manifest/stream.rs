@@ -2858,6 +2858,38 @@ pub(crate) fn stream_disable_drain_id(
     Ok(ShardId::from_bytes(bytes).to_string())
 }
 
+/// Derive the stable UUID-v4 occurrence for graph-level resume of one exact
+/// lifecycle revision.
+///
+/// The graph coordinator deliberately persists no parallel work queue. A
+/// replacement request reconstructs the same per-lane occurrence from the
+/// immutable table lifetime and its exact SEALED compare token, while a later
+/// SEALED revision receives a different occurrence. UUID-v4 shape is retained
+/// because recovery-v15's request grammar is frozen.
+pub(crate) fn graph_stream_resume_id(
+    identity: TableIdentity,
+    lifecycle_revision: u64,
+) -> Result<String> {
+    const DOMAIN: &[u8] = b"omnigraph.graph-stream-resume-id.v1\0";
+    identity.validate()?;
+    if lifecycle_revision == 0 {
+        return Err(OmniError::manifest_internal(
+            "graph stream resume requires a positive lifecycle revision",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hash_bytes(&mut hasher, DOMAIN);
+    hash_bytes(&mut hasher, &identity.stable_table_id.to_be_bytes());
+    hash_bytes(&mut hasher, &identity.table_incarnation_id.to_be_bytes());
+    hash_bytes(&mut hasher, &lifecycle_revision.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(ShardId::from_bytes(bytes).to_string())
+}
+
 /// Canonical request selected by metadata-only disable-drain adoption.
 pub(crate) fn stream_disable_drain_adoption_request_payload(
     disable_operation_id: &str,
@@ -5344,6 +5376,22 @@ mod tests {
         );
         let parsed = ShardId::parse_str(&operation_id).unwrap();
         assert_eq!(parsed.to_string(), operation_id);
+    }
+
+    #[test]
+    fn graph_resume_derives_stable_revision_scoped_uuid_v4_occurrences() {
+        let identity = TableIdentity::new(7, 9).unwrap();
+        let first = graph_stream_resume_id(identity, 3).unwrap();
+        assert_eq!(graph_stream_resume_id(identity, 3).unwrap(), first);
+        assert_ne!(graph_stream_resume_id(identity, 4).unwrap(), first);
+        assert_ne!(
+            graph_stream_resume_id(TableIdentity::new(7, 10).unwrap(), 3).unwrap(),
+            first
+        );
+        let parsed = ShardId::parse_str(&first).unwrap();
+        assert_eq!(parsed.get_version_num(), 4);
+        assert_eq!(parsed.to_string(), first);
+        assert!(graph_stream_resume_id(identity, 0).is_err());
     }
 
     fn entry() -> StreamLifecycleEntry {

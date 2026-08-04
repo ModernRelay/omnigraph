@@ -1228,7 +1228,6 @@ fn cluster_stream_block_requires_graph_and_accepts_only_config_scope() {
             .arg("stream")
             .arg("block")
             .arg("show")
-            .arg("node:Person")
             .arg("--config")
             .arg(temp.path())
             .arg("--block-token")
@@ -1250,7 +1249,6 @@ fn cluster_stream_block_requires_graph_and_accepts_only_config_scope() {
             .arg("stream")
             .arg("block")
             .arg("show")
-            .arg("node:Person")
             .arg("--config")
             .arg(temp.path())
             .arg("--block-token")
@@ -1275,7 +1273,6 @@ fn cluster_stream_block_reports_structured_offline_preflight_errors() {
             .arg("stream")
             .arg("block")
             .arg("show")
-            .arg("node:Person")
             .arg("--config")
             .arg(temp.path())
             .arg("--block-token")
@@ -1311,7 +1308,6 @@ fn cluster_stream_block_correct_rejects_unknown_plan_fields_before_preflight() {
             .arg("stream")
             .arg("block")
             .arg("correct")
-            .arg("node:Person")
             .arg("--config")
             .arg(temp.path())
             .arg("--block-token")
@@ -1329,5 +1325,26 @@ fn cluster_stream_block_correct_rejects_unknown_plan_fields_before_preflight() {
     assert!(
         !temp.path().join("__cluster/lock.json").exists(),
         "plan parsing must precede cluster preflight"
+    );
+}
+
+#[test]
+fn cluster_stream_block_rejects_the_old_per_table_selector() {
+    let output = output_failure(
+        cli()
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("cluster")
+            .arg("stream")
+            .arg("block")
+            .arg("show")
+            .arg("node:Person")
+            .arg("--block-token")
+            .arg("block-1"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument 'node:Person'"),
+        "{stderr}"
     );
 }

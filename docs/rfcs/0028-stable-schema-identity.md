@@ -486,9 +486,11 @@ V16/recovery-v18 adds the separate private physical-rebind owner for an exact
 authority-retirement and receipt-bearing export exit. Current
 v18/recovery-v20 adds exact stopped/offline `DataBlock` correction through the
 cluster-only `stream block show|correct` commands. Graph-native served ingress
-is active; explicit enrollment, ordinary lifecycle control, authority repair,
-rebind, and public maintenance surfaces remain inactive. Retirement and
-DataBlock control remain the two narrow cluster-control CLI exceptions.
+is active; explicit enrollment, per-declaration lifecycle control, authority
+repair, and rebind remain inactive. Graph-wide checked resume and sealed
+EnsureIndices/Optimize are the only served lifecycle/maintenance controls;
+they expose no type/table selector and reuse recovery-v15/v16/v17 unchanged.
+Retirement and DataBlock control remain narrow cluster-control CLI exceptions.
 None of the later formats reinterprets or
 backfills v5 in place. A v5
 graph was never served with a

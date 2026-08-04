@@ -1928,6 +1928,328 @@
         ]
       }
     },
+    "/graphs/{graph_id}/stream/maintenance/ensure-indices": {
+      "post": {
+        "tags": [
+          "streaming"
+        ],
+        "summary": "Refresh graph index state; any enrolled declaration changed must be sealed.",
+        "operationId": "cluster_stream_ensure_indices",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Indexes were checked across the graph; affected enrolled declarations were sealed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamEnsureIndicesOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The bodyless graph control received a request body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The actor is not authorized for graph stream management",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The graph is not in the sealed maintenance posture",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The bounded graph management operation exceeded a hard limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Graph index maintenance failed without exposing physical diagnostics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Graph recovery must complete before maintenance can proceed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/stream/maintenance/optimize": {
+      "post": {
+        "tags": [
+          "streaming"
+        ],
+        "summary": "Optimize the graph; any enrolled declaration changed must be sealed.",
+        "operationId": "cluster_stream_optimize",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The graph was considered for optimization; affected enrolled declarations were sealed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamOptimizeOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The bodyless graph control received a request body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The actor is not authorized for graph stream management",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The graph is not in the sealed maintenance posture",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The bounded graph management operation exceeded a hard limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Graph stream optimization failed without exposing physical diagnostics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Graph recovery must complete before maintenance can proceed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/stream/resume": {
+      "post": {
+        "tags": [
+          "streaming"
+        ],
+        "summary": "Reopen every sealed streaming declaration in the graph.",
+        "description": "The operation is deliberately bodyless and graph-wide: callers cannot\nselect a logical type, table, lane, dataset, or physical maintenance\ntarget. The server supplies the bearer-resolved actor and the engine\nperforms the authoritative graph-scoped `stream_manage` check.",
+        "operationId": "cluster_stream_resume",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "All sealed streaming declarations were reopened through graph authority",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamResumeOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The bodyless graph control received a request body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The actor is not authorized for graph stream management",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The graph streaming profile or lifecycle is not ready to resume",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The bounded graph management operation exceeded a hard limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Graph stream resume failed without exposing physical diagnostics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Graph recovery must complete before resume can proceed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs/{graph_id}/stream/status": {
       "get": {
         "tags": [
@@ -3331,6 +3653,24 @@
           }
         }
       },
+      "StreamEnsureIndicesOutput": {
+        "type": "object",
+        "description": "Aggregate result of graph-wide checked index refresh. Any enrolled\ndeclaration changed by the operation is required to be sealed.",
+        "required": [
+          "changed",
+          "pending_index_count"
+        ],
+        "properties": {
+          "changed": {
+            "type": "boolean"
+          },
+          "pending_index_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "StreamIngestChallenge": {
         "type": "object",
         "description": "Effect-free precondition challenge for graph-native streaming ingest.\n\nThe same value is returned as a strong `ETag` response header. Clients\nretry the request with that tag in `If-Match`; this convenience copy keeps\nthe graph authority token distinct from the per-row sequencing\n[`StreamIngestLineOutput::stream_token`].",
@@ -3539,6 +3879,28 @@
           "draining",
           "sealed"
         ]
+      },
+      "StreamOptimizeOutput": {
+        "type": "object",
+        "description": "Aggregate result of graph-wide checked stream optimization. Any enrolled\ndeclaration changed by the operation is required to be sealed. Physical\nfragment and dataset details stay inside the engine.",
+        "required": [
+          "changed",
+          "pending_index_count",
+          "requires_repair"
+        ],
+        "properties": {
+          "changed": {
+            "type": "boolean"
+          },
+          "pending_index_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "requires_repair": {
+            "type": "boolean"
+          }
+        }
       },
       "StreamPendingStatusOutput": {
         "oneOf": [
@@ -3778,6 +4140,38 @@
           },
           "ready": {
             "type": "boolean"
+          }
+        }
+      },
+      "StreamResumeOutput": {
+        "type": "object",
+        "description": "Aggregate result of reopening every sealed streaming declaration in a\ngraph. Declaration, table, lane, dataset, and recovery identities are\ndeliberately absent from this graph-level control-plane shape.",
+        "required": [
+          "profile_revision",
+          "enrolled_declarations",
+          "resumed_declarations",
+          "already_open_declarations"
+        ],
+        "properties": {
+          "already_open_declarations": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "enrolled_declarations": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "profile_revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "resumed_declarations": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },

@@ -45,6 +45,7 @@ mod stream_enrollment;
 mod stream_graph_ingest;
 mod stream_ingest;
 pub(crate) mod stream_lifecycle;
+mod stream_management;
 mod stream_ndjson;
 mod stream_profile;
 mod stream_rebind;
@@ -72,6 +73,10 @@ pub use stream_correction::{
 #[doc(hidden)]
 pub use stream_dead_letter::{
     StreamDeadLetterEncodingCostForTest, failpoint_measure_stream_dead_letter_object_for_test,
+};
+#[doc(hidden)]
+pub use stream_management::{
+    GraphStreamEnsureIndicesResult, GraphStreamOptimizeResult, GraphStreamResumeResult,
 };
 #[doc(hidden)]
 pub use stream_ndjson::{GraphStreamChunkSource, GraphStreamIngestHandle, GraphStreamIngestStart};
@@ -2678,7 +2683,9 @@ impl Omnigraph {
         &self,
         actor_id: &str,
     ) -> Result<Vec<PendingIndex>> {
-        table_ops::ensure_indices_sealed_as(self, actor_id).await
+        Ok(table_ops::ensure_indices_sealed_as(self, actor_id)
+            .await?
+            .pending)
     }
 
     #[cfg(feature = "failpoints")]

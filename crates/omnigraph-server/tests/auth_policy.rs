@@ -82,6 +82,29 @@ async fn protected_routes_require_bearer_token() {
         .unwrap();
     assert_eq!(status_response.status(), StatusCode::UNAUTHORIZED);
 
+    for path in [
+        "/stream/resume",
+        "/stream/maintenance/ensure-indices",
+        "/stream/maintenance/optimize",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(g(path))
+                    .method(Method::POST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "protected graph streaming control {path}"
+        );
+    }
+
     let stream_body_polled = Arc::new(AtomicBool::new(false));
     let body_probe = Arc::clone(&stream_body_polled);
     let response = app

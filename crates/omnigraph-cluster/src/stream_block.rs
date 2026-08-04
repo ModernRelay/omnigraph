@@ -61,10 +61,155 @@ impl OfflineStreamControlKind {
     }
 }
 
+fn redacted_stream_control_error(
+    kind: OfflineStreamControlKind,
+    error: &omnigraph::error::OmniError,
+) -> &'static str {
+    use omnigraph::error::{ManifestErrorKind, OmniError};
+
+    match error {
+        OmniError::Policy(_) => "graph stream control was denied by policy",
+        OmniError::StreamingAuthorityMismatch { .. }
+        | OmniError::StreamingRequiresClusterRuntime { .. } => {
+            "offline graph streaming authority is unavailable or changed; stop every live runtime, refresh cluster state, and retry"
+        }
+        OmniError::ResourceLimitExceeded { .. }
+        | OmniError::Manifest(omnigraph::error::ManifestError {
+            kind: ManifestErrorKind::BadRequest,
+            ..
+        }) => "graph stream control request is invalid or exceeds a safety limit",
+        OmniError::StreamLifecycleChanged { .. }
+        | OmniError::StreamLifecycleIdempotencyConflict { .. }
+        | OmniError::Manifest(omnigraph::error::ManifestError {
+            kind: ManifestErrorKind::Conflict,
+            ..
+        }) => "graph stream authority changed; reread graph stream status and retry",
+        OmniError::RecoveryRequired { .. } => {
+            "graph recovery must settle before stream control can continue"
+        }
+        _ => match kind {
+            OfflineStreamControlKind::Block => {
+                "graph stream-block control failed; reread graph stream status and retry"
+            }
+            OfflineStreamControlKind::DeadLetter => {
+                "graph stream dead-letter control failed; reread graph stream status and retry"
+            }
+        },
+    }
+}
+
+fn project_logical_declaration(
+    table_key: &str,
+) -> omnigraph::error::Result<StreamLogicalDeclarationOutput> {
+    let (kind, type_name) = if let Some(type_name) = table_key.strip_prefix("node:") {
+        ("node", type_name)
+    } else if let Some(type_name) = table_key.strip_prefix("edge:") {
+        ("edge", type_name)
+    } else {
+        return Err(omnigraph::error::OmniError::manifest_internal(
+            "graph stream projection found an invalid logical declaration key",
+        ));
+    };
+    if type_name.is_empty() {
+        return Err(omnigraph::error::OmniError::manifest_internal(
+            "graph stream projection found an empty logical declaration name",
+        ));
+    }
+    Ok(StreamLogicalDeclarationOutput {
+        kind: kind.to_string(),
+        type_name: type_name.to_string(),
+    })
+}
+
+fn project_stream_block_page(
+    page: omnigraph::db::StreamDataBlockPage,
+) -> omnigraph::error::Result<StreamBlockPageOutput> {
+    let declaration = project_logical_declaration(&page.table_key)?;
+    if page
+        .entries
+        .iter()
+        .any(|entry| entry.table_key != page.table_key)
+    {
+        return Err(omnigraph::error::OmniError::manifest_internal(
+            "graph stream block projection crossed logical declarations",
+        ));
+    }
+    Ok(StreamBlockPageOutput {
+        declaration,
+        block_token: page.block_token,
+        lifecycle_revision: page.lifecycle_revision,
+        correction_view_digest: page.correction_view_digest,
+        entries: page
+            .entries
+            .into_iter()
+            .map(|entry| StreamBlockEntryOutput {
+                ordinal: entry.ordinal,
+                logical_key: entry.logical_key,
+                current_blocked_winner_stream_token: entry.current_blocked_winner_stream_token,
+                violation_code: entry.violation_code,
+                field_path_or_group: entry.field_path_or_group,
+                violation_instance_id: entry.violation_instance_id,
+                allowed_actions: entry.allowed_actions,
+            })
+            .collect(),
+        next_cursor: page.next_cursor,
+    })
+}
+
+fn project_stream_dead_letter_entry(
+    entry: omnigraph::db::StreamDeadLetterEntry,
+) -> omnigraph::error::Result<StreamDeadLetterEntryOutput> {
+    Ok(StreamDeadLetterEntryOutput {
+        declaration: project_logical_declaration(&entry.table_key)?,
+        logical_id: entry.logical_id,
+        occurrence_token: entry.occurrence_token,
+        predecessor_token: entry.predecessor_token,
+        write_id: entry.write_id,
+        contributor_id: entry.contributor_id,
+        payload_digest: entry.payload_digest,
+        reason_code: entry.reason_code,
+        candidate_ordinal: entry.candidate_ordinal,
+    })
+}
+
+fn project_stream_dead_letter_page(
+    page: omnigraph::db::StreamDeadLetterPage,
+) -> omnigraph::error::Result<StreamDeadLetterPageOutput> {
+    Ok(StreamDeadLetterPageOutput {
+        source_manifest_version: page.source_manifest_version,
+        source_profile_revision: page.source_profile_revision,
+        entries: page
+            .entries
+            .into_iter()
+            .map(project_stream_dead_letter_entry)
+            .collect::<omnigraph::error::Result<_>>()?,
+        next_cursor: page.next_cursor,
+    })
+}
+
+fn project_stream_dead_letter_payload_page(
+    page: omnigraph::db::StreamDeadLetterPayloadPage,
+) -> omnigraph::error::Result<StreamDeadLetterPayloadPageOutput> {
+    Ok(StreamDeadLetterPayloadPageOutput {
+        source_manifest_version: page.source_manifest_version,
+        source_profile_revision: page.source_profile_revision,
+        entries: page
+            .entries
+            .into_iter()
+            .map(|entry| {
+                Ok(StreamDeadLetterPayloadEntryOutput {
+                    authority: project_stream_dead_letter_entry(entry.authority)?,
+                    payload: entry.payload,
+                })
+            })
+            .collect::<omnigraph::error::Result<_>>()?,
+        next_cursor: page.next_cursor,
+    })
+}
+
 pub async fn show_stream_data_block_config_dir(
     config_dir: impl AsRef<Path>,
     graph_id: impl AsRef<str>,
-    table_key: impl AsRef<str>,
     block_token: impl AsRef<str>,
     cursor: Option<&str>,
     options: StreamBlockControlOptions,
@@ -86,7 +231,6 @@ pub async fn show_stream_data_block_config_dir(
         }
     };
 
-    let table_key = table_key.as_ref();
     let block_token = block_token.as_ref();
     let PreparedBlockCommand {
         config_dir,
@@ -117,8 +261,10 @@ pub async fn show_stream_data_block_config_dir(
         let db =
             open_authorized_block_graph(&graph_id, &graph_uri, &desired, &backend, &state).await?;
         let authority = db.check_cluster_block_authority(guard).await?;
-        db.show_stream_data_block(authority, table_key, block_token, cursor)
-            .await
+        let page = db
+            .show_graph_stream_data_block(authority, block_token, cursor)
+            .await?;
+        project_stream_block_page(page)
     }
     .await;
 
@@ -128,7 +274,7 @@ pub async fn show_stream_data_block_config_dir(
             diagnostics.push(Diagnostic::error(
                 "stream_block_show_failed",
                 format!("graph.{graph_id}"),
-                error.to_string(),
+                redacted_stream_control_error(OfflineStreamControlKind::Block, &error),
             ));
             None
         }
@@ -148,7 +294,6 @@ pub async fn show_stream_data_block_config_dir(
 pub async fn correct_stream_data_block_config_dir(
     config_dir: impl AsRef<Path>,
     graph_id: impl AsRef<str>,
-    table_key: impl AsRef<str>,
     request: StreamDataCorrectionRequest,
     options: StreamBlockControlOptions,
 ) -> StreamBlockCorrectOutput {
@@ -169,7 +314,6 @@ pub async fn correct_stream_data_block_config_dir(
         }
     };
 
-    let table_key = table_key.as_ref();
     let correction_id = request.correction_id.clone();
     let PreparedBlockCommand {
         config_dir,
@@ -200,8 +344,7 @@ pub async fn correct_stream_data_block_config_dir(
         let db =
             open_authorized_block_graph(&graph_id, &graph_uri, &desired, &backend, &state).await?;
         let authority = db.check_cluster_block_authority(guard).await?;
-        db.correct_stream_data_block(authority, table_key, request)
-            .await
+        db.correct_graph_stream_data_block(authority, request).await
     }
     .await;
 
@@ -211,7 +354,7 @@ pub async fn correct_stream_data_block_config_dir(
             diagnostics.push(Diagnostic::error(
                 "stream_block_correct_failed",
                 format!("graph.{graph_id}"),
-                error.to_string(),
+                redacted_stream_control_error(OfflineStreamControlKind::Block, &error),
             ));
             None
         }
@@ -287,7 +430,8 @@ pub async fn list_stream_dead_letters_config_dir(
         )
         .await?;
         let authority = db.check_cluster_dead_letter_authority(guard).await?;
-        db.list_stream_dead_letters(authority, cursor).await
+        let page = db.list_stream_dead_letters(authority, cursor).await?;
+        project_stream_dead_letter_page(page)
     }
     .await;
     let page = match result {
@@ -296,7 +440,7 @@ pub async fn list_stream_dead_letters_config_dir(
             diagnostics.push(Diagnostic::error(
                 "stream_dead_letter_list_failed",
                 format!("graph.{graph_id}"),
-                error.to_string(),
+                redacted_stream_control_error(OfflineStreamControlKind::DeadLetter, &error),
             ));
             None
         }
@@ -372,8 +516,10 @@ pub async fn export_stream_dead_letters_config_dir(
         )
         .await?;
         let authority = db.check_cluster_dead_letter_authority(guard).await?;
-        db.export_stream_dead_letter_payloads(authority, cursor)
-            .await
+        let page = db
+            .export_stream_dead_letter_payloads(authority, cursor)
+            .await?;
+        project_stream_dead_letter_payload_page(page)
     }
     .await;
     let page = match result {
@@ -382,7 +528,7 @@ pub async fn export_stream_dead_letters_config_dir(
             diagnostics.push(Diagnostic::error(
                 "stream_dead_letter_export_failed",
                 format!("graph.{graph_id}"),
-                error.to_string(),
+                redacted_stream_control_error(OfflineStreamControlKind::DeadLetter, &error),
             ));
             None
         }
@@ -746,4 +892,149 @@ async fn validated_dead_letter_offline_guard<'lock>(
             reason: error.to_string(),
         },
     )
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    fn raw_dead_letter_entry() -> omnigraph::db::StreamDeadLetterEntry {
+        omnigraph::db::StreamDeadLetterEntry {
+            stable_table_id: 41,
+            table_incarnation_id: 42,
+            table_key: "node:SecretDeclaration".to_string(),
+            logical_id: "logical-1".to_string(),
+            stream_incarnation_id: "secret-stream-incarnation".to_string(),
+            occurrence_token: "occurrence-1".to_string(),
+            predecessor_token: Some("predecessor-1".to_string()),
+            write_id: "write-1".to_string(),
+            contributor_id: "contributor-1".to_string(),
+            payload_digest: "sha256:payload".to_string(),
+            reason_code: "UNIQUE_VIOLATION".to_string(),
+            fold_operation_id: "secret-fold-operation".to_string(),
+            object_location: "s3://private-bucket/secret-object".to_string(),
+            object_digest: "sha256:secret-object".to_string(),
+            object_encoded_length: 99,
+            object_candidate_count: 3,
+            candidate_ordinal: 2,
+        }
+    }
+
+    #[test]
+    fn block_projection_exposes_only_graph_level_correction_authority() {
+        let projected = project_stream_block_page(omnigraph::db::StreamDataBlockPage {
+            block_token: "opaque-block-token".to_string(),
+            stable_table_id: 41,
+            table_incarnation_id: 42,
+            table_key: "node:SecretDeclaration".to_string(),
+            lifecycle_revision: 7,
+            correction_view_digest: "sha256:view".to_string(),
+            entries: vec![omnigraph::db::StreamDataBlockEntry {
+                ordinal: 0,
+                table_key: "node:SecretDeclaration".to_string(),
+                logical_key: "logical-1".to_string(),
+                current_blocked_winner_stream_token: "winner-1".to_string(),
+                violation_code: "UNIQUE_VIOLATION".to_string(),
+                field_path_or_group: vec!["email".to_string()],
+                violation_instance_id: "violation-1".to_string(),
+                allowed_actions: vec!["WITHDRAW".to_string()],
+            }],
+            next_cursor: Some("opaque-cursor".to_string()),
+        })
+        .unwrap();
+
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(json.contains("opaque-block-token"));
+        assert!(json.contains("logical-1"));
+        assert!(json.contains(r#""kind":"node""#));
+        assert!(json.contains(r#""type":"SecretDeclaration""#));
+        for forbidden in [
+            "stable_table_id",
+            "table_incarnation_id",
+            "table_key",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "projection leaked {forbidden}: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn dead_letter_projections_hide_dataset_and_object_coordinates() {
+        let projected = project_stream_dead_letter_page(omnigraph::db::StreamDeadLetterPage {
+            source_manifest_version: 10,
+            source_profile_revision: 11,
+            token_table_version: 12,
+            token_transaction_uuid: "secret-token-transaction".to_string(),
+            entries: vec![raw_dead_letter_entry()],
+            next_cursor: Some("opaque-cursor".to_string()),
+        })
+        .unwrap();
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(json.contains("logical-1"));
+        assert!(json.contains("source_manifest_version"));
+        assert!(json.contains(r#""kind":"node""#));
+        assert!(json.contains(r#""type":"SecretDeclaration""#));
+        for forbidden in [
+            "stable_table_id",
+            "table_incarnation_id",
+            "table_key",
+            "stream_incarnation_id",
+            "fold_operation_id",
+            "object_location",
+            "object_digest",
+            "object_encoded_length",
+            "object_candidate_count",
+            "token_table_version",
+            "token_transaction_uuid",
+            "private-bucket",
+            "secret-stream-incarnation",
+            "secret-fold-operation",
+            "secret-token-transaction",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "projection leaked {forbidden}: {json}"
+            );
+        }
+
+        let payload =
+            serde_json::value::RawValue::from_string(r#"{"nested":{"legal":true}}"#.to_string())
+                .unwrap();
+        let payload_projection =
+            project_stream_dead_letter_payload_page(omnigraph::db::StreamDeadLetterPayloadPage {
+                source_manifest_version: 10,
+                source_profile_revision: 11,
+                token_table_version: 12,
+                token_transaction_uuid: "secret-token-transaction".to_string(),
+                entries: vec![omnigraph::db::StreamDeadLetterPayloadEntry {
+                    authority: raw_dead_letter_entry(),
+                    payload,
+                }],
+                next_cursor: None,
+            })
+            .unwrap();
+        let payload_json = serde_json::to_string(&payload_projection).unwrap();
+        assert!(payload_json.contains(r#""nested":{"legal":true}"#));
+        assert!(!payload_json.contains("private-bucket"));
+        assert!(!payload_json.contains("token_transaction_uuid"));
+    }
+
+    #[test]
+    fn diagnostics_do_not_render_physical_stream_identity() {
+        let error = omnigraph::error::OmniError::StreamLifecycleChanged {
+            stable_table_id: 41,
+            table_incarnation_id: 42,
+            expected_revision: 7,
+            current_revision: 8,
+        };
+        let message = redacted_stream_control_error(OfflineStreamControlKind::Block, &error);
+        assert_eq!(
+            message,
+            "graph stream authority changed; reread graph stream status and retry"
+        );
+        assert!(!message.contains("0000000000000029"));
+        assert!(!message.contains("000000000000002a"));
+    }
 }
