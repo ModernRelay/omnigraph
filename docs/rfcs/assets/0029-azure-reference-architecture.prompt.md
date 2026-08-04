@@ -36,10 +36,12 @@ resource group".
    exact sublabel "At most one OmniGraph child". Both the server and bootstrap
    job must connect through this gate before reaching storage. Make it clear
    that an extra pre-warmed replica can exist but cannot pass the gate.
-4. Right: an "Azure Blob Storage" card with sublabel "Private container".
+4. Right: an "Azure Blob Storage" card with sublabel "Anonymous access
+   disabled".
    Inside it show two compartments:
    - "Cluster root (az://)" with small labels "ledger · manifests · Lance data".
-   - "Infinite lease blob".
+   - "Infinite lease blob", visibly separate from the cluster root and stored
+     in a reserved container-level admission namespace.
 5. Above the Container Apps boundary: "Azure Container Registry" with sublabel
    "Immutable image digest".
 6. Below: "User-assigned managed identity" and "Microsoft Entra ID".
@@ -59,10 +61,11 @@ Connections and exact arrow labels:
 - Managed identity to Azure Blob Storage: dashed arrow,
   "Container-scoped RBAC".
 - Managed identity to Azure Container Registry: dashed arrow, "AcrPull".
-- Server and job to Log Analytics: solid arrows, "Logs".
+- Azure Container Apps boundary (representing both server and job) to Log
+  Analytics: one solid arrow, "App + job logs".
 
 Legend: solid line = request/data/runtime control flow; dashed line = identity
-and RBAC. Add a small security strip with exactly: "Shared key off · Public
+and RBAC. Add a small security strip with exactly: "Shared key off · Anonymous
 Blob access off · ACR admin off".
 
 Constraints: Keep total service-node count under 12. Preserve every quoted

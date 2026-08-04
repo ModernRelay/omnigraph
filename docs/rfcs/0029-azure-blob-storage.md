@@ -146,6 +146,9 @@ az://<container>[/<object-prefix>]
 - `<container>` is required and must be valid for Azure Blob Storage.
 - The object prefix may be empty, although a dedicated cluster prefix is
   recommended.
+- The storage backend accepts an empty prefix, but the Container Apps reference
+  deployment requires a non-empty dedicated prefix so its reserved admission
+  object stays unambiguous and outside graph-root cleanup.
 - A trailing slash on a root is normalized away, matching S3 root behavior.
 - Joining graph and control paths appends slash-delimited object keys beneath
   the captured root.
@@ -171,8 +174,8 @@ The checked-in deployment creates or connects the following resources:
 - `Storage Blob Data Contributor` for that identity scoped to the cluster
   container and `AcrPull` scoped to the registry;
 - a Log Analytics workspace and Container Apps environment;
-- one deployment-owned writer-admission Blob beneath the canonical cluster
-  prefix; and
+- one deployment-owned writer-admission Blob in a reserved container-level
+  namespace outside the canonical cluster prefix; and
 - an externally reachable Container App with HTTPS ingress, `/healthz` probes,
   a secure bearer-token secret, and a one-replica sizing target.
 
@@ -181,6 +184,12 @@ The app receives `AZURE_STORAGE_ACCOUNT_NAME` and
 `--cluster` argument. It does not receive a storage account key. The storage
 container remains private, and deployment output must not print the server
 bearer token or any credential.
+
+In this first public-cloud topology, "private" means anonymous Blob access is
+disabled (`allowBlobPublicAccess = false`), shared-key authorization is
+disabled, and runtime access uses Microsoft Entra ID plus container-scoped
+RBAC. The Azure Blob public service endpoint remains enabled. Private endpoints
+and VNet integration are explicitly outside this first support boundary.
 
 Azure documents that replica quantities are
 [targets, not guarantees](https://learn.microsoft.com/azure/container-apps/scale-app),
@@ -191,8 +200,10 @@ assertions only. They are not part of the correctness proof.
 Both the serving app and every bootstrap/job execution enter through the same
 PID-1 wrapper. Before any child can open the cluster or run recovery, the
 wrapper derives one canonical lock Blob from the exact storage account,
-container, and normalized cluster root, creates it atomically if necessary, and
-excludes it from lifecycle cleanup. It generates a
+container, and normalized cluster root. It stores that permanent object at
+`__omnigraph_azure_admission/v1/<normalized-prefix>/writer.lock`, a reserved
+container-level namespace outside the cluster root and its lifecycle cleanup,
+and creates it atomically if necessary. It generates a
 cryptographically unique proposed lease ID, and positively acquires an
 [infinite Blob lease](https://learn.microsoft.com/rest/api/storageservices/lease-blob)
 with managed identity. Azure grants only one active lease for that Blob. A
@@ -302,9 +313,12 @@ SAS query strings, token responses, or Container Apps secret values. URI
 validation rejects query-bearing roots, which also prevents SAS credentials
 from becoming persisted cluster identifiers.
 
-The admission wrapper keeps the managed-identity header, Blob access token, and
-lease ID out of child-inherited environment, command arguments, and logs. It
-uses owner-only temporary request files and removes them after use.
+The admission wrapper keeps its acquired Blob access token, lease ID, and
+request files out of the child environment, command arguments, and logs. The
+OmniGraph child still receives the Container Apps-managed identity endpoint and
+header because its own Azure storage credential provider requires them; those
+runtime values must not be logged. Wrapper-owned request files are owner-only
+and removed after use.
 
 ### Supported process topology
 
