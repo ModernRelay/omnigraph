@@ -360,6 +360,7 @@ jobs:
       contents: read
     env:
       CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
     steps:
       - name: Skip for documentation-only changes
         if: needs.classify_changes.outputs.run_full_ci != 'true'
