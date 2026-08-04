@@ -13,8 +13,9 @@ use futures::StreamExt;
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_server::api::{
-    ChangeRequest, ErrorOutput, ExportRequest, QueryRequest, ReadRequest, StreamIngestChallenge,
-    StreamIngestKindOutput, StreamIngestLineOutput, StreamIngestStatusOutput,
+    ChangeRequest, ErrorOutput, ExportRequest, QueryRequest, ReadRequest, StreamDriverStateOutput,
+    StreamIngestChallenge, StreamIngestKindOutput, StreamIngestLineOutput,
+    StreamIngestStatusOutput, StreamProfileModeOutput, StreamStatusOutput,
 };
 use omnigraph_server::{AppState, build_app};
 use serde_json::Value;
@@ -590,6 +591,37 @@ graphs:
 async fn cluster_boot_installs_enabled_stream_runtime_authority() {
     let (_temp, state, engine) = enabled_stream_state(Vec::new()).await;
     let app = build_app(state);
+    let status_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/graphs/knowledge/stream/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), StatusCode::OK);
+    assert_eq!(
+        status_response.headers().get(CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+    let status: StreamStatusOutput = serde_json::from_slice(
+        &to_bytes(status_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status.profile_mode, StreamProfileModeOutput::Enabled);
+    assert!(status.enrolled_declarations.is_empty());
+    assert_eq!(status.token_counts.present, 0);
+    assert_eq!(status.token_counts.withdrawn, 0);
+    assert_eq!(status.token_counts.dead_lettered, 0);
+    assert_eq!(status.recovery_pending_count, 0);
+    assert_eq!(status.driver.state, StreamDriverStateOutput::Running);
+    assert!(!status.rebuild.ready);
+
     let (status, body) = json_response(
         &app,
         Request::builder()
@@ -903,6 +935,57 @@ query streamed_edge() {
         );
         tokio::task::yield_now().await;
     }
+
+    let (status_code, status_body) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/graphs/knowledge/stream/status")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK, "{status_body}");
+    let redacted = status_body.to_string();
+    for forbidden in [
+        "table_key",
+        "stable_table_id",
+        "table_incarnation_id",
+        "stream_incarnation_id",
+        "enrollment_id",
+        "binding_scope_id",
+        "shard_id",
+        "writer_epoch",
+        "generation",
+        "dataset",
+        "operation_id",
+        "block_token",
+        "drain_id",
+        "initiating_actor",
+        "graph_commit_id",
+    ] {
+        assert!(
+            !redacted.contains(forbidden),
+            "graph status leaked forbidden physical/opaque field '{forbidden}': {status_body}"
+        );
+    }
+    let status: StreamStatusOutput = serde_json::from_value(status_body).unwrap();
+    assert_eq!(status.token_counts.present, 3);
+    assert_eq!(status.token_counts.withdrawn, 0);
+    assert_eq!(status.token_counts.dead_lettered, 0);
+    let declarations = status
+        .enrolled_declarations
+        .iter()
+        .map(|status| {
+            (
+                status.declaration.kind,
+                status.declaration.type_name.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(declarations.contains(&(StreamIngestKindOutput::Node, "Person")));
+    assert!(declarations.contains(&(StreamIngestKindOutput::Edge, "Knows")));
+
     engine
         .shutdown_stream_fold_driver()
         .await
@@ -920,6 +1003,7 @@ async fn authenticated_default_deny_refuses_stream_ingest_before_body_ownership(
     let app = build_app(state);
     let body_polled = Arc::new(AtomicBool::new(false));
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -944,6 +1028,22 @@ async fn authenticated_default_deny_refuses_stream_ingest_before_body_ownership(
         engine.stream_status().await.unwrap().tables.is_empty(),
         "a default-denied request cannot lazily enroll a private lane"
     );
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/graphs/knowledge/stream/status")
+            .header("authorization", "Bearer stream-secret")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "read-authorized status must not require stream_manage: {body}"
+    );
+    assert_eq!(body["profile_mode"], "enabled");
     engine
         .shutdown_stream_fold_driver()
         .await
@@ -1014,7 +1114,29 @@ graphs:
     )
     .await
     .expect("server startup consumes terminal binding into checked authority");
-    let response = build_app(state)
+    let app = build_app(state);
+    let status_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/graphs/knowledge/stream/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), StatusCode::OK);
+    let status: StreamStatusOutput = serde_json::from_slice(
+        &to_bytes(status_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status.profile_mode, StreamProfileModeOutput::Disabled);
+    assert!(status.enrolled_declarations.is_empty());
+
+    let response = app
         .oneshot(
             Request::builder()
                 .method(Method::POST)

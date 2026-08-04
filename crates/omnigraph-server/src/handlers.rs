@@ -718,6 +718,63 @@ fn graph_stream_etag(authority_token: &str) -> std::result::Result<HeaderValue, 
         .map_err(|_| ApiError::internal("graph stream authority token is not a valid ETag"))
 }
 
+#[utoipa::path(
+    get,
+    path = "/stream/status",
+    tag = "streaming",
+    operation_id = "stream_status",
+    responses(
+        (status = 200, description = "Checked graph-level streaming operational status", body = StreamStatusOutput,
+            headers(("Cache-Control" = String, description = "Always `no-store`; the response contains live advisory state and compare revisions"))),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "The current server does not own checked status authority for this profile state", body = ErrorOutput),
+        (status = 413, description = "The bounded status inventory exceeded its hard observation envelope", body = ErrorOutput),
+        (status = 500, description = "Checked status failed without exposing physical diagnostics", body = ErrorOutput),
+        (status = 503, description = "A stable checked cut could not be obtained; retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Return one coherent, graph-redacted streaming operational cut.
+///
+/// This is graph-wide read metadata, so Cedar authorizes it with `read`
+/// rather than the mutation-capable `stream_manage` action. The engine bridge
+/// already removes every table, lane, binding, shard, epoch, generation,
+/// dataset, and recovery identity before the transport receives the value.
+pub(crate) async fn server_stream_status(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+) -> std::result::Result<([(HeaderName, HeaderValue); 1], Json<StreamStatusOutput>), ApiError> {
+    authorize_request(
+        actor.as_ref().map(|Extension(actor)| actor),
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: None,
+            target_branch: None,
+        },
+    )?;
+    let _process_observation = Arc::clone(&state.stream_status_gate)
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::service_unavailable(
+                "another graph stream status observation is already in progress; retry",
+            )
+        })?;
+    let status = handle
+        .engine
+        .capture_served_graph_stream_status()
+        .await
+        .map_err(ApiError::from_graph_stream_status)?;
+    let output = stream_status_output(status)
+        .map_err(|_| ApiError::internal("graph stream status projection failed"))?;
+    Ok((
+        [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(output),
+    ))
+}
+
 fn require_graph_stream_content_type(
     headers: &axum::http::HeaderMap,
 ) -> std::result::Result<(), ApiError> {

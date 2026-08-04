@@ -202,6 +202,12 @@ pub mod names {
     /// immutable cut while every writer gate is still held. Concurrency tests
     /// park here to prove writers wait only until capture returns.
     pub const STREAM_EXPORT_POST_CUT_CAPTURE: &str = "stream_export.post_cut_capture";
+    /// A checked operational-status observer owns the root-scoped observation
+    /// slot but has not started its immutable preflight. Tests park the first
+    /// observer here to prove later observers refuse immediately and the slot
+    /// is released after completion or cancellation.
+    pub const STREAM_STATUS_POST_OBSERVATION_ADMISSION: &str =
+        "stream_status.post_observation_admission";
     /// The resident stream driver has frozen and ordered one finite
     /// manifest-derived round, but has not attempted its first lane. Tests use
     /// this boundary to add a new node trigger and prove it cannot enter ahead

@@ -223,6 +223,29 @@ F7a admits an absent declaration lane (prepared lazily) or an existing `OPEN`
 lane. It does not expose resume: a `SEALED` lane after disable/re-enable returns
 `stream_authority_changed` until a later graph-level resume surface exists.
 
+`GET /graphs/{graph_id}/stream/status` returns one checked, read-only
+operational cut for a cluster-served streaming graph. The response is
+graph-native: it reports the profile and revision, logical node/edge type
+lifecycle and compare revision for declarations whose streaming state has been
+initialized, bounded pending-work availability, current
+terminal-authority counts, advisory driver health, pending recovery count, and
+rebuild readiness. It never exposes table or dataset keys, stable table ids,
+stream bindings, shards, epochs, generations, Lance versions, recovery-object
+identities, or storage paths. The response carries `Cache-Control: no-store`.
+
+Status is authorized like other graph read metadata; it does not require a
+`stream_manage` grant. An unmanaged graph that has never established checked
+streaming authority returns **409** instead of synthesizing full physical
+evidence from its manifest-only state. If the bounded observation cannot obtain
+one stable cut, the route returns a redacted, retryable **503**. Status never
+heals recovery or publishes graph, token, lifecycle, or Lance state.
+Absence from `enrolled_declarations` means streaming state has not yet been
+initialized for that accepted-schema declaration; it does not mean the graph
+schema lacks the declaration. To bound immutable status scans, at most one
+checked observation runs per graph storage root and at most one runs across a
+server process. An overlapping request refuses immediately with the same
+redacted, retryable **503**.
+
 The existing `/export` route also streams `application/x-ndjson`; other routes
 remain buffered JSON. Export authorization, relevant checked recovery settlement/validation,
 branch/filter validation, and stream-authority validation all finish before the

@@ -19,9 +19,9 @@
 //! against exact selected versions without blocking writers. A short second
 //! phase closes every selected lane, reads the mutable Lance shard/recovery
 //! witnesses without healing them, then rereads authority before release. It
-//! is engine-internal until F7 gives the shape a reviewed transport contract.
+//! remains engine-internal; F7b exposes only its graph-redacted projection.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -382,6 +382,451 @@ pub struct StreamOperationalStatus {
     pub relevant_recovery: Vec<StreamRecoveryOperationalStatus>,
     pub driver: StreamDriverAdvisoryStatus,
     pub rebuild: StreamRebuildReadiness,
+}
+
+/// Graph-logical declaration selected by one checked stream status cut.
+///
+/// This is deliberately the only declaration identity carried across the
+/// served boundary. The physical table identity and current table key remain
+/// inside the engine.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GraphStreamDeclaration {
+    /// `node` or `edge`.
+    pub kind: &'static str,
+    /// Current accepted-schema name from the exact status cut.
+    pub type_name: String,
+}
+
+/// Logical drain state for one graph declaration.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphStreamDrainStatus {
+    pub goal: &'static str,
+    pub phase: &'static str,
+    pub initiated_at: i64,
+}
+
+/// Logical strict-block state for one graph declaration.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphStreamStrictBlockStatus {
+    pub kind: &'static str,
+    pub violation_code: String,
+}
+
+/// Aggregate pending work for one graph declaration.
+///
+/// Exact counts are returned only when every selected physical member has an
+/// exact observation. An unavailable member makes the aggregate unavailable;
+/// the booleans retain the actionable class without exposing a shard,
+/// generation, recovery owner, or storage coordinate.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphStreamPendingStatus {
+    Exact {
+        rows: u64,
+        arrow_bytes: u64,
+        batches: u64,
+    },
+    Unavailable {
+        cold_replay: bool,
+        flushed: bool,
+        recovery: bool,
+    },
+}
+
+/// Last graph-visible fold summary, with physical generation and operation
+/// identities intentionally removed.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphStreamLastFoldStatus {
+    pub outcome: String,
+    pub input_rows: u64,
+    pub input_bytes: u64,
+    pub visible_rows: u64,
+    pub visible_bytes: u64,
+    pub recorded_at: i64,
+}
+
+/// Checked operational status for one accepted graph declaration.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphStreamDeclarationStatus {
+    pub declaration: GraphStreamDeclaration,
+    pub lifecycle: &'static str,
+    pub lifecycle_revision: u64,
+    pub drain: Option<GraphStreamDrainStatus>,
+    pub strict_block: Option<GraphStreamStrictBlockStatus>,
+    pub pending: GraphStreamPendingStatus,
+    pub last_fold: Option<GraphStreamLastFoldStatus>,
+}
+
+/// Graph-global current sequencing-authority counts.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphStreamTokenCounts {
+    pub present: u64,
+    pub withdrawn: u64,
+    pub dead_lettered: u64,
+}
+
+/// Sanitized process-local driver error summary.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphStreamDriverErrorStatus {
+    pub kind: &'static str,
+    pub retry_in_ms: Option<u64>,
+}
+
+/// Advisory driver summary. It intentionally carries no trigger, event, or
+/// declaration identity and no raw error message.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphStreamDriverStatus {
+    pub scope: &'static str,
+    pub authoritative: bool,
+    pub state: &'static str,
+    pub pending_count: u64,
+    pub published_open_folds: u64,
+    pub last_completion_kind: Option<&'static str>,
+    pub last_error: Option<GraphStreamDriverErrorStatus>,
+}
+
+/// Graph-safe reason a logical rebuild is not currently admissible.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphStreamRebuildBlocker {
+    ProfileNotTerminal,
+    DeclarationNotSealed {
+        declaration: GraphStreamDeclaration,
+    },
+    StrictBlock {
+        declaration: GraphStreamDeclaration,
+    },
+    PendingWork {
+        declaration: GraphStreamDeclaration,
+    },
+    PendingWorkUnavailable {
+        declaration: GraphStreamDeclaration,
+    },
+    RecoveryPending {
+        count: u64,
+    },
+    TerminalTokenAuthority {
+        withdrawn_count: u64,
+        dead_lettered_count: u64,
+    },
+}
+
+/// Graph-safe rebuild decision from the checked status cut.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphStreamRebuildStatus {
+    pub ready: bool,
+    pub blockers: Vec<GraphStreamRebuildBlocker>,
+}
+
+/// One checked, graph-redacted operational status cut for the served F7
+/// boundary.
+///
+/// The richer internal value remains private because it contains table,
+/// binding, shard, generation, Lance-version, receipt, and recovery identities.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphStreamOperationalStatus {
+    pub manifest_version: u64,
+    pub profile_mode: &'static str,
+    pub profile_revision: u64,
+    pub enrolled_declarations: Vec<GraphStreamDeclarationStatus>,
+    pub token_counts: GraphStreamTokenCounts,
+    pub recovery_pending_count: u64,
+    pub driver: GraphStreamDriverStatus,
+    pub rebuild: GraphStreamRebuildStatus,
+}
+
+fn graph_stream_declaration(table_key: &str) -> Result<GraphStreamDeclaration> {
+    let (kind, type_name) = if let Some(type_name) = table_key.strip_prefix("node:") {
+        ("node", type_name)
+    } else if let Some(type_name) = table_key.strip_prefix("edge:") {
+        ("edge", type_name)
+    } else {
+        return Err(OmniError::manifest_internal(format!(
+            "checked graph stream status found invalid table key '{table_key}'"
+        )));
+    };
+    if type_name.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "checked graph stream status found an empty declaration name",
+        ));
+    }
+    Ok(GraphStreamDeclaration {
+        kind,
+        type_name: type_name.to_string(),
+    })
+}
+
+fn checked_graph_status_add(total: &mut u64, value: u64, label: &str) -> Result<()> {
+    *total = total.checked_add(value).ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "checked graph stream status overflowed aggregate {label}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn graph_stream_pending_status(
+    physical: &StreamTablePhysicalOperationalStatus,
+) -> Result<GraphStreamPendingStatus> {
+    let StreamTablePhysicalOperationalStatus::Observed { shards } = physical else {
+        return Ok(GraphStreamPendingStatus::Unavailable {
+            cold_replay: false,
+            flushed: false,
+            recovery: true,
+        });
+    };
+    if shards.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "checked graph stream status found no physical member for an enrolled declaration",
+        ));
+    }
+
+    let mut rows = 0_u64;
+    let mut arrow_bytes = 0_u64;
+    let mut batches = 0_u64;
+    let mut cold_replay = false;
+    let mut flushed = false;
+    for shard in shards {
+        match shard.pending {
+            StreamPendingGenerationStatus::Exact {
+                rows: member_rows,
+                arrow_bytes: member_arrow_bytes,
+                batches: member_batches,
+                ..
+            } => {
+                checked_graph_status_add(&mut rows, member_rows, "pending rows")?;
+                checked_graph_status_add(
+                    &mut arrow_bytes,
+                    member_arrow_bytes,
+                    "pending Arrow bytes",
+                )?;
+                let member_batches = u64::try_from(member_batches).map_err(|_| {
+                    OmniError::manifest_internal(
+                        "checked graph stream status could not represent pending batch count",
+                    )
+                })?;
+                checked_graph_status_add(&mut batches, member_batches, "pending batches")?;
+            }
+            StreamPendingGenerationStatus::UnavailableColdReplay { .. } => cold_replay = true,
+            StreamPendingGenerationStatus::UnavailableFlushed { .. } => flushed = true,
+        }
+    }
+    if cold_replay || flushed {
+        Ok(GraphStreamPendingStatus::Unavailable {
+            cold_replay,
+            flushed,
+            recovery: false,
+        })
+    } else {
+        Ok(GraphStreamPendingStatus::Exact {
+            rows,
+            arrow_bytes,
+            batches,
+        })
+    }
+}
+
+fn graph_stream_declaration_status(
+    table: &StreamTableOperationalStatus,
+) -> Result<GraphStreamDeclarationStatus> {
+    Ok(GraphStreamDeclarationStatus {
+        declaration: graph_stream_declaration(&table.durable.table_key)?,
+        lifecycle: table.durable.lifecycle,
+        lifecycle_revision: table.durable.lifecycle_revision,
+        drain: table.drain.as_ref().map(|drain| GraphStreamDrainStatus {
+            goal: drain.goal,
+            phase: drain.phase,
+            initiated_at: drain.initiated_at,
+        }),
+        strict_block: table
+            .strict_block
+            .as_ref()
+            .map(|block| GraphStreamStrictBlockStatus {
+                kind: block.kind,
+                violation_code: block.violation_code.clone(),
+            }),
+        pending: graph_stream_pending_status(&table.physical)?,
+        last_fold: table
+            .last_fold
+            .as_ref()
+            .map(|fold| GraphStreamLastFoldStatus {
+                outcome: fold.outcome.clone(),
+                input_rows: fold.input_rows,
+                input_bytes: fold.input_bytes,
+                visible_rows: fold.visible_rows,
+                visible_bytes: fold.visible_bytes,
+                recorded_at: fold.recorded_at,
+            }),
+    })
+}
+
+fn graph_stream_rebuild_status(
+    rebuild: StreamRebuildReadiness,
+    declarations_by_table_key: &BTreeMap<String, GraphStreamDeclaration>,
+    recovery_pending_count: u64,
+) -> Result<GraphStreamRebuildStatus> {
+    let declaration = |table_key: &str| {
+        declarations_by_table_key
+            .get(table_key)
+            .cloned()
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "checked graph stream rebuild reason referenced unknown declaration '{table_key}'"
+                ))
+            })
+    };
+    let mut blockers = Vec::with_capacity(rebuild.reasons.len());
+    let mut declaration_reasons = BTreeSet::new();
+    let mut recovery_reason_count = 0_u64;
+    for reason in rebuild.reasons {
+        let projected = match reason {
+            StreamRebuildBlockReason::ProfileNotTerminal { .. } => {
+                Some(GraphStreamRebuildBlocker::ProfileNotTerminal)
+            }
+            StreamRebuildBlockReason::LaneNotSealed { table_key } => declaration_reasons
+                .insert(("not_sealed", table_key.clone()))
+                .then(|| declaration(&table_key))
+                .transpose()?
+                .map(|declaration| GraphStreamRebuildBlocker::DeclarationNotSealed { declaration }),
+            StreamRebuildBlockReason::StrictBlock { table_key } => declaration_reasons
+                .insert(("strict_block", table_key.clone()))
+                .then(|| declaration(&table_key))
+                .transpose()?
+                .map(|declaration| GraphStreamRebuildBlocker::StrictBlock { declaration }),
+            StreamRebuildBlockReason::PendingGeneration { table_key } => declaration_reasons
+                .insert(("pending", table_key.clone()))
+                .then(|| declaration(&table_key))
+                .transpose()?
+                .map(|declaration| GraphStreamRebuildBlocker::PendingWork { declaration }),
+            StreamRebuildBlockReason::PendingGenerationUnavailable { table_key } => {
+                declaration_reasons
+                    .insert(("pending_unavailable", table_key.clone()))
+                    .then(|| declaration(&table_key))
+                    .transpose()?
+                    .map(
+                        |declaration| GraphStreamRebuildBlocker::PendingWorkUnavailable {
+                            declaration,
+                        },
+                    )
+            }
+            StreamRebuildBlockReason::RelevantRecovery { .. } => {
+                recovery_reason_count = recovery_reason_count.checked_add(1).ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "checked graph stream status overflowed recovery blocker count",
+                    )
+                })?;
+                if recovery_reason_count == 1 {
+                    Some(GraphStreamRebuildBlocker::RecoveryPending {
+                        count: recovery_pending_count,
+                    })
+                } else {
+                    None
+                }
+            }
+            StreamRebuildBlockReason::TerminalTokenAuthority {
+                withdrawn_count,
+                dead_lettered_count,
+            } => Some(GraphStreamRebuildBlocker::TerminalTokenAuthority {
+                withdrawn_count,
+                dead_lettered_count,
+            }),
+        };
+        if let Some(projected) = projected {
+            blockers.push(projected);
+        }
+    }
+    if recovery_reason_count != recovery_pending_count {
+        return Err(OmniError::manifest_internal(format!(
+            "checked graph stream status found {recovery_pending_count} recovery operation(s) but {recovery_reason_count} rebuild blocker(s)"
+        )));
+    }
+    Ok(GraphStreamRebuildStatus {
+        ready: rebuild.ready,
+        blockers,
+    })
+}
+
+fn project_graph_stream_operational_status(
+    status: StreamOperationalStatus,
+) -> Result<GraphStreamOperationalStatus> {
+    let StreamOperationalStatus {
+        cut_manifest_version,
+        durable,
+        tables,
+        token_ledger,
+        relevant_recovery,
+        driver,
+        rebuild,
+    } = status;
+    let enrolled_declarations = tables
+        .iter()
+        .map(graph_stream_declaration_status)
+        .collect::<Result<Vec<_>>>()?;
+    let declarations_by_table_key = tables
+        .iter()
+        .zip(&enrolled_declarations)
+        .map(|(table, declaration)| {
+            (
+                table.durable.table_key.clone(),
+                declaration.declaration.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if declarations_by_table_key.len() != enrolled_declarations.len() {
+        return Err(OmniError::manifest_internal(
+            "checked graph stream status found duplicate declaration aliases",
+        ));
+    }
+    let recovery_pending_count = u64::try_from(relevant_recovery.len()).map_err(|_| {
+        OmniError::manifest_internal(
+            "checked graph stream status could not represent recovery operation count",
+        )
+    })?;
+    let pending_count = u64::try_from(driver.pending_triggers.len()).map_err(|_| {
+        OmniError::manifest_internal(
+            "checked graph stream status could not represent driver pending count",
+        )
+    })?;
+    let rebuild =
+        graph_stream_rebuild_status(rebuild, &declarations_by_table_key, recovery_pending_count)?;
+    Ok(GraphStreamOperationalStatus {
+        manifest_version: cut_manifest_version,
+        profile_mode: durable.profile_mode,
+        profile_revision: durable.profile_revision,
+        enrolled_declarations,
+        token_counts: GraphStreamTokenCounts {
+            present: token_ledger.present_count,
+            withdrawn: token_ledger.withdrawn_count,
+            dead_lettered: token_ledger.dead_lettered_count,
+        },
+        recovery_pending_count,
+        driver: GraphStreamDriverStatus {
+            scope: driver.scope,
+            authoritative: driver.authoritative,
+            state: driver.state,
+            pending_count,
+            published_open_folds: driver.published_open_folds,
+            last_completion_kind: driver.last_completion.as_ref().map(|event| event.kind),
+            last_error: driver
+                .last_error
+                .as_ref()
+                .map(|error| GraphStreamDriverErrorStatus {
+                    kind: error.kind,
+                    retry_in_ms: error.retry_in_ms,
+                }),
+        },
+        rebuild,
+    })
 }
 
 /// Project every durable field from one already-resolved immutable snapshot.
@@ -1410,9 +1855,9 @@ impl Omnigraph {
         })
     }
 
-    /// Checked, read-only full stream status for the later F7 transport.
-    /// Existing callers continue to use the non-blocking manifest-only
-    /// [`Self::stream_status`].
+    /// Checked, read-only full stream status underlying the F7b graph-safe
+    /// served projection. Existing callers continue to use the non-blocking
+    /// manifest-only [`Self::stream_status`].
     pub(crate) async fn stream_operational_status(&self) -> Result<StreamOperationalStatus> {
         self.stream_operational_status_with_deadlines(
             None,
@@ -1420,6 +1865,17 @@ impl Omnigraph {
             STREAM_OPERATIONAL_STATUS_CUT_DEADLINE,
         )
         .await
+    }
+
+    /// Capture one checked operational cut and project it onto graph-logical
+    /// declarations for the served F7 status boundary.
+    ///
+    /// The returned value intentionally cannot identify a table dataset,
+    /// physical binding, receipt, shard, epoch, generation, Lance version, or
+    /// recovery sidecar. The complete physical cut remains engine-private.
+    #[doc(hidden)]
+    pub async fn capture_served_graph_stream_status(&self) -> Result<GraphStreamOperationalStatus> {
+        project_graph_stream_operational_status(self.stream_operational_status().await?)
     }
 
     /// Checked DISABLING observation for the stopped cluster-apply owner. The
@@ -1442,6 +1898,15 @@ impl Omnigraph {
         preflight_deadline: Duration,
         cut_deadline: Duration,
     ) -> Result<StreamOperationalStatus> {
+        let _observation = self
+            .write_queue()
+            .try_acquire_stream_status_observation()
+            .ok_or_else(|| OmniError::StreamStatusBusy {
+                phase: "another checked status observation is already in progress".to_string(),
+            })?;
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::STREAM_STATUS_POST_OBSERVATION_ADMISSION,
+        )?;
         let preflight = tokio::time::timeout(
             preflight_deadline,
             self.prepare_stream_operational_status(offline_apply),
@@ -1611,6 +2076,64 @@ impl Omnigraph {
 #[cfg(all(test, feature = "failpoints"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_rebuild_projection_collapses_physical_reason_multiplicity() {
+        let declaration = GraphStreamDeclaration {
+            kind: "node",
+            type_name: "Person".to_string(),
+        };
+        let declarations = BTreeMap::from([("node:Person".to_string(), declaration)]);
+        let mut reasons = Vec::new();
+        for _ in 0..3 {
+            reasons.extend([
+                StreamRebuildBlockReason::LaneNotSealed {
+                    table_key: "node:Person".to_string(),
+                },
+                StreamRebuildBlockReason::StrictBlock {
+                    table_key: "node:Person".to_string(),
+                },
+                StreamRebuildBlockReason::PendingGeneration {
+                    table_key: "node:Person".to_string(),
+                },
+                StreamRebuildBlockReason::PendingGenerationUnavailable {
+                    table_key: "node:Person".to_string(),
+                },
+            ]);
+        }
+        let projected = graph_stream_rebuild_status(
+            StreamRebuildReadiness {
+                ready: false,
+                reasons,
+            },
+            &declarations,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(projected.blockers.len(), 4);
+        assert_eq!(
+            projected
+                .blockers
+                .iter()
+                .filter(|reason| matches!(reason, GraphStreamRebuildBlocker::PendingWork { .. }))
+                .count(),
+            1,
+            "physical shard multiplicity must not appear on the graph wire"
+        );
+        assert_eq!(
+            projected
+                .blockers
+                .iter()
+                .filter(|reason| matches!(
+                    reason,
+                    GraphStreamRebuildBlocker::PendingWorkUnavailable { .. }
+                ))
+                .count(),
+            1,
+            "unavailable physical members must collapse to one logical blocker"
+        );
+    }
 
     #[test]
     fn resident_binding_validation_rejects_same_identity_stale_physical_keys() {

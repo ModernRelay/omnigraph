@@ -39,10 +39,11 @@ use object_store::{
     UploadPart,
 };
 use omnigraph::db::{
-    CleanupPolicyOptions, GraphStreamChunkSource, GraphStreamIngestStart, Omnigraph, ReadTarget,
-    StreamAuthorityRetirementPlan, StreamDataCorrectionAction, StreamDataCorrectionRequest,
-    StreamOldestUncoveredAgeStatus, StreamPendingGenerationStatus, StreamRebuildBlockReason,
-    StreamTablePhysicalOperationalStatus, StreamTableStatus, StreamTokenIndexCoverageStatus,
+    CleanupPolicyOptions, GraphStreamChunkSource, GraphStreamIngestStart, GraphStreamPendingStatus,
+    GraphStreamRebuildBlocker, Omnigraph, ReadTarget, StreamAuthorityRetirementPlan,
+    StreamDataCorrectionAction, StreamDataCorrectionRequest, StreamOldestUncoveredAgeStatus,
+    StreamPendingGenerationStatus, StreamRebuildBlockReason, StreamTablePhysicalOperationalStatus,
+    StreamTableStatus, StreamTokenIndexCoverageStatus,
 };
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
@@ -12671,6 +12672,72 @@ async fn checked_operational_status_reports_one_coherent_read_only_physical_cut(
         "the advisory due-in countdown may move, but status must not add driver work"
     );
 
+    let graph_status = db
+        .capture_served_graph_stream_status()
+        .await
+        .expect("the served bridge must reuse the same checked status owner");
+    assert_eq!(graph_status.manifest_version, manifest_before);
+    assert_eq!(graph_status.profile_mode, "ENABLED");
+    assert_eq!(
+        graph_status.profile_revision,
+        status.durable.profile_revision
+    );
+    assert_eq!(graph_status.enrolled_declarations.len(), 1);
+    let declaration = &graph_status.enrolled_declarations[0];
+    assert_eq!(declaration.declaration.kind, "node");
+    assert_eq!(declaration.declaration.type_name, "Person");
+    assert_eq!(declaration.lifecycle, "OPEN");
+    assert_eq!(
+        declaration.lifecycle_revision,
+        status.tables[0].durable.lifecycle_revision
+    );
+    assert!(declaration.drain.is_none());
+    assert!(declaration.strict_block.is_none());
+    assert!(declaration.last_fold.is_none());
+    assert!(matches!(
+        declaration.pending,
+        GraphStreamPendingStatus::Exact {
+            rows: 1,
+            arrow_bytes,
+            batches: 1,
+        } if arrow_bytes > 0
+    ));
+    assert_eq!(graph_status.token_counts.present, 0);
+    assert_eq!(graph_status.token_counts.withdrawn, 0);
+    assert_eq!(graph_status.token_counts.dead_lettered, 0);
+    assert_eq!(graph_status.recovery_pending_count, 0);
+    assert_eq!(graph_status.driver.state, status.driver.state);
+    assert_eq!(
+        graph_status.driver.pending_count,
+        u64::try_from(status.driver.pending_triggers.len()).unwrap()
+    );
+    assert!(!graph_status.rebuild.ready);
+    assert!(
+        graph_status
+            .rebuild
+            .blockers
+            .iter()
+            .any(|blocker| matches!(blocker, GraphStreamRebuildBlocker::ProfileNotTerminal))
+    );
+    assert!(graph_status.rebuild.blockers.iter().any(|blocker| matches!(
+        blocker,
+        GraphStreamRebuildBlocker::PendingWork { declaration }
+            if declaration.kind == "node" && declaration.type_name == "Person"
+    )));
+    assert!(
+        graph_status
+            .rebuild
+            .blockers
+            .iter()
+            .all(|blocker| !matches!(blocker, GraphStreamRebuildBlocker::RecoveryPending { .. })),
+        "zero internal sidecars must remain zero graph-level recovery blockers"
+    );
+    assert_eq!(
+        db.version_of(ReadTarget::branch("main")).await.unwrap(),
+        manifest_before,
+        "the served graph projection must remain read-only"
+    );
+
     let busy = db
         .failpoint_stream_operational_status_for_test(Duration::ZERO)
         .await
@@ -12693,6 +12760,34 @@ async fn operational_status_times_out_only_the_blocked_authority_cut_and_cancels
     let _scenario = FailScenario::setup();
     let (dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
     let manifest_before = db.version_of(ReadTarget::branch("main")).await.unwrap();
+
+    let admitted =
+        helpers::failpoint::Rendezvous::park_first(names::STREAM_STATUS_POST_OBSERVATION_ADMISSION);
+    let first_db = Arc::clone(&db);
+    let first = tokio::spawn(async move {
+        first_db
+            .failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+            .await
+    });
+    admitted.wait_until_reached().await;
+    let overlapping = db
+        .failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+        .await
+        .expect_err("a second root observation must refuse without waiting");
+    assert!(matches!(
+        overlapping,
+        OmniError::StreamStatusBusy { ref phase }
+            if phase == "another checked status observation is already in progress"
+    ));
+    admitted.release();
+    first
+        .await
+        .expect("the admitted observation task must remain live")
+        .expect("the admitted observation must complete after release");
+    db.failpoint_stream_operational_status_for_test(Duration::from_secs(10))
+        .await
+        .expect("a completed observation must release its root slot");
+
     let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let blocker_db = Arc::clone(&db);

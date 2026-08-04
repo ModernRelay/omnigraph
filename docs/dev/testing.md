@@ -30,6 +30,16 @@ no replay after 412, while `planes::tests` pins served graph addressing and
 direct-mode refusal before dispatch. No test exposes a table/lane selector or
 adds a lifecycle, status, or maintenance route.
 
+**F7b amendment:** checked operational status is now the second narrow served
+stream surface. `memwal_stream.rs` extends the existing F6b6 owner with the
+graph-logical projection and no-effect proof; raw table, binding, shard,
+generation, token-sample, and recovery identities stay engine-private.
+Server route/auth tests own `GET /graphs/{graph_id}/stream/status`, read-policy
+authorization, redaction, checked-runtime ownership, and retryable refusal;
+`openapi.rs` pins the generated contract. CLI in-source client and plane tests
+own selected-graph GET/decode, served-only addressing, and JSON/human output.
+No F7b test exposes or mutates lifecycle, maintenance, or rebind authority.
+
 The engine's `tests/` is the principal coverage surface; most graph-shaped behavior is exercised there.
 
 ## CI control-plane tests
@@ -755,9 +765,10 @@ evidence, or maintenance/rebind/resume composition. Later F6b2 closes the named
 acceptance cells, F6b3 closes the uncovered-tail token-cost harness, and F6b7
 closes the paired decision evidence with a bounded standalone-reconciler NO-GO
 through 260 exact uncovered fragments for the uncompacted profile-cycle
-fixture. Public operational-status transport and the remaining guardrails keep
-F7 closed; graph-manifest-compacted or checked-Optimize-coupled reconciliation
-requires fresh evidence.
+fixture. At that boundary, public operational-status transport and the
+remaining guardrails kept F7 closed; F7b now covers the graph-redacted served
+status surface. Graph-manifest-compacted or checked-Optimize-coupled
+reconciliation requires fresh evidence.
 
 ### RFC-026 F6b1 checked export-cut evidence ownership
 
@@ -844,8 +855,10 @@ cumulative bodies. Crossing any one bound must refuse the whole status; the
 bounded path never returns a truncated inventory.
 
 `memwal_stream.rs::operational_status_times_out_only_the_blocked_authority_cut_and_cancels_cleanly`
-proves the immutable preflight can succeed while a deterministic root owner
-blocks only the short authority cut. The cut returns `StreamStatusBusy` for
+first parks one admitted observer and proves a second observer on the same root
+immediately returns `StreamStatusBusy`, then proves completion releases the
+slot. It also proves the immutable preflight can succeed while a deterministic
+root owner blocks only the short authority cut. The cut returns `StreamStatusBusy` for
 `exclusive authority cut` without manifest movement, cancellation retains no
 partial gate ownership, and a later status plus ordinary writer both progress.
 `memwal_stream.rs::operational_status_terminal_sample_is_the_first_eight_current_keys_and_marks_more`
@@ -898,8 +911,11 @@ all remain `StreamStatusChanged`. Worker-registry tests likewise use the full
 identity/enrollment/shard key and cover non-vacant Active, Opening, and Retiring
 entries so a stale physical binding cannot disappear behind identity-only
 projection.
-There are deliberately no CLI/HTTP/OpenAPI/SDK parity or generated-OpenAPI
-tests for this shape until F7 supplies that transport contract.
+F7b extends this owner rather than duplicating the physical proof. The engine
+test pins the graph-logical projection and no manifest movement. Server and
+CLI owners pin the read-authorized HTTP/OpenAPI/remote contract and a forbidden
+wire-key allowlist. The ambient SDK still exposes only manifest-only
+`stream_status`; the checked method remains a doc-hidden served bridge.
 
 ### RFC-026 implemented F6b2 acceptance scope
 
@@ -947,9 +963,10 @@ F6b2 deliberately does **not** accept in-place productive SchemaApply on an
 enrolled graph. Schema-change acceptance is a separate checked sealed/retired
 export → initialize fresh graph with the desired schema → ordinary load
 workflow; physical rebind keeps the accepted schema unchanged. Covered/
-reconciled token evidence is owned by F6b7; public operational-status transport
-and the remaining served row/control parity remain later F6/F7 owners. F6b4
-separately closes the isolated dead-letter envelope evidence.
+reconciled token evidence is owned by F6b7; implemented F7b owns graph-redacted
+checked operational-status transport, while direct SDK status and remaining
+lifecycle/maintenance parity remain later F6/F7 owners. F6b4 separately closes the
+isolated dead-letter envelope evidence.
 
 ### RFC-026 implemented F6b3/F6b7 selected-token cost evidence
 

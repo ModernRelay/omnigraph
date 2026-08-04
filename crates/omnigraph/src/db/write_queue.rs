@@ -127,6 +127,16 @@ pub(crate) struct StreamExportDestructivePermit {
     _permit: OwnedRwLockReadGuard<()>,
 }
 
+/// Non-cloneable ownership of the sole checked operational-status observation
+/// for one graph root. The immutable preflight can scan token/base authority
+/// for up to its full deadline, so allowing parallel observations would turn
+/// a bounded request into unbounded aggregate IO and retained memory.
+#[must_use = "dropping the permit releases stream-status observation"]
+pub(crate) struct StreamStatusObservationPermit {
+    _manager: Arc<WriteQueueManager>,
+    _permit: OwnedMutexGuard<()>,
+}
+
 impl StreamAdmissionKey {
     /// Bind one immutable table lifetime to its resolved physical Lance ref.
     pub(crate) fn for_resolved_ref(identity: TableIdentity, physical_ref: Option<&str>) -> Self {
@@ -195,6 +205,12 @@ pub(crate) struct WriteQueueManager {
     /// Cooperative controls that can remove/reuse exact paths or versions own
     /// it shared, so they remain mutually concurrent but cannot race a cut.
     stream_export_gate: Arc<AsyncRwLock<()>>,
+    /// Root-wide checked operational-status admission.
+    ///
+    /// The expensive immutable preflight intentionally takes no writer gate.
+    /// This separate non-waiting slot keeps one root from running several
+    /// bounded scans concurrently while preserving writer availability.
+    stream_status_gate: Arc<AsyncMutex<()>>,
 }
 
 impl WriteQueueManager {
@@ -395,6 +411,20 @@ impl WriteQueueManager {
             .try_read_owned()
             .ok()?;
         Some(StreamExportDestructivePermit {
+            _manager: Arc::clone(self),
+            _permit: permit,
+        })
+    }
+
+    /// Try to reserve the sole checked operational-status observation.
+    ///
+    /// Refusal is immediate. A caller must not queue another 60-second
+    /// immutable scan behind the current one or run those scans in parallel.
+    pub(crate) fn try_acquire_stream_status_observation(
+        self: &Arc<Self>,
+    ) -> Option<StreamStatusObservationPermit> {
+        let permit = Arc::clone(&self.stream_status_gate).try_lock_owned().ok()?;
+        Some(StreamStatusObservationPermit {
             _manager: Arc::clone(self),
             _permit: permit,
         })
@@ -721,7 +751,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_export_gate_is_root_shared_non_waiting_and_released_on_drop() {
+    async fn stream_export_and_status_gates_are_root_shared_non_waiting_and_release_on_drop() {
         let root = format!("memory://stream-export-slot/{}", ulid::Ulid::new());
         let first = WriteQueueManager::for_root(&root);
         let second = WriteQueueManager::for_root(&root);
@@ -778,6 +808,29 @@ mod tests {
             .try_acquire_stream_export_cut()
             .expect("dropping the cut owner must release the root gate");
         drop(reacquired);
+
+        let status = reopened_again
+            .try_acquire_stream_status_observation()
+            .expect("the first checked status observation must acquire its root slot");
+        assert!(
+            WriteQueueManager::for_root(&root)
+                .try_acquire_stream_status_observation()
+                .is_none(),
+            "a second checked status observation must refuse across handles"
+        );
+        drop(reopened_again);
+        let status_reopened = WriteQueueManager::for_root(&root);
+        assert!(
+            status_reopened
+                .try_acquire_stream_status_observation()
+                .is_none(),
+            "the status permit must keep the weakly registered root manager alive"
+        );
+        drop(status);
+        let status_reacquired = status_reopened
+            .try_acquire_stream_status_observation()
+            .expect("dropping checked status must release its root slot");
+        drop(status_reacquired);
     }
 
     #[tokio::test]

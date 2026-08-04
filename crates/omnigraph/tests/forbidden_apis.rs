@@ -385,6 +385,10 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph/stream_status.rs", "stream_status"),
     (
         "db/omnigraph/stream_status.rs",
+        "capture_served_graph_stream_status",
+    ),
+    (
+        "db/omnigraph/stream_status.rs",
         "failpoint_stream_operational_status_for_test",
     ),
     (
@@ -2394,6 +2398,146 @@ fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
     assert!(
         !contents.contains("impl Clone for StreamExportCut"),
         "StreamExportCut must remain non-cloneable"
+    );
+}
+
+#[test]
+fn served_graph_stream_status_bridge_has_only_graph_logical_fields() {
+    let path = engine_src_root().join("db/omnigraph/stream_status.rs");
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let ast = parse_rust_source(&contents, "db/omnigraph/stream_status.rs");
+    let expected_types = BTreeSet::from([
+        "GraphStreamDeclaration".to_string(),
+        "GraphStreamDeclarationStatus".to_string(),
+        "GraphStreamDrainStatus".to_string(),
+        "GraphStreamDriverErrorStatus".to_string(),
+        "GraphStreamDriverStatus".to_string(),
+        "GraphStreamLastFoldStatus".to_string(),
+        "GraphStreamOperationalStatus".to_string(),
+        "GraphStreamPendingStatus".to_string(),
+        "GraphStreamRebuildBlocker".to_string(),
+        "GraphStreamRebuildStatus".to_string(),
+        "GraphStreamStrictBlockStatus".to_string(),
+        "GraphStreamTokenCounts".to_string(),
+    ]);
+    let allowed_fields = BTreeSet::from([
+        "arrow_bytes",
+        "authoritative",
+        "batches",
+        "blockers",
+        "cold_replay",
+        "count",
+        "dead_lettered",
+        "dead_lettered_count",
+        "declaration",
+        "drain",
+        "driver",
+        "enrolled_declarations",
+        "flushed",
+        "goal",
+        "initiated_at",
+        "input_bytes",
+        "input_rows",
+        "kind",
+        "last_completion_kind",
+        "last_error",
+        "last_fold",
+        "lifecycle",
+        "lifecycle_revision",
+        "manifest_version",
+        "outcome",
+        "pending",
+        "pending_count",
+        "phase",
+        "present",
+        "profile_mode",
+        "profile_revision",
+        "published_open_folds",
+        "ready",
+        "recorded_at",
+        "rebuild",
+        "recovery",
+        "recovery_pending_count",
+        "retry_in_ms",
+        "rows",
+        "scope",
+        "state",
+        "strict_block",
+        "token_counts",
+        "type_name",
+        "violation_code",
+        "visible_bytes",
+        "visible_rows",
+        "withdrawn",
+        "withdrawn_count",
+    ]);
+    let mut seen_types = BTreeSet::new();
+    let mut bridge_count = 0;
+
+    let check_fields = |type_name: &str, fields: &syn::Fields| {
+        for field in fields {
+            let Some(name) = field.ident.as_ref().map(ToString::to_string) else {
+                continue;
+            };
+            assert!(
+                allowed_fields.contains(name.as_str()),
+                "served graph status type {type_name} exposes unreviewed field '{name}'"
+            );
+        }
+    };
+
+    for item in &ast.items {
+        match item {
+            Item::Struct(item) if item.ident.to_string().starts_with("GraphStream") => {
+                let name = item.ident.to_string();
+                seen_types.insert(name.clone());
+                assert!(matches!(item.vis, Visibility::Public(_)));
+                assert!(has_doc_hidden(&item.attrs));
+                check_fields(&name, &item.fields);
+            }
+            Item::Enum(item) if item.ident.to_string().starts_with("GraphStream") => {
+                let name = item.ident.to_string();
+                seen_types.insert(name.clone());
+                assert!(matches!(item.vis, Visibility::Public(_)));
+                assert!(has_doc_hidden(&item.attrs));
+                for variant in &item.variants {
+                    check_fields(&name, &variant.fields);
+                }
+            }
+            Item::Impl(item) if item.trait_.is_none() && is_omnigraph_type(&item.self_ty) => {
+                for member in &item.items {
+                    let syn::ImplItem::Fn(function) = member else {
+                        continue;
+                    };
+                    if function.sig.ident != "capture_served_graph_stream_status" {
+                        continue;
+                    }
+                    bridge_count += 1;
+                    assert!(matches!(function.vis, Visibility::Public(_)));
+                    assert!(function.sig.asyncness.is_some());
+                    assert!(has_doc_hidden(&function.attrs));
+                    assert!(return_type_contains_identifier(
+                        &function.sig.output,
+                        "GraphStreamOperationalStatus"
+                    ));
+                    assert!(!return_type_contains_identifier(
+                        &function.sig.output,
+                        "StreamOperationalStatus"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        seen_types, expected_types,
+        "graph status type registry drifted"
+    );
+    assert_eq!(
+        bridge_count, 1,
+        "there must be exactly one checked served graph status bridge"
     );
 }
 

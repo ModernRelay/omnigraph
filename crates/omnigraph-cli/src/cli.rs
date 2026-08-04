@@ -16,7 +16,7 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
 URI): query, mutate, load, branch, snapshot, export, commit, schema show/apply.\n  \
-served — require a server: stream ingest (graph scope) and graphs (registry scope).\n  \
+served — require a server: stream ingest/status (graph scope) and graphs (registry scope).\n  \
 direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
 schema plan, lint).\n  \
 control — manage or inspect a cluster (cluster via --config; policy & queries via \
@@ -387,6 +387,12 @@ pub(crate) enum StreamCommand {
         /// bodyless preflight before the input is opened.
         #[arg(long, value_name = "TOKEN")]
         graph_token: Option<String>,
+    },
+    /// Inspect the served graph's checked streaming health and readiness.
+    Status {
+        /// Emit the complete graph-logical status as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
