@@ -29,7 +29,11 @@ frozen-round node/edge fairness, physical rebind → re-enable → reopen → re
 combined maintenance, fresh-target import, and legacy writer refusal.
 F6b3 implements exact-selected uncovered-token-tail cost evidence behind
 failpoints-only read seams, with a fast local cell and ignored local/RustFS
-decision sweeps. It adds no reconciler, status, or transport. F6b4 implements
+sweeps. It adds no reconciler, status, or transport. F6b7 preserves that
+historical baseline and adds a paired failpoints-only exact-selected index cut
+for current-token and profile-receipt lookup decision evidence. The helper owns
+no recovery sidecar and is not a production reconciler or scheduling threshold.
+F6b4 implements
 the isolated production-size dead-letter byte/capacity/timing and peak-RSS
 evidence behind one new source-guarded, doc-hidden failpoints-only measurement
 seam. It changes no format, recovery, or production route; its stopped/offline
@@ -65,7 +69,9 @@ are green. The broader post-claim install/retirement-failure matrix remains F6
 work.
 Public row streaming, public enrollment, general lifecycle/rebind verbs,
 `AuthorityBlock` repair,
-the F6b-remainder guardrail acceptance, and SDK/HTTP/OpenAPI row-ingress,
+the standalone production token-index reconciler deferred by F6b7's uncompacted-
+profile-cycle bounded NO-GO, the F6b-remainder
+guardrail acceptance, and SDK/HTTP/OpenAPI row-ingress,
 lifecycle, operational-status, or maintenance surfaces remain inactive.
 Stream-aware served export is the narrow activated transport exception.
 Retirement, DataBlock show/correct, and current dead-letter list/export are
@@ -250,9 +256,11 @@ prefix listing or second inventory. Recovery-v21 also extends irreversible
 retirement to exact `WITHDRAWN | DEAD_LETTERED` cuts; recovery-v19 and
 recovery-v20 retain their historical meanings. This activates no HTTP, SDK,
 remote CLI, or OpenAPI row surface. F6b3 now owns the exact-selected uncovered-
-tail current-token hit/miss and terminal-page harness, and F6b4 owns isolated
+tail current-token hit/miss and terminal-page harness, F6b7 later adds paired
+failpoints-only selected-index decision evidence, and F6b4 owns isolated
 production-size dead-letter encoding/materialization and peak-RSS evidence.
-Covered/reconciled token evidence and the complete guardrail matrix remain.
+F6b7's uncompacted-profile-cycle bounded NO-GO schedules no standalone recovery-
+owned production token-index reconciler; the complete guardrail matrix remains.
 **F6a in-process acceptance slice implemented:** 2026-08-02 — a typed
 failpoints-only snapshot exposes process-local driver run state, pending
 trigger/backoff scheduling, and last completion/error evidence as explicitly
@@ -265,9 +273,9 @@ checked offline disable. Public durable `Omnigraph::stream_status` remains
 manifest-only. This slice adds no format/recovery or public API/SDK/HTTP/CLI/
 OpenAPI contract and does not complete F6. Later F6b2 closes the named process,
 fairness, and maintenance/rebind/resume cells, and F6b3 closes the uncovered-
-tail current-token hit/miss and terminal-page instrument. The remaining
-covered/reconciled token curve, public operational-status transport, and
-guardrails keep F7 forbidden;
+tail current-token hit/miss and terminal-page instrument. F6b7 later adds the
+paired token-index decision instrument; public operational-status transport and
+the remaining guardrails keep F7 forbidden;
 F6b4 separately closes the isolated dead-letter envelope evidence and F6b5
 closes bounded served export.
 **F6b1 checked immutable export-cut slice implemented:** 2026-08-02 — an exact
@@ -323,8 +331,10 @@ sequential sole-writer evidence, not a distributed fence. The broader post-
 claim install/retirement-failure matrix remains later F6 work.
 Productive SchemaApply stays refused on enrolled graphs: EXP schema evolution
 is checked sealed/retired export followed by fresh init/load, while physical
-rebind keeps accepted schema unchanged. Covered/reconciled token evidence,
-F6b5 closes bounded stream-aware served export; public operational-status
+rebind keeps accepted schema unchanged. F6b7 closes the paired failpoints-only
+token-index decision instrument and F6b5 closes bounded stream-aware served
+export. Its uncompacted-profile-cycle bounded NO-GO schedules no standalone
+production reconciler; public operational-status
 transport and the other served surfaces remain later F6b/F7 work. F6b4
 separately closes the isolated dead-letter envelope evidence.
 **F6b3 exact-selected uncovered-tail evidence implemented:** 2026-08-02 — a
@@ -344,11 +354,12 @@ coverage is a separate sample-level probe. The terminal page keeps one logical
 entry, not byte-identical content, as receipt history changes. This instrument
 does not query receipt keys. It refuses writes, MemWAL/base reads, prefix
 listing, and dead-letter payload-object reads. Production has no authority-safe
-token-index reconciler, so this is explicitly uncovered-tail evidence; it
+token-index reconciler, so this remains explicitly F6b3 uncovered-tail evidence; it
 neither calls raw `optimize_indices` nor publishes an index-only/reconciled token
 HEAD. Fixture setup necessarily publishes ordinary receipt and terminal token
-versions. Public status, the decision threshold/reconciler, receipt-key cost,
-and covered/reconciled token evidence remain later work.
+versions. At the F6b3 boundary, receipt-key cost and paired covered/reconciled
+evidence remained later work; F6b7 closes that measurement gap without adding
+public status or production maintenance.
 **F6b4 dead-letter envelope evidence implemented:** 2026-08-02 — the existing
 codec boundary cell remains the fast one-under/exact/one-over regression, while
 an ignored production-size cell drives 8,192 adversarial candidates through the
@@ -435,6 +446,34 @@ because the selected cut has no exact fragment-creation timestamp. The
 existing public `Omnigraph::stream_status` remains manifest-only and
 nonblocking. This slice adds no CLI/HTTP/OpenAPI/SDK transport; F7 owns that
 wire contract.
+**F6b7 selected token-index decision instrument implemented:** 2026-08-03 — the
+F6b3 fixture now takes paired observations over the same logical authority. It
+measures current-token and profile-management-receipt hit/miss work on the
+manifest-selected uncovered cut, runs one failpoints-only content-identical
+lookup-index refresh, selects the exact successor witness, and repeats those
+lookups plus the bounded terminal page. The helper first settles recovery,
+excludes token writers, proves raw HEAD equals manifest selection, and accepts
+only the named index's one-version `CreateIndex` effect. Fragment set, schema,
+row count, token result, receipt identity, and terminal-page contents must remain
+unchanged; the after-cut must cover the complete fragment set. The measured
+maintenance window contains `optimize_indices`, exact transaction
+classification, and manifest selection. Gate/coordinator setup, the pre/post
+content proofs, and final graph refresh run outside that window. This is test/
+failpoints evidence only: it owns no recovery
+sidecar, changes no format or wire contract, and is neither the production
+authority-safe reconciler nor its scheduling threshold. Ordinary graph
+`optimize` still does not maintain `_stream_tokens.lance`.
+**Configured-RustFS uncompacted profile-cycle result — bounded NO-GO:** exact uncovered-fragment samples
+were 6/20/68/260. Each warm current-token and profile-receipt hit/miss term had
+a 3.000× token-table read-request ratio, while total maintenance-request break-even grew
+45/136/448/1,697 calls. The corresponding byte ratios were
+19.267×/10.913×/4.849×/2.084× with byte break-even at 12/20/46/150 calls. At
+260 fragments the byte term still qualified, but the request term exceeded the
+1,000-call ceiling, so the predeclared AND rule rejects a standalone production
+reconciler for this fixture. This is not a universal token-index NO-GO.
+Remeasure beyond 260 uncovered fragments, after a Lance/index-grammar change, or
+before considering graph-manifest-compacted or checked-Optimize-coupled
+maintenance; F6b7 schedules no standalone production maintenance.
 **F6b8 resume/driver handoff implemented:** 2026-08-03 — resume now moves the
 non-clone root producer permit into the detached install owner and its retained
 retirement authority, then arms an urgent trigger before making that transfer.
@@ -1325,15 +1364,16 @@ Appending a ledger fragment leaves that fragment outside an older index until
 tail. Recovery-v14 reserves a fail-closed
 `StreamTokenLedgerIndexMaintenance` scaffold whose payload meaning is frozen;
 a different final grammar requires a new strand. Logical EXP activation does
-not require the reconciler. When measured evidence schedules it, a
-manifest-derived reconciler runs under
+not require the reconciler. If accepted production evidence later schedules
+one, a manifest-derived reconciler runs under
 the graph-global recovery barrier and root token gate, applies the existing
 Optimize-style exact-effect classification and auto-cleanup stripping, and
 advances only the manifest-selected `_stream_tokens` pointer to a
 content-identical version with extended index coverage without weakening B2a
 retain-all. It never changes a current token row, receipt chain, or logical
 operation result. A late or failed reconciliation leaves lookup
-correct and reports uncovered-fragment count/age plus its error; it cannot make
+correct and reports uncovered-fragment count, the honest oldest-age availability
+state, and its error; it cannot make
 a lifecycle operation fail because a physical index is stale. Ordinary graph
 `optimize` does not maintain `_stream_tokens`. F6b3's failpoints-only
 instrument now measures exact-selected uncovered coverage plus current-token
@@ -1342,11 +1382,17 @@ fixture holds the logical token result and terminal-page cardinality fixed, not
 the page's serialized bytes: immutable receipt history continues to change
 selected-version metadata. Fresh-handle operations are not cold graph opens or
 cold-provider-cache measurements, and coverage is sampled outside their timed
-windows. The instrument does not synthesize a covered token HEAD. Status must
-still expose uncovered count/oldest age and a lookup-cost warning; the later
-covered/reconciled curve records the latency/I/O threshold that schedules
-reconciliation. Until that threshold is crossed, uncovered-tail work is an
-explicit invariant-15 EXP gap. Thus “bounded result
+windows. The F6b3 instrument does not synthesize a covered token HEAD. F6b7
+adds a distinct failpoints-only paired cut: after proving raw HEAD equals
+manifest selection and excluding token writers, it accepts only the named
+lookup index's content-identical `CreateIndex` successor, selects that exact
+witness, and compares current-token plus profile-receipt hit/miss work while
+charging its table/manifest maintenance I/O. It owns no recovery sidecar and is
+not the production reconciler or scheduling threshold. Status exposes uncovered
+count when Lance provides exact coverage and explicitly marks oldest age
+unavailable because this cut has no exact fragment-creation timestamp. Until an
+accepted production decision says otherwise, uncovered-tail work is an explicit
+invariant-15 EXP gap. Thus “bounded result
 materialization” never masquerades as a claim that a partially covered index
 performs zero physical scanning.
 
@@ -1932,7 +1978,7 @@ Movement returns typed `StatusChanged`; failure to settle returns typed
 `lifecycle_revision`, authoritative and observed epoch, drain ID/goal/phase,
 pending generation rows/bytes, replay and merge cut, strict block
 token/code/revision, current receipt identifiers/summaries, token-ledger
-covered/uncovered-fragment count and oldest-uncovered age, the persisted
+covered/uncovered-fragment count and the explicit oldest-age availability state, the persisted
 `LastFoldSummary`, every pending recovery operation inside the accepted bounded
 inventory, and exact rebuild-readiness reasons. A reconciliation error is reported only after measured evidence has
 caused a reconciler to be implemented and scheduled.
@@ -3996,9 +4042,13 @@ participants, the one dead-letter object's recovery-owned publication, and the
 sole manifest decision. F6b3's landed long-history cells report exact selected
 uncovered token fragments and measure fixed-cardinality current-token hit/miss
 and terminal-page scan cost; they do not query receipt keys or claim
-history-flat or covered behavior before a reconciler exists. The covered curve
-and measured threshold for adding that reconciler are recorded before
-activation.
+history-flat or covered behavior. F6b7 adds the paired failpoints-only selected-
+index current-token and receipt-key comparison, including maintenance
+amortization and semantic-equivalence proofs. It is not production recovery;
+its bounded NO-GO applies only to the uncompacted profile-cycle fixture and
+schedules no standalone reconciler. Evidence reopens at greater depth, after a
+Lance/index-grammar change, or before considering graph-manifest-compacted or
+checked-Optimize-coupled maintenance.
 Sealing proves it reads only the current WAL-tail delta. Historical
 recovery-v12 ordinary-fold bytes retain their meaning and are refused under
 v12. Current cells crash v13 `StreamProfileChange` around its exact
@@ -4869,8 +4919,11 @@ Optional retained-object counts/bytes are advisory current-listing diagnostics,
 not admission or provider-billing truth.
 Richer **user-table** index-catchup and reject detail may follow in Phase C;
 the internal token-ledger covered/uncovered-fragment diagnostic required by
-§4.3 is part of the activation profile. A reconciler is added only when the
-recorded threshold is crossed; ordinary table optimize does not cover this
+§4.3 is part of the activation profile. F6b7's failpoints-only bounded NO-GO
+applies only to the uncompacted profile-cycle fixture and schedules no standalone
+reconciler; evidence reopens beyond 260 uncovered fragments, after a Lance/index-
+grammar change, or before considering graph-manifest-compacted or checked-
+Optimize-coupled maintenance. Ordinary table optimize does not cover this
 ledger. Lance's `wal_entry_position_last_seen`
 and next-position statistics are explicitly labeled hints; neither is
 presented as a durable per-row receipt or a way to resolve one `AckUnknown`
@@ -6124,7 +6177,7 @@ remain concurrent with one another.
 | B2a | selected unbounded retain-all/no-GC profile on stock Lance | **Private gate implemented 2026-07-21 (§12.5):** no OmniGraph byte/object/file/history quota; zero canonical `_mem_wal` deletion; complete/partial provider residue remains retained, unreferenced, and untouched below its root through retry/reopen; provider failures are loud; local/configured-RustFS history sweeps are advisory. This gate itself activated no schema or product surface; the later private B2-common slice activates v9 |
 | B2b | candidate managed-reclamation retention profile | Inactive. Requires the Lance-owned durable inspect/plan/execute + receipt, post-success fencing, bounded checkpoint/inventory/accounting, local/RustFS enforced-bound validation, and the profile-specific crash matrix (§4.5.2/§12.6). Passing it alone activates no product surface |
 | B2-common | schema v9/config-v3/state-v2, compare-and-chain token/attribution, graph-global token authority, recovery-v12 base+token fold; then explicit enrollment, revision-fenced lifecycle/correction/full status, SDK row/control methods, HTTP, CLI, and OpenAPI | **Private row/fold subset implemented 2026-07-22 (§11/§12.6):** canonical digests, hidden attribution, stale-authority revalidation after shared admission, same-generation chains, exact two-participant recovery/publication, durable fold attribution, retain-all, and genuine v8↔v9 refusal/rebuild are green. Explicit production enrollment, general lifecycle mutation, public row admission, cancellation/shutdown, API compatibility, and transport parity remain inactive. The later F6b6 slice implements the checked read-only operational-status core internally; its public transport remains inactive. The Cedar vocabulary, embedded manifest-only status, and narrow stopped/offline F3f DataBlock correction shipped in later EXP slices. `GraphHistoryBudget` belongs only to a future bounded/managed profile |
-| EXP | experimental cluster-only activation of the §4.7 profile: offline capability-bound enablement, lazy enrollment, caller-supplied vectors, terminal per-key dead letter plus correction, irreversible authority retirement for fresh-root rebuild, SEALED maintenance/rebind, starvation-free serial folding, and upsert-only hidden ingress | **Selected 2026-07-27 and amended 2026-07-29 (§4.7); F3a–F3f, hidden F4, F5a/F5b0/F5b, and F6a–F6b6 are implemented.** Current v19/token-schema-v3/recovery-v21 publishes deterministic mixed/all-diverted folds, current `DEAD_LETTERED` authority, exact retry/ordinary successor, stopped/offline inspection, and three-disposition retirement. F6b1 freezes an exact-terminal move-only cut; F6b5 connects it to existing served HTTP/remote-client/CLI/OpenAPI export with incremental exact-version scans using approximate Lance targets, strict 64-KiB chunks, complete queue-envelope reservation, pre-header typed refusal, backpressure, and disconnect-safe body-plus-producer ownership. F6b6 adds the engine-internal checked operational cut with explicit checked `DISABLING` cluster-apply status authority. Within the hard status envelope it reports every sidecar as rebuild-blocking, while an over-bound discovery refuses the whole status; it makes only exact sidecar-owned base-HEAD movement physically unavailable, and reports cold-replay/flushed-LWW accounting plus exact oldest-uncovered age as unavailable; the public manifest-only status is unchanged. Public ingress/enrollment/lifecycle/rebind control, every served row/lifecycle/maintenance/status transport, and unreachable `AuthorityBlock` repair remain inactive. Covered/reconciled token evidence and threshold plus the remaining guardrail matrix stay open; full row/control activation still requires the remaining F6 evidence before F7. |
+| EXP | experimental cluster-only activation of the §4.7 profile: offline capability-bound enablement, lazy enrollment, caller-supplied vectors, terminal per-key dead letter plus correction, irreversible authority retirement for fresh-root rebuild, SEALED maintenance/rebind, starvation-free serial folding, and upsert-only hidden ingress | **Selected 2026-07-27 and amended 2026-07-29 (§4.7); F3a–F3f, hidden F4, F5a/F5b0/F5b, and F6a–F6b7 evidence subsets are implemented.** Current v19/token-schema-v3/recovery-v21 publishes deterministic mixed/all-diverted folds, current `DEAD_LETTERED` authority, exact retry/ordinary successor, stopped/offline inspection, and three-disposition retirement. F6b1 freezes an exact-terminal move-only cut; F6b5 connects it to existing served HTTP/remote-client/CLI/OpenAPI export with incremental exact-version scans using approximate Lance targets, strict 64-KiB chunks, complete queue-envelope reservation, pre-header typed refusal, backpressure, and disconnect-safe body-plus-producer ownership. F6b6 adds the engine-internal checked operational cut with explicit checked `DISABLING` cluster-apply status authority. F6b7 adds a paired failpoints-only exact-selected token-index decision instrument without recovery or production maintenance. Within the hard status envelope it reports every sidecar as rebuild-blocking, while an over-bound discovery refuses the whole status; it makes only exact sidecar-owned base-HEAD movement physically unavailable, and reports cold-replay/flushed-LWW accounting plus exact oldest-uncovered age as unavailable; the public manifest-only status is unchanged. Public ingress/enrollment/lifecycle/rebind control, every served row/lifecycle/maintenance/status transport, and unreachable `AuthorityBlock` repair remain inactive. F6b7's bounded NO-GO applies only to the uncompacted profile-cycle fixture and schedules no standalone production token-index reconciler; remeasurement begins beyond 260 uncovered fragments, after a Lance/index-grammar change, or before considering graph-manifest-compacted or checked-Optimize-coupled maintenance, while the remaining guardrail matrix stays open; full row/control activation still requires the remaining F6 evidence before F7. |
 | C | restart-stable reject-row identity, atomic dead letter, richer status, and evidence-backed configurable bounds | reject crash matrix; reject-retention proof; backpressure and RSS/latency evidence. The §4.7 profile pulls a bounded object-form dead-letter subset forward using the §4.1 token as reject identity |
 | D | automatic operation drain, broader schema/branch/upgrade integration, and orchestrated rematerialization rebind beyond P7's explicit bridge | two-coordinator race, old/new physical-binding crash matrix, and format-transition suite |
 | E | fresh cuts and maintained-index reads; cross-process `Fresh` ships only if the substrate generation-retention guard exists (§9), otherwise same-process only | cut consistency; merged-generation exclusion |

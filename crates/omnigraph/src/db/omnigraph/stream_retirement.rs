@@ -32,12 +32,16 @@ use crate::db::manifest::stream_token::{
     decode_trusted_stream_metadata, stream_authority_retirement_token_witness_digest_v2,
     validate_authority_base_pair,
 };
-#[cfg(feature = "failpoints")]
-use crate::db::manifest::token_store::stage_stream_token_upsert;
 use crate::db::manifest::token_store::{
     LifecycleLedgerRecord, lookup_authority_retirement_receipt_v2,
     scan_current_stream_token_batches, stage_authority_retirement_receipt_v2,
     stream_token_rows_for_keys, stream_token_rows_from_batch,
+};
+#[cfg(feature = "failpoints")]
+use crate::db::manifest::token_store::{
+    prepare_stream_token_lookup_index_reconciliation_for_cost_test,
+    prove_stream_token_lookup_index_reconciliation_for_cost_test,
+    reconcile_stream_token_lookup_index_for_cost_test, stage_stream_token_upsert,
 };
 use crate::db::manifest::{
     AuthorityRetirementReceipt, INTERNAL_MANIFEST_SCHEMA_VERSION, RecoveryAuthorityToken,
@@ -1147,6 +1151,77 @@ impl Omnigraph {
             _tables: tables,
             catalog,
         })
+    }
+
+    /// Build and select one content-identical, fully covered token-index cut
+    /// for the F6b7 cost decision. This is evidence-only, not a production
+    /// reconciler: it has no recovery sidecar and is failpoints-only.
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    pub async fn failpoint_reconcile_stream_token_lookup_index_for_cost_test<Before, After>(
+        &self,
+        before_maintenance: Before,
+        after_maintenance: After,
+    ) -> Result<(u64, u64)>
+    where
+        Before: FnOnce(),
+        After: FnOnce(),
+    {
+        // This evidence seam deliberately owns no recovery grammar. Settle any
+        // prior recovery first, then exclude every stream-token writer for the
+        // complete raw-HEAD effect and exact manifest selection window.
+        self.heal_pending_recovery_sidecars_for_write(&[None])
+            .await?;
+        let _profile = self.write_queue().acquire_stream_profile_shared().await;
+        let _schema = self
+            .write_queue()
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        let _branch = self.write_queue().acquire_branch(None).await;
+        let _token = self.write_queue().acquire_stream_token().await;
+        self.ensure_no_pending_recovery_sidecars_under_gates(
+            &[None],
+            "F6b7 test-only token lookup-index reconciliation",
+        )
+        .await?;
+
+        let mut coordinator = self.open_coordinator_for_branch(None).await?;
+        let selected = coordinator.snapshot().stream_token_authority().clone();
+        let prior_version = selected.current_head_witness.table_version;
+        let dataset =
+            open_stream_token_authority_head(self.root_uri(), &selected, &self.control_session())
+                .await?;
+        let content_proof =
+            prepare_stream_token_lookup_index_reconciliation_for_cost_test(&dataset, &selected)
+                .await?;
+        before_maintenance();
+        let (reconciled, next) =
+            reconcile_stream_token_lookup_index_for_cost_test(dataset, &selected).await?;
+        let next_version = next.current_head_witness.table_version;
+        if next_version <= prior_version {
+            return Err(OmniError::manifest_internal(
+                "F6b7 token-index reconciliation did not advance token authority",
+            ));
+        }
+        let reconciled_authority = next.clone();
+        coordinator
+            .commit_operational_changes_with_expected(
+                &[ManifestChange::SetStreamTokenAuthority {
+                    expected: selected,
+                    next,
+                }],
+                &std::collections::HashMap::new(),
+            )
+            .await?;
+        after_maintenance();
+        prove_stream_token_lookup_index_reconciliation_for_cost_test(
+            &reconciled,
+            &reconciled_authority,
+            &content_proof,
+        )
+        .await?;
+        self.refresh_coordinator_only().await?;
+        Ok((prior_version, next_version))
     }
 
     /// Test-only bridge that creates the exact terminal authority shape whose

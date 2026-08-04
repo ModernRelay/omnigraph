@@ -29,7 +29,9 @@ acceptance slice for SIGTERM/shared shutdown, sequential OS-process recovery,
 frozen-round node/edge fairness, physical rebind → re-enable → reopen → resume,
 combined maintenance, fresh-target import, and legacy writer refusal.
 F6b3 implements the exact-selected uncovered-token-tail cost harness locally
-and as ignored local/configured-RustFS decision sweeps. F6b4 closes the
+and as ignored local/configured-RustFS sweeps. F6b7 preserves that historical
+baseline and adds the paired failpoints-only selected-index decision instrument
+for current-token and profile-receipt lookup work. F6b4 closes the
 isolated production-size dead-letter encoding/materialization and peak-RSS
 evidence without changing format, recovery, or a production route. Its narrow
 stopped/offline Rust payload DTO source shape changes as recorded in §7. F6b5
@@ -49,16 +51,17 @@ recovery participant outcome can explain physical movement as an unavailable
 projection rather than a movement error. Cold-replay and flushed-LWW pending accounting plus
 exact oldest-uncovered-token age remain explicit unavailable values; the public
 `stream_status` stays nonblocking and manifest-only, and CLI/HTTP/OpenAPI/SDK
-transport remains F7. Covered/reconciled evidence, the scheduling threshold,
-and the rest of the guardrail matrix remain later. F6b8 closes the resume-to-
-driver handoff without changing format or recovery: resume transfers its root
-producer permit into detached writer installation, arms an urgent driver turn
-before that transfer can release, and performs an exact empty-owner
-housekeeping prepass before the unchanged node-before-edge round so the sole
-root slot is released promptly. Driver-first, resume-first/caller-cancelled,
-cross-lane reuse, and clean-shutdown cells are green. The broader post-claim
-install/retirement-failure matrix remains in F6; F7 remains forbidden until
-all of F6 passes.
+transport remains F7. F6b7 supplies covered/reconciled decision evidence; its
+configured-RustFS result is a bounded NO-GO only for the uncompacted profile-
+cycle fixture, so no standalone production reconciler is scheduled. F6b8 closes
+the resume-to-driver handoff without changing format or recovery: resume
+transfers its root producer permit into detached writer installation, arms an
+urgent driver turn before that transfer can release, and performs an exact
+empty-owner housekeeping prepass before the unchanged node-before-edge round
+so the sole root slot is released promptly. Driver-first, resume-first/caller-
+cancelled, cross-lane reuse, and clean-shutdown cells are green. The remaining
+guardrail matrix and the broader post-claim install/retirement-failure matrix
+remain in F6; F7 remains forbidden until all of F6 passes.
 **Design authority:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) — this
 file never overrides it. Where they disagree, the RFC wins and this file is
 wrong. §4.7 records the selected experimental profile; §4.3/§4.6 record the
@@ -158,6 +161,7 @@ reachable.
 | Checked exact-terminal served-export authority plus one hidden immutable exact-version export cut | control authority, cluster/server boot, engine private seam | F6b1 |
 | Bounded stream-aware served export with pre-header cut validation and disconnect-safe ownership | engine export, server HTTP body, remote CLI/OpenAPI | F6b5 |
 | Checked read-only operational-status cut with typed movement/deadline refusal | engine stream status, worker/driver/token/recovery projections | F6b6 |
+| Paired exact-selected token-index decision evidence with no production maintenance owner | engine failpoints-only token/status seams and cost harness | F6b7 |
 
 Internal schema is **v19**, token schema is **v3**, profile protocol is **v2**, and lifecycle protocol
 is **v3**. Recovery-v13 remains exactly `StreamProfileChange`: it owns the exact
@@ -282,9 +286,12 @@ uncovered age are unavailable. F6b1 provides
 the checked terminal served-export capability and hidden immutable cut
 described in §7, and F6b5 now routes that cut through the existing
 HTTP/remote-client/CLI/OpenAPI export surface with bounded transport ownership.
-F6b3 owns exact-selected uncovered-tail current-token hit/miss and terminal-page
-measurement; covered/reconciled evidence, public status transport, and
-remaining guardrail acceptance stay in F6b/F7. F6b4 owns the production-size dead-letter
+F6b3 owns historical exact-selected uncovered-tail current-token hit/miss and
+terminal-page measurement. F6b7 owns the paired failpoints-only selected-index
+refresh, receipt-key/current-token comparison, and maintenance-cost evidence;
+its uncompacted-profile-cycle bounded NO-GO schedules no standalone production
+reconciler. Public status transport and remaining guardrail
+acceptance stay in F6b/F7. F6b4 owns the production-size dead-letter
 byte/capacity/timing and isolated peak-RSS acceptance described below.
 
 ---
@@ -315,8 +322,9 @@ byte/capacity/timing and isolated peak-RSS acceptance described below.
 | ~~F6b4 dead-letter envelope evidence~~ | Exact production 8,192-candidate one-under/exact/one-over encoding, cap-aware retained capacity, encode/verify timing, paired isolated peak RSS, and real overflow/no-partial-fold assertions | no format or recovery change | implemented behind failpoints-only cost/test seams; 192-MiB remeasurement tripwire, not admission or an SLO |
 | ~~F6b5 bounded served export~~ | Pre-header stream-aware cut capture; incremental Lance scans with approximate targets, strict 64-KiB chunks, two-chunk queue, complete per-response/process queue-envelope reservation, deadline, backpressure, and disconnect-safe cut ownership on the existing HTTP/remote CLI/OpenAPI export surface | no format or recovery change | implemented; embedded/direct enrolled export remains refused |
 | ~~F6b6 checked operational status~~ | One checked read-only multi-authority cut with physical lane/token/recovery/rebuild evidence, advisory driver projection, and typed `StreamStatusChanged` / `StreamStatusBusy` refusal | no format or recovery change | implemented behind an engine-internal seam; public manifest status unchanged |
+| ~~F6b7 token-index decision evidence~~ | Paired current-token and profile-receipt hit/miss work before/after one content-identical exact-selected index refresh, with maintenance I/O and semantic-equivalence proof | no format or recovery change | bounded NO-GO only for the uncompacted profile-cycle fixture; failpoints-only and no standalone production reconciler |
 | ~~F6b8 resume/driver handoff~~ | Compile-enforced root-producer-permit transfer into detached resume installation, urgent trigger-before-release, exact empty-owner housekeeping before the unchanged node-before-edge round, cancellation-safe shutdown, and cross-lane root-slot reuse | no format or recovery change | implemented behind existing hidden lifecycle/driver seams; broader retirement-failure matrix remains in F6 |
-| **F6b remainder** | Covered/reconciled token curve and threshold plus the remaining guardrail matrix | — | later |
+| **F6b remainder** | Remaining guardrail matrix, including F6b8's post-claim install/retirement-failure cells; token-index evidence reopens at greater depth, after a Lance/index-grammar change, or before considering graph-manifest-compacted / checked-Optimize-coupled maintenance | — | later |
 | **F7** | Remaining served row ingress, lifecycle, maintenance, operational-status transport, and their SDK/HTTP/remote-CLI/OpenAPI parity | — | only after all F6 cells pass; export is already the F6b5 exception |
 
 These are dependency milestones, not mandates for giant PRs. Keep each PR
@@ -685,9 +693,18 @@ writer a sidecar-covered witness/rebind transition.
    fallback. The reconciler is not an F3 correctness prerequisite for EXP.
    F6b3 measures exact current-token hit/miss plus cluster-only terminal-page
    scans across increasing **uncovered** receipt history locally and on
-   RustFS/S3. The F6b remainder still owns the covered/reconciled curve, the
-   recorded activation threshold, and the authority-safe reconciler scheduled
-   only when that threshold is crossed. F6b6's internal checked status reports
+   RustFS/S3. F6b7 adds a paired failpoints-only cut: after excluding token
+   writers and proving raw HEAD equals manifest selection, it permits only the
+   named lookup index's content-identical `CreateIndex` successor, selects that
+   exact witness, and compares current-token plus profile-receipt hit/miss work.
+   The measured maintenance window contains `optimize_indices`, exact transaction
+   classification, and manifest selection; gate/coordinator setup, pre/post
+   content proofs, and final graph refresh sit outside it. The configured-RustFS
+   result is a bounded NO-GO only for the uncompacted profile-cycle fixture, not
+   a universal token-index NO-GO, so no standalone production reconciler is
+   scheduled. Remeasure at greater depth, after a Lance/index-grammar change, or
+   before considering graph-manifest-compacted or checked-Optimize-coupled
+   maintenance. F6b6's internal checked status reports
    exact uncovered counts when Lance exposes coverage and explicitly reports
    oldest age unavailable because the selected cut has no exact fragment-
    creation timestamp; its public transport remains F7. Ordinary graph
@@ -1917,9 +1934,11 @@ fairness matrix, long-history token lookup, RSS/latency/object measurements,
 or maintenance/rebind/resume composition. F6b2 later closes the named process,
 fairness, and maintenance/rebind/resume cells; F6b3 closes the exact-selected
 uncovered-tail current-token instrument. F6b4 separately closes the isolated
-dead-letter envelope evidence and F6b5 closes bounded served export. Covered/
-reconciled token cost and its threshold, public operational-status transport,
-and the remaining guardrails still keep F6 open and F7 forbidden.
+dead-letter envelope evidence and F6b5 closes bounded served export. F6b7 adds
+the paired failpoints-only covered/reconciled decision instrument. Its
+uncompacted-profile-cycle bounded NO-GO schedules no standalone production
+reconciler. Public operational-status transport and the
+remaining guardrails still keep F6 open and F7 forbidden.
 
 ### Implemented F6b1 checked immutable export-cut subset
 
@@ -1960,9 +1979,11 @@ adds no new public HTTP/SDK/remote-CLI/OpenAPI route, response contract, bounded
 channel or queue-byte reservation, wait deadline, stall/disconnect handling,
 measurement, or public status. F6b3 subsequently closed the exact-selected
 uncovered-tail token instrument and F6b5 subsequently closed the bounded
-transport. Public operational-status transport, covered/reconciled cost, and
-the remaining correctness/performance matrix stay in the F6b remainder/F7
-boundaries below.
+transport. F6b7 subsequently added paired failpoints-only covered/reconciled
+decision evidence without a production maintenance path; its uncompacted-
+profile-cycle bounded NO-GO schedules no standalone reconciler. Public
+operational-status transport and the
+remaining correctness/performance matrix stay in the F6b remainder/F7 boundary.
 
 ### Implemented F6b5 bounded served-export subset
 
@@ -2087,8 +2108,9 @@ Productive SchemaApply is deliberately absent: an
 enrolled graph's schema changes only through checked sealed/retired export,
 fresh graph initialization with the desired schema, and ordinary load there.
 Physical rebind preserves accepted schema. F6b5 closes bounded stream-aware
-served export; covered/reconciled token evidence, public operational-status
-transport, and the other
+served export; F6b7 closes the paired failpoints-only token-index decision
+instrument with a bounded NO-GO for the uncompacted profile-cycle fixture.
+Public operational-status transport and the other
 served/public surfaces remain later F6b/F7 work. F6b4 separately closes the
 isolated dead-letter envelope evidence.
 
@@ -2121,10 +2143,42 @@ read-only sample-level probe. Wall time is evidence, not an SLO.
 
 This is deliberately an uncovered-tail instrument. The production token index
 is created at genesis, and no recovery-owned authority-safe reconciler exists.
-Calling raw `optimize_indices` would move an unselected physical HEAD and would
-not prove production behavior. Covered/reconciled curves, count/oldest-age and
-lookup-cost status, the measured scheduling threshold, and the reconciler stay
-open.
+Calling raw `optimize_indices` there would move an unselected physical HEAD and
+would not prove production behavior. At the F6b3 boundary, receipt-key cost and
+the paired covered/reconciled decision remained open; F6b7 closes that evidence
+gap below without adding production maintenance. Count/oldest-age status and any
+recovery-owned maintenance remain separate concerns; F6b7's uncompacted-
+profile-cycle bounded NO-GO below schedules no standalone reconciler.
+
+### Implemented F6b7 selected token-index decision instrument
+
+F6b7 preserves F6b3 as the uncovered-tail baseline and extends the same fixture
+with one paired, failpoints-only after-cut. Before physical maintenance the seam
+settles recovery, excludes every stream-token writer, and proves the raw token
+HEAD is exactly the manifest-selected witness. It accepts only a one-version
+`CreateIndex` successor whose changed index metadata belongs to the named token
+lookup index, whose fragment set/schema/row count are unchanged, and whose
+coverage reaches the complete selected fragment set. Only then does the test
+manifest select that exact witness for the reconciled sample.
+
+The before/after windows compare current-token hit/miss, profile-management-
+receipt hit/miss, and the bounded terminal page while proving identical logical
+token/receipt identities and terminal entries. The measured maintenance window
+contains `optimize_indices`, exact transaction classification, and manifest
+selection. Gate/coordinator setup, the pre/post content proofs, and final graph
+refresh are outside it. The instrument reports both request- and byte-based
+benefit/amortization; latency remains supporting evidence rather than an SLO.
+
+This seam is not production maintenance. It is compiled only for tests and
+`failpoints`, owns no recovery sidecar, and deliberately cannot justify calling
+raw `optimize_indices` from an ordinary runtime. The configured-RustFS sweep is
+a bounded NO-GO only for the uncompacted profile-cycle fixture, not a universal
+token-index NO-GO. No standalone production reconciler is scheduled. Remeasure
+at greater depth, after a Lance/index-grammar change, or before considering
+graph-manifest-compacted or checked-Optimize-coupled maintenance. Exact samples
+and ratios remain in [RFC-026](../rfcs/0026-memwal-streaming-ingest.md); the
+fixture owner remains in the [testing map](testing.md). Ordinary graph
+`optimize` still does not maintain `_stream_tokens.lance`.
 
 ### Implemented F6b4 dead-letter envelope evidence subset
 
@@ -2286,10 +2340,13 @@ public ingress activates; `AuthorityBlock` repair remains separate.
   fresh-handle hit/miss and first page plus warm hit/miss and repeat pages report
   token-read counts, total table-store read bytes, manifest reads/bytes, adapter
   operations, and per-sample warm/repeat elapsed p50 plus max-of-eight while forbidding payload-object
-  reads. It does not measure receipt-key lookup. The covered/reconciled curve,
-  degraded-work status, and measured threshold that schedules an authority-
-  safe reconciler remain open. No reconciler is required for logical EXP
-  activation, and ordinary graph
+  reads. It deliberately does not measure receipt-key lookup or synthesize a
+  covered HEAD. F6b7 preserves that baseline and adds the paired failpoints-only
+  receipt-key/current-token covered comparison plus exact maintenance-cost
+  accounting. Its uncompacted-profile-cycle bounded NO-GO changes no production
+  state machine and schedules no standalone authority-safe reconciler. Degraded-
+  work status remains separate.
+  No reconciler is required for logical EXP activation, and ordinary graph
   `optimize` is not credited with token-ledger convergence.
 - A sustained mixed-backlog cell continuously makes node work ready while an
   edge is already in the frozen scheduling round and proves that the edge gets
@@ -2631,8 +2688,10 @@ progress owner while it remains hidden; F5b0 closes goal-`SEALED` resident
 continuation and the offline disable loop without a format change; F5b adds
 the terminal disposition. F6a proves the first in-process composition and
 advisory driver diagnostics; F6b1–F6b5 close export/process/cost ownership and
-F6b6 adds the checked read-only operational cut. The F6b remainder closes the
-covered/reconciled threshold and remaining guardrails. F7 alone activates the
+F6b6 adds the checked read-only operational cut. F6b7 adds the failpoints-only
+paired token-index decision instrument and records a bounded NO-GO for the
+uncompacted profile-cycle fixture, so the F6b remainder owns only the remaining
+guardrails. F7 alone activates the
 remaining row/control/status surfaces.
 
 This ordering makes every intermediate merge safe:
@@ -2649,6 +2708,9 @@ This ordering makes every intermediate merge safe:
 - after F6b6, the checked owner can obtain one coherent read-only operational
   cut internally, while the public method remains manifest-only and no status
   transport exists;
+- after F6b7, tests can compare one exact selected uncovered cut with its
+  content-identical reconciled successor, but no production maintenance owner or
+  recovery protocol exists; the fixture-scoped bounded NO-GO schedules neither;
 - after F6, all gates are proved but no compatibility surface is committed;
 - F7 exposes the served SDK, HTTP, remote CLI, and OpenAPI together while
   direct mutation remains a typed refusal.
@@ -2663,7 +2725,7 @@ lands a production writer or claims an SLO before F6.
 | Decision | Selected shape |
 |---|---|
 | Effectful claims | Every effect is classified into one immutable attempt-ledger row before another Lance call; the terminal `ClaimReceipt` commits the chain and there is no arbitrary attempt cap or receipt-free `SEALED` route |
-| Receipt authority | Tagged immutable rows live in manifest-selected `_stream_tokens.lance`; hot profile/lifecycle rows retain bounded current pointers/count/chain commitments. Exact lookup remains recovery/idempotency authority, but EXP exposes no public receipt-history pagination. Uncovered-fragment fallback is correct and observable; a measured threshold, not F3, schedules reconciliation |
+| Receipt authority | Tagged immutable rows live in manifest-selected `_stream_tokens.lance`; hot profile/lifecycle rows retain bounded current pointers/count/chain commitments. Exact lookup remains recovery/idempotency authority, but EXP exposes no public receipt-history pagination. Uncovered-fragment fallback is correct and observable. F6b7's paired failpoints-only selected-index cut records a bounded NO-GO only for the uncompacted profile-cycle fixture, schedules no standalone production reconciler, and reopens at greater depth, after a Lance/index-grammar change, or before considering graph-manifest-compacted or checked-Optimize-coupled maintenance |
 | Quiesce ownership | One exclusive admission lease; folds consume injected checked authority |
 | Empty lane | Dedicated fence/tail/empty-proof path with an incremental authenticated WAL-segment cursor/chain; never scan from genesis or invent/seal an empty generation |
 | Lifecycle format | Internal v12/lifecycle-v3 + recovery-v14 activates hidden enrollment, claim, ordinary/drain fold, and terminal lifecycle receipt with fixed-size ledger-chain/current authority. Dormant v14 scaffold meanings are immutable: F3 uses them only if exact, otherwise takes a new pre-release strand. F5a and F5b0 change no format; F5b requires a new terminal-authority/object strand. The release gate records the final strand count |
