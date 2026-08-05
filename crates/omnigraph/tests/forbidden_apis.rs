@@ -209,6 +209,10 @@ const STREAM_LIFECYCLE_V14: WriteProtocol =
     WriteProtocol::Exact("private firehose lifecycle recovery v14");
 const STREAM_LIFECYCLE_V14_V15: WriteProtocol =
     WriteProtocol::Composed("private firehose lifecycle recovery v14 + resume recovery v15");
+const STREAM_SEALED_ENSURE_INDICES_V16: WriteProtocol =
+    WriteProtocol::Exact("sealed EnsureIndices recovery v16");
+const STREAM_SEALED_OPTIMIZE_V17: WriteProtocol =
+    WriteProtocol::Bounded("sealed Optimize recovery v17");
 const STREAM_REBIND_V18: WriteProtocol =
     WriteProtocol::Exact("private physical rebind recovery v18");
 const STREAM_RETIREMENT_V19: WriteProtocol =
@@ -226,6 +230,9 @@ const STREAM_LIFECYCLE_V14_V15_V18: WriteProtocol =
     WriteProtocol::Composed("private firehose lifecycle recovery v14 + resume v15 + rebind v18");
 const STREAM_FOLD_DRIVER_V14: WriteProtocol =
     WriteProtocol::Composed("hidden resident stream fold driver + recovery v14");
+const SERVED_GRAPH_STREAM_INGEST_V14_V21: WriteProtocol = WriteProtocol::Composed(
+    "served graph ingress over enrollment/fold recovery v14 + dead-letter recovery v21",
+);
 /// RFC-026 checked profile authority: ENABLED/DISABLED terminal transitions
 /// pair one immutable token-ledger receipt with one profile/lineage publish
 /// under recovery-v13. Disable additionally persists the admission-cutoff
@@ -285,15 +292,19 @@ write_surfaces! {
         "failpoint_withdraw_stream_token_for_retirement_test",
     ],
     "db/omnigraph/stream_correction.rs" => STREAM_CORRECTION_V20 => [
-        "correct_stream_data_block",
+        "correct_graph_stream_data_block",
     ],
     "db/omnigraph/stream_correction.rs" => WriteProtocol::TestOnly => [
         "failpoint_correct_stream_data_block_for_test",
         "failpoint_show_stream_data_block_for_test",
     ],
     "db/omnigraph/stream_ndjson.rs" => WriteProtocol::TestOnly => [
+        "failpoint_stream_ingest_graph_ndjson_as_for_test",
         "failpoint_stream_ingest_ndjson_as_for_test",
         "failpoint_stream_ingest_ndjson_cancel_for_test",
+    ],
+    "db/omnigraph/stream_ndjson.rs" => SERVED_GRAPH_STREAM_INGEST_V14_V21 => [
+        "start_served_graph_stream_ingest_as",
     ],
     "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],
     "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],
@@ -302,6 +313,15 @@ write_surfaces! {
     "db/omnigraph/stream_driver.rs" => STREAM_FOLD_DRIVER_V14 => [
         "start_stream_fold_driver",
         "shutdown_stream_fold_driver",
+    ],
+    "db/omnigraph/stream_management.rs" => STREAM_LIFECYCLE_V14_V15 => [
+        "resume_served_graph_stream_as",
+    ],
+    "db/omnigraph/stream_management.rs" => STREAM_SEALED_ENSURE_INDICES_V16 => [
+        "ensure_served_graph_stream_indices_as",
+    ],
+    "db/omnigraph/stream_management.rs" => STREAM_SEALED_OPTIMIZE_V17 => [
+        "optimize_served_graph_stream_as",
     ],
     "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup"],
     "db/omnigraph.rs" => WriteProtocol::NativeRefControl => ["branch_create", "branch_create_as", "branch_create_from", "branch_create_from_as", "branch_delete", "branch_delete_as"],
@@ -378,6 +398,14 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph/stream_status.rs", "stream_status"),
     (
         "db/omnigraph/stream_status.rs",
+        "capture_served_graph_stream_status",
+    ),
+    (
+        "db/omnigraph/stream_correction.rs",
+        "show_graph_stream_data_block",
+    ),
+    (
+        "db/omnigraph/stream_status.rs",
         "failpoint_stream_operational_status_for_test",
     ),
     (
@@ -415,10 +443,6 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     (
         "db/omnigraph/stream_retirement.rs",
         "export_stream_dead_letter_payloads",
-    ),
-    (
-        "db/omnigraph/stream_correction.rs",
-        "show_stream_data_block",
     ),
     ("exec/query.rs", "query"),
     ("exec/query.rs", "run_query_at"),
@@ -2388,6 +2412,254 @@ fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
         !contents.contains("impl Clone for StreamExportCut"),
         "StreamExportCut must remain non-cloneable"
     );
+}
+
+#[test]
+fn served_graph_stream_status_bridge_has_only_graph_logical_fields() {
+    let path = engine_src_root().join("db/omnigraph/stream_status.rs");
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let ast = parse_rust_source(&contents, "db/omnigraph/stream_status.rs");
+    let expected_types = BTreeSet::from([
+        "GraphStreamDeclaration".to_string(),
+        "GraphStreamDeclarationStatus".to_string(),
+        "GraphStreamDrainStatus".to_string(),
+        "GraphStreamDriverErrorStatus".to_string(),
+        "GraphStreamDriverStatus".to_string(),
+        "GraphStreamLastFoldStatus".to_string(),
+        "GraphStreamOperationalStatus".to_string(),
+        "GraphStreamPendingStatus".to_string(),
+        "GraphStreamRebuildBlocker".to_string(),
+        "GraphStreamRebuildStatus".to_string(),
+        "GraphStreamStrictBlockStatus".to_string(),
+        "GraphStreamTokenCounts".to_string(),
+    ]);
+    let allowed_fields = BTreeSet::from([
+        "arrow_bytes",
+        "authoritative",
+        "batches",
+        "blockers",
+        "cold_replay",
+        "count",
+        "dead_lettered",
+        "dead_lettered_count",
+        "declaration",
+        "drain",
+        "driver",
+        "enrolled_declarations",
+        "flushed",
+        "goal",
+        "initiated_at",
+        "input_bytes",
+        "input_rows",
+        "kind",
+        "last_completion_kind",
+        "last_error",
+        "last_fold",
+        "lifecycle",
+        "lifecycle_revision",
+        "manifest_version",
+        "outcome",
+        "pending",
+        "pending_count",
+        "phase",
+        "present",
+        "profile_mode",
+        "profile_revision",
+        "published_open_folds",
+        "ready",
+        "recorded_at",
+        "rebuild",
+        "recovery",
+        "recovery_pending_count",
+        "retry_in_ms",
+        "rows",
+        "scope",
+        "state",
+        "strict_block",
+        "token_counts",
+        "type_name",
+        "violation_code",
+        "visible_bytes",
+        "visible_rows",
+        "withdrawn",
+        "withdrawn_count",
+    ]);
+    let mut seen_types = BTreeSet::new();
+    let mut bridge_count = 0;
+
+    let check_fields = |type_name: &str, fields: &syn::Fields| {
+        for field in fields {
+            let Some(name) = field.ident.as_ref().map(ToString::to_string) else {
+                continue;
+            };
+            assert!(
+                allowed_fields.contains(name.as_str()),
+                "served graph status type {type_name} exposes unreviewed field '{name}'"
+            );
+        }
+    };
+
+    for item in &ast.items {
+        match item {
+            Item::Struct(item) if item.ident.to_string().starts_with("GraphStream") => {
+                let name = item.ident.to_string();
+                seen_types.insert(name.clone());
+                assert!(matches!(item.vis, Visibility::Public(_)));
+                assert!(has_doc_hidden(&item.attrs));
+                check_fields(&name, &item.fields);
+            }
+            Item::Enum(item) if item.ident.to_string().starts_with("GraphStream") => {
+                let name = item.ident.to_string();
+                seen_types.insert(name.clone());
+                assert!(matches!(item.vis, Visibility::Public(_)));
+                assert!(has_doc_hidden(&item.attrs));
+                for variant in &item.variants {
+                    check_fields(&name, &variant.fields);
+                }
+            }
+            Item::Impl(item) if item.trait_.is_none() && is_omnigraph_type(&item.self_ty) => {
+                for member in &item.items {
+                    let syn::ImplItem::Fn(function) = member else {
+                        continue;
+                    };
+                    if function.sig.ident != "capture_served_graph_stream_status" {
+                        continue;
+                    }
+                    bridge_count += 1;
+                    assert!(matches!(function.vis, Visibility::Public(_)));
+                    assert!(function.sig.asyncness.is_some());
+                    assert!(has_doc_hidden(&function.attrs));
+                    assert!(return_type_contains_identifier(
+                        &function.sig.output,
+                        "GraphStreamOperationalStatus"
+                    ));
+                    assert!(!return_type_contains_identifier(
+                        &function.sig.output,
+                        "StreamOperationalStatus"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        seen_types, expected_types,
+        "graph status type registry drifted"
+    );
+    assert_eq!(
+        bridge_count, 1,
+        "there must be exactly one checked served graph status bridge"
+    );
+}
+
+#[test]
+fn served_graph_stream_controls_are_graph_only_and_redacted() {
+    let relative = "db/omnigraph/stream_management.rs";
+    let path = engine_src_root().join(relative);
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let ast = parse_rust_source(&contents, relative);
+    let expected_fields = BTreeMap::from([
+        (
+            "GraphStreamEnsureIndicesResult".to_string(),
+            BTreeSet::from(["changed".to_string(), "pending_index_count".to_string()]),
+        ),
+        (
+            "GraphStreamOptimizeResult".to_string(),
+            BTreeSet::from([
+                "changed".to_string(),
+                "pending_index_count".to_string(),
+                "requires_repair".to_string(),
+            ]),
+        ),
+        (
+            "GraphStreamResumeResult".to_string(),
+            BTreeSet::from([
+                "already_open_declarations".to_string(),
+                "enrolled_declarations".to_string(),
+                "profile_revision".to_string(),
+                "resumed_declarations".to_string(),
+            ]),
+        ),
+    ]);
+    let expected_methods = BTreeSet::from([
+        "ensure_served_graph_stream_indices_as".to_string(),
+        "optimize_served_graph_stream_as".to_string(),
+        "resume_served_graph_stream_as".to_string(),
+    ]);
+    let mut seen_fields = BTreeMap::new();
+    let mut seen_methods = BTreeSet::new();
+
+    for item in &ast.items {
+        match item {
+            Item::Struct(item) if item.ident.to_string().starts_with("GraphStream") => {
+                assert!(matches!(item.vis, Visibility::Public(_)));
+                assert!(has_doc_hidden(&item.attrs));
+                let fields = item
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        assert!(
+                            matches!(field.vis, Visibility::Public(_)),
+                            "transport must project the graph aggregate without private engine state"
+                        );
+                        assert!(
+                            ![
+                                "PendingIndex",
+                                "TableIdentity",
+                                "TableOptimizeStats",
+                                "String",
+                            ]
+                            .iter()
+                            .any(|forbidden| type_contains_identifier(&field.ty, forbidden)),
+                            "graph stream result {} exposes selector or physical detail",
+                            item.ident
+                        );
+                        field.ident.as_ref().unwrap().to_string()
+                    })
+                    .collect::<BTreeSet<_>>();
+                seen_fields.insert(item.ident.to_string(), fields);
+            }
+            Item::Impl(item) if item.trait_.is_none() && is_omnigraph_type(&item.self_ty) => {
+                for member in &item.items {
+                    let syn::ImplItem::Fn(function) = member else {
+                        continue;
+                    };
+                    if !matches!(function.vis, Visibility::Public(_)) {
+                        continue;
+                    }
+                    assert!(function.sig.asyncness.is_some());
+                    assert!(has_doc_hidden(&function.attrs));
+                    assert_eq!(
+                        function.sig.inputs.len(),
+                        2,
+                        "served graph controls may accept only self plus graph actor authority"
+                    );
+                    let Some(syn::FnArg::Typed(actor)) = function.sig.inputs.iter().nth(1) else {
+                        panic!("served graph control must accept actor_id after self");
+                    };
+                    let syn::Pat::Ident(actor_name) = actor.pat.as_ref() else {
+                        panic!("served graph control actor must be a simple binding");
+                    };
+                    assert_eq!(actor_name.ident, "actor_id");
+                    assert!(type_contains_identifier(&actor.ty, "str"));
+                    seen_methods.insert(function.sig.ident.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(seen_fields, expected_fields);
+    assert_eq!(seen_methods, expected_methods);
+    for forbidden in ["table_key", "stable_table_id", "table_incarnation_id"] {
+        assert!(
+            !contents.contains(&format!("pub {forbidden}:")),
+            "served graph stream control must not expose '{forbidden}'"
+        );
+    }
 }
 
 #[test]

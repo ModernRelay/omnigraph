@@ -4493,7 +4493,6 @@ query seed($name: String, $age: I32) {
         let shown = show_stream_data_block_config_dir(
             dir.path(),
             "knowledge",
-            "node:Person",
             block_token,
             None,
             StreamBlockControlOptions {
@@ -4562,6 +4561,59 @@ node Person {
         assert!(
             !live_after_schema_attempt.schema_source().contains("nickname"),
             "schema movement must wait until the disable continuation reaches DISABLED"
+        );
+
+        let shown_page = shown.page.expect("the graph-level block page is present");
+        let correction = omnigraph::db::StreamDataCorrectionRequest {
+            protocol_version: 1,
+            block_token: shown_page.block_token.clone(),
+            correction_id: "abababab-abab-4bab-8bab-abababababab".to_string(),
+            expected_lifecycle_revision: shown_page.lifecycle_revision,
+            actions: shown_page
+                .entries
+                .iter()
+                .map(|entry| omnigraph::db::StreamDataCorrectionAction::Withdraw {
+                    ordinal: entry.ordinal,
+                    logical_key: entry.logical_key.clone(),
+                    current_blocked_winner_stream_token: entry
+                        .current_blocked_winner_stream_token
+                        .clone(),
+                })
+                .collect(),
+            expected_plan_digest: None,
+        };
+        let options = StreamBlockControlOptions {
+            actor: Some("stream-operator".to_string()),
+            confirm_stream_offline: true,
+        };
+        let corrected = correct_stream_data_block_config_dir(
+            dir.path(),
+            "knowledge",
+            correction.clone(),
+            options.clone(),
+        )
+        .await;
+        assert!(corrected.ok, "{corrected:?}");
+        assert!(corrected.result.as_ref().is_some_and(|result| result.changed));
+
+        // The exact retry has no current block or caller-supplied table alias
+        // to resolve. It must discover the receipt across enrolled immutable
+        // identities before inspecting current lifecycle authority.
+        let replayed = correct_stream_data_block_config_dir(
+            dir.path(),
+            "knowledge",
+            correction,
+            options,
+        )
+        .await;
+        assert!(replayed.ok, "{replayed:?}");
+        assert!(replayed
+            .result
+            .as_ref()
+            .is_some_and(|result| !result.changed));
+        assert_eq!(
+            corrected.result.as_ref().map(|result| &result.plan_digest),
+            replayed.result.as_ref().map(|result| &result.plan_digest)
         );
     }
 
@@ -5407,7 +5459,6 @@ policies: {}
         let missing_authority = show_stream_data_block_config_dir(
             dir.path(),
             "knowledge",
-            "node:Person",
             "block-1",
             None,
             StreamBlockControlOptions::default(),
@@ -5429,7 +5480,6 @@ policies: {}
         let unknown_graph = show_stream_data_block_config_dir(
             dir.path(),
             "other",
-            "node:Person",
             "block-1",
             None,
             StreamBlockControlOptions {
@@ -5454,7 +5504,6 @@ policies: {}
         let unapplied_profile = show_stream_data_block_config_dir(
             dir.path(),
             "knowledge",
-            "node:Person",
             "block-1",
             None,
             StreamBlockControlOptions {
@@ -5551,7 +5600,7 @@ policies: {}
             diagnostic.code == "stream_dead_letter_list_failed"
                 && diagnostic
                     .message
-                    .contains("offline stream dead-letter control expected profile revision")
+                    .contains("offline graph streaming authority is unavailable or changed")
         }));
         let stale_export = export_stream_dead_letters_config_dir(
             dir.path(),
@@ -5565,7 +5614,7 @@ policies: {}
             diagnostic.code == "stream_dead_letter_export_failed"
                 && diagnostic
                     .message
-                    .contains("offline stream dead-letter control expected profile revision")
+                    .contains("offline graph streaming authority is unavailable or changed")
         }));
     }
 
@@ -5682,7 +5731,6 @@ query arm_recovery($name: String, $age: I32) {
         let refused = correct_stream_data_block_config_dir(
             dir.path(),
             "knowledge",
-            "node:Person",
             request.clone(),
             StreamBlockControlOptions {
                 actor: Some("stream-operator".to_string()),
@@ -5710,7 +5758,6 @@ query arm_recovery($name: String, $age: I32) {
         let malformed = correct_stream_data_block_config_dir(
             dir.path(),
             "knowledge",
-            "node:Person",
             request,
             StreamBlockControlOptions {
                 actor: Some("stream-operator".to_string()),
@@ -5721,7 +5768,7 @@ query arm_recovery($name: String, $age: I32) {
         assert!(!malformed.ok, "{malformed:?}");
         assert!(malformed.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "stream_block_correct_failed"
-                && diagnostic.message.contains("stream correction actions")
+                && diagnostic.message.contains("request is invalid")
         }));
         assert_eq!(
             graph_tree(&graph_root),

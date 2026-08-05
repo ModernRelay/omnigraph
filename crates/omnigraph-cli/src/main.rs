@@ -9,7 +9,9 @@ use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
     ChangeOutput, CommitOutput, ErrorOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
-    SnapshotTableOutput,
+    SnapshotTableOutput, StreamDriverStateOutput, StreamEnsureIndicesOutput,
+    StreamIngestKindOutput, StreamLifecycleOutput, StreamOptimizeOutput, StreamPendingStatusOutput,
+    StreamProfileModeOutput, StreamRebuildBlockerOutput, StreamResumeOutput, StreamStatusOutput,
 };
 use omnigraph_cluster::{
     ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput,
@@ -729,6 +731,86 @@ async fn main() -> Result<()> {
                 .export(&branch, &type_names, &table_keys, &mut stdout)
                 .await?;
         }
+        Command::Stream { command } => match command {
+            StreamCommand::Ingest { data, graph_token } => {
+                let client = client::GraphClient::resolve_stream_ingest(
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                echo_write_target(cli.quiet, "stream ingest", client.uri(), true);
+                let stdout = io::stdout();
+                let mut stdout = stdout.lock();
+                client
+                    .stream_ingest(&data, graph_token.as_deref(), &mut stdout)
+                    .await?;
+            }
+            StreamCommand::Status { json } => {
+                let client = client::GraphClient::resolve_stream_status(
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let output = client.stream_operational_status().await?;
+                finish_stream_status(&output, json)?;
+            }
+            StreamCommand::Resume { json } => {
+                let client = client::GraphClient::resolve_stream_control(
+                    "stream resume",
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                echo_write_target(cli.quiet, "stream resume", client.uri(), true);
+                let output = client.stream_resume().await?;
+                finish_stream_resume(&output, json)?;
+            }
+            StreamCommand::Maintenance { command } => match command {
+                StreamMaintenanceCommand::EnsureIndices { json } => {
+                    let client = client::GraphClient::resolve_stream_control(
+                        "stream maintenance ensure-indices",
+                        cli.server.as_deref(),
+                        cli.graph.as_deref(),
+                        cli.profile.as_deref(),
+                        cli.store.as_deref(),
+                    )
+                    .await?;
+                    echo_write_target(
+                        cli.quiet,
+                        "stream maintenance ensure-indices",
+                        client.uri(),
+                        true,
+                    );
+                    let output = client.stream_ensure_indices().await?;
+                    finish_stream_ensure_indices(&output, json)?;
+                }
+                StreamMaintenanceCommand::Optimize { json } => {
+                    let client = client::GraphClient::resolve_stream_control(
+                        "stream maintenance optimize",
+                        cli.server.as_deref(),
+                        cli.graph.as_deref(),
+                        cli.profile.as_deref(),
+                        cli.store.as_deref(),
+                    )
+                    .await?;
+                    echo_write_target(
+                        cli.quiet,
+                        "stream maintenance optimize",
+                        client.uri(),
+                        true,
+                    );
+                    let output = client.stream_optimize().await?;
+                    finish_stream_optimize(&output, json)?;
+                }
+            },
+        },
         Command::Query {
             name,
             query,
@@ -1201,7 +1283,6 @@ async fn main() -> Result<()> {
                     let actor = resolve_cluster_actor(cli.as_actor.as_deref())?;
                     match command {
                         StreamBlockCommand::Show {
-                            table_key,
                             config,
                             block_token,
                             cursor,
@@ -1211,7 +1292,6 @@ async fn main() -> Result<()> {
                             let output = show_stream_data_block_config_dir(
                                 config,
                                 graph_id,
-                                table_key,
                                 block_token,
                                 cursor.as_deref(),
                                 StreamBlockControlOptions {
@@ -1223,7 +1303,6 @@ async fn main() -> Result<()> {
                             finish_stream_block_show(&output, json)?;
                         }
                         StreamBlockCommand::Correct {
-                            table_key,
                             config,
                             block_token,
                             correction_id,
@@ -1260,7 +1339,6 @@ async fn main() -> Result<()> {
                             let output = correct_stream_data_block_config_dir(
                                 config,
                                 graph_id,
-                                table_key,
                                 request,
                                 StreamBlockControlOptions {
                                     actor,

@@ -225,17 +225,24 @@ recovery and does not reinterpret recovery-v14's frozen
 `StreamTokenLedgerIndexMaintenance` placeholder. Any later production
 reconciler therefore needs its own exact recovery grammar/strand.
 
+F7a also changes no storage, recovery, or persisted wire version. Its strong
+graph-ingest token is derived from existing graph identity, accepted schema,
+profile revision, and fold delegation; it is an HTTP authority precondition,
+not persisted state. The graph route reuses recovery-v14 lazy enrollment and
+recovery-v21 terminal outcomes without reinterpreting either grammar.
+
 Recovery-v13 remains exactly the v11 profile-change protocol. Historical
 recovery-v10 enrollment and recovery-v12 lifecycle-v2 folds retain their old
 wire meanings and are refused under lifecycle-v3 rather than synthesized.
-There is still no public firehose ingress, public production enrollment,
-quiesce, resume/abort, physical rebind, or streaming or maintenance
-transport surface. The narrow offline operator surfaces are
+F7a activates graph-native served firehose ingress plus remote CLI/OpenAPI
+parity. It exposes no table/lane selector or physical evidence. Public lane
+enrollment, quiesce, resume/abort, physical rebind, operational status, and
+maintenance transport remain inactive. The narrow offline operator surfaces are
 `cluster stream retire-for-rebuild plan|confirm` and exact `DataBlock`
 inspection/correction through `cluster stream block show|correct`, plus
 manifest-selected current dead-letter inspection through
 `cluster stream dead-letter list|export`. Their recovery owners remain
-crate-private; none activates public row ingress or ordinary lifecycle control.
+crate-private; none widens the graph row route or activates ordinary lifecycle control.
 F6b3 closes the exact-selected uncovered-tail current-token hit/miss and
 terminal-page instrument; F6b7 closes the paired uncovered/reconciled
 current-token and receipt-key decision evidence. F6b4 already closes isolated

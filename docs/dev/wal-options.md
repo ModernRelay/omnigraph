@@ -54,7 +54,9 @@ Option 4 remains useful precedent for the acknowledgement boundary; OmniGraph's
 selected profile keeps stronger fencing, recovery, sequencing, and terminal-
 disposition requirements than the surveyed LanceDB path.
 
-No option in this document authorizes public streaming today.
+This options analysis selected the substrate and acknowledgement boundary; F7a
+later authorizes the narrow graph-native served row path. It does not authorize
+public lane controls, embedded/direct SDK ingest, or overlapping-process writers.
 
 ## The contracts that must not be conflated
 

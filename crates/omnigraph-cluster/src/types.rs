@@ -326,8 +326,45 @@ pub struct StreamBlockShowOutput {
     pub actor: Option<String>,
     pub state_observations: StateObservations,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub page: Option<omnigraph::db::StreamDataBlockPage>,
+    pub page: Option<StreamBlockPageOutput>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Graph-scoped projection of one correction-view entry. Physical table
+/// identity remains an engine implementation detail.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamBlockEntryOutput {
+    pub ordinal: u64,
+    pub logical_key: String,
+    pub current_blocked_winner_stream_token: String,
+    pub violation_code: String,
+    pub field_path_or_group: Vec<String>,
+    pub violation_instance_id: String,
+    pub allowed_actions: Vec<String>,
+}
+
+/// Accepted-schema identity for one logical graph declaration. This is the
+/// user-visible node/edge type, not a Lance dataset or manifest table key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamLogicalDeclarationOutput {
+    pub kind: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+}
+
+/// Bounded graph-level correction page selected only by an opaque block token.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamBlockPageOutput {
+    #[serde(flatten)]
+    pub declaration: StreamLogicalDeclarationOutput,
+    pub block_token: String,
+    pub lifecycle_revision: u64,
+    pub correction_view_digest: String,
+    pub entries: Vec<StreamBlockEntryOutput>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -363,7 +400,7 @@ pub struct StreamDeadLetterListOutput {
     pub actor: Option<String>,
     pub state_observations: StateObservations,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub page: Option<omnigraph::db::StreamDeadLetterPage>,
+    pub page: Option<StreamDeadLetterPageOutput>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -378,8 +415,57 @@ pub struct StreamDeadLetterExportOutput {
     pub actor: Option<String>,
     pub state_observations: StateObservations,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub page: Option<omnigraph::db::StreamDeadLetterPayloadPage>,
+    pub page: Option<StreamDeadLetterPayloadPageOutput>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Graph-level terminal authority. Dataset coordinates, recovery ownership,
+/// and immutable object descriptors are deliberately absent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDeadLetterEntryOutput {
+    #[serde(flatten)]
+    pub declaration: StreamLogicalDeclarationOutput,
+    pub logical_id: String,
+    pub occurrence_token: String,
+    pub predecessor_token: Option<String>,
+    pub write_id: String,
+    pub contributor_id: String,
+    pub payload_digest: String,
+    pub reason_code: String,
+    pub candidate_ordinal: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDeadLetterPageOutput {
+    pub source_manifest_version: u64,
+    pub source_profile_revision: u64,
+    pub entries: Vec<StreamDeadLetterEntryOutput>,
+    pub next_cursor: Option<String>,
+}
+
+/// Descriptor-verified payload paired with its graph-level authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDeadLetterPayloadEntryOutput {
+    pub authority: StreamDeadLetterEntryOutput,
+    pub payload: Box<serde_json::value::RawValue>,
+}
+
+impl PartialEq for StreamDeadLetterPayloadEntryOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.authority == other.authority && self.payload.get() == other.payload.get()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDeadLetterPayloadPageOutput {
+    pub source_manifest_version: u64,
+    pub source_profile_revision: u64,
+    pub entries: Vec<StreamDeadLetterPayloadEntryOutput>,
+    pub next_cursor: Option<String>,
 }
 
 /// Output of config-only `cluster apply`. "Applied" means recorded in the

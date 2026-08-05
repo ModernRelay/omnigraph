@@ -14,7 +14,9 @@ use color_eyre::eyre::bail;
 
 use crate::cli::{
     Cli, ClusterCommand, ClusterStreamCommand, Command, GraphsCommand, QueriesCommand,
-    SchemaCommand, StreamBlockCommand, StreamDeadLetterCommand, StreamRetireForRebuildCommand,
+    SchemaCommand, StreamBlockCommand, StreamCommand, StreamDeadLetterCommand,
+    StreamMaintenanceCommand,
+    StreamRetireForRebuildCommand,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,18 +149,19 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
     let cluster_ok = accepts_cluster_addressing(cmd);
     let graph_ok = accepts_graph_selector(cmd);
     match flag {
-        // Served-graph addressing; `served` is the registry scope (the bare
-        // server), which still needs a server to talk to.
+        // Served addressing always needs a server. `graphs list` uses the bare
+        // registry scope; the `stream` family selects one graph on that server.
         ScopeFlag::Server => matches!(capability, Any | Served),
         ScopeFlag::Cluster => cluster_ok,
-        // The one graph selector across scopes: a served graph (`any`), or a
-        // cluster graph on the verbs that take cluster addressing. `served`
-        // rejects it — `graphs list` IS the enumeration, and a selected graph
-        // would corrupt the registry URL.
+        // The one graph selector across scopes: a served graph (`any` or the
+        // served-only `stream` family), or a cluster graph on verbs that take
+        // cluster addressing. The other served-only command, `graphs list`,
+        // rejects it because that command IS the registry enumeration.
         ScopeFlag::Graph => match capability {
             Any => true,
             Direct | Control => graph_ok,
-            Served | Local => false,
+            Served => graph_ok,
+            Local => false,
         },
         // `direct` refines per command: the maintenance verbs (optimize/
         // repair/cleanup/schema plan/lint) resolve their target through
@@ -207,12 +210,13 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
 }
 
 /// The capability a subcommand needs, derived from its `Plane` (the exhaustive
-/// classifier) plus the one Data→Served refinement: `graphs` is remote-only.
+/// classifier) plus the Data→Served refinements: graph-scoped `stream`
+/// commands and registry-scoped `graphs` are remote-only.
 ///
 /// This reflects *current enforced behavior*, so messages stay truthful:
 /// `queries`/`policy` read a cluster's applied state (`Control`).
 pub(crate) fn command_capability(cmd: &Command) -> Capability {
-    if let Command::Graphs { .. } = cmd {
+    if matches!(cmd, Command::Graphs { .. } | Command::Stream { .. }) {
         return Capability::Served;
     }
     match command_plane(cmd) {
@@ -237,7 +241,8 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Snapshot { .. }
         | Command::Export { .. }
         | Command::Commit { .. }
-        | Command::Graphs { .. } => Plane::Data,
+        | Command::Graphs { .. }
+        | Command::Stream { .. } => Plane::Data,
         Command::Schema {
             command: SchemaCommand::Show { .. } | SchemaCommand::Apply { .. },
         } => Plane::Data,
@@ -339,6 +344,17 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Graphs { command } => match command {
             GraphsCommand::List { .. } => "graphs list",
         },
+        Command::Stream { command } => match command {
+            StreamCommand::Ingest { .. } => "stream ingest",
+            StreamCommand::Status { .. } => "stream status",
+            StreamCommand::Resume { .. } => "stream resume",
+            StreamCommand::Maintenance { command } => match command {
+                StreamMaintenanceCommand::EnsureIndices { .. } => {
+                    "stream maintenance ensure-indices"
+                }
+                StreamMaintenanceCommand::Optimize { .. } => "stream maintenance optimize",
+            },
+        },
     }
 }
 
@@ -374,9 +390,10 @@ fn accepts_graph_selector(cmd: &Command) -> bool {
     accepts_cluster_addressing(cmd)
         || matches!(
             cmd,
-            Command::Cluster {
-                command: ClusterCommand::Stream { .. },
-            }
+            Command::Stream { .. }
+                | Command::Cluster {
+                    command: ClusterCommand::Stream { .. },
+                }
         )
 }
 
@@ -470,9 +487,9 @@ mod tests {
         // The full flag × capability contract in one place. Rows cover every
         // capability, both cluster_ok refinements of `direct` (optimize vs
         // init) and of `control` (queries vs cluster), plus the graph-only
-        // stream-control selectors. `served` is the registry scope: server
-        // addressing only — --graph/--store/--as are rejected (--graph used
-        // to corrupt the registry URL to /graphs/<id>/graphs).
+        // stream-control selectors. Served commands split by scope: `graphs`
+        // is registry-only, while the `stream` family consumes --graph.
+        // Neither accepts --store/--as.
         let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
         // (command, [server, cluster, graph, store, as, profile])
         let rows = [
@@ -483,6 +500,14 @@ mod tests {
             (
                 parse(&["omnigraph", "graphs", "list"]),
                 [true, false, false, false, false, true],
+            ),
+            (
+                parse(&["omnigraph", "stream", "ingest"]),
+                [true, false, true, false, false, true],
+            ),
+            (
+                parse(&["omnigraph", "stream", "status"]),
+                [true, false, true, false, false, true],
             ),
             (
                 parse(&["omnigraph", "optimize", "g.omni"]),
@@ -530,7 +555,6 @@ mod tests {
                     "stream",
                     "block",
                     "show",
-                    "node:Person",
                     "--block-token",
                     "block-1",
                 ]),
@@ -557,9 +581,20 @@ mod tests {
     #[test]
     fn command_capability_classifies_representative_verbs() {
         let cap = |args: &[&str]| command_capability(&Cli::try_parse_from(args).unwrap().command);
-        // The one Data→Served refinement — if the `graphs` guard were deleted,
-        // every other assertion here would still pass.
+        // Both Data→Served refinements are explicit: one registry-scoped and
+        // one graph-scoped family.
         assert_eq!(cap(&["omnigraph", "graphs", "list"]), Capability::Served);
+        assert_eq!(cap(&["omnigraph", "stream", "ingest"]), Capability::Served);
+        assert_eq!(cap(&["omnigraph", "stream", "status"]), Capability::Served);
+        assert_eq!(cap(&["omnigraph", "stream", "resume"]), Capability::Served);
+        assert_eq!(
+            cap(&["omnigraph", "stream", "maintenance", "ensure-indices"]),
+            Capability::Served
+        );
+        assert_eq!(
+            cap(&["omnigraph", "stream", "maintenance", "optimize"]),
+            Capability::Served
+        );
         assert_eq!(cap(&["omnigraph", "alias", "who"]), Capability::Local);
         assert_eq!(
             cap(&["omnigraph", "optimize", "graph.omni"]),
@@ -587,7 +622,6 @@ mod tests {
                 "stream",
                 "block",
                 "correct",
-                "node:Person",
                 "--block-token",
                 "block-1",
                 "--correction-id",
@@ -627,6 +661,114 @@ mod tests {
         assert_eq!(
             cap(&["omnigraph", "policy", "validate"]),
             Capability::Control
+        );
+    }
+
+    #[test]
+    fn stream_commands_are_served_only_before_dispatch() {
+        let cli = Cli::try_parse_from([
+            "omnigraph",
+            "stream",
+            "ingest",
+            "--store",
+            "file:///must-not-open.omni",
+            "--data",
+            "/must-not-open.ndjson",
+        ])
+        .unwrap();
+        let error = guard_addressing(&cli).unwrap_err().to_string();
+        assert!(error.contains("`stream ingest` is a served command"));
+        assert!(error.contains("--store addresses"));
+
+        let cli = Cli::try_parse_from([
+            "omnigraph",
+            "stream",
+            "ingest",
+            "--server",
+            "http://server.invalid:9",
+            "--graph",
+            "knowledge",
+        ])
+        .unwrap();
+        guard_addressing(&cli).unwrap();
+        match cli.command {
+            Command::Stream {
+                command:
+                    StreamCommand::Ingest {
+                        data, graph_token, ..
+                    },
+            } => {
+                assert_eq!(data, std::path::Path::new("-"));
+                assert_eq!(graph_token, None);
+            }
+            other => panic!("expected stream ingest, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "omnigraph",
+            "stream",
+            "status",
+            "--store",
+            "file:///must-not-open.omni",
+        ])
+        .unwrap();
+        let error = guard_addressing(&cli).unwrap_err().to_string();
+        assert!(error.contains("`stream status` is a served command"));
+        assert!(error.contains("--store addresses"));
+
+        let cli = Cli::try_parse_from([
+            "omnigraph",
+            "stream",
+            "status",
+            "--server",
+            "http://server.invalid:9",
+            "--graph",
+            "knowledge",
+            "--json",
+        ])
+        .unwrap();
+        guard_addressing(&cli).unwrap();
+        match cli.command {
+            Command::Stream {
+                command: StreamCommand::Status { json },
+            } => assert!(json),
+            other => panic!("expected stream status, got {other:?}"),
+        }
+
+        for args in [
+            vec!["omnigraph", "stream", "resume"],
+            vec!["omnigraph", "stream", "maintenance", "ensure-indices"],
+            vec!["omnigraph", "stream", "maintenance", "optimize"],
+        ] {
+            let mut served = args.clone();
+            served.extend([
+                "--server",
+                "http://server.invalid:9",
+                "--graph",
+                "knowledge",
+                "--json",
+            ]);
+            let cli = Cli::try_parse_from(served).unwrap();
+            guard_addressing(&cli).unwrap();
+
+            let mut direct = args;
+            direct.extend(["--store", "file:///must-not-open.omni"]);
+            let cli = Cli::try_parse_from(direct).unwrap();
+            let error = guard_addressing(&cli).unwrap_err().to_string();
+            assert!(error.contains("is a served command"), "{error}");
+            assert!(error.contains("--store addresses"), "{error}");
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "omnigraph",
+                "stream",
+                "resume",
+                "--type",
+                "Person",
+            ])
+            .is_err(),
+            "graph resume must not accept a declaration selector"
         );
     }
 

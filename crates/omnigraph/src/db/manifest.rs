@@ -129,9 +129,10 @@ pub(crate) use stream_profile::{
 };
 pub(crate) use stream_token::stream_token_authority_plan_digest;
 pub(crate) use token_store::{
-    LifecycleLedgerRecord, StreamTokenAuthorityEntry, lookup_authority_retirement_receipt,
-    lookup_claim_receipt, lookup_lifecycle_ledger_record_by_id, lookup_management_receipt,
-    lookup_profile_management_receipt, lookup_stream_correction_receipt,
+    LifecycleLedgerRecord, MAX_LIFECYCLE_LEDGER_LOOKUP_KEYS_PER_SCAN, StreamTokenAuthorityEntry,
+    lookup_authority_retirement_receipt, lookup_claim_receipt,
+    lookup_lifecycle_ledger_record_by_id, lookup_lifecycle_ledger_records_batched,
+    lookup_management_receipt, lookup_profile_management_receipt, lookup_stream_correction_receipt,
     open_stream_token_authority_at, open_stream_token_authority_head,
     stage_authority_retirement_receipt, stage_lifecycle_ledger_records, stage_management_receipt,
     stage_profile_management_receipt, stage_stream_correction_effect,

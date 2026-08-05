@@ -9,6 +9,16 @@ enum EnsureIndicesMode<'a> {
     },
 }
 
+pub(super) struct SealedEnsureIndicesOutcome {
+    pub(super) changed: bool,
+    pub(super) pending: Vec<PendingIndex>,
+}
+
+struct EnsureIndicesOutcome {
+    changed: bool,
+    pending: Vec<PendingIndex>,
+}
+
 impl<'a> EnsureIndicesMode<'a> {
     fn actor_id(self) -> Option<&'a str> {
         match self {
@@ -49,19 +59,27 @@ pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<Vec<PendingIndex>> 
         .await
         .current_branch()
         .map(str::to_string);
-    ensure_indices_for_branch(db, current_branch.as_deref(), EnsureIndicesMode::Ambient).await
+    Ok(
+        ensure_indices_for_branch(db, current_branch.as_deref(), EnsureIndicesMode::Ambient)
+            .await?
+            .pending,
+    )
 }
 
 pub(super) async fn ensure_indices_on(db: &Omnigraph, branch: &str) -> Result<Vec<PendingIndex>> {
     let branch = normalize_branch_name(branch)?;
-    ensure_indices_for_branch(db, branch.as_deref(), EnsureIndicesMode::Ambient).await
+    Ok(
+        ensure_indices_for_branch(db, branch.as_deref(), EnsureIndicesMode::Ambient)
+            .await?
+            .pending,
+    )
 }
 
 #[cfg_attr(not(feature = "failpoints"), allow(dead_code))]
 pub(super) async fn ensure_indices_sealed_as(
     db: &Omnigraph,
     actor_id: &str,
-) -> Result<Vec<PendingIndex>> {
+) -> Result<SealedEnsureIndicesOutcome> {
     db.enforce(
         omnigraph_policy::PolicyAction::StreamManage,
         &omnigraph_policy::ResourceScope::Graph,
@@ -69,7 +87,13 @@ pub(super) async fn ensure_indices_sealed_as(
     )?;
     db.ensure_streaming_sealed_maintenance_runtime_authorized()
         .await?;
-    ensure_indices_for_branch(db, None, EnsureIndicesMode::SealedMaintenance { actor_id }).await
+    let outcome =
+        ensure_indices_for_branch(db, None, EnsureIndicesMode::SealedMaintenance { actor_id })
+            .await?;
+    Ok(SealedEnsureIndicesOutcome {
+        changed: outcome.changed,
+        pending: outcome.pending,
+    })
 }
 
 #[cfg(feature = "failpoints")]
@@ -120,7 +144,7 @@ async fn ensure_indices_for_branch(
     db: &Omnigraph,
     branch: Option<&str>,
     mode: EnsureIndicesMode<'_>,
-) -> Result<Vec<PendingIndex>> {
+) -> Result<EnsureIndicesOutcome> {
     if mode.is_sealed_maintenance() && branch.is_some() {
         return Err(OmniError::manifest(
             "SEALED stream maintenance is canonical-main only",
@@ -311,6 +335,7 @@ async fn ensure_indices_for_branch(
             )
         })
         .collect::<Vec<_>>();
+    let changed = !recovery_pins.is_empty();
     if mode.is_sealed_maintenance() {
         // Recheck under the retained profile gate and immediately before the
         // lower writer domains so stale checked runtime cannot authorize the
@@ -761,7 +786,7 @@ async fn ensure_indices_for_branch(
             pending.append(&mut table_pending);
         }
     }
-    Ok(pending)
+    Ok(EnsureIndicesOutcome { changed, pending })
 }
 
 fn pre_minted_index_transaction(

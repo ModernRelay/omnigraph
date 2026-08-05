@@ -24,6 +24,15 @@ pub use omnigraph::{
     StreamDeadLetterPayloadPage, StreamExportCut, StreamStatus, StreamTableStatus,
     StreamingProfileResult, TableCleanupStats, TableOptimizeStats, TableRepairStats,
 };
+#[doc(hidden)]
+pub use omnigraph::{
+    GraphStreamChunkSource, GraphStreamDeclaration, GraphStreamDeclarationStatus,
+    GraphStreamDrainStatus, GraphStreamDriverErrorStatus, GraphStreamDriverStatus,
+    GraphStreamEnsureIndicesResult, GraphStreamIngestHandle, GraphStreamIngestStart,
+    GraphStreamLastFoldStatus, GraphStreamOperationalStatus, GraphStreamOptimizeResult,
+    GraphStreamPendingStatus, GraphStreamRebuildBlocker, GraphStreamRebuildStatus,
+    GraphStreamResumeResult, GraphStreamStrictBlockStatus, GraphStreamTokenCounts,
+};
 pub(crate) use omnigraph::{
     DeferredTableFork, StreamAuthorityRetirementExportProvenance, WriteAuthorityToken, WriteTxn,
 };

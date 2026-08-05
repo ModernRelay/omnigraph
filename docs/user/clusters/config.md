@@ -167,8 +167,12 @@ profile is enabled, Mutation/Load/delete through an embedded SDK handle or
 direct `--store` CLI handle fail before input-file reads, staging, recovery
 arming, or Lance effects. Existing served Mutation/Load operations continue
 only through the one cluster-booted server carrying the exact checked runtime
-authority. There is not yet a public firehose-ingest endpoint in this release.
-Do not set `streaming: true` expecting an additional input route.
+authority. The graph-native served firehose is available through
+`POST /graphs/{graph_id}/stream/ingest` and remote `stream ingest`, but only an
+absent declaration (prepared lazily) or an existing `OPEN` declaration can
+admit rows. After disable/re-enable, restart the checked server and run the
+selector-free graph-wide `omnigraph stream resume` to reopen every `SEALED`
+declaration. Repeated ingest requests never reopen one implicitly.
 Branch merge is stricter: it is refused while the profile is `ENABLED` or
 `DISABLING`, even through that checked served runtime, because this release has
 no token-aware merge transition.

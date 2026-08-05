@@ -44,11 +44,29 @@
 - `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id`. Resolve the sidecar through a read-write reopen/server restart before retrying; this is intentionally not an ordinary OCC retry.
 - `StreamExportBlocked { withdrawn_token_count, dead_lettered_token_count }` —
   ordinary export found current `WITHDRAWN` or `DEAD_LETTERED` sequencing
-  authority that a row-only artifact cannot preserve. The hidden ingest path
-  can install a fresh ordinary `PRESENT` successor, but no public row-ingress
-  surface exposes it yet; the current operator exit is the stopped/offline
-  `cluster stream retire-for-rebuild` handshake.
+  authority that a row-only artifact cannot preserve. Graph-native firehose
+  ingest can install a fresh ordinary `PRESENT` successor only while the
+  enabled declaration is absent or `OPEN`. For a disabled `SEALED`
+  declaration, re-enable streaming, restart the checked server, run the
+  selector-free graph-wide `omnigraph stream resume`, and then submit the
+  successor. If the authority must instead be discarded, use the stopped/
+  offline `cluster stream retire-for-rebuild` handshake.
   The served export route returns this as HTTP **409** before `200`.
+- Graph-ingest HTTP preconditions are transport errors rather than new durable
+  engine states. Missing `If-Match` returns **428** plus the current opaque
+  graph-ingest ETag without polling the body. Malformed or stale `If-Match`
+  returns **412** without a replacement token, also before body polling. A
+  non-`application/x-ndjson` request returns **415**. None of these outcomes
+  enrolls a lane or invokes MemWAL.
+- Checked stream status may return a redacted **503** when its bounded
+  observation cannot obtain one coherent authority cut (`StreamStatusBusy` or
+  `StreamStatusChanged`). The response intentionally omits the private gate,
+  physical member, and recovery identity that moved; retry the read. A **409**
+  means the served graph does not own checked operational-status authority for
+  its current profile, including an unmanaged graph that never established
+  checked serving authority. A **413** means the bounded observation inventory exceeded
+  its hard envelope; the server refuses the whole response instead of returning
+  partial recovery evidence. None of these responses mutates or heals the graph.
 - `StreamRetirementPlanChanged` — graph/profile/lifecycle/token authority moved
   between retirement plan and confirm. No retirement effect is accepted; rerun
   the plan and review the new digest.

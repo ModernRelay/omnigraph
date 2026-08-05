@@ -11,6 +11,10 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `init` | `--schema <pg>` → initialize a graph (start cluster configs from the [cluster.md](../clusters/index.md) quick-start) |
 | `load` | bulk load a branch, local or remote (`--mode overwrite\|append\|merge` is **required** — overwrite is destructive, so there is no default). Without `--from` the target branch must exist; `--from <base>` forks a missing `--branch` from `<base>` first |
 | `ingest` | deprecated alias of `load --from <base>` (defaults: `--from main --mode merge`); prints a one-line warning to stderr |
+| `stream ingest` | experimental graph-native firehose; served-only. `stream ingest [--data <path\|->] [--graph-token <token>]` streams mixed node/edge NDJSON to `/graphs/{graph_id}/stream/ingest`, performs at most one missing-token preflight before opening the body, and emits ordered NDJSON acknowledgement lines. `--data` defaults to `-` (stdin). It never targets a table or direct `--store` |
+| `stream status` | checked operational status for one served streaming graph. `stream status [--json]` reports graph/profile readiness, lifecycle revisions for logical node/edge declarations whose streaming state has initialized, pending-work availability, terminal-authority counts, driver/recovery health, and rebuild blockers. A declaration absent from `enrolled_declarations` may still exist in the graph schema. It never exposes or accepts a table, dataset, lane, binding, shard, or Lance identifier |
+| `stream resume` | graph-wide checked resume for one served graph. It reopens every currently `SEALED` enrolled declaration, skips declarations already `OPEN`, and refuses before effects when a drain or strict block still needs attention. There is deliberately no type, table, or lane selector |
+| `stream maintenance ensure-indices \| optimize` | graph-wide checked maintenance. Any enrolled declaration the operation would physically change must be `SEALED`; an unaffected `OPEN` declaration does not block derived maintenance. Both commands are served-only, use the existing coordinated graph publication/recovery paths, and return aggregate results only; physical dataset and fragment identities remain private |
 | `query <name>` (alias: `read`) | run a read query. **Catalog lane** (default): `<name>` is a stored query invoked **by name** from the served catalog (served-only — address with `--server`/`--profile`; the verb asserts the query is a read). **Ad-hoc lane**: with `--query <path>` or `-e`/`--query-string <GQ>`, runs that source (the positional `<name>` then selects which query in it). No positional graph URI — address via `--store`/`--server`/`--profile`. `read` is the deprecated previous name (one-line stderr warning) |
 | `mutate <name>` (alias: `change`) | run a mutation query; same catalog (by-name, served-only, verb asserts mutation) / ad-hoc (`--query`/`-e`) lanes as `query`. `change` is the deprecated previous name (one-line stderr warning) |
 | `alias <name> [args]` | invoke an operator alias — a read-only personal binding (under `aliases:` in `~/.omnigraph/config.yaml`) to a stored query on a named server (replaces the removed `--alias` flag; stored mutations are rejected before execution) |
@@ -36,7 +40,7 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 Every command declares the **capability** it needs — what it requires to reach a graph — which determines the addressing flags that apply:
 
 - **`any`** — `query`, `mutate`, `load`, `ingest`, `branch *`, `snapshot`, `export`, `commit *`, `schema show`, `schema apply`. Run against a graph **served (via a server) or embedded (direct against a store)**: accept a positional `file://`/`s3://` URI, `--server <name|url>` (+ `--graph <id>` for multi-graph servers), `--store <uri>`, or `--profile <name>`. A remote server is addressed with `--server` — a positional `http(s)://` URI does **not** dispatch to one.
-- **`served`** — `graphs list`. Requires a server, and addresses the server's graph *registry* (the bare server URL), not a graph within it: only `--server` / `--profile` apply, and `--graph`, `--store`, and `--as` are rejected loudly.
+- **`served`** — `graphs list` and the `stream ingest|status|resume|maintenance` family. All require a server. `graphs list` addresses the graph *registry* (the bare server URL), while every `stream` command requires one selected graph through `--server` / `--profile` plus `--graph` or a configured default. Direct `--store` and client-supplied `--as` are rejected; the server resolves the authenticated actor for writes.
 - **`direct`** — `init`, `optimize`, `repair`, `cleanup`, `schema plan`, `lint`. Need **direct storage access** (`file://` / `s3://`), never through a server. They accept a positional `URI`, but **not** `--server`, and a remote (`http(s)://`) URI is rejected. `optimize` / `repair` / `cleanup` additionally accept **`--cluster <dir|s3://…> --graph <id>`** (`--cluster` is a cluster directory or storage-root URI, named via `clusters:` in `~/.omnigraph/config.yaml` or a literal root), which resolves the graph's storage URI from the served cluster state (so you needn't know the `<storage>/graphs/<id>.omni` layout). `--graph` is the one graph selector across all scopes — on these three verbs it picks the cluster graph; on the other `direct` verbs it does not apply. `--as` does not apply to any `direct` verb — maintenance records no actor.
 - **`control`** — `cluster *` via `--config <dir>`; `policy *` and `queries *` via `--cluster <dir|uri>` or a cluster profile.
 - **`local`** — `alias`, `embed`, `login`, `logout`, `profile`, `version`. Address no explicit graph scope.
@@ -192,11 +196,16 @@ omnigraph cluster status   --config company-brain --json
 omnigraph cluster refresh  --config company-brain --json
 omnigraph cluster import   --config company-brain --json
 omnigraph cluster force-unlock <LOCK_ID> --config company-brain --json
+# After re-enabling a graph whose declarations are sealed:
+omnigraph stream resume --server <name-or-url> --graph <graph-id> --json
+# Checked graph-wide maintenance (affected enrolled declarations must be sealed):
+omnigraph stream maintenance ensure-indices --server <name-or-url> --graph <graph-id> --json
+omnigraph stream maintenance optimize       --server <name-or-url> --graph <graph-id> --json
 # Inspect and correct one exact strict drain block while every writer is stopped:
-omnigraph --graph <graph-id> --as <actor> cluster stream block show node:Person \
+omnigraph --graph <graph-id> --as <actor> cluster stream block show \
   --config company-brain --block-token <token> \
   --confirm-stream-offline --json
-omnigraph --graph <graph-id> --as <actor> cluster stream block correct node:Person \
+omnigraph --graph <graph-id> --as <actor> cluster stream block correct \
   --config company-brain --block-token <token> --correction-id <uuid> \
   --expected-lifecycle-revision <revision> --plan correction.json \
   --confirm-stream-offline --json
@@ -234,9 +243,12 @@ apply --confirm-stream-offline` is additionally required when a streaming
 profile changes. It attests that every writer-capable process for the affected
 graph is stopped; profile changes also require the state lock and an
 authenticated `--as` actor. The flag is not a distributed lease. Enabling the
-experimental profile disables embedded/direct Mutation/Load/delete, does not
-yet add a public firehose endpoint, and should be followed by a server restart
-so served writes carry the checked runtime authority. Branch merge remains
+experimental profile disables embedded/direct Mutation/Load/delete and should
+be followed by a server restart so the graph-native firehose and controls carry
+the checked runtime authority. The first ingest lazily initializes internal
+declarations. Re-enabling does not implicitly reopen a previously sealed
+declaration; run the selector-free, graph-wide `stream resume` after restart.
+Branch merge remains
 unavailable while that profile is `ENABLED` or `DISABLING`, even through the
 served runtime. Offline disable publishes `DISABLING`, derives one finite
 manifest lane cut, and serially drains `OPEN`, goal-`SEALED`, and adopted
@@ -251,7 +263,9 @@ removes a lock only when the supplied id exactly matches the lock file.
 cluster recovery, and `--confirm-stream-offline`. The flag is an operator
 attestation, not a distributed lease. `show` revalidates the exact block and
 returns at most one bounded page; pass its opaque `--cursor` to fetch the next
-page. `correct` accepts a strict JSON file with no unknown fields:
+page. The block token resolves the affected internal declaration; neither
+command accepts a type, table, or dataset selector. `correct` accepts a strict
+JSON file with no unknown fields:
 
 ```json
 {
@@ -282,7 +296,8 @@ manifest-selected current-token version and return one bounded page; pass the
 opaque `--cursor` for the next page. `list` returns current `DEAD_LETTERED`
 sequencing evidence. `export` additionally verifies the recovery-owned object
 descriptor and returns canonical payload entries. It never lists the object
-prefix or treats payload export as replay/import.
+prefix or treats payload export as replay/import. Entries identify their
+accepted-schema node/edge declaration, not a physical table or dataset.
 
 `cluster stream retire-for-rebuild` is separate from normal apply. Both `plan`
 and `confirm` require a declared/applied graph, `state.lock: true`, an

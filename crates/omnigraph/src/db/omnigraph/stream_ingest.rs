@@ -18,6 +18,7 @@ use futures::TryStreamExt;
 use lance::dataset::mem_wal::scanner::LsmScanner;
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardManifestStore, ShardWriter, WalTailer};
 use lance_index::mem_wal::{MemWalIndexDetails, MergedGeneration, ShardId, ShardStatus};
+use sha2::{Digest, Sha256};
 
 #[cfg(feature = "failpoints")]
 use crate::db::ReadTarget;
@@ -50,16 +51,16 @@ use crate::db::manifest::{
     RecoveryStreamDrainFoldAuthorityV14, RecoveryStreamFoldCut, RecoveryStreamLifecycleReceiptKind,
     RecoveryStreamOpenPlanV15, RecoveryStreamResumeOutcomeV15, RecoveryStreamResumeRequestV15,
     SidecarTablePin, StreamLifecycle, StreamLifecycleEntry, StreamPhysicalBinding,
-    StreamProfileEntry, StreamProfileMode, TableIdentity, TableVersionExpectation,
-    arm_stream_claim_checkpoint_sidecar_v14, arm_stream_claim_terminal_sidecar_v14,
-    arm_stream_resume_checkpoint_sidecar_v15, arm_stream_resume_terminal_sidecar_v15,
-    classify_effect_free_stream_claim_sidecar_v14, classify_effect_free_stream_resume_sidecar_v15,
-    complete_stream_claim_sidecar_v14, complete_stream_dead_letter_fold_sidecar_v21,
-    complete_stream_fold_sidecar_v14, complete_stream_lifecycle_receipt_sidecar_v14,
-    complete_stream_resume_sidecar_v15, confirm_stream_claim_sidecar_v14,
-    confirm_stream_dead_letter_fold_sidecar_v21, confirm_stream_fold_sidecar_v14,
-    confirm_stream_lifecycle_receipt_sidecar_v14, confirm_stream_resume_sidecar_v15,
-    finalize_effect_free_stream_fold_sidecar_v14, list_sidecars,
+    StreamProfileEntry, StreamProfileMode, StreamProfileState, TableIdentity,
+    TableVersionExpectation, arm_stream_claim_checkpoint_sidecar_v14,
+    arm_stream_claim_terminal_sidecar_v14, arm_stream_resume_checkpoint_sidecar_v15,
+    arm_stream_resume_terminal_sidecar_v15, classify_effect_free_stream_claim_sidecar_v14,
+    classify_effect_free_stream_resume_sidecar_v15, complete_stream_claim_sidecar_v14,
+    complete_stream_dead_letter_fold_sidecar_v21, complete_stream_fold_sidecar_v14,
+    complete_stream_lifecycle_receipt_sidecar_v14, complete_stream_resume_sidecar_v15,
+    confirm_stream_claim_sidecar_v14, confirm_stream_dead_letter_fold_sidecar_v21,
+    confirm_stream_fold_sidecar_v14, confirm_stream_lifecycle_receipt_sidecar_v14,
+    confirm_stream_resume_sidecar_v15, finalize_effect_free_stream_fold_sidecar_v14, list_sidecars,
     lookup_stream_claim_continuation_v14, mint_recovery_operation_id, new_stream_claim_sidecar_v14,
     new_stream_dead_letter_fold_sidecar_v21, new_stream_drain_fold_sidecar_v14,
     new_stream_fold_v2_sidecar_v14, new_stream_lifecycle_receipt_sidecar_v14,
@@ -153,6 +154,89 @@ pub(super) struct NormalizedStreamJsonRow {
     pub(super) envelope: StreamWriteEnvelope,
     pub(super) batch: RecordBatch,
     pub(super) logical_id: String,
+}
+
+/// Non-serialized graph authority pinned by one hidden graph-native ingest
+/// request.
+///
+/// Operational publications inside the request legitimately advance the
+/// manifest version and graph head, so neither is part of this witness. The
+/// accepted graph identity/catalog and active profile delegation are the
+/// stable authority that must remain exact while a logical row is routed to a
+/// private lane. F7 derives the opaque served-ingest precondition token from
+/// this witness; the witness itself remains internal and non-serialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StreamGraphIngestWitness {
+    graph_identity_digest: String,
+    schema_ir_hash: String,
+    schema_identity_version: u32,
+    profile_revision: u64,
+    fold_delegation_id: String,
+    fold_delegation_digest: String,
+}
+
+impl StreamGraphIngestWitness {
+    pub(super) fn capture(txn: &WriteTxn) -> Result<Self> {
+        let profile = txn.base.stream_profile();
+        let StreamProfileState::Enabled {
+            active_fold_delegation,
+        } = &profile.state
+        else {
+            return Err(OmniError::StreamingRequiresClusterRuntime {
+                mode: profile.mode().as_str().to_string(),
+            });
+        };
+        Ok(Self {
+            graph_identity_digest: stream_graph_identity_digest(
+                &txn.authority.schema_identity_domain,
+            )?,
+            schema_ir_hash: txn.authority.schema_ir_hash.clone(),
+            schema_identity_version: txn.authority.schema_identity_version,
+            profile_revision: profile.profile_revision,
+            fold_delegation_id: active_fold_delegation.delegation_id.clone(),
+            fold_delegation_digest: active_fold_delegation.delegation_digest.clone(),
+        })
+    }
+
+    pub(super) fn validate(&self, txn: &WriteTxn, operation: &str) -> Result<()> {
+        let current = Self::capture(txn)?;
+        if &current == self {
+            return Ok(());
+        }
+        Err(OmniError::manifest_read_set_changed(
+            format!("{operation}:graph_stream_authority"),
+            Some("pinned graph stream authority".to_string()),
+            Some("current graph stream authority differs".to_string()),
+        ))
+    }
+
+    pub(super) fn schema_ir_hash(&self) -> &str {
+        &self.schema_ir_hash
+    }
+
+    /// Derive the opaque served-ingest compare token from this exact witness.
+    ///
+    /// This is deliberately a projection of existing manifest authority, not
+    /// a persisted token or a second source of truth. Every variable-width
+    /// field is length framed and every integer is big endian, so the v1
+    /// domain has one canonical byte representation without relying on JSON
+    /// object ordering or a serializer version.
+    pub(super) fn authority_token(&self) -> String {
+        fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+            hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(bytes);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"omnigraph.graph-stream-ingest-authority.v1\0");
+        hash_bytes(&mut hasher, self.graph_identity_digest.as_bytes());
+        hash_bytes(&mut hasher, self.schema_ir_hash.as_bytes());
+        hasher.update(self.schema_identity_version.to_be_bytes());
+        hasher.update(self.profile_revision.to_be_bytes());
+        hash_bytes(&mut hasher, self.fold_delegation_id.as_bytes());
+        hash_bytes(&mut hasher, self.fold_delegation_digest.as_bytes());
+        format!("sha256:{:x}", hasher.finalize())
+    }
 }
 
 /// Effect-free disposition for the first row at a physical-run boundary.
@@ -420,10 +504,27 @@ pub(super) fn normalize_stream_json_row_with_catalog(
     validate_stream_json_structure_bound(raw_json)?;
     let wire = serde_json::from_slice::<StreamJsonRowWire>(raw_json)
         .map_err(|error| OmniError::manifest(format!("invalid stream JSON: {error}")))?;
-    wire.envelope
+    normalize_stream_json_parts_with_catalog(
+        table_key,
+        wire.envelope,
+        serde_json::Value::Object(wire.body.into_iter().collect()),
+        catalog,
+    )
+}
+
+/// Normalize an already-bounded logical body with an engine-injected private
+/// envelope. The graph-native adapter uses this after parsing its distinct
+/// caller wire so it can validate the complete row before lazy enrollment
+/// without serializing and reparsing a synthetic table-scoped JSON object.
+pub(super) fn normalize_stream_json_parts_with_catalog(
+    table_key: &str,
+    envelope: StreamWriteEnvelope,
+    row: serde_json::Value,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+) -> Result<NormalizedStreamJsonRow> {
+    envelope
         .validate()
         .map_err(|error| OmniError::manifest(error.to_string()))?;
-    let row = serde_json::Value::Object(wire.body.into_iter().collect());
     let batch = crate::loader::normalize_stream_json_row(catalog, table_key, row)?;
     validate_stream_input_bounds(table_key, &batch)?;
     validate_stream_value_constraints(table_key, &batch, catalog)?;
@@ -439,7 +540,7 @@ pub(super) fn normalize_stream_json_row_with_catalog(
         ));
     }
     Ok(NormalizedStreamJsonRow {
-        envelope: wire.envelope,
+        envelope,
         logical_id: ids.value(0).to_string(),
         batch,
     })
@@ -903,6 +1004,7 @@ impl Omnigraph {
                 preprocessing,
                 driver_round_guard,
                 profile_guard,
+                None,
             )
             .await?
         {
@@ -985,6 +1087,7 @@ impl Omnigraph {
         preprocessing: Option<B2PreprocessingPermit>,
         driver_round_guard: StreamFoldProducerPermit,
         profile_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+        expected_graph_witness: Option<&StreamGraphIngestWitness>,
     ) -> Result<StreamB2PrefixOutcome> {
         let ordinal_len = caller_ordinals
             .end
@@ -1018,6 +1121,9 @@ impl Omnigraph {
         let provisional = self
             .capture_stream_authority(table_key, "stream token admission")
             .await?;
+        if let Some(expected) = expected_graph_witness {
+            expected.validate(&provisional.txn, "stream token provisional admission")?;
+        }
         Self::ensure_stream_table_admission_supported(&provisional.txn.catalog, table_key)?;
         let mut preprocessing = match preprocessing {
             Some(preprocessing) => preprocessing,
@@ -1101,6 +1207,9 @@ impl Omnigraph {
         let prepared = self
             .capture_stream_authority(table_key, "stream token final admission")
             .await?;
+        if let Some(expected) = expected_graph_witness {
+            expected.validate(&prepared.txn, "stream token final admission")?;
+        }
         let classified_binding = StreamB2BindingProof {
             enrollment_id: prepared.enrollment_id.to_string(),
             shard_id: prepared.shard_id.to_string(),
@@ -8405,6 +8514,26 @@ pub(super) fn exact_merged_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_ingest_authority_token_pins_canonical_witness_encoding() {
+        let witness = StreamGraphIngestWitness {
+            graph_identity_digest: format!("sha256:{}", "1".repeat(64)),
+            schema_ir_hash: format!("sha256:{}", "2".repeat(64)),
+            schema_identity_version: 2,
+            profile_revision: 7,
+            fold_delegation_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            fold_delegation_digest: format!("sha256:{}", "3".repeat(64)),
+        };
+
+        assert_eq!(
+            witness.authority_token(),
+            "sha256:e7662e871c1eb31a2cc86098cdf5bb13a767c3aff852fb1db2999c272eadfda1"
+        );
+        let mut changed = witness.clone();
+        changed.profile_revision += 1;
+        assert_ne!(changed.authority_token(), witness.authority_token());
+    }
 
     #[test]
     fn data_block_error_preserves_typed_correction_token() {

@@ -10,6 +10,20 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. **Cluster-only boot**: the server a
 omnigraph-server --cluster <dir | s3://…> --bind 0.0.0.0:8080
 ```
 
+Passing port `0` lets the operating system select an available port. After the
+listener binds, the server writes the actual address to stdout as one
+machine-readable line:
+
+```text
+OMNIGRAPH_LISTEN_ADDR=127.0.0.1:54321
+```
+
+Process supervisors and test harnesses can use this record instead of
+reserving and releasing a port before starting the server. When the bind host
+is a wildcard such as `0.0.0.0` or `[::]`, the record identifies the listener
+but is not itself a portable client endpoint; use the selected port with a
+host that is reachable from the client.
+
 `omnigraph-server --cluster <dir-or-uri>` boots from the cluster catalog's
 **applied revision**. The server resolves that revision into per-graph
 startup configs (id, URI, optional per-graph policy, stored-query
@@ -158,8 +172,121 @@ the request body and response handling alone.
 
 ## Streaming
 
-Only `/export` streams (`application/x-ndjson`); everything else is buffered
-JSON. Export authorization, relevant checked recovery settlement/validation,
+The experimental graph-native firehose is
+`POST /graphs/{graph_id}/stream/ingest`. Its request and successful response
+are both `application/x-ndjson`; logical node and edge declarations may be
+mixed in one ordered request. The request is a firehose, not one graph
+transaction: earlier durable rows are not rolled back by a later failure, and
+an edge must follow the endpoint nodes it needs because forward references are
+not buffered. The URL never names a table, dataset, lane, or stream
+incarnation. Each response line reports only caller-logical identity, the
+acknowledgement disposition, and safe sequencing evidence.
+
+```json
+{"type":"Person","data":{"id":"p1","name":"Ada"},"$stream":{"write_id":"8a880f0a-3f41-4a42-9b0e-f34af0a9a4df","predecessor_token":null}}
+{"edge":"Knows","from":"p1","to":"p2","data":{},"$stream":{"write_id":"83ed1d92-87bb-489f-a64a-202e8369b46f","predecessor_token":null}}
+```
+
+Ingest uses an opaque graph-authority ETag to prevent a producer from writing
+an owned body into a rebuilt or reconfigured graph at the same URL. A request
+without `If-Match` is authorized and preflighted without polling its body, then
+returns HTTP **428** with the current strong `ETag`, `Cache-Control: no-store`,
+and a small JSON challenge. Retry once with that exact value in `If-Match`. A malformed or stale value
+returns HTTP **412** without a replacement token; the caller must re-check its
+target and must not automatically replay an already-owned body. The CLI
+performs the missing-token handshake before opening its input. With bearer
+authentication but no applied policy bundle, default-deny mode returns **403**
+before polling the body; an explicit graph-level `stream_ingest` grant is
+required.
+
+```http
+ETag: "sha256:…"
+Cache-Control: no-store
+
+{"graph_token":"sha256:…"}
+```
+
+After the exact precondition passes, input and results stream incrementally
+through bounded queues. Acknowledgement means the row is durable in Lance
+MemWAL, not yet graph-visible. The resident server driver later validates and
+publishes folds through the ordinary atomic graph publication path. A row-local
+shape/value error does not invalidate earlier acknowledgements. An ambiguous
+acknowledgement or graph-authority/backpressure failure stops later physical
+invocation. For `ack_unknown`, retry the exact same logical row with the same
+`write_id`, predecessor, and payload; the unconfirmed candidate token is not
+valid as a successor predecessor. Uninvoked rows may be retried only after the
+graph blocker is resolved. Disconnect
+stops future body polling while already-invoked work remains owned until its
+durability result is classified.
+
+Ingest admits an absent internal declaration (prepared lazily) or an existing
+`OPEN` one. A `SEALED` declaration returns `stream_authority_changed`; it is
+never resumed as a side effect of ingest.
+
+`POST /graphs/{graph_id}/stream/resume` is the explicit graph-wide resume
+control. It accepts no body and no declaration selector. Under exact checked
+`ENABLED` runtime authority it preflights every enrolled declaration, refuses
+before effects if any declaration is still draining or strictly blocked,
+skips declarations already `OPEN`, and reopens the `SEALED` remainder in a
+deterministic internal order. A retry after an interrupted sequence is
+convergent: declarations already opened are skipped. Physical table, lane,
+claim, and recovery identities never appear in the response.
+
+Two bodyless graph-wide maintenance controls are available. Any enrolled
+declaration that the operation would physically change must be `SEALED`; an
+unaffected `OPEN` declaration does not block derived maintenance:
+
+- `POST /graphs/{graph_id}/stream/maintenance/ensure-indices`
+- `POST /graphs/{graph_id}/stream/maintenance/optimize`
+
+They reuse OmniGraph's existing graph coordinator and Lance maintenance
+adapters; they do not introduce a second WAL, job queue, or persisted
+coordinator. Productive work publishes through the existing one-graph
+recovery/manifest envelope, while the response contains aggregate change,
+pending-index, and repair-needed status only. There is no per-type, per-table,
+or per-dataset endpoint.
+
+The control plane does not turn graph scope into one physical dataset. Resume
+captures the manifest work list once, then performs the necessary
+recovery-covered transitions against the separate Lance datasets in a bounded,
+deterministic sequence because the experimental profile has one resident WAL
+writer slot. Ensure-indices and Optimize already plan the graph once; Optimize
+runs productive physical tasks with bounded concurrency and publishes their
+visibility together. Clients therefore make one graph request and do not pay a
+public request round trip per declaration, while the coordinator still honors
+the real multi-dataset atomicity boundary.
+
+All three controls require graph-scoped `stream_manage`. The actor comes only
+from the server's bearer-token resolution; clients cannot supply one. Runtime,
+recovery, and storage errors are mapped to graph-safe responses that omit
+table keys, dataset locations, manifest/Lance coordinates, and internal
+operation identifiers.
+
+`GET /graphs/{graph_id}/stream/status` returns one checked, read-only
+operational cut for a cluster-served streaming graph. The response is
+graph-native: it reports the profile and revision, logical node/edge type
+lifecycle and compare revision for declarations whose streaming state has been
+initialized, bounded pending-work availability, current
+terminal-authority counts, advisory driver health, pending recovery count, and
+rebuild readiness. It never exposes table or dataset keys, stable table ids,
+stream bindings, shards, epochs, generations, Lance versions, recovery-object
+identities, or storage paths. The response carries `Cache-Control: no-store`.
+
+Status is authorized like other graph read metadata; it does not require a
+`stream_manage` grant. An unmanaged graph that has never established checked
+streaming authority returns **409** instead of synthesizing full physical
+evidence from its manifest-only state. If the bounded observation cannot obtain
+one stable cut, the route returns a redacted, retryable **503**. Status never
+heals recovery or publishes graph, token, lifecycle, or Lance state.
+Absence from `enrolled_declarations` means streaming state has not yet been
+initialized for that accepted-schema declaration; it does not mean the graph
+schema lacks the declaration. To bound immutable status scans, at most one
+checked observation runs per graph storage root and at most one runs across a
+server process. An overlapping request refuses immediately with the same
+redacted, retryable **503**.
+
+The existing `/export` route also streams `application/x-ndjson`; other routes
+remain buffered JSON. Export authorization, relevant checked recovery settlement/validation,
 branch/filter validation, and stream-authority validation all finish before the
 server sends `200`. A pristine graph may export normally. An enrolled
 `DISABLED` graph must be cluster-served at that exact terminal cut; ordinary
@@ -224,7 +351,9 @@ structured field is additive and rolling-safe.
 Do not blindly resubmit the write: let a read-write open or the recovery sweep
 resolve that operation first, then retry from a fresh snapshot.
 
-HTTP status codes used: 200, 400, 401, 403, 404, 405, 409, 429, 500, 503.
+HTTP status codes used include 200, 400, 401, 403, 404, 405, 409, 412, 413,
+415, 428, 429, 500, and 503. The firehose-specific 412/415/428 meanings are
+defined in [Streaming](#streaming).
 
 ## Per-actor admission control
 
@@ -260,6 +389,12 @@ deprecated alias `/change`), `/load` (and its deprecated alias `/ingest`),
 and `/schema/apply`. Read-only endpoints (`/snapshot`, `/query`, `/read`,
 `/export`, `/branches` GET, `/commits`, `/schema` GET) are not
 admission-gated.
+
+Graph firehose uses the engine's separate bounded per-actor and per-graph
+stream-request registry because its body is incremental rather than a buffered
+request with an up-front byte estimate. That permit is acquired before body
+polling and remains owned by the request task through invoked-tail settlement;
+saturation returns structured HTTP **413** without consuming the body.
 
 ## Body limits
 

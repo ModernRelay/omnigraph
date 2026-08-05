@@ -202,11 +202,15 @@ omnigraph --graph <graph-id> --as <actor> \
 ```
 
 Pass the returned `--cursor` to request the next page. Payload export is an
-inspection artifact, not a replay or import protocol. In the hidden row path,
-a corrected value is a fresh ordinary stream admission naming the current
-terminal token as its predecessor; while it remains current, exact retry
-returns the same terminal result. No public HTTP, SDK, remote-CLI, or OpenAPI
-row-ingress surface exposes that successor yet.
+inspection artifact, not a replay or import protocol. A corrected value is a
+fresh ordinary stream admission naming the current terminal token as its
+predecessor; while it remains current, exact retry returns the same terminal
+result. The graph-native HTTP/remote-CLI firehose can submit that successor only
+while the enabled declaration is absent or `OPEN`. For a disabled `SEALED`
+declaration, re-enable streaming, restart the checked server, run the
+selector-free graph-wide `omnigraph stream resume`, and then submit the
+successor. Ingest never reopens it implicitly. Retirement/rebuild remains the
+exit when that sequencing authority must intentionally be discarded.
 
 If terminal authority must intentionally be discarded for a fresh-root
 rebuild, use the same v19 binary's irreversible
