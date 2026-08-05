@@ -1030,43 +1030,6 @@ fn policy_validate_accepts_cluster_bundle() {
 }
 
 #[test]
-fn policy_validate_fails_for_wrong_kind_cluster_bundle() {
-    // Cluster validation owns bundle-wide syntax and semantic rules. The
-    // policy command additionally loads the bundle for its selected serving
-    // slot, so a server-scoped action bound only to a graph still fails here.
-    let cluster = converged_loaded_cluster(
-        "knowledge",
-        Some(
-            r#"
-version: 1
-groups:
-  team: [act-andrew]
-rules:
-  - id: wrong-kind
-    allow:
-      actors: { group: team }
-      actions: [graph_list]
-"#,
-        ),
-    );
-
-    let output = output_failure(
-        cli()
-            .arg("policy")
-            .arg("validate")
-            .arg("--cluster")
-            .arg(cluster.path())
-            .arg("--graph")
-            .arg("knowledge"),
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("server-scoped") && stderr.contains("graph_list"),
-        "expected a wrong-kind policy error; got: {stderr}"
-    );
-}
-
-#[test]
 fn policy_test_runs_declarative_cases_against_cluster_bundle() {
     let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
     let tests = cluster.path().join("policy.tests.yaml");

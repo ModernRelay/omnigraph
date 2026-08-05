@@ -949,12 +949,16 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
 
         let policy_address = policy_address(policy_name);
         let mut normalized_bindings: Vec<String> = Vec::new();
+        let mut binds_cluster = false;
+        let mut graph_binding = None;
         for (idx, target) in policy.applies_to.iter().enumerate() {
             match normalize_policy_target(target) {
                 PolicyTarget::Cluster => {
+                    binds_cluster = true;
                     normalized_bindings.push("cluster".to_string());
                 }
                 PolicyTarget::Graph(graph_id) => {
+                    graph_binding.get_or_insert_with(|| graph_id.clone());
                     normalized_bindings.push(graph_address(&graph_id));
                     if raw.graphs.contains_key(&graph_id) {
                         dependencies.insert(Dependency {
@@ -981,7 +985,6 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
 
         normalized_bindings.sort();
         normalized_bindings.dedup();
-        policy_bindings.insert(policy_address.clone(), normalized_bindings);
 
         let policy_path = resolve_config_path(&config_dir, &policy.file);
         match fs::read_to_string(&policy_path) {
@@ -989,13 +992,32 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                 resources.insert(
                     policy_address.clone(),
                     ResourceSummary {
-                        address: policy_address,
+                        address: policy_address.clone(),
                         kind: "policy".to_string(),
                         digest: sha256_hex(source.as_bytes()),
                         path: Some(display_path(&policy_path)),
                     },
                 );
-                if let Err(err) = omnigraph_policy::PolicyConfig::from_source(&source) {
+                let validation = omnigraph_policy::PolicyConfig::from_source(&source)
+                    .and_then(|_| {
+                        if binds_cluster {
+                            omnigraph_policy::PolicyEngine::load_server_from_source(&source)
+                                .map(|_| ())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .and_then(|_| {
+                        if let Some(graph_id) = graph_binding.as_deref() {
+                            omnigraph_policy::PolicyEngine::load_graph_from_source(
+                                &source, graph_id,
+                            )
+                            .map(|_| ())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                if let Err(err) = validation {
                     diagnostics.push(Diagnostic::error(
                         "policy_invalid",
                         format!("policies.{policy_name}.file"),
@@ -1012,6 +1034,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                 ),
             )),
         }
+        policy_bindings.insert(policy_address, normalized_bindings);
     }
 
     let mut resource_digests = BTreeMap::new();

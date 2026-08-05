@@ -281,6 +281,58 @@ rules:
     }
 
     #[test]
+    fn policy_binding_kind_mismatch_fails_validation() {
+        for (applies_to, action, scope, expected_kind) in [
+            ("knowledge", "graph_list", "", "server-scoped"),
+            (
+                "cluster",
+                "read",
+                "      branch_scope: any\n",
+                "per-graph",
+            ),
+        ] {
+            let dir = fixture();
+            let config_path = dir.path().join(CLUSTER_CONFIG_FILE);
+            let config = fs::read_to_string(&config_path)
+                .unwrap()
+                .replace("applies_to: [knowledge]", &format!("applies_to: [{applies_to}]"));
+            fs::write(config_path, config).unwrap();
+            fs::write(
+                dir.path().join("base.policy.yaml"),
+                format!(
+                    r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: wrong-kind
+    allow:
+      actors: {{ group: team }}
+      actions: [{action}]
+{scope}"#
+                ),
+            )
+            .unwrap();
+
+            let out = validate_config_dir(dir.path());
+            assert!(!out.ok, "{action} must be rejected for {applies_to}");
+            let diagnostic = out
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "policy_invalid")
+                .unwrap_or_else(|| {
+                    panic!("missing policy_invalid diagnostic: {:?}", out.diagnostics)
+                });
+            assert_eq!(diagnostic.path, "policies.base.file");
+            assert!(
+                diagnostic.message.contains(expected_kind)
+                    && diagnostic.message.contains(action),
+                "unexpected diagnostic: {diagnostic:?}"
+            );
+        }
+    }
+
+    #[test]
     fn wrong_kind_and_dangling_refs_fail() {
         let dir = fixture();
         fs::write(
@@ -2250,11 +2302,10 @@ version: 1
 groups:
   team: [act-andrew]
 rules:
-  - id: invalid-scope
+  - id: wrong-kind
     allow:
       actors: { group: team }
-      actions: [invoke_query]
-      branch_scope: any
+      actions: [graph_list]
 "#,
         )
         .unwrap();
