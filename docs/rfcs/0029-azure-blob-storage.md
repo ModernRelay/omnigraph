@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed |
+| **Status** | Accepted (2026-08-05) |
 | **Author track** | Public contribution |
 | **Author(s)** | Roey Zalta ([@roy2392](https://github.com/roy2392)) |
 | **Discussion** | [ModernRelay/omnigraph#439](https://github.com/ModernRelay/omnigraph/discussions/439) |
