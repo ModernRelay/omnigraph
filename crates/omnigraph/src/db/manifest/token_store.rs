@@ -64,6 +64,10 @@ const MAX_LIFECYCLE_LEDGER_RECORD_JSON_BYTES: usize = 16 * 1024;
 const MAX_LIFECYCLE_LEDGER_TRANSACTION_JSON_BYTES: usize =
     MAX_LIFECYCLE_LEDGER_RECORDS_PER_TRANSACTION * MAX_LIFECYCLE_LEDGER_RECORD_JSON_BYTES;
 const MAX_LIFECYCLE_LEDGER_TRANSACTION_ARROW_BYTES: u64 = 1024 * 1024;
+/// One graph-level receipt probe normally covers every enrolled declaration in
+/// one structured scan. Larger graphs split into explicit bounded chunks so
+/// the IN predicate and retained decoded receipts cannot grow without limit.
+pub(crate) const MAX_LIFECYCLE_LEDGER_LOOKUP_KEYS_PER_SCAN: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LifecycleLedgerEnvelope {
@@ -1571,6 +1575,108 @@ pub(crate) async fn lookup_lifecycle_ledger_record(
         .await?
         .map(LifecycleLedgerRecord::from_envelope)
         .transpose()
+}
+
+fn collect_requested_lifecycle_ledger_records(
+    requested: &BTreeMap<String, &'static str>,
+    envelopes: Vec<LifecycleLedgerEnvelope>,
+) -> Result<BTreeMap<String, LifecycleLedgerRecord>> {
+    if requested.is_empty() || requested.len() > MAX_LIFECYCLE_LEDGER_LOOKUP_KEYS_PER_SCAN {
+        return Err(OmniError::resource_limit(
+            "stream_lifecycle_ledger_lookup_keys",
+            MAX_LIFECYCLE_LEDGER_LOOKUP_KEYS_PER_SCAN as u64,
+            u64::try_from(requested.len()).unwrap_or(u64::MAX),
+        ));
+    }
+    for (lookup_key, tag) in requested {
+        for (name, value) in [("record tag", *tag), ("record lookup key", lookup_key.as_str())] {
+            if value.is_empty() || value.trim() != value {
+                return Err(OmniError::manifest_internal(format!(
+                    "lifecycle ledger {name} must be non-empty canonical text"
+                )));
+            }
+        }
+    }
+    if envelopes.len() > requested.len() {
+        return Err(OmniError::manifest_internal(
+            "lifecycle ledger batched lookup returned more rows than requested keys",
+        ));
+    }
+
+    let mut selected = BTreeMap::new();
+    for envelope in envelopes {
+        let expected_tag = requested.get(&envelope.record_lookup_key).ok_or_else(|| {
+            OmniError::manifest_internal(
+                "lifecycle ledger batched lookup returned an unexpected record lookup key",
+            )
+        })?;
+        if envelope.record_tag != *expected_tag {
+            return Err(OmniError::manifest_internal(format!(
+                "lifecycle ledger batched lookup expected trusted record tag '{expected_tag}' but received '{}'",
+                envelope.record_tag
+            )));
+        }
+        let lookup_key = envelope.record_lookup_key.clone();
+        let record = LifecycleLedgerRecord::from_envelope(envelope)?;
+        if selected.insert(lookup_key, record).is_some() {
+            return Err(OmniError::manifest_internal(
+                "lifecycle ledger batched lookup returned a duplicate record lookup key",
+            ));
+        }
+    }
+    Ok(selected)
+}
+
+/// Resolve one bounded set of immutable lifecycle-ledger keys with one Lance
+/// scan. The predicate deliberately selects by lookup key alone: a row with an
+/// unexpected tag is returned and refused instead of being hidden by a tag
+/// filter. The rows+1 limit and cross-batch map catch duplicate unenforced keys.
+pub(crate) async fn lookup_lifecycle_ledger_records_batched(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    requested: &BTreeMap<String, &'static str>,
+) -> Result<BTreeMap<String, LifecycleLedgerRecord>> {
+    validate_exact_dataset(dataset, authority).await?;
+    // Validate the bound and request grammar before constructing the IN list.
+    collect_requested_lifecycle_ledger_records(requested, Vec::new())?;
+
+    let mut scanner = dataset.scan();
+    scanner.filter_expr(col("record_lookup_key").in_list(
+        requested.keys().cloned().map(lit).collect(),
+        false,
+    ));
+    scanner.batch_size(MAX_LIFECYCLE_LEDGER_RECORDS_PER_TRANSACTION);
+    scanner.batch_size_bytes(MAX_LIFECYCLE_LEDGER_TRANSACTION_ARROW_BYTES);
+    scanner
+        .limit(
+            Some(
+                i64::try_from(requested.len().saturating_add(1)).map_err(|_| {
+                    OmniError::manifest_internal(
+                        "lifecycle ledger batched lookup row limit exceeds i64",
+                    )
+                })?,
+            ),
+            None,
+        )
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let mut stream = scanner
+        .try_into_stream()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let mut envelopes = Vec::new();
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?
+    {
+        envelopes.extend(lifecycle_ledger_envelopes_from_batch(&batch, None)?);
+        if envelopes.len() > requested.len() {
+            return Err(OmniError::manifest_internal(
+                "lifecycle ledger batched lookup returned more rows than requested keys",
+            ));
+        }
+    }
+    collect_requested_lifecycle_ledger_records(requested, envelopes)
 }
 
 /// Resolve one manifest-selected immutable ledger head by its exact record ID.
@@ -3134,6 +3240,50 @@ mod tests {
         assert_eq!(lookup_keys.len(), records.len());
         assert!(!tags.contains(CURRENT_TOKEN_RECORD_TAG));
         assert!(!tags.contains(PROFILE_MANAGEMENT_RECEIPT_TAG));
+    }
+
+    #[test]
+    fn batched_lifecycle_lookup_refuses_duplicate_unexpected_and_unbounded_rows() {
+        let records = typed_lifecycle_records();
+        let first = records[0].to_envelope().unwrap();
+        let second = records[1].to_envelope().unwrap();
+        let third = records[2].to_envelope().unwrap();
+        let requested = BTreeMap::from([
+            (first.record_lookup_key.clone(), records[0].record_tag()),
+            (second.record_lookup_key.clone(), records[1].record_tag()),
+        ]);
+
+        let duplicate = collect_requested_lifecycle_ledger_records(
+            &requested,
+            vec![first.clone(), first],
+        )
+        .expect_err("one unenforced lookup key may not resolve twice");
+        assert!(duplicate.to_string().contains("duplicate record lookup key"));
+
+        let unexpected = collect_requested_lifecycle_ledger_records(&requested, vec![third])
+            .expect_err("the structured scan may not return an unrequested key");
+        assert!(unexpected.to_string().contains("unexpected record lookup key"));
+
+        let too_many = (0..=MAX_LIFECYCLE_LEDGER_LOOKUP_KEYS_PER_SCAN)
+            .map(|ordinal| {
+                (
+                    format!("stream-control-test:{ordinal}"),
+                    MANAGEMENT_RECEIPT_TAG,
+                )
+            })
+            .collect();
+        let error = collect_requested_lifecycle_ledger_records(&too_many, Vec::new())
+            .expect_err("the one-scan request has an explicit key bound");
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            } if resource == "stream_lifecycle_ledger_lookup_keys"
+                && limit == MAX_LIFECYCLE_LEDGER_LOOKUP_KEYS_PER_SCAN as u64
+                && actual == limit + 1
+        ));
     }
 
     #[test]

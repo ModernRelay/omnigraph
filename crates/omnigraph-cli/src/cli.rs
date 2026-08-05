@@ -16,7 +16,7 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
 URI): query, mutate, load, branch, snapshot, export, commit, schema show/apply.\n  \
-served — require a server: stream ingest/status (graph scope) and graphs (registry scope).\n  \
+served — require a server: stream ingest/status/resume/maintenance (graph scope) and graphs (registry scope).\n  \
 direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
 schema plan, lint).\n  \
 control — manage or inspect a cluster (cluster via --config; policy & queries via \
@@ -394,6 +394,34 @@ pub(crate) enum StreamCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Reopen every sealed declaration in the served graph.
+    Resume {
+        /// Emit the graph-level result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run checked graph-wide maintenance; any enrolled declaration changed
+    /// by the operation must be sealed.
+    Maintenance {
+        #[command(subcommand)]
+        command: StreamMaintenanceCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum StreamMaintenanceCommand {
+    /// Reconcile declared indexes across the graph.
+    EnsureIndices {
+        /// Emit the graph-level result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compact the graph through one coordinated publish.
+    Optimize {
+        /// Emit the graph-level result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -566,8 +594,6 @@ pub(crate) enum StreamDeadLetterCommand {
 pub(crate) enum StreamBlockCommand {
     /// Revalidate and print one bounded page of correction evidence.
     Show {
-        /// Exact manifest table key, for example node:Person.
-        table_key: String,
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,
@@ -586,8 +612,6 @@ pub(crate) enum StreamBlockCommand {
     },
     /// Apply one ordered REPLACE/WITHDRAW plan to the exact blocked cut.
     Correct {
-        /// Exact manifest table key, for example node:Person.
-        table_key: String,
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,

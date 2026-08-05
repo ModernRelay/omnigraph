@@ -219,9 +219,48 @@ graph blocker is resolved. Disconnect
 stops future body polling while already-invoked work remains owned until its
 durability result is classified.
 
-F7a admits an absent declaration lane (prepared lazily) or an existing `OPEN`
-lane. It does not expose resume: a `SEALED` lane after disable/re-enable returns
-`stream_authority_changed` until a later graph-level resume surface exists.
+Ingest admits an absent internal declaration (prepared lazily) or an existing
+`OPEN` one. A `SEALED` declaration returns `stream_authority_changed`; it is
+never resumed as a side effect of ingest.
+
+`POST /graphs/{graph_id}/stream/resume` is the explicit graph-wide resume
+control. It accepts no body and no declaration selector. Under exact checked
+`ENABLED` runtime authority it preflights every enrolled declaration, refuses
+before effects if any declaration is still draining or strictly blocked,
+skips declarations already `OPEN`, and reopens the `SEALED` remainder in a
+deterministic internal order. A retry after an interrupted sequence is
+convergent: declarations already opened are skipped. Physical table, lane,
+claim, and recovery identities never appear in the response.
+
+Two bodyless graph-wide maintenance controls are available. Any enrolled
+declaration that the operation would physically change must be `SEALED`; an
+unaffected `OPEN` declaration does not block derived maintenance:
+
+- `POST /graphs/{graph_id}/stream/maintenance/ensure-indices`
+- `POST /graphs/{graph_id}/stream/maintenance/optimize`
+
+They reuse OmniGraph's existing graph coordinator and Lance maintenance
+adapters; they do not introduce a second WAL, job queue, or persisted
+coordinator. Productive work publishes through the existing one-graph
+recovery/manifest envelope, while the response contains aggregate change,
+pending-index, and repair-needed status only. There is no per-type, per-table,
+or per-dataset endpoint.
+
+The control plane does not turn graph scope into one physical dataset. Resume
+captures the manifest work list once, then performs the necessary
+recovery-covered transitions against the separate Lance datasets in a bounded,
+deterministic sequence because the experimental profile has one resident WAL
+writer slot. Ensure-indices and Optimize already plan the graph once; Optimize
+runs productive physical tasks with bounded concurrency and publishes their
+visibility together. Clients therefore make one graph request and do not pay a
+public request round trip per declaration, while the coordinator still honors
+the real multi-dataset atomicity boundary.
+
+All three controls require graph-scoped `stream_manage`. The actor comes only
+from the server's bearer-token resolution; clients cannot supply one. Runtime,
+recovery, and storage errors are mapped to graph-safe responses that omit
+table keys, dataset locations, manifest/Lance coordinates, and internal
+operation identifiers.
 
 `GET /graphs/{graph_id}/stream/status` returns one checked, read-only
 operational cut for a cluster-served streaming graph. The response is

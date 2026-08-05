@@ -200,15 +200,29 @@ Mutation/Load/delete fail before input reads or durable
 effects. Existing served mutations work only through the restarted
 cluster-booted server's checked runtime authority. Graph-native producers use
 the served [`/stream/ingest` firehose](../operations/server.md#streaming), which
-keeps physical datasets and lanes private. F7a admits absent or `OPEN` lanes;
-it does not resume a `SEALED` lane after disable/re-enable. Branch merge remains refused while the profile is `ENABLED` or
+keeps physical datasets and lanes private. Ingest admits absent or `OPEN`
+internal declarations. After disable/re-enable, run the graph-wide served
+`omnigraph stream resume`; it opens every `SEALED` declaration and exposes no
+per-type, table, or lane selector. Branch merge remains refused while the profile is `ENABLED` or
 `DISABLING`, including through the checked server runtime. A later explicit
 `streaming: false` offline apply publishes `DISABLING`, derives one finite
 manifest lane cut, and serially drains `OPEN`, goal-`SEALED`, and adopted
 `OPEN_AFTER_FOLD` lanes. A selected `DataBlock` leaves the apply pending until
-stopped/offline correction and a retry. Only the no-lane case restores the direct physical lane.
-Already-`SEALED` enrollments remain fenced, so use the strict export/init/load
-rebuild to return an enrolled graph to that non-streaming lane.
+stopped/offline correction and a retry. Only the no-lane case restores the
+direct physical lane. A disabled enrolled graph remains a checked
+served/export state; resume is available only after the profile is enabled and
+the cluster-booted server is restarted.
+
+The sealed window is also the supported maintenance window. After applying
+`streaming: true` and restarting—but before `stream resume`—run
+`stream maintenance ensure-indices` and/or `stream maintenance optimize`.
+These controls operate on the whole graph through the existing coordinated
+manifest/recovery paths. They do not accept a declaration selector and return
+only aggregate results. Resume is convergent rather than a new all-dataset
+transaction: it preflights the complete graph, then reopens internal
+declarations in deterministic order; if an unexpected race interrupts the
+sequence, retrying the same graph-level command skips declarations already
+`OPEN` and continues the remainder.
 
 ### Strict drain blocks: inspect → correct → retry
 
@@ -217,19 +231,21 @@ and inspect the exact blocked cut through the cluster control plane:
 
 ```bash
 omnigraph --graph knowledge --as andrew \
-  cluster stream block show node:Person \
+  cluster stream block show \
   --config company-brain --block-token <token> \
   --confirm-stream-offline --json
 
 omnigraph --graph knowledge --as andrew \
-  cluster stream block correct node:Person \
+  cluster stream block correct \
   --config company-brain --block-token <token> \
   --correction-id <uuid> --expected-lifecycle-revision <revision> \
   --plan correction.json --confirm-stream-offline --json
 ```
 
 `show` reconstructs validator evidence from the retained immutable WAL
-generation and returns a bounded page; follow `next_cursor` until it is absent.
+generation and returns a bounded page; the opaque block token resolves the
+affected internal declaration, so the user never supplies a type/table/lane
+selector. Follow `next_cursor` until it is absent.
 Build an ordered plan that chooses `REPLACE` or `WITHDRAW` for the entries it
 changes; unmentioned keys retain their blocked winner, and the resulting
 complete overlay must clear every violation. `correct` revalidates the block,
@@ -260,13 +276,16 @@ omnigraph --graph knowledge --as andrew \
 Follow `next_cursor` with `--cursor` until it is absent. Both commands pin the
 manifest-selected token version; export verifies the recovery-owned object
 descriptor and does not prefix-list storage. Payload export is an inspection
-artifact, not replay or import. A fresh ordinary stream occurrence can restore
+artifact, not replay or import. Each entry names its logical node/edge
+declaration while keeping the physical table and dataset private. A fresh ordinary stream occurrence can restore
 `PRESENT` by naming the terminal token as predecessor.
 The graph-native `stream ingest` command and
 `POST /graphs/{graph_id}/stream/ingest` route can submit that occurrence while
 the enabled lane is absent or `OPEN`; payload export itself does not replay it
-automatically. Once the lane is terminally disabled/`SEALED`, retirement and
-rebuild remain the public exit until resume control ships.
+automatically. If the declaration is `SEALED`, re-enable/restart the served
+graph and run graph-wide `stream resume` before submitting the successor.
+Retirement and rebuild remain the irreversible exit when terminal sequencing
+authority must be discarded for export.
 
 ### Terminal authority retirement: plan → confirm → rebuild
 

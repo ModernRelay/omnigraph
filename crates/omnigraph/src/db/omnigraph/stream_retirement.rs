@@ -71,6 +71,9 @@ const DEAD_LETTER_PAGE_ENVELOPE_BYTES: usize = 64 * 1024;
 const DEAD_LETTER_CURSOR_MAX_DECODED_BYTES: usize = 4 * 1024;
 const DEAD_LETTER_CURSOR_MAX_ENCODED_BYTES: usize =
     DEAD_LETTER_CURSOR_MAX_DECODED_BYTES.div_ceil(3) * 4;
+const DEAD_LETTER_CURSOR_FORMAT: &str = "omnigraph.stream-dead-letter-cursor.v1";
+const DEAD_LETTER_CURSOR_BINDING_DOMAIN: &[u8] =
+    b"omnigraph.stream-dead-letter-cursor-binding.v1\0";
 const MAX_STREAM_TERMINAL_TOKEN_SAMPLE_ROWS: usize = 16;
 
 /// Complete in-process full-root cut envelope shared by authority retirement
@@ -215,13 +218,18 @@ struct CapturedStreamDeadLetterPage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StreamDeadLetterCursor {
-    source_manifest_version: u64,
-    source_profile_revision: u64,
-    token_table_version: u64,
-    token_transaction_uuid: String,
-    last_stable_table_id: u64,
-    last_table_incarnation_id: u64,
-    last_logical_id: String,
+    format: String,
+    declaration_kind: StreamDeadLetterCursorDeclarationKind,
+    declaration_type: String,
+    logical_id: String,
+    authority_binding: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StreamDeadLetterCursorDeclarationKind {
+    Node,
+    Edge,
 }
 
 /// Exact frozen branch member named by one retired export. The receipt binds
@@ -522,15 +530,14 @@ impl Omnigraph {
             .capture_stream_dead_letter_page(&authority, cursor)
             .await?;
         let cut_cursor = |entry: &CapturedStreamDeadLetterEntry| {
-            encode_stream_dead_letter_cursor(&StreamDeadLetterCursor {
-                source_manifest_version: captured.source_manifest_version,
-                source_profile_revision: captured.source_profile_revision,
-                token_table_version: captured.token_table_version,
-                token_transaction_uuid: captured.token_transaction_uuid.clone(),
-                last_stable_table_id: entry.key.identity.stable_table_id,
-                last_table_incarnation_id: entry.key.identity.table_incarnation_id,
-                last_logical_id: entry.key.logical_id.clone(),
-            })
+            encode_stream_dead_letter_cursor(
+                captured.source_manifest_version,
+                captured.source_profile_revision,
+                captured.token_table_version,
+                &captured.token_transaction_uuid,
+                &entry.key,
+                &entry.public.table_key,
+            )
         };
 
         let mut entries = Vec::new();
@@ -642,24 +649,17 @@ impl Omnigraph {
         let cursor = encoded_cursor
             .map(decode_stream_dead_letter_cursor)
             .transpose()?;
-        if cursor.as_ref().is_some_and(|cursor| {
-            cursor.source_manifest_version != snapshot.version()
-                || cursor.source_profile_revision != snapshot.stream_profile().profile_revision
-                || cursor.token_table_version != token_head.table_version
-                || cursor.token_transaction_uuid != token_head.transaction_uuid
-        }) {
-            return Err(OmniError::StreamingAuthorityMismatch {
-                reason: "stream dead-letter cursor belongs to another manifest/profile/token cut"
-                    .to_string(),
-            });
-        }
-        let after = cursor.as_ref().map(|cursor| StreamDeadLetterKey {
-            identity: TableIdentity {
-                stable_table_id: cursor.last_stable_table_id,
-                table_incarnation_id: cursor.last_table_incarnation_id,
-            },
-            logical_id: cursor.last_logical_id.clone(),
-        });
+        let after = cursor
+            .as_ref()
+            .map(|cursor| {
+                resolve_stream_dead_letter_cursor(
+                    cursor,
+                    &snapshot,
+                    token_head.table_version,
+                    &token_head.transaction_uuid,
+                )
+            })
+            .transpose()?;
 
         let table_keys = snapshot
             .entries()
@@ -798,15 +798,14 @@ impl Omnigraph {
                     "dead-letter scan found additional entries but retained no page boundary",
                 )
             })?;
-            Some(encode_stream_dead_letter_cursor(&StreamDeadLetterCursor {
-                source_manifest_version: snapshot.version(),
-                source_profile_revision: snapshot.stream_profile().profile_revision,
-                token_table_version: token_head.table_version,
-                token_transaction_uuid: token_head.transaction_uuid.clone(),
-                last_stable_table_id: last.key.identity.stable_table_id,
-                last_table_incarnation_id: last.key.identity.table_incarnation_id,
-                last_logical_id: last.key.logical_id.clone(),
-            })?)
+            Some(encode_stream_dead_letter_cursor(
+                snapshot.version(),
+                snapshot.stream_profile().profile_revision,
+                token_head.table_version,
+                &token_head.transaction_uuid,
+                &last.key,
+                &last.public.table_key,
+            )?)
         } else {
             None
         };
@@ -1809,8 +1808,100 @@ fn validate_dead_letter_payload_binding(
     Ok(())
 }
 
-fn encode_stream_dead_letter_cursor(cursor: &StreamDeadLetterCursor) -> Result<String> {
-    let bytes = serde_json::to_vec(cursor).map_err(|error| {
+impl StreamDeadLetterCursorDeclarationKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Edge => "edge",
+        }
+    }
+
+    fn table_key(self, type_name: &str) -> String {
+        format!("{}:{type_name}", self.as_str())
+    }
+}
+
+fn stream_dead_letter_cursor_declaration(
+    table_key: &str,
+) -> Result<(StreamDeadLetterCursorDeclarationKind, String)> {
+    let (kind, type_name) = if let Some(type_name) = table_key.strip_prefix("node:") {
+        (StreamDeadLetterCursorDeclarationKind::Node, type_name)
+    } else if let Some(type_name) = table_key.strip_prefix("edge:") {
+        (StreamDeadLetterCursorDeclarationKind::Edge, type_name)
+    } else {
+        return Err(OmniError::manifest_internal(
+            "stream dead-letter cursor cannot project an invalid logical declaration key",
+        ));
+    };
+    if type_name.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "stream dead-letter cursor cannot project an empty logical declaration name",
+        ));
+    }
+    Ok((kind, type_name.to_string()))
+}
+
+fn stream_dead_letter_cursor_authority_binding(
+    cursor: &StreamDeadLetterCursor,
+    source_manifest_version: u64,
+    source_profile_revision: u64,
+    token_table_version: u64,
+    token_transaction_uuid: &str,
+    identity: TableIdentity,
+) -> String {
+    // The manifest-selected token transaction UUID is high-entropy authority
+    // that is deliberately absent from the public cursor. Derive a private
+    // cut key first, then frame that key on both sides of the public cursor
+    // preimage. This avoids a forgeable checksum (and secret-prefix length
+    // extension) without introducing process-local state or another persisted
+    // signing key.
+    let mut cut_key_hasher = Sha256::new();
+    hash_field(&mut cut_key_hasher, DEAD_LETTER_CURSOR_BINDING_DOMAIN);
+    hash_u64(&mut cut_key_hasher, source_manifest_version);
+    hash_u64(&mut cut_key_hasher, source_profile_revision);
+    hash_u64(&mut cut_key_hasher, token_table_version);
+    hash_field(&mut cut_key_hasher, token_transaction_uuid.as_bytes());
+    hash_u64(&mut cut_key_hasher, identity.stable_table_id);
+    hash_u64(&mut cut_key_hasher, identity.table_incarnation_id);
+    let cut_key = cut_key_hasher.finalize();
+
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, DEAD_LETTER_CURSOR_BINDING_DOMAIN);
+    hash_field(&mut hasher, &cut_key);
+    hash_field(&mut hasher, cursor.format.as_bytes());
+    hash_field(&mut hasher, cursor.declaration_kind.as_str().as_bytes());
+    hash_field(&mut hasher, cursor.declaration_type.as_bytes());
+    hash_field(&mut hasher, cursor.logical_id.as_bytes());
+    hash_field(&mut hasher, &cut_key);
+    finish_digest(hasher)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_stream_dead_letter_cursor(
+    source_manifest_version: u64,
+    source_profile_revision: u64,
+    token_table_version: u64,
+    token_transaction_uuid: &str,
+    key: &StreamDeadLetterKey,
+    table_key: &str,
+) -> Result<String> {
+    let (declaration_kind, declaration_type) = stream_dead_letter_cursor_declaration(table_key)?;
+    let mut cursor = StreamDeadLetterCursor {
+        format: DEAD_LETTER_CURSOR_FORMAT.to_string(),
+        declaration_kind,
+        declaration_type,
+        logical_id: key.logical_id.clone(),
+        authority_binding: String::new(),
+    };
+    cursor.authority_binding = stream_dead_letter_cursor_authority_binding(
+        &cursor,
+        source_manifest_version,
+        source_profile_revision,
+        token_table_version,
+        token_transaction_uuid,
+        key.identity,
+    );
+    let bytes = serde_json::to_vec(&cursor).map_err(|error| {
         OmniError::manifest_internal(format!(
             "failed to encode stream dead-letter cursor: {error}"
         ))
@@ -1852,18 +1943,49 @@ fn decode_stream_dead_letter_cursor(encoded: &str) -> Result<StreamDeadLetterCur
             "invalid stream dead-letter cursor payload: {error}"
         ))
     })?;
-    if cursor.source_manifest_version == 0
-        || cursor.source_profile_revision == 0
-        || cursor.token_table_version == 0
-        || cursor.token_transaction_uuid.is_empty()
-        || cursor.last_stable_table_id == 0
-        || cursor.last_table_incarnation_id == 0
-    {
+    if cursor.format != DEAD_LETTER_CURSOR_FORMAT || cursor.declaration_type.is_empty() {
         return Err(OmniError::manifest(
             "invalid stream dead-letter cursor fields",
         ));
     }
+    validate_canonical_retirement_digest(
+        "stream dead-letter cursor authority binding",
+        &cursor.authority_binding,
+    )?;
     Ok(cursor)
+}
+
+fn resolve_stream_dead_letter_cursor(
+    cursor: &StreamDeadLetterCursor,
+    snapshot: &crate::db::manifest::Snapshot,
+    token_table_version: u64,
+    token_transaction_uuid: &str,
+) -> Result<StreamDeadLetterKey> {
+    let table_key = cursor.declaration_kind.table_key(&cursor.declaration_type);
+    let entry =
+        snapshot
+            .entry(&table_key)
+            .ok_or_else(|| OmniError::StreamingAuthorityMismatch {
+                reason: "stream dead-letter cursor belongs to another graph authority cut"
+                    .to_string(),
+            })?;
+    let expected = stream_dead_letter_cursor_authority_binding(
+        cursor,
+        snapshot.version(),
+        snapshot.stream_profile().profile_revision,
+        token_table_version,
+        token_transaction_uuid,
+        entry.identity,
+    );
+    if cursor.authority_binding != expected {
+        return Err(OmniError::StreamingAuthorityMismatch {
+            reason: "stream dead-letter cursor belongs to another graph authority cut".to_string(),
+        });
+    }
+    Ok(StreamDeadLetterKey {
+        identity: entry.identity,
+        logical_id: cursor.logical_id.clone(),
+    })
 }
 
 fn enforce_dead_letter_page_bound(resource: &'static str, page: &impl Serialize) -> Result<()> {
@@ -2397,25 +2519,87 @@ fn finish_digest(hasher: Sha256) -> String {
 mod tests {
     use super::*;
 
-    fn cursor() -> StreamDeadLetterCursor {
-        StreamDeadLetterCursor {
-            source_manifest_version: 9,
-            source_profile_revision: 4,
-            token_table_version: 7,
-            token_transaction_uuid: "00000000-0000-4000-8000-000000000001".to_string(),
-            last_stable_table_id: 11,
-            last_table_incarnation_id: 12,
-            last_logical_id: "person-42".to_string(),
+    const CURSOR_TOKEN_TRANSACTION: &str = "00000000-0000-4000-8000-000000000001";
+
+    fn cursor_key() -> StreamDeadLetterKey {
+        StreamDeadLetterKey {
+            identity: TableIdentity::new(11, 12).unwrap(),
+            logical_id: "person-42".to_string(),
         }
     }
 
     #[test]
-    fn dead_letter_cursor_round_trips_exact_cut_and_boundary() {
-        let expected = cursor();
-        let encoded = encode_stream_dead_letter_cursor(&expected).unwrap();
+    fn dead_letter_cursor_exposes_only_logical_boundary_and_bound_digest() {
+        let encoded = encode_stream_dead_letter_cursor(
+            9,
+            4,
+            7,
+            CURSOR_TOKEN_TRANSACTION,
+            &cursor_key(),
+            "node:Person",
+        )
+        .unwrap();
+        let decoded_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&encoded)
+            .unwrap();
+        let decoded_json: serde_json::Value = serde_json::from_slice(&decoded_bytes).unwrap();
+        assert_eq!(decoded_json["format"], DEAD_LETTER_CURSOR_FORMAT);
+        assert_eq!(decoded_json["declaration_kind"], "node");
+        assert_eq!(decoded_json["declaration_type"], "Person");
+        assert_eq!(decoded_json["logical_id"], "person-42");
+        assert!(
+            decoded_json["authority_binding"]
+                .as_str()
+                .is_some_and(|binding| binding.starts_with("sha256:"))
+        );
+        let rendered = String::from_utf8(decoded_bytes).unwrap();
+        for forbidden in [
+            "source_manifest_version",
+            "source_profile_revision",
+            "token_table_version",
+            "token_transaction_uuid",
+            "stable_table_id",
+            "table_incarnation_id",
+            CURSOR_TOKEN_TRANSACTION,
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "cursor leaked {forbidden}: {rendered}"
+            );
+        }
+
+        let decoded = decode_stream_dead_letter_cursor(&encoded).unwrap();
         assert_eq!(
-            decode_stream_dead_letter_cursor(&encoded).unwrap(),
-            expected
+            decoded.declaration_kind,
+            StreamDeadLetterCursorDeclarationKind::Node
+        );
+        assert_eq!(decoded.declaration_type, "Person");
+        assert_eq!(decoded.logical_id, "person-42");
+        assert_eq!(
+            decoded.authority_binding,
+            stream_dead_letter_cursor_authority_binding(
+                &decoded,
+                9,
+                4,
+                7,
+                CURSOR_TOKEN_TRANSACTION,
+                cursor_key().identity,
+            )
+        );
+
+        let mut tampered = decoded;
+        tampered.logical_id = "person-43".to_string();
+        assert_ne!(
+            tampered.authority_binding,
+            stream_dead_letter_cursor_authority_binding(
+                &tampered,
+                9,
+                4,
+                7,
+                CURSOR_TOKEN_TRANSACTION,
+                cursor_key().identity,
+            ),
+            "the logical page boundary must be integrity-bound to the hidden cut"
         );
     }
 

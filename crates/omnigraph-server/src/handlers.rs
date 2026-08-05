@@ -775,6 +775,147 @@ pub(crate) async fn server_stream_status(
     ))
 }
 
+fn authorize_graph_stream_management<'a>(
+    handle: &GraphHandle,
+    actor: Option<&'a ResolvedActor>,
+) -> std::result::Result<&'a str, ApiError> {
+    if handle.policy.is_none() {
+        // A configured graph policy is installed on the engine, which makes
+        // its graph-scoped StreamManage decision authoritative. Without one,
+        // preserve the server's open-mode / authenticated-default-deny
+        // contract before any management work starts.
+        authorize_request(
+            actor,
+            None,
+            PolicyRequest {
+                action: PolicyAction::StreamManage,
+                branch: None,
+                target_branch: None,
+            },
+        )?;
+    }
+    Ok(actor.map_or("anonymous", |actor| actor.actor_id.as_ref()))
+}
+
+async fn require_empty_graph_stream_management_body(
+    body: Body,
+) -> std::result::Result<(), ApiError> {
+    // A zero-byte collection limit accepts a genuinely empty body while
+    // refusing on the first data byte, so selector-shaped payloads are rejected
+    // without buffering them or reaching authorization/engine effects.
+    axum::body::to_bytes(body, 0).await.map_err(|_| {
+        ApiError::bad_request("graph stream management does not accept a request body")
+    })?;
+    Ok(())
+}
+
+#[utoipa::path(
+    post,
+    path = "/stream/resume",
+    tag = "streaming",
+    operation_id = "stream_resume",
+    responses(
+        (status = 200, description = "All sealed streaming declarations were reopened through graph authority", body = StreamResumeOutput),
+        (status = 400, description = "The bodyless graph control received a request body", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "The actor is not authorized for graph stream management", body = ErrorOutput),
+        (status = 409, description = "The graph streaming profile or lifecycle is not ready to resume", body = ErrorOutput),
+        (status = 413, description = "The bounded graph management operation exceeded a hard limit", body = ErrorOutput),
+        (status = 500, description = "Graph stream resume failed without exposing physical diagnostics", body = ErrorOutput),
+        (status = 503, description = "Graph recovery must complete before resume can proceed", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Reopen every sealed streaming declaration in the graph.
+///
+/// The operation is deliberately bodyless and graph-wide: callers cannot
+/// select a logical type, table, lane, dataset, or physical maintenance
+/// target. The server supplies the bearer-resolved actor and the engine
+/// performs the authoritative graph-scoped `stream_manage` check.
+pub(crate) async fn server_stream_resume(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    body: Body,
+) -> std::result::Result<Json<StreamResumeOutput>, ApiError> {
+    require_empty_graph_stream_management_body(body).await?;
+    let actor_id =
+        authorize_graph_stream_management(&handle, actor.as_ref().map(|Extension(actor)| actor))?;
+    let result = handle
+        .engine
+        .resume_served_graph_stream_as(actor_id)
+        .await
+        .map_err(|error| ApiError::from_graph_stream_management(error, "resume"))?;
+    Ok(Json(stream_resume_output(result)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/stream/maintenance/ensure-indices",
+    tag = "streaming",
+    operation_id = "stream_ensure_indices",
+    responses(
+        (status = 200, description = "Indexes were checked across the graph; affected enrolled declarations were sealed", body = StreamEnsureIndicesOutput),
+        (status = 400, description = "The bodyless graph control received a request body", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "The actor is not authorized for graph stream management", body = ErrorOutput),
+        (status = 409, description = "The graph is not in the sealed maintenance posture", body = ErrorOutput),
+        (status = 413, description = "The bounded graph management operation exceeded a hard limit", body = ErrorOutput),
+        (status = 500, description = "Graph index maintenance failed without exposing physical diagnostics", body = ErrorOutput),
+        (status = 503, description = "Graph recovery must complete before maintenance can proceed", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Refresh graph index state; any enrolled declaration changed must be sealed.
+pub(crate) async fn server_stream_ensure_indices(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    body: Body,
+) -> std::result::Result<Json<StreamEnsureIndicesOutput>, ApiError> {
+    require_empty_graph_stream_management_body(body).await?;
+    let actor_id =
+        authorize_graph_stream_management(&handle, actor.as_ref().map(|Extension(actor)| actor))?;
+    let result = handle
+        .engine
+        .ensure_served_graph_stream_indices_as(actor_id)
+        .await
+        .map_err(|error| ApiError::from_graph_stream_management(error, "ensure indices"))?;
+    Ok(Json(stream_ensure_indices_output(result)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/stream/maintenance/optimize",
+    tag = "streaming",
+    operation_id = "stream_optimize",
+    responses(
+        (status = 200, description = "The graph was considered for optimization; affected enrolled declarations were sealed", body = StreamOptimizeOutput),
+        (status = 400, description = "The bodyless graph control received a request body", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "The actor is not authorized for graph stream management", body = ErrorOutput),
+        (status = 409, description = "The graph is not in the sealed maintenance posture", body = ErrorOutput),
+        (status = 413, description = "The bounded graph management operation exceeded a hard limit", body = ErrorOutput),
+        (status = 500, description = "Graph stream optimization failed without exposing physical diagnostics", body = ErrorOutput),
+        (status = 503, description = "Graph recovery must complete before maintenance can proceed", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Optimize the graph; any enrolled declaration changed must be sealed.
+pub(crate) async fn server_stream_optimize(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    body: Body,
+) -> std::result::Result<Json<StreamOptimizeOutput>, ApiError> {
+    require_empty_graph_stream_management_body(body).await?;
+    let actor_id =
+        authorize_graph_stream_management(&handle, actor.as_ref().map(|Extension(actor)| actor))?;
+    let result = handle
+        .engine
+        .optimize_served_graph_stream_as(actor_id)
+        .await
+        .map_err(|error| ApiError::from_graph_stream_management(error, "optimize"))?;
+    Ok(Json(stream_optimize_output(result)))
+}
+
 fn require_graph_stream_content_type(
     headers: &axum::http::HeaderMap,
 ) -> std::result::Result<(), ApiError> {

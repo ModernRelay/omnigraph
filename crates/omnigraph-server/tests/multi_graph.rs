@@ -14,8 +14,9 @@ use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_server::api::{
     ChangeRequest, ErrorOutput, ExportRequest, QueryRequest, ReadRequest, StreamDriverStateOutput,
-    StreamIngestChallenge, StreamIngestKindOutput, StreamIngestLineOutput,
-    StreamIngestStatusOutput, StreamProfileModeOutput, StreamStatusOutput,
+    StreamEnsureIndicesOutput, StreamIngestChallenge, StreamIngestKindOutput,
+    StreamIngestLineOutput, StreamIngestStatusOutput, StreamOptimizeOutput,
+    StreamProfileModeOutput, StreamResumeOutput, StreamStatusOutput,
 };
 use omnigraph_server::{AppState, build_app};
 use serde_json::Value;
@@ -622,6 +623,98 @@ async fn cluster_boot_installs_enabled_stream_runtime_authority() {
     assert_eq!(status.driver.state, StreamDriverStateOutput::Running);
     assert!(!status.rebuild.ready);
 
+    for path in [
+        "/graphs/knowledge/stream/resume",
+        "/graphs/knowledge/stream/maintenance/ensure-indices",
+        "/graphs/knowledge/stream/maintenance/optimize",
+    ] {
+        let (rejected_status, rejected_body) = json_response(
+            &app,
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"type":"Person"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            rejected_status,
+            StatusCode::BAD_REQUEST,
+            "selector body must be rejected by {path}: {rejected_body}"
+        );
+        let error: ErrorOutput = serde_json::from_value(rejected_body).unwrap();
+        assert!(
+            error.error.contains("does not accept a request body"),
+            "{path}: {error:?}"
+        );
+        assert!(
+            engine.stream_status().await.unwrap().tables.is_empty(),
+            "a rejected graph control body cannot initialize a private declaration"
+        );
+    }
+
+    let (resume_status, resume_body) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/graphs/knowledge/stream/resume")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resume_status, StatusCode::OK, "{resume_body}");
+    let resume: StreamResumeOutput = serde_json::from_value(resume_body.clone()).unwrap();
+    assert_eq!(resume.profile_revision, status.profile_revision);
+    assert_eq!(resume.enrolled_declarations, 0);
+    assert_eq!(resume.resumed_declarations, 0);
+    assert_eq!(resume.already_open_declarations, 0);
+
+    let (ensure_status, ensure_body) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/graphs/knowledge/stream/maintenance/ensure-indices")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(ensure_status, StatusCode::OK, "{ensure_body}");
+    let _: StreamEnsureIndicesOutput = serde_json::from_value(ensure_body.clone()).unwrap();
+
+    let (optimize_status, optimize_body) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/graphs/knowledge/stream/maintenance/optimize")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(optimize_status, StatusCode::OK, "{optimize_body}");
+    let _: StreamOptimizeOutput = serde_json::from_value(optimize_body.clone()).unwrap();
+
+    for output in [&resume_body, &ensure_body, &optimize_body] {
+        let rendered = output.to_string();
+        for forbidden in [
+            "type_name",
+            "table_key",
+            "stable_table_id",
+            "table_incarnation_id",
+            "stream_incarnation_id",
+            "lane",
+            "dataset",
+            "operation_id",
+            "block_token",
+            "recovery",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "graph streaming control leaked '{forbidden}': {output}"
+            );
+        }
+    }
+
     let (status, body) = json_response(
         &app,
         Request::builder()
@@ -994,7 +1087,7 @@ query streamed_edge() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn authenticated_default_deny_refuses_stream_ingest_before_body_ownership() {
+async fn authenticated_default_deny_refuses_stream_writes_before_effects() {
     let (_temp, state, engine) = enabled_stream_state(vec![(
         "stream-actor".to_string(),
         "stream-secret".to_string(),
@@ -1028,6 +1121,32 @@ async fn authenticated_default_deny_refuses_stream_ingest_before_body_ownership(
         engine.stream_status().await.unwrap().tables.is_empty(),
         "a default-denied request cannot lazily enroll a private lane"
     );
+    for path in [
+        "/graphs/knowledge/stream/resume",
+        "/graphs/knowledge/stream/maintenance/ensure-indices",
+        "/graphs/knowledge/stream/maintenance/optimize",
+    ] {
+        let (status, body) = json_response(
+            &app,
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header("authorization", "Bearer stream-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+        let error: ErrorOutput = serde_json::from_value(body).unwrap();
+        assert!(
+            error.error.contains("default-deny mode"),
+            "{path}: {error:?}"
+        );
+        assert!(
+            engine.stream_status().await.unwrap().tables.is_empty(),
+            "default-denied graph control {path} cannot create a private lane"
+        );
+    }
     let (status, body) = json_response(
         &app,
         Request::builder()

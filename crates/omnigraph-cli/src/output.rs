@@ -312,6 +312,14 @@ pub(crate) fn render_stream_status_human(output: &StreamStatusOutput) -> String 
                 writeln!(rendered, "      drain: {} / {}", drain.goal, drain.phase)
                     .expect("writing stream status to a String cannot fail");
             }
+            if let Some(fold) = status.last_fold.as_ref() {
+                writeln!(
+                    rendered,
+                    "      last fold: {} ({} input row(s), {} visible row(s), recorded {})",
+                    fold.outcome, fold.input_rows, fold.visible_rows, fold.recorded_at
+                )
+                .expect("writing stream status to a String cannot fail");
+            }
         }
     }
     writeln!(
@@ -354,6 +362,10 @@ pub(crate) fn render_stream_status_human(output: &StreamStatusOutput) -> String 
         };
         result.expect("writing stream status to a String cannot fail");
     }
+    if let Some(kind) = output.driver.last_completion_kind.as_deref() {
+        writeln!(rendered, "    last completion: {kind}")
+            .expect("writing stream status to a String cannot fail");
+    }
     if output.rebuild.ready {
         writeln!(rendered, "  rebuild: ready")
             .expect("writing stream status to a String cannot fail");
@@ -364,6 +376,44 @@ pub(crate) fn render_stream_status_human(output: &StreamStatusOutput) -> String 
             render_stream_rebuild_blocker(&mut rendered, blocker);
         }
     }
+    let next = if output.recovery_pending_count > 0 {
+        "reopen/restart the graph to resolve recovery before another stream operation"
+    } else if output
+        .enrolled_declarations
+        .iter()
+        .any(|status| status.strict_block.is_some())
+    {
+        "stop serving, inspect the graph-level block token, correct it, then retry the control"
+    } else if output
+        .enrolled_declarations
+        .iter()
+        .any(|status| status.lifecycle == StreamLifecycleOutput::Draining)
+    {
+        "wait for the drain, or retry the stopped-cluster apply after correcting a block"
+    } else {
+        match output.profile_mode {
+            StreamProfileModeOutput::Enabled
+                if output
+                    .enrolled_declarations
+                    .iter()
+                    .any(|status| status.lifecycle == StreamLifecycleOutput::Sealed) =>
+            {
+                "optionally run graph-wide `stream maintenance ensure-indices|optimize`, then `stream resume`"
+            }
+            StreamProfileModeOutput::Enabled => {
+                "send graph rows with `omnigraph stream ingest`"
+            }
+            StreamProfileModeOutput::Disabling => {
+                "stop serving and retry `omnigraph cluster apply` to finish disabling"
+            }
+            StreamProfileModeOutput::Disabled => {
+                "set `streaming: true`, apply the cluster config, and restart the server"
+            }
+            StreamProfileModeOutput::Retired => "export and rebuild into a fresh graph",
+        }
+    };
+    writeln!(rendered, "  next: {next}")
+        .expect("writing stream status to a String cannot fail");
     rendered
 }
 
@@ -378,6 +428,57 @@ pub(crate) fn finish_stream_status(output: &StreamStatusOutput, json: bool) -> R
         print_stream_status_human(output);
         Ok(())
     }
+}
+
+pub(crate) fn finish_stream_resume(output: &StreamResumeOutput, json: bool) -> Result<()> {
+    if json {
+        return print_json(output);
+    }
+    println!(
+        "stream resume: {} resumed, {} already open ({} enrolled; profile revision {})",
+        output.resumed_declarations,
+        output.already_open_declarations,
+        output.enrolled_declarations,
+        output.profile_revision
+    );
+    Ok(())
+}
+
+pub(crate) fn finish_stream_ensure_indices(
+    output: &StreamEnsureIndicesOutput,
+    json: bool,
+) -> Result<()> {
+    if json {
+        return print_json(output);
+    }
+    println!(
+        "stream index maintenance: {} ({} pending index(es))",
+        if output.changed { "published" } else { "no change" },
+        output.pending_index_count
+    );
+    Ok(())
+}
+
+pub(crate) fn finish_stream_optimize(output: &StreamOptimizeOutput, json: bool) -> Result<()> {
+    if json {
+        return print_json(output);
+    }
+    println!(
+        "stream optimize: {} ({} pending index(es))",
+        if output.changed { "published" } else { "no change" },
+        output.pending_index_count
+    );
+    if output.requires_repair {
+        println!("{}", stream_optimize_drift_advice());
+    }
+    Ok(())
+}
+
+fn stream_optimize_drift_advice() -> &'static str {
+    concat!(
+        "  uncovered storage drift needs offline review; stop serving and preserve the root\n",
+        "  enrolled drift has no supported in-place repair; rebuild a fresh graph from the last verified clean export or backup",
+    )
 }
 
 pub(crate) fn print_cluster_validate_human(output: &ValidateOutput) {
@@ -660,10 +761,9 @@ pub(crate) fn finish_stream_block_show(output: &StreamBlockShowOutput, json: boo
         print_json(output)?;
     } else if let Some(page) = output.page.as_ref() {
         println!("stream data block for {}", output.graph_id);
-        println!("  table: {}", page.table_key);
         println!(
-            "  table identity: {}:{}",
-            page.stable_table_id, page.table_incarnation_id
+            "  declaration: {} {}",
+            page.declaration.kind, page.declaration.type_name
         );
         println!("  block token: {}", page.block_token);
         println!("  lifecycle revision: {}", page.lifecycle_revision);
@@ -703,7 +803,6 @@ pub(crate) fn finish_stream_dead_letter_list(
             "  source profile revision: {}",
             page.source_profile_revision
         );
-        println!("  token table version: {}", page.token_table_version);
         println!("  entries:");
         for entry in &page.entries {
             println!("    {}", serde_json::to_string(entry)?);
@@ -739,7 +838,6 @@ pub(crate) fn finish_stream_dead_letter_export(
             "  source profile revision: {}",
             page.source_profile_revision
         );
-        println!("  token table version: {}", page.token_table_version);
         println!("  entries:");
         for entry in &page.entries {
             println!("    {}", serde_json::to_string(entry)?);
@@ -1453,7 +1551,7 @@ mod tests {
     use omnigraph_compiler::schema::parser::parse_schema;
     use std::collections::BTreeMap;
 
-    use super::{render_annotations, render_stream_status_human};
+    use super::{render_annotations, render_stream_status_human, stream_optimize_drift_advice};
 
     #[test]
     fn render_annotations_quotes_values_so_embed_round_trips() {
@@ -1528,7 +1626,9 @@ mod tests {
         assert!(
             rendered.contains("driver: failed (advisory; 5 pending, 6 open fold(s) published)")
         );
+        assert!(rendered.contains("last completion: folded"));
         assert!(rendered.contains("terminal sequencing authority: 1 withdrawn, 2 dead-lettered"));
+        assert!(rendered.contains("next: reopen/restart the graph to resolve recovery"));
         for forbidden in [
             "dataset",
             "table_key",
@@ -1543,5 +1643,14 @@ mod tests {
                 "human output leaked private vocabulary: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn stream_optimize_drift_advice_does_not_promise_enrolled_repair() {
+        let advice = stream_optimize_drift_advice();
+        assert!(advice.contains("stop serving and preserve the root"));
+        assert!(advice.contains("enrolled drift has no supported in-place repair"));
+        assert!(advice.contains("rebuild a fresh graph"));
+        assert!(!advice.contains("omnigraph repair"));
     }
 }

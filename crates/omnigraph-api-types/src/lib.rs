@@ -5,8 +5,9 @@
 
 use omnigraph::db::{
     GraphCommit, GraphStreamDeclaration, GraphStreamDeclarationStatus,
-    GraphStreamDriverErrorStatus, GraphStreamDriverStatus, GraphStreamOperationalStatus,
-    GraphStreamPendingStatus, GraphStreamRebuildBlocker, GraphStreamRebuildStatus,
+    GraphStreamDriverErrorStatus, GraphStreamDriverStatus, GraphStreamEnsureIndicesResult,
+    GraphStreamOperationalStatus, GraphStreamOptimizeResult, GraphStreamPendingStatus,
+    GraphStreamRebuildBlocker, GraphStreamRebuildStatus, GraphStreamResumeResult,
     GraphStreamTokenCounts, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot,
 };
 use omnigraph::error::{MergeConflict, MergeConflictKind};
@@ -823,6 +824,61 @@ pub struct StreamStatusOutput {
     pub recovery_pending_count: u64,
     pub driver: StreamDriverStatusOutput,
     pub rebuild: StreamRebuildStatusOutput,
+}
+
+/// Aggregate result of reopening every sealed streaming declaration in a
+/// graph. Declaration, table, lane, dataset, and recovery identities are
+/// deliberately absent from this graph-level control-plane shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct StreamResumeOutput {
+    pub profile_revision: u64,
+    pub enrolled_declarations: u64,
+    pub resumed_declarations: u64,
+    pub already_open_declarations: u64,
+}
+
+/// Aggregate result of graph-wide checked index refresh. Any enrolled
+/// declaration changed by the operation is required to be sealed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct StreamEnsureIndicesOutput {
+    pub changed: bool,
+    pub pending_index_count: u64,
+}
+
+/// Aggregate result of graph-wide checked stream optimization. Any enrolled
+/// declaration changed by the operation is required to be sealed. Physical
+/// fragment and dataset details stay inside the engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct StreamOptimizeOutput {
+    pub changed: bool,
+    pub pending_index_count: u64,
+    pub requires_repair: bool,
+}
+
+pub fn stream_resume_output(value: GraphStreamResumeResult) -> StreamResumeOutput {
+    StreamResumeOutput {
+        profile_revision: value.profile_revision,
+        enrolled_declarations: value.enrolled_declarations,
+        resumed_declarations: value.resumed_declarations,
+        already_open_declarations: value.already_open_declarations,
+    }
+}
+
+pub fn stream_ensure_indices_output(
+    value: GraphStreamEnsureIndicesResult,
+) -> StreamEnsureIndicesOutput {
+    StreamEnsureIndicesOutput {
+        changed: value.changed,
+        pending_index_count: value.pending_index_count,
+    }
+}
+
+pub fn stream_optimize_output(value: GraphStreamOptimizeResult) -> StreamOptimizeOutput {
+    StreamOptimizeOutput {
+        changed: value.changed,
+        pending_index_count: value.pending_index_count,
+        requires_repair: value.requires_repair,
+    }
 }
 
 fn stream_profile_mode_output(

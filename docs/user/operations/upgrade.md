@@ -206,9 +206,11 @@ inspection artifact, not a replay or import protocol. A corrected value is a
 fresh ordinary stream admission naming the current terminal token as its
 predecessor; while it remains current, exact retry returns the same terminal
 result. The graph-native HTTP/remote-CLI firehose can submit that successor only
-while the enabled declaration lane is absent or `OPEN`. A terminally disabled/
-`SEALED` lane cannot be reopened by F7a ingress; until public resume ships,
-retirement/rebuild remains the public exit there.
+while the enabled declaration is absent or `OPEN`. For a disabled `SEALED`
+declaration, re-enable streaming, restart the checked server, run the
+selector-free graph-wide `omnigraph stream resume`, and then submit the
+successor. Ingest never reopens it implicitly. Retirement/rebuild remains the
+exit when that sequencing authority must intentionally be discarded.
 
 If terminal authority must intentionally be discarded for a fresh-root
 rebuild, use the same v19 binary's irreversible
