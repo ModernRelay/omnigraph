@@ -232,6 +232,8 @@ operation is active.
 - schema parsing and catalog construction
 - stored-query parsing and query-name matching
 - stored-query type-checking against the desired schema
+- policy YAML parsing and semantic rule validation (groups, actions, and scope
+  compatibility)
 - policy `applies_to` graph references
 - embedding provider profiles and graph `embedding_provider` references
 

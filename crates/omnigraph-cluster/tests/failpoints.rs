@@ -43,7 +43,11 @@ fn fixture() -> tempfile::TempDir {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
     fs::write(dir.path().join("people.gq"), QUERY).unwrap();
-    fs::write(dir.path().join("base.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(
+        dir.path().join("base.policy.yaml"),
+        "version: 1\nrules: []\n",
+    )
+    .unwrap();
     fs::write(
         dir.path().join("cluster.yaml"),
         r#"

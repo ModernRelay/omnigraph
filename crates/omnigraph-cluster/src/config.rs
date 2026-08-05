@@ -984,17 +984,24 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         policy_bindings.insert(policy_address.clone(), normalized_bindings);
 
         let policy_path = resolve_config_path(&config_dir, &policy.file);
-        match fs::read(&policy_path) {
-            Ok(bytes) => {
+        match fs::read_to_string(&policy_path) {
+            Ok(source) => {
                 resources.insert(
                     policy_address.clone(),
                     ResourceSummary {
                         address: policy_address,
                         kind: "policy".to_string(),
-                        digest: sha256_hex(&bytes),
+                        digest: sha256_hex(source.as_bytes()),
                         path: Some(display_path(&policy_path)),
                     },
                 );
+                if let Err(err) = omnigraph_policy::PolicyConfig::from_source(&source) {
+                    diagnostics.push(Diagnostic::error(
+                        "policy_invalid",
+                        format!("policies.{policy_name}.file"),
+                        format!("policy file '{}' is invalid: {err}", policy_path.display()),
+                    ));
+                }
             }
             Err(err) => diagnostics.push(Diagnostic::error(
                 "policy_file_missing",

@@ -37,11 +37,13 @@ query find_person($name: String) {
 }
 "#;
 
+    const POLICY: &str = "version: 1\nrules: []\n";
+
     fn fixture() -> tempfile::TempDir {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
         fs::write(dir.path().join("people.gq"), QUERY).unwrap();
-        fs::write(dir.path().join("base.policy.yaml"), "rules: []\n").unwrap();
+        fs::write(dir.path().join("base.policy.yaml"), POLICY).unwrap();
         fs::write(
             dir.path().join(CLUSTER_CONFIG_FILE),
             r#"
@@ -234,6 +236,48 @@ policies:
         assert!(codes.contains("schema_file_missing"));
         assert!(codes.contains("query_file_missing"));
         assert!(codes.contains("policy_file_missing"));
+    }
+
+    #[test]
+    fn semantically_invalid_policy_bundle_fails_validation() {
+        for (action, scope) in [
+            ("invoke_query", "branch_scope"),
+            ("schema_apply", "branch_scope"),
+        ] {
+            let dir = fixture();
+            fs::write(
+                dir.path().join("base.policy.yaml"),
+                format!(
+                    r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: invalid-scope
+    allow:
+      actors: {{ group: team }}
+      actions: [{action}]
+      {scope}: any
+"#
+                ),
+            )
+            .unwrap();
+
+            let out = validate_config_dir(dir.path());
+            assert!(!out.ok, "{action} with {scope} must be rejected");
+            let diagnostic = out
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "policy_invalid")
+                .unwrap_or_else(|| {
+                    panic!("missing policy_invalid diagnostic: {:?}", out.diagnostics)
+                });
+            assert_eq!(diagnostic.path, "policies.base.file");
+            assert!(
+                diagnostic.message.contains(scope) && diagnostic.message.contains(action),
+                "unexpected diagnostic: {diagnostic:?}"
+            );
+        }
     }
 
     #[test]
@@ -1298,7 +1342,7 @@ graphs:
         let query_blob = query_payload_path(dir.path(), &query_digest);
         assert_eq!(fs::read_to_string(&query_blob).unwrap(), QUERY);
         let policy_blob = policy_payload_path(dir.path(), &policy_digest);
-        assert_eq!(fs::read_to_string(&policy_blob).unwrap(), "rules: []\n");
+        assert_eq!(fs::read_to_string(&policy_blob).unwrap(), POLICY);
 
         let state = read_state_json(dir.path());
         assert_eq!(state["state_revision"], 2);
@@ -2026,7 +2070,11 @@ graphs:
         assert!(approved.ok, "{:?}", approved.diagnostics);
         // The config moves after approval: the bound config digest no longer
         // matches and the artifact authorizes nothing.
-        fs::write(dir.path().join("base.policy.yaml"), "rules: [] # moved\n").unwrap();
+        fs::write(
+            dir.path().join("base.policy.yaml"),
+            "version: 1\nrules: [] # moved\n",
+        )
+        .unwrap();
 
         let out = apply_config_dir(dir.path()).await;
         assert!(
@@ -2181,7 +2229,7 @@ graphs:
     }
 
     #[tokio::test]
-    async fn apply_invalid_config_fails_before_lock() {
+    async fn apply_invalid_config_or_policy_fails_before_lock() {
         let dir = fixture();
         fs::write(
             dir.path().join(CLUSTER_CONFIG_FILE),
@@ -2192,6 +2240,35 @@ graphs:
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         // Config errors bail before the lock or any state directory exists.
+        assert!(!dir.path().join(CLUSTER_STATE_DIR).exists());
+
+        let dir = fixture();
+        fs::write(
+            dir.path().join("base.policy.yaml"),
+            r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: invalid-scope
+    allow:
+      actors: { group: team }
+      actions: [invoke_query]
+      branch_scope: any
+"#,
+        )
+        .unwrap();
+
+        let out = apply_config_dir(dir.path()).await;
+        assert!(!out.ok);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "policy_invalid"),
+            "{:?}",
+            out.diagnostics
+        );
+        // Policy errors share the same pre-lock, pre-state refusal boundary.
         assert!(!dir.path().join(CLUSTER_STATE_DIR).exists());
     }
 
@@ -3436,7 +3513,7 @@ policies:
         assert_eq!(snapshot.policies.len(), 1);
         assert_eq!(snapshot.policies[0].applies_to, vec!["graph.knowledge"]);
         // Content, not a path: the catalog may live on object storage.
-        // The fixture bundle is `rules: []` — assert the verified text.
+        // The fixture bundle has no rules — assert the verified text.
         assert!(snapshot.policies[0].source.contains("rules:"));
     }
 

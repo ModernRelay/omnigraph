@@ -1030,10 +1030,10 @@ fn policy_validate_accepts_cluster_bundle() {
 }
 
 #[test]
-fn policy_validate_fails_for_invalid_cluster_bundle() {
-    // The cluster does not validate a policy bundle's internal rules, so an
-    // applied-but-malformed bundle reaches `policy validate`, which compiles it
-    // and surfaces the error (here: a duplicate rule id).
+fn policy_validate_fails_for_wrong_kind_cluster_bundle() {
+    // Cluster validation owns bundle-wide syntax and semantic rules. The
+    // policy command additionally loads the bundle for its selected serving
+    // slot, so a server-scoped action bound only to a graph still fails here.
     let cluster = converged_loaded_cluster(
         "knowledge",
         Some(
@@ -1042,16 +1042,10 @@ version: 1
 groups:
   team: [act-andrew]
 rules:
-  - id: duplicate
+  - id: wrong-kind
     allow:
       actors: { group: team }
-      actions: [read]
-      branch_scope: any
-  - id: duplicate
-    allow:
-      actors: { group: team }
-      actions: [export]
-      branch_scope: any
+      actions: [graph_list]
 "#,
         ),
     );
@@ -1067,8 +1061,8 @@ rules:
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("duplicate policy rule id"),
-        "expected a duplicate-rule error; got: {stderr}"
+        stderr.contains("server-scoped") && stderr.contains("graph_list"),
+        "expected a wrong-kind policy error; got: {stderr}"
     );
 }
 
