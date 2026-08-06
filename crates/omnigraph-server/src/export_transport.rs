@@ -1,6 +1,6 @@
 use axum::body::Bytes;
 use futures::Stream;
-use omnigraph::db::{EXPORT_CHUNK_MAX_BYTES, StreamExportCut};
+use omnigraph::db::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 use omnigraph::error::{OmniError, Result};
 use std::io;
 use std::pin::Pin;
@@ -97,7 +97,7 @@ pub(crate) enum ExportFrame {
     Terminal {
         /// The move-only cut stays queued behind every data frame. Dropping a
         /// disconnected response drops this frame and releases the root slot.
-        cut: StreamExportCut,
+        cut: ExportCut,
         error: Option<io::Error>,
     },
 }

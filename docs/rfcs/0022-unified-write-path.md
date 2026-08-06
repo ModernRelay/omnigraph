@@ -19,6 +19,12 @@ owner: OmniGraph maintainers
 RFC-022's structural rollout and lifecycle findings are closed; the ledger
 remains active for RFC-023–027.
 
+> **RFC-026 disposition:** RFC-022's ordinary graph-write protocol remains
+> implemented, but RFC-026 was later rejected and removed. Every MemWAL,
+> stream-quiescence, or fold-adapter passage below is historical only. Bounded
+> graph ingestion now reuses ordinary Load; see
+> [the removal decision](../dev/wal-removal.md).
+
 **Implementation evidence:** [#343](https://github.com/ModernRelay/omnigraph/pull/343),
 [#344](https://github.com/ModernRelay/omnigraph/pull/344),
 [#345](https://github.com/ModernRelay/omnigraph/pull/345),

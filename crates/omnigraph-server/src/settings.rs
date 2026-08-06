@@ -165,8 +165,6 @@ pub(crate) async fn load_cluster_settings(
             graph_id: graph.graph_id.clone(),
             uri: graph.root.to_string_lossy().to_string(),
             policy: graph_policies.get(&graph.graph_id).cloned(),
-            stream_runtime_authority: graph.stream_runtime_authority.clone(),
-            stream_served_export_authority: graph.stream_served_export_authority.clone(),
             embedding,
             queries: registry,
         });
@@ -642,8 +640,6 @@ mod tests {
                         .to_string_lossy()
                         .into_owned(),
                     policy: None,
-                    stream_runtime_authority: None,
-                    stream_served_export_authority: None,
                     embedding: None,
                     queries: crate::queries::QueryRegistry::default(),
                 }],
@@ -697,8 +693,6 @@ mod tests {
                         .to_string_lossy()
                         .into_owned(),
                     policy: None,
-                    stream_runtime_authority: None,
-                    stream_served_export_authority: None,
                     embedding: None,
                     queries: crate::queries::QueryRegistry::default(),
                 }],

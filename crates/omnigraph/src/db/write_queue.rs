@@ -1,4 +1,4 @@
-//! Process-local writer queues and RFC-026 stream-admission leases.
+//! Per-`(table_key, branch)` writer queues.
 //!
 //! These queues are the engine's process-local, root-scoped write-serialization
 //! mechanism. The server normally holds one lockless `Arc<Omnigraph>`, but
@@ -13,37 +13,6 @@
 //! before a Lance HEAD advance or destructive recovery action. Serialization
 //! remains in-process only; cross-process writers on one graph remain
 //! one-winner-CAS at publish.
-//!
-//! RFC-026 adds a graph-global profile-transition gate plus a separate
-//! admission lease keyed by immutable
-//! [`TableIdentity`](crate::db::manifest::TableIdentity) plus the resolved
-//! physical Lance ref (`None` means main). Shared leases are the future
-//! final-check-through-effect window for ordinary base-table writers and
-//! MemWAL appends. Enrollment and drain take the same lease exclusively. An
-//! alias is deliberately not accepted by the key: a rename keeps contending on
-//! the same table lifetime, while drop/re-add gets a different incarnation.
-//!
-//! The graph-profile gate is the **outermost** process-local gate for ordinary
-//! and other non-resident-producing writers. They hold it shared from profile
-//! preflight through completion; a profile transition holds it exclusively.
-//! Served ingress that can create resident MemWAL work has one earlier bounded
-//! corridor: preprocessing/inflight reservation -> root MemWAL opportunity
-//! shared -> graph-profile shared -> table admission. The resident driver owns
-//! the opportunity gate exclusively across one frozen finite round, then takes
-//! profile/admission per candidate. Both opportunity permits retain the root
-//! `MemWalWorkerRegistry` `Arc`, so the weak root registry cannot recreate an
-//! independent fence while detached ownership is live. Runtime shutdown fences
-//! root opportunity exclusive and then graph-profile exclusive, drops both,
-//! and only then joins the driver that needs those gates to settle.
-//! Other callers compose graph-profile -> admission key(s), then keep the
-//! established schema -> branch -> token-authority -> sorted-table order.
-//! The token-authority gate is graph-global because every B2 fold advances the
-//! same manifest-selected `_stream_tokens.lance` participant. This prevents an
-//! append (which needs only a shared admission lease) from deadlocking with a
-//! drain or enrollment that also needs the existing gates. These locks are
-//! neither durable lifecycle authority nor distributed fencing. Callers must
-//! still revalidate manifest/Lance authority under the lease, and the bounded
-//! RFC-026 profile still permits only one live writer process per graph.
 //!
 //! ## Why exclusive `tokio::sync::Mutex<()>` per key
 //!
@@ -79,8 +48,6 @@ use tokio::sync::{
     RwLock as AsyncRwLock,
 };
 
-use crate::db::manifest::TableIdentity;
-
 /// Queue key: `(table_key, branch_ref)`. `branch_ref = None` means main.
 ///
 /// Branch is part of the key because the same Lance dataset can be
@@ -89,62 +56,23 @@ use crate::db::manifest::TableIdentity;
 /// serialize at the queue.
 pub(crate) type TableQueueKey = (String, Option<String>);
 
-/// One process-local RFC-026 admission domain.
+/// Non-cloneable ownership of the sole immutable export cut for one graph.
 ///
-/// `physical_ref = None` is the base table's main ref. A named value is the
-/// already-resolved physical Lance ref, not necessarily the logical graph
-/// branch requested by a caller (a lazy graph branch may still resolve to
-/// main). `table_key` / display alias is intentionally absent.
-/// Representing a named ref here does not activate named-branch streaming;
-/// RFC-026's bounded production profile remains main-only.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct StreamAdmissionKey {
-    identity: TableIdentity,
-    physical_ref: Option<String>,
-}
-
-/// Non-cloneable ownership of the sole immutable export cut for one root.
-///
-/// The manager registry intentionally holds only weak references. Keeping the
-/// manager alive here is therefore part of the one-slot contract: a cut may
-/// outlive the `Omnigraph` handle that created it without allowing a reopened
-/// handle to allocate a fresh semaphore for the same root.
-#[must_use = "dropping the permit releases the stream-export cut"]
-pub(crate) struct StreamExportCutPermit {
+/// The root registry stores weak references, so retaining the manager here is
+/// part of the exclusion contract: a cut can outlive the `Omnigraph` handle
+/// that captured it without a reopened handle creating an independent gate.
+#[must_use = "dropping the permit releases the export cut"]
+pub(crate) struct ExportCutPermit {
     _manager: Arc<WriteQueueManager>,
     _permit: OwnedRwLockWriteGuard<()>,
 }
 
 /// Shared exclusion held by controls that can remove or reuse an export cut's
 /// exact path/version coordinates.
-///
-/// Destructive controls may proceed concurrently with one another when their
-/// existing schema/branch/table gates permit it. They only need to exclude the
-/// sole export cut, which owns the write side of this root-scoped gate.
-#[must_use = "dropping the permit releases stream-export destructive control"]
-pub(crate) struct StreamExportDestructivePermit {
+#[must_use = "dropping the permit releases export destructive control"]
+pub(crate) struct ExportDestructivePermit {
     _manager: Arc<WriteQueueManager>,
     _permit: OwnedRwLockReadGuard<()>,
-}
-
-/// Non-cloneable ownership of the sole checked operational-status observation
-/// for one graph root. The immutable preflight can scan token/base authority
-/// for up to its full deadline, so allowing parallel observations would turn
-/// a bounded request into unbounded aggregate IO and retained memory.
-#[must_use = "dropping the permit releases stream-status observation"]
-pub(crate) struct StreamStatusObservationPermit {
-    _manager: Arc<WriteQueueManager>,
-    _permit: OwnedMutexGuard<()>,
-}
-
-impl StreamAdmissionKey {
-    /// Bind one immutable table lifetime to its resolved physical Lance ref.
-    pub(crate) fn for_resolved_ref(identity: TableIdentity, physical_ref: Option<&str>) -> Self {
-        Self {
-            identity,
-            physical_ref: physical_ref.map(str::to_string),
-        }
-    }
 }
 
 /// Per-`(table_key, branch)` writer queue manager.
@@ -169,48 +97,10 @@ pub(crate) struct WriteQueueManager {
     /// publication; explicit authority/physical exceptions follow their own
     /// registered ordering contracts.
     branch_queues: Mutex<HashMap<Option<String>, Arc<AsyncMutex<()>>>>,
-    /// Graph-global RFC-026 sequencing-participant gate.
-    ///
-    /// This is intentionally a singleton per root rather than a synthetic
-    /// table queue: `_stream_tokens.lance` is graph protocol authority, not a
-    /// user table and not a member of the stable table-identity domain. A B2
-    /// fold acquires it after the main-branch gate and before any graph-table
-    /// gate, then holds it through exact participant confirmation and the one
-    /// manifest visibility CAS.
-    stream_token_gate: Arc<AsyncMutex<()>>,
-    /// Graph-global RFC-026 profile-transition gate.
-    ///
-    /// Mutation/load and the remaining ordinary/non-resident-producing writers
-    /// hold a shared guard from their profile-authority preflight through the
-    /// whole operation. Resident-producing served ingress first holds the root
-    /// MemWAL opportunity shared; the driver holds that opportunity exclusive
-    /// for a finite round and takes this gate shared per candidate. A profile
-    /// transition takes this gate exclusively before changing the manifest
-    /// profile. Runtime shutdown first fences root opportunity exclusively,
-    /// then this gate exclusively, and drops both before joining the driver.
-    /// The gate is root-shared across
-    /// independently opened handles, but remains process-local contention
-    /// control rather than durable profile authority.
-    stream_profile_gate: Arc<AsyncRwLock<()>>,
-    /// RFC-026 final-check-through-effect admission domains.
-    ///
-    /// Tokio's fair, write-preferring `RwLock` lets ordinary writers/appends
-    /// share the admitted window while enrollment/drain closes it and waits for
-    /// every admitted effect to finish. This remains an in-process guard only;
-    /// the manifest lifecycle row and Lance witness are durable authority.
-    stream_admission_leases: Mutex<HashMap<StreamAdmissionKey, Arc<AsyncRwLock<()>>>>,
-    /// Root-wide export/destructive-control exclusion.
-    ///
-    /// One immutable export cut owns this gate exclusively through output.
-    /// Cooperative controls that can remove/reuse exact paths or versions own
-    /// it shared, so they remain mutually concurrent but cannot race a cut.
-    stream_export_gate: Arc<AsyncRwLock<()>>,
-    /// Root-wide checked operational-status admission.
-    ///
-    /// The expensive immutable preflight intentionally takes no writer gate.
-    /// This separate non-waiting slot keeps one root from running several
-    /// bounded scans concurrently while preserving writer availability.
-    stream_status_gate: Arc<AsyncMutex<()>>,
+    /// One immutable export owns the write side through output. Cooperative
+    /// destructive controls share the read side, so they remain mutually
+    /// concurrent but cannot remove a path/version beneath a live cut.
+    export_gate: Arc<AsyncRwLock<()>>,
 }
 
 impl WriteQueueManager {
@@ -260,103 +150,6 @@ impl WriteQueueManager {
         fresh
     }
 
-    fn stream_admission_slot(&self, key: &StreamAdmissionKey) -> Arc<AsyncRwLock<()>> {
-        let mut map = self
-            .stream_admission_leases
-            .lock()
-            .expect("stream admission lease map poisoned");
-        if let Some(existing) = map.get(key) {
-            return Arc::clone(existing);
-        }
-        let fresh = Arc::new(AsyncRwLock::new(()));
-        map.insert(key.clone(), Arc::clone(&fresh));
-        fresh
-    }
-
-    /// Acquire the graph-global shared profile window for an ordinary writer.
-    ///
-    /// This is the outermost process-local gate for ordinary and other
-    /// non-resident-producing writers. Resident-producing served callers first
-    /// retain their bounded preprocessing/inflight reservation and shared root
-    /// MemWAL opportunity. Hold this guard from the final profile-authority
-    /// preflight through the entire operation, including retry or recovery.
-    pub(crate) async fn acquire_stream_profile_shared(&self) -> OwnedRwLockReadGuard<()> {
-        Arc::clone(&self.stream_profile_gate).read_owned().await
-    }
-
-    /// Acquire exclusive graph-global admission for a profile transition.
-    ///
-    /// An ordinary profile transition takes this before any table admission,
-    /// schema, branch, token-authority, or table gate and keeps it through the
-    /// durable transition. Served-runtime shutdown is the deliberate exception:
-    /// it first fences the root MemWAL opportunity, then this gate, drops both,
-    /// and joins the resident driver.
-    #[allow(dead_code)] // Scaffolded before the profile-transition writer is wired.
-    pub(crate) async fn acquire_stream_profile_exclusive(&self) -> OwnedRwLockWriteGuard<()> {
-        Arc::clone(&self.stream_profile_gate).write_owned().await
-    }
-
-    /// Acquire a shared RFC-026 admission window for one physical table ref.
-    ///
-    /// Future ordinary writers and MemWAL appends hold this from their final
-    /// durable-authority check through physical-effect/durability resolution.
-    /// Acquire this after the graph-profile gate and before schema, branch, or
-    /// legacy table queues. A resident-producing served append already holds
-    /// bounded preprocessing/inflight ownership and the shared root MemWAL
-    /// opportunity outside that profile -> admission pair.
-    pub(crate) async fn acquire_stream_shared(
-        &self,
-        key: &StreamAdmissionKey,
-    ) -> OwnedRwLockReadGuard<()> {
-        self.stream_admission_slot(key).read_owned().await
-    }
-
-    /// Acquire exclusive RFC-026 admission closure for enrollment or drain.
-    ///
-    /// Acquire this after the graph-profile gate and before schema, branch, or
-    /// legacy table queues, then keep it through the lifecycle transition and
-    /// relevant physical effects. It does not replace durable manifest
-    /// authority or a cross-process fence.
-    pub(crate) async fn acquire_stream_exclusive(
-        &self,
-        key: &StreamAdmissionKey,
-    ) -> OwnedRwLockWriteGuard<()> {
-        self.stream_admission_slot(key).write_owned().await
-    }
-
-    /// Acquire shared admission for many physical table refs in stable order.
-    ///
-    /// Sorting and deduplication make this safe for future multi-table ordinary
-    /// writers. All admission keys are acquired before entering the existing
-    /// schema -> branch -> sorted-table hierarchy.
-    pub(crate) async fn acquire_stream_shared_many(
-        &self,
-        keys: &[StreamAdmissionKey],
-    ) -> Vec<OwnedRwLockReadGuard<()>> {
-        let sorted = sorted_unique_stream_admission_keys(keys);
-        let mut guards = Vec::with_capacity(sorted.len());
-        for key in &sorted {
-            guards.push(self.acquire_stream_shared(key).await);
-        }
-        guards
-    }
-
-    /// Acquire exclusive admission for many physical table refs in stable
-    /// order. Enrollment is initially single-table, but keeping the same
-    /// normalization rule prevents a later multi-table drain from introducing
-    /// a second lock order.
-    pub(crate) async fn acquire_stream_exclusive_many(
-        &self,
-        keys: &[StreamAdmissionKey],
-    ) -> Vec<OwnedRwLockWriteGuard<()>> {
-        let sorted = sorted_unique_stream_admission_keys(keys);
-        let mut guards = Vec::with_capacity(sorted.len());
-        for key in &sorted {
-            guards.push(self.acquire_stream_exclusive(key).await);
-        }
-        guards
-    }
-
     /// Acquire the coarse effect gate for one graph branch.
     ///
     /// RFC-022-enrolled callers MUST acquire this before any per-table queue.
@@ -367,64 +160,24 @@ impl WriteQueueManager {
         self.branch_slot(&key).lock_owned().await
     }
 
-    /// Acquire the graph-global RFC-026 token-participant gate.
-    ///
-    /// Ordinary/non-resident callers compose this only in the canonical order:
-    /// graph profile -> sorted relevant stream admission -> schema -> main
-    /// branch -> token -> sorted graph tables. Resident-producing served
-    /// callers additionally retain their earlier bounded preprocessing/
-    /// inflight and root MemWAL opportunity ownership. The mutex is
-    /// process-local contention control; the
-    /// exact manifest-selected token witness and recovery-v12 remain durable
-    /// authority.
-    pub(crate) async fn acquire_stream_token(&self) -> OwnedMutexGuard<()> {
-        Arc::clone(&self.stream_token_gate).lock_owned().await
-    }
-
-    /// Try to reserve the sole root-wide stream-aware export cut.
-    ///
-    /// This remains deliberately non-waiting: F6b5 places its bounded
-    /// transport-reservation deadline before this same slot and never creates
-    /// a second cut owner.
-    pub(crate) fn try_acquire_stream_export_cut(
-        self: &Arc<Self>,
-    ) -> Option<StreamExportCutPermit> {
-        let permit = Arc::clone(&self.stream_export_gate)
-            .try_write_owned()
-            .ok()?;
-        Some(StreamExportCutPermit {
+    /// Reserve the sole immutable export cut without waiting.
+    pub(crate) fn try_acquire_export_cut(self: &Arc<Self>) -> Option<ExportCutPermit> {
+        let permit = Arc::clone(&self.export_gate).try_write_owned().ok()?;
+        Some(ExportCutPermit {
             _manager: Arc::clone(self),
             _permit: permit,
         })
     }
 
-    /// Try to exclude a live export cut while destructive control is active.
+    /// Exclude a live export while destructive control is active.
     ///
-    /// This takes the shared side deliberately: unrelated branch controls and
-    /// other operations already serialized by their own authority gates must
-    /// not be turned into one graph-global queue merely because each could
-    /// invalidate an export's exact coordinates.
-    pub(crate) fn try_acquire_stream_export_destructive(
+    /// Destructive controls take the shared side so unrelated controls keep
+    /// their existing concurrency; they only serialize against an export cut.
+    pub(crate) fn try_acquire_export_destructive(
         self: &Arc<Self>,
-    ) -> Option<StreamExportDestructivePermit> {
-        let permit = Arc::clone(&self.stream_export_gate)
-            .try_read_owned()
-            .ok()?;
-        Some(StreamExportDestructivePermit {
-            _manager: Arc::clone(self),
-            _permit: permit,
-        })
-    }
-
-    /// Try to reserve the sole checked operational-status observation.
-    ///
-    /// Refusal is immediate. A caller must not queue another 60-second
-    /// immutable scan behind the current one or run those scans in parallel.
-    pub(crate) fn try_acquire_stream_status_observation(
-        self: &Arc<Self>,
-    ) -> Option<StreamStatusObservationPermit> {
-        let permit = Arc::clone(&self.stream_status_gate).try_lock_owned().ok()?;
-        Some(StreamStatusObservationPermit {
+    ) -> Option<ExportDestructivePermit> {
+        let permit = Arc::clone(&self.export_gate).try_read_owned().ok()?;
+        Some(ExportDestructivePermit {
             _manager: Arc::clone(self),
             _permit: permit,
         })
@@ -484,353 +237,16 @@ impl WriteQueueManager {
     }
 }
 
-fn sorted_unique_stream_admission_keys(keys: &[StreamAdmissionKey]) -> Vec<StreamAdmissionKey> {
-    let mut sorted = keys.to_vec();
-    sorted.sort();
-    sorted.dedup();
-    sorted
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::write_queue_root_identity;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
-    use tokio::sync::oneshot;
     use tokio::time::timeout;
 
     fn key(table: &str, branch: Option<&str>) -> TableQueueKey {
         (table.to_string(), branch.map(str::to_string))
-    }
-
-    fn identity(stable_table_id: u64, table_incarnation_id: u64) -> TableIdentity {
-        TableIdentity::new(stable_table_id, table_incarnation_id).unwrap()
-    }
-
-    fn stream_key(
-        stable_table_id: u64,
-        table_incarnation_id: u64,
-        physical_ref: Option<&str>,
-    ) -> StreamAdmissionKey {
-        StreamAdmissionKey::for_resolved_ref(
-            identity(stable_table_id, table_incarnation_id),
-            physical_ref,
-        )
-    }
-
-    #[test]
-    fn stream_admission_keys_sort_and_dedupe_by_identity_then_physical_ref() {
-        let a_main = stream_key(1, 1, None);
-        let a_feature = stream_key(1, 1, Some("feature"));
-        let b_main = stream_key(2, 1, None);
-
-        let normalized = sorted_unique_stream_admission_keys(&[
-            b_main.clone(),
-            a_feature.clone(),
-            a_main.clone(),
-            b_main.clone(),
-            a_main.clone(),
-        ]);
-
-        assert_eq!(normalized, vec![a_main, a_feature, b_main]);
-    }
-
-    #[tokio::test]
-    async fn stream_admission_many_dedupes_for_both_lease_modes() {
-        let qm = WriteQueueManager::new();
-        let a = stream_key(1, 1, None);
-        let b = stream_key(2, 1, None);
-        let keys = [b.clone(), a.clone(), b, a];
-
-        let shared = timeout(Duration::from_secs(2), qm.acquire_stream_shared_many(&keys))
-            .await
-            .expect("shared multi-key admission must not self-deadlock");
-        assert_eq!(shared.len(), 2);
-        drop(shared);
-
-        let exclusive = timeout(
-            Duration::from_secs(2),
-            qm.acquire_stream_exclusive_many(&keys),
-        )
-        .await
-        .expect("exclusive multi-key admission must not self-deadlock");
-        assert_eq!(exclusive.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn shared_stream_windows_overlap_and_exclusive_closes_admission() {
-        let qm = Arc::new(WriteQueueManager::new());
-        let key = stream_key(1, 1, None);
-
-        let first_shared = qm.acquire_stream_shared(&key).await;
-        let second_shared = timeout(Duration::from_secs(2), qm.acquire_stream_shared(&key))
-            .await
-            .expect("ordinary-write and append windows must be able to overlap");
-        drop(second_shared);
-
-        let (exclusive_started_tx, exclusive_started_rx) = oneshot::channel();
-        let (exclusive_acquired_tx, mut exclusive_acquired_rx) = oneshot::channel();
-        let (release_exclusive_tx, release_exclusive_rx) = oneshot::channel();
-        let exclusive_qm = Arc::clone(&qm);
-        let exclusive_key = key.clone();
-        let exclusive_task = tokio::spawn(async move {
-            exclusive_started_tx.send(()).unwrap();
-            let guard = exclusive_qm.acquire_stream_exclusive(&exclusive_key).await;
-            exclusive_acquired_tx.send(()).unwrap();
-            release_exclusive_rx.await.unwrap();
-            drop(guard);
-        });
-
-        exclusive_started_rx.await.unwrap();
-        assert!(
-            timeout(Duration::from_millis(50), &mut exclusive_acquired_rx)
-                .await
-                .is_err(),
-            "enrollment/drain must wait for an admitted shared effect"
-        );
-
-        drop(first_shared);
-        timeout(Duration::from_secs(2), &mut exclusive_acquired_rx)
-            .await
-            .expect("exclusive admission did not acquire after shared release")
-            .expect("exclusive admission task exited before acquisition");
-
-        let (shared_started_tx, shared_started_rx) = oneshot::channel();
-        let (shared_acquired_tx, mut shared_acquired_rx) = oneshot::channel();
-        let shared_qm = Arc::clone(&qm);
-        let shared_key = key.clone();
-        let shared_task = tokio::spawn(async move {
-            shared_started_tx.send(()).unwrap();
-            let _guard = shared_qm.acquire_stream_shared(&shared_key).await;
-            shared_acquired_tx.send(()).unwrap();
-        });
-
-        shared_started_rx.await.unwrap();
-        assert!(
-            timeout(Duration::from_millis(50), &mut shared_acquired_rx)
-                .await
-                .is_err(),
-            "an exclusive drain/enrollment must close new shared admission"
-        );
-
-        release_exclusive_tx.send(()).unwrap();
-        timeout(Duration::from_secs(2), &mut shared_acquired_rx)
-            .await
-            .expect("shared admission did not reopen after exclusive release")
-            .expect("shared admission task exited before acquisition");
-        exclusive_task.await.unwrap();
-        shared_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn root_shared_admission_tracks_lifetime_not_alias_and_separates_refs() {
-        let root = format!("memory://stream-admission/{}", ulid::Ulid::new());
-        let first_handle = WriteQueueManager::for_root(&root);
-        let second_handle = WriteQueueManager::for_root(&root);
-
-        // A rename is not part of the key at all: both aliases resolve to the
-        // same immutable lifetime and physical main ref.
-        let before_rename = stream_key(7, 11, None);
-        let after_rename = StreamAdmissionKey::for_resolved_ref(identity(7, 11), None);
-        assert_eq!(before_rename, after_rename);
-
-        let held = first_handle.acquire_stream_exclusive(&before_rename).await;
-        let (started_tx, started_rx) = oneshot::channel();
-        let (acquired_tx, mut acquired_rx) = oneshot::channel();
-        let renamed_handle = Arc::clone(&second_handle);
-        let renamed_key = after_rename.clone();
-        let renamed_task = tokio::spawn(async move {
-            started_tx.send(()).unwrap();
-            let _guard = renamed_handle.acquire_stream_shared(&renamed_key).await;
-            acquired_tx.send(()).unwrap();
-        });
-        started_rx.await.unwrap();
-        assert!(
-            timeout(Duration::from_millis(50), &mut acquired_rx)
-                .await
-                .is_err(),
-            "separately opened handles must share admission for a renamed lifetime"
-        );
-
-        // Drop/re-add mints a new incarnation; a different table and a named
-        // physical ref are independent domains as well.
-        let _replacement = timeout(
-            Duration::from_secs(2),
-            second_handle.acquire_stream_shared(&stream_key(7, 12, None)),
-        )
-        .await
-        .expect("drop/re-add replacement must use a distinct admission domain");
-        let _disjoint = timeout(
-            Duration::from_secs(2),
-            second_handle.acquire_stream_shared(&stream_key(8, 1, None)),
-        )
-        .await
-        .expect("disjoint table must not wait on another table's admission");
-        let _named_ref = timeout(
-            Duration::from_secs(2),
-            second_handle.acquire_stream_shared(&stream_key(7, 11, Some("feature"))),
-        )
-        .await
-        .expect("resolved named ref must not alias the physical main domain");
-
-        drop(held);
-        timeout(Duration::from_secs(2), &mut acquired_rx)
-            .await
-            .expect("renamed lifetime did not acquire after release")
-            .expect("renamed admission task exited before acquisition");
-        renamed_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn separately_opened_handles_share_one_graph_profile_gate() {
-        let root = format!("memory://stream-profile-gate/{}", ulid::Ulid::new());
-        let first = WriteQueueManager::for_root(&root);
-        let second = WriteQueueManager::for_root(&root);
-
-        let first_shared = first.acquire_stream_profile_shared().await;
-        let second_shared = timeout(
-            Duration::from_secs(2),
-            second.acquire_stream_profile_shared(),
-        )
-        .await
-        .expect("ordinary writers must be able to share the graph-profile window");
-
-        let (started_tx, started_rx) = oneshot::channel();
-        let (acquired_tx, mut acquired_rx) = oneshot::channel();
-        let transition = tokio::spawn(async move {
-            started_tx.send(()).unwrap();
-            let _guard = second.acquire_stream_profile_exclusive().await;
-            acquired_tx.send(()).unwrap();
-        });
-        started_rx.await.unwrap();
-        assert!(
-            timeout(Duration::from_millis(50), &mut acquired_rx)
-                .await
-                .is_err(),
-            "a profile transition must wait for every admitted ordinary writer"
-        );
-
-        drop(first_shared);
-        drop(second_shared);
-        timeout(Duration::from_secs(2), &mut acquired_rx)
-            .await
-            .expect("profile transition did not acquire after shared writers completed")
-            .expect("profile-transition task exited before acquisition");
-        transition.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn separately_opened_handles_share_one_graph_token_gate() {
-        let root = format!("memory://stream-token-gate/{}", ulid::Ulid::new());
-        let first = WriteQueueManager::for_root(&root);
-        let second = WriteQueueManager::for_root(&root);
-
-        let held = first.acquire_stream_token().await;
-        let (started_tx, started_rx) = oneshot::channel();
-        let (acquired_tx, mut acquired_rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            started_tx.send(()).unwrap();
-            let _guard = second.acquire_stream_token().await;
-            acquired_tx.send(()).unwrap();
-        });
-        started_rx.await.unwrap();
-        assert!(
-            timeout(Duration::from_millis(50), &mut acquired_rx)
-                .await
-                .is_err(),
-            "the token participant must serialize across independently opened handles"
-        );
-
-        drop(held);
-        timeout(Duration::from_secs(2), &mut acquired_rx)
-            .await
-            .expect("token gate did not acquire after release")
-            .expect("token gate task exited before acquisition");
-        task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn stream_export_and_status_gates_are_root_shared_non_waiting_and_release_on_drop() {
-        let root = format!("memory://stream-export-slot/{}", ulid::Ulid::new());
-        let first = WriteQueueManager::for_root(&root);
-        let second = WriteQueueManager::for_root(&root);
-
-        let destructive_a = first
-            .try_acquire_stream_export_destructive()
-            .expect("first destructive control must acquire the shared gate");
-        let destructive_b = second
-            .try_acquire_stream_export_destructive()
-            .expect("independent destructive controls must remain concurrent");
-        assert!(
-            second.try_acquire_stream_export_cut().is_none(),
-            "an export must refuse while destructive control is active"
-        );
-        drop(first);
-        drop(second);
-        let reopened = WriteQueueManager::for_root(&root);
-        assert!(
-            reopened.try_acquire_stream_export_cut().is_none(),
-            "a shared permit must keep the weakly registered root manager alive"
-        );
-        let destructive_c = reopened
-            .try_acquire_stream_export_destructive()
-            .expect("reopened destructive control must share the retained gate");
-        drop(destructive_a);
-        drop(destructive_b);
-        drop(destructive_c);
-
-        let held = reopened
-            .try_acquire_stream_export_cut()
-            .expect("first export must reserve the root gate exclusively");
-        assert!(
-            WriteQueueManager::for_root(&root)
-                .try_acquire_stream_export_cut()
-                .is_none(),
-            "a second handle must refuse before pinning another export cut"
-        );
-        assert!(
-            WriteQueueManager::for_root(&root)
-                .try_acquire_stream_export_destructive()
-                .is_none(),
-            "destructive control must refuse while an export cut is live"
-        );
-
-        drop(reopened);
-        let reopened_again = WriteQueueManager::for_root(&root);
-        assert!(
-            reopened_again.try_acquire_stream_export_cut().is_none(),
-            "the permit must keep the weakly registered root manager alive"
-        );
-
-        drop(held);
-        let reacquired = reopened_again
-            .try_acquire_stream_export_cut()
-            .expect("dropping the cut owner must release the root gate");
-        drop(reacquired);
-
-        let status = reopened_again
-            .try_acquire_stream_status_observation()
-            .expect("the first checked status observation must acquire its root slot");
-        assert!(
-            WriteQueueManager::for_root(&root)
-                .try_acquire_stream_status_observation()
-                .is_none(),
-            "a second checked status observation must refuse across handles"
-        );
-        drop(reopened_again);
-        let status_reopened = WriteQueueManager::for_root(&root);
-        assert!(
-            status_reopened
-                .try_acquire_stream_status_observation()
-                .is_none(),
-            "the status permit must keep the weakly registered root manager alive"
-        );
-        drop(status);
-        let status_reacquired = status_reopened
-            .try_acquire_stream_status_observation()
-            .expect("dropping checked status must release its root slot");
-        drop(status_reacquired);
     }
 
     #[tokio::test]
@@ -869,6 +285,32 @@ mod tests {
         .await
         .expect("duplicate branch keys must not self-deadlock");
         assert_eq!(guards.len(), 2);
+    }
+
+    #[test]
+    fn export_cut_and_destructive_controls_share_one_root_gate() {
+        let root = format!("memory://export-gate/{}", ulid::Ulid::new());
+        let first = WriteQueueManager::for_root(&root);
+        let second = WriteQueueManager::for_root(&root);
+
+        let destructive_a = first
+            .try_acquire_export_destructive()
+            .expect("first destructive control must acquire");
+        let destructive_b = second
+            .try_acquire_export_destructive()
+            .expect("destructive controls must remain mutually concurrent");
+        assert!(second.try_acquire_export_cut().is_none());
+        drop(destructive_a);
+        drop(destructive_b);
+
+        let cut = first
+            .try_acquire_export_cut()
+            .expect("export must acquire after destructive controls release");
+        assert!(second.try_acquire_export_cut().is_none());
+        assert!(second.try_acquire_export_destructive().is_none());
+        drop(cut);
+
+        assert!(second.try_acquire_export_cut().is_some());
     }
 
     #[tokio::test]

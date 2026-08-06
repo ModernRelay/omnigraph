@@ -3,13 +3,10 @@
 
     use super::{
         DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, legacy_change_request_body,
-        normalize_bearer_token, read_stream_data_correction_plan_with_limit,
-        resolve_remote_bearer_token,
+        normalize_bearer_token, resolve_remote_bearer_token,
     };
-    use omnigraph::error::OmniError;
     use reqwest::header::AUTHORIZATION;
     use serde_json::json;
-    use std::fs;
 
     #[test]
     fn legacy_change_request_body_uses_legacy_field_names() {
@@ -126,30 +123,3 @@
         }
     }
 
-    #[test]
-    fn stream_correction_plan_reader_enforces_an_inclusive_typed_byte_cap() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("correction-plan.json");
-        let contents = br#"{"version":1,"actions":[]}"#;
-        fs::write(&path, contents).unwrap();
-
-        assert_eq!(
-            read_stream_data_correction_plan_with_limit(&path, contents.len() as u64).unwrap(),
-            contents
-        );
-        let error = read_stream_data_correction_plan_with_limit(
-            &path,
-            u64::try_from(contents.len() - 1).unwrap(),
-        )
-        .expect_err("an oversized plan must be refused before deserialization");
-        assert!(matches!(
-            error.downcast_ref::<OmniError>(),
-            Some(OmniError::ResourceLimitExceeded {
-                resource,
-                limit,
-                actual,
-            }) if resource == "stream_correction_plan_file_bytes"
-                && *limit == (contents.len() - 1) as u64
-                && *actual == contents.len() as u64
-        ));
-    }

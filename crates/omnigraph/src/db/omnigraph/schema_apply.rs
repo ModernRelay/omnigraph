@@ -1,14 +1,4 @@
 use super::*;
-use crate::db::write_queue::StreamAdmissionKey;
-
-fn schema_apply_stream_admission_keys(snapshot: &Snapshot) -> BTreeSet<StreamAdmissionKey> {
-    snapshot
-        .entries()
-        .map(|entry| {
-            StreamAdmissionKey::for_resolved_ref(entry.identity, entry.table_branch.as_deref())
-        })
-        .collect()
-}
 
 /// Operator-supplied options that gate schema-apply behavior.
 ///
@@ -189,7 +179,7 @@ pub(super) async fn preview_schema_apply(
     let planned = plan_schema_for_apply(db, desired_schema_source, options).await?;
     Ok(SchemaApplyPreview {
         plan: planned.plan,
-        catalog: super::public_catalog_view(&planned.desired_catalog)?,
+        catalog: planned.desired_catalog,
     })
 }
 
@@ -224,7 +214,8 @@ where
         &omnigraph_policy::ResourceScope::TargetBranch("main".to_string()),
         actor,
     )?;
-    let _export_exclusion = db.reserve_stream_export_destructive_control()?;
+
+    let _export_exclusion = db.reserve_export_destructive_control()?;
 
     // Converge any pending recovery sidecar before planning: a table
     // rewrite over sidecar-covered drift would otherwise re-plan from
@@ -233,46 +224,16 @@ where
     // against the post-apply pins. Runs before the apply's own sidecar
     // exists, so the heal can never observe it.
     db.heal_pending_recovery_sidecars().await?;
-    let _stream_profile_guard = db.write_queue().acquire_stream_profile_shared().await;
 
-    // Admission is the outermost process-local gate. Capture every accepted
-    // existing table lifetime/ref before taking it, then prove that coverage is
-    // still complete after entering the schema gate. A concurrent schema apply
-    // may add/drop a lifetime between those points; retrying outside both gates
-    // avoids acquiring a newly discovered admission lease inside the established
-    // admission -> schema order. Adds in *this* apply have no prior lifecycle.
-    db.refresh_coordinator_only().await?;
-    if let Some(error) = db.current_canonical_stream_profile().await?.retired_error() {
-        return Err(error);
-    }
-    let mut admission_keys = {
-        let snapshot = db.coordinator.read().await.snapshot();
-        schema_apply_stream_admission_keys(&snapshot)
-    };
+    // Process-local schema-control gate. RFC-022 mutation/load commit paths
+    // acquire this before their branch/table gates and retain it through
+    // publication. Taking it before the durable sentinel closes the old race in
+    // which schema apply could create the sentinel while a mutation already held
+    // a table queue, causing that mutation to advance Lance HEAD and only then
+    // discover the schema lock. The native sentinel remains the cross-handle /
+    // crash-visible authority; this queue removes the avoidable same-handle race.
     let schema_gate_key = crate::db::manifest::schema_apply_serial_queue_key();
-    let write_queue = db.write_queue();
-    let (_stream_admission, _schema_gate) = loop {
-        let keys = admission_keys.iter().cloned().collect::<Vec<_>>();
-        let admission = write_queue.acquire_stream_shared_many(&keys).await;
-        let schema = write_queue.acquire(&schema_gate_key).await;
-
-        db.refresh_coordinator_only().await?;
-        let live_keys = {
-            let snapshot = db.coordinator.read().await.snapshot();
-            schema_apply_stream_admission_keys(&snapshot)
-        };
-        if live_keys == admission_keys {
-            break (admission, schema);
-        }
-
-        drop(schema);
-        drop(admission);
-        admission_keys = live_keys;
-    };
-
-    // The native sentinel remains the cross-handle / crash-visible authority;
-    // the admission and schema gates close avoidable same-process races and are
-    // retained through sentinel release after publication.
+    let _schema_gate = db.write_queue().acquire(&schema_gate_key).await;
     acquire_schema_apply_lock(db).await?;
     let result =
         apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await;
@@ -717,7 +678,6 @@ where
     // therefore cover only the concrete table effects; acquiring the schema key
     // again would deadlock because these queues are intentionally non-reentrant.
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
-    let _stream_token_guard = db.write_queue().acquire_stream_token().await;
     let _schema_apply_queue_guards = db
         .write_queue()
         .acquire_many(&schema_apply_queue_keys)
@@ -782,16 +742,6 @@ where
         ));
     }
 
-    // Durable manifest lifecycle is the authority. The shared admission lease
-    // held by the outer caller closes enrollment/drain's check-to-effect race.
-    // SchemaApply is graph-global, so conservatively reject if any accepted
-    // existing table has OPEN, DRAINING, or SEALED authority; Phase A has no
-    // witness-advancing drain path. First-touch additions have no lifecycle.
-    snapshot.ensure_stream_effects_allowed(
-        "schema_apply",
-        snapshot.entries().map(|entry| entry.identity),
-    )?;
-
     // Prove every existing physical ref is still exactly at its manifest pin
     // before arming the exact SchemaApply sidecar. Retain the verified handles
     // and reuse them below: reopening after this ownership check would create a
@@ -848,7 +798,6 @@ where
         actor_id: lineage_intent.actor_id.clone(),
         merged_parent_commit_id: lineage_intent.merged_parent_commit_id.clone(),
         created_at: lineage_intent.created_at,
-        stream_fold_attribution_v2: None,
     };
     let mut sidecar = crate::db::manifest::new_schema_apply_sidecar_v9(
         actor.map(str::to_string),

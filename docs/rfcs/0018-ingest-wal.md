@@ -1,8 +1,8 @@
 ---
 type: spec
 title: "RFC-018 — Streaming-ingest WAL on Lance MemWAL"
-description: Adds a durability-first streaming ingest path (ack on WAL durability, asynchronous fold into the graph commit chain) built entirely on Lance's MemWAL primitive; reconciled against Lance v8.0.0 and the v9 beta line; analyzed for composition with the upstream multi-table-commit RFCs.
-status: superseded
+description: Historical proposal for a durability-first Lance MemWAL ingest path; superseded by RFC-026 and rejected with it after implementation and benchmarking.
+status: rejected
 tags: [eng, rfc, wal, ingest, lance, omnigraph]
 timestamp: 2026-07-02
 owner: OmniGraph maintainers
@@ -10,7 +10,8 @@ owner: OmniGraph maintainers
 
 # RFC-018 — Streaming-ingest WAL on Lance MemWAL
 
-**Status:** Superseded by [RFC-026](0026-memwal-streaming-ingest.md)
+**Status:** Rejected. Superseded by [RFC-026](0026-memwal-streaming-ingest.md),
+then rejected with it; see [the removal decision](../dev/wal-removal.md).
 **Date:** 2026-07-02
 **Author track:** Maintainer design series
 **Surveyed version:** 0.7.2 (branch `dst-extract-crate`); Lance pinned at 7.0.0
@@ -23,6 +24,11 @@ owner: OmniGraph maintainers
 > architecture and a major substrate investment, not an experimental direction.
 > The integration risk is its evolving API and format surface across Lance
 > releases.
+
+> **Final disposition (2026-08-06):** the implemented design optimized
+> per-dataset durable admission while OmniGraph must publish one atomic
+> multi-dataset graph commit. Its extra coordinator dominated throughput, so
+> the WAL path was removed in favor of bounded direct graph batches.
 
 ---
 

@@ -31,17 +31,6 @@ pub enum ManifestConflictDetails {
         expected: Option<String>,
         actual: Option<String>,
     },
-    /// A durable RFC-026 lifecycle owns the physical table ref, so this
-    /// operation is not authorized to move that ref.  This is distinct from a
-    /// stale read set: retrying without first completing the lifecycle
-    /// transition would hit the same authority fence.
-    StreamLifecycleConflict {
-        stable_table_id: u64,
-        table_incarnation_id: u64,
-        table_key: String,
-        lifecycle: String,
-        operation: String,
-    },
     /// Lance's row-level CAS rejected the publish because a concurrent writer
     /// landed a row with the same `object_id`. Distinct from
     /// `ExpectedVersionMismatch`: the caller's expectations (if any) still
@@ -133,190 +122,11 @@ pub enum OmniError {
         limit: u64,
         actual: u64,
     },
-    /// RFC-026 §4.7 P1 refused to disable graph-wide streaming because at
-    /// least one stream lifecycle is non-terminal: disabling would strand
-    /// durable acknowledged-unfolded promises nobody is scheduled to keep.
-    /// Effect-free and typed so `cluster apply` maps it structurally to its
-    /// pending-until-drained disposition. Drain (fold) the named tables'
-    /// streams, then retry.
-    #[error("cannot disable streaming: undrained stream state on {undrained_tables:?}")]
-    StreamingDisablePending { undrained_tables: Vec<String> },
-    /// RFC-026 F2: the graph-wide streaming profile is cluster-owned. Cedar
-    /// authorization alone is not the stopped-writer ownership handoff, so an
-    /// embedded/direct caller cannot flip the profile through a raw graph
-    /// handle.
-    #[error(
-        "streaming profile changes require `cluster apply --confirm-stream-offline` while every writer-capable process for the graph is stopped"
-    )]
-    StreamingRequiresClusterControlPlane,
-    /// RFC-026 F2: once the profile is enabled, ordinary graph-content writes
-    /// are accepted only through the one checked cluster serving runtime.
-    /// DISABLING and RETIRED are also fail-closed at this boundary.
-    #[error(
-        "content mutation is unavailable while the streaming profile is {mode}; use the checked cluster serving runtime or disable the profile offline"
-    )]
-    StreamingRequiresClusterRuntime { mode: String },
-    /// A legacy content operation has no token-aware sequencing contract.
-    /// Possessing the sole served-runtime capability prevents split-brain
-    /// writers, but cannot make an operation that bypasses `_stream_tokens`
-    /// safe. Such operations remain closed until their dedicated protocol
-    /// exists.
-    #[error(
-        "{operation} is unavailable while the streaming profile is {mode}; disable streaming offline before retrying"
-    )]
-    StreamingContentOperationUnsupported { operation: String, mode: String },
-    /// A checked cluster capability was minted for a different graph/store,
-    /// declaration, profile revision, actor, or operation class. Keep this
-    /// typed so startup/apply callers can quarantine the graph without parsing
-    /// protocol text.
-    #[error("checked streaming authority does not match current graph authority: {reason}")]
-    StreamingAuthorityMismatch { reason: String },
-    /// The read-only full stream-status observation could not obtain one
-    /// stable cut during the named phase. This covers both bounded waiting and
-    /// an immediately busy resident transition without pretending every case
-    /// exhausted the same deadline. Retrying is effect-free.
-    #[error("stream operational status could not obtain a stable cut during {phase}")]
-    StreamStatusBusy { phase: String },
-    /// An authority-bearing member moved between the first observation and
-    /// the mandatory trailing reread. Returning a hybrid status would lie, so
-    /// the entire read is refused and the caller must retry from a fresh cut.
-    #[error("stream operational status changed while observing {member}")]
-    StreamStatusChanged { member: String },
-    /// An externally initiated stream-management request named a lifecycle
-    /// revision which is no longer current. This is an effect-free CAS
-    /// refusal: the caller must reread status and must not retarget the
-    /// original operation ID to the newer revision.
-    #[error(
-        "stream lifecycle changed for table {stable_table_id:016x}:{table_incarnation_id:016x}: expected revision {expected_revision}, current revision {current_revision}"
-    )]
-    StreamLifecycleChanged {
-        stable_table_id: u64,
-        table_incarnation_id: u64,
-        expected_revision: u64,
-        current_revision: u64,
-    },
-    /// The same lifecycle-management occurrence `(stream incarnation,
-    /// operation kind, operation ID)` was retained with a different canonical
-    /// request. The operation ID can never be reinterpreted as a new request.
-    #[error(
-        "stream lifecycle idempotency conflict for table {stable_table_id:016x}:{table_incarnation_id:016x}, operation {operation_kind} '{operation_id}'"
-    )]
-    StreamLifecycleIdempotencyConflict {
-        stable_table_id: u64,
-        table_incarnation_id: u64,
-        operation_kind: String,
-        operation_id: String,
-    },
-    /// RETIRED is an irreversible read/export-only disposition. F2 decodes it
-    /// fail-closed; the later retirement slice owns the sole transition into
-    /// it and no transition out.
-    #[error(
-        "stream authority retirement '{retirement_id}' fixed this graph at export cut {export_cut_digest}; the source is read/export-only"
-    )]
-    StreamAuthorityRetired {
-        retirement_id: String,
-        export_cut_digest: String,
-    },
-    /// Ordinary export cannot discard terminal sequencing authority. The
-    /// stopped-writer retirement/rebuild command is the explicit exit.
-    #[error(
-        "stream export is blocked by {withdrawn_token_count} current WITHDRAWN and {dead_lettered_token_count} current DEAD_LETTERED token(s); retire authority for rebuild or install PRESENT successors"
-    )]
-    StreamExportBlocked {
-        withdrawn_token_count: u64,
-        dead_lettered_token_count: u64,
-    },
-    /// The exact root-wide retirement plan moved between plan and confirm.
-    /// No token-ledger or manifest effect was allowed.
-    #[error("stream retirement plan changed before confirmation; rerun the plan command")]
-    StreamRetirementPlanChanged,
-    /// A root-wide retirement occurrence ID was already bound to another
-    /// canonical plan or authenticated actor.
-    #[error("stream authority retirement idempotency conflict for retirement '{retirement_id}'")]
-    StreamRetirementIdempotencyConflict { retirement_id: String },
-    /// RFC-026 rejected a stream append before invoking Lance because the one
-    /// active generation is at its hard whole-generation ceiling. The caller
-    /// must fold the durable generation before retrying; no row from this call
-    /// reached MemWAL.
-    #[error(
-        "stream fold required for table '{table_key}': active generation has {rows} rows and {bytes} bytes"
-    )]
-    FoldRequired {
-        table_key: String,
-        rows: u64,
-        bytes: u64,
-    },
-    /// Strict validation rejected a durable stream generation and retained
-    /// canonical evidence for correction. The token is machine-readable so
-    /// callers never have to recover correction authority by parsing the
-    /// display string.
-    #[error("stream fold is strict-blocked; correction requires block token {block_token}")]
-    StreamDataBlocked { block_token: String },
-    /// RFC-026 compare-and-chain request names a stream incarnation which is
-    /// no longer current. This is proven before Lance is invoked.
-    #[error(
-        "stream binding changed for table {stable_table_id:016x}:{table_incarnation_id:016x}: current stream incarnation is {current_stream_incarnation_id}"
-    )]
-    StreamBindingChanged {
-        stable_table_id: u64,
-        table_incarnation_id: u64,
-        current_stream_incarnation_id: String,
-    },
-    /// RFC-026 compare-and-chain predecessor differs from the complete current
-    /// token. `None` means this key has no current stream token.
-    #[error(
-        "stream sequence conflict for table {stable_table_id:016x}:{table_incarnation_id:016x}, key '{logical_id}' (current token: {current_token:?})"
-    )]
-    StreamSequenceConflict {
-        stable_table_id: u64,
-        table_incarnation_id: u64,
-        logical_id: String,
-        current_token: Option<String>,
-    },
-    /// The same occurrence key was reused with a different trusted actor or
-    /// normalized payload. It can never be reinterpreted as a new change.
-    #[error(
-        "stream idempotency conflict for table {stable_table_id:016x}:{table_incarnation_id:016x}, key '{logical_id}' (current token: {current_token})"
-    )]
-    StreamIdempotencyConflict {
-        stable_table_id: u64,
-        table_incarnation_id: u64,
-        logical_id: String,
-        current_token: String,
-    },
-    /// RFC-026 invoked Lance's MemWAL append but could not prove the complete
-    /// acknowledgement boundary: watcher durability plus no observed successor
-    /// writer epoch. The attempt may be durable and is intentionally never
-    /// translated into a row-effect-free retry. Stable caller ordinals identify
-    /// the ambiguous invocation without pretending that RC.1 exposes an
-    /// attributable WAL coordinate.
-    #[error(
-        "stream acknowledgement unknown for table {stable_table_id:016x}:{table_incarnation_id:016x}, shard {shard_id}, ordinals {caller_ordinal_start}..={caller_ordinal_end}: {reason}"
-    )]
-    AckUnknown {
-        stable_table_id: u64,
-        table_incarnation_id: u64,
-        enrollment_id: String,
-        shard_id: String,
-        writer_epoch: u64,
-        caller_ordinal_start: u64,
-        caller_ordinal_end: u64,
-        /// B2-only server-minted physical invocation identity. B1's private
-        /// substrate seam leaves this absent.
-        admission_attempt_id: Option<String>,
-        /// B2 logical idempotency labels covered by this physical invocation.
-        logical_write_ids: Vec<String>,
-        /// Deterministic but explicitly unconfirmed candidate returned only as
-        /// retry correlation; it is never valid predecessor authority.
-        unconfirmed_candidate_token: Option<String>,
-        reason: String,
-    },
-    /// A durable recovery intent or retained pre-sidecar physical owner
-    /// overlaps this write. Its effects may already have landed, or it may
-    /// still be armed/in flight before a classifiable effect; either way the
-    /// owner named by `operation_id` must settle and be resolved before the
-    /// caller retries. Treating this as ordinary OCC would let a writer advance
-    /// around unresolved commit ownership.
+    /// A durable recovery intent overlaps this write. Its physical effects may
+    /// already have landed, or it may still be armed before its first effect;
+    /// either way the sidecar named by `operation_id` must be resolved before
+    /// the caller retries. Treating this as ordinary OCC would let a writer
+    /// advance around unresolved commit ownership.
     #[error("recovery required for operation {operation_id}: {reason}")]
     RecoveryRequired {
         operation_id: String,
@@ -450,32 +260,6 @@ impl OmniError {
                     member,
                     expected,
                     actual,
-                },
-            ),
-        )
-    }
-
-    pub(crate) fn manifest_stream_lifecycle_conflict(
-        stable_table_id: u64,
-        table_incarnation_id: u64,
-        table_key: impl Into<String>,
-        lifecycle: impl Into<String>,
-        operation: impl Into<String>,
-    ) -> Self {
-        let table_key = table_key.into();
-        let lifecycle = lifecycle.into();
-        let operation = operation.into();
-        let message = format!(
-            "operation '{operation}' cannot touch table '{table_key}' while its stream lifecycle is {lifecycle}"
-        );
-        Self::Manifest(
-            ManifestError::new(ManifestErrorKind::Conflict, message).with_details(
-                ManifestConflictDetails::StreamLifecycleConflict {
-                    stable_table_id,
-                    table_incarnation_id,
-                    table_key,
-                    lifecycle,
-                    operation,
                 },
             ),
         )

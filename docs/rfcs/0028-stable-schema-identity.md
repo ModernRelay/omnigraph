@@ -13,6 +13,12 @@ owner: OmniGraph maintainers
 **Status:** Implemented (2026-07-15)
 **Date:** 2026-07-14
 **Author track:** Maintainer design series
+
+> **RFC-026 disposition:** stable schema identity remains implemented in v5/v6,
+> but RFC-026 was later rejected and removed. Its lifecycle, WAL, and v7+
+> passages below are historical consumers of the identity model, not current
+> format behavior. See [the removal decision](../dev/wal-removal.md).
+
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s accepted-schema capture,
 SchemaApply recovery, and strict publication boundary
 **Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-rc.1 at git rev

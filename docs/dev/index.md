@@ -28,8 +28,7 @@ roadmap). The per-area docs below remain the mechanical authority.
 | System structure, L1/L2 framing, component diagrams | [architecture.md](architecture.md) |
 | On-disk layout, manifest schema, URI behavior | [storage.md](../user/concepts/storage.md) |
 | Direct-publish writes, D2, staged writes, recovery sidecars | [writes.md](writes.md) |
-| Write-path state of affairs — shipped RFCs, current boundaries, blockers, upstream alignment, and next gates | [writing-path-state-of-affairs.md](writing-path-state-of-affairs.md) |
-| RFC-026 supporting analysis — WAL mental model, retention options, and the deferred managed-reclamation proposal | [wal-thinking.md](wal-thinking.md), [wal-options.md](wal-options.md), [lance-memwal-pr.md](lance-memwal-pr.md) |
+| Streaming-ingest decision — direct graph batches and RFC-018/026 rejection | [wal-removal.md](wal-removal.md) |
 | Query execution, mutation execution, loader flow | [execution.md](execution.md) |
 | Index lifecycle and graph topology indexes | [indexes.md](../user/search/indexes.md) |
 | Branch and commit internals | [branches-commits.md](../user/branching/index.md) |
@@ -84,14 +83,14 @@ pattern, not just the outcome.
 |---|---|
 | camelCase property filters lowercased at runtime (#283) — two engine→Lance boundaries, two different fixes | [bug-case-fix.md](bug-case-fix.md) |
 
-## Active Design Reviews
+## Historical Design Reviews
 
 Review ledgers record open findings against proposed architecture. They remain
 as durable disposition history after closure, so RFC backlinks stay valid.
 
 | Area | Read |
 |---|---|
-| RFC-022–028 split architecture review — RFC-022/023/028 implemented; RFC-024/025/027 research-blocked; RFC-026 Phase A/B1 private core and private B2a unbounded retain-all gate implemented with widest-shape closure green, while common public/B2b contracts remain inactive; dependency corrections and acceptance evidence remain tracked | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
+| RFC-022–028 split architecture review — retained disposition history; RFC-026 is now rejected and its implementation removed | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
 
 ## Active Implementation Plans
 
@@ -99,7 +98,6 @@ Working documents for in-flight feature work. Removed when the work lands.
 
 | Area | Read |
 |---|---|
-| Firehose path (RFC-026 streaming) — safe slice ordering, exact seams, closed protocol choices, and activation evidence | [firehose-path-specs.md](firehose-path-specs.md) |
 | Schema-lint chassis v1 (MR-694) — `--allow-data-loss`, soft/hard drops | [schema-lint-v1-plan.md](schema-lint-v1-plan.md) |
 | Inline + stored queries, request/response envelope, MCP (MR-656 / MR-976 / MR-969) | [rfc-001-queries-envelope-mcp.md](rfc-001-queries-envelope-mcp.md) |
 | Config & CLI architecture — layered config, client targeting, file naming (MR-973 / MR-974 / MR-981) | [rfc-002-config-cli-architecture.md](rfc-002-config-cli-architecture.md) |
@@ -116,6 +114,17 @@ Working documents for in-flight feature work. Removed when the work lands.
 | Write-path latency — capture-once `WriteTxn`, version-pinned opens, one `GraphPublishAuthority` fed declarative `PublishPlan`s, manifest-authoritative lineage, epoch fence, bounded history (compaction + cleanup), and an IO-counted cost contract (`iss-write-s3-roundtrip-amplification`, `iss-991`) | [rfc-013-write-path-latency.md](rfc-013-write-path-latency.md) |
 | RFC-013 handoff — current-state map, latest validation, and concrete next actions for finishing write-path latency and correctness work | [handoff-rfc-013-write-path.md](handoff-rfc-013-write-path.md) |
 | Write-latency roadmap — validated cost model (the 6-LIST warm-write trace), the two root causes (un-GC'd `_versions/`; re-resolving latest by listing), and the layered fix (GC + capture-once reuse); how commit-graph-table retirement feeds in | [write-latency-roadmap.md](write-latency-roadmap.md) |
+
+## Historical Design Records
+
+These documents preserve the rejected RFC-026 experiment and its evidence.
+They are not current architecture or implementation plans.
+
+| Area | Read |
+|---|---|
+| RFC-026 implementation sequence and acceptance evidence | [firehose-path-specs.md](firehose-path-specs.md) |
+| WAL mental model, retention options, and proposed upstream support | [wal-thinking.md](wal-thinking.md), [wal-options.md](wal-options.md), [lance-memwal-pr.md](lance-memwal-pr.md) |
+| Pre-removal write-path snapshot | [writing-path-state-of-affairs.md](writing-path-state-of-affairs.md) |
 
 ## Boundary
 

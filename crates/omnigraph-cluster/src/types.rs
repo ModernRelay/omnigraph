@@ -2,7 +2,7 @@
 //! models (moved verbatim from lib.rs in the modularization).
 
 use super::*;
-pub(crate) use omnigraph_control_authority::StateLockFile;
+pub(crate) use crate::state_lock::StateLockFile;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -267,207 +267,6 @@ pub struct ForceUnlockOutput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Shared stopped-writer inputs for both halves of the authority-retirement
-/// handshake. Keeping actor/confirmation optional here lets direct library
-/// callers receive the same structured diagnostics as the CLI.
-#[derive(Debug, Clone, Default)]
-pub struct StreamAuthorityRetirementOptions {
-    pub actor: Option<String>,
-    pub confirm_stream_offline: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct StreamAuthorityRetirementPlanOutput {
-    pub ok: bool,
-    pub config_dir: String,
-    pub graph_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub graph_uri: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub actor: Option<String>,
-    pub state_observations: StateObservations,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub plan: Option<omnigraph::db::StreamAuthorityRetirementPlan>,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct StreamAuthorityRetirementConfirmOutput {
-    pub ok: bool,
-    pub config_dir: String,
-    pub graph_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub graph_uri: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub actor: Option<String>,
-    pub state_observations: StateObservations,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<omnigraph::db::StreamAuthorityRetirementResult>,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-/// Shared stopped-writer inputs for strict stream-block inspection and
-/// correction. Direct library callers receive the same structured preflight
-/// diagnostics as the CLI.
-#[derive(Debug, Clone, Default)]
-pub struct StreamBlockControlOptions {
-    pub actor: Option<String>,
-    pub confirm_stream_offline: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct StreamBlockShowOutput {
-    pub ok: bool,
-    pub config_dir: String,
-    pub graph_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub graph_uri: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub actor: Option<String>,
-    pub state_observations: StateObservations,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub page: Option<StreamBlockPageOutput>,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-/// Graph-scoped projection of one correction-view entry. Physical table
-/// identity remains an engine implementation detail.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct StreamBlockEntryOutput {
-    pub ordinal: u64,
-    pub logical_key: String,
-    pub current_blocked_winner_stream_token: String,
-    pub violation_code: String,
-    pub field_path_or_group: Vec<String>,
-    pub violation_instance_id: String,
-    pub allowed_actions: Vec<String>,
-}
-
-/// Accepted-schema identity for one logical graph declaration. This is the
-/// user-visible node/edge type, not a Lance dataset or manifest table key.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct StreamLogicalDeclarationOutput {
-    pub kind: String,
-    #[serde(rename = "type")]
-    pub type_name: String,
-}
-
-/// Bounded graph-level correction page selected only by an opaque block token.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct StreamBlockPageOutput {
-    #[serde(flatten)]
-    pub declaration: StreamLogicalDeclarationOutput,
-    pub block_token: String,
-    pub lifecycle_revision: u64,
-    pub correction_view_digest: String,
-    pub entries: Vec<StreamBlockEntryOutput>,
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct StreamBlockCorrectOutput {
-    pub ok: bool,
-    pub config_dir: String,
-    pub graph_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub graph_uri: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub actor: Option<String>,
-    pub state_observations: StateObservations,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<omnigraph::db::StreamDataCorrectionResult>,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-/// Stopped-writer inputs for read-only current dead-letter inspection.
-#[derive(Debug, Clone, Default)]
-pub struct StreamDeadLetterControlOptions {
-    pub actor: Option<String>,
-    pub confirm_stream_offline: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct StreamDeadLetterListOutput {
-    pub ok: bool,
-    pub config_dir: String,
-    pub graph_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub graph_uri: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub actor: Option<String>,
-    pub state_observations: StateObservations,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub page: Option<StreamDeadLetterPageOutput>,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct StreamDeadLetterExportOutput {
-    pub ok: bool,
-    pub config_dir: String,
-    pub graph_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub graph_uri: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub actor: Option<String>,
-    pub state_observations: StateObservations,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub page: Option<StreamDeadLetterPayloadPageOutput>,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-/// Graph-level terminal authority. Dataset coordinates, recovery ownership,
-/// and immutable object descriptors are deliberately absent.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct StreamDeadLetterEntryOutput {
-    #[serde(flatten)]
-    pub declaration: StreamLogicalDeclarationOutput,
-    pub logical_id: String,
-    pub occurrence_token: String,
-    pub predecessor_token: Option<String>,
-    pub write_id: String,
-    pub contributor_id: String,
-    pub payload_digest: String,
-    pub reason_code: String,
-    pub candidate_ordinal: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct StreamDeadLetterPageOutput {
-    pub source_manifest_version: u64,
-    pub source_profile_revision: u64,
-    pub entries: Vec<StreamDeadLetterEntryOutput>,
-    pub next_cursor: Option<String>,
-}
-
-/// Descriptor-verified payload paired with its graph-level authority.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StreamDeadLetterPayloadEntryOutput {
-    pub authority: StreamDeadLetterEntryOutput,
-    pub payload: Box<serde_json::value::RawValue>,
-}
-
-impl PartialEq for StreamDeadLetterPayloadEntryOutput {
-    fn eq(&self, other: &Self) -> bool {
-        self.authority == other.authority && self.payload.get() == other.payload.get()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct StreamDeadLetterPayloadPageOutput {
-    pub source_manifest_version: u64,
-    pub source_profile_revision: u64,
-    pub entries: Vec<StreamDeadLetterPayloadEntryOutput>,
-    pub next_cursor: Option<String>,
-}
-
 /// Output of config-only `cluster apply`. "Applied" means recorded in the
 /// local cluster catalog (`__cluster/`); nothing applied here serves traffic —
 /// the server still boots from `omnigraph.yaml` until the server-boot stage.
@@ -556,9 +355,6 @@ pub(crate) struct DesiredGraph {
     pub(crate) id: String,
     pub(crate) schema_digest: String,
     pub(crate) embedding_provider: Option<String>,
-    /// Declared streaming enablement; `None` = unmanaged (no `streaming.<id>`
-    /// resource is emitted and apply never touches the graph's flag).
-    pub(crate) streaming: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -634,17 +430,6 @@ pub(crate) struct GraphConfig {
     /// Optional reference to a top-level `providers.embedding.<name>` profile.
     #[serde(default)]
     pub(crate) embedding_provider: Option<String>,
-    /// RFC-026 F2: declare the graph's experimental stream profile.
-    /// `cluster apply` reconciles it through the checked offline authority
-    /// bound to the held state lock; the ambient engine toggle always refuses.
-    /// Absent means UNMANAGED, but removing the key never disables active
-    /// manifest authority: disabling requires an explicit `streaming: false`
-    /// and converges pending-until-drained.
-    /// `skip_serializing_if` is load-bearing: an absent key must serialize
-    /// byte-identically so existing clusters' `desired_config_digest` (and the
-    /// approvals bound to it) do not churn.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) streaming: Option<bool>,
 }
 
 /// A named cluster embedding provider profile (RFC-012 Phase 5). `kind`/`base_url`/
@@ -816,30 +601,6 @@ pub(crate) struct StateResource {
     /// once at boot and injects the resulting engine config into the graph.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) embedding_profile: Option<EmbeddingProviderConfig>,
-    /// `streaming.<id>` resources only: the applied RFC-026 §4.7 enablement
-    /// value, recorded from the live-graph observation so refresh converges
-    /// the ledger to engine truth. Absent on all other resource kinds and on
-    /// pre-streaming ledgers (which must keep parsing unchanged).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) streaming_enabled: Option<bool>,
-    /// `streaming.<id>` resources only: a domain-separated revision of this
-    /// graph's declaration. It changes when that declaration changes, but not
-    /// when an unrelated cluster resource advances the global config digest.
-    /// The manifest fold delegation and served runtime bind this value.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) declaration_revision: Option<String>,
-    /// Exact v2 profile mode (`DISABLED | ENABLED | DISABLING | RETIRED`).
-    /// Unlike the compatibility boolean, this preserves a durable disable
-    /// continuation and prevents refresh from mistaking it for terminal
-    /// `DISABLED`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) profile_mode: Option<String>,
-    /// `streaming.<id>` resources only: exact manifest profile revision
-    /// observed or published with `streaming_enabled`. Older ledgers parse
-    /// with this absent, but an enabled served runtime refuses to mint
-    /// authority until refresh/apply backfills it from engine truth.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) profile_revision: Option<u64>,
 }
 
 /// Recovery-intent record for a graph-moving apply operation (RFC-004 §D2).

@@ -75,7 +75,8 @@ graph id from the cluster's applied revision:
 | POST | `/graphs/{id}/queries/{name}` | bearer + `invoke_query` (+ `change` for a stored mutation) | invoke a named query from the `queries:` registry; deny == 404 |
 | GET | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source |
 | POST | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | disabled for cluster-backed serving; returns 409 and points operators at `omnigraph cluster apply` + restart |
-| POST | `/graphs/{id}/load` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | bulk load (canonical); branch creation is opt-in via `from` — without it a missing `branch` is a 404, never an implicit fork (32 MB body limit) |
+| POST | `/graphs/{id}/load` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | JSON-envelope load (`data` contains NDJSON), retained for compatibility (32 MB body limit) |
+| POST | `/graphs/{id}/load/ndjson?branch=&from=&mode=` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | strict raw `application/x-ndjson` graph batch; one request publishes one graph commit before success (32 MB body limit) |
 | POST | `/graphs/{id}/ingest` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | **deprecated** alias of `/load` (carries `Deprecation: true` + `Link: <load>; rel="successor-version"`) (32 MB body limit) |
 | GET | `/graphs/{id}/branches` | bearer + `read` | list branches |
 | POST | `/graphs/{id}/branches` | bearer + `branch_create` | create |
@@ -170,132 +171,48 @@ channels:
 Migration is purely cosmetic on the client side — swap the URL path, leave
 the request body and response handling alone.
 
-## Streaming
+## Bounded graph-batch ingestion
 
-The experimental graph-native firehose is
-`POST /graphs/{graph_id}/stream/ingest`. Its request and successful response
-are both `application/x-ndjson`; logical node and edge declarations may be
-mixed in one ordered request. The request is a firehose, not one graph
-transaction: earlier durable rows are not rolled back by a later failure, and
-an edge must follow the endpoint nodes it needs because forward references are
-not buffered. The URL never names a table, dataset, lane, or stream
-incarnation. Each response line reports only caller-logical identity, the
-acknowledgement disposition, and safe sequencing evidence.
-
-```json
-{"type":"Person","data":{"id":"p1","name":"Ada"},"$stream":{"write_id":"8a880f0a-3f41-4a42-9b0e-f34af0a9a4df","predecessor_token":null}}
-{"edge":"Knows","from":"p1","to":"p2","data":{},"$stream":{"write_id":"83ed1d92-87bb-489f-a64a-202e8369b46f","predecessor_token":null}}
-```
-
-Ingest uses an opaque graph-authority ETag to prevent a producer from writing
-an owned body into a rebuilt or reconfigured graph at the same URL. A request
-without `If-Match` is authorized and preflighted without polling its body, then
-returns HTTP **428** with the current strong `ETag`, `Cache-Control: no-store`,
-and a small JSON challenge. Retry once with that exact value in `If-Match`. A malformed or stale value
-returns HTTP **412** without a replacement token; the caller must re-check its
-target and must not automatically replay an already-owned body. The CLI
-performs the missing-token handshake before opening its input. With bearer
-authentication but no applied policy bundle, default-deny mode returns **403**
-before polling the body; an explicit graph-level `stream_ingest` grant is
-required.
+`POST /graphs/{graph_id}/load/ndjson` accepts a raw
+`application/x-ndjson` body. Targeting stays at graph level: `branch`, optional
+`from`, and `mode=append|merge|overwrite` are query parameters; there is no
+table or dataset selector. One request may mix logical node and edge
+declarations:
 
 ```http
-ETag: "sha256:…"
-Cache-Control: no-store
+POST /graphs/knowledge/load/ndjson?branch=main&mode=merge
+Content-Type: application/x-ndjson
 
-{"graph_token":"sha256:…"}
+{"type":"Person","data":{"name":"Ada"}}
+{"edge":"Knows","from":"Ada","to":"Grace","data":{}}
 ```
 
-After the exact precondition passes, input and results stream incrementally
-through bounded queues. Acknowledgement means the row is durable in Lance
-MemWAL, not yet graph-visible. The resident server driver later validates and
-publishes folds through the ordinary atomic graph publication path. A row-local
-shape/value error does not invalidate earlier acknowledgements. An ambiguous
-acknowledgement or graph-authority/backpressure failure stops later physical
-invocation. For `ack_unknown`, retry the exact same logical row with the same
-`write_id`, predecessor, and payload; the unconfirmed candidate token is not
-valid as a successor predecessor. Uninvoked rows may be retried only after the
-graph blocker is resolved. Disconnect
-stops future body polling while already-invoked work remains owned until its
-durability result is classified.
+The server authenticates and completes Cedar `branch_create`/`change`
+authorization before polling the body. It then buffers at most 32 MiB, applies
+the ordinary admission limits, strictly validates the complete batch, and calls
+the actor-aware graph-batch loader. All touched declarations publish through
+the existing multi-dataset transaction. A successful response is terminal: the
+single graph commit is already visible. Its `nodes` and `edges` arrays contain
+only logical accepted-schema names and row counts; physical table and Lance
+identities are not exposed.
 
-Ingest admits an absent internal declaration (prepared lazily) or an existing
-`OPEN` one. A `SEALED` declaration returns `stream_authority_changed`; it is
-never resumed as a side effect of ingest.
+`append` is strict insert, `merge` is upsert, and `overwrite` replaces each
+touched declaration's image. A malformed batch has no effect. Use multiple
+bounded requests for a larger feed; each successful request is one graph
+commit.
 
-`POST /graphs/{graph_id}/stream/resume` is the explicit graph-wide resume
-control. It accepts no body and no declaration selector. Under exact checked
-`ENABLED` runtime authority it preflights every enrolled declaration, refuses
-before effects if any declaration is still draining or strictly blocked,
-skips declarations already `OPEN`, and reopens the `SEALED` remainder in a
-deterministic internal order. A retry after an interrupted sequence is
-convergent: declarations already opened are skipped. Physical table, lane,
-claim, and recovery identities never appear in the response.
+The existing `POST /load` JSON envelope remains available: its `data` string
+contains the NDJSON and its other fields carry the same branch options. The
+canonical remote `omnigraph load` command uses the raw `/load/ndjson` route.
 
-Two bodyless graph-wide maintenance controls are available. Any enrolled
-declaration that the operation would physically change must be `SEALED`; an
-unaffected `OPEN` declaration does not block derived maintenance:
+The legacy JSON `POST /ingest` endpoint remains a deprecated alias of
+JSON `POST /load`.
 
-- `POST /graphs/{graph_id}/stream/maintenance/ensure-indices`
-- `POST /graphs/{graph_id}/stream/maintenance/optimize`
+## Export streaming
 
-They reuse OmniGraph's existing graph coordinator and Lance maintenance
-adapters; they do not introduce a second WAL, job queue, or persisted
-coordinator. Productive work publishes through the existing one-graph
-recovery/manifest envelope, while the response contains aggregate change,
-pending-index, and repair-needed status only. There is no per-type, per-table,
-or per-dataset endpoint.
-
-The control plane does not turn graph scope into one physical dataset. Resume
-captures the manifest work list once, then performs the necessary
-recovery-covered transitions against the separate Lance datasets in a bounded,
-deterministic sequence because the experimental profile has one resident WAL
-writer slot. Ensure-indices and Optimize already plan the graph once; Optimize
-runs productive physical tasks with bounded concurrency and publishes their
-visibility together. Clients therefore make one graph request and do not pay a
-public request round trip per declaration, while the coordinator still honors
-the real multi-dataset atomicity boundary.
-
-All three controls require graph-scoped `stream_manage`. The actor comes only
-from the server's bearer-token resolution; clients cannot supply one. Runtime,
-recovery, and storage errors are mapped to graph-safe responses that omit
-table keys, dataset locations, manifest/Lance coordinates, and internal
-operation identifiers.
-
-`GET /graphs/{graph_id}/stream/status` returns one checked, read-only
-operational cut for a cluster-served streaming graph. The response is
-graph-native: it reports the profile and revision, logical node/edge type
-lifecycle and compare revision for declarations whose streaming state has been
-initialized, bounded pending-work availability, current
-terminal-authority counts, advisory driver health, pending recovery count, and
-rebuild readiness. It never exposes table or dataset keys, stable table ids,
-stream bindings, shards, epochs, generations, Lance versions, recovery-object
-identities, or storage paths. The response carries `Cache-Control: no-store`.
-
-Status is authorized like other graph read metadata; it does not require a
-`stream_manage` grant. An unmanaged graph that has never established checked
-streaming authority returns **409** instead of synthesizing full physical
-evidence from its manifest-only state. If the bounded observation cannot obtain
-one stable cut, the route returns a redacted, retryable **503**. Status never
-heals recovery or publishes graph, token, lifecycle, or Lance state.
-Absence from `enrolled_declarations` means streaming state has not yet been
-initialized for that accepted-schema declaration; it does not mean the graph
-schema lacks the declaration. To bound immutable status scans, at most one
-checked observation runs per graph storage root and at most one runs across a
-server process. An overlapping request refuses immediately with the same
-redacted, retryable **503**.
-
-The existing `/export` route also streams `application/x-ndjson`; other routes
-remain buffered JSON. Export authorization, relevant checked recovery settlement/validation,
-branch/filter validation, and stream-authority validation all finish before the
-server sends `200`. A pristine graph may export normally. An enrolled
-`DISABLED` graph must be cluster-served at that exact terminal cut; ordinary
-embedded/direct export still refuses because it cannot mint served authority.
-The receipt-verified ambient `RETIRED` rebuild bridge remains compatible, while
-cluster serving normally supplies checked `RETIRED` authority too. `DISABLED`
-export additionally requires every lane `SEALED`, exact
-base/token parity, and no current `WITHDRAWN | DEAD_LETTERED` token. `RETIRED`
-export includes its verified rebuild provenance.
+The `/export` route streams `application/x-ndjson`; other routes remain
+buffered JSON. Export authorization, recovery settlement, and branch/filter
+validation all finish before the server sends `200`.
 
 The engine incrementally scans exact pinned Lance versions using an initial
 8,192-row estimate and Lance's approximate 32-MiB decoded-byte target; these
@@ -352,8 +269,7 @@ Do not blindly resubmit the write: let a read-write open or the recovery sweep
 resolve that operation first, then retry from a fresh snapshot.
 
 HTTP status codes used include 200, 400, 401, 403, 404, 405, 409, 412, 413,
-415, 428, 429, 500, and 503. The firehose-specific 412/415/428 meanings are
-defined in [Streaming](#streaming).
+415, 429, 500, and 503.
 
 ## Per-actor admission control
 
@@ -385,21 +301,17 @@ denied requests don't consume admission slots.
 
 Today admission gates every mutating handler: `/mutate` (and its
 deprecated alias `/change`), `/load` (and its deprecated alias `/ingest`),
+`/load/ndjson`,
 `/branches/{create,delete,merge}`,
 and `/schema/apply`. Read-only endpoints (`/snapshot`, `/query`, `/read`,
 `/export`, `/branches` GET, `/commits`, `/schema` GET) are not
 admission-gated.
 
-Graph firehose uses the engine's separate bounded per-actor and per-graph
-stream-request registry because its body is incremental rather than a buffered
-request with an up-front byte estimate. That permit is acquired before body
-polling and remains owned by the request task through invoked-tail settlement;
-saturation returns structured HTTP **413** without consuming the body.
 
 ## Body limits
 
 - Default: 1 MB
-- `/load` (and its deprecated `/ingest` alias): 32 MB
+- `/load`, `/load/ndjson`, and the deprecated `/ingest` alias: 32 MB
 
 ## Auth model (`bearer + SHA-256`)
 
@@ -428,6 +340,7 @@ See [deployment.md](../deployment.md) for token-source operational details.
 - CORS — not configured; add `tower_http::cors` if needed.
 - Rate limiting — per-actor admission control gates `/mutate` (alias
   `/change`), `/load` (alias `/ingest`), `/branches/{create,delete,merge}`,
+  `/load/ndjson`,
   `/schema/apply` (see "Per-actor
   admission control" above). No global rate limiter is configured;
   add `tower_http::limit` if a graph-wide cap is needed.

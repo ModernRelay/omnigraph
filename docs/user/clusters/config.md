@@ -79,7 +79,6 @@ graphs:
   knowledge:
     schema: knowledge.pg
     embedding_provider: default
-    streaming: false          # optional, experimental; see the ownership warning below
     queries: queries/          # discover every `query <name>` in queries/*.gq
 
 policies:
@@ -118,87 +117,6 @@ only when a `--cluster` server boots, so `cluster validate`, `plan`, and
 `apply` do not need deployment secrets. `mock` is deterministic and does not
 require `api_key`. Vector dimensions stay schema-driven by the target
 `Vector(N)` column, not the provider profile.
-
-`graphs.<id>.streaming: true|false` (optional, **experimental**) declares the
-graph's RFC-026 streaming profile. `cluster apply` is the only mutation
-mechanism: apply propagates the declaration into the graph's own durable
-manifest authority, which every process that opens the graph obeys — it is
-graph state, not server configuration.
-
-A profile change is an **offline ownership handoff**. Stop every
-writer-capable server/process for that graph, then run:
-
-```bash
-omnigraph cluster apply --config company-brain \
-  --as <actor> --confirm-stream-offline
-```
-
-The confirmation is an operator attestation that the writers are stopped; it
-is not a distributed lease and OmniGraph does not claim to discover foreign
-processes. The command also requires the cluster state lock. A configuration
-with `state.lock: false` refuses a streaming-profile change. Running profile
-apply concurrently with a writer server is unsupported; restart the server
-only after apply completes.
-
-Profile apply enforces `stream_manage` against the graph policy in both the
-currently applied cluster revision and the desired revision being applied.
-When the binding changes, both policies must authorize the actor; when only
-one side has a bound policy, that policy governs. This conjunction remains in
-force until the cluster-state CAS records the desired revision, so changing a
-policy in the same apply cannot open an authorization gap. If the current
-policy denies `stream_manage` and the desired policy grants it, apply that
-policy change first, then apply the profile change. To revoke the grant while
-also changing the profile, apply the profile change while both revisions
-still allow it, then revoke the policy in a second apply. When the profile
-transition is blocked, apply demotes every current- or desired-bound policy
-change for that graph and leaves the currently applied policy selected, so a
-simultaneous revoke cannot remove the authority needed by the next retry.
-
-Profile receipts are actor-bound independently of their stable operation ID.
-After a lost apply response or an engine-effect/state-CAS failure, retry
-`cluster apply` with the same `--as` actor to receive the retained result. If
-that identity is unavailable, do not substitute another actor for the same
-occurrence: run `cluster refresh` to reconcile the state ledger from the
-authoritative graph manifest, inspect the new plan, and then continue under
-the replacement actor.
-
-This release's enable is intentionally **not additive**. While the durable
-profile is enabled, Mutation/Load/delete through an embedded SDK handle or
-direct `--store` CLI handle fail before input-file reads, staging, recovery
-arming, or Lance effects. Existing served Mutation/Load operations continue
-only through the one cluster-booted server carrying the exact checked runtime
-authority. The graph-native served firehose is available through
-`POST /graphs/{graph_id}/stream/ingest` and remote `stream ingest`, but only an
-absent declaration (prepared lazily) or an existing `OPEN` declaration can
-admit rows. After disable/re-enable, restart the checked server and run the
-selector-free graph-wide `omnigraph stream resume` to reopen every `SEALED`
-declaration. Repeated ingest requests never reopen one implicitly.
-Branch merge is stricter: it is refused while the profile is `ENABLED` or
-`DISABLING`, even through that checked served runtime, because this release has
-no token-aware merge transition.
-
-Semantics are deliberately asymmetric:
-
-- **Absent = unmanaged.** No `streaming.<id>` resource exists and apply never
-  touches the graph's flag. *Removing* the key unmanages it — it never
-  disables a previously enabled graph.
-- **Disabling requires an explicit `streaming: false`.** The profile can
-  return to `DISABLED` after a checked offline apply drains its finite
-  manifest-derived lane cut. Apply persists `DISABLING`, handles `OPEN` and
-  goal-`SEALED` lanes, and adopts an existing `OPEN_AFTER_FOLD` drain without
-  minting a second occurrence. A selected `DataBlock` leaves that exact plan
-  pending until stopped/offline correction and an apply retry; sequencing
-  authority is never discarded. Only the no-lane case restores embedded/direct
-  content writes: existing `SEALED` enrollments remain fenced and are not
-  de-enrolled by the profile transition. Rebuild the logical graph through
-  export/init/load to return an enrolled graph to the non-streaming physical
-  profile.
-- `cluster refresh` reads the live value back from the graph, so an
-  out-of-band flip or a crashed apply surfaces as ordinary plan drift toward
-  the declaration.
-
-The profile is experimental and its surface may change without a deprecation
-cycle.
 
 `storage:` (optional) is the **storage root URI** for everything the cluster
 stores — the state ledger, lock, content-addressed catalog, recovery

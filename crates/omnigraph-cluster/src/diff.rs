@@ -228,11 +228,6 @@ pub(crate) enum ResourceKind {
     Query { graph: String, name: String },
     Policy(String),
     EmbeddingProvider(String),
-    /// RFC-026 §4.7 P1: the per-graph streaming-enablement flag. First-class
-    /// (never folded into `graph.<id>`'s composite digest) because it
-    /// converges like schema — through a live engine call — and a `Derived`
-    /// graph update would fake-converge the ledger without one.
-    Streaming(String),
     Unknown,
 }
 
@@ -241,8 +236,6 @@ pub(crate) fn resource_kind(address: &str) -> ResourceKind {
         ResourceKind::Graph(graph.to_string())
     } else if let Some(graph) = address.strip_prefix("schema.") {
         ResourceKind::Schema(graph.to_string())
-    } else if let Some(graph) = address.strip_prefix("streaming.") {
-        ResourceKind::Streaming(graph.to_string())
     } else if let Some(rest) = address.strip_prefix("query.") {
         match rest.split_once('.') {
             Some((graph, name)) => ResourceKind::Query {
@@ -269,7 +262,6 @@ pub(crate) fn classify_changes(
     dependencies: &[Dependency],
     pending_recovery: &BTreeSet<String>,
     approved: &BTreeSet<String>,
-    streaming_drain_pending: &BTreeSet<String>,
 ) {
     let mut schema_creates = BTreeSet::new();
     let mut schema_pending = BTreeSet::new();
@@ -407,25 +399,6 @@ pub(crate) fn classify_changes(
                 }
             },
             ResourceKind::EmbeddingProvider(_) => (ApplyDisposition::Applied, None),
-            ResourceKind::Streaming(graph) => match change.operation {
-                // Declaration removed = the flag becomes UNMANAGED: the
-                // ledger row goes away, no engine call, the graph keeps its
-                // current state. Disabling requires an explicit
-                // `streaming: false`.
-                PlanOperation::Delete => (ApplyDisposition::Applied, None),
-                PlanOperation::Create | PlanOperation::Update => {
-                    if pending_recovery.contains(&graph) {
-                        (ApplyDisposition::Blocked, Some("cluster_recovery_pending"))
-                    } else if streaming_drain_pending.contains(&graph) {
-                        // The engine reported undrained stream state; the
-                        // flip converges on a later apply once the streams
-                        // drain (RFC-026 §4.7 P1 pending-until-drained).
-                        (ApplyDisposition::Blocked, Some("streaming_drain_pending"))
-                    } else {
-                        (ApplyDisposition::Applied, None)
-                    }
-                }
-            },
             ResourceKind::Unknown => (ApplyDisposition::Deferred, Some("apply_unsupported_kind")),
         };
         change.disposition = Some(disposition);
@@ -471,7 +444,7 @@ pub(crate) fn demote_dependents_of_failed_graphs(
             ResourceKind::Query { graph, .. } if failed.contains_key(&graph) => {
                 Some("dependency_not_applied")
             }
-            ResourceKind::Policy(_) | ResourceKind::Streaming(_) => {
+            ResourceKind::Policy(_) => {
                 let blocked = dependencies.iter().any(|dep| {
                     dep.from == change.resource
                         && dep
@@ -490,53 +463,3 @@ pub(crate) fn demote_dependents_of_failed_graphs(
     }
 }
 
-/// Keep the policy authority that can resume an incomplete stream-profile
-/// reconciliation selected in the applied state.
-///
-/// Profile changes execute before the cluster state CAS. If one is blocked,
-/// publishing a policy update/removal bound to that graph could replace the
-/// currently-authorizing policy with the very desired policy that denied the
-/// transition. The next apply would then enforce the new denial as the current
-/// policy and could never resume the disable. Freeze both currently and
-/// desired-bound policy changes until the profile transition succeeds.
-pub(crate) fn demote_policies_for_blocked_stream_profiles(
-    changes: &mut [PlanChange],
-    blocked_graphs: &BTreeSet<String>,
-    state: &ClusterState,
-    dependencies: &[Dependency],
-) {
-    if blocked_graphs.is_empty() {
-        return;
-    }
-
-    for change in changes.iter_mut() {
-        if change.disposition != Some(ApplyDisposition::Applied)
-            || !matches!(resource_kind(&change.resource), ResourceKind::Policy(_))
-        {
-            continue;
-        }
-        let currently_bound = state
-            .applied_revision
-            .resources
-            .get(&change.resource)
-            .and_then(|resource| resource.applies_to.as_deref())
-            .is_some_and(|bindings| {
-                blocked_graphs.iter().any(|graph| {
-                    bindings
-                        .iter()
-                        .any(|binding| binding == &graph_address(graph))
-                })
-            });
-        let desired_bound = dependencies.iter().any(|dependency| {
-            dependency.from == change.resource
-                && dependency
-                    .to
-                    .strip_prefix("graph.")
-                    .is_some_and(|graph| blocked_graphs.contains(graph))
-        });
-        if currently_bound || desired_bound {
-            change.disposition = Some(ApplyDisposition::Blocked);
-            change.reason = Some("streaming_profile_not_applied".to_string());
-        }
-    }
-}
