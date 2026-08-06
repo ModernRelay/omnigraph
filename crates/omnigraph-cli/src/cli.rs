@@ -415,11 +415,6 @@ pub(crate) enum ClusterCommand {
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,
-        /// Attest that every writer-capable process for graphs whose streaming
-        /// profile changes has been stopped. Required for those changes; this
-        /// is an operator-enforced ownership handoff, not a distributed lease.
-        #[arg(long)]
-        confirm_stream_offline: bool,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,

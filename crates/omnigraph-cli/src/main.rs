@@ -1088,24 +1088,13 @@ async fn main() -> Result<()> {
                 let output = plan_config_dir(config).await;
                 finish_cluster_plan(&output, json)?;
             }
-            ClusterCommand::Apply {
-                config,
-                confirm_stream_offline,
-                json,
-            } => {
+            ClusterCommand::Apply { config, json } => {
                 // The actor attributes graph-moving operations (sidecars,
                 // audit entries, engine schema-apply commits). Cluster FACTS
                 // stay unlayered; the operator's identity resolves --as flag
                 // first, then per-operator config `operator.actor`.
                 let actor = resolve_cluster_actor(cli.as_actor.as_deref())?;
-                let output = apply_config_dir_with_options(
-                    config,
-                    ApplyOptions {
-                        actor,
-                        confirm_stream_offline,
-                    },
-                )
-                .await;
+                let output = apply_config_dir_with_options(config, ApplyOptions { actor }).await;
                 finish_cluster_apply(&output, json)?;
             }
             ClusterCommand::Approve {
