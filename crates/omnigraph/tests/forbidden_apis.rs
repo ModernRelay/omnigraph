@@ -2311,7 +2311,7 @@ fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
 
     for item in &ast.items {
         match item {
-            Item::Struct(item) if item.ident == "StreamExportCut" => {
+            Item::Struct(item) if item.ident == "ExportCut" => {
                 cut_structs += 1;
                 assert!(
                     matches!(item.vis, Visibility::Public(_)),
@@ -2319,13 +2319,13 @@ fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
                 );
                 assert!(
                     has_doc_hidden(&item.attrs),
-                    "StreamExportCut must stay out of generated SDK documentation"
+                    "ExportCut must stay out of generated SDK documentation"
                 );
                 assert!(
                     item.fields
                         .iter()
                         .all(|field| matches!(field.vis, Visibility::Inherited)),
-                    "every StreamExportCut field must remain private"
+                    "every ExportCut field must remain private"
                 );
                 let mut derives_clone = false;
                 for attribute in &item.attrs {
@@ -2346,7 +2346,7 @@ fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
             Item::Impl(item)
                 if item.trait_.is_none()
                     && type_final_ident(&item.self_ty)
-                        .is_some_and(|ident| ident == "StreamExportCut") =>
+                        .is_some_and(|ident| ident == "ExportCut") =>
             {
                 for member in &item.items {
                     let syn::ImplItem::Fn(function) = member else {
@@ -2383,7 +2383,7 @@ fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
                     assert!(has_doc_hidden(&function.attrs));
                     assert!(return_type_contains_identifier(
                         &function.sig.output,
-                        "StreamExportCut"
+                        "ExportCut"
                     ));
                 }
             }
@@ -2409,8 +2409,8 @@ fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
         "the hidden cut may only be consumed through its bounded output conveniences"
     );
     assert!(
-        !contents.contains("impl Clone for StreamExportCut"),
-        "StreamExportCut must remain non-cloneable"
+        !contents.contains("impl Clone for ExportCut"),
+        "ExportCut must remain non-cloneable"
     );
 }
 

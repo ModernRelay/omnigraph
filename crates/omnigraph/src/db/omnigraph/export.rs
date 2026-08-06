@@ -21,16 +21,16 @@ pub const EXPORT_CHUNK_MAX_BYTES: usize = 64 * 1024;
 /// Private fields and the absence of `Clone`/serde/default constructors keep
 /// the cut non-forgeable.
 #[doc(hidden)]
-pub struct StreamExportCut {
+pub struct ExportCut {
     db: Arc<Omnigraph>,
     snapshot: Snapshot,
     catalog: Arc<Catalog>,
     selected_tables: Vec<String>,
     retirement_provenance: Option<StreamAuthorityRetirementExportProvenance>,
-    _slot: crate::db::write_queue::StreamExportCutPermit,
+    _slot: crate::db::write_queue::ExportCutPermit,
 }
 
-impl StreamExportCut {
+impl ExportCut {
     async fn emit_chunks<Emit, EmitFuture>(&self, emit: &mut Emit) -> Result<()>
     where
         Emit: FnMut(Vec<u8>) -> EmitFuture,
@@ -111,10 +111,10 @@ impl Omnigraph {
         branch: &str,
         type_names: &[String],
         table_keys: &[String],
-    ) -> Result<StreamExportCut> {
+    ) -> Result<ExportCut> {
         let slot = self
             .write_queue()
-            .try_acquire_stream_export_cut()
+            .try_acquire_export_cut()
             .ok_or_else(|| OmniError::ResourceLimitExceeded {
                 resource: "stream_export_slots".to_string(),
                 limit: 1,
@@ -209,7 +209,7 @@ impl Omnigraph {
         crate::failpoints::maybe_fail(crate::failpoints::names::STREAM_EXPORT_POST_CUT_CAPTURE)?;
         drop(gates);
 
-        Ok(StreamExportCut {
+        Ok(ExportCut {
             db: Arc::clone(self),
             snapshot,
             catalog,
@@ -272,7 +272,7 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
     // exact snapshot coordinates while bytes are still being read.
     let _export_cut = db
         .write_queue()
-        .try_acquire_stream_export_cut()
+        .try_acquire_export_cut()
         .ok_or_else(|| OmniError::ResourceLimitExceeded {
             resource: "stream_export_slots".to_string(),
             limit: 1,

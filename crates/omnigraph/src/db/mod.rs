@@ -21,7 +21,7 @@ pub use omnigraph::{
     StreamAuthorityRetirementResult, StreamDataBlockEntry, StreamDataBlockPage,
     StreamDataCorrectionAction, StreamDataCorrectionRequest, StreamDataCorrectionResult,
     StreamDeadLetterEntry, StreamDeadLetterPage, StreamDeadLetterPayloadEntry,
-    StreamDeadLetterPayloadPage, StreamExportCut, StreamStatus, StreamTableStatus,
+    StreamDeadLetterPayloadPage, ExportCut, StreamStatus, StreamTableStatus,
     StreamingProfileResult, TableCleanupStats, TableOptimizeStats, TableRepairStats,
 };
 #[doc(hidden)]
@@ -66,8 +66,8 @@ use crate::error::{OmniError, Result};
 /// a cut's exact table paths and versions.
 #[doc(hidden)]
 #[must_use = "dropping the guard releases destructive root control"]
-pub struct StreamExportRootExclusion {
-    _permit: write_queue::StreamExportDestructivePermit,
+pub struct ExportRootExclusion {
+    _permit: write_queue::ExportDestructivePermit,
 }
 
 /// Nonwaitingly reserve one graph root against a live immutable export cut.
@@ -76,20 +76,20 @@ pub struct StreamExportRootExclusion {
 /// graph deletion without exposing the engine's queue manager or a capability
 /// that can read, write, or delete storage.
 #[doc(hidden)]
-pub fn reserve_stream_export_root_exclusion(
+pub fn reserve_export_root_exclusion(
     graph_uri: &str,
-) -> Result<StreamExportRootExclusion> {
+) -> Result<ExportRootExclusion> {
     let normalized = crate::storage::normalize_root_uri(graph_uri)?;
     let identity = crate::storage::write_queue_root_identity(&normalized)?;
     let manager = write_queue::WriteQueueManager::for_root(&identity);
     let permit = manager
-        .try_acquire_stream_export_destructive()
+        .try_acquire_export_destructive()
         .ok_or_else(|| OmniError::ResourceLimitExceeded {
             resource: "stream_export_slots".to_string(),
             limit: 1,
             actual: 2,
         })?;
-    Ok(StreamExportRootExclusion { _permit: permit })
+    Ok(ExportRootExclusion { _permit: permit })
 }
 
 pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";

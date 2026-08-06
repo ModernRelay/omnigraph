@@ -59,7 +59,7 @@ mod stream_status;
 mod table_ops;
 
 #[doc(hidden)]
-pub use export::{EXPORT_CHUNK_MAX_BYTES, StreamExportCut};
+pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
 pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
@@ -3101,11 +3101,11 @@ impl Omnigraph {
     /// This is non-waiting to remain safe for loader composition that already
     /// holds shared stream gates: either side owns the slot, never waits while
     /// holding the opposite side's gates.
-    pub(super) fn reserve_stream_export_destructive_control(
+    pub(super) fn reserve_export_destructive_control(
         &self,
-    ) -> Result<crate::db::write_queue::StreamExportDestructivePermit> {
+    ) -> Result<crate::db::write_queue::ExportDestructivePermit> {
         self.write_queue()
-            .try_acquire_stream_export_destructive()
+            .try_acquire_export_destructive()
             .ok_or_else(|| OmniError::ResourceLimitExceeded {
                 resource: "stream_export_slots".to_string(),
                 limit: 1,
@@ -3133,7 +3133,7 @@ impl Omnigraph {
         ensure_public_branch_ref(name, "branch_create")?;
         let target = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
-        let _export_exclusion = self.reserve_stream_export_destructive_control()?;
+        let _export_exclusion = self.reserve_export_destructive_control()?;
         self.ensure_schema_state_valid().await?;
         let source = self.active_branch().await;
         let relevant = [source.as_deref(), Some(target.as_str()), None];
@@ -3276,7 +3276,7 @@ impl Omnigraph {
         let branch = normalize_branch_name(&branch_name)?;
         let target_branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
-        let _export_exclusion = self.reserve_stream_export_destructive_control()?;
+        let _export_exclusion = self.reserve_export_destructive_control()?;
         self.ensure_schema_state_valid().await?;
         let relevant = [branch.as_deref(), Some(target_branch.as_str()), None];
         if heal_recovery {
@@ -3380,7 +3380,7 @@ impl Omnigraph {
         ensure_public_branch_ref(name, "branch_delete")?;
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
-        let _export_exclusion = self.reserve_stream_export_destructive_control()?;
+        let _export_exclusion = self.reserve_export_destructive_control()?;
         self.ensure_schema_state_valid().await?;
         self.heal_pending_recovery_sidecars_for_branch_delete(&branch)
             .await?;

@@ -933,7 +933,7 @@ pub async fn apply_config_dir_with_options(
             .map(|artifact| artifact.approval_id.clone());
         let graph_uri = backend.graph_root(graph_id);
         let _export_exclusion =
-            match omnigraph::db::reserve_stream_export_root_exclusion(&graph_uri) {
+            match omnigraph::db::reserve_export_root_exclusion(&graph_uri) {
                 Ok(guard) => guard,
                 Err(error) => {
                     diagnostics.push(Diagnostic::error(

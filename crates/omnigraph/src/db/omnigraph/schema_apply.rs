@@ -224,7 +224,7 @@ where
         &omnigraph_policy::ResourceScope::TargetBranch("main".to_string()),
         actor,
     )?;
-    let _export_exclusion = db.reserve_stream_export_destructive_control()?;
+    let _export_exclusion = db.reserve_export_destructive_control()?;
 
     // Converge any pending recovery sidecar before planning: a table
     // rewrite over sidecar-covered drift would otherwise re-plan from
