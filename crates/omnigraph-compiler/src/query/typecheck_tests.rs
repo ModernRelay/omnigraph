@@ -1288,6 +1288,54 @@ return { $f.name }
 }
 
 #[test]
+fn test_edge_binding_blob_property_rejected() {
+    // The bound scan excludes blob columns (Lance limit); access must fail
+    // loudly, not vanish downstream.
+    let schema = parse_schema(
+        r#"
+node Person {
+name: String
+}
+edge Sent: Person -> Person {
+note: String?
+attachment: Blob?
+}
+"#,
+    )
+    .unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $a: Person
+    $a $w:sent $b
+}
+return { $w.attachment }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23") && msg.contains("blob"), "{msg}");
+
+    let qf_ok = parse_query(
+        r#"
+query q() {
+match {
+    $a: Person
+    $a $w:sent $b
+}
+return { $w.note }
+}
+"#,
+    )
+    .unwrap();
+    assert!(typecheck_query(&catalog, &qf_ok.queries[0]).is_ok());
+}
+
+#[test]
 fn test_edge_binding_aggregate_typechecks() {
     // The uniformity promise ("works wherever a node field does") includes
     // aggregates: count over an edge property, grouped by a node field.

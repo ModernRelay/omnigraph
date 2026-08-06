@@ -1035,6 +1035,12 @@ fn resolve_expr_type(
                                 bv.type_name
                             ))
                         })?;
+                    if edge_type.blob_properties.contains(property) {
+                        return Err(CompilerError::Type(format!(
+                            "T23: blob edge property `${}.{}` is not projectable; the bound edge scan excludes blob columns",
+                            variable, property
+                        )));
+                    }
                     edge_type.properties.get(property).ok_or_else(|| {
                         CompilerError::Type(format!(
                             "T6: edge `{}` has no property `{}`",

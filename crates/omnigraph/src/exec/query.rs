@@ -1448,8 +1448,15 @@ async fn execute_expand_bound(
         .edge_types
         .get(edge_type)
         .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_type)))?;
-    // Deterministic column order for the attached edge batch.
-    let mut prop_cols: Vec<&str> = edge_def.properties.keys().map(String::as_str).collect();
+    // Sorted for determinism. Blobs excluded: Lance rejects blob projection
+    // in a filtered scan (node scans carry the same guard); typecheck
+    // rejects the access.
+    let mut prop_cols: Vec<&str> = edge_def
+        .properties
+        .keys()
+        .map(String::as_str)
+        .filter(|c| !edge_def.blob_properties.contains(*c))
+        .collect();
     prop_cols.sort_unstable();
 
     // Wide rows grouped by src id: several wide rows may share one source node.
