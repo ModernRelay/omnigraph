@@ -1195,3 +1195,186 @@ update Event set { on: now() } where slug = "launch"
     assert!(err.to_string().contains("DateTime"));
     assert!(err.to_string().contains("property `on`"));
 }
+
+#[test]
+fn test_edge_binding_prop_access_in_filter_and_return() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:knows $f
+    $w.since >= date("2026-01-01")
+}
+return { $f.name, $w.since }
+}
+"#,
+    )
+    .unwrap();
+    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let w = &ctx.bindings["w"];
+    assert!(matches!(w.kind, BindingKind::Edge));
+    assert_eq!(w.type_name, "Knows");
+    assert_eq!(
+        ctx.traversals[0].edge_binding.as_deref(),
+        Some("w"),
+        "resolved traversal carries the binding for lowering"
+    );
+}
+
+#[test]
+fn test_edge_binding_unknown_property_rejected() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:knows $f
+}
+return { $w.nonsense }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("Knows"), "names the edge type: {msg}");
+    assert!(
+        msg.contains("nonsense"),
+        "names the missing property: {msg}"
+    );
+}
+
+#[test]
+fn test_edge_binding_rejected_on_bounded_traversal() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:knows{1,3} $f
+}
+return { $f.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23"), "dedicated code: {msg}");
+    assert!(msg.contains("multi-hop"), "explains the restriction: {msg}");
+}
+
+#[test]
+fn test_edge_binding_name_collision_rejected() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $p:knows $f
+}
+return { $f.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    assert!(err.to_string().contains("T23"), "{err}");
+}
+
+#[test]
+fn test_edge_binding_aggregate_typechecks() {
+    // The uniformity promise ("works wherever a node field does") includes
+    // aggregates: count over an edge property, grouped by a node field.
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query knows_counts() {
+match {
+    $p: Person
+    $p $w:knows $f
+}
+return { $f.name, count($w.since) }
+}
+"#,
+    )
+    .unwrap();
+    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    assert!(matches!(ctx.bindings["w"].kind, BindingKind::Edge));
+}
+
+#[test]
+fn test_edge_binding_rejected_in_search_field() {
+    // Would otherwise typecheck (title is a String edge prop) and then be
+    // SILENTLY DROPPED by the engine's search-filter hoist, which targets a
+    // NodeScan the edge binding does not have.
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:worksAt $c
+    search($w.title, "engineer")
+}
+return { $c.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23"), "{msg}");
+    assert!(msg.contains("search"), "{msg}");
+}
+
+#[test]
+fn test_edge_binding_rejected_in_nearest() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:worksAt $c
+}
+return { $c.name }
+order { nearest($w.title, "x") }
+limit 5
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("T23"),
+        "clear edge-binding error, not a confusing catalog miss: {msg}"
+    );
+}
+
+#[test]
+fn test_edge_binding_bare_use_rejected() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:knows $f
+}
+return { $w }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23"), "{msg}");
+    assert!(msg.contains("propert"), "points at property access: {msg}");
+}

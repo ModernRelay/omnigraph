@@ -66,6 +66,7 @@ Hybrid example: `order { rrf(nearest($d.embedding, $q), bm25($d.body, $q_text)) 
 ### Joins / set operations
 
 - Joins are implicit: MATCH bindings + traversals are implemented as scans + CSR/CSC lookups.
+- A traversal with an edge binding (`$p $w:knows $f`) bypasses both unbound expand modes: it always scans the edge dataset (`execute_expand_bound` — CSR holds topology only, not edge properties), emits one row per matching edge row, and never triggers the lazy `GraphIndex` build on its own.
 - `not { … }` lowers to an `AntiJoin` over the inner pipeline.
 
 ### Scoped reads

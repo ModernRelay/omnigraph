@@ -836,6 +836,7 @@ fn execute_pipeline<'a>(
                     min_hops,
                     max_hops,
                     dst_filters,
+                    edge_binding,
                 } => {
                     // Merge lowered destination filters with hoisted ones
                     let mut all_dst_filters: Vec<IRFilter> = dst_filters.clone();
@@ -856,6 +857,7 @@ fn execute_pipeline<'a>(
                             *min_hops,
                             *max_hops,
                             &all_dst_filters,
+                            edge_binding.as_deref(),
                             params,
                         )
                         .await?;
@@ -1273,12 +1275,26 @@ async fn execute_expand(
     min_hops: u32,
     max_hops: Option<u32>,
     dst_filters: &[IRFilter],
+    edge_binding: Option<&str>,
     params: &ParamMap,
 ) -> Result<()> {
     let frontier_rows = wide.num_rows();
     let effective_max_hops = max_hops.unwrap_or(min_hops.max(1));
     let (key_col, _) = endpoint_columns(direction);
     let edge_table_key = format!("edge:{}", edge_type);
+
+    // A bound edge needs edge ROWS (per-row cardinality, property columns);
+    // the CSR index holds topology only, so this path always scans the edge
+    // dataset. Single-hop by typecheck (T23), so the multi-hop cost model
+    // does not apply.
+    if let Some(binding) = edge_binding {
+        let edge_ds = snapshot.open_dataset(&edge_table_key).await?;
+        return execute_expand_bound(
+            wide, snapshot, catalog, src_var, dst_var, edge_type, direction, dst_type,
+            dst_filters, binding, params, edge_ds,
+        )
+        .await;
+    }
 
     // Cardinality-first preliminary decision (no IO). The override wins; else the
     // cost model decides under *optimistic* coverage. Optimistic is what lets us
@@ -1391,6 +1407,151 @@ async fn execute_expand(
     execute_expand_indexed(
         wide, snapshot, catalog, src_var, dst_var, edge_type, direction, dst_type, min_hops,
         max_hops, dst_filters, params, edge_ds,
+    )
+    .await
+}
+
+/// Single-hop expand with a bound edge variable (`$p $w:knows $f`). Differs
+/// from the unbound paths in two contracted ways: output cardinality is one
+/// row per matching edge ROW (parallel edges between the same endpoints stay
+/// distinct, because each carries its own properties), and the edge's declared
+/// property columns ride into the wide batch under the binding's prefix
+/// (`w.since`), where the ordinary filter/projection machinery consumes them.
+/// Typecheck (T23) guarantees single-hop.
+#[allow(clippy::too_many_arguments)]
+async fn execute_expand_bound(
+    wide: &mut RecordBatch,
+    snapshot: &Snapshot,
+    catalog: &Catalog,
+    src_var: &str,
+    dst_var: &str,
+    edge_type: &str,
+    direction: Direction,
+    dst_type: &str,
+    dst_filters: &[IRFilter],
+    edge_binding: &str,
+    params: &ParamMap,
+    edge_ds: Dataset,
+) -> Result<()> {
+    let src_id_col_name = format!("{}.id", src_var);
+    let src_ids = wide
+        .column_by_name(&src_id_col_name)
+        .ok_or_else(|| {
+            OmniError::manifest(format!("wide batch missing '{}' column", src_id_col_name))
+        })?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::manifest(format!("'{}' column is not Utf8", src_id_col_name)))?
+        .clone();
+
+    let edge_def = catalog
+        .edge_types
+        .get(edge_type)
+        .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_type)))?;
+    // Deterministic column order for the attached edge batch.
+    let mut prop_cols: Vec<&str> = edge_def.properties.keys().map(String::as_str).collect();
+    prop_cols.sort_unstable();
+
+    // Wide rows grouped by src id: several wide rows may share one source node.
+    let mut rows_by_src: HashMap<&str, Vec<u32>> = HashMap::new();
+    for i in 0..src_ids.len() {
+        rows_by_src.entry(src_ids.value(i)).or_default().push(i as u32);
+    }
+    let union_keys: Vec<String> = rows_by_src.keys().map(|k| k.to_string()).collect();
+
+    let mut src_indices: Vec<u32> = Vec::new();
+    let mut dst_ids: Vec<String> = Vec::new();
+    // Edge row of each emitted pair, as (scanned batch, row); flattened after
+    // the scan into one pair-parallel batch.
+    let mut edge_rows: Vec<(usize, usize)> = Vec::new();
+    let mut scanned: Vec<RecordBatch> = Vec::new();
+
+    for (probe_idx, &(key_col, opp_col)) in endpoint_probes(direction).iter().enumerate() {
+        let batches = crate::table_store::TableStore::scan_edges_by_endpoint_projected(
+            &edge_ds, key_col, opp_col, &prop_cols, &union_keys,
+        )
+        .await?;
+        for batch in batches {
+            let batch_idx = scanned.len();
+            let keys = batch
+                .column_by_name(key_col)
+                .ok_or_else(|| OmniError::manifest(format!("edge batch missing '{}'", key_col)))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", key_col)))?
+                .clone();
+            let opps = batch
+                .column_by_name(opp_col)
+                .ok_or_else(|| OmniError::manifest(format!("edge batch missing '{}'", opp_col)))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", opp_col)))?
+                .clone();
+            for r in 0..batch.num_rows() {
+                // Undirected probes both orientations; a self-loop row would
+                // match the same wide row through both, so emit it only once.
+                if probe_idx == 1 && keys.value(r) == opps.value(r) {
+                    continue;
+                }
+                let Some(wide_rows) = rows_by_src.get(keys.value(r)) else {
+                    continue;
+                };
+                for &wide_row in wide_rows {
+                    src_indices.push(wide_row);
+                    dst_ids.push(opps.value(r).to_string());
+                    edge_rows.push((batch_idx, r));
+                }
+            }
+            scanned.push(batch);
+        }
+    }
+
+    // Pair-parallel batch of the edge's property columns (empty for a
+    // property-less edge; the binding is then legal but vacuous, since
+    // typecheck already rejected every `$w.prop` access).
+    let edge_attach: Option<RecordBatch> = if prop_cols.is_empty() || scanned.is_empty() {
+        None
+    } else {
+        let prop_only: Vec<RecordBatch> = scanned
+            .iter()
+            .map(|b| {
+                let indices: Vec<usize> = prop_cols
+                    .iter()
+                    .map(|c| b.schema().index_of(c))
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(|e| OmniError::manifest(e.to_string()))?;
+                b.project(&indices)
+                    .map_err(|e| OmniError::manifest(e.to_string()))
+            })
+            .collect::<Result<_>>()?;
+        let schema = prop_only[0].schema();
+        let combined = arrow_select::concat::concat_batches(&schema, &prop_only)
+            .map_err(|e| OmniError::manifest(e.to_string()))?;
+        // Flatten (batch, row) to rows in `combined`.
+        let mut offsets: Vec<usize> = Vec::with_capacity(scanned.len());
+        let mut acc = 0usize;
+        for b in &scanned {
+            offsets.push(acc);
+            acc += b.num_rows();
+        }
+        let flat: Vec<u32> = edge_rows
+            .iter()
+            .map(|&(b, r)| (offsets[b] + r) as u32)
+            .collect();
+        Some(take_batch(&combined, &UInt32Array::from(flat))?)
+    };
+
+    expand_hydrate_and_align(
+        wide,
+        src_indices,
+        dst_ids,
+        snapshot,
+        catalog,
+        dst_type,
+        dst_var,
+        dst_filters,
+        params,
+        edge_attach.map(|batch| (edge_binding.to_string(), batch)),
     )
     .await
 }
@@ -1569,13 +1730,17 @@ async fn execute_expand_indexed(
 
     expand_hydrate_and_align(
         wide, src_indices, dst_ids, snapshot, catalog, dst_type, dst_var, dst_filters, params,
+        None,
     )
     .await
 }
 
-/// Shared tail for both Expand modes: hydrate the unique destination ids, align
+/// Shared tail for all Expand modes: hydrate the unique destination ids, align
 /// the `(src_row, dst_id)` pairs back onto `wide`, hconcat, and apply
-/// non-pushable destination filters in memory.
+/// non-pushable destination filters in memory. `edge_attach`, present only for
+/// a bound-edge expand, is a pair-parallel batch of edge property columns that
+/// joins the wide batch under the binding's prefix.
+#[allow(clippy::too_many_arguments)]
 async fn expand_hydrate_and_align(
     wide: &mut RecordBatch,
     src_indices: Vec<u32>,
@@ -1586,6 +1751,7 @@ async fn expand_hydrate_and_align(
     dst_var: &str,
     dst_filters: &[IRFilter],
     params: &ParamMap,
+    edge_attach: Option<(String, RecordBatch)>,
 ) -> Result<()> {
     // Pushable destination filters are applied by `hydrate_nodes`; the rest
     // (`ir_filter_to_expr` → None) are applied in memory after hconcat. The
@@ -1624,10 +1790,12 @@ async fn expand_hydrate_and_align(
     // Align pairs to (src_row, hydrated_dst_row), dropping ids hydration filtered out.
     let mut final_src_indices: Vec<u32> = Vec::with_capacity(src_indices.len());
     let mut dst_indices: Vec<u32> = Vec::with_capacity(src_indices.len());
-    for (&src_idx, dst_id) in src_indices.iter().zip(dst_ids.iter()) {
+    let mut surviving_pairs: Vec<u32> = Vec::with_capacity(src_indices.len());
+    for (pair_idx, (&src_idx, dst_id)) in src_indices.iter().zip(dst_ids.iter()).enumerate() {
         if let Some(&dst_row) = id_to_row.get(dst_id.as_str()) {
             final_src_indices.push(src_idx);
             dst_indices.push(dst_row);
+            surviving_pairs.push(pair_idx as u32);
         }
     }
 
@@ -1637,6 +1805,12 @@ async fn expand_hydrate_and_align(
     let dst_prefixed = prefix_batch(&dst_batch, dst_var)?;
     let aligned_dst = take_batch(&dst_prefixed, &dst_take)?;
     *wide = hconcat_batches(&expanded_wide, &aligned_dst)?;
+
+    if let Some((binding, edge_batch)) = edge_attach {
+        let aligned_edge = take_batch(&edge_batch, &UInt32Array::from(surviving_pairs))?;
+        let edge_prefixed = prefix_batch(&aligned_edge, &binding)?;
+        *wide = hconcat_batches(wide, &edge_prefixed)?;
+    }
 
     for f in &non_pushable {
         apply_filter(wide, f, params)?;
@@ -1781,6 +1955,7 @@ async fn execute_expand_csr(
         dst_var,
         dst_filters,
         params,
+        None,
     )
     .await
 }
@@ -2738,6 +2913,7 @@ mod referenced_edge_types_tests {
             min_hops: 1,
             max_hops: Some(1),
             dst_filters: Vec::new(),
+            edge_binding: None,
         }
     }
 
