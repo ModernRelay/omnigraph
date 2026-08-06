@@ -12,9 +12,7 @@ use axum::http::{Method, Request, StatusCode};
 use futures::StreamExt;
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_server::api::{
-    ChangeRequest, ErrorOutput, ExportRequest, QueryRequest, ReadRequest,
-};
+use omnigraph_server::api::{ChangeRequest, ErrorOutput, ExportRequest, QueryRequest, ReadRequest};
 use omnigraph_server::{AppState, build_app};
 use serde_json::Value;
 use serial_test::serial;

@@ -12,9 +12,7 @@
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
-use crate::cli::{
-    Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand, SchemaCommand,
-};
+use crate::cli::{Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand, SchemaCommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Plane {

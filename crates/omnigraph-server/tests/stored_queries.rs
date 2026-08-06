@@ -1,12 +1,10 @@
 //! Stored-query registry boot, /queries listing, and invocation routes.
 //! Moved verbatim from tests/server.rs in the modularization.
 
-
 use axum::body::Body;
 use axum::http::StatusCode;
 use omnigraph_server::AppState;
 use serde_json::json;
-
 
 mod support;
 use support::*;
@@ -29,7 +27,11 @@ async fn server_boots_with_a_valid_stored_query_registry() {
         registry,
     )
     .await;
-    assert!(state.is_ok(), "valid registry should boot: {:?}", state.err());
+    assert!(
+        state.is_ok(),
+        "valid registry should boot: {:?}",
+        state.err()
+    );
 }
 
 #[tokio::test]
@@ -56,7 +58,10 @@ async fn server_refuses_boot_on_type_broken_stored_query() {
         Err(err) => err,
     };
     let msg = err.to_string();
-    assert!(msg.contains("ghost"), "error should name the broken query: {msg}");
+    assert!(
+        msg.contains("ghost"),
+        "error should name the broken query: {msg}"
+    );
     assert!(
         msg.contains("schema check"),
         "error should mention the schema check: {msg}"
@@ -73,12 +78,19 @@ async fn invoke_stored_read_returns_rows() {
     .await;
     let (status, body) = json_response(
         &app,
-        invoke_request("find_person", "t-invoke", json!({ "params": { "name": "Alice" } })),
+        invoke_request(
+            "find_person",
+            "t-invoke",
+            json!({ "params": { "name": "Alice" } }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["query_name"], "find_person");
-    assert_eq!(body["row_count"], 1, "Alice is in the fixture; body: {body}");
+    assert_eq!(
+        body["row_count"], 1,
+        "Alice is in the fixture; body: {body}"
+    );
     assert!(body["rows"].is_array(), "read envelope shape; body: {body}");
 }
 
@@ -130,7 +142,11 @@ async fn invoke_with_matching_expected_kind_runs() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "matching kind should run; body: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "matching kind should run; body: {body}"
+    );
     assert_eq!(body["query_name"], "find_person");
 }
 
@@ -213,7 +229,11 @@ async fn invoke_stored_mutation_double_gates_on_change() {
     // Has invoke_query but NOT change → the inner change gate denies (403).
     let (status, body) = json_response(
         &app,
-        invoke_request("add_person", "t-invoke", json!({ "params": { "name": "Eve" } })),
+        invoke_request(
+            "add_person",
+            "t-invoke",
+            json!({ "params": { "name": "Eve" } }),
+        ),
     )
     .await;
     assert_eq!(
@@ -225,7 +245,11 @@ async fn invoke_stored_mutation_double_gates_on_change() {
     // Has invoke_query + change → applied.
     let (status, body) = json_response(
         &app,
-        invoke_request("add_person", "t-full", json!({ "params": { "name": "Eve" } })),
+        invoke_request(
+            "add_person",
+            "t-full",
+            json!({ "params": { "name": "Eve" } }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -243,7 +267,11 @@ async fn invoke_stored_query_bad_param_is_400() {
     // `name` is declared String; pass a number.
     let (status, body) = json_response(
         &app,
-        invoke_request("find_person", "t-invoke", json!({ "params": { "name": 123 } })),
+        invoke_request(
+            "find_person",
+            "t-invoke",
+            json!({ "params": { "name": 123 } }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
@@ -263,12 +291,19 @@ async fn invoke_unknown_query_and_denied_actor_return_identical_404() {
     .await;
 
     // Authorized actor, unknown query name → 404.
-    let (unknown_status, unknown_body) =
-        json_response(&app, invoke_request("does_not_exist", "t-invoke", json!({}))).await;
+    let (unknown_status, unknown_body) = json_response(
+        &app,
+        invoke_request("does_not_exist", "t-invoke", json!({})),
+    )
+    .await;
     // Denied actor (no invoke_query), real query name → 404.
     let (denied_status, denied_body) = json_response(
         &app,
-        invoke_request("find_person", "t-noinvoke", json!({ "params": { "name": "Alice" } })),
+        invoke_request(
+            "find_person",
+            "t-noinvoke",
+            json!({ "params": { "name": "Alice" } }),
+        ),
     )
     .await;
 
@@ -295,17 +330,28 @@ async fn invoke_query_holder_without_read_sees_403_not_404() {
     .await;
     let (exists_status, _) = json_response(
         &app,
-        invoke_request("find_person", "t-invokeonly", json!({ "params": { "name": "Alice" } })),
+        invoke_request(
+            "find_person",
+            "t-invokeonly",
+            json!({ "params": { "name": "Alice" } }),
+        ),
     )
     .await;
-    let (absent_status, _) =
-        json_response(&app, invoke_request("does_not_exist", "t-invokeonly", json!({}))).await;
+    let (absent_status, _) = json_response(
+        &app,
+        invoke_request("does_not_exist", "t-invokeonly", json!({})),
+    )
+    .await;
     assert_eq!(
         exists_status,
         StatusCode::FORBIDDEN,
         "an existing read query the holder can't read → inner-gate 403"
     );
-    assert_eq!(absent_status, StatusCode::NOT_FOUND, "unknown query still 404s");
+    assert_eq!(
+        absent_status,
+        StatusCode::NOT_FOUND,
+        "unknown query still 404s"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -318,7 +364,11 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
                 "query add_person($name: String) { insert Person { name: $name } }",
                 true,
             ),
-            ("hidden", "query hidden() { match { $p: Person } return { $p.name } }", false),
+            (
+                "hidden",
+                "query hidden() { match { $p: Person } return { $p.name } }",
+                false,
+            ),
         ],
         &[("act-invoke", "t-invoke")],
         INVOKE_POLICY_YAML,
@@ -328,12 +378,18 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
     let entries = body["queries"].as_array().unwrap();
-    let names: Vec<&str> = entries.iter().map(|q| q["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|q| q["name"].as_str().unwrap())
+        .collect();
     assert!(
         names.contains(&"find_person") && names.contains(&"add_person"),
         "exposed queries listed: {names:?}"
     );
-    assert!(!names.contains(&"hidden"), "non-exposed query hidden from the catalog: {names:?}");
+    assert!(
+        !names.contains(&"hidden"),
+        "non-exposed query hidden from the catalog: {names:?}"
+    );
 
     let fp = entries.iter().find(|q| q["name"] == "find_person").unwrap();
     assert_eq!(fp["mutation"], false);
@@ -382,7 +438,11 @@ async fn list_queries_surfaces_query_description_and_instruction() {
     let (_temp, app) = app_with_stored_queries(
         &[
             ("described", described, true),
-            ("bare", "query bare() { match { $p: Person } return { $p.name } }", true),
+            (
+                "bare",
+                "query bare() { match { $p: Person } return { $p.name } }",
+                true,
+            ),
         ],
         &[("act-invoke", "t-invoke")],
         INVOKE_POLICY_YAML,
@@ -398,8 +458,7 @@ async fn list_queries_surfaces_query_description_and_instruction() {
         "query @description surfaces over GET /queries: {described}"
     );
     assert_eq!(
-        described["instruction"],
-        "Use for exact lookups; prefer search for fuzzy matches.",
+        described["instruction"], "Use for exact lookups; prefer search for fuzzy matches.",
         "query @instruction surfaces over GET /queries: {described}"
     );
 
