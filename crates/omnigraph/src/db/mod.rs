@@ -24,6 +24,9 @@ pub use omnigraph::{
     StreamDeadLetterPayloadPage, StreamExportCut, StreamStatus, StreamTableStatus,
     StreamingProfileResult, TableCleanupStats, TableOptimizeStats, TableRepairStats,
 };
+pub(crate) use omnigraph::{
+    DeferredTableFork, StreamAuthorityRetirementExportProvenance, WriteAuthorityToken, WriteTxn,
+};
 #[doc(hidden)]
 pub use omnigraph::{
     GraphStreamChunkSource, GraphStreamDeclaration, GraphStreamDeclarationStatus,
@@ -32,9 +35,6 @@ pub use omnigraph::{
     GraphStreamLastFoldStatus, GraphStreamOperationalStatus, GraphStreamOptimizeResult,
     GraphStreamPendingStatus, GraphStreamRebuildBlocker, GraphStreamRebuildStatus,
     GraphStreamResumeResult, GraphStreamStrictBlockStatus, GraphStreamTokenCounts,
-};
-pub(crate) use omnigraph::{
-    DeferredTableFork, StreamAuthorityRetirementExportProvenance, WriteAuthorityToken, WriteTxn,
 };
 #[cfg(test)]
 pub(crate) use omnigraph::{
@@ -76,9 +76,7 @@ pub struct StreamExportRootExclusion {
 /// graph deletion without exposing the engine's queue manager or a capability
 /// that can read, write, or delete storage.
 #[doc(hidden)]
-pub fn reserve_stream_export_root_exclusion(
-    graph_uri: &str,
-) -> Result<StreamExportRootExclusion> {
+pub fn reserve_stream_export_root_exclusion(graph_uri: &str) -> Result<StreamExportRootExclusion> {
     let normalized = crate::storage::normalize_root_uri(graph_uri)?;
     let identity = crate::storage::write_queue_root_identity(&normalized)?;
     let manager = write_queue::WriteQueueManager::for_root(&identity);

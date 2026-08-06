@@ -243,8 +243,7 @@ pub struct GraphStartupConfig {
     /// Cloneable serving-snapshot evidence for a terminal stream profile.
     /// This is not export authority; `open_single_graph` rereads canonical
     /// cluster state and consumes it into a non-cloneable served-export guard.
-    pub stream_served_export_authority:
-        Option<omnigraph_cluster::ServedExportAuthorityBinding>,
+    pub stream_served_export_authority: Option<omnigraph_cluster::ServedExportAuthorityBinding>,
     /// Pre-resolved embedding config from an applied cluster provider profile.
     /// Legacy config paths leave this unset and continue to use env resolution.
     pub embedding: Option<omnigraph::embedding::EmbeddingConfig>,
@@ -2060,18 +2059,15 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<OpenedGraph> {
                 graph_id.as_str(),
                 binding.state_revision()
             );
-            let guard = omnigraph_cluster::mint_runtime_guard(
-                binding,
-                &operation_id,
-                "omnigraph:server",
-            )
-            .await
-            .map_err(|err| {
-                color_eyre::eyre::eyre!(
-                    "validate stream runtime authority for graph '{}': {err}",
-                    graph_id
-                )
-            })?;
+            let guard =
+                omnigraph_cluster::mint_runtime_guard(binding, &operation_id, "omnigraph:server")
+                    .await
+                    .map_err(|err| {
+                        color_eyre::eyre::eyre!(
+                            "validate stream runtime authority for graph '{}': {err}",
+                            graph_id
+                        )
+                    })?;
             db.with_checked_cluster_stream_runtime(guard)
                 .await
                 .map_err(|err| {

@@ -362,10 +362,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
         "db/omnigraph/stream_profile.rs",
         "with_checked_cluster_served_export",
     ),
-    (
-        "db/omnigraph/export.rs",
-        "capture_served_export_cut",
-    ),
+    ("db/omnigraph/export.rs", "capture_served_export_cut"),
     (
         "db/omnigraph/stream_ingest.rs",
         "failpoint_stream_incarnation_for_test",

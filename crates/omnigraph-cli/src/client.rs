@@ -32,10 +32,10 @@ use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
     ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest,
-    InvokeStoredQueryRequest, ReadOutput,
-    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
-    StreamEnsureIndicesOutput, StreamOptimizeOutput, StreamResumeOutput, StreamStatusOutput,
-    commit_output, ingest_output, read_output, schema_apply_output, snapshot_payload,
+    InvokeStoredQueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest,
+    SchemaOutput, SnapshotOutput, StreamEnsureIndicesOutput, StreamOptimizeOutput,
+    StreamResumeOutput, StreamStatusOutput, commit_output, ingest_output, read_output,
+    schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::Method;
@@ -46,9 +46,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::cli::CliLoadMode;
 use crate::helpers::{
     apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
-    legacy_change_request_body, query_params_from_json,
-    remote_json, remote_url, resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token,
-    resolve_server_flag, select_named_query,
+    legacy_change_request_body, query_params_from_json, remote_json, remote_url, resolve_cli_actor,
+    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_result, load_output_from_tables};
 
@@ -125,10 +124,7 @@ pub(crate) enum GraphClient {
     /// writes (`resolve_with_policy()`) attribute the resolved actor.
     /// Direct-store access carries no Cedar policy (RFC-011: policy lives
     /// in the cluster/server, not in per-operator addressing).
-    Embedded {
-        uri: String,
-        actor: Option<String>,
-    },
+    Embedded { uri: String, actor: Option<String> },
     /// Remote HTTP server. The actor is resolved server-side from the
     /// token; the client never sets identity.
     Remote {
@@ -145,9 +141,7 @@ pub(crate) enum GraphClient {
 /// a policy-gated `/graphs`, or an unreachable server all proceed — the bare URL
 /// is then correct, or the real request surfaces the failure. Only fires on the
 /// no-graph path, so a `--graph`/`default_graph` happy path does no extra I/O.
-async fn require_graph_for_multi_graph_server(
-    scope: &crate::scope::ResolvedScope,
-) -> Result<()> {
+async fn require_graph_for_multi_graph_server(scope: &crate::scope::ResolvedScope) -> Result<()> {
     let (Some(server), None) = (scope.server.as_deref(), scope.graph.as_deref()) else {
         return Ok(());
     };
@@ -187,8 +181,7 @@ impl GraphClient {
     /// resolution, no I/O. Used by the RFC-011 D7 multi-graph probe and the
     /// `graphs list` registry factory.
     fn registry_client(server: &str) -> Result<Self> {
-        let base = resolve_server_flag(Some(server), None)?
-            .expect("server name is present");
+        let base = resolve_server_flag(Some(server), None)?.expect("server name is present");
         let token = resolve_remote_bearer_token(Some(&base))?;
         Ok(GraphClient::Remote {
             http: build_http_client()?,
@@ -207,10 +200,7 @@ impl GraphClient {
     /// default would make `graphs list` unusable in any profile that sets
     /// one, and the registry is server-scoped either way). An explicit
     /// `--graph` never reaches here — the addressing guard rejects it.
-    pub(crate) fn resolve_registry(
-        server: Option<&str>,
-        profile: Option<&str>,
-    ) -> Result<Self> {
+    pub(crate) fn resolve_registry(server: Option<&str>, profile: Option<&str>) -> Result<Self> {
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             crate::planes::Capability::Served,
@@ -263,14 +253,17 @@ impl GraphClient {
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             capability,
-            crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
+            crate::scope::ScopeFlags {
+                profile,
+                store,
+                server,
+                cluster: None,
+                graph,
+                uri,
+            },
         )?;
         require_graph_for_multi_graph_server(&scope).await?;
-        let (server, graph, uri) = (
-            scope.server.as_deref(),
-            scope.graph.as_deref(),
-            scope.uri,
-        );
+        let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
         let via_server = server.is_some();
         let uri = apply_server_flag(server, graph, uri)?;
         let token = resolve_remote_bearer_token(uri.as_deref())?;
@@ -308,7 +301,14 @@ impl GraphClient {
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             capability,
-            crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
+            crate::scope::ScopeFlags {
+                profile,
+                store,
+                server,
+                cluster: None,
+                graph,
+                uri,
+            },
         )?;
         Self::resolve_with_policy_scope(scope, cli_as).await
     }
@@ -390,11 +390,7 @@ impl GraphClient {
         cli_as: Option<&str>,
     ) -> Result<Self> {
         require_graph_for_multi_graph_server(&scope).await?;
-        let (server, graph, uri) = (
-            scope.server.as_deref(),
-            scope.graph.as_deref(),
-            scope.uri,
-        );
+        let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
         let via_server = server.is_some();
         let uri = apply_server_flag(server, graph, uri)?;
         let token = resolve_remote_bearer_token(uri.as_deref())?;
@@ -603,7 +599,12 @@ impl GraphClient {
                     token.as_deref(),
                 )
                 .await?;
-                Ok(load_output_from_tables(base_url, branch, mode.as_str(), &output))
+                Ok(load_output_from_tables(
+                    base_url,
+                    branch,
+                    mode.as_str(),
+                    &output,
+                ))
             }
             GraphClient::Embedded { uri, actor } => {
                 let db = Self::open_embedded(uri).await?;
@@ -1040,11 +1041,7 @@ impl GraphClient {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
-            .is_some_and(|media_type| {
-                media_type
-                    .trim()
-                    .eq_ignore_ascii_case(NDJSON_CONTENT_TYPE)
-            });
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case(NDJSON_CONTENT_TYPE));
         if !response_is_ndjson {
             bail!(
                 "stream ingest requires an exact 200 application/x-ndjson response from the server"
@@ -1150,9 +1147,9 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { .. } => bail!(
-                "internal error: `stream maintenance optimize` reached an embedded client"
-            ),
+            GraphClient::Embedded { .. } => {
+                bail!("internal error: `stream maintenance optimize` reached an embedded client")
+            }
         }
     }
 
@@ -1338,8 +1335,7 @@ mod tests {
         // the trailing slash trimmed and no `/graphs/<id>` segment. A literal
         // `://` --server value bypasses the operator server registry, so a
         // developer's real config cannot change the outcome.
-        let client =
-            GraphClient::resolve_registry(Some("http://server.invalid:9/"), None).unwrap();
+        let client = GraphClient::resolve_registry(Some("http://server.invalid:9/"), None).unwrap();
         assert_eq!(client.uri(), "http://server.invalid:9");
         assert!(client.is_remote());
     }
@@ -1466,13 +1462,7 @@ mod tests {
                 let (mut ingest, _) = listener.accept().await.unwrap();
                 let request = read_http_request(&mut ingest).await;
                 assert_eq!(request.body, b"{}\n");
-                write_response(
-                    &mut ingest,
-                    status,
-                    &[("Content-Type", content_type)],
-                    &[],
-                )
-                .await;
+                write_response(&mut ingest, status, &[("Content-Type", content_type)], &[]).await;
             });
             let client = GraphClient::Remote {
                 http: reqwest::Client::new(),
@@ -1487,7 +1477,10 @@ mod tests {
             if status == "200 OK" {
                 assert!(error.contains("exact 200 application/x-ndjson"), "{error}");
             } else {
-                assert!(error.contains(status.split_whitespace().next().unwrap()), "{error}");
+                assert!(
+                    error.contains(status.split_whitespace().next().unwrap()),
+                    "{error}"
+                );
             }
             server.await.unwrap();
         }
@@ -1623,9 +1616,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_http_request(&mut stream).await;
                 assert!(
-                    request
-                        .head
-                        .starts_with(&format!("POST {path} HTTP/1.1")),
+                    request.head.starts_with(&format!("POST {path} HTTP/1.1")),
                     "{}",
                     request.head
                 );

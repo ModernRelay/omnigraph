@@ -948,11 +948,7 @@ mod projection_tests {
         assert!(json.contains("logical-1"));
         assert!(json.contains(r#""kind":"node""#));
         assert!(json.contains(r#""type":"SecretDeclaration""#));
-        for forbidden in [
-            "stable_table_id",
-            "table_incarnation_id",
-            "table_key",
-        ] {
+        for forbidden in ["stable_table_id", "table_incarnation_id", "table_key"] {
             assert!(
                 !json.contains(forbidden),
                 "projection leaked {forbidden}: {json}"

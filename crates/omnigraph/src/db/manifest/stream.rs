@@ -84,8 +84,7 @@ const CLAIM_RECEIPT_LOOKUP_DOMAIN: &[u8] = b"omnigraph.stream-claim-receipt-look
 const CLAIM_RECEIPT_RECORD_DOMAIN: &[u8] = b"omnigraph.stream-claim-receipt-record.v1\0";
 const RECEIPT_CHAIN_STEP_DOMAIN: &[u8] = b"omnigraph.stream-receipt-chain-step.v1\0";
 const BINDING_RECEIPT_DIGEST_DOMAIN: &[u8] = b"omnigraph.stream-binding-receipt-result.v1\0";
-const RETAINED_SHARD_SET_DIGEST_DOMAIN: &[u8] =
-    b"omnigraph.stream-retained-shard-set.v1\0";
+const RETAINED_SHARD_SET_DIGEST_DOMAIN: &[u8] = b"omnigraph.stream-retained-shard-set.v1\0";
 const STRICT_DATA_BLOCK_TOKEN_DOMAIN: &[u8] = b"omnigraph.stream-data-block-token.v1\0";
 const MAX_RECEIPT_JSON_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_SELECTED_BINDING_CHAIN_RECORDS: u64 = 1_024;
@@ -2116,14 +2115,12 @@ impl BindingReceipt {
         Ok(self
             .retained_shard_count
             .zip(self.retained_shard_set_digest.clone())
-            .map(
-                |(retained_shard_count, retained_shard_set_digest)| {
-                    RetainedShardInventoryCommitment {
-                        retained_shard_count,
-                        retained_shard_set_digest,
-                    }
-                },
-            ))
+            .map(|(retained_shard_count, retained_shard_set_digest)| {
+                RetainedShardInventoryCommitment {
+                    retained_shard_count,
+                    retained_shard_set_digest,
+                }
+            }))
     }
 
     fn validate_retained_shard_inventory_context(&self) -> Result<()> {
@@ -5347,31 +5344,17 @@ mod tests {
             stream_disable_drain_adoption_id("disable-operation", identity, &drain, 4).unwrap(),
             adoption
         );
-        let operation_id = stream_disable_drain_adoption_operation_id(
-            "disable-operation",
-            identity,
-            &drain,
-            3,
-        )
-        .unwrap();
+        let operation_id =
+            stream_disable_drain_adoption_operation_id("disable-operation", identity, &drain, 3)
+                .unwrap();
         assert_eq!(
-            stream_disable_drain_adoption_operation_id(
-                "disable-operation",
-                identity,
-                &drain,
-                3,
-            )
-            .unwrap(),
+            stream_disable_drain_adoption_operation_id("disable-operation", identity, &drain, 3,)
+                .unwrap(),
             operation_id
         );
         assert_ne!(
-            stream_disable_drain_adoption_operation_id(
-                "disable-operation",
-                identity,
-                &drain,
-                4,
-            )
-            .unwrap(),
+            stream_disable_drain_adoption_operation_id("disable-operation", identity, &drain, 4,)
+                .unwrap(),
             operation_id
         );
         let parsed = ShardId::parse_str(&operation_id).unwrap();
@@ -5834,8 +5817,7 @@ mod tests {
         );
 
         let old_shard = ShardId::parse_str(&base.binding.shard_ids[0]).unwrap();
-        let new_shard =
-            ShardId::parse_str("88888888-8888-4888-8888-888888888888").unwrap();
+        let new_shard = ShardId::parse_str("88888888-8888-4888-8888-888888888888").unwrap();
         let forward = retained_shard_inventory_commitment(&[old_shard, new_shard]).unwrap();
         let reverse = retained_shard_inventory_commitment(&[new_shard, old_shard]).unwrap();
         assert_eq!(forward, reverse);

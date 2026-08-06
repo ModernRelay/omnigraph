@@ -141,11 +141,7 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     // then revalidate the complete capture under schema -> main -> table
     // ordering before repair can adopt any physical HEAD into the manifest.
     let admission_txn = db.open_write_txn(None).await?;
-    if let Some(error) = db
-        .current_canonical_stream_profile()
-        .await?
-        .retired_error()
-    {
+    if let Some(error) = db.current_canonical_stream_profile().await?.retired_error() {
         return Err(error);
     }
     let stream_admission_keys = Omnigraph::stream_admission_keys_for_snapshot(&admission_txn.base);

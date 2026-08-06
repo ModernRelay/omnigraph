@@ -246,8 +246,7 @@ pub struct CheckedClusterServedExportAuthority {
 
 impl CheckedClusterServedExportAuthority {
     pub(super) fn validate_profile(&self, profile: &StreamProfileEntry) -> Result<()> {
-        if profile.mode() != self.profile_mode
-            || profile.profile_revision != self.profile_revision
+        if profile.mode() != self.profile_mode || profile.profile_revision != self.profile_revision
         {
             return Err(OmniError::StreamingAuthorityMismatch {
                 reason: format!(

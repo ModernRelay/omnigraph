@@ -1596,7 +1596,10 @@ fn documented_manifest_staging(relative: &str) -> bool {
         return false;
     };
     let canonical_manifest = format!("manifest/{manifest_name}");
-    if !matches!(documented_manifest_version(&canonical_manifest), Some(Some(1..))) {
+    if !matches!(
+        documented_manifest_version(&canonical_manifest),
+        Some(Some(1..))
+    ) {
         return false;
     }
     ShardId::parse_str(temporary_id)

@@ -386,9 +386,7 @@ impl WriteQueueManager {
     /// This remains deliberately non-waiting: F6b5 places its bounded
     /// transport-reservation deadline before this same slot and never creates
     /// a second cut owner.
-    pub(crate) fn try_acquire_stream_export_cut(
-        self: &Arc<Self>,
-    ) -> Option<StreamExportCutPermit> {
+    pub(crate) fn try_acquire_stream_export_cut(self: &Arc<Self>) -> Option<StreamExportCutPermit> {
         let permit = Arc::clone(&self.stream_export_gate)
             .try_write_owned()
             .ok()?;
@@ -407,9 +405,7 @@ impl WriteQueueManager {
     pub(crate) fn try_acquire_stream_export_destructive(
         self: &Arc<Self>,
     ) -> Option<StreamExportDestructivePermit> {
-        let permit = Arc::clone(&self.stream_export_gate)
-            .try_read_owned()
-            .ok()?;
+        let permit = Arc::clone(&self.stream_export_gate).try_read_owned().ok()?;
         Some(StreamExportDestructivePermit {
             _manager: Arc::clone(self),
             _permit: permit,

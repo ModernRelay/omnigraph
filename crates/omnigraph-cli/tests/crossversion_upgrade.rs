@@ -1094,11 +1094,7 @@ fn current_refuses_and_rebuilds_genuine_v8_and_v8_refuses_current() {
             .arg(&current_graph),
     );
     let reexport = output_success(cli().arg("export").arg(&current_graph));
-    assert_export_fidelity(
-        "v8/config-v2 → current",
-        &export.stdout,
-        &reexport.stdout,
-    );
+    assert_export_fidelity("v8/config-v2 → current", &export.stdout, &reexport.stdout);
     assert_export_omits_trusted_stream_metadata("rebuilt current", &reexport.stdout);
     let rebuilt_legacy = exported_row_with_data_value(
         &reexport.stdout,

@@ -54,10 +54,11 @@ async fn plan_schema_reports_supported_additive_change() {
         .preview_schema_apply_with_options(&desired, omnigraph::db::SchemaApplyOptions::default())
         .await
         .unwrap();
-    assert!(preview.catalog.node_types.values().all(|node| node
-        .arrow_schema
-        .field_with_name("__omnigraph_stream_v1$")
-        .is_err()));
+    assert!(preview.catalog.node_types.values().all(|node| {
+        node.arrow_schema
+            .field_with_name("__omnigraph_stream_v1$")
+            .is_err()
+    }));
 }
 
 #[tokio::test]

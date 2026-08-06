@@ -19,7 +19,6 @@ use serde_json::{Value, json};
 use serial_test::serial;
 use tower::ServiceExt;
 
-
 mod support;
 use support::*;
 
@@ -1279,7 +1278,10 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
     )
     .await;
     assert_eq!(list_status, StatusCode::OK);
-    assert_eq!(list_body["branches"], json!(["feature", "feature-child", "main"]));
+    assert_eq!(
+        list_body["branches"],
+        json!(["feature", "feature-child", "main"])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

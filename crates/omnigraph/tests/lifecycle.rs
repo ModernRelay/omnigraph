@@ -142,9 +142,7 @@ async fn init_creates_graph() {
     );
     assert_eq!(
         person
-            .count_rows(Some(
-                "name = '__omnigraph_stream_v1$'".to_string(),
-            ))
+            .count_rows(Some("name = '__omnigraph_stream_v1$'".to_string(),))
             .await
             .unwrap(),
         0,
@@ -198,16 +196,20 @@ async fn public_snapshot_wildcard_omits_protocol_metadata() {
     let person = snapshot.open("node:Person").await.unwrap();
     let mut scanner = person.scan();
     scanner.project(&["*"]).unwrap();
-    let batches: Vec<arrow_array::RecordBatch> = futures::TryStreamExt::try_collect(
-        scanner.try_into_stream().await.unwrap(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(batches.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
-    assert!(batches.iter().all(|batch| batch
-        .schema()
-        .field_with_name("__omnigraph_stream_v1$")
-        .is_err()));
+    let batches: Vec<arrow_array::RecordBatch> =
+        futures::TryStreamExt::try_collect(scanner.try_into_stream().await.unwrap())
+            .await
+            .unwrap();
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        1
+    );
+    assert!(batches.iter().all(|batch| {
+        batch
+            .schema()
+            .field_with_name("__omnigraph_stream_v1$")
+            .is_err()
+    }));
 }
 
 #[tokio::test]

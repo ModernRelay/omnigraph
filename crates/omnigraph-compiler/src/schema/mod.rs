@@ -15,9 +15,9 @@ pub(crate) fn is_reserved_storage_system_column(name: &str) -> bool {
         || matches!(
             name,
             "_rowid"
-            | "_rowaddr"
-            | "_rowoffset"
-            | "_row_created_at_version"
-            | "_row_last_updated_at_version"
+                | "_rowaddr"
+                | "_rowoffset"
+                | "_row_created_at_version"
+                | "_row_last_updated_at_version"
         )
 }

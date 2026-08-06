@@ -1589,7 +1589,10 @@ fn collect_requested_lifecycle_ledger_records(
         ));
     }
     for (lookup_key, tag) in requested {
-        for (name, value) in [("record tag", *tag), ("record lookup key", lookup_key.as_str())] {
+        for (name, value) in [
+            ("record tag", *tag),
+            ("record lookup key", lookup_key.as_str()),
+        ] {
             if value.is_empty() || value.trim() != value {
                 return Err(OmniError::manifest_internal(format!(
                     "lifecycle ledger {name} must be non-empty canonical text"
@@ -1641,10 +1644,9 @@ pub(crate) async fn lookup_lifecycle_ledger_records_batched(
     collect_requested_lifecycle_ledger_records(requested, Vec::new())?;
 
     let mut scanner = dataset.scan();
-    scanner.filter_expr(col("record_lookup_key").in_list(
-        requested.keys().cloned().map(lit).collect(),
-        false,
-    ));
+    scanner.filter_expr(
+        col("record_lookup_key").in_list(requested.keys().cloned().map(lit).collect(), false),
+    );
     scanner.batch_size(MAX_LIFECYCLE_LEDGER_RECORDS_PER_TRANSACTION);
     scanner.batch_size_bytes(MAX_LIFECYCLE_LEDGER_TRANSACTION_ARROW_BYTES);
     scanner
@@ -3253,16 +3255,22 @@ mod tests {
             (second.record_lookup_key.clone(), records[1].record_tag()),
         ]);
 
-        let duplicate = collect_requested_lifecycle_ledger_records(
-            &requested,
-            vec![first.clone(), first],
-        )
-        .expect_err("one unenforced lookup key may not resolve twice");
-        assert!(duplicate.to_string().contains("duplicate record lookup key"));
+        let duplicate =
+            collect_requested_lifecycle_ledger_records(&requested, vec![first.clone(), first])
+                .expect_err("one unenforced lookup key may not resolve twice");
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate record lookup key")
+        );
 
         let unexpected = collect_requested_lifecycle_ledger_records(&requested, vec![third])
             .expect_err("the structured scan may not return an unrequested key");
-        assert!(unexpected.to_string().contains("unexpected record lookup key"));
+        assert!(
+            unexpected
+                .to_string()
+                .contains("unexpected record lookup key")
+        );
 
         let too_many = (0..=MAX_LIFECYCLE_LEDGER_LOOKUP_KEYS_PER_SCAN)
             .map(|ordinal| {

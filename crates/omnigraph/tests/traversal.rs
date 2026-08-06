@@ -96,9 +96,14 @@ query reach_both($name: String) {
     // Charlie's only edge is INCOMING (Alice->Charlie). Undirected: hop 1
     // reaches Alice; hop 2 from Alice reaches Bob (out) — Charlie itself is
     // the visited source, never re-emitted.
-    let result = query_main(&mut db, queries, "reach_both", &params(&[("$name", "Charlie")]))
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        queries,
+        "reach_both",
+        &params(&[("$name", "Charlie")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         first_column_sorted(&result),
         vec!["Alice", "Bob"],
@@ -260,8 +265,16 @@ query slow() {
         v
     };
 
-    let fast = names(query_main(&mut db, queries, "fast", &ParamMap::new()).await.unwrap());
-    let slow = names(query_main(&mut db, queries, "slow", &ParamMap::new()).await.unwrap());
+    let fast = names(
+        query_main(&mut db, queries, "fast", &ParamMap::new())
+            .await
+            .unwrap(),
+    );
+    let slow = names(
+        query_main(&mut db, queries, "slow", &ParamMap::new())
+            .await
+            .unwrap(),
+    );
 
     assert_eq!(fast, slow, "anti-join fast and slow paths must agree");
     // Alice->Acme, Bob->Globex employed; Charlie & Diana have no employer.
@@ -291,7 +304,9 @@ async fn nested_anti_join_with_fanout_correlates_correctly() {
 {"edge":"WorksAt","from":"p2","to":"Globex"}
 {"edge":"WorksAt","from":"p3","to":"Acme"}"#;
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let queries = r#"
 query no_nonacme_employer() {
@@ -341,7 +356,9 @@ async fn anti_join_respects_multi_hop_bounds() {
 {"edge":"Knows","from":"c","to":"d"}
 {"edge":"Knows","from":"d","to":"e"}"#;
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let queries = r#"
 query no_two_hop() {

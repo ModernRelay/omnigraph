@@ -415,11 +415,10 @@ pub(crate) async fn observe_declared_graphs(
                                 .as_ref()
                                 .map(|resource| {
                                     let digest = resource.digest.clone();
-                                    let declaration_revision = Some(
-                                        resource.declaration_revision.clone().unwrap_or_else(|| {
-                                            streaming_declaration_revision(&graph.id, &digest)
-                                        }),
-                                    );
+                                    let declaration_revision =
+                                        Some(resource.declaration_revision.clone().unwrap_or_else(
+                                            || streaming_declaration_revision(&graph.id, &digest),
+                                        ));
                                     (digest, declaration_revision)
                                 })
                                 .unwrap_or_else(|| {
@@ -487,20 +486,14 @@ pub(crate) async fn observe_declared_graphs(
                         schema_matches_desired: Some(schema_matches),
                         streaming_enabled: Some(observation.streaming_enabled),
                         streaming_undrained: Some(observation.streaming_undrained),
-                        streaming_profile_mode: Some(
-                            observation.streaming_profile_mode.as_str(),
-                        ),
-                        streaming_profile_revision: Some(
-                            observation.streaming_profile_revision,
-                        ),
-                        streaming_matches_desired: graph
-                            .streaming
-                            .map(|desired| {
-                                streaming_mode_matches_desired(
-                                    &observation.streaming_profile_mode,
-                                    desired,
-                                )
-                            }),
+                        streaming_profile_mode: Some(observation.streaming_profile_mode.as_str()),
+                        streaming_profile_revision: Some(observation.streaming_profile_revision),
+                        streaming_matches_desired: graph.streaming.map(|desired| {
+                            streaming_mode_matches_desired(
+                                &observation.streaming_profile_mode,
+                                desired,
+                            )
+                        }),
                         error: None,
                     }),
                 );
@@ -1024,10 +1017,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                 .cloned()
                 .unwrap_or_default(),
             embedding_provider: graph_embedding_providers.get(graph_id).cloned(),
-            streaming: raw
-                .graphs
-                .get(graph_id)
-                .and_then(|graph| graph.streaming),
+            streaming: raw.graphs.get(graph_id).and_then(|graph| graph.streaming),
         })
         .collect();
     let config_digest = desired_config_digest(&raw, &resource_digests);
@@ -1213,10 +1203,7 @@ pub(crate) fn streaming_digest(graph_id: &str, enabled: bool) -> String {
 /// an otherwise unchanged enabled graph without any supported renewal
 /// transition. This domain-separated revision changes only with this graph's
 /// declaration digest and can therefore be reconstructed by refresh.
-pub(crate) fn streaming_declaration_revision(
-    graph_id: &str,
-    declaration_digest: &str,
-) -> String {
+pub(crate) fn streaming_declaration_revision(graph_id: &str, declaration_digest: &str) -> String {
     sha256_hex(
         format!(
             "omnigraph.cluster.streaming-declaration-revision.v1\0{graph_id}\0{declaration_digest}"
@@ -1239,10 +1226,7 @@ pub(crate) fn observed_streaming_digest(graph_id: &str, profile_mode: &str) -> S
     }
 }
 
-pub(crate) fn streaming_mode_matches_desired(
-    profile_mode: &str,
-    desired_enabled: bool,
-) -> bool {
+pub(crate) fn streaming_mode_matches_desired(profile_mode: &str, desired_enabled: bool) -> bool {
     matches!(
         (profile_mode, desired_enabled),
         ("ENABLED", true) | ("DISABLED" | "RETIRED", false)

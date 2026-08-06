@@ -225,7 +225,10 @@ pub(crate) fn approved_resources(
 pub(crate) enum ResourceKind {
     Graph(String),
     Schema(String),
-    Query { graph: String, name: String },
+    Query {
+        graph: String,
+        name: String,
+    },
     Policy(String),
     EmbeddingProvider(String),
     /// RFC-026 §4.7 P1: the per-graph streaming-enablement flag. First-class

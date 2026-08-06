@@ -12,9 +12,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::sync::Arc;
 
-use omnigraph_policy::{
-    PolicyAction, PolicyChecker, PolicyEngine, PolicyError, ResourceScope,
-};
+use omnigraph_policy::{PolicyAction, PolicyChecker, PolicyEngine, PolicyError, ResourceScope};
 
 use crate::diff::{ResourceKind, resource_kind};
 use crate::store::ClusterStore;
@@ -112,22 +110,19 @@ pub(crate) async fn stream_profile_policy_checker(
     }
 
     if let Some(address) = desired_bound.into_iter().next() {
-        let digest = desired.resource_digests.get(address).ok_or_else(|| {
-            format!("desired graph policy '{address}' has no resource digest")
-        })?;
+        let digest = desired
+            .resource_digests
+            .get(address)
+            .ok_or_else(|| format!("desired graph policy '{address}' has no resource digest"))?;
         if !seen.contains(&(address.to_string(), digest.clone())) {
             let path = desired
                 .resources
                 .iter()
                 .find(|resource| resource.address == address)
                 .and_then(|resource| resource.path.as_deref())
-                .ok_or_else(|| {
-                    format!("desired graph policy '{address}' has no source path")
-                })?;
+                .ok_or_else(|| format!("desired graph policy '{address}' has no source path"))?;
             let source = fs::read_to_string(path).map_err(|error| {
-                format!(
-                    "could not read desired graph policy '{address}' from '{path}': {error}"
-                )
+                format!("could not read desired graph policy '{address}' from '{path}': {error}")
             })?;
             let observed = super::sha256_hex(source.as_bytes());
             if &observed != digest {

@@ -53,12 +53,8 @@ impl ClusterStore {
     /// (`file://<abs config dir>`), byte-compatible with every pre-existing
     /// cluster on disk.
     pub(crate) fn for_config_dir(config_dir: &Path) -> Self {
-        let absolute =
-            std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
-        let display_root = absolute
-            .to_string_lossy()
-            .trim_end_matches('/')
-            .to_string();
+        let absolute = std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
+        let display_root = absolute.to_string_lossy().trim_end_matches('/').to_string();
         let root = format!("file://{display_root}");
         let storage = storage_handle_for_uri(&root)
             .expect("local storage adapter construction is infallible for file:// roots");
@@ -231,7 +227,10 @@ impl ClusterStore {
     /// on the deletion (e.g. the pre-movement sidecar cleanup fast-path) can
     /// report it as a diagnostic instead of silently leaving stale state.
     pub(crate) async fn try_delete_object(&self, uri: &str) -> Result<(), String> {
-        self.adapter.delete(uri).await.map_err(|err| err.to_string())
+        self.adapter
+            .delete(uri)
+            .await
+            .map_err(|err| err.to_string())
     }
 
     /// Recursive prefix delete for graph roots (approved deletes). Idempotent;
@@ -408,16 +407,12 @@ impl ClusterStore {
             Ok(true) => {}
             Err(err) => return Err(err.to_string()),
         }
-        self.adapter
-            .read_text(&uri)
-            .await
-            .map(Some)
-            .map_err(|err| {
-                format!(
-                    "could not read catalog payload '{}': {err}",
-                    self.display(&relative)
-                )
-            })
+        self.adapter.read_text(&uri).await.map(Some).map_err(|err| {
+            format!(
+                "could not read catalog payload '{}': {err}",
+                self.display(&relative)
+            )
+        })
     }
 
     /// Idempotent content-addressed write: a payload already present at its
@@ -726,11 +721,13 @@ impl ClusterStore {
                 observations.locked = true;
                 match StateLockFile::parse(&text) {
                     Ok(lock) => observations.observe_lock_metadata(&lock),
-                    Err(AuthorityError::LockVersion(version)) => diagnostics.push(Diagnostic::warning(
-                        "unsupported_state_lock_version",
-                        CLUSTER_LOCK_FILE,
-                        format!("unsupported cluster state lock version {version}"),
-                    )),
+                    Err(AuthorityError::LockVersion(version)) => {
+                        diagnostics.push(Diagnostic::warning(
+                            "unsupported_state_lock_version",
+                            CLUSTER_LOCK_FILE,
+                            format!("unsupported cluster state lock version {version}"),
+                        ))
+                    }
                     Err(AuthorityError::LockParse(err)) => diagnostics.push(Diagnostic::warning(
                         "invalid_state_lock",
                         CLUSTER_LOCK_FILE,
@@ -752,10 +749,7 @@ impl ClusterStore {
         }
     }
 
-    pub(crate) async fn observe_lock_metadata_lossy(
-        &self,
-        observations: &mut StateObservations,
-    ) {
+    pub(crate) async fn observe_lock_metadata_lossy(&self, observations: &mut StateObservations) {
         observations.locked = true;
         let lock_uri = self.uri(CLUSTER_LOCK_FILE);
         if let Ok(Some((text, _))) = self.read_versioned_opt(&lock_uri).await {

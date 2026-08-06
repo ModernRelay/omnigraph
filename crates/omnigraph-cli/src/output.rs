@@ -400,9 +400,7 @@ pub(crate) fn render_stream_status_human(output: &StreamStatusOutput) -> String 
             {
                 "optionally run graph-wide `stream maintenance ensure-indices|optimize`, then `stream resume`"
             }
-            StreamProfileModeOutput::Enabled => {
-                "send graph rows with `omnigraph stream ingest`"
-            }
+            StreamProfileModeOutput::Enabled => "send graph rows with `omnigraph stream ingest`",
             StreamProfileModeOutput::Disabling => {
                 "stop serving and retry `omnigraph cluster apply` to finish disabling"
             }
@@ -412,8 +410,7 @@ pub(crate) fn render_stream_status_human(output: &StreamStatusOutput) -> String 
             StreamProfileModeOutput::Retired => "export and rebuild into a fresh graph",
         }
     };
-    writeln!(rendered, "  next: {next}")
-        .expect("writing stream status to a String cannot fail");
+    writeln!(rendered, "  next: {next}").expect("writing stream status to a String cannot fail");
     rendered
 }
 
@@ -453,7 +450,11 @@ pub(crate) fn finish_stream_ensure_indices(
     }
     println!(
         "stream index maintenance: {} ({} pending index(es))",
-        if output.changed { "published" } else { "no change" },
+        if output.changed {
+            "published"
+        } else {
+            "no change"
+        },
         output.pending_index_count
     );
     Ok(())
@@ -465,7 +466,11 @@ pub(crate) fn finish_stream_optimize(output: &StreamOptimizeOutput, json: bool) 
     }
     println!(
         "stream optimize: {} ({} pending index(es))",
-        if output.changed { "published" } else { "no change" },
+        if output.changed {
+            "published"
+        } else {
+            "no change"
+        },
         output.pending_index_count
     );
     if output.requires_repair {

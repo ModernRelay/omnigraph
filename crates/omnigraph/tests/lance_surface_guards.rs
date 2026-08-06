@@ -889,13 +889,11 @@ impl BlockNextPut {
     }
 
     async fn wait_until_reached(&self) {
-        let permit = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.reached.acquire(),
-        )
-        .await
-        .expect("generation N+1 WAL append never reached the object-store barrier")
-        .expect("put-barrier semaphore closed");
+        let permit =
+            tokio::time::timeout(std::time::Duration::from_secs(10), self.reached.acquire())
+                .await
+                .expect("generation N+1 WAL append never reached the object-store barrier")
+                .expect("put-barrier semaphore closed");
         permit.forget();
     }
 
@@ -959,11 +957,7 @@ impl ObjectStore for BlockNextPutStore {
         self.target.put_multipart_opts(location, options).await
     }
 
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> ObjectStoreResult<GetResult> {
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
         self.target.get_opts(location, options).await
     }
 
@@ -974,10 +968,7 @@ impl ObjectStore for BlockNextPutStore {
         self.target.delete_stream(locations)
     }
 
-    fn list(
-        &self,
-        prefix: Option<&Path>,
-    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         self.target.list(prefix)
     }
 
@@ -989,10 +980,7 @@ impl ObjectStore for BlockNextPutStore {
         self.target.list_with_offset(prefix, offset)
     }
 
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> ObjectStoreResult<ListResult> {
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
         self.target.list_with_delimiter(prefix).await
     }
 
@@ -1234,7 +1222,12 @@ async fn mem_wal_watcher_watermark_is_not_generation_scoped_on_pinned_lance() {
         .load()
         .await
         .unwrap();
-    dataset.initialize_mem_wal().unsharded().execute().await.unwrap();
+    dataset
+        .initialize_mem_wal()
+        .unsharded()
+        .execute()
+        .await
+        .unwrap();
 
     let shard_id = ShardId::new_v4();
     let config = ShardWriterConfig::new(shard_id)

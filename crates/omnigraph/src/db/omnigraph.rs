@@ -97,6 +97,13 @@ pub use stream_retirement::{
     StreamAuthorityRetirementPlan, StreamAuthorityRetirementResult, StreamDeadLetterEntry,
     StreamDeadLetterPage, StreamDeadLetterPayloadEntry, StreamDeadLetterPayloadPage,
 };
+#[doc(hidden)]
+pub use stream_status::{
+    GraphStreamDeclaration, GraphStreamDeclarationStatus, GraphStreamDrainStatus,
+    GraphStreamDriverErrorStatus, GraphStreamDriverStatus, GraphStreamLastFoldStatus,
+    GraphStreamOperationalStatus, GraphStreamPendingStatus, GraphStreamRebuildBlocker,
+    GraphStreamRebuildStatus, GraphStreamStrictBlockStatus, GraphStreamTokenCounts,
+};
 #[cfg(feature = "failpoints")]
 #[doc(hidden)]
 pub use stream_status::{
@@ -107,13 +114,6 @@ pub use stream_status::{
     StreamShardOperationalStatus, StreamStrictBlockOperationalStatus, StreamTableOperationalStatus,
     StreamTablePhysicalOperationalStatus, StreamTerminalTokenOperationalStatus,
     StreamTokenIndexCoverageStatus, StreamTokenLedgerOperationalStatus,
-};
-#[doc(hidden)]
-pub use stream_status::{
-    GraphStreamDeclaration, GraphStreamDeclarationStatus, GraphStreamDrainStatus,
-    GraphStreamDriverErrorStatus, GraphStreamDriverStatus, GraphStreamLastFoldStatus,
-    GraphStreamOperationalStatus, GraphStreamPendingStatus, GraphStreamRebuildBlocker,
-    GraphStreamRebuildStatus, GraphStreamStrictBlockStatus, GraphStreamTokenCounts,
 };
 pub use stream_status::{StreamStatus, StreamTableStatus};
 pub use table_ops::PendingIndex;

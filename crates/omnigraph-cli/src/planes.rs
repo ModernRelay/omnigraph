@@ -15,8 +15,7 @@ use color_eyre::eyre::bail;
 use crate::cli::{
     Cli, ClusterCommand, ClusterStreamCommand, Command, GraphsCommand, QueriesCommand,
     SchemaCommand, StreamBlockCommand, StreamCommand, StreamDeadLetterCommand,
-    StreamMaintenanceCommand,
-    StreamRetireForRebuildCommand,
+    StreamMaintenanceCommand, StreamRetireForRebuildCommand,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -760,14 +759,7 @@ mod tests {
         }
 
         assert!(
-            Cli::try_parse_from([
-                "omnigraph",
-                "stream",
-                "resume",
-                "--type",
-                "Person",
-            ])
-            .is_err(),
+            Cli::try_parse_from(["omnigraph", "stream", "resume", "--type", "Person",]).is_err(),
             "graph resume must not accept a declaration selector"
         );
     }

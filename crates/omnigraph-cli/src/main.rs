@@ -800,12 +800,7 @@ async fn main() -> Result<()> {
                         cli.store.as_deref(),
                     )
                     .await?;
-                    echo_write_target(
-                        cli.quiet,
-                        "stream maintenance optimize",
-                        client.uri(),
-                        true,
-                    );
+                    echo_write_target(cli.quiet, "stream maintenance optimize", client.uri(), true);
                     let output = client.stream_optimize().await?;
                     finish_stream_optimize(&output, json)?;
                 }

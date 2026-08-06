@@ -2796,11 +2796,7 @@ mod tests {
         assert_eq!(original.0, 7);
         assert_eq!(original.1, start + GRAPH_STREAM_RUN_MAX_COALESCE_DELAY);
 
-        sync_graph_run_flush_deadline_at(
-            &mut deadline,
-            Some(7),
-            start + Duration::from_millis(40),
-        );
+        sync_graph_run_flush_deadline_at(&mut deadline, Some(7), start + Duration::from_millis(40));
         assert_eq!(
             deadline,
             Some(original),

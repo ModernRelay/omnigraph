@@ -230,11 +230,7 @@ async fn converge_retired_streaming_resource(
     profile_revision: u64,
 ) -> Result<(), Diagnostic> {
     let streaming_address = format!("streaming.{graph_id}");
-    let Some(streaming) = state
-        .applied_revision
-        .resources
-        .get_mut(&streaming_address)
-    else {
+    let Some(streaming) = state.applied_revision.resources.get_mut(&streaming_address) else {
         return Ok(());
     };
     if streaming.streaming_enabled == Some(false)
