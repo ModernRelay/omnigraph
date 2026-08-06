@@ -275,13 +275,17 @@ async fn optimize_all_tables_with_mode(
         crate::failpoints::names::OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE,
     )?;
 
-    // Capture the immutable table lifetimes before entering any writer gate so
-    // RFC-026 admission can remain the outermost lock class. The complete
-    // authority token is revalidated after schema -> main -> table gates; if a
-    // concurrent schema/graph publish changed this set, this attempt fails
-    // before a physical maintenance effect instead of acquiring a late lease.
-    let admission_txn = db.open_write_txn(None).await?;
-    let stream_admission_keys = Omnigraph::stream_admission_keys_for_snapshot(&admission_txn.base);
+    // One capture, two duties. It is the complete authority token -- revalidated
+    // after schema -> main -> table gates, and the source of the recovery
+    // sidecar's `RecoveryAuthorityToken` -- so if a concurrent schema/graph
+    // publish moved the graph while this attempt waited, it fails before any
+    // physical maintenance effect. It is *also* taken before any writer gate so
+    // RFC-026 admission can remain the outermost lock class. The name follows
+    // the first duty: that one outlives streaming, and dropping the binding
+    // with the stream code would silently remove the authority check.
+    // Pinned by `optimize_refuses_when_graph_authority_moves_before_its_gates`.
+    let authority_txn = db.open_write_txn(None).await?;
+    let stream_admission_keys = Omnigraph::stream_admission_keys_for_snapshot(&authority_txn.base);
     crate::failpoints::maybe_fail(
         crate::failpoints::names::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
     )?;
@@ -345,7 +349,7 @@ async fn optimize_all_tables_with_mode(
     // armed a main/global intent crosses one of the gates now held. The entry
     // probe above is only a cheap fast-path/race seam.
     ensure_no_pending_recovery_for_optimize_under_main_gate(db).await?;
-    let snapshot = db.revalidate_write_txn(&admission_txn).await?;
+    let snapshot = db.revalidate_write_txn(&authority_txn).await?;
 
     let table_tasks = table_keys
         .into_iter()
@@ -482,11 +486,11 @@ async fn optimize_all_tables_with_mode(
                 .as_ref()
                 .expect("checked Optimize must pre-mint graph lineage");
             let authority = crate::db::manifest::RecoveryAuthorityToken {
-                branch_identifier: admission_txn.authority.branch_identifier.clone(),
-                graph_head: admission_txn.authority.graph_head.clone(),
-                schema_identity_domain: admission_txn.authority.schema_identity_domain.clone(),
-                schema_ir_hash: admission_txn.authority.schema_ir_hash.clone(),
-                schema_identity_version: admission_txn.authority.schema_identity_version,
+                branch_identifier: authority_txn.authority.branch_identifier.clone(),
+                graph_head: authority_txn.authority.graph_head.clone(),
+                schema_identity_domain: authority_txn.authority.schema_identity_domain.clone(),
+                schema_ir_hash: authority_txn.authority.schema_ir_hash.clone(),
+                schema_identity_version: authority_txn.authority.schema_identity_version,
             };
             let recovery_lineage = crate::db::manifest::RecoveryLineageIntent {
                 graph_commit_id: lineage.graph_commit_id.clone(),
@@ -623,7 +627,7 @@ async fn optimize_all_tables_with_mode(
                 "sealed optimize",
                 &updates,
                 &expected_versions,
-                &admission_txn,
+                &authority_txn,
                 lineage.expect("checked Optimize must retain graph lineage"),
                 &prior_stream_lifecycles,
                 &next_stream_lifecycles,
@@ -1319,9 +1323,9 @@ pub async fn cleanup_all_tables(
     // accepted main-table admission domain before taking the schema, branch,
     // or table queues, and hold those shared leases through orphan-ref
     // reconciliation and all version GC.
-    let admission_txn = db.open_write_txn(None).await?;
-    let stream_admission_keys = Omnigraph::stream_admission_keys_for_snapshot(&admission_txn.base);
-    let stream_admission_identities = admission_txn
+    let authority_txn = db.open_write_txn(None).await?;
+    let stream_admission_keys = Omnigraph::stream_admission_keys_for_snapshot(&authority_txn.base);
+    let stream_admission_identities = authority_txn
         .base
         .entries()
         .map(|entry| entry.identity)
@@ -1345,7 +1349,7 @@ pub async fn cleanup_all_tables(
     db.refresh_coordinator_only().await?;
     db.ensure_schema_apply_not_locked("cleanup").await?;
     let cleanup_catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
-    let snapshot = db.revalidate_write_txn(&admission_txn).await?;
+    let snapshot = db.revalidate_write_txn(&authority_txn).await?;
     snapshot
         .ensure_stream_effects_allowed("cleanup", stream_admission_identities.iter().copied())?;
 

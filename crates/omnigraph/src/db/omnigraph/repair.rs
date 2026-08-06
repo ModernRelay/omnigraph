@@ -136,11 +136,12 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     ensure_no_pending_recovery_sidecars(db, "repair").await?;
     let _stream_profile_guard = db.write_queue().acquire_stream_profile_shared().await;
 
-    // Admission must precede every existing writer gate. Capture the accepted
-    // main-table lifetimes first, acquire their shared identity/ref leases, and
-    // then revalidate the complete capture under schema -> main -> table
-    // ordering before repair can adopt any physical HEAD into the manifest.
-    let admission_txn = db.open_write_txn(None).await?;
+    // One capture, two duties -- see the matching note in `optimize.rs`. It is
+    // the complete authority token, revalidated under schema -> main -> table
+    // ordering before repair may adopt any physical HEAD into the manifest, and
+    // it is taken before every writer gate so RFC-026 admission stays the
+    // outermost lock class. The authority duty outlives streaming.
+    let authority_txn = db.open_write_txn(None).await?;
     if let Some(error) = db
         .current_canonical_stream_profile()
         .await?
@@ -148,7 +149,7 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     {
         return Err(error);
     }
-    let stream_admission_keys = Omnigraph::stream_admission_keys_for_snapshot(&admission_txn.base);
+    let stream_admission_keys = Omnigraph::stream_admission_keys_for_snapshot(&authority_txn.base);
     let _stream_admission_guards = db
         .write_queue()
         .acquire_stream_shared_many(&stream_admission_keys)
@@ -177,7 +178,7 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     let _table_guards = db.write_queue().acquire_many(&queue_keys).await;
     ensure_no_pending_recovery_sidecars(db, "repair").await?;
 
-    let snapshot = db.revalidate_write_txn(&admission_txn).await?;
+    let snapshot = db.revalidate_write_txn(&authority_txn).await?;
     let table_tasks = table_keys
         .into_iter()
         .filter_map(|table_key| {
