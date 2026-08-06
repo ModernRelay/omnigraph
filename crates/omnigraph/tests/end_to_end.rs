@@ -922,6 +922,12 @@ query get_doc($title: String) {
     match { $d: Document { title: $title } }
     return { $d.title, $d.content }
 }
+
+query get_doc_clause($title: String) {
+    match { $d: Document
+        $d.title = $title }
+    return { $d.title, $d.content }
+}
 "#;
 
 const BLOB_MUTATIONS: &str = r#"
@@ -978,26 +984,31 @@ async fn blob_query_returns_metadata() {
         .await
         .unwrap();
 
-    let result = query_main(
-        &mut db,
-        BLOB_QUERIES,
-        "get_doc",
-        &params(&[("$title", "readme")]),
-    )
-    .await
-    .unwrap();
+    // Both filter spellings must survive a blob-bearing scan: inline props and
+    // the standalone clause (hoisted onto the scan) ride the same filter path,
+    // which excludes blob columns before Lance sees the filter.
+    for query_name in ["get_doc", "get_doc_clause"] {
+        let result = query_main(
+            &mut db,
+            BLOB_QUERIES,
+            query_name,
+            &params(&[("$title", "readme")]),
+        )
+        .await
+        .unwrap();
 
-    assert_eq!(result.num_rows(), 1);
+        assert_eq!(result.num_rows(), 1, "{query_name}");
 
-    let json = result.to_sdk_json();
-    let row = json.as_array().unwrap().first().unwrap();
-    assert_eq!(row["d.title"], "readme");
-    // Blob columns return null in query projections — data is accessed via take_blobs API.
-    // (Lance bug: BlobsDescriptions + filter triggers assertion, so blobs are excluded from scan)
-    assert!(
-        row["d.content"].is_null(),
-        "blob column should return null in query projection"
-    );
+        let json = result.to_sdk_json();
+        let row = json.as_array().unwrap().first().unwrap();
+        assert_eq!(row["d.title"], "readme", "{query_name}");
+        // Blob columns return null in query projections — data is accessed via take_blobs API.
+        // (Lance bug: BlobsDescriptions + filter triggers assertion, so blobs are excluded from scan)
+        assert!(
+            row["d.content"].is_null(),
+            "{query_name}: blob column should return null in query projection"
+        );
+    }
 }
 
 #[tokio::test]

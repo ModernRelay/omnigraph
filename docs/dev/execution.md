@@ -44,13 +44,14 @@ sequenceDiagram
 
 **Code paths:**
 
-- Entry: `Omnigraph::query` at `crates/omnigraph/src/exec/query.rs:7`
-- Search-mode extraction: `extract_search_mode` at `crates/omnigraph/src/exec/query.rs:110`
-- Pipeline runner: `execute_query` at `crates/omnigraph/src/exec/query.rs:347`
-- RRF fan-out: `execute_rrf_query` at `crates/omnigraph/src/exec/query.rs:393`
-- Per-source-row BFS: `execute_expand` at `crates/omnigraph/src/exec/query.rs:675`
-- Lance scan + pushdown: `execute_node_scan` at `crates/omnigraph/src/exec/query.rs:1027`
-- Filter → SQL pushdown: `build_lance_filter` at `crates/omnigraph/src/exec/query.rs:1158`
+- Entry: `Omnigraph::query` at `crates/omnigraph/src/exec/query.rs:31`
+- Search-mode extraction: `extract_search_mode` at `crates/omnigraph/src/exec/query.rs:149`
+- Pipeline runner: `execute_query` at `crates/omnigraph/src/exec/query.rs:419`
+- RRF fan-out: `execute_rrf_query` at `crates/omnigraph/src/exec/query.rs:478`
+- Per-source-row BFS: `execute_expand` at `crates/omnigraph/src/exec/query.rs:1263`
+- Filter hoist pre-pass: `execute_pipeline` at `crates/omnigraph/src/exec/query.rs:717` — search filters and single-binding pushable scalar filters move onto the introducing `NodeScan` (arming `prefilter(true)` for any search on the same scanner) or into the introducing `Expand`'s `dst_filters`; multi-binding and non-pushable filters stay in-memory at their lowered position
+- Lance scan + pushdown: `execute_node_scan` at `crates/omnigraph/src/exec/query.rs:2065`
+- Filter → Expr pushdown: `build_lance_filter_expr` at `crates/omnigraph/src/exec/query.rs:2331`
 
 ### Multi-modal search modes (`SearchMode`)
 
