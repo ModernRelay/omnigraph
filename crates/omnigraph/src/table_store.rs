@@ -1017,7 +1017,7 @@ impl TableStore {
 
     /// `scan_edges_by_endpoint` with extra projected columns beyond the two
     /// endpoints. Consumed by the bound-edge expand, which carries the edge's
-    /// declared property columns alongside each matched row.
+    /// physical id and declared property columns alongside each matched row.
     pub async fn scan_edges_by_endpoint_projected(
         ds: &Dataset,
         key_col: &str,

@@ -43,7 +43,7 @@ Param types reuse all schema scalars; trailing `?` makes a param optional. The c
 
 - `order { <expr> [asc|desc], … }` — supports plain expressions and `nearest(...)`.
 - `limit <integer>` — required when there is a `nearest(...)` ordering.
-- **Total, deterministic order.** Rows with equal user-sort keys are broken by the bound entities' key columns (`<var>.id`, ascending) appended as a final tie-break, so the result is a *total* order — reproducible across runs, and `order … limit N` returns a deterministic top-N even when ties straddle the cutoff. (Aggregate results have no entity-key columns; their group rows are already distinct on the projected group keys.) One narrow exception: with an edge binding, parallel edges between the same endpoints yield rows identical in every node key column, so their relative order under a tie is not covered by the tie-break (edge tables have no key column); it follows storage order in practice.
+- **Total, deterministic order.** Rows with equal user-sort keys are broken by the bound entities' physical `id` columns (ascending) appended as a final tie-break, so the result is a *total* order — reproducible across runs, and `order … limit N` returns a deterministic top-N even when ties straddle the cutoff. Bound edges participate through their internal physical edge ID, including parallel edges; that ID is not exposed as a queryable edge property. (Aggregate results have no entity-ID columns; their group rows are already distinct on the projected group keys.)
 - **NULL placement** is *nulls-first ascending, nulls-last descending* (i.e. `nulls_first = !descending`): a NULL sorts as if smaller than any value.
 
 Write statements (`insert` / `update` / `delete`) are documented on the

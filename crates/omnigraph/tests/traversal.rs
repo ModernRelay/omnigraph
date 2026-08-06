@@ -1,6 +1,7 @@
 mod helpers;
 
 use arrow_array::{Array, Int32Array, StringArray};
+use arrow_schema::DataType;
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
@@ -1106,6 +1107,31 @@ query all_friend_edges($name: String) {
     }
     return { $f.name, $w.since }
 }
+query empty_source_edge_projection($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+    }
+    return { $w.since }
+}
+query no_outgoing_edge_filter($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+        $w.since >= date("2023-01-01")
+    }
+    return { $w.since }
+}
+query no_future_friend() {
+    match {
+        $p: Person
+        not {
+            $p $w:knows $f
+            $w.since >= date("2030-01-01")
+        }
+    }
+    return { $p.name }
+}
 "#;
 
     // Filter on the edge property: only the 2024 friendship survives the
@@ -1143,6 +1169,53 @@ query all_friend_edges($name: String) {
         since_col.null_count(),
         2,
         "the two undated edge rows (fixture Bob, Charlie) have null since"
+    );
+
+    // Empty input must still carry the edge binding's declared Arrow schema.
+    // Otherwise projecting the edge property fails at runtime instead of
+    // returning a well-typed zero-row result.
+    let empty_source = query_main(
+        &mut db,
+        queries,
+        "empty_source_edge_projection",
+        &params(&[("$name", "Nobody")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(empty_source.num_rows(), 0);
+    assert_eq!(
+        empty_source.schema().field(0).data_type(),
+        &DataType::Date32,
+        "zero-row edge projections retain the declared property type"
+    );
+
+    // A real source with no matching edge exercises the scanner-empty arm.
+    // The edge filter must see a typed zero-length column, not a missing one.
+    let no_outgoing = query_main(
+        &mut db,
+        queries,
+        "no_outgoing_edge_filter",
+        &params(&[("$name", "Diana")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(no_outgoing.num_rows(), 0);
+    assert_eq!(no_outgoing.schema().field(0).data_type(), &DataType::Date32);
+
+    // The same zero-match edge schema must survive inside the correlated
+    // anti-join. Every person has no friendship dated in the future; sources
+    // with no outgoing row exercise the empty bound-edge arm per outer row.
+    let no_future = query_main(
+        &mut db,
+        queries,
+        "no_future_friend",
+        &ParamMap::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first_column_sorted(&no_future),
+        vec!["Alice", "Bob", "Charlie", "Diana"]
     );
 
     // Aggregate over an edge property, grouped by a node field: count(since)

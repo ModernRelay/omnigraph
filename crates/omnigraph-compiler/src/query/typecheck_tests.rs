@@ -25,6 +25,24 @@ title: String?
     build_catalog(&schema).unwrap()
 }
 
+fn setup_same_named_node_and_edge() -> Catalog {
+    // Node and edge namespaces are independent. These deliberately share a
+    // name so the typechecker cannot use `type_name` as a proxy for binding
+    // kind when it validates rebinding and traversal endpoints.
+    let schema = parse_schema(
+        r#"
+node Shared {
+label: String
+}
+edge Shared: Shared -> Shared {
+label: String?
+}
+"#,
+    )
+    .unwrap();
+    build_catalog(&schema).unwrap()
+}
+
 fn setup_vector() -> Catalog {
     let schema = parse_schema(
         r#"
@@ -1285,6 +1303,84 @@ return { $f.name }
     .unwrap();
     let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
     assert!(err.to_string().contains("T23"), "{err}");
+}
+
+#[test]
+fn test_edge_binding_cannot_reuse_a_fresh_traversal_endpoint() {
+    let catalog = setup_same_named_node_and_edge();
+
+    for pattern in ["$w $w:shared $b", "$a $w:shared $w"] {
+        let source = format!(
+            r#"
+query q() {{
+match {{ {pattern} }}
+return {{ $w.label }}
+}}
+"#
+        );
+        let qf = parse_query(&source).unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("T23"), "dedicated edge-binding error: {msg}");
+        assert!(
+            msg.contains("endpoint") && msg.contains("distinct"),
+            "explains the namespace collision: {msg}"
+        );
+    }
+}
+
+#[test]
+fn test_edge_binding_cannot_be_rebound_as_same_named_node_type() {
+    let catalog = setup_same_named_node_and_edge();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $a: Shared
+    $a $w:shared $b
+    $w: Shared
+}
+return { $w.label }
+}
+"#,
+    )
+    .unwrap();
+
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23"), "dedicated edge-binding error: {msg}");
+    assert!(
+        msg.contains("edge") && msg.contains("node"),
+        "reports the cross-kind rebind: {msg}"
+    );
+}
+
+#[test]
+fn test_edge_binding_cannot_be_a_same_named_traversal_endpoint() {
+    let catalog = setup_same_named_node_and_edge();
+
+    for second_traversal in ["$w $x:shared $c", "$c $x:shared $w"] {
+        let source = format!(
+            r#"
+query q() {{
+match {{
+    $a: Shared
+    $a $w:shared $b
+    {second_traversal}
+}}
+return {{ $c.label }}
+}}
+"#
+        );
+        let qf = parse_query(&source).unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("T23"), "dedicated edge-binding error: {msg}");
+        assert!(
+            msg.contains("edge") && msg.contains("endpoint"),
+            "reports the cross-kind endpoint use: {msg}"
+        );
+    }
 }
 
 #[test]

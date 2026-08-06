@@ -657,14 +657,22 @@ fn typecheck_binding(
         }
     }
 
-    // Don't overwrite if already bound to same type (re-binding same var is OK)
-    if let Some(existing) = ctx.bindings.get(&binding.variable)
-        && existing.type_name != binding.type_name
-    {
-        return Err(CompilerError::Type(format!(
-            "variable `${}` already bound to type `{}`, cannot rebind to `{}`",
-            binding.variable, existing.type_name, binding.type_name
-        )));
+    // Don't overwrite if already bound to the same node type (re-binding the
+    // same node var is OK). Node and edge namespaces are independent, so a
+    // matching type name does not make a cross-kind rebind valid.
+    if let Some(existing) = ctx.bindings.get(&binding.variable) {
+        if matches!(existing.kind, BindingKind::Edge) {
+            return Err(CompilerError::Type(format!(
+                "T23: variable `${}` is bound to edge type `{}` and cannot be rebound as node type `{}`",
+                binding.variable, existing.type_name, binding.type_name
+            )));
+        }
+        if existing.type_name != binding.type_name {
+            return Err(CompilerError::Type(format!(
+                "variable `${}` already bound to type `{}`, cannot rebind to `{}`",
+                binding.variable, existing.type_name, binding.type_name
+            )));
+        }
     }
 
     ctx.bindings.insert(
@@ -797,6 +805,11 @@ fn typecheck_traversal(
         )));
     }
     if let Some(binding) = &edge_binding {
+        if binding == &traversal.src || binding == &traversal.dst {
+            return Err(CompilerError::Type(format!(
+                "T23: edge binding `${binding}` cannot reuse a traversal endpoint name; edge bindings and node endpoints need distinct names"
+            )));
+        }
         if ctx.bindings.contains_key(binding) {
             return Err(CompilerError::Type(format!(
                 "T23: variable `${}` is already bound; an edge binding needs a fresh name",
@@ -820,6 +833,7 @@ fn typecheck_traversal(
     let mut direction;
 
     if let Some(src_bv) = src_bound {
+        require_node_traversal_endpoint(&traversal.src, src_bv)?;
         // T5: src type must match one endpoint of the edge
         if src_bv.type_name == edge.from_type {
             direction = Direction::Out;
@@ -836,6 +850,7 @@ fn typecheck_traversal(
             )));
         }
     } else if let Some(dst_bv) = dst_bound {
+        require_node_traversal_endpoint(&traversal.dst, dst_bv)?;
         // dst is bound, infer direction from it
         if dst_bv.type_name == edge.to_type {
             direction = Direction::Out;
@@ -875,6 +890,15 @@ fn typecheck_traversal(
     Ok(())
 }
 
+fn require_node_traversal_endpoint(var: &str, binding: &BoundVariable) -> Result<()> {
+    if matches!(binding.kind, BindingKind::Edge) {
+        return Err(CompilerError::Type(format!(
+            "T23: edge binding `${var}` cannot be used as a traversal endpoint; traversal endpoints must be node bindings"
+        )));
+    }
+    Ok(())
+}
+
 fn bind_traversal_endpoint(
     ctx: &mut TypeContext,
     var: &str,
@@ -885,6 +909,7 @@ fn bind_traversal_endpoint(
         return Ok(()); // anonymous variable
     }
     if let Some(existing) = ctx.bindings.get(var) {
+        require_node_traversal_endpoint(var, existing)?;
         if existing.type_name != expected_type {
             return Err(CompilerError::Type(format!(
                 "T5: variable `${}` has type `{}` but edge `{}` expects `{}`",

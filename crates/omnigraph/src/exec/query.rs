@@ -532,23 +532,33 @@ async fn execute_rrf_query(
         ))
     })?;
 
-    // Build ID → rank maps
+    // Build entity-ID → rank maps. A downstream traversal may fan one
+    // ranked entity out to several result rows; those rows all have the same
+    // search rank and must not consume additional rank ordinals.
     let id_col_name = format!("{}.id", primary_var);
     let primary_ids = extract_id_column_by_name(primary_batch, &id_col_name)?;
     let secondary_ids = extract_id_column_by_name(secondary_batch, &id_col_name)?;
 
     let mut primary_rank: HashMap<String, usize> = HashMap::new();
-    for (i, id) in primary_ids.iter().enumerate() {
-        primary_rank.entry(id.clone()).or_insert(i);
+    let mut primary_unique: Vec<String> = Vec::new();
+    for id in &primary_ids {
+        if !primary_rank.contains_key(id) {
+            primary_rank.insert(id.clone(), primary_unique.len());
+            primary_unique.push(id.clone());
+        }
     }
     let mut secondary_rank: HashMap<String, usize> = HashMap::new();
-    for (i, id) in secondary_ids.iter().enumerate() {
-        secondary_rank.entry(id.clone()).or_insert(i);
+    let mut secondary_unique: Vec<String> = Vec::new();
+    for id in &secondary_ids {
+        if !secondary_rank.contains_key(id) {
+            secondary_rank.insert(id.clone(), secondary_unique.len());
+            secondary_unique.push(id.clone());
+        }
     }
 
     // Collect all unique IDs
-    let mut all_ids: Vec<String> = primary_ids.clone();
-    for id in &secondary_ids {
+    let mut all_ids: Vec<String> = primary_unique;
+    for id in &secondary_unique {
         if !primary_rank.contains_key(id) {
             all_ids.push(id.clone());
         }
@@ -573,27 +583,38 @@ async fn execute_rrf_query(
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(rrf.limit);
 
-    // Collect winning IDs in order — look up rows from primary or secondary batch
+    // Collect winning entity IDs in order. Every downstream row belonging to
+    // a winner survives; fusion ranks entities, not arbitrary fanout rows.
     let winning_ids: Vec<String> = scored.iter().map(|(id, _)| id.clone()).collect();
 
-    // Build a combined row source: merge primary and secondary by id
-    let mut id_to_batch_row: HashMap<String, (&RecordBatch, usize)> = HashMap::new();
+    // Build a combined row source: prefer the primary arm for an entity it
+    // contains, otherwise use the secondary arm. The downstream pipeline is
+    // identical in both arms, so either contains the same fanout rows.
+    let mut primary_rows: HashMap<String, Vec<u32>> = HashMap::new();
     for (i, id) in primary_ids.iter().enumerate() {
-        id_to_batch_row
-            .entry(id.clone())
-            .or_insert((primary_batch, i));
+        primary_rows.entry(id.clone()).or_default().push(i as u32);
     }
+    let mut secondary_rows: HashMap<String, Vec<u32>> = HashMap::new();
     for (i, id) in secondary_ids.iter().enumerate() {
-        id_to_batch_row
-            .entry(id.clone())
-            .or_insert((secondary_batch, i));
+        secondary_rows.entry(id.clone()).or_default().push(i as u32);
     }
 
-    // Reconstruct a combined batch for the binding in winning order
-    let fused_batch = build_fused_batch(&winning_ids, &id_to_batch_row, primary_batch.schema())?;
+    // Reconstruct a combined batch in fused entity order, retaining each
+    // entity's rows in their pipeline order.
+    let fused_batch = build_fused_batch(
+        &winning_ids,
+        primary_batch,
+        &primary_rows,
+        secondary_batch,
+        &secondary_rows,
+    )?;
 
     // Project directly from fused batch
-    let result_batch = project_return(&fused_batch, &ir.return_exprs, params)?;
+    let mut result_batch = project_return(&fused_batch, &ir.return_exprs, params)?;
+    // `rrf.limit` is the query's row limit. A winning entity can now own more
+    // than one row after traversal, so enforce the limit after reconstruction.
+    let len = result_batch.num_rows().min(rrf.limit);
+    result_batch = result_batch.slice(0, len);
 
     // Already ordered by RRF score + already limited
     Ok(QueryResult::new(result_batch.schema(), vec![result_batch]))
@@ -612,23 +633,31 @@ fn extract_id_column_by_name(batch: &RecordBatch, col_name: &str) -> Result<Vec<
 
 fn build_fused_batch(
     ordered_ids: &[String],
-    id_to_batch_row: &HashMap<String, (&RecordBatch, usize)>,
-    schema: SchemaRef,
+    primary_batch: &RecordBatch,
+    primary_rows: &HashMap<String, Vec<u32>>,
+    secondary_batch: &RecordBatch,
+    secondary_rows: &HashMap<String, Vec<u32>>,
 ) -> Result<RecordBatch> {
     if ordered_ids.is_empty() {
-        return Ok(RecordBatch::new_empty(schema));
+        return Ok(RecordBatch::new_empty(primary_batch.schema()));
     }
 
-    // Gather indices from source batches, collecting rows in the right order
+    // Gather every row for each winning entity, preserving both fused entity
+    // order and the downstream row order within that entity.
     let mut row_slices: Vec<RecordBatch> = Vec::with_capacity(ordered_ids.len());
     for id in ordered_ids {
-        if let Some(&(batch, row_idx)) = id_to_batch_row.get(id) {
-            row_slices.push(batch.slice(row_idx, 1));
+        if let Some(rows) = primary_rows.get(id) {
+            row_slices.push(take_batch(primary_batch, &UInt32Array::from(rows.clone()))?);
+        } else if let Some(rows) = secondary_rows.get(id) {
+            row_slices.push(take_batch(
+                secondary_batch,
+                &UInt32Array::from(rows.clone()),
+            )?);
         }
     }
 
     if row_slices.is_empty() {
-        return Ok(RecordBatch::new_empty(schema));
+        return Ok(RecordBatch::new_empty(primary_batch.schema()));
     }
 
     let schema = row_slices[0].schema();
@@ -1417,6 +1446,8 @@ async fn execute_expand(
 /// distinct, because each carries its own properties), and the edge's declared
 /// property columns ride into the wide batch under the binding's prefix
 /// (`w.since`), where the ordinary filter/projection machinery consumes them.
+/// The physical edge `id` rides along as a hidden `w.id` column so ordering can
+/// totally order parallel edge rows; typecheck keeps it out of user expressions.
 /// Typecheck (T23) guarantees single-hop.
 #[allow(clippy::too_many_arguments)]
 async fn execute_expand_bound(
@@ -1449,8 +1480,9 @@ async fn execute_expand_bound(
         .get(edge_type)
         .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_type)))?;
     // Sorted for determinism. Blobs excluded: Lance rejects blob projection
-    // in a filtered scan (node scans carry the same guard); typecheck
-    // rejects the access.
+    // in a filtered scan (node scans carry the same guard); typecheck rejects
+    // the access. Physical `id` is always projected as hidden row identity,
+    // including for property-less edges.
     let mut prop_cols: Vec<&str> = edge_def
         .properties
         .keys()
@@ -1458,6 +1490,20 @@ async fn execute_expand_bound(
         .filter(|c| !edge_def.blob_properties.contains(*c))
         .collect();
     prop_cols.sort_unstable();
+    let mut attach_cols: Vec<&str> = Vec::with_capacity(1 + prop_cols.len());
+    attach_cols.push("id");
+    attach_cols.extend(prop_cols.iter().copied());
+    let attach_fields: Vec<Field> = attach_cols
+        .iter()
+        .map(|name| {
+            edge_def
+                .arrow_schema
+                .field_with_name(name)
+                .map(Clone::clone)
+                .map_err(|e| OmniError::manifest(e.to_string()))
+        })
+        .collect::<Result<_>>()?;
+    let attach_schema = Arc::new(Schema::new(attach_fields));
 
     // Wide rows grouped by src id: several wide rows may share one source node.
     let mut rows_by_src: HashMap<&str, Vec<u32>> = HashMap::new();
@@ -1466,16 +1512,19 @@ async fn execute_expand_bound(
     }
     let union_keys: Vec<String> = rows_by_src.keys().map(|k| k.to_string()).collect();
 
-    let mut src_indices: Vec<u32> = Vec::new();
-    let mut dst_ids: Vec<String> = Vec::new();
-    // Edge row of each emitted pair, as (scanned batch, row); flattened after
-    // the scan into one pair-parallel batch.
-    let mut edge_rows: Vec<(usize, usize)> = Vec::new();
+    // Each match carries the incoming wide-row ordinal plus physical edge id.
+    // Sorting by those keys preserves an upstream ANN/BM25 rank while giving
+    // parallel edges a deterministic order independent of Lance scan layout.
+    let mut matches: Vec<(u32, String, usize, usize, String)> = Vec::new();
     let mut scanned: Vec<RecordBatch> = Vec::new();
 
     for (probe_idx, &(key_col, opp_col)) in endpoint_probes(direction).iter().enumerate() {
         let batches = crate::table_store::TableStore::scan_edges_by_endpoint_projected(
-            &edge_ds, key_col, opp_col, &prop_cols, &union_keys,
+            &edge_ds,
+            key_col,
+            opp_col,
+            &attach_cols,
+            &union_keys,
         )
         .await?;
         for batch in batches {
@@ -1494,6 +1543,13 @@ async fn execute_expand_bound(
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", opp_col)))?
                 .clone();
+            let edge_ids = batch
+                .column_by_name("id")
+                .ok_or_else(|| OmniError::manifest("edge batch missing 'id'".to_string()))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| OmniError::manifest("edge 'id' is not Utf8".to_string()))?
+                .clone();
             for r in 0..batch.num_rows() {
                 // Undirected probes both orientations; a self-loop row would
                 // match the same wide row through both, so emit it only once.
@@ -1504,25 +1560,47 @@ async fn execute_expand_bound(
                     continue;
                 };
                 for &wide_row in wide_rows {
-                    src_indices.push(wide_row);
-                    dst_ids.push(opps.value(r).to_string());
-                    edge_rows.push((batch_idx, r));
+                    matches.push((
+                        wide_row,
+                        opps.value(r).to_string(),
+                        batch_idx,
+                        r,
+                        edge_ids.value(r).to_string(),
+                    ));
                 }
             }
             scanned.push(batch);
         }
     }
 
-    // Pair-parallel batch of the edge's property columns (empty for a
-    // property-less edge; the binding is then legal but vacuous, since
-    // typecheck already rejected every `$w.prop` access).
-    let edge_attach: Option<RecordBatch> = if prop_cols.is_empty() || scanned.is_empty() {
-        None
+    matches.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.4.cmp(&b.4))
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+    let mut src_indices: Vec<u32> = Vec::with_capacity(matches.len());
+    let mut dst_ids: Vec<String> = Vec::with_capacity(matches.len());
+    // Edge row of each emitted pair, as (scanned batch, row); flattened after
+    // the scan into one pair-parallel batch.
+    let mut edge_rows: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
+    for (src_row, dst_id, batch_idx, edge_row, _) in matches {
+        src_indices.push(src_row);
+        dst_ids.push(dst_id);
+        edge_rows.push((batch_idx, edge_row));
+    }
+
+    // Pair-parallel batch of physical id + declared non-blob properties. Even
+    // when there are zero matches, attach a typed zero-row batch: later filter,
+    // projection, and ordering must still see the bound edge's schema.
+    let edge_attach = if scanned.is_empty() {
+        RecordBatch::new_empty(attach_schema)
     } else {
-        let prop_only: Vec<RecordBatch> = scanned
+        let attach_only: Vec<RecordBatch> = scanned
             .iter()
             .map(|b| {
-                let indices: Vec<usize> = prop_cols
+                let indices: Vec<usize> = attach_cols
                     .iter()
                     .map(|c| b.schema().index_of(c))
                     .collect::<std::result::Result<_, _>>()
@@ -1531,8 +1609,8 @@ async fn execute_expand_bound(
                     .map_err(|e| OmniError::manifest(e.to_string()))
             })
             .collect::<Result<_>>()?;
-        let schema = prop_only[0].schema();
-        let combined = arrow_select::concat::concat_batches(&schema, &prop_only)
+        let schema = attach_only[0].schema();
+        let combined = arrow_select::concat::concat_batches(&schema, &attach_only)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
         // Flatten (batch, row) to rows in `combined`.
         let mut offsets: Vec<usize> = Vec::with_capacity(scanned.len());
@@ -1545,7 +1623,7 @@ async fn execute_expand_bound(
             .iter()
             .map(|&(b, r)| (offsets[b] + r) as u32)
             .collect();
-        Some(take_batch(&combined, &UInt32Array::from(flat))?)
+        take_batch(&combined, &UInt32Array::from(flat))?
     };
 
     expand_hydrate_and_align(
@@ -1558,7 +1636,7 @@ async fn execute_expand_bound(
         dst_var,
         dst_filters,
         params,
-        edge_attach.map(|batch| (edge_binding.to_string(), batch)),
+        Some((edge_binding.to_string(), edge_attach)),
     )
     .await
 }
