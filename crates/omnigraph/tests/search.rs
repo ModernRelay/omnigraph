@@ -79,6 +79,52 @@ query insert_doc($slug: String, $title: String, $body: String, $embedding: Vecto
 }
 "#;
 
+// A deliberately reverse-loaded edge table over a trivially ranked vector
+// corpus.  The source search order is rank-1, rank-2, rank-3, while physical
+// edge scan order starts at rank-3.  rank-1 has two parallel edges so the RRF
+// assertion also catches row loss/duplication within one fused entity rank.
+const RANKED_EDGE_SCHEMA: &str = r#"
+node RankedDoc {
+    slug: String @key
+    embedding: Vector(4)
+}
+
+edge RankedLink: RankedDoc -> RankedDoc {
+    label: String
+}
+"#;
+
+const RANKED_EDGE_DATA: &str = r#"{"type":"RankedDoc","data":{"slug":"rank-1","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"RankedDoc","data":{"slug":"rank-2","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"RankedDoc","data":{"slug":"rank-3","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"RankedDoc","data":{"slug":"sink","embedding":[9.0,0.0,0.0,0.0]}}
+{"edge":"RankedLink","from":"rank-3","to":"sink","data":{"id":"edge-c","label":"C"}}
+{"edge":"RankedLink","from":"rank-2","to":"sink","data":{"id":"edge-b","label":"B"}}
+{"edge":"RankedLink","from":"rank-1","to":"sink","data":{"id":"edge-a2","label":"A2"}}
+{"edge":"RankedLink","from":"rank-1","to":"sink","data":{"id":"edge-a1","label":"A1"}}"#;
+
+const RANKED_EDGE_QUERIES: &str = r#"
+query nearest_edges($q: Vector(4)) {
+    match {
+        $d: RankedDoc
+        $d $w:rankedLink $target
+    }
+    return { $d.slug, $w.label }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+
+query rrf_edges($q1: Vector(4), $q2: Vector(4)) {
+    match {
+        $d: RankedDoc
+        $d $w:rankedLink $target
+    }
+    return { $d.slug, $w.label }
+    order { rrf(nearest($d.embedding, $q1), nearest($d.embedding, $q2)) }
+    limit 4
+}
+"#;
+
 async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap();
@@ -86,6 +132,15 @@ async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
+    db
+}
+
+async fn init_ranked_edge_db(dir: &tempfile::TempDir) -> Omnigraph {
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, RANKED_EDGE_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, RANKED_EDGE_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
     db
 }
 
@@ -186,6 +241,28 @@ fn result_slugs(result: &QueryResult) -> Vec<String> {
         .unwrap();
     (0..slugs.len())
         .map(|index| slugs.value(index).to_string())
+        .collect()
+}
+
+fn first_two_strings(result: &QueryResult) -> Vec<(String, String)> {
+    let batch = result.concat_batches().unwrap();
+    let first = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let second = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    (0..batch.num_rows())
+        .map(|row| {
+            (
+                first.value(row).to_string(),
+                second.value(row).to_string(),
+            )
+        })
         .collect()
 }
 
@@ -853,6 +930,63 @@ async fn bm25_full_rank_order() {
     .unwrap();
     // Descending BM25 score order.
     assert_eq!(result_slugs(&result), vec!["rl-intro", "ml-intro", "dl-basics"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn nearest_rank_survives_bound_edge_fanout() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_ranked_edge_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        RANKED_EDGE_QUERIES,
+        "nearest_edges",
+        &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        first_two_strings(&result),
+        vec![
+            ("rank-1".to_string(), "A1".to_string()),
+            ("rank-1".to_string(), "A2".to_string()),
+            ("rank-2".to_string(), "B".to_string()),
+            ("rank-3".to_string(), "C".to_string()),
+        ],
+        "edge-table storage order must not replace the incoming ANN rank"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn rrf_rank_preserves_every_bound_edge_row_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_ranked_edge_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        RANKED_EDGE_QUERIES,
+        "rrf_edges",
+        &two_vector_params(
+            "$q1",
+            &[0.0, 0.0, 0.0, 0.0],
+            "$q2",
+            &[0.0, 0.0, 0.0, 0.0],
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        first_two_strings(&result),
+        vec![
+            ("rank-1".to_string(), "A1".to_string()),
+            ("rank-1".to_string(), "A2".to_string()),
+            ("rank-2".to_string(), "B".to_string()),
+            ("rank-3".to_string(), "C".to_string()),
+        ],
+        "fusion ranks source entities, then retains each matched edge row once"
+    );
 }
 
 // Characterization: fuzzy() does NOT match under the default tokenizer/index in

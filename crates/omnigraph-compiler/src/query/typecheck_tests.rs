@@ -25,6 +25,24 @@ title: String?
     build_catalog(&schema).unwrap()
 }
 
+fn setup_same_named_node_and_edge() -> Catalog {
+    // Node and edge namespaces are independent. These deliberately share a
+    // name so the typechecker cannot use `type_name` as a proxy for binding
+    // kind when it validates rebinding and traversal endpoints.
+    let schema = parse_schema(
+        r#"
+node Shared {
+label: String
+}
+edge Shared: Shared -> Shared {
+label: String?
+}
+"#,
+    )
+    .unwrap();
+    build_catalog(&schema).unwrap()
+}
+
 fn setup_vector() -> Catalog {
     let schema = parse_schema(
         r#"
@@ -1194,4 +1212,313 @@ update Event set { on: now() } where slug = "launch"
     let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
     assert!(err.to_string().contains("DateTime"));
     assert!(err.to_string().contains("property `on`"));
+}
+
+#[test]
+fn test_edge_binding_prop_access_in_filter_and_return() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:knows $f
+    $w.since >= date("2026-01-01")
+}
+return { $f.name, $w.since }
+}
+"#,
+    )
+    .unwrap();
+    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let w = &ctx.bindings["w"];
+    assert!(matches!(w.kind, BindingKind::Edge));
+    assert_eq!(w.type_name, "Knows");
+    assert_eq!(
+        ctx.traversals[0].edge_binding.as_deref(),
+        Some("w"),
+        "resolved traversal carries the binding for lowering"
+    );
+}
+
+#[test]
+fn test_edge_binding_unknown_property_rejected() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:knows $f
+}
+return { $w.nonsense }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("Knows"), "names the edge type: {msg}");
+    assert!(
+        msg.contains("nonsense"),
+        "names the missing property: {msg}"
+    );
+}
+
+#[test]
+fn test_edge_binding_rejected_on_bounded_traversal() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:knows{1,3} $f
+}
+return { $f.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23"), "dedicated code: {msg}");
+    assert!(msg.contains("multi-hop"), "explains the restriction: {msg}");
+}
+
+#[test]
+fn test_edge_binding_name_collision_rejected() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $p:knows $f
+}
+return { $f.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    assert!(err.to_string().contains("T23"), "{err}");
+}
+
+#[test]
+fn test_edge_binding_cannot_reuse_a_fresh_traversal_endpoint() {
+    let catalog = setup_same_named_node_and_edge();
+
+    for pattern in ["$w $w:shared $b", "$a $w:shared $w"] {
+        let source = format!(
+            r#"
+query q() {{
+match {{ {pattern} }}
+return {{ $w.label }}
+}}
+"#
+        );
+        let qf = parse_query(&source).unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("T23"), "dedicated edge-binding error: {msg}");
+        assert!(
+            msg.contains("endpoint") && msg.contains("distinct"),
+            "explains the namespace collision: {msg}"
+        );
+    }
+}
+
+#[test]
+fn test_edge_binding_cannot_be_rebound_as_same_named_node_type() {
+    let catalog = setup_same_named_node_and_edge();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $a: Shared
+    $a $w:shared $b
+    $w: Shared
+}
+return { $w.label }
+}
+"#,
+    )
+    .unwrap();
+
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23"), "dedicated edge-binding error: {msg}");
+    assert!(
+        msg.contains("edge") && msg.contains("node"),
+        "reports the cross-kind rebind: {msg}"
+    );
+}
+
+#[test]
+fn test_edge_binding_cannot_be_a_same_named_traversal_endpoint() {
+    let catalog = setup_same_named_node_and_edge();
+
+    for second_traversal in ["$w $x:shared $c", "$c $x:shared $w"] {
+        let source = format!(
+            r#"
+query q() {{
+match {{
+    $a: Shared
+    $a $w:shared $b
+    {second_traversal}
+}}
+return {{ $c.label }}
+}}
+"#
+        );
+        let qf = parse_query(&source).unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("T23"), "dedicated edge-binding error: {msg}");
+        assert!(
+            msg.contains("edge") && msg.contains("endpoint"),
+            "reports the cross-kind endpoint use: {msg}"
+        );
+    }
+}
+
+#[test]
+fn test_edge_binding_blob_property_rejected() {
+    // The bound scan excludes blob columns (Lance limit); access must fail
+    // loudly, not vanish downstream.
+    let schema = parse_schema(
+        r#"
+node Person {
+name: String
+}
+edge Sent: Person -> Person {
+note: String?
+attachment: Blob?
+}
+"#,
+    )
+    .unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $a: Person
+    $a $w:sent $b
+}
+return { $w.attachment }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23") && msg.contains("blob"), "{msg}");
+
+    let qf_ok = parse_query(
+        r#"
+query q() {
+match {
+    $a: Person
+    $a $w:sent $b
+}
+return { $w.note }
+}
+"#,
+    )
+    .unwrap();
+    assert!(typecheck_query(&catalog, &qf_ok.queries[0]).is_ok());
+}
+
+#[test]
+fn test_edge_binding_aggregate_typechecks() {
+    // The uniformity promise ("works wherever a node field does") includes
+    // aggregates: count over an edge property, grouped by a node field.
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query knows_counts() {
+match {
+    $p: Person
+    $p $w:knows $f
+}
+return { $f.name, count($w.since) }
+}
+"#,
+    )
+    .unwrap();
+    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    assert!(matches!(ctx.bindings["w"].kind, BindingKind::Edge));
+}
+
+#[test]
+fn test_edge_binding_rejected_in_search_field() {
+    // Would otherwise typecheck (title is a String edge prop) and then be
+    // SILENTLY DROPPED by the engine's search-filter hoist, which targets a
+    // NodeScan the edge binding does not have.
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:worksAt $c
+    search($w.title, "engineer")
+}
+return { $c.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23"), "{msg}");
+    assert!(msg.contains("search"), "{msg}");
+}
+
+#[test]
+fn test_edge_binding_rejected_in_nearest() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:worksAt $c
+}
+return { $c.name }
+order { nearest($w.title, "x") }
+limit 5
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("T23"),
+        "clear edge-binding error, not a confusing catalog miss: {msg}"
+    );
+}
+
+#[test]
+fn test_edge_binding_bare_use_rejected() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:knows $f
+}
+return { $w }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23"), "{msg}");
+    assert!(msg.contains("propert"), "points at property access: {msg}");
 }

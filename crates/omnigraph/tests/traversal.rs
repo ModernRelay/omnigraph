@@ -1,6 +1,7 @@
 mod helpers;
 
 use arrow_array::{Array, Int32Array, StringArray};
+use arrow_schema::DataType;
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
@@ -1063,4 +1064,212 @@ query not_at_acme_binding() {
     let mut names_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
     names_vec.sort();
     assert_eq!(names_vec, vec!["Bob", "Charlie", "Diana"]);
+}
+
+// ─── Bound edge variable (`$p $w:knows $f`) — edge property filter/projection ──
+//
+// iss-gq-edge-property-filter-projection: an edge binding names the matched
+// edge ROW, so its declared properties become addressable in filters and
+// projections like any node field.
+
+#[tokio::test]
+async fn edge_binding_filters_and_projects_edge_properties() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Fixture Knows edges (Alice->Bob, Alice->Charlie, Bob->Diana) carry no
+    // `since`; give Alice two dated friendships on either side of the cutoff.
+    load_jsonl(
+        &mut db,
+        concat!(
+            r#"{"edge": "Knows", "from": "Alice", "to": "Bob", "data": {"since": "2020-05-01"}}"#,
+            "\n",
+            r#"{"edge": "Knows", "from": "Alice", "to": "Diana", "data": {"since": "2024-11-30"}}"#,
+        ),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let queries = r#"
+query recent_friends($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+        $w.since >= date("2023-01-01")
+    }
+    return { $f.name, $w.since }
+}
+query all_friend_edges($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+    }
+    return { $f.name, $w.since }
+}
+query empty_source_edge_projection($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+    }
+    return { $w.since }
+}
+query no_outgoing_edge_filter($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+        $w.since >= date("2023-01-01")
+    }
+    return { $w.since }
+}
+query no_future_friend() {
+    match {
+        $p: Person
+        not {
+            $p $w:knows $f
+            $w.since >= date("2030-01-01")
+        }
+    }
+    return { $p.name }
+}
+"#;
+
+    // Filter on the edge property: only the 2024 friendship survives the
+    // cutoff, proving real `since` values flow through the bound edge.
+    let recent = query_main(
+        &mut db,
+        queries,
+        "recent_friends",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_column_sorted(&recent), vec!["Diana"]);
+
+    // Unfiltered: one output row per edge ROW — Bob appears twice because the
+    // fixture's undated Alice->Bob edge and the loaded dated one are parallel
+    // edges, each with its own `since`. Null edge properties flow (fixture
+    // Bob + Charlie rows); they don't drop rows.
+    let all = query_main(
+        &mut db,
+        queries,
+        "all_friend_edges",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first_column_sorted(&all),
+        vec!["Bob", "Bob", "Charlie", "Diana"],
+        "one row per edge row from Alice, parallel edges distinct"
+    );
+    let all_batch = all.concat_batches().unwrap();
+    let since_col = all_batch.column(1);
+    assert_eq!(
+        since_col.null_count(),
+        2,
+        "the two undated edge rows (fixture Bob, Charlie) have null since"
+    );
+
+    // Empty input must still carry the edge binding's declared Arrow schema.
+    // Otherwise projecting the edge property fails at runtime instead of
+    // returning a well-typed zero-row result.
+    let empty_source = query_main(
+        &mut db,
+        queries,
+        "empty_source_edge_projection",
+        &params(&[("$name", "Nobody")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(empty_source.num_rows(), 0);
+    assert_eq!(
+        empty_source.schema().field(0).data_type(),
+        &DataType::Date32,
+        "zero-row edge projections retain the declared property type"
+    );
+
+    // A real source with no matching edge exercises the scanner-empty arm.
+    // The edge filter must see a typed zero-length column, not a missing one.
+    let no_outgoing = query_main(
+        &mut db,
+        queries,
+        "no_outgoing_edge_filter",
+        &params(&[("$name", "Diana")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(no_outgoing.num_rows(), 0);
+    assert_eq!(no_outgoing.schema().field(0).data_type(), &DataType::Date32);
+
+    // The same zero-match edge schema must survive inside the correlated
+    // anti-join. Every person has no friendship dated in the future; sources
+    // with no outgoing row exercise the empty bound-edge arm per outer row.
+    let no_future = query_main(
+        &mut db,
+        queries,
+        "no_future_friend",
+        &ParamMap::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first_column_sorted(&no_future),
+        vec!["Alice", "Bob", "Charlie", "Diana"]
+    );
+
+    // Aggregate over an edge property, grouped by a node field: count(since)
+    // per friend. SQL null semantics: count skips nulls, so the fixture's
+    // undated Bob edge contributes 0 while the loaded dated one contributes 1.
+    let agg_queries = r#"
+query knows_counts($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+    }
+    return { $f.name, count($w.since) }
+}
+"#;
+    let counts = query_main(
+        &mut db,
+        agg_queries,
+        "knows_counts",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
+    let counts_batch = counts.concat_batches().unwrap();
+    assert_eq!(
+        first_column_sorted(&counts),
+        vec!["Bob", "Charlie", "Diana"],
+        "one group per friend node, parallel edges collapse into Bob's group"
+    );
+    let mut by_name: Vec<(String, i64)> = (0..counts_batch.num_rows())
+        .map(|i| {
+            let name = counts_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(i)
+                .to_string();
+            let count = counts_batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap()
+                .value(i);
+            (name, count)
+        })
+        .collect();
+    by_name.sort();
+    assert_eq!(
+        by_name,
+        vec![
+            ("Bob".to_string(), 1),
+            ("Charlie".to_string(), 0),
+            ("Diana".to_string(), 1)
+        ],
+        "count skips null since values"
+    );
 }

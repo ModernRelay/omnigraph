@@ -1012,17 +1012,34 @@ impl TableStore {
         opposite_col: &str,
         keys: &[String],
     ) -> Result<Vec<RecordBatch>> {
+        Self::scan_edges_by_endpoint_projected(ds, key_col, opposite_col, &[], keys).await
+    }
+
+    /// `scan_edges_by_endpoint` with extra projected columns beyond the two
+    /// endpoints. Consumed by the bound-edge expand, which carries the edge's
+    /// physical id and declared property columns alongside each matched row.
+    pub async fn scan_edges_by_endpoint_projected(
+        ds: &Dataset,
+        key_col: &str,
+        opposite_col: &str,
+        extra_cols: &[&str],
+        keys: &[String],
+    ) -> Result<Vec<RecordBatch>> {
         use datafusion::prelude::{col, lit};
 
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        let mut projection: Vec<&str> = Vec::with_capacity(2 + extra_cols.len());
+        projection.push(key_col);
+        projection.push(opposite_col);
+        projection.extend_from_slice(extra_cols);
         let key_list: Vec<datafusion::prelude::Expr> =
             keys.iter().map(|k| lit(k.clone())).collect();
         let filter_expr = col(key_col).in_list(key_list, false);
         Self::scan_stream_with(
             ds,
-            Some(&[key_col, opposite_col]),
+            Some(projection.as_slice()),
             None,
             None,
             false,

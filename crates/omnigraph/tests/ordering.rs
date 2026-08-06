@@ -102,6 +102,54 @@ query q() {
 }
 
 #[tokio::test]
+async fn ordering_parallel_edge_tie_breaks_by_physical_edge_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = TEST_SCHEMA.replace(
+        "    since: Date?\n",
+        "    since: Date?\n    label: String?\n",
+    );
+    let mut db = Omnigraph::init(uri, &schema).await.unwrap();
+
+    // Put edge-b in the original fragment and append edge-a later, so storage
+    // order is deliberately the reverse of physical edge-id order. The two
+    // rows are otherwise tied: same user sort key and same endpoint ids.
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"edge-b","label":"loaded-first"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"edge-a","label":"id-first"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let q = r#"
+query q() {
+    match {
+        $p: Person { name: "Alice" }
+        $p $w:knows $f
+    }
+    return { $w.label }
+    order { $p.age asc }
+}
+"#;
+    let got = names_in_order(&query_main(&mut db, q, "q", &ParamMap::new()).await.unwrap());
+    assert_eq!(
+        got,
+        vec!["id-first", "loaded-first"],
+        "parallel rows tied on user keys and endpoints order by physical edge id"
+    );
+}
+
+#[tokio::test]
 async fn ordering_nulls_placement_asc_and_desc() {
     let dir = tempfile::tempdir().unwrap();
     // Bob has a NULL age.
