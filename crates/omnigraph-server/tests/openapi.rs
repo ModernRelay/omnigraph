@@ -170,11 +170,6 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/query",
     "/graphs/{graph_id}/export",
-    "/graphs/{graph_id}/stream/status",
-    "/graphs/{graph_id}/stream/ingest",
-    "/graphs/{graph_id}/stream/resume",
-    "/graphs/{graph_id}/stream/maintenance/optimize",
-    "/graphs/{graph_id}/stream/maintenance/ensure-indices",
     "/graphs/{graph_id}/change",
     "/graphs/{graph_id}/mutate",
     "/graphs/{graph_id}/queries",
@@ -241,102 +236,7 @@ fn openapi_export_is_post() {
 }
 
 #[test]
-fn graph_stream_status_documents_checked_json_cut() {
-    let doc = openapi_json();
-    let operation = &doc["paths"]["/graphs/{graph_id}/stream/status"]["get"];
-    assert!(operation.is_object());
-    assert_eq!(
-        operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
-        "#/components/schemas/StreamStatusOutput"
-    );
-    assert!(operation["responses"]["200"]["headers"]["Cache-Control"].is_object());
-    for status in ["401", "403", "409", "413", "500", "503"] {
-        assert_eq!(
-            operation["responses"][status]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/ErrorOutput",
-            "stream status {status} must use ErrorOutput"
-        );
-    }
-}
-
-#[test]
-fn graph_stream_ingest_documents_ndjson_and_token_preconditions() {
-    let doc = openapi_json();
-    let operation = &doc["paths"]["/graphs/{graph_id}/stream/ingest"]["post"];
-    assert!(operation.is_object());
-
-    let request_body = &operation["requestBody"];
-    assert!(request_body.is_object());
-    assert!(request_body["content"]["application/x-ndjson"].is_object());
-    assert!(
-        request_body["content"].get("application/json").is_none(),
-        "graph streaming input is NDJSON, not a buffered JSON document"
-    );
-    assert!(
-        operation["parameters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|parameter| parameter["name"] == "If-Match" && parameter["in"] == "header"),
-        "graph stream ingest must document its strong graph-token precondition"
-    );
-
-    let responses = &operation["responses"];
-    assert_eq!(
-        responses["200"]["content"]["application/x-ndjson"]["schema"]["$ref"],
-        "#/components/schemas/StreamIngestLineOutput"
-    );
-    for status in ["401", "403", "409", "412", "413", "415", "503"] {
-        assert_eq!(
-            responses[status]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/ErrorOutput",
-            "stream ingest {status} must use ErrorOutput"
-        );
-    }
-    assert_eq!(
-        responses["428"]["content"]["application/json"]["schema"]["$ref"],
-        "#/components/schemas/StreamIngestChallenge"
-    );
-    assert!(responses["428"]["headers"]["ETag"].is_object());
-    assert!(responses["428"]["headers"]["Cache-Control"].is_object());
-}
-
-#[test]
-fn graph_stream_controls_are_bodyless_graph_wide_operations() {
-    let doc = openapi_json();
-    for (path, schema) in [
-        ("/graphs/{graph_id}/stream/resume", "StreamResumeOutput"),
-        (
-            "/graphs/{graph_id}/stream/maintenance/ensure-indices",
-            "StreamEnsureIndicesOutput",
-        ),
-        (
-            "/graphs/{graph_id}/stream/maintenance/optimize",
-            "StreamOptimizeOutput",
-        ),
-    ] {
-        let operation = &doc["paths"][path]["post"];
-        assert!(operation.is_object(), "missing graph stream control {path}");
-        assert!(
-            operation.get("requestBody").is_none(),
-            "graph stream control {path} must not accept a selector or actor body"
-        );
-        assert_eq!(
-            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
-            format!("#/components/schemas/{schema}")
-        );
-        for status in ["400", "401", "403", "409", "413", "500", "503"] {
-            assert_eq!(
-                operation["responses"][status]["content"]["application/json"]["schema"]["$ref"],
-                "#/components/schemas/ErrorOutput",
-                "graph stream control {path} response {status}"
-            );
-        }
-    }
-}
-
-#[test]
-fn stream_aware_export_documents_pre_header_failures() {
+fn export_documents_pre_header_failures() {
     let doc = openapi_json();
     let responses = &doc["paths"]["/graphs/{graph_id}/export"]["post"]["responses"];
     for status in ["400", "401", "403", "404", "409", "413", "503"] {
@@ -518,29 +418,6 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "SchemaApplyRequest",
     "SnapshotOutput",
     "SnapshotTableOutput",
-    "StreamDeclarationOutput",
-    "StreamDeclarationStatusOutput",
-    "StreamDrainStatusOutput",
-    "StreamDriverErrorOutput",
-    "StreamDriverStateOutput",
-    "StreamDriverStatusOutput",
-    "StreamEnsureIndicesOutput",
-    "StreamIngestChallenge",
-    "StreamIngestKindOutput",
-    "StreamIngestLineOutput",
-    "StreamIngestScopeOutput",
-    "StreamIngestStatusOutput",
-    "StreamLastFoldStatusOutput",
-    "StreamLifecycleOutput",
-    "StreamOptimizeOutput",
-    "StreamPendingStatusOutput",
-    "StreamProfileModeOutput",
-    "StreamRebuildBlockerOutput",
-    "StreamRebuildStatusOutput",
-    "StreamResumeOutput",
-    "StreamStatusOutput",
-    "StreamStrictBlockStatusOutput",
-    "StreamTokenCountsOutput",
 ];
 
 #[test]
@@ -935,8 +812,6 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
         ("/graphs/{graph_id}/export", "post"),
-        ("/graphs/{graph_id}/stream/status", "get"),
-        ("/graphs/{graph_id}/stream/ingest", "post"),
         ("/graphs/{graph_id}/snapshot", "get"),
         ("/graphs/{graph_id}/branches", "get"),
         ("/graphs/{graph_id}/branches", "post"),
@@ -1124,7 +999,6 @@ fn recovery_barrier_write_endpoints_document_recovery_required() {
         ("/graphs/{graph_id}/queries/{name}", "post"),
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
-        ("/graphs/{graph_id}/stream/ingest", "post"),
         ("/graphs/{graph_id}/branches", "post"),
         ("/graphs/{graph_id}/branches/{branch}", "delete"),
         ("/graphs/{graph_id}/branches/merge", "post"),
@@ -1151,7 +1025,6 @@ fn bounded_keyed_write_endpoints_document_resource_limit() {
         ("/graphs/{graph_id}/queries/{name}", "post"),
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
-        ("/graphs/{graph_id}/stream/ingest", "post"),
         ("/graphs/{graph_id}/branches/merge", "post"),
     ] {
         let response = &doc["paths"][path][method]["responses"]["413"];
@@ -1310,8 +1183,6 @@ async fn auth_mode_spec_has_security_on_protected_operations() {
     let protected_paths = [
         ("/graphs/{graph_id}/read", "post"),
         ("/graphs/{graph_id}/change", "post"),
-        ("/graphs/{graph_id}/stream/status", "get"),
-        ("/graphs/{graph_id}/stream/ingest", "post"),
         ("/graphs/{graph_id}/snapshot", "get"),
         ("/graphs/{graph_id}/branches", "get"),
         ("/graphs/{graph_id}/commits", "get"),
@@ -1391,8 +1262,6 @@ const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/snapshot",
     "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/export",
-    "/graphs/{graph_id}/stream/status",
-    "/graphs/{graph_id}/stream/ingest",
     "/graphs/{graph_id}/change",
     "/graphs/{graph_id}/schema",
     "/graphs/{graph_id}/schema/apply",
@@ -1467,8 +1336,6 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
         "/snapshot",
         "/read",
         "/export",
-        "/stream/status",
-        "/stream/ingest",
         "/change",
         "/schema",
         "/schema/apply",
@@ -1665,8 +1532,6 @@ async fn served_spec_always_nests_under_cluster_prefix() {
         "/read",
         "/query",
         "/export",
-        "/stream/status",
-        "/stream/ingest",
         "/change",
         "/mutate",
         "/queries",

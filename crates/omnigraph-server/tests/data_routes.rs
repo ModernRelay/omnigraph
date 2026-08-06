@@ -108,69 +108,6 @@ fn export_request(type_names: Vec<String>) -> Request<Body> {
         .unwrap()
 }
 
-fn body_poll_probe(polled: Arc<AtomicBool>) -> Body {
-    Body::from_stream(futures::stream::once(async move {
-        polled.store(true, Ordering::SeqCst);
-        Ok::<_, std::io::Error>(Bytes::from_static(
-            b"{\"type\":\"Person\",\"data\":{\"id\":\"must-not-run\",\"age\":1},\"$stream\":{\"write_id\":\"00000000-0000-4000-8000-000000000001\",\"predecessor_token\":null}}\n",
-        ))
-    }))
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn stream_ingest_media_and_runtime_refusals_do_not_poll_the_body() {
-    let (_temp, app) = app_for_loaded_graph().await;
-
-    let wrong_media_polled = Arc::new(AtomicBool::new(false));
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(g("/stream/ingest"))
-                .method(Method::POST)
-                .header("content-type", "application/json")
-                .body(body_poll_probe(Arc::clone(&wrong_media_polled)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    assert!(!wrong_media_polled.load(Ordering::SeqCst));
-
-    let missing_media_polled = Arc::new(AtomicBool::new(false));
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(g("/stream/ingest"))
-                .method(Method::POST)
-                .body(body_poll_probe(Arc::clone(&missing_media_polled)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    assert!(!missing_media_polled.load(Ordering::SeqCst));
-
-    let no_runtime_polled = Arc::new(AtomicBool::new(false));
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri(g("/stream/ingest"))
-                .method(Method::POST)
-                .header("content-type", "application/x-ndjson")
-                .body(body_poll_probe(Arc::clone(&no_runtime_polled)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert!(!no_runtime_polled.load(Ordering::SeqCst));
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-    assert_eq!(error.error, "graph stream ingest is not ready");
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn export_invalid_filter_refuses_before_success_headers() {
     let (_temp, app) = app_for_loaded_graph().await;

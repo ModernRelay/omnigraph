@@ -69,63 +69,6 @@ async fn protected_routes_require_bearer_token() {
         Some(omnigraph_server::api::ErrorCode::Unauthorized)
     );
 
-    let status_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(g("/stream/status"))
-                .method(Method::GET)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(status_response.status(), StatusCode::UNAUTHORIZED);
-
-    for path in [
-        "/stream/resume",
-        "/stream/maintenance/ensure-indices",
-        "/stream/maintenance/optimize",
-    ] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(g(path))
-                    .method(Method::POST)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "protected graph streaming control {path}"
-        );
-    }
-
-    let stream_body_polled = Arc::new(AtomicBool::new(false));
-    let body_probe = Arc::clone(&stream_body_polled);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri(g("/stream/ingest"))
-                .method(Method::POST)
-                .header("content-type", "application/x-ndjson")
-                .body(Body::from_stream(futures::stream::once(async move {
-                    body_probe.store(true, Ordering::SeqCst);
-                    Ok::<_, std::io::Error>(Bytes::from_static(b"{}\n"))
-                })))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert!(
-        !stream_body_polled.load(Ordering::SeqCst),
-        "bearer authentication must reject graph ingest before polling input"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
