@@ -427,4 +427,3 @@ async fn branch_merge_as_allows_when_policy_permits_actor() {
         .await
         .expect("act-allowed should be able to BranchMerge");
 }
-

@@ -13,12 +13,12 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph_server::api::{
-    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest, ReadRequest, SchemaApplyRequest,
+    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
+    ReadRequest, SchemaApplyRequest,
 };
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
 use tower::ServiceExt;
-
 
 mod support;
 use support::*;
@@ -68,7 +68,6 @@ async fn protected_routes_require_bearer_token() {
         error.code,
         Some(omnigraph_server::api::ErrorCode::Unauthorized)
     );
-
 }
 
 #[tokio::test(flavor = "multi_thread")]

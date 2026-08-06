@@ -95,8 +95,7 @@ pub(super) fn validate_args(args: &Args) -> Result<(), String> {
             let source_batch_rows = general_merge_batch_rows(args.dims);
             let source_transaction_count = args.delta_rows.div_ceil(source_batch_rows);
             if args.source_mode == "insert"
-                && source_transaction_count
-                    > rfc023_limits::PURE_INSERT_HISTORY_MAX_VERSIONS
+                && source_transaction_count > rfc023_limits::PURE_INSERT_HISTORY_MAX_VERSIONS
             {
                 return Err(format!(
                     "--source-mode insert needs {source_transaction_count} source transactions at \
@@ -124,11 +123,9 @@ pub(super) fn validate_args(args: &Args) -> Result<(), String> {
         }
         _ => {
             if args.phase.is_some() || args.fixture_root.is_some() {
-                return Err(
-                    "--phase/--fixture-root require fenced-adopt-all-new or \
+                return Err("--phase/--fixture-root require fenced-adopt-all-new or \
                      general-merge-updates"
-                        .to_string(),
-                );
+                    .to_string());
             }
         }
     }
@@ -1467,10 +1464,7 @@ const GENERAL_MERGE_SOURCE_BRANCH: &str = "update-source";
 fn general_merge_batch_rows(dims: usize) -> usize {
     // (dims + 1) * 4 offsets + dims * 4 values, plus generous room for the
     // slug string, its offset, and per-row bookkeeping.
-    let per_row = (dims as u64)
-        .saturating_mul(8)
-        .saturating_add(128)
-        .max(1);
+    let per_row = (dims as u64).saturating_mul(8).saturating_add(128).max(1);
     // Spend only 90% of the ceiling so a future accounting tweak does not put
     // the fixture back on the cliff.
     let by_bytes = rfc023_limits::KEYED_WRITE_MAX_BYTES
@@ -1571,12 +1565,8 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
     let target_divergence_start = args.rows - GENERAL_MERGE_TARGET_DELTA_ROWS;
     let diverge_vectors = vector_json_patterns(args.dims, args.seed ^ 0x0230_0385);
     let diverge_start = Instant::now();
-    let diverge_jsonl = graph_jsonl_chunk(
-        "base",
-        target_divergence_start,
-        args.rows,
-        &diverge_vectors,
-    );
+    let diverge_jsonl =
+        graph_jsonl_chunk("base", target_divergence_start, args.rows, &diverge_vectors);
     db.load("main", &diverge_jsonl, LoadMode::Merge)
         .await
         .expect("advance main after the branch forked");
@@ -1873,14 +1863,8 @@ pub(super) async fn general_merge_verify(args: &Args) -> serde_json::Value {
     } else {
         "base"
     };
-    let source_delta_row = verify_fixture_row(
-        &table,
-        source_prefix,
-        0,
-        args.dims,
-        args.seed ^ 0x0230_0384,
-    )
-    .await;
+    let source_delta_row =
+        verify_fixture_row(&table, source_prefix, 0, args.dims, args.seed ^ 0x0230_0384).await;
     let target_delta_row = verify_fixture_row(
         &table,
         "base",

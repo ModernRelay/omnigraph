@@ -462,4 +462,3 @@ pub(crate) fn demote_dependents_of_failed_graphs(
         }
     }
 }
-
