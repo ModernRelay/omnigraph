@@ -949,7 +949,7 @@
         "tags": [
           "mutations"
         ],
-        "summary": "Bulk-load NDJSON data into a branch (canonical load endpoint).",
+        "summary": "Compatibility-load NDJSON data through a JSON envelope.",
         "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting rows: `merge` upserts by id (default), `append` strictly inserts\nabsent ids, and `overwrite` replaces table contents. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.\n\nThe legacy `POST /ingest` route has identical semantics and is kept as a\ndeprecated alias.",
         "operationId": "cluster_load",
         "parameters": [
@@ -1026,6 +1026,185 @@
           },
           "413": {
             "description": "Keyed load exceeds the per-commit row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/load/ndjson": {
+      "post": {
+        "tags": [
+          "mutations"
+        ],
+        "summary": "Load one strict, bounded graph-level NDJSON batch.",
+        "description": "Bearer authentication runs in middleware. This handler completes both\nbranch authorization checks before polling the raw body. A successful\nresponse describes logical schema declarations only and is returned after\nthe ordinary graph commit is visible.",
+        "operationId": "cluster_loadNdjson",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "Target branch. Defaults to `main`. Without `from`, it must exist.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Parent branch used to create a missing target branch.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "mode",
+            "in": "query",
+            "description": "How existing rows are handled. Defaults to `merge`.",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/LoadMode"
+                }
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Strict raw graph-level NDJSON. Each nonblank line is exactly one node envelope {\"type\":\"<Node>\",\"data\":{...}} or edge envelope {\"edge\":\"<Edge>\",\"from\":\"<src-id>\",\"to\":\"<dst-id>\",\"data\":{...}}. `data` defaults to {}; optional `data.id` follows ordinary ID semantics. Duplicate, unknown, reserved physical, and noncanonical supplied node-ID members are refused.",
+          "content": {
+            "application/x-ndjson": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "One committed graph-batch result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphBatchLoadOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed query or graph batch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Target branch missing without `from`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Prepared load authority changed before effects",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request or keyed load exceeds a bounded ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Content-Type must be application/x-ndjson",
             "content": {
               "application/json": {
                 "schema": {
@@ -2188,6 +2367,77 @@
               "type": "string"
             },
             "description": "Restrict the export to these node/edge type names. Empty exports all types."
+          }
+        }
+      },
+      "GraphBatchDeclarationOutput": {
+        "type": "object",
+        "description": "One logical declaration touched by a graph-batch load.\n\nThis deliberately carries the accepted-schema name, not the backing\nmanifest table key, dataset path, or Lance identity.",
+        "required": [
+          "name",
+          "rows_loaded"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "rows_loaded": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "GraphBatchLoadOutput": {
+        "type": "object",
+        "description": "Terminal result for the raw graph-level NDJSON load surface.",
+        "required": [
+          "branch",
+          "branch_created",
+          "mode",
+          "nodes",
+          "edges",
+          "total_rows"
+        ],
+        "properties": {
+          "actor_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base branch a fork was requested from, even when the target already\nexisted. `null` when the request omitted `from`."
+          },
+          "branch": {
+            "type": "string"
+          },
+          "branch_created": {
+            "type": "boolean"
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphBatchDeclarationOutput"
+            },
+            "description": "Logical edge declarations touched by this batch, sorted by name."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/LoadMode"
+          },
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphBatchDeclarationOutput"
+            },
+            "description": "Logical node declarations touched by this batch, sorted by name."
+          },
+          "total_rows": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },

@@ -31,7 +31,6 @@ use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
 use lance::Dataset;
 use omnigraph_compiler::catalog::{Catalog, EdgeType};
-use sha2::{Digest, Sha256};
 
 use crate::db::{Omnigraph, Snapshot};
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
@@ -49,20 +48,6 @@ pub(crate) struct Violation {
     pub row_id: Option<String>,
     pub kind: MergeConflictKind,
     pub message: String,
-    /// Structured, validator-owned identities for a future bounded stream
-    /// correction. One logical violation may expose several current stream
-    /// keys (for example, the changed edges contributing to a cardinality
-    /// overflow). The lifecycle layer refuses to mint a repairable DataBlock
-    /// when this set is empty.
-    pub corrections: Vec<ViolationCorrectionEvidence>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ViolationCorrectionEvidence {
-    pub logical_key: String,
-    pub field_path_or_group: Vec<String>,
-    pub violation_instance_id: String,
-    pub allowed_actions: Vec<String>,
 }
 
 impl Violation {
@@ -109,23 +94,9 @@ pub(crate) type ChangeSet = HashMap<String, TableChange>;
 /// Row-local value validation — `@range`/`@check` (nodes) and enum membership
 /// (nodes **and** edges) — Δ-scoped to the changed rows. Reuses the loader
 /// leaves so the merge and write paths share one implementation; including the
-/// enum check here is what closes the merge-vs-write drift.
-pub(crate) fn evaluate_value_constraints(
-    changeset: &ChangeSet,
-    catalog: &Catalog,
-) -> Vec<Violation> {
-    let mut violations = Vec::new();
-    evaluate_value_constraints_with_sink(changeset, catalog, &mut |violation| {
-        violations.push(violation);
-        Ok(())
-    })
-    .expect("the compatibility violation collector is infallible");
-    violations
-}
-
-/// Sink form of [`evaluate_value_constraints`]. Leaf validators still produce
-/// at most one error per invocation, but this avoids retaining their aggregate
-/// across every changed table and batch.
+/// enum check here is what closes the merge-vs-write drift. Leaf validators
+/// still produce at most one error per invocation, while the sink avoids
+/// retaining their aggregate across every changed table and batch.
 fn evaluate_value_constraints_with_sink<F>(
     changeset: &ChangeSet,
     catalog: &Catalog,
@@ -174,10 +145,6 @@ fn value_violation(table_key: &str, err: OmniError) -> Violation {
         row_id: None,
         kind: MergeConflictKind::ValueConstraintViolation,
         message: err.to_string(),
-        // Stream admission rejects row-local range/check/enum failures before
-        // they can enter a retained generation. There is therefore no current
-        // stream winner to address from this surface-neutral fallback.
-        corrections: Vec::new(),
     }
 }
 
@@ -195,7 +162,7 @@ fn value_violation(table_key: &str, err: OmniError) -> Violation {
 #[derive(Debug, Clone)]
 pub(crate) enum Constraint {
     /// Row-local value/enum validation across the whole change-set (one entry
-    /// covers every table; handled by [`evaluate_value_constraints`]).
+    /// covers every table; handled by [`evaluate_value_constraints_with_sink`]).
     Value,
     Unique {
         table_key: String,
@@ -840,19 +807,7 @@ where
                 continue;
             };
             if let Some(prior) = seen_in_batch.insert(key.clone(), id.clone()) {
-                let correctable_ids = if prior == id {
-                    vec![id.as_str()]
-                } else {
-                    vec![id.as_str(), prior.as_str()]
-                };
-                sink(unique_violation(
-                    table_key,
-                    columns,
-                    &key,
-                    &id,
-                    &prior,
-                    &correctable_ids,
-                ))?;
+                sink(unique_violation(table_key, columns, &key, &id, &prior))?;
                 has_within_batch_violation = true;
             }
             // Typed literals from the row's Arrow columns for the committed probe
@@ -868,8 +823,7 @@ where
     }
     // Preserve the established bulk-input contract and error ordering: a
     // within-batch duplicate is reported before the coalesced cross-row and
-    // committed passes. Structured correction evidence is canonicalized
-    // independently inside `unique_violation`.
+    // committed passes.
     if has_within_batch_violation {
         return Ok(());
     }
@@ -884,14 +838,7 @@ where
     for (id, (key, _)) in &entries {
         if let Some(other) = holder_by_key.insert(key, id) {
             if other != id {
-                sink(unique_violation(
-                    table_key,
-                    columns,
-                    key,
-                    id,
-                    other,
-                    &[id.as_str(), other.as_str()],
-                ))?;
+                sink(unique_violation(table_key, columns, key, id, other))?;
             }
         }
     }
@@ -912,14 +859,7 @@ where
             };
             for holder in holders {
                 if !delta_ids.contains(holder) && !deleted.contains(holder) {
-                    sink(unique_violation(
-                        table_key,
-                        columns,
-                        key,
-                        id,
-                        holder,
-                        &[id.as_str()],
-                    ))?;
+                    sink(unique_violation(table_key, columns, key, id, holder))?;
                     break;
                 }
             }
@@ -1145,12 +1085,6 @@ where
         let count = per_src.get(src).map(|ids| ids.len() as u32).unwrap_or(0);
         if let Some(max) = card.max {
             if count > max {
-                let mut correction_keys = delta_by_id
-                    .iter()
-                    .filter(|(_, candidate_src)| *candidate_src == src)
-                    .map(|(id, _)| id.clone())
-                    .collect::<Vec<_>>();
-                correction_keys.sort();
                 sink(cardinality_violation(
                     edge_table,
                     &edge_type.name,
@@ -1158,35 +1092,10 @@ where
                     count,
                     "max",
                     max,
-                    &correction_keys,
-                    &["REPLACE", "WITHDRAW"],
                 ))?;
             }
         }
         if count < card.min {
-            // A minimum violation can be repaired by withdrawing/replacing
-            // either a delta edge currently landing on this source or a delta
-            // edge that moved away from it. Keep both identities: the former
-            // covers a fresh under-min source, while the latter can restore the
-            // manifest-visible source it vacated.
-            let mut correction_keys = delta_by_id
-                .iter()
-                .filter(|(_, candidate_src)| *candidate_src == src)
-                .map(|(id, _)| id.clone())
-                .chain(
-                    moved_from
-                        .iter()
-                        .filter(|(id, old_src)| {
-                            old_src == src
-                                && delta_by_id
-                                    .get(id)
-                                    .is_some_and(|current_src| current_src != src)
-                        })
-                        .map(|(id, _)| id.clone()),
-                )
-                .collect::<Vec<_>>();
-            correction_keys.sort();
-            correction_keys.dedup();
             sink(cardinality_violation(
                 edge_table,
                 &edge_type.name,
@@ -1194,8 +1103,6 @@ where
                 count,
                 "min",
                 card.min,
-                &correction_keys,
-                &["REPLACE", "WITHDRAW"],
             ))?;
         }
     }
@@ -1213,19 +1120,11 @@ fn unique_violation(
     key: &[String],
     id: &str,
     other: &str,
-    correctable_ids: &[&str],
 ) -> Violation {
     let type_name = table_key
         .strip_prefix("node:")
         .or_else(|| table_key.strip_prefix("edge:"))
         .unwrap_or(table_key);
-    let mut participants = [id, other];
-    participants.sort();
-    let mut discriminator = key.to_vec();
-    discriminator.extend(participants.into_iter().map(str::to_string));
-    let mut correctable_ids = correctable_ids.to_vec();
-    correctable_ids.sort();
-    correctable_ids.dedup();
     Violation {
         table_key: table_key.to_string(),
         row_id: Some(id.to_string()),
@@ -1235,21 +1134,6 @@ fn unique_violation(
             format_tuple(columns),
             format_tuple(key)
         ),
-        corrections: correctable_ids
-            .into_iter()
-            .map(|logical_key| ViolationCorrectionEvidence {
-                logical_key: logical_key.to_string(),
-                field_path_or_group: columns.to_vec(),
-                violation_instance_id: violation_instance_id(
-                    "UNIQUE_VIOLATION",
-                    table_key,
-                    logical_key,
-                    columns,
-                    discriminator.iter().map(String::as_str),
-                ),
-                allowed_actions: vec!["REPLACE".to_string(), "WITHDRAW".to_string()],
-            })
-            .collect(),
     }
 }
 
@@ -1267,18 +1151,6 @@ fn orphan_violation(
         row_id: Some(edge_id.to_string()),
         kind: MergeConflictKind::OrphanEdge,
         message: format!("{label} '{endpoint}' not found in {node_type}"),
-        corrections: vec![ViolationCorrectionEvidence {
-            logical_key: edge_id.to_string(),
-            field_path_or_group: vec![label.to_string()],
-            violation_instance_id: violation_instance_id(
-                "ORPHAN_EDGE",
-                edge_table,
-                edge_id,
-                &[label.to_string()],
-                [endpoint, node_type].into_iter(),
-            ),
-            allowed_actions: vec!["REPLACE".to_string(), "WITHDRAW".to_string()],
-        }],
     }
 }
 
@@ -1289,16 +1161,7 @@ fn cardinality_violation(
     count: u32,
     bound: &str,
     limit: u32,
-    correction_keys: &[String],
-    allowed_actions: &[&str],
 ) -> Violation {
-    let discriminator = [
-        edge_name.to_string(),
-        src.to_string(),
-        count.to_string(),
-        bound.to_string(),
-        limit.to_string(),
-    ];
     Violation {
         table_key: edge_table.to_string(),
         row_id: None,
@@ -1306,62 +1169,7 @@ fn cardinality_violation(
         message: format!(
             "@card violation on edge {edge_name}: source '{src}' has {count} edges ({bound} {limit})"
         ),
-        corrections: correction_keys
-            .iter()
-            .map(|logical_key| ViolationCorrectionEvidence {
-                logical_key: logical_key.clone(),
-                field_path_or_group: vec!["src".to_string()],
-                violation_instance_id: violation_instance_id(
-                    "CARDINALITY_VIOLATION",
-                    edge_table,
-                    logical_key,
-                    &["src".to_string()],
-                    discriminator.iter().map(String::as_str),
-                ),
-                allowed_actions: allowed_actions
-                    .iter()
-                    .map(|action| (*action).to_string())
-                    .collect(),
-            })
-            .collect(),
     }
-}
-
-fn violation_instance_id<'a>(
-    kind: &str,
-    table_key: &str,
-    logical_key: &str,
-    field_path_or_group: &[String],
-    discriminator: impl IntoIterator<Item = &'a str>,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"omnigraph.validator-violation-instance.v1\0");
-    hash_violation_field(&mut hasher, kind.as_bytes());
-    hash_violation_field(&mut hasher, table_key.as_bytes());
-    hash_violation_field(&mut hasher, logical_key.as_bytes());
-    hasher.update(
-        u64::try_from(field_path_or_group.len())
-            .unwrap_or(u64::MAX)
-            .to_be_bytes(),
-    );
-    for field in field_path_or_group {
-        hash_violation_field(&mut hasher, field.as_bytes());
-    }
-    let discriminator = discriminator.into_iter().collect::<Vec<_>>();
-    hasher.update(
-        u64::try_from(discriminator.len())
-            .unwrap_or(u64::MAX)
-            .to_be_bytes(),
-    );
-    for field in discriminator {
-        hash_violation_field(&mut hasher, field.as_bytes());
-    }
-    format!("sha256:{:x}", hasher.finalize())
-}
-
-fn hash_violation_field(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
-    hasher.update(bytes);
 }
 
 #[cfg(test)]
@@ -1432,12 +1240,22 @@ mod tests {
         changeset
     }
 
+    fn collect_value_constraints(changeset: &ChangeSet, catalog: &Catalog) -> Vec<Violation> {
+        let mut violations = Vec::new();
+        evaluate_value_constraints_with_sink(changeset, catalog, &mut |violation| {
+            violations.push(violation);
+            Ok(())
+        })
+        .expect("the test violation collector is infallible");
+        violations
+    }
+
     /// The merge path previously validated `@range`/`@check` but NOT enum
     /// membership, so a delta carrying an out-of-enum value slipped through (W1).
     /// The unified evaluator runs the enum check the write path always ran.
     #[test]
     fn evaluator_flags_out_of_enum_value_in_delta() {
-        let v = evaluate_value_constraints(&status_change(&["bogus"]), &catalog(DOC_SCHEMA));
+        let v = collect_value_constraints(&status_change(&["bogus"]), &catalog(DOC_SCHEMA));
         assert_eq!(v.len(), 1, "expected one enum violation, got {v:?}");
         assert_eq!(v[0].kind, MergeConflictKind::ValueConstraintViolation);
         assert!(
@@ -1445,13 +1263,12 @@ mod tests {
             "message was: {}",
             v[0].message
         );
-        assert!(v[0].corrections.is_empty());
     }
 
     #[test]
     fn evaluator_accepts_valid_delta() {
         assert!(
-            evaluate_value_constraints(&status_change(&["draft"]), &catalog(DOC_SCHEMA)).is_empty()
+            collect_value_constraints(&status_change(&["draft"]), &catalog(DOC_SCHEMA)).is_empty()
         );
     }
 
@@ -1509,7 +1326,6 @@ mod tests {
             assert_eq!(actual.row_id, expected.row_id);
             assert_eq!(actual.kind, expected.kind);
             assert_eq!(actual.message, expected.message);
-            assert_eq!(actual.corrections, expected.corrections);
         }
     }
 
@@ -1547,103 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn cardinality_violation_names_each_correctable_delta_key() {
-        let violation = cardinality_violation(
-            "edge:WorksAt",
-            "WorksAt",
-            "alice",
-            3,
-            "max",
-            1,
-            &["edge-1".to_string(), "edge-2".to_string()],
-            &["REPLACE", "WITHDRAW"],
-        );
-        assert_eq!(violation.corrections.len(), 2);
-        assert_eq!(violation.corrections[0].logical_key, "edge-1");
-        assert_eq!(violation.corrections[1].logical_key, "edge-2");
-        assert!(
-            violation
-                .corrections
-                .iter()
-                .all(|correction| correction.field_path_or_group == ["src"])
-        );
-
-        let minimum = cardinality_violation(
-            "edge:WorksAt",
-            "WorksAt",
-            "alice",
-            0,
-            "min",
-            1,
-            &["edge-1".to_string()],
-            &["REPLACE", "WITHDRAW"],
-        );
-        assert_eq!(
-            minimum.corrections[0].allowed_actions,
-            ["REPLACE", "WITHDRAW"],
-            "withdrawing a blocked move restores its manifest-visible source"
-        );
-    }
-
-    #[tokio::test]
-    async fn min_cardinality_violation_names_fresh_delta_edge() {
-        const MIN_CARD_SCHEMA: &str = r#"
-node Person { name: String @key }
-edge Knows: Person -> Person @card(2..)
-"#;
-        let catalog = catalog(MIN_CARD_SCHEMA);
-        let edge_type = catalog.edge_types.get("Knows").unwrap();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("src", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["edge-1"])) as _,
-                Arc::new(StringArray::from(vec!["alice"])) as _,
-            ],
-        )
-        .unwrap();
-        let mut change = TableChange::default();
-        change.added.push(batch);
-        let mut changeset = ChangeSet::new();
-        changeset.insert("edge:Knows".to_string(), change);
-        let committed = CommittedState {
-            committed: None,
-            overwritten: HashSet::new(),
-            live: None,
-        };
-        let mut violations = Vec::new();
-
-        evaluate_cardinality(
-            "edge:Knows",
-            edge_type,
-            changeset.get("edge:Knows").unwrap(),
-            &changeset,
-            &committed,
-            &mut |violation| {
-                violations.push(violation);
-                Ok(())
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].kind, MergeConflictKind::CardinalityViolation);
-        assert_eq!(violations[0].corrections.len(), 1);
-        assert_eq!(violations[0].corrections[0].logical_key, "edge-1");
-        assert_eq!(
-            violations[0].corrections[0].allowed_actions,
-            ["REPLACE", "WITHDRAW"]
-        );
-    }
-
-    /// Δ-scoping: an empty change-set does no work and raises nothing —
-    /// validation cost follows the delta, not the table size.
-    #[test]
     fn evaluator_ignores_empty_changeset() {
-        assert!(evaluate_value_constraints(&ChangeSet::new(), &catalog(DOC_SCHEMA)).is_empty());
+        assert!(collect_value_constraints(&ChangeSet::new(), &catalog(DOC_SCHEMA)).is_empty());
     }
 }

@@ -5,8 +5,8 @@ use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
-    ChangeOutput, CommitOutput, ErrorOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
-    SnapshotTableOutput,
+    ChangeOutput, CommitOutput, ErrorOutput, GraphBatchLoadOutput, IngestOutput, ReadOutput,
+    SchemaApplyOutput, SnapshotTableOutput,
 };
 use omnigraph_cluster::{
     ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput,
@@ -27,8 +27,8 @@ use omnigraph_server::{
 };
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
@@ -297,7 +297,8 @@ async fn main() -> Result<()> {
             // stderr so `--json` consumers reading stdout are unaffected.
             eprintln!(
                 "warning: `omnigraph ingest` is deprecated and will be removed in a future release; \
-                 use `omnigraph load --from <base> --mode <mode>` (ingest defaults: --from main --mode merge)"
+                 use strict graph-batch `omnigraph load --from <base> --mode <mode>` for new integrations \
+                 (ingest defaults: --from main --mode merge)"
             );
             let client = client::GraphClient::resolve_with_policy(
                 capability,

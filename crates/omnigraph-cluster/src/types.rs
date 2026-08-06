@@ -2,7 +2,7 @@
 //! models (moved verbatim from lib.rs in the modularization).
 
 use super::*;
-pub(crate) use omnigraph_control_authority::StateLockFile;
+pub(crate) use crate::state_lock::StateLockFile;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

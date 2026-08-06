@@ -1,12 +1,11 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
+use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::refs::BranchIdentifier;
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
     DescribeTableRequest, DescribeTableVersionRequest, ListTableVersionsRequest,
@@ -14,17 +13,11 @@ use lance_namespace::models::{
 use lance_namespace_impls::DirectoryNamespaceBuilder;
 use tokio::sync::Mutex;
 
-use crate::error::{ManifestConflictDetails, ManifestError};
-
 use super::publisher::{
     GraphHeadExpectation, LineageIntent, ManifestBatchPublisher, PublishOutcome,
     PublishPrecondition,
 };
 use super::state::read_publish_scan;
-use super::stream_token::{
-    STREAM_FOLD_ACTOR, StreamDeadLetterObjectDescriptor, StreamFoldAttributionSummary,
-    stream_fold_attribution_commitment_v2,
-};
 use super::*;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
@@ -124,41 +117,6 @@ fn table_identity_rejects_zero_and_drives_paths_and_object_ids() {
     );
 }
 
-#[test]
-fn manifest_graph_table_schema_adds_exact_hidden_metadata_and_rejects_lookalikes() {
-    let catalog = build_test_catalog();
-    let input = &catalog.node_types["Person"].arrow_schema;
-    assert!(
-        input
-            .field_with_name(crate::db::STREAM_METADATA_COLUMN)
-            .is_err()
-    );
-
-    let physical = super::graph::keyed_graph_table_schema(input).unwrap();
-    let hidden = physical
-        .field_with_name(crate::db::STREAM_METADATA_COLUMN)
-        .unwrap();
-    assert_eq!(
-        hidden,
-        &super::stream_token::trusted_stream_metadata_field()
-    );
-    assert!(hidden.is_nullable());
-
-    let mut supplied = input.fields().iter().cloned().collect::<Vec<_>>();
-    supplied.push(Arc::new(Field::new(
-        crate::db::STREAM_METADATA_COLUMN,
-        DataType::Utf8,
-        true,
-    )));
-    let supplied = Arc::new(Schema::new_with_metadata(supplied, input.metadata.clone()));
-    let error = super::graph::keyed_graph_table_schema(&supplied).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("non-canonical reserved physical field")
-    );
-}
-
 #[tokio::test]
 async fn historical_alias_binding_keeps_same_name_node_and_edge_identities_distinct() {
     let dir = tempfile::tempdir().unwrap();
@@ -198,105 +156,6 @@ async fn test_init_creates_manifest_and_sub_tables() {
         assert_eq!(entry.row_count, 0);
         assert!(entry.table_branch.is_none());
     }
-}
-
-#[tokio::test]
-async fn init_materializes_one_exact_manifest_selected_stream_token_dataset() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let catalog = build_test_catalog();
-
-    let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    let snapshot = mc.snapshot();
-    let authority = snapshot.stream_token_authority();
-    assert_eq!(authority.location, token_store::STREAM_TOKEN_DATASET_PATH);
-    assert_eq!(
-        authority.schema_version,
-        token_store::STREAM_TOKEN_AUTHORITY_SCHEMA_VERSION
-    );
-    assert_eq!(
-        authority.schema_hash,
-        token_store::stream_token_schema_hash()
-    );
-    assert_eq!(
-        authority.current_head_witness.branch_identifier,
-        BranchIdentifier::main()
-    );
-
-    let token_dataset = snapshot.open_stream_token_authority().await.unwrap();
-    assert_eq!(
-        token_dataset.version().version,
-        authority.current_head_witness.table_version
-    );
-    assert_eq!(token_dataset.count_rows(None).await.unwrap(), 0);
-    let actual_schema: Schema = token_dataset.schema().into();
-    assert_eq!(&actual_schema, token_store::stream_token_schema().as_ref());
-    assert_eq!(
-        actual_schema
-            .field_with_name("id")
-            .unwrap()
-            .metadata()
-            .get(lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY)
-            .map(String::as_str),
-        Some("true")
-    );
-
-    let manifest = open_manifest_dataset(uri, None).await.unwrap();
-    let batches: Vec<RecordBatch> = manifest
-        .scan()
-        .try_into_stream()
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    let mut authority_rows = 0;
-    for batch in batches {
-        let object_types = super::state::string_column(&batch, "object_type").unwrap();
-        let stable_ids = batch
-            .column_by_name("stable_table_id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let incarnation_ids = batch
-            .column_by_name("table_incarnation_id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        for row in 0..batch.num_rows() {
-            if object_types.value(row) == OBJECT_TYPE_STREAM_TOKEN_AUTHORITY {
-                authority_rows += 1;
-                assert!(stable_ids.is_null(row));
-                assert!(incarnation_ids.is_null(row));
-            }
-        }
-    }
-    assert_eq!(authority_rows, 1);
-}
-
-#[test]
-fn stream_token_internal_primary_key_is_canonical_and_collision_free() {
-    let identity = TableIdentity::new(7, 9).unwrap();
-    assert_eq!(
-        token_store::stream_token_row_id(identity, "a:b").unwrap(),
-        "stream-token-v1:0000000000000007:0000000000000009:a:b"
-    );
-    assert_ne!(
-        token_store::stream_token_row_id(identity, "a:b").unwrap(),
-        token_store::stream_token_row_id(identity, "a3a62").unwrap()
-    );
-    assert!(
-        token_store::stream_token_row_id(
-            TableIdentity {
-                stable_table_id: 0,
-                table_incarnation_id: 1,
-            },
-            "id"
-        )
-        .is_err()
-    );
 }
 
 #[tokio::test]
@@ -1386,10 +1245,7 @@ impl ManifestBatchPublisher for RecordingPublisher {
                 ManifestChange::Update(update) => Some(update.to_create_table_version_request()),
                 ManifestChange::RegisterTable(_)
                 | ManifestChange::RenameTable(_)
-                | ManifestChange::Tombstone(_)
-                | ManifestChange::SetStreamLifecycle { .. }
-                | ManifestChange::SetStreamTokenAuthority { .. }
-                | ManifestChange::SetStreamProfile { .. } => None,
+                | ManifestChange::Tombstone(_) => None,
             })
             .collect();
         self.requests.lock().await.extend_from_slice(&requests);
@@ -1571,603 +1427,6 @@ async fn append_person_and_make_update(
         row_count: 1,
         version_metadata,
     }
-}
-
-#[tokio::test]
-async fn table_and_stream_token_pointers_publish_in_one_manifest_cas() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let catalog = build_test_catalog();
-    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    let before = mc.snapshot();
-    let person = before.entry("node:Person").unwrap().clone();
-    let expected_token = before.stream_token_authority().clone();
-
-    // Move only the physical token HEAD. Until the manifest row changes, the
-    // old snapshot must continue opening the exact selected version.
-    let mut token_dataset = before.open_stream_token_authority().await.unwrap();
-    token_dataset
-        .update_config([("omnigraph.test.token_effect", Some("1"))])
-        .await
-        .unwrap();
-    let next_token = token_store::stream_token_authority_entry_for_dataset(&token_dataset)
-        .await
-        .unwrap();
-    assert!(
-        next_token.current_head_witness.table_version
-            > expected_token.current_head_witness.table_version
-    );
-    assert_eq!(
-        before
-            .open_stream_token_authority()
-            .await
-            .unwrap()
-            .version()
-            .version,
-        expected_token.current_head_witness.table_version
-    );
-
-    let table_update = append_person_and_make_update(uri, &person, "TokenAtomic").await;
-    let manifest_before = mc.version();
-    mc.commit_changes(&[
-        ManifestChange::Update(table_update.clone()),
-        ManifestChange::SetStreamTokenAuthority {
-            expected: expected_token.clone(),
-            next: next_token.clone(),
-        },
-    ])
-    .await
-    .unwrap();
-
-    assert_eq!(mc.version(), manifest_before + 1);
-    let after = mc.snapshot();
-    assert_eq!(
-        after.entry("node:Person").unwrap().table_version,
-        table_update.table_version
-    );
-    assert_eq!(after.stream_token_authority(), &next_token);
-    assert_eq!(
-        after
-            .open_stream_token_authority()
-            .await
-            .unwrap()
-            .version()
-            .version,
-        next_token.current_head_witness.table_version
-    );
-
-    let stale = mc
-        .commit_changes(&[ManifestChange::SetStreamTokenAuthority {
-            expected: expected_token,
-            next: next_token.clone(),
-        }])
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        stale,
-        OmniError::Manifest(ManifestError {
-            details: Some(ManifestConflictDetails::ReadSetChanged { .. }),
-            ..
-        })
-    ));
-
-    let reopened = ManifestCoordinator::open(uri).await.unwrap().snapshot();
-    assert_eq!(reopened.stream_token_authority(), &next_token);
-    assert_eq!(
-        reopened.entry("node:Person").unwrap().table_version,
-        table_update.table_version
-    );
-}
-
-/// RFC-026 §4.7 F2: terminal profile authority cannot move without its selected
-/// receipt participant, while the receipt-free admission cutoff remains a
-/// standalone exact-entry CAS.
-#[tokio::test]
-async fn stream_profile_genesis_cas_and_revision_rules() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let catalog = build_test_catalog();
-    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-
-    // Genesis: present from manifest version one, disabled, revision 1, with
-    // the canonical empty receipt-chain commitment.
-    let before = mc.snapshot();
-    let genesis = before.stream_profile().clone();
-    assert_eq!(genesis, StreamProfileEntry::genesis());
-    let status = before.streaming_status();
-    assert!(!status.enabled);
-    assert!(!status.undrained);
-    assert_eq!(status.profile_revision, 1);
-    assert_eq!(status.profile_mode, "DISABLED");
-
-    let graph_identity_digest = format!("sha256:{}", "a".repeat(64));
-    let declaration_digest = format!("sha256:{}", "b".repeat(64));
-    let active_delegation = FoldDelegation::issue(
-        "11111111-1111-4111-8111-111111111111",
-        format!("sha256:{}", "c".repeat(64)),
-        "config-1",
-        declaration_digest.clone(),
-        2,
-        "operator:alice",
-        1_700_000_000_000_000,
-    )
-    .unwrap();
-    let request_digest = stream_profile_management_request_digest(
-        &graph_identity_digest,
-        "enable-profile-test",
-        "config-1",
-        &declaration_digest,
-        genesis.profile_revision,
-        StreamProfileMode::Enabled,
-    )
-    .unwrap();
-    let result = ProfileManagementResult::new(
-        mc.version() + 1,
-        2,
-        StreamProfileState::Enabled {
-            active_fold_delegation: active_delegation.clone(),
-        },
-        0,
-        format!("sha256:{}", "d".repeat(64)),
-    )
-    .unwrap();
-    let receipt = ProfileManagementReceipt::new(
-        &graph_identity_digest,
-        &genesis.profile_receipt_chain,
-        "enable-profile-test",
-        request_digest,
-        "config-1",
-        &declaration_digest,
-        "operator:alice",
-        genesis.profile_revision,
-        result,
-        1_700_000_000_000_001,
-    )
-    .unwrap();
-    let enabled = StreamProfileEntry::enabled_from(
-        &genesis,
-        receipt.next_chain_ref().unwrap(),
-        active_delegation.clone(),
-    )
-    .unwrap();
-
-    // A terminal transition cannot publish its receipt-chain commitment
-    // without selecting the exact receipt-bearing token-ledger HEAD.
-    let unpaired = mc
-        .commit_changes(&[ManifestChange::SetStreamProfile {
-            expected: genesis.clone(),
-            next: enabled.clone(),
-        }])
-        .await
-        .unwrap_err();
-    assert!(
-        unpaired
-            .to_string()
-            .contains("must advance stream-token authority in the same manifest batch"),
-        "got: {unpaired}"
-    );
-    assert_eq!(mc.version(), before.version());
-    assert_eq!(mc.snapshot().stream_profile(), &genesis);
-
-    let expected_token = mc.snapshot().stream_token_authority().clone();
-    let token_dataset = mc.snapshot().open_stream_token_authority().await.unwrap();
-    let staged = token_store::stage_profile_management_receipt(
-        token_dataset.clone(),
-        &expected_token,
-        &receipt,
-    )
-    .await
-    .unwrap();
-    let store = crate::table_store::TableStore::new(uri, crate::lance_access::control_session());
-    let (achieved, _) = store
-        .commit_staged_exact(Arc::new(token_dataset), staged)
-        .await
-        .unwrap();
-    let next_token = token_store::stream_token_authority_entry_for_dataset(&achieved)
-        .await
-        .unwrap();
-
-    // Terminal profile authority and its immutable receipt participant become
-    // authoritative in one manifest CAS.
-    let manifest_before = mc.version();
-    mc.commit_changes(&[
-        ManifestChange::SetStreamTokenAuthority {
-            expected: expected_token,
-            next: next_token.clone(),
-        },
-        ManifestChange::SetStreamProfile {
-            expected: genesis.clone(),
-            next: enabled.clone(),
-        },
-    ])
-    .await
-    .unwrap();
-    assert_eq!(mc.version(), manifest_before + 1);
-    let after = mc.snapshot();
-    assert_eq!(after.stream_profile(), &enabled);
-    assert_eq!(after.stream_token_authority(), &next_token);
-    assert!(after.streaming_status().enabled);
-
-    // ENABLED -> DISABLING closes admission before terminal drain work and is
-    // intentionally the only receipt-chain-preserving standalone profile CAS.
-    let disabling_revision = enabled.profile_revision + 1;
-    let disabling_declaration_digest = format!("sha256:{}", "e".repeat(64));
-    let disable_request_digest = stream_profile_management_request_digest(
-        &graph_identity_digest,
-        "disable-profile-test",
-        "config-2",
-        &disabling_declaration_digest,
-        disabling_revision,
-        StreamProfileMode::Disabled,
-    )
-    .unwrap();
-    let disabling = StreamProfileEntry::disabling_from(
-        &enabled,
-        DisablePlan::new(
-            "disable-profile-test",
-            disable_request_digest,
-            "config-2",
-            disabling_declaration_digest,
-            "operator:alice",
-            FoldContinuation::derive(&active_delegation, disabling_revision).unwrap(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let manifest_before_disabling = mc.version();
-    mc.commit_changes(&[ManifestChange::SetStreamProfile {
-        expected: enabled.clone(),
-        next: disabling.clone(),
-    }])
-    .await
-    .unwrap();
-    assert_eq!(mc.version(), manifest_before_disabling + 1);
-
-    // A stale expected entry is a typed read-set conflict, not an overwrite.
-    let stale = mc
-        .commit_changes(&[ManifestChange::SetStreamProfile {
-            expected: genesis.clone(),
-            next: enabled.clone(),
-        }])
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        stale,
-        OmniError::Manifest(ManifestError {
-            details: Some(ManifestConflictDetails::ReadSetChanged { .. }),
-            ..
-        })
-    ));
-
-    // A non-advancing revision is refused even with the correct expected
-    // entry: the strict advance is what makes a lost-and-retried flip visible
-    // instead of silently overwriting a concurrent transition.
-    let non_advancing = mc
-        .commit_changes(&[ManifestChange::SetStreamProfile {
-            expected: disabling.clone(),
-            next: StreamProfileEntry {
-                profile_revision: disabling.profile_revision,
-                profile_receipt_chain: disabling.profile_receipt_chain.clone(),
-                state: StreamProfileState::Disabled,
-            },
-        }])
-        .await
-        .unwrap_err();
-    assert!(
-        non_advancing
-            .to_string()
-            .contains("stream profile transition must advance revision exactly once"),
-        "got: {non_advancing}"
-    );
-
-    // An identical next entry is a no-op publish, not an error and not a new
-    // manifest version.
-    let version_before_noop = mc.version();
-    mc.commit_changes(&[ManifestChange::SetStreamProfile {
-        expected: disabling.clone(),
-        next: disabling.clone(),
-    }])
-    .await
-    .unwrap();
-    assert_eq!(mc.version(), version_before_noop);
-
-    // The flip is durable across a cold reopen.
-    let reopened = ManifestCoordinator::open(uri).await.unwrap().snapshot();
-    assert_eq!(reopened.stream_profile(), &disabling);
-    assert_eq!(reopened.stream_token_authority(), &next_token);
-    assert!(!reopened.streaming_status().enabled);
-    assert!(!reopened.streaming_status().undrained);
-    assert_eq!(reopened.streaming_status().profile_mode, "DISABLING");
-}
-
-/// RFC-026 §4.7 P1: the ambient graph API cannot mint profile authority.
-///
-/// Profile transitions are cluster-control-plane operations in F2, so the old
-/// embedded/direct writer must refuse before changing either the singleton or
-/// its receipt chain.
-#[tokio::test]
-async fn ambient_stream_profile_writer_refuses_without_cluster_control_plane() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = crate::db::Omnigraph::init(uri, test_schema_source())
-        .await
-        .unwrap();
-
-    let err = db.set_streaming_enabled_as(true, None).await.unwrap_err();
-    assert!(matches!(
-        err,
-        OmniError::StreamingRequiresClusterControlPlane
-    ));
-
-    // Effect-free refusal: a cold reopen observes the exact genesis singleton
-    // and canonical empty receipt-chain commitment.
-    let snapshot = ManifestCoordinator::open(uri).await.unwrap().snapshot();
-    assert_eq!(snapshot.stream_profile(), &StreamProfileEntry::genesis());
-    let status = snapshot.streaming_status();
-    assert!(!status.enabled);
-    assert!(!status.undrained);
-    assert_eq!(status.profile_revision, 1);
-    assert_eq!(status.profile_mode, "DISABLED");
-}
-
-fn stream_lifecycle_for_person(
-    person_entry: &SubTableEntry,
-    table_version: u64,
-    lifecycle: StreamLifecycle,
-) -> StreamLifecycleEntry {
-    let shard_id = "22222222-2222-4222-8222-222222222222".to_string();
-    let binding = StreamPhysicalBinding {
-        stable_table_id: person_entry.identity.stable_table_id,
-        table_incarnation_id: person_entry.identity.table_incarnation_id,
-        table_location: person_entry.table_path.clone(),
-        table_branch: None,
-        enrollment_id: "11111111-1111-4111-8111-111111111111".to_string(),
-        shard_ids: vec![shard_id.clone()],
-        stream_config_version: STREAM_CONFIG_VERSION,
-        stream_config_hash: format!("sha256:{}", "a".repeat(64)),
-    };
-    let head = CurrentHeadWitness {
-        branch_identifier: BranchIdentifier::main(),
-        table_version,
-        transaction_uuid: "33333333-3333-4333-8333-333333333333".to_string(),
-        manifest_e_tag: None,
-    };
-    let enrollment_receipt = stream::EnrollmentReceipt::new(
-        "44444444-4444-4444-8444-444444444444".to_string(),
-        format!("sha256:{}", "b".repeat(64)),
-        "55555555-5555-4555-8555-555555555555".to_string(),
-        binding.clone(),
-    )
-    .unwrap();
-    let binding_scope_id = "77777777-7777-4777-8777-777777777777";
-    let binding_receipt = stream::BindingReceipt::new(
-        stream::stream_graph_identity_digest("manifest-test-domain").unwrap(),
-        person_entry.identity,
-        &stream::test_initial_binding_prior_chain(),
-        binding_scope_id,
-        enrollment_receipt.stream_incarnation_id.clone(),
-        binding.clone(),
-        "INITIAL_ENROLLMENT",
-        1,
-    )
-    .unwrap();
-    let mut entry = StreamLifecycleEntry::new_open_enrollment(
-        person_entry.identity,
-        person_entry.table_key.clone(),
-        binding.clone(),
-        binding_scope_id.to_string(),
-        head.clone(),
-        BTreeMap::from([(shard_id.clone(), 1)]),
-        enrollment_receipt,
-        binding_receipt.record_id.clone(),
-        binding_receipt.next_chain_ref().unwrap(),
-    )
-    .unwrap();
-    if lifecycle == StreamLifecycle::Draining {
-        entry.lifecycle = StreamLifecycle::Draining;
-        entry.lifecycle_revision = 2;
-        let drain_id = "66666666-6666-4666-8666-666666666666".to_string();
-        let operation_request_payload = stream::QuiesceRequestPayload {
-            protocol_version: stream::QUIESCE_REQUEST_PROTOCOL_VERSION,
-            graph_identity_digest: format!("sha256:{}", "b".repeat(64)),
-            identity: entry.identity,
-            stream_incarnation_id: entry.enrollment_receipt.stream_incarnation_id.clone(),
-            binding_scope_id: entry.binding_scope_id.clone(),
-            enrollment_id: binding.enrollment_id.clone(),
-            drain_id: drain_id.clone(),
-            expected_lifecycle_revision: 1,
-            goal: stream::DrainGoal::OpenAfterFold,
-            physical_binding_digest: stream::stream_physical_binding_digest(&binding).unwrap(),
-            expected_current_head_witness: head.clone(),
-            target_epoch_floor_by_shard: BTreeMap::from([(shard_id.clone(), 1)]),
-            seal_override: None,
-        };
-        let operation_request_digest = operation_request_payload.request_digest().unwrap();
-        entry.drain = Some(stream::DrainDescriptor {
-            drain_id,
-            operation_expected_revision: 1,
-            operation_request_digest,
-            goal: stream::DrainGoal::OpenAfterFold,
-            initiating_actor: "actor:test".to_string(),
-            initiated_at: 1,
-            expected_binding: binding,
-            expected_current_head_witness: head,
-            operation_request_payload,
-            target_epoch_floor_by_shard: BTreeMap::from([(shard_id, 1)]),
-            guarded_operation: None,
-            seal_override: None,
-        });
-    }
-    entry.validate().unwrap();
-    entry
-}
-
-#[tokio::test]
-async fn stream_lifecycle_and_table_pointer_publish_in_one_manifest_cas() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let catalog = build_test_catalog();
-    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    let person_entry = mc.snapshot().entry("node:Person").unwrap().clone();
-    let company_identity = mc.snapshot().entry("node:Company").unwrap().identity;
-
-    let open = stream_lifecycle_for_person(
-        &person_entry,
-        person_entry.table_version,
-        StreamLifecycle::Open,
-    );
-    let before_enrollment = mc.version();
-    mc.commit_changes(&[ManifestChange::SetStreamLifecycle {
-        expected: None,
-        next: open.clone(),
-    }])
-    .await
-    .unwrap();
-    assert_eq!(mc.version(), before_enrollment + 1);
-    assert_eq!(
-        mc.snapshot().stream_lifecycle(person_entry.identity),
-        Some(&open)
-    );
-    let after_enrollment = mc.version();
-    let stale_absence = mc
-        .commit_changes(&[ManifestChange::SetStreamLifecycle {
-            expected: None,
-            next: open.clone(),
-        }])
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        stale_absence,
-        OmniError::Manifest(ManifestError {
-            details: Some(ManifestConflictDetails::ReadSetChanged { .. }),
-            ..
-        })
-    ));
-    assert_eq!(mc.version(), after_enrollment);
-
-    let mut wrong_pointer = open.clone();
-    wrong_pointer.current_head_witness.table_version += 1;
-    let pointer_error = mc
-        .commit_changes(&[ManifestChange::SetStreamLifecycle {
-            expected: Some(open.clone()),
-            next: wrong_pointer,
-        }])
-        .await
-        .unwrap_err();
-    assert!(
-        pointer_error
-            .to_string()
-            .contains("effective table pointer")
-    );
-    assert_eq!(mc.version(), after_enrollment);
-    let open_error = mc
-        .snapshot()
-        .ensure_stream_effects_allowed("mutation", [person_entry.identity])
-        .unwrap_err();
-    assert!(matches!(
-        open_error,
-        OmniError::Manifest(ManifestError {
-            details: Some(ManifestConflictDetails::StreamLifecycleConflict {
-                lifecycle,
-                operation,
-                ..
-            }),
-            ..
-        }) if lifecycle == "OPEN" && operation == "mutation"
-    ));
-
-    let update = append_person_and_make_update(uri, &person_entry, "Alice").await;
-    let draining = stream_lifecycle_for_person(
-        &person_entry,
-        update.table_version,
-        StreamLifecycle::Draining,
-    );
-    let before_transition = mc.version();
-    mc.commit_changes(&[
-        ManifestChange::Update(update.clone()),
-        ManifestChange::SetStreamLifecycle {
-            expected: Some(open.clone()),
-            next: draining.clone(),
-        },
-    ])
-    .await
-    .unwrap();
-
-    assert_eq!(mc.version(), before_transition + 1);
-    assert_eq!(
-        mc.snapshot().entry("node:Person").unwrap().table_version,
-        update.table_version
-    );
-    assert_eq!(
-        mc.snapshot().stream_lifecycle(person_entry.identity),
-        Some(&draining)
-    );
-    assert_eq!(mc.snapshot().stream_lifecycles().count(), 1);
-
-    let mut reopened = ManifestCoordinator::open(uri).await.unwrap();
-    assert_eq!(reopened.version(), mc.version());
-    assert_eq!(
-        reopened
-            .snapshot()
-            .entry("node:Person")
-            .unwrap()
-            .table_version,
-        update.table_version
-    );
-    assert_eq!(
-        reopened.snapshot().stream_lifecycle(person_entry.identity),
-        Some(&draining)
-    );
-    let draining_error = reopened
-        .snapshot()
-        .ensure_stream_effects_allowed("schema apply", [person_entry.identity])
-        .unwrap_err();
-    assert!(matches!(
-        draining_error,
-        OmniError::Manifest(ManifestError {
-            details: Some(ManifestConflictDetails::StreamLifecycleConflict {
-                lifecycle,
-                operation,
-                ..
-            }),
-            ..
-        }) if lifecycle == "DRAINING" && operation == "schema apply"
-    ));
-
-    let sealed = super::stream::test_sealed_lifecycle_from(&draining).unwrap();
-    let expected_draining = reopened
-        .snapshot()
-        .stream_lifecycle(person_entry.identity)
-        .cloned();
-    reopened
-        .commit_changes(&[ManifestChange::SetStreamLifecycle {
-            expected: expected_draining,
-            next: sealed,
-        }])
-        .await
-        .unwrap();
-    let sealed_effect_error = reopened
-        .snapshot()
-        .ensure_stream_effects_allowed("mutation", [person_entry.identity, company_identity])
-        .unwrap_err();
-    assert!(matches!(
-        sealed_effect_error,
-        OmniError::Manifest(ManifestError {
-            details: Some(ManifestConflictDetails::StreamLifecycleConflict {
-                lifecycle,
-                operation,
-                ..
-            }),
-            ..
-        }) if lifecycle == "SEALED" && operation == "mutation"
-    ));
-    reopened
-        .snapshot()
-        .ensure_stream_branch_controls_allowed(
-            "branch_create",
-            [person_entry.identity, company_identity],
-        )
-        .unwrap();
 }
 
 #[tokio::test]
@@ -2589,7 +1848,7 @@ async fn future_stamp_is_refused_in_both_open_modes() {
 }
 
 // A graph stamped below CURRENT (the strand floor: `MIN_SUPPORTED == CURRENT`,
-// so anything older than v8) is refused on open in BOTH modes, with the
+// so anything older than v5) is refused on open in BOTH modes, with the
 // rebuild-via-export/import hint — there is no in-place migration. This is the
 // floor twin of `future_stamp_is_refused_in_both_open_modes` (the ceiling). The
 // open path (`Omnigraph::open` read-write and `Omnigraph::open_read_only`) routes
@@ -2601,17 +1860,17 @@ async fn sub_current_graph_is_refused_on_open_with_rebuild_hint() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    // A full graph (schema artifacts present) so the open path gets past its
+    // A full v5 graph (schema artifacts present) so the open path gets past its
     // schema read to the stamp check.
     Omnigraph::init(uri, "node Person { name: String }\n")
         .await
         .unwrap();
 
-    // Rewind main's stamp to v7 — the immediately preceding strict strand,
-    // which this v8-only binary cannot open (`MIN_SUPPORTED == CURRENT == 8`).
+    // Rewind main's stamp to v4 — a graph this binary's single served version
+    // (v5) cannot open, since `MIN_SUPPORTED == CURRENT == 5`.
     {
         let mut ds = open_manifest_dataset(uri, None).await.unwrap();
-        super::migrations::set_stamp_for_test(&mut ds, 7)
+        super::migrations::set_stamp_for_test(&mut ds, 4)
             .await
             .unwrap();
     }
@@ -2673,7 +1932,7 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
     // Make it look like a graph from an older release: rewind the stamp below CURRENT.
     {
         let mut ds = open_manifest_dataset(uri_old, None).await.unwrap();
-        super::migrations::set_stamp_for_test(&mut ds, 6)
+        super::migrations::set_stamp_for_test(&mut ds, 4)
             .await
             .unwrap();
     }
@@ -2687,11 +1946,9 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
         "the refusal must nudge the operator to `omnigraph export`, got: {err}",
     );
     assert!(
-        msg.contains("0.9.0-dev"),
-        "the refusal must name the build that wrote this stamp so the operator knows \
-         which binary to use. v6 never shipped in a release — it existed only in \
-         source builds during 0.9.0 development — so the refusal names `0.9.0-dev`, \
-         got: {err}",
+        msg.contains("0.8.x"),
+        "the refusal must name the release that wrote this stamp (v4 → 0.8.x) so the \
+         operator knows which binary to use, got: {err}",
     );
 
     // Rebuild with this binary: fresh init + load the export.
@@ -2738,148 +1995,6 @@ fn lineage_now_micros() -> i64 {
         .as_micros() as i64
 }
 
-#[tokio::test]
-async fn graph_commit_metadata_round_trips_optional_stream_fold_attribution() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let catalog = build_test_catalog();
-    let _coordinator = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    let publisher = GraphNamespacePublisher::new(uri, None);
-    let empty = HashMap::new();
-
-    let ordinary = LineageIntent {
-        graph_commit_id: ulid::Ulid::new().to_string(),
-        branch: None,
-        actor_id: Some("act-alice".to_string()),
-        merged_parent_commit_id: None,
-        created_at: lineage_now_micros(),
-        stream_fold_attribution: None,
-        stream_fold_attribution_v2: None,
-    };
-    publisher
-        .publish(&[], &empty, Some(&ordinary))
-        .await
-        .unwrap();
-
-    let summary = StreamFoldAttributionSummary {
-        visible_contributor_count: 2,
-        visible_write_count: 3,
-        winning_attribution_digest: format!("sha256:{}", "ab".repeat(32)),
-        dead_letter_object: None,
-    };
-    let historical_fold = LineageIntent {
-        graph_commit_id: ulid::Ulid::new().to_string(),
-        branch: None,
-        actor_id: Some(STREAM_FOLD_ACTOR.to_string()),
-        merged_parent_commit_id: None,
-        created_at: lineage_now_micros(),
-        stream_fold_attribution: None,
-        stream_fold_attribution_v2: None,
-    };
-    publisher
-        .publish(&[], &empty, Some(&historical_fold))
-        .await
-        .expect("pre-commitment v11 folds with the fixed actor remain readable");
-
-    let wrong_actor = LineageIntent {
-        graph_commit_id: ulid::Ulid::new().to_string(),
-        branch: None,
-        actor_id: Some("act-not-system".to_string()),
-        merged_parent_commit_id: None,
-        created_at: lineage_now_micros(),
-        stream_fold_attribution: Some(summary.clone()),
-        stream_fold_attribution_v2: None,
-    };
-    let error = publisher
-        .publish(&[], &empty, Some(&wrong_actor))
-        .await
-        .expect_err("ordinary actors must not publish a stream-fold commitment");
-    assert!(error.to_string().contains(STREAM_FOLD_ACTOR));
-
-    let fold = LineageIntent {
-        graph_commit_id: ulid::Ulid::new().to_string(),
-        branch: None,
-        actor_id: Some(STREAM_FOLD_ACTOR.to_string()),
-        merged_parent_commit_id: None,
-        created_at: lineage_now_micros(),
-        stream_fold_attribution: Some(summary.clone()),
-        stream_fold_attribution_v2: None,
-    };
-    publisher.publish(&[], &empty, Some(&fold)).await.unwrap();
-
-    let summary_v2 = stream_fold_attribution_commitment_v2(
-        &[],
-        StreamDeadLetterObjectDescriptor::new(
-            "01K3EJ5J5Y7YWCM2DHRZ2Q5WEQ",
-            format!("sha256:{}", "cd".repeat(32)),
-            128,
-            1,
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let fold_v2 = LineageIntent {
-        graph_commit_id: ulid::Ulid::new().to_string(),
-        branch: None,
-        actor_id: Some(STREAM_FOLD_ACTOR.to_string()),
-        merged_parent_commit_id: None,
-        created_at: lineage_now_micros(),
-        stream_fold_attribution: None,
-        stream_fold_attribution_v2: Some(summary_v2.clone()),
-    };
-    publisher
-        .publish(&[], &empty, Some(&fold_v2))
-        .await
-        .unwrap();
-
-    let dataset = open_manifest_dataset(uri, None).await.unwrap();
-    let (rows, _) = read_graph_lineage(&dataset).await.unwrap();
-    assert_eq!(
-        rows.iter()
-            .find(|row| row.graph_commit_id == ordinary.graph_commit_id)
-            .unwrap()
-            .stream_fold_attribution
-            .as_ref(),
-        None
-    );
-    assert_eq!(
-        rows.iter()
-            .find(|row| row.graph_commit_id == historical_fold.graph_commit_id)
-            .unwrap()
-            .stream_fold_attribution
-            .as_ref(),
-        None
-    );
-    assert_eq!(
-        rows.iter()
-            .find(|row| row.graph_commit_id == fold.graph_commit_id)
-            .unwrap()
-            .stream_fold_attribution
-            .as_ref(),
-        Some(&summary)
-    );
-    let decoded_v2 = rows
-        .iter()
-        .find(|row| row.graph_commit_id == fold_v2.graph_commit_id)
-        .unwrap();
-    assert!(decoded_v2.stream_fold_attribution.is_none());
-    assert_eq!(
-        decoded_v2.stream_fold_attribution_v2.as_ref(),
-        Some(&summary_v2)
-    );
-    assert!(
-        rows.iter()
-            .filter(|row| row.graph_commit_id != fold.graph_commit_id)
-            .all(|row| row.stream_fold_attribution.is_none()),
-        "genesis and every ordinary commit must keep attribution logically null"
-    );
-    assert!(
-        rows.iter()
-            .all(|row| row.graph_commit_id != wrong_actor.graph_commit_id),
-        "rejected attribution intents must not leave immutable graph_commit rows"
-    );
-}
-
 /// Race two lineage-only publishes against the same exact named-branch head.
 /// Returns after proving exactly one committed and the loser surfaced a typed
 /// read-set change. `establish_head=false` exercises the load-bearing absent-row
@@ -2902,8 +2017,6 @@ async fn assert_exact_named_head_race(establish_head: bool) {
             actor_id: None,
             merged_parent_commit_id: None,
             created_at: lineage_now_micros(),
-            stream_fold_attribution: None,
-            stream_fold_attribution_v2: None,
         };
         publisher
             .publish(&[], &empty, Some(&intent))
@@ -2933,8 +2046,6 @@ async fn assert_exact_named_head_race(establish_head: bool) {
         actor_id: Some("act-a".to_string()),
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
-        stream_fold_attribution: None,
-        stream_fold_attribution_v2: None,
     };
     let intent_b = LineageIntent {
         graph_commit_id: ulid::Ulid::new().to_string(),
@@ -2942,8 +2053,6 @@ async fn assert_exact_named_head_race(establish_head: bool) {
         actor_id: Some("act-b".to_string()),
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
-        stream_fold_attribution: None,
-        stream_fold_attribution_v2: None,
     };
     let publisher_a = GraphNamespacePublisher::new(uri, Some("feature"));
     let publisher_b = GraphNamespacePublisher::new(uri, Some("feature"));
@@ -3210,8 +2319,6 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
         actor_id: Some("act-a".to_string()),
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
-        stream_fold_attribution: None,
-        stream_fold_attribution_v2: None,
     };
     let intent_b = LineageIntent {
         graph_commit_id: ulid::Ulid::new().to_string(),
@@ -3219,8 +2326,6 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
         actor_id: Some("act-b".to_string()),
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
-        stream_fold_attribution: None,
-        stream_fold_attribution_v2: None,
     };
     // Empty expected-versions: the two writers are disjoint, so neither asserts a
     // version on the other's table; contention is purely the shared head row.
@@ -3300,8 +2405,6 @@ async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
         actor_id: Some("act-a".to_string()),
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
-        stream_fold_attribution: None,
-        stream_fold_attribution_v2: None,
     };
     let intent_b = LineageIntent {
         graph_commit_id: ulid::Ulid::new().to_string(),
@@ -3309,8 +2412,6 @@ async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
         actor_id: Some("act-b".to_string()),
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
-        stream_fold_attribution: None,
-        stream_fold_attribution_v2: None,
     };
     let empty = HashMap::new();
     let (res_a, res_b) = tokio::join!(
@@ -3400,8 +2501,6 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
                     actor_id: None,
                     merged_parent_commit_id: None,
                     created_at: lineage_now_micros(),
-                    stream_fold_attribution: None,
-                    stream_fold_attribution_v2: None,
                 };
                 let publisher = GraphNamespacePublisher::new(&uri, None);
                 match publisher.publish(&changes, &empty, Some(&intent)).await {

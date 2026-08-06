@@ -11,6 +11,10 @@
 > **RFC-028 identity update (2026-07-15):** table-version object IDs and folds now
 > use `(stable_table_id, table_incarnation_id, version)`. Any older passage below
 > that keys a current table lifetime by mutable `table_key` is historical.
+>
+> **RFC-026 disposition (2026-08-06):** the MemWAL/LSM thread mentioned in this
+> record was implemented experimentally and rejected. Current bounded graph
+> batches reuse ordinary commit-visible Load; see [wal-removal.md](wal-removal.md).
 
 **Status:** Historical design record (partially implemented); current write and
 identity contracts are [RFC-022](../rfcs/0022-unified-write-path.md) and

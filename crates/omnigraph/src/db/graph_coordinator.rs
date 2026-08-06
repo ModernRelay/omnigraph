@@ -516,27 +516,6 @@ impl GraphCoordinator {
         })
     }
 
-    /// Publish operational manifest authority without minting graph-content
-    /// lineage. Lifecycle admission transitions such as `OPEN -> DRAINING`
-    /// move only control authority; recording a graph commit for them would
-    /// incorrectly make a row-neutral fence appear in the content DAG.
-    pub(crate) async fn commit_operational_changes_with_expected(
-        &mut self,
-        changes: &[ManifestChange],
-        expected_table_versions: &ExpectedTableVersions,
-    ) -> Result<u64> {
-        Ok(self
-            .manifest
-            .commit_changes_with_lineage_and_precondition(
-                changes,
-                expected_table_versions,
-                None,
-                &PublishPrecondition::Any,
-            )
-            .await?
-            .version)
-    }
-
     /// Mint a [`LineageIntent`] for the next commit on the current branch: a
     /// fresh ULID (stable across the publisher's CAS retries) and a timestamp.
     /// The parent is NOT chosen here — the publisher resolves it per attempt
@@ -552,8 +531,6 @@ impl GraphCoordinator {
             actor_id: actor_id.map(str::to_string),
             merged_parent_commit_id,
             created_at: crate::db::now_micros()?,
-            stream_fold_attribution: None,
-            stream_fold_attribution_v2: None,
         })
     }
 
@@ -575,7 +552,6 @@ impl GraphCoordinator {
             merged_parent_commit_id: intent.merged_parent_commit_id,
             actor_id: intent.actor_id,
             created_at: intent.created_at,
-            stream_fold_attribution_v2: intent.stream_fold_attribution_v2,
         };
         self.commit_graph.insert_committed(commit);
         SnapshotId::new(intent.graph_commit_id)

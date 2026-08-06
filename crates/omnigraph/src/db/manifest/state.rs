@@ -8,17 +8,11 @@ use lance::Dataset;
 
 use crate::error::{OmniError, Result};
 
-use super::layout::{stream_state_object_id, table_object_id, version_object_id};
+use super::layout::{table_object_id, version_object_id};
 use super::metadata::TableVersionMetadata;
-use super::stream_profile::StreamProfileEntry;
-use super::stream_token::{
-    STREAM_FOLD_ACTOR, StreamFoldAttributionSummary, StreamFoldAttributionSummaryV2,
-};
 use super::{
-    MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD,
-    OBJECT_TYPE_STREAM_PROFILE, OBJECT_TYPE_STREAM_STATE, OBJECT_TYPE_STREAM_TOKEN_AUTHORITY,
-    OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
-    StreamLifecycleEntry, StreamTokenAuthorityEntry, TableIdentity, TableRegistration,
+    MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD, OBJECT_TYPE_TABLE,
+    OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION, TableIdentity, TableRegistration,
 };
 
 #[derive(Debug, Clone)]
@@ -41,9 +35,6 @@ pub(super) struct ManifestState {
     /// manifest-only refresh from leaving coarse write authority split between
     /// a fresh table view and the commit graph's older derived cache.
     pub(super) graph_heads: HashMap<String, String>,
-    pub(super) stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
-    pub(super) stream_token_authority: StreamTokenAuthorityEntry,
-    pub(super) stream_profile: StreamProfileEntry,
 }
 
 #[derive(Debug, Clone)]
@@ -54,10 +45,10 @@ struct TableTombstoneEntry {
 }
 
 /// A graph-lineage commit projected out of the `__manifest` `graph_commit`
-/// rows (RFC-013 step 4). Its public-lineage fields project directly into
-/// `commit_graph::GraphCommit`; protocol-private immutable metadata may remain
-/// here until its product surface is deliberately activated. Kept as a separate
-/// struct so `state.rs` stays free of the `commit_graph` module dependency.
+/// rows (RFC-013 step 4). Field-for-field identical to `commit_graph::GraphCommit`
+/// so the commit-graph cache can be sourced from the manifest projection without
+/// touching any reader above that boundary. Kept as a separate struct here to
+/// keep `state.rs` free of the `commit_graph` module dependency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GraphLineageRow {
     pub(crate) graph_commit_id: String,
@@ -67,13 +58,6 @@ pub(crate) struct GraphLineageRow {
     pub(crate) merged_parent_commit_id: Option<String>,
     pub(crate) actor_id: Option<String>,
     pub(crate) created_at: i64,
-    /// Compact RFC-026 commitment to the exact graph-visible fold winners.
-    /// Ordinary graph commits carry `None`; the complete winning rows remain
-    /// in the base and stream-token datasets.
-    pub(crate) stream_fold_attribution: Option<StreamFoldAttributionSummary>,
-    /// F5's closed attribution grammar. Kept separate so historical v1 bytes
-    /// and readers are never reinterpreted.
-    pub(crate) stream_fold_attribution_v2: Option<StreamFoldAttributionSummaryV2>,
 }
 
 /// JSON payload of a `graph_commit` row's `metadata` column. The immutable
@@ -89,58 +73,6 @@ struct GraphCommitMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     actor_id: Option<String>,
     created_at: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    stream_fold_attribution: Option<StreamFoldAttributionSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    stream_fold_attribution_v2: Option<StreamFoldAttributionSummaryV2>,
-}
-
-fn validate_graph_commit_attribution(commit: &GraphLineageRow) -> Result<()> {
-    let fixed_actor = commit.actor_id.as_deref() == Some(STREAM_FOLD_ACTOR);
-    if commit.stream_fold_attribution.is_some() && commit.stream_fold_attribution_v2.is_some() {
-        return Err(OmniError::manifest_internal(format!(
-            "graph commit '{}' carries both stream-fold attribution versions",
-            commit.graph_commit_id
-        )));
-    }
-    let Some(summary) = commit.stream_fold_attribution.as_ref() else {
-        if let Some(summary) = commit.stream_fold_attribution_v2.as_ref() {
-            summary.validate().map_err(|error| {
-                OmniError::manifest_internal(format!(
-                    "graph commit '{}' has invalid stream-fold attribution v2: {error}",
-                    commit.graph_commit_id
-                ))
-            })?;
-            if commit.manifest_branch.is_some()
-                || commit.merged_parent_commit_id.is_some()
-                || !fixed_actor
-            {
-                return Err(OmniError::manifest_internal(format!(
-                    "graph commit '{}' carries stream-fold attribution v2 without fixed canonical-main actor '{}'",
-                    commit.graph_commit_id, STREAM_FOLD_ACTOR
-                )));
-            }
-        }
-        // Config-v2/v11 folds predate this metadata field and used the same
-        // fixed actor. Their immutable lineage must remain readable and their
-        // recovery must remain publishable. Recovery-v12 separately requires
-        // an exact summary when deciding whether its original commit is visible.
-        return Ok(());
-    };
-    summary.validate().map_err(|error| {
-        OmniError::manifest_internal(format!(
-            "graph commit '{}' has invalid stream-fold attribution: {error}",
-            commit.graph_commit_id
-        ))
-    })?;
-    if commit.manifest_branch.is_some() || commit.merged_parent_commit_id.is_some() || !fixed_actor
-    {
-        return Err(OmniError::manifest_internal(format!(
-            "graph commit '{}' carries stream-fold attribution without fixed canonical-main actor '{}'",
-            commit.graph_commit_id, STREAM_FOLD_ACTOR
-        )));
-    }
-    Ok(())
 }
 
 /// JSON payload of a `graph_head` row's `metadata` column.
@@ -173,30 +105,16 @@ struct ManifestScan {
     /// `lineage_rows`, it does not grow with commit history. OCC must distinguish
     /// a present head from an absent one (notably on a fresh named branch).
     graph_heads: HashMap<String, String>,
-    stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
-    stream_token_authority: Option<StreamTokenAuthorityEntry>,
-    stream_profile: Option<StreamProfileEntry>,
 }
 
 pub(super) fn manifest_schema() -> SchemaRef {
     // `object_id` is the merge-insert join key in the publisher; marking it as
     // Lance's unenforced primary key engages row-level CAS at commit time, so
     // two concurrent writers that try to land the same `object_id` row are
-    // detected by Lance via bloom-filter intersection.
-    //
-    // This annotation is load-bearing, not defensive. Lance builds the
-    // key-existence filter ONLY when the merge-insert ON columns carry it.
-    // Without it, two concurrent `execute_reader()` calls inserting the same
-    // key into disjoint fragments BOTH succeed silently, and the conflict
-    // resolver rebases both writers' new fragments into duplicate rows under
-    // one key — reopening the TOCTOU window between `load_publish_state` and
-    // the merge-insert commit.
-    //
-    // Row-level CAS covers only rows the publisher is emitting, so it is one
-    // of three layers: this annotation, the publisher's pre-check of
-    // `expected_table_versions` (which covers tables it is NOT writing), and
-    // `conflict_retries(0)` so the caller-level retry re-reads authority
-    // rather than letting Lance auto-rebase onto unfamiliar manifest state.
+    // detected by Lance via bloom-filter intersection (see
+    // `.context/merge-insert-cas-granularity.md`). Without this metadata,
+    // Lance's conflict resolver would silently rebase both writers' new
+    // fragments and admit duplicate rows.
     let object_id_metadata: HashMap<String, String> =
         [("lance-schema:unenforced-primary-key", "true")]
             .into_iter()
@@ -244,9 +162,6 @@ pub(super) async fn read_manifest_state_and_lineage(
         tombstones,
         lineage_rows,
         graph_heads,
-        stream_lifecycles,
-        stream_token_authority,
-        stream_profile,
     } = read_manifest_scan(dataset, true).await?;
     let state = assemble_manifest_state(
         version,
@@ -256,9 +171,6 @@ pub(super) async fn read_manifest_state_and_lineage(
             .into_iter()
             .map(|t| (t.identity, t.tombstone_version)),
         graph_heads,
-        stream_lifecycles,
-        required_stream_token_authority(stream_token_authority)?,
-        required_stream_profile(stream_profile)?,
     )?;
     Ok((state, lineage_rows))
 }
@@ -272,9 +184,6 @@ fn manifest_state_from_scan(version: u64, scan: ManifestScan) -> Result<Manifest
             .into_iter()
             .map(|t| (t.identity, t.tombstone_version)),
         scan.graph_heads,
-        scan.stream_lifecycles,
-        required_stream_token_authority(scan.stream_token_authority)?,
-        required_stream_profile(scan.stream_profile)?,
     )
 }
 
@@ -293,9 +202,6 @@ pub(super) fn assemble_manifest_state(
     version_entries: Vec<SubTableEntry>,
     tombstones: impl IntoIterator<Item = (TableIdentity, u64)>,
     graph_heads: HashMap<String, String>,
-    stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
-    stream_token_authority: StreamTokenAuthorityEntry,
-    stream_profile: StreamProfileEntry,
 ) -> Result<ManifestState> {
     let mut latest_versions = HashMap::<TableIdentity, SubTableEntry>::new();
     for entry in version_entries {
@@ -349,38 +255,11 @@ pub(super) fn assemble_manifest_state(
             }
         }
     }
-    let live_identities = entries
-        .iter()
-        .map(|entry| (entry.identity, entry))
-        .collect::<HashMap<_, _>>();
-    for (identity, lifecycle) in &stream_lifecycles {
-        let live_entry = live_identities.get(identity).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "stream lifecycle authority exists for non-live table identity {identity}"
-            ))
-        })?;
-        let registration = registrations.get(identity).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "stream lifecycle authority has no table registration for identity {identity}"
-            ))
-        })?;
-        lifecycle.validate_against_registration(registration)?;
-        if lifecycle.current_head_witness.table_version != live_entry.table_version {
-            return Err(OmniError::manifest_internal(format!(
-                "stream lifecycle HEAD version {} does not match visible table pointer {} for identity {identity}",
-                lifecycle.current_head_witness.table_version, live_entry.table_version
-            )));
-        }
-    }
-
     entries.sort_by(|a, b| a.table_key.cmp(&b.table_key));
     Ok(ManifestState {
         version,
         entries,
         graph_heads,
-        stream_lifecycles,
-        stream_token_authority,
-        stream_profile,
     })
 }
 
@@ -424,9 +303,6 @@ pub(super) struct PublishScan {
     /// Exact `graph_head:<branch>` rows keyed by the branch suffix (`main` for
     /// main). Absence is meaningful and is preserved by a missing map entry.
     pub(super) graph_heads: HashMap<String, String>,
-    pub(super) stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
-    pub(super) stream_token_authority: StreamTokenAuthorityEntry,
-    pub(super) stream_profile: StreamProfileEntry,
 }
 
 /// One-scan read of everything the publish path needs. `collect_lineage` is
@@ -444,9 +320,6 @@ pub(super) async fn read_publish_scan(dataset: &Dataset) -> Result<PublishScan> 
             .collect(),
         lineage_rows: scan.lineage_rows,
         graph_heads: scan.graph_heads,
-        stream_lifecycles: scan.stream_lifecycles,
-        stream_token_authority: required_stream_token_authority(scan.stream_token_authority)?,
-        stream_profile: required_stream_profile(scan.stream_profile)?,
     })
 }
 
@@ -472,7 +345,7 @@ fn decode_graph_commit_row(
         serde_json::from_str(metadata.value(row)).map_err(|e| {
             OmniError::manifest_internal(format!("failed to decode graph_commit metadata: {e}"))
         })?;
-    let commit = GraphLineageRow {
+    Ok(GraphLineageRow {
         graph_commit_id: object_ids.value(row).to_string(),
         manifest_branch: if branches.is_null(row) {
             None
@@ -484,11 +357,7 @@ fn decode_graph_commit_row(
         merged_parent_commit_id: commit_meta.merged_parent_commit_id,
         actor_id: commit_meta.actor_id,
         created_at: commit_meta.created_at,
-        stream_fold_attribution: commit_meta.stream_fold_attribution,
-        stream_fold_attribution_v2: commit_meta.stream_fold_attribution_v2,
-    };
-    validate_graph_commit_attribution(&commit)?;
-    Ok(commit)
+    })
 }
 
 /// Decode one `graph_head` row into its exact branch-key / commit-id pair.
@@ -556,9 +425,6 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
     let mut tombstones = Vec::new();
     let mut lineage_rows = Vec::new();
     let mut graph_heads = HashMap::new();
-    let mut stream_lifecycles = HashMap::new();
-    let mut stream_token_authority = None;
-    let mut stream_profile = None;
 
     for batch in &batches {
         let object_types = string_column(batch, "object_type")?;
@@ -705,93 +571,6 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
                         decode_graph_head_row(object_ids, metadata, row)?;
                     graph_heads.insert(branch_key, head_commit_id);
                 }
-                OBJECT_TYPE_STREAM_STATE => {
-                    let identity = required_table_identity(
-                        stable_table_ids,
-                        table_incarnation_ids,
-                        row,
-                        OBJECT_TYPE_STREAM_STATE,
-                    )?;
-                    if metadata.is_null(row) {
-                        return Err(OmniError::manifest_internal(format!(
-                            "manifest stream_state row missing metadata for identity {identity}"
-                        )));
-                    }
-                    let lifecycle = StreamLifecycleEntry::from_manifest_row(
-                        object_ids.value(row),
-                        &table_key,
-                        identity,
-                        (!locations.is_null(row)).then(|| locations.value(row)),
-                        (!versions.is_null(row)).then(|| versions.value(row)),
-                        (!branches.is_null(row)).then(|| branches.value(row)),
-                        metadata.value(row),
-                    )?;
-                    if stream_lifecycles.insert(identity, lifecycle).is_some() {
-                        return Err(OmniError::manifest_internal(format!(
-                            "manifest contains duplicate stream_state rows for identity {identity}"
-                        )));
-                    }
-                }
-                OBJECT_TYPE_STREAM_TOKEN_AUTHORITY => {
-                    require_null_table_identity(
-                        stable_table_ids,
-                        table_incarnation_ids,
-                        row,
-                        OBJECT_TYPE_STREAM_TOKEN_AUTHORITY,
-                    )?;
-                    if metadata.is_null(row) {
-                        return Err(OmniError::manifest_internal(
-                            "manifest stream_token_authority row is missing metadata",
-                        ));
-                    }
-                    if !table_key.is_empty() || !row_counts.is_null(row) {
-                        return Err(OmniError::manifest_internal(
-                            "manifest stream_token_authority row must have an empty table_key and null row_count",
-                        ));
-                    }
-                    let authority = StreamTokenAuthorityEntry::from_manifest_row(
-                        object_ids.value(row),
-                        (!locations.is_null(row)).then(|| locations.value(row)),
-                        (!versions.is_null(row)).then(|| versions.value(row)),
-                        (!branches.is_null(row)).then(|| branches.value(row)),
-                        metadata.value(row),
-                    )?;
-                    if stream_token_authority.replace(authority).is_some() {
-                        return Err(OmniError::manifest_internal(
-                            "manifest contains duplicate stream_token_authority rows",
-                        ));
-                    }
-                }
-                OBJECT_TYPE_STREAM_PROFILE => {
-                    require_null_table_identity(
-                        stable_table_ids,
-                        table_incarnation_ids,
-                        row,
-                        OBJECT_TYPE_STREAM_PROFILE,
-                    )?;
-                    if metadata.is_null(row) {
-                        return Err(OmniError::manifest_internal(
-                            "manifest stream_profile row is missing metadata",
-                        ));
-                    }
-                    if !table_key.is_empty() || !row_counts.is_null(row) {
-                        return Err(OmniError::manifest_internal(
-                            "manifest stream_profile row must have an empty table_key and null row_count",
-                        ));
-                    }
-                    let profile = StreamProfileEntry::from_manifest_row(
-                        object_ids.value(row),
-                        (!locations.is_null(row)).then(|| locations.value(row)),
-                        (!versions.is_null(row)).then(|| versions.value(row)),
-                        (!branches.is_null(row)).then(|| branches.value(row)),
-                        metadata.value(row),
-                    )?;
-                    if stream_profile.replace(profile).is_some() {
-                        return Err(OmniError::manifest_internal(
-                            "manifest contains duplicate stream_profile rows",
-                        ));
-                    }
-                }
                 // Commit rows are skipped on the table-state path; unknown future
                 // object types are skipped on every path.
                 _ => {}
@@ -827,25 +606,6 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
         tombstones,
         lineage_rows,
         graph_heads,
-        stream_lifecycles,
-        stream_token_authority,
-        stream_profile,
-    })
-}
-
-fn required_stream_token_authority(
-    authority: Option<StreamTokenAuthorityEntry>,
-) -> Result<StreamTokenAuthorityEntry> {
-    authority.ok_or_else(|| {
-        OmniError::manifest_internal(
-            "manifest is missing the graph-global stream_token_authority row",
-        )
-    })
-}
-
-fn required_stream_profile(profile: Option<StreamProfileEntry>) -> Result<StreamProfileEntry> {
-    profile.ok_or_else(|| {
-        OmniError::manifest_internal("manifest is missing the graph-global stream_profile row")
     })
 }
 
@@ -953,14 +713,11 @@ pub(crate) fn graph_lineage_row_parts(
     commit: &GraphLineageRow,
     branch: Option<&str>,
 ) -> Result<[GraphLineageRowPart; 2]> {
-    validate_graph_commit_attribution(commit)?;
     let commit_metadata = serde_json::to_string(&GraphCommitMetadata {
         parent_commit_id: commit.parent_commit_id.clone(),
         merged_parent_commit_id: commit.merged_parent_commit_id.clone(),
         actor_id: commit.actor_id.clone(),
         created_at: commit.created_at,
-        stream_fold_attribution: commit.stream_fold_attribution.clone(),
-        stream_fold_attribution_v2: commit.stream_fold_attribution_v2.clone(),
     })
     .map_err(|e| {
         OmniError::manifest_internal(format!("failed to encode graph_commit metadata: {e}"))
@@ -997,12 +754,8 @@ pub(super) fn entries_to_batch(
     entries: &[SubTableEntry],
     version_metadata: &HashMap<TableIdentity, String>,
     genesis_lineage: &[GraphLineageRowPart],
-    stream_token_authority: &StreamTokenAuthorityEntry,
-    stream_profile: &StreamProfileEntry,
 ) -> Result<RecordBatch> {
-    stream_token_authority.validate()?;
-    stream_profile.validate()?;
-    let cap = entries.len() * 2 + genesis_lineage.len() + 2;
+    let cap = entries.len() * 2 + genesis_lineage.len();
     let mut object_ids = Vec::with_capacity(cap);
     let mut object_types = Vec::with_capacity(cap);
     let mut locations = Vec::with_capacity(cap);
@@ -1062,34 +815,6 @@ pub(super) fn entries_to_batch(
         row_counts.push(None);
     }
 
-    // The graph-global token participant exists from genesis. It has no table
-    // identity or diagnostic alias; its exact version witness is selected by
-    // this singleton row and may move only through the shared publisher.
-    object_ids.push(stream_token_authority.object_id().to_string());
-    object_types.push(OBJECT_TYPE_STREAM_TOKEN_AUTHORITY.to_string());
-    locations.push(Some(stream_token_authority.location.clone()));
-    metadata.push(Some(stream_token_authority.to_metadata_json()?));
-    table_keys.push(String::new());
-    table_identities.push(None);
-    table_versions.push(Some(
-        stream_token_authority.current_head_witness.table_version,
-    ));
-    table_branches.push(None);
-    row_counts.push(None);
-
-    // The graph-global RFC-026 §4.7 enablement authority also exists from
-    // genesis (disabled). It is pure metadata: no physical participant, so no
-    // location or version witness — only the required singleton row.
-    object_ids.push(stream_profile.object_id().to_string());
-    object_types.push(OBJECT_TYPE_STREAM_PROFILE.to_string());
-    locations.push(None);
-    metadata.push(Some(stream_profile.to_metadata_json()?));
-    table_keys.push(String::new());
-    table_identities.push(None);
-    table_versions.push(None);
-    table_branches.push(None);
-    row_counts.push(None);
-
     manifest_rows_batch(
         object_ids,
         object_types,
@@ -1126,10 +851,7 @@ pub(super) fn manifest_rows_batch(
         object_types.iter().zip(table_identities.iter()).enumerate()
     {
         match object_type.as_str() {
-            OBJECT_TYPE_TABLE
-            | OBJECT_TYPE_TABLE_VERSION
-            | OBJECT_TYPE_TABLE_TOMBSTONE
-            | OBJECT_TYPE_STREAM_STATE => {
+            OBJECT_TYPE_TABLE | OBJECT_TYPE_TABLE_VERSION | OBJECT_TYPE_TABLE_TOMBSTONE => {
                 let identity = identity.ok_or_else(|| {
                     OmniError::manifest_internal(format!(
                         "manifest {object_type} row at index {row} is missing table identity"
@@ -1154,7 +876,6 @@ pub(super) fn manifest_rows_batch(
                         })?;
                         super::layout::tombstone_object_id(identity, version)
                     }
-                    OBJECT_TYPE_STREAM_STATE => stream_state_object_id(identity),
                     _ => unreachable!("outer match restricts object type"),
                 };
                 if object_ids.get(row) != Some(&expected_object_id) {
@@ -1164,70 +885,11 @@ pub(super) fn manifest_rows_batch(
                         expected_object_id
                     )));
                 }
-                if object_type == OBJECT_TYPE_STREAM_STATE {
-                    let metadata =
-                        metadata
-                            .get(row)
-                            .and_then(Option::as_deref)
-                            .ok_or_else(|| {
-                                OmniError::manifest_internal(format!(
-                                    "manifest stream_state row at index {row} is missing metadata"
-                                ))
-                            })?;
-                    StreamLifecycleEntry::from_manifest_row(
-                        &expected_object_id,
-                        table_keys.get(row).map(String::as_str).unwrap_or_default(),
-                        identity,
-                        locations.get(row).and_then(Option::as_deref),
-                        table_versions.get(row).copied().flatten(),
-                        table_branches.get(row).and_then(Option::as_deref),
-                        metadata,
-                    )?;
-                }
             }
             OBJECT_TYPE_GRAPH_COMMIT | OBJECT_TYPE_GRAPH_HEAD if identity.is_some() => {
                 return Err(OmniError::manifest_internal(format!(
                     "manifest {object_type} row at index {row} must not carry table identity"
                 )));
-            }
-            OBJECT_TYPE_STREAM_TOKEN_AUTHORITY | OBJECT_TYPE_STREAM_PROFILE => {
-                if identity.is_some() {
-                    return Err(OmniError::manifest_internal(format!(
-                        "manifest {object_type} row at index {row} must not carry table identity"
-                    )));
-                }
-                let metadata = metadata
-                    .get(row)
-                    .and_then(Option::as_deref)
-                    .ok_or_else(|| {
-                        OmniError::manifest_internal(format!(
-                            "manifest {object_type} row at index {row} is missing metadata"
-                        ))
-                    })?;
-                if table_keys.get(row).is_some_and(|key| !key.is_empty())
-                    || row_counts.get(row).copied().flatten().is_some()
-                {
-                    return Err(OmniError::manifest_internal(format!(
-                        "manifest {object_type} row at index {row} must have an empty table_key and null row_count"
-                    )));
-                }
-                if object_type == OBJECT_TYPE_STREAM_PROFILE {
-                    StreamProfileEntry::from_manifest_row(
-                        object_ids.get(row).map(String::as_str).unwrap_or_default(),
-                        locations.get(row).and_then(Option::as_deref),
-                        table_versions.get(row).copied().flatten(),
-                        table_branches.get(row).and_then(Option::as_deref),
-                        metadata,
-                    )?;
-                } else {
-                    StreamTokenAuthorityEntry::from_manifest_row(
-                        object_ids.get(row).map(String::as_str).unwrap_or_default(),
-                        locations.get(row).and_then(Option::as_deref),
-                        table_versions.get(row).copied().flatten(),
-                        table_branches.get(row).and_then(Option::as_deref),
-                        metadata,
-                    )?;
-                }
             }
             _ => {}
         }

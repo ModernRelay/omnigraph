@@ -134,26 +134,11 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("repair").await?;
     ensure_no_pending_recovery_sidecars(db, "repair").await?;
-    let _stream_profile_guard = db.write_queue().acquire_stream_profile_shared().await;
 
-    // One capture, two duties -- see the matching note in `optimize.rs`. It is
-    // the complete authority token, revalidated under schema -> main -> table
-    // ordering before repair may adopt any physical HEAD into the manifest, and
-    // it is taken before every writer gate so RFC-026 admission stays the
-    // outermost lock class. The authority duty outlives streaming.
+    // Repair may adopt physical HEADs into graph authority. Bind the entire
+    // attempt to one accepted view and revalidate after schema -> main -> table
+    // gates so concurrent graph movement refuses before publication.
     let authority_txn = db.open_write_txn(None).await?;
-    if let Some(error) = db
-        .current_canonical_stream_profile()
-        .await?
-        .retired_error()
-    {
-        return Err(error);
-    }
-    let stream_admission_keys = Omnigraph::stream_admission_keys_for_snapshot(&authority_txn.base);
-    let _stream_admission_guards = db
-        .write_queue()
-        .acquire_stream_shared_many(&stream_admission_keys)
-        .await;
 
     // Repair publishes manifest authority, so it joins the canonical writer
     // envelope. The accepted catalog, identity/path pairs, raw Lance reads, and
@@ -168,7 +153,6 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     db.ensure_schema_apply_not_locked("repair").await?;
     let catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
-    let _stream_token_guard = db.write_queue().acquire_stream_token().await;
 
     let table_keys = optimize::all_table_keys(&catalog);
     let queue_keys = table_keys
@@ -290,10 +274,6 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     let manifest_version = if updates.is_empty() {
         None
     } else {
-        snapshot.ensure_stream_effects_allowed(
-            "repair",
-            updates.iter().map(|update| update.identity),
-        )?;
         let actor = if any_forced {
             Some("omnigraph:repair:force")
         } else {

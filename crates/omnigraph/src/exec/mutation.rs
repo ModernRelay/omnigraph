@@ -353,11 +353,6 @@ fn build_insert_batch(
     for field in schema.fields() {
         if field.name() == "id" {
             columns.push(Arc::new(StringArray::from(vec![id])));
-        } else if field.name() == crate::db::STREAM_METADATA_COLUMN {
-            columns.push(
-                crate::db::manifest::stream_token::build_trusted_stream_metadata_array(&[None])
-                    .map_err(|error| OmniError::manifest_internal(error.to_string()))?,
-            );
         } else if blob_properties.contains(field.name()) {
             if let Some(Literal::String(uri)) = assignments.get(field.name()) {
                 columns.push(build_blob_array_from_value(uri)?);
@@ -676,32 +671,8 @@ impl Omnigraph {
             &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
             actor_id,
         )?;
-        let requested = Self::normalize_branch_name(branch)?;
-        // Reject internal `__run__*` / system-prefixed branches at the
-        // public write boundary. Do this before recovery so an invalid caller
-        // cannot trigger graph mutation as a side effect of validation.
-        if let Some(name) = requested.as_deref() {
-            crate::db::ensure_public_branch_ref(name, "mutate")?;
-        }
-        // Profile-change recovery takes the graph-profile gate exclusively.
-        // Heal before joining it in shared mode or this writer can wait on its
-        // own read guard forever.
-        self.heal_pending_recovery_sidecars_for_write(&[requested.as_deref()])
-            .await?;
-        // Root-shared, graph-global admission for the future stream-profile
-        // preflight. Revalidate durable profile authority after acquisition,
-        // then keep the guard across every reprepare, physical effect, recovery
-        // decision, and manifest publication in the mutation.
-        let _stream_profile_guard = self.write_queue().acquire_stream_profile_shared().await;
-        self.ensure_streaming_content_write_authorized().await?;
-        self.mutate_with_current_actor(
-            requested.as_deref(),
-            query_source,
-            query_name,
-            params,
-            actor_id,
-        )
-        .await
+        self.mutate_with_current_actor(branch, query_source, query_name, params, actor_id)
+            .await
     }
 
     /// End-of-query validation for a constructive mutation: build the change-set
@@ -732,7 +703,7 @@ impl Omnigraph {
 
     async fn mutate_with_current_actor(
         &self,
-        requested: Option<&str>,
+        branch: &str,
         query_source: &str,
         query_name: &str,
         params: &ParamMap,
@@ -747,7 +718,7 @@ impl Omnigraph {
             let mut retryable = false;
             match self
                 .mutate_one_attempt(
-                    requested,
+                    branch,
                     query_source,
                     query_name,
                     &resolved_params,
@@ -763,10 +734,10 @@ impl Omnigraph {
                 {
                     tracing::debug!(
                         attempt = attempt + 1,
-                        branch = requested.unwrap_or("main"),
+                        branch,
                         "prepared mutation authority changed before effects; repreparing"
                     );
-                    self.refresh_pre_effect_write_attempt().await?;
+                    self.refresh().await?;
                 }
                 result => return result,
             }
@@ -776,20 +747,34 @@ impl Omnigraph {
 
     async fn mutate_one_attempt(
         &self,
-        requested: Option<&str>,
+        branch: &str,
         query_source: &str,
         query_name: &str,
         params: &ParamMap,
         actor_id: Option<&str>,
         retryable: &mut bool,
     ) -> Result<MutationResult> {
+        let requested = Self::normalize_branch_name(branch)?;
+        // Reject internal `__run__*` / system-prefixed branches at the
+        // public write boundary. Direct-publish paths assert this
+        // explicitly so a caller can't write to legacy or system
+        // staging branches by passing the prefix verbatim.
+        if let Some(name) = requested.as_deref() {
+            crate::db::ensure_public_branch_ref(name, "mutate")?;
+        }
+        // Stage A: converge any roll-forward-eligible sidecars, then close the
+        // barrier on every unresolved intent for this graph branch. This MUST
+        // run before `open_write_txn`: healing may advance the manifest, and a
+        // deferred Armed intent remains ownership even when no table HEAD moved.
+        self.heal_pending_recovery_sidecars_for_write(&[requested.as_deref()])
+            .await?;
         // Capture one branch-wide write authority after the recovery barrier:
         // native branch identity, exact optional graph head, accepted schema
         // identity/catalog, and the base table snapshot. Execution, validation,
         // staging, and publication all use this immutable attempt. `commit_all`
         // revalidates the complete token under the root-shared schema → branch →
         // sorted-table gates before it arms recovery or advances Lance HEAD.
-        let txn = self.open_write_txn(requested).await?;
+        let txn = self.open_write_txn(requested.as_deref()).await?;
         let resolved_params = params.clone();
 
         // Per-query staging accumulator. Inserts and updates push batches into
@@ -815,7 +800,13 @@ impl Omnigraph {
             .all(|op| matches!(op, MutationOpIR::Insert { .. }));
 
         let exec_result = self
-            .execute_named_mutation(&ir, &resolved_params, requested, &mut staging, &txn)
+            .execute_named_mutation(
+                &ir,
+                &resolved_params,
+                requested.as_deref(),
+                &mut staging,
+                &txn,
+            )
             .await;
 
         match exec_result {
@@ -823,12 +814,12 @@ impl Omnigraph {
             Ok(total) if staging.is_empty() => Ok(total),
             Ok(total) => {
                 self.validate_staged_mutation(&staging, &txn).await?;
-                let staged = staging.stage_all(self, requested).await?;
+                let staged = staging.stage_all(self, requested.as_deref()).await?;
                 crate::failpoints::maybe_fail(
                     crate::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
                 )?;
                 let lineage_intent = self
-                    .new_lineage_intent_for_branch(requested, actor_id)
+                    .new_lineage_intent_for_branch(requested.as_deref(), actor_id)
                     .await?;
                 // `_queue_guards` holds the root-shared schema gate, branch
                 // effect gate, and sorted table gates acquired by `commit_all`.
@@ -844,7 +835,7 @@ impl Omnigraph {
                 } = staged
                     .commit_all(
                         self,
-                        requested,
+                        requested.as_deref(),
                         crate::db::manifest::SidecarKind::Mutation,
                         actor_id,
                         &txn,
@@ -863,7 +854,7 @@ impl Omnigraph {
                 )?;
                 let publish_result = self
                     .commit_updates_on_branch_with_expected(
-                        requested,
+                        requested.as_deref(),
                         &updates,
                         &expected_versions,
                         actor_id,

@@ -27,18 +27,18 @@ use std::sync::Arc;
 use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
-    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
-    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
-    SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output,
-    snapshot_payload,
+    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
+    GraphBatchLoadQuery, GraphInfo, GraphListResponse, HealthOutput, IngestOutput, IngestRequest,
+    InvokeStoredQueryRequest, InvokeStoredQueryResponse, QueriesCatalogOutput, QueryRequest,
+    ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery,
+    graph_batch_load_output, ingest_output, schema_apply_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
 use axum::http::StatusCode;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -61,7 +61,6 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -106,6 +105,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_schema_apply,
         handlers::server_schema_get,
         handlers::server_load,
+        handlers::server_load_ndjson,
         // deprecated; the #[deprecated] attribute on the handler surfaces as
         // `deprecated: true` on the OpenAPI operation.
         #[allow(deprecated)] handlers::server_ingest,
@@ -504,9 +504,9 @@ impl AppState {
     ) -> Self {
         // Engine-layer policy gate (MR-722). With a per-graph policy
         // installed, every `_as` writer on `Omnigraph` calls into the
-        // PolicyChecker. Most handlers retain an HTTP-layer first gate;
-        // graph firehose deliberately uses the engine's single graph-scoped
-        // decision so lazy private-lane work cannot create policy drift.
+        // PolicyChecker. Handlers retain an HTTP-layer first gate so served
+        // requests fail before their write bodies are interpreted; the engine
+        // repeats the authoritative actor-aware decision at the write boundary.
         let db = if let Some(policy) = policy_engine.as_ref() {
             let checker = Arc::clone(policy) as Arc<dyn omnigraph_policy::PolicyChecker>;
             db.with_policy(checker)
@@ -702,20 +702,6 @@ impl ApiError {
         }
     }
 
-    fn precondition_failed(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::PRECONDITION_FAILED,
-            code: Some(ErrorCode::Conflict),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
-            manifest_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            recovery_required: None,
-        }
-    }
-
     fn unsupported_media_type(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -734,20 +720,6 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: Some(ErrorCode::Internal),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
-            manifest_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            recovery_required: None,
-        }
-    }
-
-    fn service_unavailable(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: None,
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
@@ -935,39 +907,6 @@ impl ApiError {
                     actual,
                 },
             ),
-            // The graph firehose converts invoked row outcomes to its ordered
-            // NDJSON union inside the engine. Only request-level stream errors
-            // reach this ordinary JSON translation: fold-required and strict-
-            // blocked are retryable logical conflicts, while an invoked-but-
-            // unconfirmed append is unavailable/ambiguous.
-            err @ (OmniError::FoldRequired { .. } | OmniError::StreamDataBlocked { .. }) => {
-                Self::conflict(err.to_string())
-            }
-            // §4.7 P1: an effect-free pending-until-drained refusal — a
-            // retryable logical conflict, converged by a later cluster apply
-            // once the named streams fold. No HTTP caller can reach it in
-            // this slice (the flip is cluster-apply-only); the mapping exists
-            // so the taxonomy stays total.
-            err @ OmniError::StreamingDisablePending { .. } => Self::conflict(err.to_string()),
-            err @ (OmniError::StreamingRequiresClusterControlPlane
-            | OmniError::StreamingRequiresClusterRuntime { .. }
-            | OmniError::StreamingContentOperationUnsupported { .. }
-            | OmniError::StreamingAuthorityMismatch { .. }
-            | OmniError::StreamAuthorityRetired { .. }
-            | OmniError::StreamExportBlocked { .. }
-            | OmniError::StreamRetirementPlanChanged
-            | OmniError::StreamRetirementIdempotencyConflict { .. }) => {
-                Self::conflict(err.to_string())
-            }
-            err @ (OmniError::StreamLifecycleChanged { .. }
-            | OmniError::StreamLifecycleIdempotencyConflict { .. }
-            | OmniError::StreamBindingChanged { .. }
-            | OmniError::StreamSequenceConflict { .. }
-            | OmniError::StreamIdempotencyConflict { .. }) => Self::conflict(err.to_string()),
-            err @ (OmniError::StreamStatusBusy { .. } | OmniError::StreamStatusChanged { .. }) => {
-                Self::internal(err.to_string())
-            }
-            err @ OmniError::AckUnknown { .. } => Self::internal(err.to_string()),
             OmniError::RecoveryRequired {
                 operation_id,
                 reason,
@@ -983,9 +922,7 @@ impl ApiError {
             // Engine-layer policy enforcement (MR-722). Authentication
             // middleware has already distinguished a missing/invalid bearer
             // (401); policy denials and evaluation failures surface as 403.
-            // Most legacy handlers also perform an HTTP-layer policy check,
-            // while graph firehose intentionally makes the engine's one
-            // graph-scoped decision authoritative.
+            // Most handlers also perform an HTTP-layer policy check.
             OmniError::Policy(message) => Self::forbidden(message),
             // `Omnigraph::init` against an existing graph URI in strict
             // mode. Not currently HTTP-reachable (POST /graphs was
@@ -995,7 +932,6 @@ impl ApiError {
             err @ OmniError::AlreadyInitialized { .. } => Self::conflict(err.to_string()),
         }
     }
-
 }
 
 fn summarize_merge_conflicts(conflicts: &[api::MergeConflictOutput]) -> String {
@@ -1214,6 +1150,7 @@ pub fn build_app(state: AppState) -> Router {
             "/load",
             post(server_load).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
         )
+        .route("/load/ndjson", post(server_load_ndjson))
         // /ingest is the deprecated alias of /load; its handler carries
         // #[deprecated] (OpenAPI operation flagged) and emits RFC 9745
         // Deprecation + RFC 8288 Link headers. Suppress the call-site warning.

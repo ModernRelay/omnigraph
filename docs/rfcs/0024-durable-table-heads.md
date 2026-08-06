@@ -10,6 +10,12 @@ owner: OmniGraph maintainers
 
 # RFC-024: Durable table heads
 
+> **Current disposition (2026-08-06):** this proposal remains research-blocked
+> and no durable-head format ships. RFC-026 was rejected and its unreleased
+> internal formats v7-v19 were abandoned; the current binary serves manifest
+> v6 and still resolves current table state by folding the identity-bearing
+> manifest journal.
+
 **Status:** Research blocked — Gate A physical lookup rejected
 **Date:** 2026-07-10
 **Author track:** Maintainer design series
@@ -25,7 +31,7 @@ uncompacted endpoint, while compacted cold scan bytes still grow. The
 representative RustFS table in §7.4 remains explicitly historical beta.21
 evidence; its bucket-gated RC.1 cell was not available for this audit. The
 candidate remains rejected for the same physical-cost reason.
-**Current production consequence (2026-07-19):** RFC-026 Phase A activated
+**Historical development consequence (2026-07-19):** RFC-026 Phase A activated
 internal schema v7 and private Phase B1 subsequently activated v8; neither added
 table-head rows or lookup. The candidate remains rejected and v8 still resolves
 current table state by folding the identity-bearing manifest journal.
@@ -72,7 +78,7 @@ The first Gate A instrument rejected the proposed in-manifest BTREE shape on
 2026-07-15. Exact indexed scan work is flat at fixed catalog width, but the
 complete required cost is not: latest-manifest discovery on uncompacted
 RustFS grows in object reads and bytes, and compacted reads still grow in bytes.
-No heads-format production code ships from this RFC; current internal schema v19
+No heads-format production code ships from this RFC; current internal schema v6
 preserves the journal-fold current-state path while research looks for a
 different substrate/access shape.
 
@@ -657,7 +663,7 @@ coverage and does run against RustFS in CI.
 - Checkpoint retention is deferred.
 - The first in-manifest BTREE candidate is rejected: flat indexed scan work is
   insufficient while latest-manifest/object byte work grows with history.
-- The current development format remains on internal schema v19 without table heads; no
+- The current development format remains on internal schema v6 without table heads; no
   heads-format number or partial implementation is assigned.
 
 ### Gate status

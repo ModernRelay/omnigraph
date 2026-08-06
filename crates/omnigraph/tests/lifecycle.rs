@@ -3,7 +3,6 @@ mod helpers;
 use std::fs;
 
 use omnigraph::db::{InitOptions, Omnigraph, ReadTarget};
-use omnigraph::error::OmniError;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
     SchemaIR, SchemaIdentityDomain, compile_schema_shape, resolve_schema_ir, schema_ir_hash,
@@ -87,6 +86,13 @@ async fn init_creates_graph() {
     );
 
     let snap = snapshot_main(&db).await.unwrap();
+    assert_eq!(
+        db.internal_schema_version_of(ReadTarget::branch("main"))
+            .await
+            .unwrap(),
+        6,
+        "fresh graphs must use the restored pre-WAL v6 manifest format"
+    );
     assert!(snap.entry("node:Person").is_some());
     assert!(snap.entry("node:Company").is_some());
     assert!(snap.entry("edge:Knows").is_some());
@@ -104,110 +110,38 @@ async fn init_creates_graph() {
             ["id"],
             "fresh graph table {table_key} must be created with exactly `id` as its Lance unenforced primary key"
         );
+        assert!(
+            dataset.schema().field("__omnigraph_stream_v1$").is_none(),
+            "fresh v6 table {table_key} must not carry abandoned stream metadata"
+        );
+    }
+
+    assert!(
+        !dir.path().join("_stream_tokens.lance").exists(),
+        "fresh v6 roots must not create the abandoned token-authority dataset"
+    );
+    let mut pending = vec![dir.path().to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            assert_ne!(
+                entry.file_name().to_string_lossy(),
+                "_mem_wal",
+                "fresh v6 roots must not create MemWAL storage"
+            );
+            if path.is_dir() {
+                pending.push(path);
+            }
+        }
     }
 
     assert_eq!(db.catalog().node_types.len(), 2);
     assert_eq!(db.catalog().edge_types.len(), 2);
-    assert!(
-        db.catalog().node_types.values().all(|node| node
-            .arrow_schema
-            .field_with_name("__omnigraph_stream_v1$")
-            .is_err()),
-        "public catalog reflection must omit protocol-private stream metadata"
-    );
     assert_eq!(
         db.catalog().node_types["Person"].key_property(),
         Some("name")
     );
-    let person = snap.open("node:Person").await.unwrap();
-    assert!(person.schema().field("__omnigraph_stream_v1$").is_none());
-    assert!(
-        person
-            .load_indices()
-            .await
-            .unwrap()
-            .iter()
-            .all(|index| index.name != "__lance_mem_wal"),
-        "public index reflection must omit Lance's private MemWAL system index"
-    );
-    let private_filter = person
-        .count_rows(Some(r#""__OMNIGRAPH_STREAM_V1$" IS NULL"#.to_string()))
-        .await
-        .unwrap_err();
-    assert!(
-        private_filter
-            .to_string()
-            .contains("reserved for OmniGraph storage protocol metadata"),
-        "{private_filter:?}"
-    );
-    assert_eq!(
-        person
-            .count_rows(Some(
-                "name = '__omnigraph_stream_v1$'".to_string(),
-            ))
-            .await
-            .unwrap(),
-        0,
-        "the private spelling remains legal as ordinary user data"
-    );
-    let mut literal_filter = person.scan();
-    literal_filter
-        .filter("name = '__omnigraph_stream_v1$'")
-        .unwrap();
-    literal_filter.try_into_stream().await.unwrap();
-    let mut private_projection = person.scan();
-    let private_projection = match private_projection.project(&["__OMNIGRAPH_STREAM_V1$"]) {
-        Ok(_) => panic!("public projection must reject protocol-private stream metadata"),
-        Err(error) => error,
-    };
-    assert!(
-        private_projection
-            .to_string()
-            .contains("reserved for OmniGraph storage protocol metadata"),
-        "{private_projection:?}"
-    );
-    let mut structured_private_filter = person.scan();
-    structured_private_filter
-        .filter_expr(datafusion::prelude::col("__omnigraph_stream_v1$").is_null());
-    let structured_private_filter = match structured_private_filter.try_into_stream().await {
-        Ok(_) => panic!("structured filters must not expose protocol-private stream metadata"),
-        Err(error) => error,
-    };
-    assert!(
-        structured_private_filter
-            .to_string()
-            .contains("reserved for OmniGraph storage protocol metadata"),
-        "{structured_private_filter:?}"
-    );
-}
-
-#[tokio::test]
-async fn public_snapshot_wildcard_omits_protocol_metadata() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    omnigraph::loader::load_jsonl(
-        &mut db,
-        r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
-        omnigraph::loader::LoadMode::Merge,
-    )
-    .await
-    .unwrap();
-
-    let snapshot = snapshot_main(&db).await.unwrap();
-    let person = snapshot.open("node:Person").await.unwrap();
-    let mut scanner = person.scan();
-    scanner.project(&["*"]).unwrap();
-    let batches: Vec<arrow_array::RecordBatch> = futures::TryStreamExt::try_collect(
-        scanner.try_into_stream().await.unwrap(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(batches.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
-    assert!(batches.iter().all(|batch| batch
-        .schema()
-        .field_with_name("__omnigraph_stream_v1$")
-        .is_err()));
 }
 
 #[tokio::test]
@@ -872,4 +806,3 @@ node Task {
         "rejected init must not persist a schema IR"
     );
 }
-

@@ -185,8 +185,7 @@ fn rfc023_external_writer_process() {
 /// an enrolled multi-table writer has committed table 1 and parked before
 /// table 2, where publishing a competing graph commit would be both unnecessary
 /// and semantically wrong for the recovery assertion. The source schema is
-/// restricted to the `name @key` fixture used by that test; the canonical
-/// hidden attribution column is supplied as physical null metadata.
+/// restricted to the `name @key` fixture used by that test.
 async fn commit_raw_fenced_name_row(table_uri: &str, id: &str) {
     let base = Arc::new(Dataset::open(table_uri).await.unwrap());
     let schema = Arc::new(Schema::from(base.schema()));
@@ -196,16 +195,14 @@ async fn commit_raw_fenced_name_row(table_uri: &str, id: &str) {
             .iter()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>(),
-        vec!["id", "name", "__omnigraph_stream_v1$"],
+        vec!["id", "name"],
         "raw conflict injector is intentionally limited to the name-only fixture"
     );
-    let hidden = arrow_array::new_null_array(schema.field(2).data_type(), 1);
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
             Arc::new(StringArray::from(vec![id])),
             Arc::new(StringArray::from(vec![id])),
-            hidden,
         ],
     )
     .unwrap();
@@ -2063,17 +2060,15 @@ async fn rfc023_disjoint_retryable_strict_conflict_reprepares_without_key_confli
             .iter()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>(),
-        ["id", "name", "score", "__omnigraph_stream_v1$"],
+        ["id", "name", "score"],
         "raw disjoint-conflict injector is schema-specific"
     );
-    let hidden = arrow_array::new_null_array(schema.field(3).data_type(), 1);
     let foreign = RecordBatch::try_new(
         schema,
         vec![
             Arc::new(StringArray::from(vec!["foreign-disjoint"])),
             Arc::new(StringArray::from(vec!["foreign-disjoint"])),
             Arc::new(Int32Array::from(vec![1])),
-            hidden,
         ],
     )
     .unwrap();
@@ -7428,11 +7423,9 @@ async fn seed_optimize_late_sidecar_race(dir: &tempfile::TempDir) {
 /// stops a maintenance run from planning against a graph that moved while it
 /// waited — v6 had no such check, it used a bare fresh snapshot.
 ///
-/// The token is carried in a binding named `admission_txn`, which reads as
-/// RFC-026 stream machinery. It is not: it is also the authority proof and the
-/// source of the recovery sidecar's `RecoveryAuthorityToken`. Nothing pinned
-/// that second duty, so removing the binding with the streaming code would
-/// have silently downgraded optimize/cleanup/repair from
+/// The token carried in `admission_txn` is the authority proof and the source
+/// of the recovery sidecar's `RecoveryAuthorityToken`. Removing it would
+/// silently downgrade optimize/cleanup/repair from
 /// reject-on-authority-drift to read-whatever-is-fresh.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
@@ -7492,7 +7485,9 @@ async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
     );
     let rendered = error.to_string();
     assert!(
-        rendered.contains("read set") || rendered.contains("graph_head") || rendered.contains("changed"),
+        rendered.contains("read set")
+            || rendered.contains("graph_head")
+            || rendered.contains("changed"),
         "expected an authority-drift refusal, got: {rendered}",
     );
 

@@ -113,15 +113,6 @@ Per-graph actions (evaluated against the graph being addressed):
 | `branch_create` | branch creation |
 | `branch_delete` | branch deletion |
 | `branch_merge` | merges (especially into protected branches) |
-| `stream_ingest` | RFC-026 streaming row admission. The action is registered and graph-scoped, but no production ingest caller exists yet. |
-| `stream_manage` | RFC-026 streaming lifecycle management. It currently gates the graph enable/disable writer; fold, quiesce, resume, abort-drain, enrollment, and correction callers remain inactive. |
-
-Both stream actions are graph-scoped but not branch-scoped: a rule that sets
-`branch_scope` or `target_branch_scope` on either action is rejected. Policy
-YAML and `omnigraph policy explain --action` use the underscore spellings as
-canonical; the CLI also accepts `stream-ingest` / `stream-manage` as aliases.
-Embedded read-only `stream_status` is operational metadata and does not require
-`stream_manage`; there is no CLI/HTTP/OpenAPI stream-status surface yet.
 
 `admin` exists but is reserved (no call site yet — don't write rules for it).
 A server-scoped `graph_list` action gates `GET /graphs`; declare it in a
@@ -131,7 +122,7 @@ For any shared repo, gate at least `schema_apply` and `branch_merge`.
 
 ### Where policy is declared
 
-Cedar bundles are declared in `cluster.yaml` and attach via `applies_to`: `[cluster]` is the server-level engine (gates `graph_list` / `GET /graphs`); `[<graph-id>]` is that graph's engine (gates `invoke_query`, `read`, `change`, `branch_*`, `schema_apply`, and the two stream actions). `cluster apply` publishes them and the `--cluster` server enforces the applied revision. The `policy.yaml` rule format (below) is the bundle content.
+Cedar bundles are declared in `cluster.yaml` and attach via `applies_to`: `[cluster]` is the server-level engine (gates `graph_list` / `GET /graphs`); `[<graph-id>]` is that graph's engine (gates `invoke_query`, `read`, `change`, `branch_*`, and `schema_apply`). `cluster apply` publishes them and the `--cluster` server enforces the applied revision. The `policy.yaml` rule format (below) is the bundle content.
 
 ### `policy.yaml` shape
 

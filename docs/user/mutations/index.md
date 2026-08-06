@@ -119,3 +119,13 @@ single bulk-write command and applies the same schema validation and atomic
 publish as inline mutations. `append` means strict insert, `merge` means upsert,
 and `overwrite` replaces the target image; these are logical semantics, not
 names of raw Lance operations.
+
+The file is strict graph-level NDJSON: each nonblank line is one
+`{"type":"<Node>","data":{...}}` or
+`{"edge":"<Edge>","from":"<src-id>","to":"<dst-id>","data":{...}}`
+envelope. `data` defaults to `{}`, and one file may mix declarations without
+exposing any table or dataset selector. Local and remote `load` use the same
+parser and one graph transaction; see [the CLI guide](../cli/index.md) and the
+[raw HTTP route](../operations/server.md#bounded-graph-batch-ingestion).
+`omnigraph ingest` remains only as a deprecated loader-compatible command for
+older integrations; it is not the strict `load` grammar.

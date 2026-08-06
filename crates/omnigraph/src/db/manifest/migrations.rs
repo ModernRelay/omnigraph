@@ -62,61 +62,10 @@ use crate::error::{OmniError, Result};
 ///   non-null `id` field using Lance's unenforced-primary-key metadata. The
 ///   annotation is present at dataset creation and preserved by overwrites;
 ///   older graphs cross this immutable boundary by export/init/load rebuild.
-/// - v7 — RFC-026 adds identity-keyed `stream_state` authority rows carrying
-///   the physical enrollment, mutable current-HEAD witness, lifecycle, and
-///   per-shard epoch floor.
-/// - v8 — RFC-026 Phase B1 activates data-bearing MemWAL state with the exact
-///   persisted config-v2 writer profile and recovery-v11 `StreamFold` intents.
-/// - v9 — RFC-026 Phase B2 provisions the reserved trusted-row metadata and
-///   manifest-selected token authority, and upgrades enrolled streams to
-///   config-v3/state-v2/recovery-v12 authority. V8 graphs cross this immutable
-///   format boundary by export/init/load rebuild.
-/// - v10 — RFC-026 §4.7 P1 adds the required graph-global `stream_profile`
-///   enablement singleton (present from genesis, disabled) and adds the
-///   now-frozen explicit-null fold-attribution dead-letter placeholder. V9
-///   graphs cross this immutable format
-///   boundary by export/init/load rebuild: v9 decoders silently skip unknown
-///   row kinds, so only the stamp can make an older binary refuse a
-///   streaming-capable graph instead of writing blind to the flag.
-/// - v11 — RFC-026 §4.7 F2 replaces the boolean stream-profile payload with
-///   discriminated `DISABLED | ENABLED | DISABLING | RETIRED` authority and
-///   upgrades `_stream_tokens.lance` to the tagged current-token/control-ledger
-///   schema. Profile changes use recovery-v13 and immutable management receipts.
-/// - v12 — RFC-026 F2 lifecycle tranche replaces inline lane receipt vectors
-///   with lifecycle-v3 bounded ledger-chain/current pointers and authenticated
-///   incremental WAL-tail authority. Claim/drain effects use recovery-v14;
-///   historical recovery-v10 enrollment and recovery-v12 ordinary fold retain
-///   their exact lifecycle-v2 wire types and are never reinterpreted.
-/// - v13 — RFC-026 F3a activates explicit `SEALED -> OPEN` resume and guarded
-///   `DRAINING -> OPEN` abort-drain through recovery-v15. Recovery-v14 remains
-///   frozen; its dormant resume/rebind scaffolds keep their original wire
-///   meaning and continue to fail closed.
-/// - v14 — RFC-026 F3b adds the same-binding, `SEALED`-only `EnsureIndices`
-///   maintenance bridge. The v13 format remains frozen and is never
-///   reinterpreted as carrying that maintenance authority.
-/// - v15 — RFC-026 F3c adds the checked-runtime, `SEALED`-only `Optimize`
-///   maintenance bridge through recovery-v17. The v14/recovery-v16
-///   `EnsureIndices` format remains frozen and is never reinterpreted as
-///   carrying Optimize's internally committing maintenance effects.
-/// - v16 — RFC-026 F3d adds recovery-v18 for physical rebind. The
-///   v15/recovery-v17 `StreamSealedOptimize` format remains frozen and is never
-///   reinterpreted as carrying rebind's fresh binding, shard, receipt, and
-///   `SEALED` proof authority.
-/// - v17 — RFC-026 F3e adds recovery-v19 for irreversible root-wide stream
-///   authority retirement. The v16/recovery-v18 physical-rebind format and the
-///   frozen recovery-v14 retirement scaffold keep their old meanings.
-/// - v18 — RFC-026 F3f adds recovery-v20 for exact `DataBlock` correction.
-///   The v17/recovery-v19 retirement format and frozen recovery-v14 correction
-///   scaffold keep their old meanings; neither is reinterpreted.
-/// - v19 — RFC-026 F5 adds current-token schema v3 with terminal
-///   `DEAD_LETTERED` evidence, versioned fold attribution, one recovery-owned
-///   dead-letter object, recovery-v21 mixed/all-diverted folds, and
-///   three-disposition authority retirement. Historical v10 attribution,
-///   recovery-v14, recovery-v19, and recovery-v20 retain their exact meanings.
 ///
-/// v1–v18 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
+/// v1–v5 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
 /// is kept for provenance and to document what each stamp value meant.
-pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 19;
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 6;
 
 /// The oldest on-disk internal-schema stamp this binary will open. With no
 /// in-place migration, this equals `INTERNAL_MANIFEST_SCHEMA_VERSION`: a graph
@@ -128,51 +77,28 @@ pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 19;
 /// module doc).
 pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_SCHEMA_VERSION;
 
-/// The omnigraph release line that wrote a given internal-schema stamp. The
+/// The omnigraph release or exact development build that wrote a given
+/// internal-schema stamp. The
 /// open-refusal uses it to tell an operator exactly which binary to use to
 /// export a sub-CURRENT graph (the export side of the strand-model upgrade —
 /// see `docs/user/operations/upgrade.md`). Ranges are the release tags that
 /// stamped each version (verify with
 /// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
-/// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5–v8 unreleased,
-/// v9 0.9.x, v10–v19 unreleased. V10–v19 are source-only development
-/// formats; release preparation designates whichever later strand actually
-/// ships instead of relabeling superseded stamps.
-///
-/// v5 through v8 never reached a published release: the format advanced five
-/// times (RFC-028 identity, RFC-023 key fencing, and the three RFC-026 stream
-/// slices) inside the single 0.8.1 → 0.9.0 development window, so the only
-/// graphs carrying those stamps came from source builds off `main`. An earlier
-/// revision of this table optimistically assigned each of them its own release
-/// line (0.9.x–0.12.x); those releases do not exist and naming them here would
-/// send an operator hunting for a binary that was never published. V10 and v11
-/// remain 0.10.0-dev permanently because each was superseded before release.
-/// V19 is currently written only by 0.10.0-dev source builds. If it is the
-/// format that ships, the 0.10.0 release-prep commit flips only its entry to
-/// the published line; superseded v18 stays dev.
+/// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5 was
+/// unreleased (final source commit pinned below), and v6 is 0.9.x.
 pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
     match stamp {
         1 => "0.3.1 or earlier",
         2 => "0.4.1 to 0.6.1",
         3 => "0.6.2 to 0.7.2",
         4 => "0.8.x",
-        // Reads in both message slots ("created by omnigraph X" and "with an
-        // omnigraph X binary"). No such binary was ever published, so
-        // upgrade.md explains that these graphs must be exported with the
-        // source commit that stamped them.
-        5..=8 => "0.9.0-dev",
-        // The published line whose binaries serve v9 — the string the gated
-        // v9↔v10 crossversion fence asserts inside the v10 refusal message.
-        9 => "0.9.x",
-        // Unreachable in refusals while CURRENT == 19 (the sub-floor path
-        // consults 1–18 only; the ceiling path never consults the map). It
-        // exists for the table's honesty and the next bump. Release-prep for
-        // 0.10.0 release prep MUST split this arm and flip only the stamp that
-        // actually ships. Every superseded source-only stamp stays
-        // "0.10.0-dev" permanently.
-        10..=19 => "0.10.0-dev",
-        // Worded to read naturally after "created by omnigraph " if a future
-        // bump ever leaves a gap.
+        5 => {
+            "built from unreleased final-v5 source commit 46b6d9084fb629b88d4ac9e8c546e0a30d213d19"
+        }
+        6 => "0.9.x",
+        // Unreachable today (1–6 are mapped; > CURRENT is caught by the ceiling
+        // guard before this is consulted). Worded to read naturally after
+        // "created by omnigraph " if a future bump ever leaves a gap.
         _ => "an unrecognized older release",
     }
 }
@@ -250,12 +176,10 @@ mod tests {
     use super::*;
 
     /// The guard accepts exactly the single served version and refuses anything
-    /// below the floor or above the ceiling. With `MIN == CURRENT == 19` the
-    /// live range is exactly `[19, 19]`.
+    /// below the floor or above the ceiling. With `MIN == CURRENT == 6` the live
+    /// range is exactly `[6, 6]`.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
-        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 19);
-        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 19);
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
             assert!(
                 refuse_if_stamp_unsupported(stamp).is_ok(),
@@ -268,10 +192,13 @@ mod tests {
                 "a sub-floor stamp must be refused"
             );
         }
-        assert!(
-            refuse_if_stamp_unsupported(INTERNAL_MANIFEST_SCHEMA_VERSION + 1).is_err(),
-            "a future stamp must be refused"
-        );
+        let future_stamp = INTERNAL_MANIFEST_SCHEMA_VERSION + 1;
+        let future = refuse_if_stamp_unsupported(future_stamp)
+            .expect_err("the first abandoned post-v6 stamp must be refused")
+            .to_string();
+        assert!(future.contains("internal schema v7"), "got: {future}");
+        assert!(future.contains("expects v6"), "got: {future}");
+        assert!(future.contains("upgrade omnigraph"), "got: {future}");
     }
 
     /// The refusal names the release line that wrote each stamp so an operator
@@ -281,22 +208,9 @@ mod tests {
     fn release_names_the_writing_line_for_each_stamp() {
         assert_eq!(release_for_internal_schema_version(3), "0.6.2 to 0.7.2");
         assert_eq!(release_for_internal_schema_version(4), "0.8.x");
-        // v5-v8 advanced and were superseded entirely within the 0.8.1 -> 0.9.0
-        // development window, so no published release stamped them.
-        for unreleased in 5..=8 {
-            assert_eq!(release_for_internal_schema_version(unreleased), "0.9.0-dev");
-        }
-        assert_eq!(release_for_internal_schema_version(9), "0.9.x");
-        assert_eq!(release_for_internal_schema_version(10), "0.10.0-dev");
-        assert_eq!(release_for_internal_schema_version(11), "0.10.0-dev");
-        assert_eq!(release_for_internal_schema_version(12), "0.10.0-dev");
-        assert_eq!(release_for_internal_schema_version(13), "0.10.0-dev");
-        assert_eq!(release_for_internal_schema_version(14), "0.10.0-dev");
-        assert_eq!(release_for_internal_schema_version(15), "0.10.0-dev");
-        assert_eq!(release_for_internal_schema_version(16), "0.10.0-dev");
-        assert_eq!(release_for_internal_schema_version(17), "0.10.0-dev");
-        assert_eq!(release_for_internal_schema_version(18), "0.10.0-dev");
-        assert_eq!(release_for_internal_schema_version(19), "0.10.0-dev");
+        assert!(release_for_internal_schema_version(5).contains("unreleased final-v5"));
+        assert!(release_for_internal_schema_version(5).contains("46b6d908"));
+        assert_eq!(release_for_internal_schema_version(6), "0.9.x");
         assert_eq!(
             release_for_internal_schema_version(99),
             "an unrecognized older release"
@@ -305,170 +219,5 @@ mod tests {
         let err = refuse_if_stamp_unsupported(3).unwrap_err().to_string();
         assert!(err.contains("0.6.2 to 0.7.2"), "got: {err}");
         assert!(err.contains("omnigraph export"), "got: {err}");
-
-        let v6_err = refuse_if_stamp_unsupported(6).unwrap_err().to_string();
-        assert!(v6_err.contains("0.9.0-dev"), "got: {v6_err}");
-        assert!(v6_err.contains("omnigraph export"), "got: {v6_err}");
-        // The embedded release must read naturally in both slots of the
-        // rebuild instruction, not just the "created by" clause.
-        assert!(
-            v6_err.contains("with an omnigraph 0.9.0-dev binary"),
-            "got: {v6_err}"
-        );
-
-        // The v9 refusal pins the exact strings asserted by the historical
-        // source-v9 → CURRENT coverage (`OMNIGRAPH_V9_BIN`). A future map edit
-        // must break HERE, locally and unskippably, not only in an env-gated
-        // historical-binary run (the #387 failure class).
-        let v9_err = refuse_if_stamp_unsupported(9).unwrap_err().to_string();
-        assert!(
-            v9_err.contains("created by omnigraph 0.9.x"),
-            "got: {v9_err}"
-        );
-        assert!(
-            v9_err.contains("with an omnigraph 0.9.x binary"),
-            "got: {v9_err}"
-        );
-        assert!(v9_err.contains("omnigraph export"), "got: {v9_err}");
-
-        // The v10 refusal strings are also asserted by historical source-v10
-        // → CURRENT coverage (`OMNIGRAPH_V10_BIN`). Keep a local, unskippable
-        // guard so release-map drift fails before that optional run.
-        let v10_err = refuse_if_stamp_unsupported(10).unwrap_err().to_string();
-        assert!(
-            v10_err.contains("created by omnigraph 0.10.0-dev"),
-            "got: {v10_err}"
-        );
-        assert!(
-            v10_err.contains("with an omnigraph 0.10.0-dev binary"),
-            "got: {v10_err}"
-        );
-        assert!(v10_err.contains("omnigraph export"), "got: {v10_err}");
-
-        // Historical source-v11 → CURRENT coverage asserts these strings via
-        // `OMNIGRAPH_V11_BIN`. Pin them locally so release-prep cannot
-        // accidentally relabel the superseded source-only v11 stamp.
-        let v11_err = refuse_if_stamp_unsupported(11).unwrap_err().to_string();
-        assert!(
-            v11_err.contains("created by omnigraph 0.10.0-dev"),
-            "got: {v11_err}"
-        );
-        assert!(
-            v11_err.contains("with an omnigraph 0.10.0-dev binary"),
-            "got: {v11_err}"
-        );
-        assert!(v11_err.contains("omnigraph export"), "got: {v11_err}");
-
-        // Historical source-v12 → CURRENT coverage asserts this refusal.
-        // Keep its source-build release wording local and unskippable so
-        // release preparation cannot relabel this superseded stamp.
-        let v12_err = refuse_if_stamp_unsupported(12).unwrap_err().to_string();
-        assert!(
-            v12_err.contains("created by omnigraph 0.10.0-dev"),
-            "got: {v12_err}"
-        );
-        assert!(
-            v12_err.contains("with an omnigraph 0.10.0-dev binary"),
-            "got: {v12_err}"
-        );
-        assert!(v12_err.contains("omnigraph export"), "got: {v12_err}");
-
-        // Historical source-v13 → CURRENT coverage asserts this refusal.
-        // Keep its source-build release wording local and unskippable so
-        // release preparation cannot relabel this superseded stamp.
-        let v13_err = refuse_if_stamp_unsupported(13).unwrap_err().to_string();
-        assert!(
-            v13_err.contains("created by omnigraph 0.10.0-dev"),
-            "got: {v13_err}"
-        );
-        assert!(
-            v13_err.contains("with an omnigraph 0.10.0-dev binary"),
-            "got: {v13_err}"
-        );
-        assert!(v13_err.contains("omnigraph export"), "got: {v13_err}");
-
-        // Historical source-v14 → CURRENT coverage asserts this refusal.
-        // Keep its source-build release wording local and unskippable so
-        // release preparation cannot relabel this superseded stamp.
-        let v14_err = refuse_if_stamp_unsupported(14).unwrap_err().to_string();
-        assert!(
-            v14_err.contains("created by omnigraph 0.10.0-dev"),
-            "got: {v14_err}"
-        );
-        assert!(
-            v14_err.contains("with an omnigraph 0.10.0-dev binary"),
-            "got: {v14_err}"
-        );
-        assert!(v14_err.contains("omnigraph export"), "got: {v14_err}");
-
-        // Historical source-v15 → CURRENT coverage asserts this refusal.
-        // Keep its source-build release wording local and unskippable so
-        // release preparation cannot relabel this superseded stamp.
-        let v15_err = refuse_if_stamp_unsupported(15).unwrap_err().to_string();
-        assert!(
-            v15_err.contains("created by omnigraph 0.10.0-dev"),
-            "got: {v15_err}"
-        );
-        assert!(
-            v15_err.contains("with an omnigraph 0.10.0-dev binary"),
-            "got: {v15_err}"
-        );
-        assert!(v15_err.contains("omnigraph export"), "got: {v15_err}");
-
-        // Historical source-v16 → CURRENT coverage asserts this refusal.
-        // Keep its source-build release wording local and unskippable so
-        // release preparation cannot relabel this superseded stamp.
-        let v16_err = refuse_if_stamp_unsupported(16).unwrap_err().to_string();
-        assert!(
-            v16_err.contains("created by omnigraph 0.10.0-dev"),
-            "got: {v16_err}"
-        );
-        assert!(
-            v16_err.contains("with an omnigraph 0.10.0-dev binary"),
-            "got: {v16_err}"
-        );
-        assert!(v16_err.contains("omnigraph export"), "got: {v16_err}");
-
-        // Historical source-v17 → CURRENT coverage asserts this refusal. Keep
-        // its source-build release wording local and unskippable so release
-        // preparation cannot relabel this superseded stamp.
-        let v17_err = refuse_if_stamp_unsupported(17).unwrap_err().to_string();
-        assert!(
-            v17_err.contains("created by omnigraph 0.10.0-dev"),
-            "got: {v17_err}"
-        );
-        assert!(
-            v17_err.contains("with an omnigraph 0.10.0-dev binary"),
-            "got: {v17_err}"
-        );
-        assert!(v17_err.contains("omnigraph export"), "got: {v17_err}");
-
-        // V18 is the immediate predecessor used by the v18↔v19 format
-        // fence. It remains source-only even if v19 later becomes the
-        // published 0.10.x format.
-        let v18_err = refuse_if_stamp_unsupported(18).unwrap_err().to_string();
-        assert!(
-            v18_err.contains("created by omnigraph 0.10.0-dev"),
-            "got: {v18_err}"
-        );
-        assert!(
-            v18_err.contains("with an omnigraph 0.10.0-dev binary"),
-            "got: {v18_err}"
-        );
-        assert!(v18_err.contains("omnigraph export"), "got: {v18_err}");
-    }
-
-    /// Pin both sides of the current v19 grammar locally. The historical
-    /// binary fence is optional in developer environments; this is the
-    /// unskippable guard against changing its upgrade contract.
-    #[test]
-    fn current_v19_and_future_v20_have_exact_guard_behavior() {
-        assert!(refuse_if_stamp_unsupported(19).is_ok());
-
-        let future = refuse_if_stamp_unsupported(20).unwrap_err().to_string();
-        assert_eq!(
-            future,
-            "__manifest is stamped at internal schema v20 but this binary expects v19 — upgrade omnigraph before opening this graph"
-        );
     }
 }

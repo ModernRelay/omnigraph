@@ -1,7 +1,12 @@
 # Firehose Path — Implementation Specs
 
-**Type:** implementation plan for in-flight work
-**Status:** slices F0–F1, F2 profile authority, the hidden F2 lifecycle tranche,
+> **Historical record — rejected architecture.** RFC-026 and this implementation
+> plan are no longer active. The MemWAL path and its v7-v19 formats were removed
+> after benchmarking showed that its per-dataset durability layer did not
+> improve graph-level ingestion. See [the current decision](wal-removal.md).
+
+**Type:** archived implementation plan
+**Historical status at archival time:** slices F0–F1, F2 profile authority, the hidden F2 lifecycle tranche,
 private F3a resume/abort-drain, F3b EnsureIndices, F3c Optimize, F3d physical
 rebind, F3e authority retirement/export, F3f exact DataBlock correction, and
 F5b terminal dead-letter handling are implemented. The current development

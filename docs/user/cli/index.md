@@ -11,6 +11,23 @@ omnigraph query  get_person    --params '{"name":"Alice"}'
 omnigraph mutate insert_person --params '{"name":"Mina","age":28}'
 ```
 
+`omnigraph load` accepts strict graph-level NDJSON. Each nonblank line is
+exactly one logical node or edge envelope:
+
+```json
+{"type":"Person","data":{"name":"Ada"}}
+{"edge":"Knows","from":"Ada","to":"Grace","data":{}}
+```
+
+`data` may be omitted and defaults to `{}`. An optional `data.id` follows the
+ordinary ID rules: it must match a node's canonical `@key` ID when one exists;
+otherwise an omitted node or edge ID is generated. Duplicate members, unknown
+properties, reserved physical fields, and noncanonical supplied node IDs are
+rejected before effects. There is no table or dataset selector: one file may
+touch several logical declarations and publishes as one atomic graph commit.
+Local and remote CLI loads use this same grammar; the remote client sends it as
+raw `application/x-ndjson` to `/graphs/{graph_id}/load/ndjson`.
+
 `omnigraph query` is the canonical read command (pairs with `POST /query`);
 `omnigraph mutate` is the canonical write command (pairs with `POST /mutate`).
 The positional argument is the **stored-query name**, invoked from the served

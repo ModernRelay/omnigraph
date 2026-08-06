@@ -468,8 +468,8 @@ pub async fn cost_harness<F: Future>(body: F) -> F::Output {
 
 /// Run a body with persistent raw Lance trackers for the data-table and graph-
 /// manifest stores. This is the shared wiring seam for instruments that need
-/// request-path attribution beyond [`IoCounts`] (for example MemWAL WAL,
-/// generation-data, and PK-sidecar terms). The caller owns tracker resets and
+/// request-path attribution beyond [`IoCounts`] (for example recovery-object,
+/// table-data, and PK-sidecar terms). The caller owns tracker resets and
 /// classification; probe construction remains centralized here.
 pub async fn with_raw_io_trackers<F: Future>(
     table: &IOTracker,

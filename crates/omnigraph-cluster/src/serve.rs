@@ -2,10 +2,6 @@
 //! boots from (moved verbatim from lib.rs in the modularization).
 
 use super::*;
-use omnigraph_control_authority::{
-    RuntimeBindingRequest, ServedExportBindingRequest, ServedExportTerminalRequest,
-    validate_runtime_binding, validate_served_export_binding,
-};
 
 /// One graph in a serving snapshot: its id and on-disk root.
 #[derive(Debug, Clone)]
@@ -246,7 +242,7 @@ async fn read_snapshot_with_store(
     let mut observations = backend.observations();
     let state = match backend.read_state(&mut observations).await {
         Ok(snapshot) => match snapshot.state {
-            Some(state) => Some((state, snapshot.state_cas)),
+            Some(state) => Some(state),
             None => {
                 diagnostics.push(Diagnostic::error(
                     "cluster_state_missing",
@@ -261,11 +257,10 @@ async fn read_snapshot_with_store(
             None
         }
     };
-    let Some((state, state_cas)) = state else {
+    let Some(state) = state else {
         diagnostics.extend(startup_diagnostics);
         return Err(diagnostics);
     };
-    let state_cas = state_cas.expect("a present cluster state always has a content CAS");
 
     let required_embedding_providers: BTreeSet<String> = state
         .applied_revision

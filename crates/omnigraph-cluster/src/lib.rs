@@ -6,7 +6,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
 use omnigraph_compiler::SchemaMigrationPlan;
@@ -14,9 +13,6 @@ use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::typecheck_query_decl;
 use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_control_authority::{
-    AuthorityOperationClass, OfflineAuthorityRequest, StateLockGuard, validate_offline_guard,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -29,6 +25,7 @@ pub mod failpoints;
 mod config;
 mod diff;
 mod serve;
+mod state_lock;
 mod store;
 mod sweep;
 mod types;
@@ -341,7 +338,7 @@ pub async fn apply_config_dir_with_options(
     }
 
     // Named guard: the lock must be held until the state outcome is recorded.
-    let lock_guard = if desired.state_lock {
+    let _lock_guard = if desired.state_lock {
         match backend.acquire_lock("apply", &mut observations).await {
             Ok(guard) => Some(guard),
             Err(diagnostic) => {
@@ -932,22 +929,21 @@ pub async fn apply_config_dir_with_options(
             })
             .map(|artifact| artifact.approval_id.clone());
         let graph_uri = backend.graph_root(graph_id);
-        let _export_exclusion =
-            match omnigraph::db::reserve_export_root_exclusion(&graph_uri) {
-                Ok(guard) => guard,
-                Err(error) => {
-                    diagnostics.push(Diagnostic::error(
+        let _export_exclusion = match omnigraph::db::reserve_export_root_exclusion(&graph_uri) {
+            Ok(guard) => guard,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
                         "graph_delete_export_in_progress",
                         graph_addr.clone(),
                         format!(
                             "cannot remove graph root '{graph_uri}' while an immutable export owns it: {error}"
                         ),
                     ));
-                    failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
-                    graph_moving_aborted = true;
-                    continue;
-                }
-            };
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
+                graph_moving_aborted = true;
+                continue;
+            }
+        };
         let observed_manifest_version = match Omnigraph::open_read_only(&graph_uri).await {
             Ok(db) => match db.snapshot_of(ReadTarget::branch("main")).await {
                 Ok(snapshot) => Some(snapshot.version()),

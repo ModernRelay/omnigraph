@@ -188,7 +188,7 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Deprecated alias of `load --from <base>` (defaults: --mode merge, --from main)
+    /// Deprecated loader-compatible ingestion command (defaults: --mode merge, --from main)
     #[command(hide = true)]
     Ingest {
         /// Graph URI

@@ -35,47 +35,14 @@
   logical data chain would exceed 1,024 transactions. This is detected before
   recovery arm and has no durable effect.
   HTTP returns **413** with `resource_limit.{resource,limit,actual}`.
-  Reshape the input; it is not partial success. Served export also uses this
-  typed response before `200`: `stream_export_slots` means another response
-  owns the graph's immutable cut, while `stream_export_transport_bytes` means
-  the process-wide bounded response budget did not become available within
-  250 ms. Those two export limits are transient; finish/disconnect the earlier
-  response and retry rather than changing graph data.
+  Reshape the input; it is not partial success. Served streaming export also
+  uses this typed response before `200`: `stream_export_slots` means another
+  response owns the graph's immutable export cut, while
+  `stream_export_transport_bytes` means the process-wide bounded response
+  budget did not become available within 250 ms. Those export limits are
+  transient; finish or disconnect the earlier response and retry rather than
+  changing graph data.
 - `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id`. Resolve the sidecar through a read-write reopen/server restart before retrying; this is intentionally not an ordinary OCC retry.
-- `StreamExportBlocked { withdrawn_token_count, dead_lettered_token_count }` —
-  ordinary export found current `WITHDRAWN` or `DEAD_LETTERED` sequencing
-  authority that a row-only artifact cannot preserve. Graph-native firehose
-  ingest can install a fresh ordinary `PRESENT` successor only while the
-  enabled declaration is absent or `OPEN`. For a disabled `SEALED`
-  declaration, re-enable streaming, restart the checked server, run the
-  selector-free graph-wide `omnigraph stream resume`, and then submit the
-  successor. If the authority must instead be discarded, use the stopped/
-  offline `cluster stream retire-for-rebuild` handshake.
-  The served export route returns this as HTTP **409** before `200`.
-- Graph-ingest HTTP preconditions are transport errors rather than new durable
-  engine states. Missing `If-Match` returns **428** plus the current opaque
-  graph-ingest ETag without polling the body. Malformed or stale `If-Match`
-  returns **412** without a replacement token, also before body polling. A
-  non-`application/x-ndjson` request returns **415**. None of these outcomes
-  enrolls a lane or invokes MemWAL.
-- Checked stream status may return a redacted **503** when its bounded
-  observation cannot obtain one coherent authority cut (`StreamStatusBusy` or
-  `StreamStatusChanged`). The response intentionally omits the private gate,
-  physical member, and recovery identity that moved; retry the read. A **409**
-  means the served graph does not own checked operational-status authority for
-  its current profile, including an unmanaged graph that never established
-  checked serving authority. A **413** means the bounded observation inventory exceeded
-  its hard envelope; the server refuses the whole response instead of returning
-  partial recovery evidence. None of these responses mutates or heals the graph.
-- `StreamRetirementPlanChanged` — graph/profile/lifecycle/token authority moved
-  between retirement plan and confirm. No retirement effect is accepted; rerun
-  the plan and review the new digest.
-- `StreamRetirementIdempotencyConflict { retirement_id }` — the supplied
-  retirement UUID already names a different plan or authenticated actor. Reuse
-  an ID only for an exact retry of the same confirmation.
-- `StreamAuthorityRetired { retirement_id, export_cut_digest }` — the source is
-  permanently read/query/status/export-only at the recorded cut. Rebuild its
-  receipt-bearing export into a fresh graph; there is no transition back.
 
 For RFC-023 Mutation/Load keyed writes, `KeyConflict` is returned only after
 the writer proves that none of its planned table effects landed, finalizes the

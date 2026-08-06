@@ -18,42 +18,28 @@ pub(crate) struct LoadOutput {
     pub(crate) edge_types_loaded: usize,
 }
 
-pub(crate) fn load_output_from_tables(
+pub(crate) fn load_output_from_graph_batch(
     uri: &str,
-    branch: &str,
     mode: &'static str,
-    output: &IngestOutput,
+    output: &GraphBatchLoadOutput,
 ) -> LoadOutput {
-    let mut nodes_loaded = 0;
-    let mut edges_loaded = 0;
-    let mut node_types_loaded = 0;
-    let mut edge_types_loaded = 0;
-    for table in &output.tables {
-        if table.table_key.starts_with("node:") {
-            nodes_loaded += table.rows_loaded;
-            node_types_loaded += 1;
-        } else if table.table_key.starts_with("edge:") {
-            edges_loaded += table.rows_loaded;
-            edge_types_loaded += 1;
-        }
-    }
     LoadOutput {
         uri: uri.to_string(),
-        branch: branch.to_string(),
+        branch: output.branch.clone(),
         mode,
         base_branch: output.base_branch.clone(),
         branch_created: output.branch_created,
-        nodes_loaded,
-        edges_loaded,
-        node_types_loaded,
-        edge_types_loaded,
+        nodes_loaded: output.nodes.iter().map(|entry| entry.rows_loaded).sum(),
+        edges_loaded: output.edges.iter().map(|entry| entry.rows_loaded).sum(),
+        node_types_loaded: output.nodes.len(),
+        edge_types_loaded: output.edges.len(),
     }
 }
 
-/// The local arm's twin of `load_output_from_tables`: build the same
-/// `LoadOutput` from the engine `LoadResult` directly (the remote arm only
-/// has the wire `IngestOutput`'s table list; the local arm has the full
-/// result). Both load mappings live here, next to the struct — RFC-009
+/// The local arm's twin of `load_output_from_graph_batch`: build the same
+/// `LoadOutput` from the engine `LoadResult` directly (the remote arm has the
+/// logical graph-batch DTO; the local arm has the full result). Both load
+/// mappings live here, next to the struct — RFC-009
 /// Phase 2's "one place" for the `-> LoadOutput` mapping that used to fork
 /// between this file and main.rs's inline construction.
 pub(crate) fn load_output_from_result(

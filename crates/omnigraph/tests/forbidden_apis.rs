@@ -140,7 +140,6 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "db/manifest/namespace.rs",    // Opens manifest datasets through the shared namespace.
     "db/manifest/publisher.rs",    // Lowest row-level manifest publish gateway.
     "db/manifest/recovery.rs",     // Recovery executor; exactly inventoried below.
-    "db/manifest/token_store.rs",  // Graph-global stream-token participant gateway.
     "db/manifest/tests.rs",        // Out-of-line tests for the trusted gateways.
     "instrumentation.rs",          // The instrumented dataset opener.
 ];
@@ -203,41 +202,6 @@ const SCHEMA_V9: WriteProtocol = WriteProtocol::Exact("SchemaApply v9");
 const MERGE_V9: WriteProtocol = WriteProtocol::Exact("BranchMerge v9");
 const INDICES_V9: WriteProtocol = WriteProtocol::Exact("EnsureIndices v9");
 const OPTIMIZE_V9: WriteProtocol = WriteProtocol::Bounded("Optimize v9");
-const STREAM_ENROLLMENT_V14: WriteProtocol =
-    WriteProtocol::Exact("StreamEnrollmentV2 recovery v14");
-const STREAM_LIFECYCLE_V14: WriteProtocol =
-    WriteProtocol::Exact("private firehose lifecycle recovery v14");
-const STREAM_LIFECYCLE_V14_V15: WriteProtocol =
-    WriteProtocol::Composed("private firehose lifecycle recovery v14 + resume recovery v15");
-const STREAM_SEALED_ENSURE_INDICES_V16: WriteProtocol =
-    WriteProtocol::Exact("sealed EnsureIndices recovery v16");
-const STREAM_SEALED_OPTIMIZE_V17: WriteProtocol =
-    WriteProtocol::Bounded("sealed Optimize recovery v17");
-const STREAM_REBIND_V18: WriteProtocol =
-    WriteProtocol::Exact("private physical rebind recovery v18");
-const STREAM_RETIREMENT_V19: WriteProtocol =
-    WriteProtocol::Exact("stream authority retirement recovery v19");
-const STREAM_CORRECTION_V20: WriteProtocol =
-    WriteProtocol::Exact("stream DataBlock correction recovery v20");
-const STREAM_DEAD_LETTER_V21: WriteProtocol =
-    WriteProtocol::Exact("stream dead-letter fold recovery v21");
-const STREAM_RETIREMENT_V19_V21: WriteProtocol = WriteProtocol::Composed(
-    "stream authority retirement recovery v19 + terminal-disposition recovery v21",
-);
-const STREAM_ENROLLMENT_V14_REBIND_V18: WriteProtocol =
-    WriteProtocol::Composed("StreamEnrollmentV2 recovery v14 + physical rebind recovery v18");
-const STREAM_LIFECYCLE_V14_V15_V18: WriteProtocol =
-    WriteProtocol::Composed("private firehose lifecycle recovery v14 + resume v15 + rebind v18");
-const STREAM_FOLD_DRIVER_V14: WriteProtocol =
-    WriteProtocol::Composed("hidden resident stream fold driver + recovery v14");
-const SERVED_GRAPH_STREAM_INGEST_V14_V21: WriteProtocol = WriteProtocol::Composed(
-    "served graph ingress over enrollment/fold recovery v14 + dead-letter recovery v21",
-);
-/// RFC-026 checked profile authority: ENABLED/DISABLED terminal transitions
-/// pair one immutable token-ledger receipt with one profile/lineage publish
-/// under recovery-v13. Disable additionally persists the admission-cutoff
-/// `DISABLING` continuation before its terminal receipt.
-const STREAM_PROFILE_V13: WriteProtocol = WriteProtocol::Exact("StreamProfileChange recovery v13");
 
 #[derive(Debug, Clone, Copy)]
 struct WriteSurface {
@@ -258,71 +222,15 @@ write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options"],
     "db/omnigraph.rs" => WriteProtocol::RecoveryExecutor => ["open", "open_with_storage", "refresh"],
     "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_as"],
-    "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_file"],
-    "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v9") => ["load_as", "load_file_as"],
+    "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_file", "load_graph_batch"],
+    "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v9") => ["load_as", "load_file_as", "load_graph_batch_as"],
     "loader/mod.rs" => WriteProtocol::Composed("branch create when absent, then Load v9 alias") => ["ingest", "ingest_as", "ingest_file", "ingest_file_as"],
     "db/omnigraph.rs" => WriteProtocol::Composed("SchemaApply v9 + sentinel ref + optional hard-drop GC") => ["apply_schema", "apply_schema_with_options", "apply_schema_as", "apply_schema_as_with_catalog_check"],
     "exec/merge.rs" => MERGE_V9 => ["branch_merge", "branch_merge_as"],
     "db/omnigraph.rs" => INDICES_V9 => ["ensure_indices", "ensure_indices_on"],
-    "db/omnigraph.rs" => WriteProtocol::TestOnly => [
-        "failpoint_publish_table_head_without_index_rebuild_for_test",
-        "failpoint_stream_sealed_ensure_indices_for_test",
-        "failpoint_stream_sealed_optimize_for_test",
-    ],
-    "db/omnigraph/stream_enrollment.rs" => WriteProtocol::TestOnly => [
-        "failpoint_enroll_stream_table_for_test",
-        "failpoint_prepare_stream_ingest_as_for_test",
-    ],
-    "db/omnigraph/stream_ingest.rs" => WriteProtocol::TestOnly => [
-        "failpoint_stream_b1_for_test",
-        "failpoint_stream_b2_for_test",
-        "failpoint_stream_ingest_one_as_for_test",
-        "failpoint_stream_quiesce_for_test",
-        "failpoint_start_stream_open_after_fold_drain_for_test",
-        "failpoint_stream_resume_for_test",
-    ],
-    "db/omnigraph/stream_rebind.rs" => WriteProtocol::TestOnly => [
-        "failpoint_stream_rebind_checked_for_test",
-    ],
-    "db/omnigraph/stream_retirement.rs" => STREAM_RETIREMENT_V19_V21 => [
-        "confirm_stream_authority_retirement",
-    ],
-    "db/omnigraph/stream_retirement.rs" => WriteProtocol::TestOnly => [
-        "failpoint_reconcile_stream_token_lookup_index_for_cost_test",
-        "failpoint_withdraw_stream_token_for_retirement_test",
-    ],
-    "db/omnigraph/stream_correction.rs" => STREAM_CORRECTION_V20 => [
-        "correct_graph_stream_data_block",
-    ],
-    "db/omnigraph/stream_correction.rs" => WriteProtocol::TestOnly => [
-        "failpoint_correct_stream_data_block_for_test",
-        "failpoint_show_stream_data_block_for_test",
-    ],
-    "db/omnigraph/stream_ndjson.rs" => WriteProtocol::TestOnly => [
-        "failpoint_stream_ingest_graph_ndjson_as_for_test",
-        "failpoint_stream_ingest_ndjson_as_for_test",
-        "failpoint_stream_ingest_ndjson_cancel_for_test",
-    ],
-    "db/omnigraph/stream_ndjson.rs" => SERVED_GRAPH_STREAM_INGEST_V14_V21 => [
-        "start_served_graph_stream_ingest_as",
-    ],
+    "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test"],
     "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],
     "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],
-    "db/omnigraph/stream_profile.rs" => WriteProtocol::Composed("control-plane-required refusal") => ["set_streaming_enabled_as"],
-    "db/omnigraph/stream_profile.rs" => STREAM_PROFILE_V13 => ["set_streaming_profile_checked"],
-    "db/omnigraph/stream_driver.rs" => STREAM_FOLD_DRIVER_V14 => [
-        "start_stream_fold_driver",
-        "shutdown_stream_fold_driver",
-    ],
-    "db/omnigraph/stream_management.rs" => STREAM_LIFECYCLE_V14_V15 => [
-        "resume_served_graph_stream_as",
-    ],
-    "db/omnigraph/stream_management.rs" => STREAM_SEALED_ENSURE_INDICES_V16 => [
-        "ensure_served_graph_stream_indices_as",
-    ],
-    "db/omnigraph/stream_management.rs" => STREAM_SEALED_OPTIMIZE_V17 => [
-        "optimize_served_graph_stream_as",
-    ],
     "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup"],
     "db/omnigraph.rs" => WriteProtocol::NativeRefControl => ["branch_create", "branch_create_as", "branch_create_from", "branch_create_from_as", "branch_delete", "branch_delete_as"],
 }
@@ -334,42 +242,7 @@ write_surfaces! {
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
-    (
-        "db/omnigraph/stream_profile.rs",
-        "check_cluster_apply_authority",
-    ),
-    (
-        "db/omnigraph/stream_profile.rs",
-        "check_cluster_maintenance_authority",
-    ),
-    (
-        "db/omnigraph/stream_profile.rs",
-        "check_cluster_block_authority",
-    ),
-    (
-        "db/omnigraph/stream_profile.rs",
-        "check_cluster_dead_letter_authority",
-    ),
-    (
-        "db/omnigraph/stream_profile.rs",
-        "check_cluster_retirement_authority",
-    ),
-    (
-        "db/omnigraph/stream_profile.rs",
-        "with_checked_cluster_stream_runtime",
-    ),
-    (
-        "db/omnigraph/stream_profile.rs",
-        "with_checked_cluster_served_export",
-    ),
-    (
-        "db/omnigraph/export.rs",
-        "capture_served_export_cut",
-    ),
-    (
-        "db/omnigraph/stream_ingest.rs",
-        "failpoint_stream_incarnation_for_test",
-    ),
+    ("db/omnigraph/export.rs", "capture_served_export_cut"),
     ("db/omnigraph.rs", "plan_schema"),
     ("db/omnigraph.rs", "plan_schema_with_options"),
     ("db/omnigraph.rs", "preview_schema_apply_with_options"),
@@ -391,59 +264,6 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "branch_list"),
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "list_commits"),
-    // RFC-026 status surfaces are read-only. The minimal call is a pure
-    // manifest projection; the full checked cut legitimately takes exclusive
-    // admission while it observes physical authority, but never resolves
-    // recovery, opens/claims a writer, or publishes anything.
-    ("db/omnigraph/stream_status.rs", "stream_status"),
-    (
-        "db/omnigraph/stream_status.rs",
-        "capture_served_graph_stream_status",
-    ),
-    (
-        "db/omnigraph/stream_correction.rs",
-        "show_graph_stream_data_block",
-    ),
-    (
-        "db/omnigraph/stream_status.rs",
-        "failpoint_stream_operational_status_for_test",
-    ),
-    (
-        "db/omnigraph/stream_status.rs",
-        "failpoint_stream_operational_status_with_deadlines_for_test",
-    ),
-    (
-        "db/omnigraph/stream_status.rs",
-        "failpoint_hold_stream_status_root_for_test",
-    ),
-    (
-        "db/omnigraph/stream_status.rs",
-        "failpoint_stream_operational_status_for_apply_for_test",
-    ),
-    (
-        "db/omnigraph/stream_status.rs",
-        "failpoint_stream_token_lookup_for_cost_test",
-    ),
-    (
-        "db/omnigraph/stream_status.rs",
-        "failpoint_stream_profile_receipt_lookup_for_cost_test",
-    ),
-    (
-        "db/omnigraph/stream_status.rs",
-        "failpoint_stream_token_lookup_coverage_for_cost_test",
-    ),
-    (
-        "db/omnigraph/stream_retirement.rs",
-        "plan_stream_authority_retirement",
-    ),
-    (
-        "db/omnigraph/stream_retirement.rs",
-        "list_stream_dead_letters",
-    ),
-    (
-        "db/omnigraph/stream_retirement.rs",
-        "export_stream_dead_letter_payloads",
-    ),
     ("exec/query.rs", "query"),
     ("exec/query.rs", "run_query_at"),
 ];
@@ -600,12 +420,6 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
         WriteProtocol::Exact("shared publisher gateway"),
     ),
     (
-        "db/graph_coordinator.rs",
-        "GraphCoordinator",
-        "commit_operational_changes_with_expected",
-        WriteProtocol::Exact("lineage-neutral lifecycle publisher gateway"),
-    ),
-    (
         "db/manifest.rs",
         "ManifestCoordinator",
         "init_with_lineage",
@@ -708,9 +522,7 @@ gateway_surfaces! {
         "prepare_keyed_write_batch", "validate_keyed_write_batch", "first_existing_id",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::StageOnly => [
-        "stage_create", "stage_keyed_write", "stage_stream_fold", "stage_stream_correction",
-        "stage_stream_dead_letter_fold",
-        "stage_proven_strict_insert", "stage_overwrite",
+        "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
         "stage_delete", "stage_create_indices",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
@@ -745,9 +557,7 @@ gateway_surfaces! {
         "materialize_blob_batch_bounded",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
-        "stage_create", "stage_keyed_write", "stage_stream_fold", "stage_stream_correction",
-        "stage_stream_dead_letter_fold",
-        "stage_proven_strict_insert", "stage_overwrite",
+        "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
         "stage_delete", "stage_create_indices",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
@@ -826,104 +636,39 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_create_exact(", 1, WriteProtocol::Exact("sealed TableStorage create forwarding")),
     ("storage_layer.rs", ".commit_staged(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".stage_stream_correction(", 1, WriteProtocol::Composed("sealed TableStorage correction staging forwarding")),
-    ("storage_layer.rs", ".stage_stream_dead_letter_fold(", 1, WriteProtocol::Composed("sealed TableStorage dead-letter staging forwarding")),
     ("storage_layer.rs", ".dataset()", 25, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".into_arc()", 7, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".into_arc()", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "DeleteBuilder::new(", 1, WriteProtocol::Composed("staged delete primitive")),
     ("table_store.rs", "InsertBuilder::new(", 3, WriteProtocol::Composed("staged insert primitive")),
-    ("table_store.rs", "MergeInsertBuilder::try_new(", 2, WriteProtocol::Composed("staged merge primitive")),
+    ("table_store.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Composed("staged merge primitive")),
     ("table_store.rs", "CommitBuilder::new(", 2, WriteProtocol::Composed("staged commit primitive")),
     ("table_store.rs", ".create_index_builder(", 3, WriteProtocol::Composed("staged index primitive")),
-    ("table_store.rs", ".execute_uncommitted(", 9, WriteProtocol::Composed("staged physical primitive")),
+    ("table_store.rs", ".execute_uncommitted(", 8, WriteProtocol::Composed("staged physical primitive")),
     ("exec/staging.rs", "write_sidecar(", 1, WriteProtocol::Exact("Mutation/Load v9")),
     ("exec/merge.rs", "write_sidecar(", 1, MERGE_V9),
     ("db/omnigraph/schema_apply.rs", "write_sidecar(", 1, SCHEMA_V9),
     ("db/omnigraph/table_ops.rs", "write_sidecar(", 1, INDICES_V9),
     ("db/omnigraph/optimize.rs", "write_sidecar(", 1, OPTIMIZE_V9),
-    ("db/omnigraph/stream_enrollment.rs", "write_sidecar(", 1, STREAM_ENROLLMENT_V14),
-    ("db/omnigraph/stream_ingest.rs", "write_sidecar(", 4, STREAM_LIFECYCLE_V14_V15),
-    ("db/omnigraph/stream_profile.rs", "write_sidecar(", 1, STREAM_PROFILE_V13),
-    ("db/omnigraph/stream_rebind.rs", "write_sidecar(", 1, STREAM_REBIND_V18),
-    ("db/omnigraph/stream_retirement.rs", "write_sidecar(", 1, STREAM_RETIREMENT_V19_V21),
-    ("db/omnigraph/stream_correction.rs", "write_sidecar(", 1, STREAM_CORRECTION_V20),
-    ("db/manifest/recovery/stream_rebind_v18.rs", "write_sidecar(", 1, STREAM_REBIND_V18),
-    ("db/manifest/token_store.rs", "Dataset::write(", 1, WriteProtocol::Bootstrap),
-    ("db/manifest/token_store.rs", "MergeInsertBuilder::try_new(", 4, WriteProtocol::Composed("stream token + lifecycle-ledger staging")),
-    ("db/manifest/token_store.rs", ".execute_uncommitted(", 4, WriteProtocol::Composed("stream token + lifecycle-ledger staging")),
-    ("db/manifest/token_store.rs", "stage_lifecycle_ledger_records(", 7, WriteProtocol::Composed("typed lifecycle-ledger staging wrappers")),
-    ("db/manifest/token_store.rs", "stage_stream_token_and_lifecycle_records(", 1, WriteProtocol::Composed("combined stream token + lifecycle-ledger staging wrapper")),
-    ("db/omnigraph/stream_enrollment.rs", "stage_lifecycle_ledger_records(", 1, STREAM_ENROLLMENT_V14),
-    ("db/omnigraph/stream_ingest.rs", "stage_lifecycle_ledger_records(", 2, STREAM_LIFECYCLE_V14_V15),
-    ("db/manifest/recovery/stream_rebind_v18.rs", "stage_lifecycle_ledger_records(", 2, STREAM_REBIND_V18),
-    ("db/omnigraph/stream_ingest.rs", "stage_management_receipt(", 1, STREAM_LIFECYCLE_V14),
-    ("db/manifest/recovery.rs", "stage_lifecycle_ledger_records(", 3, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph/stream_ingest.rs", "stage_stream_token_upsert(", 1, STREAM_LIFECYCLE_V14),
-    ("db/manifest/recovery.rs", "stage_stream_token_upsert(", 2, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph/stream_retirement.rs", "stage_stream_token_upsert(", 1, STREAM_RETIREMENT_V19_V21),
-    ("db/omnigraph/stream_retirement.rs", "stage_authority_retirement_receipt_v2(", 1, STREAM_RETIREMENT_V19_V21),
-    ("db/manifest/recovery/stream_retirement_v19.rs", "stage_authority_retirement_receipt(", 1, STREAM_RETIREMENT_V19),
-    ("db/manifest/recovery/stream_retirement_v21.rs", "stage_authority_retirement_receipt_v2(", 1, STREAM_RETIREMENT_V19_V21),
-    ("db/omnigraph/stream_correction.rs", "stage_stream_correction_effect(", 1, STREAM_CORRECTION_V20),
-    ("db/manifest/recovery/stream_correction_v20.rs", "stage_stream_correction_effect(", 1, STREAM_CORRECTION_V20),
-    ("db/omnigraph/stream_profile.rs", "stage_profile_management_receipt(", 1, STREAM_PROFILE_V13),
     ("exec/staging.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("Mutation/Load v9")),
     ("exec/merge.rs", ".commit_staged_exact(", 1, MERGE_V9),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_create_exact(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_exact(", 1, SCHEMA_V9),
     ("db/omnigraph/table_ops.rs", ".commit_staged_exact(", 1, INDICES_V9),
-    ("db/omnigraph/stream_enrollment.rs", ".commit_staged_exact(", 1, STREAM_ENROLLMENT_V14),
-    ("db/omnigraph/stream_ingest.rs", ".commit_staged_exact(", 5, STREAM_LIFECYCLE_V14_V15),
-    ("db/omnigraph/stream_profile.rs", ".commit_staged_exact(", 1, STREAM_PROFILE_V13),
-    ("db/omnigraph/stream_retirement.rs", ".commit_staged_exact(", 2, STREAM_RETIREMENT_V19_V21),
-    ("db/omnigraph/stream_correction.rs", ".commit_staged_exact(", 2, STREAM_CORRECTION_V20),
-    ("db/omnigraph/stream_profile.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/stream_profile.rs", "SnapshotHandle::new(", 1, STREAM_PROFILE_V13),
-    ("db/manifest/recovery.rs", ".commit_staged_exact(", 5, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery/stream_rebind_v18.rs", ".commit_staged_exact(", 1, STREAM_REBIND_V18),
-    ("db/manifest/recovery/stream_retirement_v19.rs", ".commit_staged_exact(", 1, STREAM_RETIREMENT_V19),
-    ("db/manifest/recovery/stream_retirement_v21.rs", ".commit_staged_exact(", 1, STREAM_RETIREMENT_V19_V21),
-    ("db/manifest/recovery/stream_correction_v20.rs", ".commit_staged_exact(", 1, STREAM_CORRECTION_V20),
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("adapter-owned first-touch data ref")),
     ("exec/staging.rs", "confirm_occ_sidecar_v9(", 1, WriteProtocol::Exact("Mutation/Load v9")),
     ("exec/merge.rs", "confirm_branch_merge_sidecar_v9(", 1, MERGE_V9),
     ("db/omnigraph/schema_apply.rs", "confirm_schema_apply_sidecar_v9(", 1, SCHEMA_V9),
     ("db/omnigraph/table_ops.rs", "confirm_ensure_indices_sidecar_v9(", 1, INDICES_V9),
-    ("db/omnigraph/optimize.rs", "confirm_stream_sealed_optimize_sidecar_v17(", 1, WriteProtocol::Bounded("StreamSealedOptimize recovery v17")),
-    ("db/omnigraph/stream_enrollment.rs", "complete_stream_enrollment_sidecar_v14(", 1, STREAM_ENROLLMENT_V14),
-    ("db/manifest/recovery.rs", "confirm_stream_enrollment_sidecar_v14(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph/stream_ingest.rs", "confirm_stream_claim_sidecar_v14(", 1, STREAM_LIFECYCLE_V14),
-    ("db/omnigraph/stream_ingest.rs", "complete_stream_claim_sidecar_v14(", 3, STREAM_LIFECYCLE_V14),
-    ("db/manifest/recovery.rs", "confirm_stream_claim_sidecar_v14(", 2, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "complete_stream_claim_sidecar_v14(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph/stream_ingest.rs", "confirm_stream_fold_sidecar_v14(", 1, STREAM_LIFECYCLE_V14),
-    ("db/omnigraph/stream_ingest.rs", "complete_stream_fold_sidecar_v14(", 2, STREAM_LIFECYCLE_V14),
-    ("db/omnigraph/stream_ingest.rs", "finalize_effect_free_stream_fold_sidecar_v14(", 1, STREAM_LIFECYCLE_V14),
-    ("db/manifest/recovery.rs", "confirm_stream_fold_sidecar_v14(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph/stream_ingest.rs", "confirm_stream_lifecycle_receipt_sidecar_v14(", 1, STREAM_LIFECYCLE_V14),
-    ("db/omnigraph/stream_ingest.rs", "complete_stream_lifecycle_receipt_sidecar_v14(", 3, STREAM_LIFECYCLE_V14),
-    ("db/manifest/recovery.rs", "confirm_stream_lifecycle_receipt_sidecar_v14(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph/stream_profile.rs", "confirm_stream_profile_change_sidecar_v13(", 1, STREAM_PROFILE_V13),
-    ("db/manifest/recovery.rs", "confirm_stream_profile_change_sidecar_v13(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph/stream_profile.rs", "complete_stream_profile_change_sidecar_v13(", 2, STREAM_PROFILE_V13),
-    ("db/omnigraph/stream_retirement.rs", "confirm_stream_authority_retirement_sidecar_v21(", 1, STREAM_RETIREMENT_V19_V21),
-    ("db/manifest/recovery/stream_retirement_v19.rs", "confirm_stream_authority_retirement_sidecar_v19(", 1, STREAM_RETIREMENT_V19),
-    ("db/manifest/recovery/stream_retirement_v21.rs", "confirm_stream_authority_retirement_sidecar_v21(", 1, STREAM_RETIREMENT_V19_V21),
-    ("db/omnigraph/stream_retirement.rs", "complete_stream_authority_retirement_sidecar_v21(", 2, STREAM_RETIREMENT_V19_V21),
-    ("db/omnigraph/stream_correction.rs", "confirm_stream_correction_sidecar_v20(", 1, STREAM_CORRECTION_V20),
-    ("db/manifest/recovery/stream_correction_v20.rs", "confirm_stream_correction_sidecar_v20(", 1, STREAM_CORRECTION_V20),
-    ("db/omnigraph/stream_correction.rs", "complete_stream_correction_sidecar_v20(", 3, STREAM_CORRECTION_V20),
     ("exec/mutation.rs", "delete_sidecar(", 1, MUTATION_V9),
     ("loader/mod.rs", "delete_sidecar(", 1, LOAD_V9),
     ("exec/merge.rs", "delete_sidecar(", 1, MERGE_V9),
     ("db/omnigraph/schema_apply.rs", "delete_sidecar(", 1, SCHEMA_V9),
     ("db/omnigraph/table_ops.rs", "delete_sidecar(", 1, INDICES_V9),
     ("db/omnigraph/optimize.rs", "delete_sidecar(", 1, OPTIMIZE_V9),
-    ("db/manifest/recovery/stream_rebind_v18.rs", "delete_sidecar(", 1, STREAM_REBIND_V18),
     ("exec/mutation.rs", "commit_updates_on_branch_with_expected(", 1, MUTATION_V9),
     ("loader/mod.rs", "commit_updates_on_branch_with_expected(", 1, LOAD_V9),
     ("exec/merge.rs", "commit_updates_on_branch_with_expected(", 1, MERGE_V9),
@@ -931,20 +676,16 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", "commit_updates_on_branch_with_expected(", 1, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/table_ops.rs", ".commit_changes_with_intent_and_expected(", 2, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/schema_apply.rs", ".commit_changes_with_intent_and_expected(", 1, SCHEMA_V9),
-    ("db/omnigraph/stream_profile.rs", ".commit_changes_with_intent_and_expected(", 1, STREAM_PROFILE_V13),
     ("db/omnigraph/repair.rs", ".commit_updates_with_actor_with_expected(", 1, WriteProtocol::ManifestAdoption),
     ("db/omnigraph/optimize.rs", ".commit_updates_with_actor_with_expected(", 1, OPTIMIZE_V9),
     ("db/graph_coordinator.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("publisher gateway")),
-    ("db/graph_coordinator.rs", ".commit_changes_with_lineage_and_precondition(", 2, WriteProtocol::Exact("lowest manifest publisher gateway")),
+    ("db/graph_coordinator.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/omnigraph/table_ops.rs", ".commit_updates_with_actor_with_expected(", 2, WriteProtocol::TestOnly),
     ("db/omnigraph.rs", ".write_text_if_absent(", 1, WriteProtocol::Bootstrap),
     ("db/omnigraph.rs", ".write_text(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".write_text(", 2, WriteProtocol::Composed("schema state publication")),
-    ("db/manifest/recovery.rs", ".write_text(", 19, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery/stream_retirement_v19.rs", ".write_text(", 1, STREAM_RETIREMENT_V19),
-    ("db/manifest/recovery/stream_retirement_v21.rs", ".write_text(", 1, STREAM_RETIREMENT_V19_V21),
-    ("db/manifest/recovery/stream_correction_v20.rs", ".write_text(", 1, STREAM_CORRECTION_V20),
+    ("db/manifest/recovery.rs", ".write_text(", 6, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/schema_apply.rs", ".write_text(", 1, SCHEMA_V9),
     ("db/omnigraph.rs", ".delete(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".delete(", 3, WriteProtocol::Composed("schema staging cleanup")),
@@ -958,7 +699,6 @@ durable_calls! {
     ("db/manifest/recovery.rs", "recover_schema_state_files(", 1, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/optimize.rs", "compact_files(", 2, WriteProtocol::Composed("Optimize v9 data + physical manifest compaction")),
     ("db/omnigraph/optimize.rs", ".optimize_indices(", 1, OPTIMIZE_V9),
-    ("db/manifest/token_store.rs", ".optimize_indices(", 1, WriteProtocol::TestOnly),
     ("db/omnigraph/optimize.rs", ".update_config(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/optimize.rs", "cleanup_old_versions(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/schema_apply.rs", "cleanup_old_versions(", 1, WriteProtocol::Composed("SchemaApply hard-drop GC")),
@@ -978,25 +718,15 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", ".force_delete_branch(", 1, WriteProtocol::Composed("first-touch reclaim")),
     ("db/omnigraph/optimize.rs", ".force_delete_branch(", 1, WriteProtocol::PhysicalOnly),
     ("db/manifest/recovery.rs", ".force_delete_branch(", 2, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", ".publish_with_precondition(", 7, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery/stream_rebind_v18.rs", ".publish_with_precondition(", 1, STREAM_REBIND_V18),
-    ("db/manifest/recovery/stream_retirement_v19.rs", ".publish_with_precondition(", 1, STREAM_RETIREMENT_V19),
-    ("db/manifest/recovery/stream_retirement_v21.rs", ".publish_with_precondition(", 1, STREAM_RETIREMENT_V19_V21),
+    ("db/manifest/recovery.rs", ".publish_with_precondition(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".publish(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".restore(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", ".append(RecoveryAuditRecord", 17, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery/stream_rebind_v18.rs", ".append(RecoveryAuditRecord", 1, STREAM_REBIND_V18),
-    ("db/manifest/recovery/stream_correction_v20.rs", ".append(RecoveryAuditRecord", 1, STREAM_CORRECTION_V20),
-    ("db/manifest/recovery.rs", "publish_recovery_commit(", 14, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery/stream_correction_v20.rs", "publish_recovery_commit(", 1, STREAM_CORRECTION_V20),
-    ("db/manifest/recovery.rs", "restore_table_to_version(", 4, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "record_audit(", 13, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 38, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery/stream_rebind_v18.rs", "delete_sidecar_by_operation_id(", 1, STREAM_REBIND_V18),
-    ("db/manifest/recovery/stream_retirement_v19.rs", "delete_sidecar_by_operation_id(", 1, STREAM_RETIREMENT_V19),
-    ("db/manifest/recovery/stream_retirement_v21.rs", "delete_sidecar_by_operation_id(", 2, STREAM_RETIREMENT_V19_V21),
-    ("db/manifest/recovery/stream_correction_v20.rs", "delete_sidecar_by_operation_id(", 2, STREAM_CORRECTION_V20),
-    ("db/manifest/recovery.rs", "delete_sidecar(", 4, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", ".append(RecoveryAuditRecord", 7, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "publish_recovery_commit(", 8, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "restore_table_to_version(", 3, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "record_audit(", 9, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 19, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "delete_sidecar(", 1, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", ".raw_dataset_append(", 1, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", "Dataset::write(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "promote_exact_schema_staging(", 2, WriteProtocol::RecoveryExecutor),
@@ -1005,35 +735,13 @@ durable_calls! {
     ("exec/merge.rs", "TableStore::append_or_create_batch(", 1, WriteProtocol::EphemeralScratch),
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph.rs", ".into_arc()", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/table_ops.rs", ".dataset()", 3, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/table_ops.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
-    ("db/omnigraph/optimize.rs", ".dataset()", 7, WriteProtocol::Composed("Optimize v9/v17 planning, exact HEAD witness, + physical cleanup")),
+    ("db/omnigraph/optimize.rs", ".dataset()", 5, WriteProtocol::Composed("Optimize v9 planning + physical cleanup")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
-    ("db/omnigraph/stream_enrollment.rs", ".dataset()", 7, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/stream_enrollment.rs", ".into_dataset()", 1, STREAM_ENROLLMENT_V14),
-    ("db/omnigraph/stream_ingest.rs", ".dataset()", 40, STREAM_LIFECYCLE_V14_V15_V18),
-    ("db/omnigraph/stream_rebind.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/stream_retirement.rs", ".dataset()", 3, STREAM_RETIREMENT_V19_V21),
-    ("db/omnigraph/stream_status.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/stream_correction.rs", ".dataset()", 7, STREAM_CORRECTION_V20),
-    ("db/omnigraph/stream_correction.rs", ".stage_stream_correction(", 1, STREAM_CORRECTION_V20),
-    ("db/omnigraph/stream_ingest.rs", ".stage_stream_dead_letter_fold(", 1, STREAM_DEAD_LETTER_V21),
-    ("db/omnigraph/stream_dead_letter.rs", ".write_text_if_absent(", 1, STREAM_DEAD_LETTER_V21),
-    ("db/omnigraph/stream_ingest.rs", ".mem_wal_writer(", 2, STREAM_LIFECYCLE_V14_V15),
-    ("db/omnigraph/stream_ingest.rs", ".put(", 1, STREAM_LIFECYCLE_V14),
-    ("table_store/mem_wal.rs", ".initialize_mem_wal()", 2, STREAM_ENROLLMENT_V14_REBIND_V18),
-    ("table_store/mem_wal.rs", ".mem_wal_writer(", 2, STREAM_ENROLLMENT_V14_REBIND_V18),
-    ("table_store/mem_wal/worker.rs", ".put_no_wait(", 1, STREAM_LIFECYCLE_V14),
-    ("table_store/mem_wal/worker.rs", ".abort()", 2, STREAM_LIFECYCLE_V14),
-    ("table_store/mem_wal/worker.rs", ".force_seal_active()", 1, STREAM_LIFECYCLE_V14),
-    ("table_store/mem_wal/worker.rs", ".wait_for_flush_drain()", 1, STREAM_LIFECYCLE_V14),
     ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V9),
-    ("db/omnigraph/stream_enrollment.rs", "SnapshotHandle::new(", 1, STREAM_ENROLLMENT_V14),
-    ("db/omnigraph/stream_ingest.rs", "SnapshotHandle::new(", 4, STREAM_LIFECYCLE_V14_V15),
-    ("db/omnigraph/stream_retirement.rs", "SnapshotHandle::new(", 1, STREAM_RETIREMENT_V19_V21),
-    ("db/omnigraph/stream_correction.rs", "SnapshotHandle::new(", 1, STREAM_CORRECTION_V20),
     ("exec/merge.rs", "SnapshotHandle::new(", 5, MERGE_V9),
 }
 
@@ -1043,40 +751,10 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "confirm_branch_merge_sidecar_v9(",
     "confirm_schema_apply_sidecar_v9(",
     "confirm_ensure_indices_sidecar_v9(",
-    "confirm_stream_sealed_optimize_sidecar_v17(",
-    "complete_stream_fold_sidecar_v11(",
-    "finalize_effect_free_stream_fold_sidecar_v11(",
-    "complete_stream_enrollment_sidecar_v14(",
-    "confirm_stream_enrollment_sidecar_v14(",
-    "confirm_stream_claim_sidecar_v14(",
-    "complete_stream_claim_sidecar_v14(",
-    "confirm_stream_fold_sidecar_v14(",
-    "complete_stream_fold_sidecar_v14(",
-    "finalize_effect_free_stream_fold_sidecar_v14(",
-    "confirm_stream_lifecycle_receipt_sidecar_v14(",
-    "complete_stream_lifecycle_receipt_sidecar_v14(",
-    "stage_lifecycle_ledger_records(",
-    "stage_management_receipt(",
-    "confirm_stream_profile_change_sidecar_v13(",
-    "complete_stream_profile_change_sidecar_v13(",
-    "confirm_stream_authority_retirement_sidecar_v19(",
-    "complete_stream_authority_retirement_sidecar_v19(",
-    "confirm_stream_authority_retirement_sidecar_v21(",
-    "complete_stream_authority_retirement_sidecar_v21(",
-    "confirm_stream_correction_sidecar_v20(",
-    "complete_stream_correction_sidecar_v20(",
-    "stage_stream_token_upsert(",
-    "stage_authority_retirement_receipt(",
-    "stage_authority_retirement_receipt_v2(",
-    "stage_stream_token_and_lifecycle_records(",
-    "stage_stream_correction_effect(",
-    "stage_profile_management_receipt(",
     "delete_sidecar(",
     ".commit_staged_create_exact(",
     ".commit_staged_exact(",
     ".commit_staged(",
-    ".stage_stream_correction(",
-    ".stage_stream_dead_letter_fold(",
     ".fork_branch_from_state(",
     "commit_updates_on_branch_with_expected(",
     ".commit_changes_with_intent_and_expected(",
@@ -1141,12 +819,6 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".dataset()",
     ".into_arc()",
     ".into_dataset()",
-    ".initialize_mem_wal()",
-    ".mem_wal_writer(",
-    ".put_no_wait(",
-    ".abort()",
-    ".force_seal_active()",
-    ".wait_for_flush_drain()",
     "SnapshotHandle::new(",
 ];
 
@@ -1237,70 +909,6 @@ fn cfg_requires_test(attributes: &[Attribute]) -> bool {
             return false;
         };
         cfg.path.is_ident("cfg") && nested_meta(cfg).iter().any(meta_requires_test)
-    })
-}
-
-fn cfg_has_exact_feature(attributes: &[Attribute], expected: &str) -> bool {
-    attributes.iter().any(|attribute| {
-        let Meta::List(cfg) = &attribute.meta else {
-            return false;
-        };
-        if !cfg.path.is_ident("cfg") {
-            return false;
-        }
-        let predicates = nested_meta(cfg);
-        matches!(
-            predicates.as_slice(),
-            [Meta::NameValue(feature)]
-                if feature.path.is_ident("feature")
-                    && matches!(
-                        &feature.value,
-                        syn::Expr::Lit(expression)
-                            if matches!(
-                                &expression.lit,
-                                syn::Lit::Str(value) if value.value() == expected
-                            )
-                    )
-        )
-    })
-}
-
-fn cfg_has_exact_test_or_feature(attributes: &[Attribute], expected: &str) -> bool {
-    let is_expected_feature = |meta: &Meta| {
-        matches!(
-            meta,
-            Meta::NameValue(feature)
-                if feature.path.is_ident("feature")
-                    && matches!(
-                        &feature.value,
-                        syn::Expr::Lit(expression)
-                            if matches!(
-                                &expression.lit,
-                                syn::Lit::Str(value) if value.value() == expected
-                            )
-                    )
-        )
-    };
-    attributes.iter().any(|attribute| {
-        let Meta::List(cfg) = &attribute.meta else {
-            return false;
-        };
-        if !cfg.path.is_ident("cfg") {
-            return false;
-        }
-        let predicates = nested_meta(cfg);
-        let [Meta::List(any)] = predicates.as_slice() else {
-            return false;
-        };
-        if !any.path.is_ident("any") {
-            return false;
-        }
-        let alternatives = nested_meta(any);
-        alternatives.len() == 2
-            && alternatives
-                .iter()
-                .any(|meta| matches!(meta, Meta::Path(path) if path.is_ident("test")))
-            && alternatives.iter().any(is_expected_feature)
     })
 }
 
@@ -1489,116 +1097,15 @@ fn collect_durable_use_renames(tree: &syn::UseTree, hits: &mut Vec<String>) {
     }
 }
 
-fn collect_retain_all_delete_use_renames(tree: &syn::UseTree, hits: &mut Vec<String>) {
-    let tracked = retain_all_tracked_delete_names(RETAIN_ALL_DELETE_CALLS);
-    match tree {
-        syn::UseTree::Rename(rename) if tracked.contains(&rename.ident.to_string()) => {
-            hits.push(format!(
-                "delete gateway `{}` renamed to `{}`",
-                rename.ident, rename.rename
-            ));
-        }
-        syn::UseTree::Path(path) => {
-            collect_retain_all_delete_use_renames(&path.tree, hits);
-        }
-        syn::UseTree::Group(group) => {
-            for item in &group.items {
-                collect_retain_all_delete_use_renames(item, hits);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn expression_shape(expression: &Expr) -> String {
-    match expression {
-        Expr::Path(path) => path
-            .path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .collect::<Vec<_>>()
-            .join("::"),
-        Expr::Reference(reference) => format!(
-            "&{}{}",
-            if reference.mutability.is_some() {
-                "mut "
-            } else {
-                ""
-            },
-            expression_shape(&reference.expr)
-        ),
-        Expr::Field(field) => {
-            let member = match &field.member {
-                syn::Member::Named(identifier) => identifier.to_string(),
-                syn::Member::Unnamed(index) => index.index.to_string(),
-            };
-            format!("{}.{}", expression_shape(&field.base), member)
-        }
-        Expr::Call(call) => format!("{}(..)", expression_shape(&call.func)),
-        Expr::MethodCall(call) => {
-            format!("{}.{}(..)", expression_shape(&call.receiver), call.method)
-        }
-        Expr::Paren(paren) => expression_shape(&paren.expr),
-        Expr::Group(group) => expression_shape(&group.expr),
-        Expr::Await(await_expression) => {
-            format!("{}.await", expression_shape(&await_expression.base))
-        }
-        Expr::Index(index) => format!("{}[..]", expression_shape(&index.expr)),
-        Expr::Lit(_) => "<literal>".to_string(),
-        Expr::Macro(_) => "<macro>".to_string(),
-        _ => "<complex>".to_string(),
-    }
-}
-
-fn argument_shape(arguments: &Punctuated<Expr, Token![,]>) -> String {
-    arguments
-        .iter()
-        .map(expression_shape)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn call_shape(target: &Expr, arguments: &Punctuated<Expr, Token![,]>) -> String {
-    format!(
-        "{} => {}",
-        expression_shape(target),
-        argument_shape(arguments)
-    )
-}
-
-fn impl_owner(ty: &Type) -> String {
-    type_final_ident(ty)
-        .map(|identifier| identifier.to_string())
-        .unwrap_or_else(|| "<impl>".to_string())
-}
-
 #[derive(Default)]
 struct CallInventory {
     counts: BTreeMap<String, usize>,
-    impl_stack: Vec<String>,
-    function_stack: Vec<String>,
-    call_shapes_by_function: BTreeMap<(String, String, String), usize>,
     macro_hits: Vec<String>,
-    retain_all_hidden_route_hits: Vec<String>,
 }
 
 impl CallInventory {
     fn record(&mut self, key: impl Into<String>) {
-        let key = key.into();
-        *self.counts.entry(key).or_default() += 1;
-    }
-
-    fn record_shape(&mut self, key: impl Into<String>, shape: String) {
-        let function = self
-            .function_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(|| "<module>".to_string());
-        *self
-            .call_shapes_by_function
-            .entry((function, key.into(), shape))
-            .or_default() += 1;
+        *self.counts.entry(key.into()).or_default() += 1;
     }
 }
 
@@ -1614,32 +1121,21 @@ impl<'ast> Visit<'ast> for CallInventory {
         if cfg_requires_test(&node.attrs) {
             return;
         }
-        self.function_stack.push(node.sig.ident.to_string());
         visit::visit_item_fn(self, node);
-        self.function_stack.pop();
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
         if cfg_requires_test(&node.attrs) {
             return;
         }
-        self.impl_stack.push(impl_owner(&node.self_ty));
         visit::visit_item_impl(self, node);
-        self.impl_stack.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         if cfg_requires_test(&node.attrs) {
             return;
         }
-        let function = self
-            .impl_stack
-            .last()
-            .map(|owner| format!("{owner}::{}", node.sig.ident))
-            .unwrap_or_else(|| node.sig.ident.to_string());
-        self.function_stack.push(function);
         visit::visit_impl_item_fn(self, node);
-        self.function_stack.pop();
     }
 
     fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
@@ -1651,7 +1147,6 @@ impl<'ast> Visit<'ast> for CallInventory {
 
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
         collect_durable_use_renames(&node.tree, &mut self.macro_hits);
-        collect_retain_all_delete_use_renames(&node.tree, &mut self.retain_all_hidden_route_hits);
         visit::visit_item_use(self, node);
     }
 
@@ -1671,14 +1166,6 @@ impl<'ast> Visit<'ast> for CallInventory {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         let method = node.method.to_string();
         self.record(method.clone());
-        self.record_shape(
-            method.clone(),
-            format!(
-                "{} => {}",
-                expression_shape(&node.receiver),
-                argument_shape(&node.args)
-            ),
-        );
         if method == "append" && node.args.len() == 2 {
             self.record(".raw_dataset_append(");
         }
@@ -1696,7 +1183,6 @@ impl<'ast> Visit<'ast> for CallInventory {
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let Some(identifier) = final_path_ident(&node.func) {
             self.record(identifier.clone());
-            self.record_shape(identifier.clone(), call_shape(&node.func, &node.args));
             if identifier == "append" && node.args.len() == 3 {
                 self.record(".raw_dataset_append(");
             }
@@ -1730,12 +1216,6 @@ impl<'ast> Visit<'ast> for CallInventory {
             .last()
             .map(|segment| segment.ident.to_string())
             .unwrap_or_else(|| "macro".into());
-        for gateway in retain_all_tracked_delete_names(RETAIN_ALL_DELETE_CALLS) {
-            if tokens.contains(&format!("{gateway} (")) {
-                self.retain_all_hidden_route_hits
-                    .push(format!("{macro_name}! may hide delete gateway `{gateway}`"));
-            }
-        }
         if macro_name == "include" {
             self.macro_hits
                 .push("include! can hide unparsed durable calls".into());
@@ -1806,366 +1286,6 @@ fn call_inventory(ast: &syn::File) -> CallInventory {
     inventory
 }
 
-/// Raw MemWAL storage is retained indefinitely in RFC-026's selected B2a
-/// profile. These are the only production functions allowed to spell the
-/// physical `_mem_wal` directory. Most perform bounded read-only inventory;
-/// recovery-v18 additionally replaces only the Lance system-index pointer and
-/// provisions a fresh empty shard while retaining every old canonical object.
-/// A new owner is therefore an architectural change, not an incidental helper.
-const RAW_MEM_WAL_PATH_OWNERS: &[(&str, &str, usize)] = &[
-    (
-        "table_store/mem_wal.rs",
-        "drop_current_index_from_exact_rebind_no_effect",
-        1,
-    ),
-    ("table_store/mem_wal.rs", "mem_wal_top_level_shards", 2),
-    ("table_store/mem_wal.rs", "raw_mem_wal_inventory", 2),
-    ("table_store/mem_wal.rs", "raw_mem_wal_shard_inventory", 2),
-    (
-        "table_store/mem_wal/worker.rs",
-        "validate_b1_lifecycle_physical_state_impl",
-        1,
-    ),
-];
-
-/// Recovery-v18 may remove and replace only Lance's current MemWAL system
-/// index. The retained shard/object roots are never deleted. The lexical
-/// scanner intentionally treats `drop` next to `MemWal` as suspicious, so
-/// these exact state references disposition that one pointer transition
-/// without permitting another reclamation-shaped symbol.
-const RETAIN_ALL_REBIND_INDEX_TRANSITION_SYMBOLS: &[(&str, &str, &str, usize)] = &[
-    (
-        "db/manifest/recovery/stream_rebind_v18.rs",
-        "converge_physical",
-        "path `MemWalRebindState::ExactIndexDropped`",
-        1,
-    ),
-    (
-        "table_store/mem_wal.rs",
-        "classify_rebind",
-        "path `MemWalRebindState::ExactIndexDropped`",
-        1,
-    ),
-    (
-        "table_store/mem_wal.rs",
-        "drop_current_index_from_exact_rebind_no_effect",
-        "path `MemWalRebindState::ExactIndexDropped`",
-        1,
-    ),
-    (
-        "table_store/mem_wal.rs",
-        "initialize_fresh_index_from_exact_rebind_drop",
-        "path `MemWalRebindState::ExactIndexDropped`",
-        1,
-    ),
-];
-
-/// Generic graph maintenance must reason from manifest/lifecycle authority,
-/// not inspect or reinterpret retained MemWAL objects.  StreamEnrollment and
-/// StreamFold recovery are intentionally absent: their exact classifiers must
-/// read MemWAL state, while the raw-path and no-reclamation guards below keep
-/// those classifiers non-destructive.
-const RETAIN_ALL_MAINTENANCE_FILES: &[&str] = &[
-    "db/omnigraph/optimize.rs",
-    "db/omnigraph/repair.rs",
-    "db/omnigraph/schema_apply.rs",
-    "db/omnigraph/table_ops.rs",
-];
-
-/// Checked `SEALED` maintenance reads Lance's composite dataset HEAD through
-/// this existing helper; despite its module path, the helper never enumerates,
-/// adopts, or deletes retained `_mem_wal` objects. Keep both the helper-call
-/// and `mem_wal` path-segment counts exact so this disposition cannot cover a
-/// second MemWAL API in the same maintenance function.
-const RETAIN_ALL_CHECKED_MAINTENANCE_HEAD_READS: &[(&str, &str, usize)] = &[
-    (
-        "db/omnigraph/optimize.rs",
-        "optimize_all_tables_with_mode",
-        1,
-    ),
-    (
-        "db/omnigraph/optimize.rs",
-        "apply_optimize_table_effects",
-        1,
-    ),
-    ("db/omnigraph/table_ops.rs", "ensure_indices_for_branch", 2),
-];
-
-const RETAIN_ALL_OMNIGRAPH_METHODS: &[&str] = &[
-    "cleanup",
-    "cleanup_deleted_branch_tables",
-    "optimize",
-    "repair",
-];
-
-/// Raw object/prefix erasure is the only delegated route this B2a guard owns.
-/// Lance version GC and branch-tree lifecycle remain covered by their existing
-/// protocol registries and behavioral guards.
-const RETAIN_ALL_RAW_DELETE_PRIMITIVES: &[&str] = &[
-    "delete",
-    "delete_prefix",
-    "remove_dir",
-    "remove_dir_all",
-    "remove_file",
-];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetainAllDeleteScope {
-    /// Accepts a caller-provided object/prefix. Registering the gateway also
-    /// enrolls its terminal function name so every caller edge is inventoried.
-    GenericGateway,
-    /// Deletes one protocol-derived schema, sidecar, staging, or lock object.
-    ExactControlObject,
-    /// Deletes an unregistered first-touch table root only after exact recovery
-    /// ownership and competing-sidecar proof.
-    FirstTouchRollback,
-    /// Destroys the entire graph after the governed cluster approval protocol.
-    WholeGraphDestroy,
-}
-
-type RetainAllDeleteCallsite = (
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-    usize,
-    RetainAllDeleteScope,
-);
-
-#[rustfmt::skip]
-const RETAIN_ALL_DELETE_CALLS: &[RetainAllDeleteCallsite] = &[
-    ("storage.rs", "ObjectStorageAdapter::delete", "delete", "omnigraph_storage::StorageAdapter::delete => &self.inner, uri", 1, RetainAllDeleteScope::GenericGateway),
-    ("storage.rs", "ObjectStorageAdapter::delete_prefix", "delete_prefix", "omnigraph_storage::StorageAdapter::delete_prefix => &self.inner, prefix_uri", 1, RetainAllDeleteScope::GenericGateway),
-    ("omnigraph-storage/lib.rs", "ObjectStorageAdapter::delete", "delete", "self.store => &location", 1, RetainAllDeleteScope::GenericGateway),
-    ("omnigraph-storage/lib.rs", "ObjectStorageAdapter::delete_prefix", "delete", "self.store => &location", 1, RetainAllDeleteScope::GenericGateway),
-    ("omnigraph-storage/lib.rs", "ObjectStorageAdapter::delete_prefix", "remove_dir_all", "tokio::fs::remove_dir_all => &path", 1, RetainAllDeleteScope::GenericGateway),
-    ("instrumentation.rs", "CountingStorageAdapter::delete", "delete", "self.inner => uri", 1, RetainAllDeleteScope::GenericGateway),
-    ("instrumentation.rs", "CountingStorageAdapter::delete_prefix", "delete_prefix", "self.inner => prefix_uri", 1, RetainAllDeleteScope::GenericGateway),
-    ("db/omnigraph.rs", "best_effort_cleanup_init_artifacts", "delete", "storage => &uri", 1, RetainAllDeleteScope::ExactControlObject),
-    ("db/schema_state.rs", "cleanup_staging_files", "delete", "storage => &schema_source_staging_uri(..)", 1, RetainAllDeleteScope::ExactControlObject),
-    ("db/schema_state.rs", "cleanup_staging_files", "delete", "storage => &schema_ir_staging_uri(..)", 1, RetainAllDeleteScope::ExactControlObject),
-    ("db/schema_state.rs", "cleanup_staging_files", "delete", "storage => &schema_state_staging_uri(..)", 1, RetainAllDeleteScope::ExactControlObject),
-    ("db/manifest/recovery.rs", "delete_sidecar", "delete", "storage => &handle.sidecar_uri", 1, RetainAllDeleteScope::ExactControlObject),
-    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id", "delete", "storage => &sidecar_uri(..)", 1, RetainAllDeleteScope::ExactControlObject),
-    ("db/manifest/recovery.rs", "roll_back_schema_apply_v7", "delete_prefix", "storage => &pin.table_path", 2, RetainAllDeleteScope::FirstTouchRollback),
-    ("omnigraph-control-authority/lib.rs", "StateLockGuard::drop", "remove_file", "std::fs::remove_file => path", 1, RetainAllDeleteScope::ExactControlObject),
-    ("omnigraph-control-authority/lib.rs", "release_remote_lock_if_owned", "delete", "adapter => uri", 1, RetainAllDeleteScope::ExactControlObject),
-    ("omnigraph-cluster/store.rs", "ClusterStore::force_unlock", "delete", "self.adapter => &lock_uri", 1, RetainAllDeleteScope::ExactControlObject),
-    ("omnigraph-cluster/store.rs", "ClusterStore::try_delete_object", "delete", "self.adapter => uri", 1, RetainAllDeleteScope::GenericGateway),
-    ("omnigraph-cluster/store.rs", "ClusterStore::delete_object", "try_delete_object", "self => uri", 1, RetainAllDeleteScope::GenericGateway),
-    ("omnigraph-cluster/store.rs", "ClusterStore::delete_graph_root", "delete_prefix", "self.adapter => graph_uri", 1, RetainAllDeleteScope::GenericGateway),
-    ("omnigraph-cluster/lib.rs", "apply_config_dir_with_options", "delete_graph_root", "backend => &graph_uri", 1, RetainAllDeleteScope::WholeGraphDestroy),
-    ("omnigraph-cluster/lib.rs", "apply_config_dir_with_options", "delete_object", "backend => &sidecar_path", 1, RetainAllDeleteScope::ExactControlObject),
-    ("omnigraph-cluster/lib.rs", "apply_config_dir_with_options", "delete_object", "backend => sidecar_uri", 1, RetainAllDeleteScope::ExactControlObject),
-    ("omnigraph-cluster/lib.rs", "apply_config_dir_with_options", "try_delete_object", "backend => &sidecar_path", 1, RetainAllDeleteScope::ExactControlObject),
-    ("omnigraph-cluster/lib.rs", "sync_config_dir", "delete_object", "backend => sidecar_uri", 1, RetainAllDeleteScope::ExactControlObject),
-];
-
-fn retain_all_tracked_delete_names(callsites: &[RetainAllDeleteCallsite]) -> BTreeSet<String> {
-    RETAIN_ALL_RAW_DELETE_PRIMITIVES
-        .iter()
-        .map(|primitive| (*primitive).to_string())
-        .chain(
-            callsites
-                .iter()
-                .filter(|callsite| callsite.5 == RetainAllDeleteScope::GenericGateway)
-                .map(|callsite| {
-                    callsite
-                        .1
-                        .rsplit("::")
-                        .next()
-                        .expect("qualified function owner")
-                        .to_string()
-                }),
-        )
-        .collect()
-}
-
-fn normalized_symbol(value: &str) -> String {
-    value
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn mentions_mem_wal(value: &str) -> bool {
-    normalized_symbol(value).contains("memwal") || value.contains("_mem_wal")
-}
-
-fn is_reclamation_verb(value: &str) -> bool {
-    let normalized = normalized_symbol(value);
-    [
-        "adopt",
-        "cleanup",
-        "compact",
-        "delete",
-        "drop",
-        "garbagecollect",
-        "prune",
-        "purge",
-        "reclaim",
-        "reclassify",
-        "remove",
-        "trim",
-        "vacuum",
-    ]
-    .iter()
-    .any(|verb| normalized.contains(verb))
-        || normalized == "gc"
-        || normalized.ends_with("gc")
-}
-
-fn is_mem_wal_reclamation_symbol(value: &str) -> bool {
-    mentions_mem_wal(value) && is_reclamation_verb(value)
-}
-
-fn raw_mem_wal_marker_count(value: &str) -> usize {
-    value.matches("_mem_wal").count()
-}
-
-#[derive(Default)]
-struct RetainAllMemWalInventory {
-    function_stack: Vec<String>,
-    raw_path_owners: BTreeMap<String, usize>,
-    mem_wal_uses: Vec<(String, String)>,
-    reclamation_symbols: Vec<(String, String)>,
-}
-
-impl RetainAllMemWalInventory {
-    fn owner(&self) -> String {
-        self.function_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(|| "<module>".to_string())
-    }
-
-    fn record_raw_path(&mut self, count: usize) {
-        if count > 0 {
-            *self.raw_path_owners.entry(self.owner()).or_default() += count;
-        }
-    }
-
-    fn record_reclamation_symbol(&mut self, symbol: impl Into<String>) {
-        self.reclamation_symbols.push((self.owner(), symbol.into()));
-    }
-}
-
-impl<'ast> Visit<'ast> for RetainAllMemWalInventory {
-    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        if cfg_requires_test(&node.attrs) {
-            return;
-        }
-        visit::visit_item_mod(self, node);
-    }
-
-    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        if cfg_requires_test(&node.attrs) {
-            return;
-        }
-        visit::visit_item_impl(self, node);
-    }
-
-    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
-        if cfg_requires_test(&node.attrs) {
-            return;
-        }
-        visit::visit_item_const(self, node);
-    }
-
-    fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
-        if cfg_requires_test(&node.attrs) {
-            return;
-        }
-        visit::visit_item_static(self, node);
-    }
-
-    fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
-        if cfg_requires_test(&node.attrs) {
-            return;
-        }
-        visit::visit_item_macro(self, node);
-    }
-
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if cfg_requires_test(&node.attrs) {
-            return;
-        }
-        let function = node.sig.ident.to_string();
-        if is_mem_wal_reclamation_symbol(&function) {
-            self.record_reclamation_symbol(format!("function `{function}`"));
-        }
-        self.function_stack.push(function);
-        visit::visit_item_fn(self, node);
-        self.function_stack.pop();
-    }
-
-    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if cfg_requires_test(&node.attrs) {
-            return;
-        }
-        let function = node.sig.ident.to_string();
-        if is_mem_wal_reclamation_symbol(&function) {
-            self.record_reclamation_symbol(format!("method `{function}`"));
-        }
-        self.function_stack.push(function);
-        visit::visit_impl_item_fn(self, node);
-        self.function_stack.pop();
-    }
-
-    fn visit_ident(&mut self, node: &'ast syn::Ident) {
-        let identifier = node.to_string();
-        if mentions_mem_wal(&identifier) {
-            self.mem_wal_uses.push((self.owner(), identifier.clone()));
-        }
-        if is_mem_wal_reclamation_symbol(&identifier) {
-            self.record_reclamation_symbol(format!("identifier `{identifier}`"));
-        }
-        visit::visit_ident(self, node);
-    }
-
-    fn visit_path(&mut self, node: &'ast syn::Path) {
-        let path = node
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .collect::<Vec<_>>()
-            .join("::");
-        if is_mem_wal_reclamation_symbol(&path) {
-            self.record_reclamation_symbol(format!("path `{path}`"));
-        }
-        visit::visit_path(self, node);
-    }
-
-    fn visit_lit(&mut self, node: &'ast syn::Lit) {
-        if let syn::Lit::Str(value) = node {
-            let value = value.value();
-            self.record_raw_path(raw_mem_wal_marker_count(&value));
-            if mentions_mem_wal(&value) {
-                self.mem_wal_uses
-                    .push((self.owner(), "literal `_mem_wal`".to_string()));
-            }
-        }
-        visit::visit_lit(self, node);
-    }
-
-    fn visit_macro(&mut self, node: &'ast syn::Macro) {
-        let tokens = node.tokens.to_string();
-        self.record_raw_path(raw_mem_wal_marker_count(&tokens));
-        if mentions_mem_wal(&tokens) {
-            self.mem_wal_uses
-                .push((self.owner(), "macro token `_mem_wal`".to_string()));
-        }
-        visit::visit_macro(self, node);
-    }
-}
-
-fn retain_all_mem_wal_inventory(ast: &syn::File) -> RetainAllMemWalInventory {
-    let mut inventory = RetainAllMemWalInventory::default();
-    inventory.visit_file(ast);
-    inventory
-}
-
 fn protocol_scan_files(src: &Path) -> Vec<PathBuf> {
     walk_rust_files(src)
         .into_iter()
@@ -2185,39 +1305,6 @@ fn durable_protocol_scan_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
             path,
         )
     }));
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    files
-}
-
-fn retain_all_production_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
-    let mut files = protocol_scan_files(engine_src)
-        .into_iter()
-        .map(|path| (relative_to_src(engine_src, &path), path))
-        .collect::<Vec<_>>();
-
-    // The cluster layer is the only sibling crate that owns a recursive graph
-    // root deletion. Scan it as part of the same retain-all boundary, while
-    // excluding its out-of-line `#[cfg(test)] mod tests` source (the attribute
-    // lives in lib.rs and is not visible when tests.rs is parsed alone).
-    let cluster_src = sibling_crate_src(engine_src, "omnigraph-cluster");
-    for path in walk_rust_files(&cluster_src) {
-        if path.file_name().and_then(|name| name.to_str()) == Some("tests.rs") {
-            continue;
-        }
-        files.push((
-            format!("omnigraph-cluster/{}", relative_to_src(&cluster_src, &path)),
-            path,
-        ));
-    }
-    for crate_name in ["omnigraph-storage", "omnigraph-control-authority"] {
-        let crate_src = sibling_crate_src(engine_src, crate_name);
-        files.extend(walk_rust_files(&crate_src).into_iter().map(|path| {
-            (
-                format!("{crate_name}/{}", relative_to_src(&crate_src, &path)),
-                path,
-            )
-        }));
-    }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
 }
@@ -2300,7 +1387,7 @@ fn public_graph_surfaces(src: &Path) -> BTreeSet<(String, String)> {
 }
 
 #[test]
-fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
+fn export_cut_is_hidden_move_only_and_non_forgeable() {
     let path = engine_src_root().join("db/omnigraph/export.rs");
     let contents = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
@@ -2313,14 +1400,8 @@ fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
         match item {
             Item::Struct(item) if item.ident == "ExportCut" => {
                 cut_structs += 1;
-                assert!(
-                    matches!(item.vis, Visibility::Public(_)),
-                    "the server-facing cut type must be nameable through the hidden engine seam"
-                );
-                assert!(
-                    has_doc_hidden(&item.attrs),
-                    "ExportCut must stay out of generated SDK documentation"
-                );
+                assert!(matches!(item.vis, Visibility::Public(_)));
+                assert!(has_doc_hidden(&item.attrs));
                 assert!(
                     item.fields
                         .iter()
@@ -2338,10 +1419,7 @@ fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
                             .unwrap_or_else(|error| panic!("failed to parse cut derive: {error}"));
                     }
                 }
-                assert!(
-                    !derives_clone,
-                    "an immutable export cut must not duplicate its root slot/version pins"
-                );
+                assert!(!derives_clone, "ExportCut must remain move-only");
             }
             Item::Impl(item)
                 if item.trait_.is_none()
@@ -2355,17 +1433,11 @@ fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
                     if !matches!(function.vis, Visibility::Public(_)) {
                         continue;
                     }
-                    assert!(
-                        function.sig.asyncness.is_some(),
-                        "cut output must remain an owned async operation"
-                    );
-                    assert!(
-                        matches!(
-                            function.sig.inputs.first(),
-                            Some(syn::FnArg::Receiver(receiver)) if receiver.reference.is_none()
-                        ),
-                        "cut output must consume the non-cloneable slot owner"
-                    );
+                    assert!(function.sig.asyncness.is_some());
+                    assert!(matches!(
+                        function.sig.inputs.first(),
+                        Some(syn::FnArg::Receiver(receiver)) if receiver.reference.is_none()
+                    ));
                     cut_methods.insert(function.sig.ident.to_string());
                 }
             }
@@ -2391,13 +1463,10 @@ fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
         }
     }
 
-    assert_eq!(
-        cut_structs, 1,
-        "exactly one immutable export-cut type is allowed"
-    );
+    assert_eq!(cut_structs, 1, "exactly one export-cut type is allowed");
     assert_eq!(
         capture_methods, 1,
-        "exactly one served export-cut capture surface is allowed"
+        "exactly one export-cut capture is allowed"
     );
     assert_eq!(
         cut_methods,
@@ -2405,496 +1474,9 @@ fn served_stream_export_cut_is_hidden_move_only_and_non_forgeable() {
             "into_jsonl".to_string(),
             "write_chunks".to_string(),
             "write_to".to_string(),
-        ]),
-        "the hidden cut may only be consumed through its bounded output conveniences"
+        ])
     );
-    assert!(
-        !contents.contains("impl Clone for ExportCut"),
-        "ExportCut must remain non-cloneable"
-    );
-}
-
-#[test]
-fn served_graph_stream_status_bridge_has_only_graph_logical_fields() {
-    let path = engine_src_root().join("db/omnigraph/stream_status.rs");
-    let contents = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    let ast = parse_rust_source(&contents, "db/omnigraph/stream_status.rs");
-    let expected_types = BTreeSet::from([
-        "GraphStreamDeclaration".to_string(),
-        "GraphStreamDeclarationStatus".to_string(),
-        "GraphStreamDrainStatus".to_string(),
-        "GraphStreamDriverErrorStatus".to_string(),
-        "GraphStreamDriverStatus".to_string(),
-        "GraphStreamLastFoldStatus".to_string(),
-        "GraphStreamOperationalStatus".to_string(),
-        "GraphStreamPendingStatus".to_string(),
-        "GraphStreamRebuildBlocker".to_string(),
-        "GraphStreamRebuildStatus".to_string(),
-        "GraphStreamStrictBlockStatus".to_string(),
-        "GraphStreamTokenCounts".to_string(),
-    ]);
-    let allowed_fields = BTreeSet::from([
-        "arrow_bytes",
-        "authoritative",
-        "batches",
-        "blockers",
-        "cold_replay",
-        "count",
-        "dead_lettered",
-        "dead_lettered_count",
-        "declaration",
-        "drain",
-        "driver",
-        "enrolled_declarations",
-        "flushed",
-        "goal",
-        "initiated_at",
-        "input_bytes",
-        "input_rows",
-        "kind",
-        "last_completion_kind",
-        "last_error",
-        "last_fold",
-        "lifecycle",
-        "lifecycle_revision",
-        "manifest_version",
-        "outcome",
-        "pending",
-        "pending_count",
-        "phase",
-        "present",
-        "profile_mode",
-        "profile_revision",
-        "published_open_folds",
-        "ready",
-        "recorded_at",
-        "rebuild",
-        "recovery",
-        "recovery_pending_count",
-        "retry_in_ms",
-        "rows",
-        "scope",
-        "state",
-        "strict_block",
-        "token_counts",
-        "type_name",
-        "violation_code",
-        "visible_bytes",
-        "visible_rows",
-        "withdrawn",
-        "withdrawn_count",
-    ]);
-    let mut seen_types = BTreeSet::new();
-    let mut bridge_count = 0;
-
-    let check_fields = |type_name: &str, fields: &syn::Fields| {
-        for field in fields {
-            let Some(name) = field.ident.as_ref().map(ToString::to_string) else {
-                continue;
-            };
-            assert!(
-                allowed_fields.contains(name.as_str()),
-                "served graph status type {type_name} exposes unreviewed field '{name}'"
-            );
-        }
-    };
-
-    for item in &ast.items {
-        match item {
-            Item::Struct(item) if item.ident.to_string().starts_with("GraphStream") => {
-                let name = item.ident.to_string();
-                seen_types.insert(name.clone());
-                assert!(matches!(item.vis, Visibility::Public(_)));
-                assert!(has_doc_hidden(&item.attrs));
-                check_fields(&name, &item.fields);
-            }
-            Item::Enum(item) if item.ident.to_string().starts_with("GraphStream") => {
-                let name = item.ident.to_string();
-                seen_types.insert(name.clone());
-                assert!(matches!(item.vis, Visibility::Public(_)));
-                assert!(has_doc_hidden(&item.attrs));
-                for variant in &item.variants {
-                    check_fields(&name, &variant.fields);
-                }
-            }
-            Item::Impl(item) if item.trait_.is_none() && is_omnigraph_type(&item.self_ty) => {
-                for member in &item.items {
-                    let syn::ImplItem::Fn(function) = member else {
-                        continue;
-                    };
-                    if function.sig.ident != "capture_served_graph_stream_status" {
-                        continue;
-                    }
-                    bridge_count += 1;
-                    assert!(matches!(function.vis, Visibility::Public(_)));
-                    assert!(function.sig.asyncness.is_some());
-                    assert!(has_doc_hidden(&function.attrs));
-                    assert!(return_type_contains_identifier(
-                        &function.sig.output,
-                        "GraphStreamOperationalStatus"
-                    ));
-                    assert!(!return_type_contains_identifier(
-                        &function.sig.output,
-                        "StreamOperationalStatus"
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    assert_eq!(
-        seen_types, expected_types,
-        "graph status type registry drifted"
-    );
-    assert_eq!(
-        bridge_count, 1,
-        "there must be exactly one checked served graph status bridge"
-    );
-}
-
-#[test]
-fn served_graph_stream_controls_are_graph_only_and_redacted() {
-    let relative = "db/omnigraph/stream_management.rs";
-    let path = engine_src_root().join(relative);
-    let contents = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    let ast = parse_rust_source(&contents, relative);
-    let expected_fields = BTreeMap::from([
-        (
-            "GraphStreamEnsureIndicesResult".to_string(),
-            BTreeSet::from(["changed".to_string(), "pending_index_count".to_string()]),
-        ),
-        (
-            "GraphStreamOptimizeResult".to_string(),
-            BTreeSet::from([
-                "changed".to_string(),
-                "pending_index_count".to_string(),
-                "requires_repair".to_string(),
-            ]),
-        ),
-        (
-            "GraphStreamResumeResult".to_string(),
-            BTreeSet::from([
-                "already_open_declarations".to_string(),
-                "enrolled_declarations".to_string(),
-                "profile_revision".to_string(),
-                "resumed_declarations".to_string(),
-            ]),
-        ),
-    ]);
-    let expected_methods = BTreeSet::from([
-        "ensure_served_graph_stream_indices_as".to_string(),
-        "optimize_served_graph_stream_as".to_string(),
-        "resume_served_graph_stream_as".to_string(),
-    ]);
-    let mut seen_fields = BTreeMap::new();
-    let mut seen_methods = BTreeSet::new();
-
-    for item in &ast.items {
-        match item {
-            Item::Struct(item) if item.ident.to_string().starts_with("GraphStream") => {
-                assert!(matches!(item.vis, Visibility::Public(_)));
-                assert!(has_doc_hidden(&item.attrs));
-                let fields = item
-                    .fields
-                    .iter()
-                    .map(|field| {
-                        assert!(
-                            matches!(field.vis, Visibility::Public(_)),
-                            "transport must project the graph aggregate without private engine state"
-                        );
-                        assert!(
-                            ![
-                                "PendingIndex",
-                                "TableIdentity",
-                                "TableOptimizeStats",
-                                "String",
-                            ]
-                            .iter()
-                            .any(|forbidden| type_contains_identifier(&field.ty, forbidden)),
-                            "graph stream result {} exposes selector or physical detail",
-                            item.ident
-                        );
-                        field.ident.as_ref().unwrap().to_string()
-                    })
-                    .collect::<BTreeSet<_>>();
-                seen_fields.insert(item.ident.to_string(), fields);
-            }
-            Item::Impl(item) if item.trait_.is_none() && is_omnigraph_type(&item.self_ty) => {
-                for member in &item.items {
-                    let syn::ImplItem::Fn(function) = member else {
-                        continue;
-                    };
-                    if !matches!(function.vis, Visibility::Public(_)) {
-                        continue;
-                    }
-                    assert!(function.sig.asyncness.is_some());
-                    assert!(has_doc_hidden(&function.attrs));
-                    assert_eq!(
-                        function.sig.inputs.len(),
-                        2,
-                        "served graph controls may accept only self plus graph actor authority"
-                    );
-                    let Some(syn::FnArg::Typed(actor)) = function.sig.inputs.iter().nth(1) else {
-                        panic!("served graph control must accept actor_id after self");
-                    };
-                    let syn::Pat::Ident(actor_name) = actor.pat.as_ref() else {
-                        panic!("served graph control actor must be a simple binding");
-                    };
-                    assert_eq!(actor_name.ident, "actor_id");
-                    assert!(type_contains_identifier(&actor.ty, "str"));
-                    seen_methods.insert(function.sig.ident.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    assert_eq!(seen_fields, expected_fields);
-    assert_eq!(seen_methods, expected_methods);
-    for forbidden in ["table_key", "stable_table_id", "table_incarnation_id"] {
-        assert!(
-            !contents.contains(&format!("pub {forbidden}:")),
-            "served graph stream control must not expose '{forbidden}'"
-        );
-    }
-}
-
-#[test]
-fn stream_driver_runtime_status_remains_advisory_and_failpoints_only() {
-    let path = engine_src_root().join("db/omnigraph/stream_driver.rs");
-    let contents = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    let ast = parse_rust_source(&contents, "db/omnigraph/stream_driver.rs");
-    let mut bridge_count = 0;
-
-    for item in &ast.items {
-        match item {
-            Item::Struct(item) if item.ident.to_string().starts_with("StreamFoldDriver") => {
-                assert!(
-                    !matches!(item.vis, Visibility::Public(_)),
-                    "process-local driver status types must not become a public SDK contract: {}",
-                    item.ident
-                );
-            }
-            Item::Enum(item) if item.ident.to_string().starts_with("StreamFoldDriver") => {
-                assert!(
-                    !matches!(item.vis, Visibility::Public(_)),
-                    "process-local driver status types must not become a public SDK contract: {}",
-                    item.ident
-                );
-            }
-            Item::Impl(item) if item.trait_.is_none() && is_omnigraph_type(&item.self_ty) => {
-                for member in &item.items {
-                    let syn::ImplItem::Fn(function) = member else {
-                        continue;
-                    };
-                    let name = function.sig.ident.to_string();
-                    if !matches!(function.vis, Visibility::Public(_))
-                        || function.sig.asyncness.is_some()
-                    {
-                        continue;
-                    }
-                    bridge_count += 1;
-                    assert_eq!(
-                        name, "failpoint_stream_fold_driver_status_for_test",
-                        "a second driver-status surface would require an explicit public contract"
-                    );
-                    assert!(
-                        cfg_has_exact_feature(&function.attrs, "failpoints"),
-                        "the process-local status bridge must compile only with failpoints"
-                    );
-                    assert!(
-                        has_doc_hidden(&function.attrs),
-                        "the failpoint status bridge must stay hidden from generated SDK docs"
-                    );
-                    assert!(matches!(
-                        &function.sig.output,
-                        syn::ReturnType::Type(_, output) if is_named_type(output, "String")
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    assert_eq!(
-        bridge_count, 1,
-        "exactly one failpoints-only JSON bridge may expose process-local driver status"
-    );
-}
-
-#[test]
-fn stream_dead_letter_cost_seam_remains_hidden_and_failpoints_only() {
-    let path = engine_src_root().join("db/omnigraph/stream_dead_letter.rs");
-    let contents = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    let ast = parse_rust_source(&contents, "db/omnigraph/stream_dead_letter.rs");
-    let mut measurement_types = 0;
-    let mut measurement_functions = 0;
-
-    for item in &ast.items {
-        let (name, visibility, attributes, is_function) = match item {
-            Item::Struct(item) if item.ident == "StreamDeadLetterEncodingCostForTest" => (
-                item.ident.to_string(),
-                &item.vis,
-                item.attrs.as_slice(),
-                false,
-            ),
-            Item::Fn(item)
-                if item.sig.ident == "failpoint_measure_stream_dead_letter_object_for_test" =>
-            {
-                (
-                    item.sig.ident.to_string(),
-                    &item.vis,
-                    item.attrs.as_slice(),
-                    true,
-                )
-            }
-            _ => continue,
-        };
-        assert!(
-            matches!(visibility, Visibility::Public(_)),
-            "the integration cost owner needs the explicit public test seam '{name}'"
-        );
-        assert!(
-            cfg_has_exact_feature(attributes, "failpoints"),
-            "dead-letter cost seam '{name}' must compile only with failpoints"
-        );
-        assert!(
-            has_doc_hidden(attributes),
-            "dead-letter cost seam '{name}' must stay out of generated SDK docs"
-        );
-        if is_function {
-            measurement_functions += 1;
-        } else {
-            measurement_types += 1;
-        }
-    }
-
-    assert_eq!(measurement_types, 1, "the F6b4 seam owns one result type");
-    assert_eq!(
-        measurement_functions, 1,
-        "the F6b4 seam owns one measurement function"
-    );
-
-    for relative in ["db/omnigraph.rs", "db/mod.rs"] {
-        let path = engine_src_root().join(relative);
-        let contents = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-        let ast = parse_rust_source(&contents, relative);
-        for expected in [
-            "StreamDeadLetterEncodingCostForTest",
-            "failpoint_measure_stream_dead_letter_object_for_test",
-        ] {
-            let exports = ast
-                .items
-                .iter()
-                .filter_map(|item| match item {
-                    Item::Use(item)
-                        if matches!(item.vis, Visibility::Public(_))
-                            && use_tree_contains_identifier(&item.tree, expected) =>
-                    {
-                        Some(item)
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                exports.len(),
-                1,
-                "{relative} must own exactly one public reexport of '{expected}'"
-            );
-            assert!(
-                cfg_has_exact_feature(&exports[0].attrs, "failpoints"),
-                "{relative} reexport '{expected}' must use exactly cfg(feature = \"failpoints\")"
-            );
-            assert!(
-                has_doc_hidden(&exports[0].attrs),
-                "{relative} reexport '{expected}' must stay out of generated SDK docs"
-            );
-        }
-    }
-}
-
-#[test]
-fn token_index_cost_seams_remain_hidden_and_failpoints_only() {
-    for (relative, expected) in [
-        (
-            "db/omnigraph/stream_retirement.rs",
-            "failpoint_reconcile_stream_token_lookup_index_for_cost_test",
-        ),
-        (
-            "db/omnigraph/stream_status.rs",
-            "failpoint_stream_profile_receipt_lookup_for_cost_test",
-        ),
-    ] {
-        let path = engine_src_root().join(relative);
-        let contents = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-        let ast = parse_rust_source(&contents, relative);
-        let functions = ast
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Impl(implementation) if is_omnigraph_type(&implementation.self_ty) => {
-                    implementation.items.iter().find_map(|item| match item {
-                        syn::ImplItem::Fn(function) if function.sig.ident == expected => {
-                            Some(function)
-                        }
-                        _ => None,
-                    })
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            functions.len(),
-            1,
-            "{relative} must own exactly one F6b7 cost seam '{expected}'"
-        );
-        let function = functions[0];
-        assert!(matches!(function.vis, Visibility::Public(_)));
-        assert!(function.sig.asyncness.is_some());
-        assert!(
-            cfg_has_exact_feature(&function.attrs, "failpoints"),
-            "F6b7 seam '{expected}' must compile only with failpoints"
-        );
-        assert!(
-            has_doc_hidden(&function.attrs),
-            "F6b7 seam '{expected}' must stay out of generated SDK docs"
-        );
-    }
-
-    let relative = "db/manifest/token_store.rs";
-    let path = engine_src_root().join(relative);
-    let contents = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    let ast = parse_rust_source(&contents, relative);
-    for expected in [
-        "StreamTokenLookupIndexCostProof",
-        "prepare_stream_token_lookup_index_reconciliation_for_cost_test",
-        "reconcile_stream_token_lookup_index_for_cost_test",
-        "prove_stream_token_lookup_index_reconciliation_for_cost_test",
-    ] {
-        let attributes = ast.items.iter().filter_map(|item| match item {
-            Item::Struct(item) if item.ident == expected => Some(&item.attrs),
-            Item::Fn(item) if item.sig.ident == expected => Some(&item.attrs),
-            _ => None,
-        });
-        let attributes = attributes.collect::<Vec<_>>();
-        assert_eq!(
-            attributes.len(),
-            1,
-            "{relative} must own exactly one F6b7 low-level cost item '{expected}'"
-        );
-        assert!(
-            cfg_has_exact_test_or_feature(attributes[0], "failpoints"),
-            "F6b7 low-level cost item '{expected}' must use exactly cfg(any(test, feature = \"failpoints\"))"
-        );
-    }
+    assert!(!contents.contains("impl Clone for ExportCut"));
 }
 
 fn low_level_async_surfaces(src: &Path, owner: &str) -> BTreeSet<(String, String, String)> {
@@ -2941,13 +1523,13 @@ fn is_gateway_owner(relative: &str, owner: &str) -> bool {
         .any(|surface| surface.file == relative && surface.owner == owner)
 }
 
-fn callable_gateway_surfaces(engine_src: &Path) -> BTreeSet<(String, String, String)> {
+fn callable_gateway_surfaces(src: &Path) -> BTreeSet<(String, String, String)> {
     let mut surfaces = BTreeSet::new();
-    let mut files = walk_rust_files(engine_src)
+    let mut files = walk_rust_files(src)
         .into_iter()
-        .map(|path| (relative_to_src(engine_src, &path), path))
+        .map(|path| (relative_to_src(src, &path), path))
         .collect::<Vec<_>>();
-    let storage_src = sibling_crate_src(engine_src, "omnigraph-storage");
+    let storage_src = sibling_crate_src(src, "omnigraph-storage");
     files.extend(walk_rust_files(&storage_src).into_iter().map(|path| {
         (
             format!("omnigraph-storage/{}", relative_to_src(&storage_src, &path)),
@@ -3163,8 +1745,7 @@ fn callable_storage_and_manifest_gateway_surfaces_are_registered() {
 fn graph_visible_keyed_writes_cannot_reach_unfenced_append() {
     let src = engine_src_root();
     let mut violations = Vec::new();
-    for file in protocol_scan_files(&src) {
-        let relative = relative_to_src(&src, &file);
+    for (relative, file) in durable_protocol_scan_files(&src) {
         // This is the one sealed forwarding boundary. TableStore's inherent
         // implementation and its cfg(test) primitive coverage contain no
         // graph-facing call site.
@@ -3303,366 +1884,6 @@ fn graph_visible_write_chokepoints_are_registered() {
          allow-list is insufficient because a second caller in an approved file is \
          still a new writer:\n  {}",
         violations.join("\n  ")
-    );
-}
-
-/// RFC-026 B2a deliberately retains every raw MemWAL object.  Generic graph
-/// maintenance may block on stream lifecycle authority, and exact stream
-/// recovery may classify its own bound effects, but neither is permission to
-/// reinterpret, adopt, or delete `_mem_wal` storage.
-#[test]
-fn retain_all_mem_wal_has_no_production_reclamation_or_adoption_route() {
-    let src = engine_src_root();
-    let expected_raw_owners = RAW_MEM_WAL_PATH_OWNERS
-        .iter()
-        .map(|(file, function, count)| (((*file).to_string(), (*function).to_string()), *count))
-        .collect::<BTreeMap<_, _>>();
-    let tracked_delete_names = retain_all_tracked_delete_names(RETAIN_ALL_DELETE_CALLS);
-    let expected_delete_calls = RETAIN_ALL_DELETE_CALLS
-        .iter()
-        .map(|callsite| {
-            (
-                (
-                    callsite.0.to_string(),
-                    callsite.1.to_string(),
-                    callsite.2.to_string(),
-                    callsite.3.to_string(),
-                ),
-                callsite.4,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(
-        expected_delete_calls.len(),
-        RETAIN_ALL_DELETE_CALLS.len(),
-        "retain-all delete callsite keys must be unique"
-    );
-    let expected_checked_maintenance_head_reads = RETAIN_ALL_CHECKED_MAINTENANCE_HEAD_READS
-        .iter()
-        .map(|(file, function, count)| (((*file).to_string(), (*function).to_string()), *count))
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(
-        expected_checked_maintenance_head_reads.len(),
-        RETAIN_ALL_CHECKED_MAINTENANCE_HEAD_READS.len(),
-        "checked-maintenance HEAD-read dispositions must be unique"
-    );
-    let mut observed_raw_owners = BTreeMap::new();
-    let mut observed_delete_calls = BTreeMap::new();
-    let mut observed_checked_maintenance_head_reads = BTreeMap::new();
-    let mut observed_checked_maintenance_mem_wal_segments = BTreeMap::new();
-    let mut reclamation_symbols = Vec::new();
-    let mut maintenance_mem_wal_uses = Vec::new();
-    let mut hidden_delete_routes = Vec::new();
-    let mut mem_wal_destructive_calls = Vec::new();
-
-    for (relative, file) in retain_all_production_files(&src) {
-        let contents = std::fs::read_to_string(&file)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
-        let ast = parse_rust_source(&contents, &relative);
-        let inventory = retain_all_mem_wal_inventory(&ast);
-        let calls = call_inventory(&ast);
-
-        for (function, count) in inventory.raw_path_owners {
-            observed_raw_owners.insert((relative.clone(), function), count);
-        }
-        reclamation_symbols.extend(
-            inventory
-                .reclamation_symbols
-                .into_iter()
-                .map(|(function, symbol)| format!("{relative}::{function}: {symbol}")),
-        );
-        hidden_delete_routes.extend(
-            calls
-                .retain_all_hidden_route_hits
-                .iter()
-                .map(|hit| format!("{relative}: {hit}")),
-        );
-        for ((function, primitive, arguments), count) in &calls.call_shapes_by_function {
-            if tracked_delete_names.contains(primitive) {
-                *observed_delete_calls
-                    .entry((
-                        relative.clone(),
-                        function.clone(),
-                        primitive.clone(),
-                        arguments.clone(),
-                    ))
-                    .or_default() += *count;
-            }
-        }
-
-        if matches!(
-            relative.as_str(),
-            "table_store/mem_wal.rs" | "table_store/mem_wal/worker.rs"
-        ) {
-            for primitive in [
-                "cleanup",
-                "cleanup_old_versions",
-                "compact",
-                "delete",
-                "delete_prefix",
-                "garbage_collect",
-                "prune",
-                "purge",
-                "reclaim",
-                "remove_dir",
-                "remove_dir_all",
-                "remove_file",
-                "trim",
-                "vacuum",
-            ] {
-                if let Some(count) = calls.counts.get(primitive) {
-                    mem_wal_destructive_calls
-                        .push(format!("{relative}: `{primitive}` called {count} time(s)"));
-                }
-            }
-        }
-
-        if RETAIN_ALL_MAINTENANCE_FILES.contains(&relative.as_str()) {
-            for ((function, primitive, shape), count) in &calls.call_shapes_by_function {
-                if primitive == "capture_current_head_witness"
-                    && shape.starts_with(
-                        "crate::table_store::mem_wal::capture_current_head_witness => ",
-                    )
-                {
-                    *observed_checked_maintenance_head_reads
-                        .entry((relative.clone(), function.clone()))
-                        .or_default() += *count;
-                }
-            }
-            for (function, usage) in &inventory.mem_wal_uses {
-                let key = (relative.clone(), function.clone());
-                if usage == "mem_wal" && expected_checked_maintenance_head_reads.contains_key(&key)
-                {
-                    *observed_checked_maintenance_mem_wal_segments
-                        .entry(key)
-                        .or_default() += 1;
-                } else {
-                    maintenance_mem_wal_uses.push(format!("{relative}::{function}: {usage}"));
-                }
-            }
-        }
-        if relative == "db/omnigraph.rs" {
-            maintenance_mem_wal_uses.extend(
-                inventory
-                    .mem_wal_uses
-                    .iter()
-                    .filter(|(function, _)| {
-                        RETAIN_ALL_OMNIGRAPH_METHODS.contains(&function.as_str())
-                    })
-                    .map(|(function, usage)| format!("{relative}::{function}: {usage}")),
-            );
-        }
-    }
-
-    assert_eq!(
-        observed_raw_owners, expected_raw_owners,
-        "raw `_mem_wal` path access must remain confined to the exact bounded read-only inventory and passive lifecycle validators"
-    );
-    let observed_reclamation_symbols =
-        reclamation_symbols
-            .into_iter()
-            .fold(BTreeMap::<_, usize>::new(), |mut counts, symbol| {
-                *counts.entry(symbol).or_default() += 1;
-                counts
-            });
-    let expected_reclamation_symbols = RETAIN_ALL_REBIND_INDEX_TRANSITION_SYMBOLS
-        .iter()
-        .map(|(file, function, symbol, count)| (format!("{file}::{function}: {symbol}"), *count))
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(
-        observed_reclamation_symbols, expected_reclamation_symbols,
-        "retain-all permits only the exact recovery-v18 MemWAL system-index pointer transition; any other reclamation/adoption/reclassification symbol is forbidden"
-    );
-    assert_eq!(
-        observed_checked_maintenance_head_reads, expected_checked_maintenance_head_reads,
-        "checked maintenance may call only the exact registered composite-HEAD witness sites"
-    );
-    assert_eq!(
-        observed_checked_maintenance_mem_wal_segments, expected_checked_maintenance_head_reads,
-        "each checked-maintenance composite-HEAD read must own exactly one registered `mem_wal` path segment"
-    );
-    assert!(
-        maintenance_mem_wal_uses.is_empty(),
-        "cleanup/repair/schema maintenance must derive exclusions from manifest lifecycle authority and never inspect or reinterpret MemWAL objects:\n  {}",
-        maintenance_mem_wal_uses.join("\n  ")
-    );
-    assert!(
-        hidden_delete_routes.is_empty(),
-        "retain-all delete routes may not hide behind aliases or macro tokens:\n  {}",
-        hidden_delete_routes.join("\n  ")
-    );
-    assert_eq!(
-        observed_delete_calls, expected_delete_calls,
-        "retain-all raw-delete route inventory drifted. Runtime-built paths and ancestor-prefix deletes are unsafe even when no symbol spells `_mem_wal`; every sink and caller-provided-path gateway requires an owner/receiver/argument disposition"
-    );
-    assert!(
-        mem_wal_destructive_calls.is_empty(),
-        "the private MemWAL adapter may validate, acknowledge, and fold, but retain-all forbids destructive/reclamation primitives:\n  {}",
-        mem_wal_destructive_calls.join("\n  ")
-    );
-
-    let mem_wal_source = std::fs::read_to_string(src.join("table_store/mem_wal.rs"))
-        .expect("read MemWAL adapter source");
-    let mem_wal_ast = parse_rust_source(&mem_wal_source, "table_store/mem_wal.rs");
-    for helper in ["raw_mem_wal_inventory", "classify_raw_inventory"] {
-        let visibility = mem_wal_ast.items.iter().find_map(|item| match item {
-            Item::Fn(function) if function.sig.ident == helper => Some(&function.vis),
-            _ => None,
-        });
-        assert!(
-            matches!(visibility, Some(Visibility::Inherited)),
-            "raw MemWAL helper `{helper}` must remain module-private so maintenance/recovery cannot turn inventory into an adoption or deletion API"
-        );
-    }
-}
-
-#[test]
-fn retain_all_mem_wal_scanner_rejects_production_delete_but_skips_test_fixture() {
-    let fixture_only = parse_rust_source(
-        r#"
-        #[cfg(test)]
-        mod tests {
-            fn destructive_fixture(storage: &Storage) {
-                let mem_wal_root = "_mem_wal";
-                storage.delete_prefix(mem_wal_root);
-            }
-        }
-
-        #[cfg(test)]
-        const TEST_MEM_WAL_ROOT: &str = "_mem_wal";
-
-        #[cfg(test)]
-        static TEST_MEM_WAL_PATH: &str = "_mem_wal";
-
-        #[cfg(test)]
-        macro_rules! reclaim_mem_wal_fixture {
-            () => {
-                let mem_wal_root = "_mem_wal";
-                mem_wal::reclaim(mem_wal_root);
-            };
-        }
-        "#,
-        "retain-all cfg(test) self-test",
-    );
-    let fixture_inventory = retain_all_mem_wal_inventory(&fixture_only);
-    assert!(fixture_inventory.raw_path_owners.is_empty());
-    assert!(fixture_inventory.reclamation_symbols.is_empty());
-
-    let production = parse_rust_source(
-        r#"
-        fn destructive_production(storage: &Storage) {
-            let mem_wal_root = "_mem_wal";
-            storage.delete_prefix(mem_wal_root);
-            mem_wal::reclaim();
-        }
-        "#,
-        "retain-all production self-test",
-    );
-    let production_inventory = retain_all_mem_wal_inventory(&production);
-    assert_eq!(
-        production_inventory.raw_path_owners,
-        BTreeMap::from([("destructive_production".to_string(), 1)])
-    );
-    assert!(
-        production_inventory
-            .reclamation_symbols
-            .iter()
-            .any(|(_, symbol)| symbol.contains("mem_wal::reclaim"))
-    );
-}
-
-#[test]
-fn retain_all_delete_scanner_catches_opaque_delegated_and_hidden_routes() {
-    let ast = parse_rust_source(
-        r#"
-        use tokio::fs::remove_dir_all as erase_tree;
-
-        macro_rules! hidden_delete {
-            ($storage:expr, $path:expr) => { $storage.delete_prefix($path) };
-        }
-
-        fn direct_maintenance(storage: &Storage, table_root: &str) {
-            storage.delete_prefix(table_root);
-        }
-
-        fn remove_tree(storage: &Storage, path: &str) {
-            storage.delete_prefix(path);
-        }
-
-        fn delegated_maintenance(storage: &Storage, runtime_path: &str) {
-            remove_tree(storage, runtime_path);
-        }
-
-        #[cfg(test)]
-        mod fixtures {
-            fn teardown(storage: &Storage, root: &str) {
-                storage.delete_prefix(root);
-            }
-        }
-        "#,
-        "retain-all opaque destructive-route self-test",
-    );
-    let inventory = call_inventory(&ast);
-    const SYNTHETIC_GATEWAYS: &[RetainAllDeleteCallsite] = &[(
-        "synthetic.rs",
-        "remove_tree",
-        "delete_prefix",
-        "storage => path",
-        1,
-        RetainAllDeleteScope::GenericGateway,
-    )];
-    let tracked = retain_all_tracked_delete_names(SYNTHETIC_GATEWAYS);
-    let observed = inventory
-        .call_shapes_by_function
-        .iter()
-        .filter(|((_, primitive, _), _)| tracked.contains(primitive))
-        .map(|(key, count)| (key.clone(), *count))
-        .collect::<BTreeMap<_, _>>();
-
-    // Neither route needs to spell `_mem_wal`: a table/root prefix is already
-    // ancestor-dangerous. Classifying `remove_tree` as a generic gateway also
-    // causes the production filter to inventory its caller edge.
-    assert_eq!(
-        observed.get(&(
-            "direct_maintenance".to_string(),
-            "delete_prefix".to_string(),
-            "storage => table_root".to_string(),
-        )),
-        Some(&1)
-    );
-    assert_eq!(
-        observed.get(&(
-            "remove_tree".to_string(),
-            "delete_prefix".to_string(),
-            "storage => path".to_string(),
-        )),
-        Some(&1)
-    );
-    assert_eq!(
-        observed.get(&(
-            "delegated_maintenance".to_string(),
-            "remove_tree".to_string(),
-            "remove_tree => storage, runtime_path".to_string(),
-        )),
-        Some(&1)
-    );
-    assert!(
-        inventory
-            .call_shapes_by_function
-            .keys()
-            .all(|(function, _, _)| function != "teardown")
-    );
-    assert!(
-        inventory
-            .retain_all_hidden_route_hits
-            .iter()
-            .any(|hit| hit.contains("remove_dir_all") && hit.contains("erase_tree"))
-    );
-    assert!(
-        inventory
-            .retain_all_hidden_route_hits
-            .iter()
-            .any(|hit| hit.contains("delete_prefix"))
     );
 }
 
@@ -4008,10 +2229,6 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
             "db/graph_coordinator.rs",
             "commit_changes_with_intent_and_expected",
         ),
-        (
-            "db/graph_coordinator.rs",
-            "commit_operational_changes_with_expected",
-        ),
     ];
     for (relative, method) in methods {
         let file = src.join(relative);
@@ -4067,79 +2284,6 @@ fn method_call_count(block: &syn::Block, method_name: &str) -> usize {
     };
     counter.visit_block(block);
     counter.count
-}
-
-fn function_call_count(block: &syn::Block, function_name: &str) -> usize {
-    struct Counter<'a> {
-        function_name: &'a str,
-        count: usize,
-    }
-
-    impl<'ast> Visit<'ast> for Counter<'_> {
-        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-            if matches!(
-                node.func.as_ref(),
-                Expr::Path(path)
-                    if path.path.segments.last().is_some_and(|segment| {
-                        segment.ident == self.function_name
-                    })
-            ) {
-                self.count += 1;
-            }
-            visit::visit_expr_call(self, node);
-        }
-    }
-
-    let mut counter = Counter {
-        function_name,
-        count: 0,
-    };
-    counter.visit_block(block);
-    counter.count
-}
-
-#[test]
-fn ordinary_stream_authority_capture_never_relists_retained_binding_history() {
-    let relative = "db/omnigraph/stream_ingest.rs";
-    let file = engine_src_root().join(relative);
-    let contents = std::fs::read_to_string(&file)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
-    let ast = parse_rust_source(&contents, relative);
-    let function = ast
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Impl(implementation) if is_omnigraph_type(&implementation.self_ty) => {
-                implementation.items.iter().find_map(|item| match item {
-                    syn::ImplItem::Fn(function)
-                        if function.sig.ident == "capture_stream_authority_for_lifecycle" =>
-                    {
-                        Some(function)
-                    }
-                    _ => None,
-                })
-            }
-            _ => None,
-        })
-        .next()
-        .expect("missing Omnigraph::capture_stream_authority_for_lifecycle");
-
-    assert_eq!(
-        function_call_count(
-            &function.block,
-            "validate_b1_lifecycle_current_binding_physical_state"
-        ),
-        1,
-        "ordinary stream authority capture must validate the selected current binding exactly once"
-    );
-    assert_eq!(
-        function_call_count(
-            &function.block,
-            "validate_b1_lifecycle_physical_state_with_binding_inventory"
-        ),
-        0,
-        "ordinary stream authority capture must not enumerate retained physical history"
-    );
 }
 
 #[test]
