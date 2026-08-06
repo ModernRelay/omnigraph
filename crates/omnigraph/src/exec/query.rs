@@ -658,6 +658,62 @@ fn search_filter_variable(filter: &IRFilter) -> Option<&str> {
     }
 }
 
+/// Collect every binding variable referenced by an expression into `vars`.
+fn collect_expr_variables(expr: &IRExpr, vars: &mut HashSet<String>) {
+    match expr {
+        IRExpr::PropAccess { variable, .. } => {
+            vars.insert(variable.clone());
+        }
+        IRExpr::Nearest {
+            variable, query, ..
+        } => {
+            vars.insert(variable.clone());
+            collect_expr_variables(query, vars);
+        }
+        IRExpr::Search { field, query }
+        | IRExpr::MatchText { field, query }
+        | IRExpr::Bm25 { field, query } => {
+            collect_expr_variables(field, vars);
+            collect_expr_variables(query, vars);
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            collect_expr_variables(field, vars);
+            collect_expr_variables(query, vars);
+            if let Some(e) = max_edits {
+                collect_expr_variables(e, vars);
+            }
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
+            collect_expr_variables(primary, vars);
+            collect_expr_variables(secondary, vars);
+            if let Some(e) = k {
+                collect_expr_variables(e, vars);
+            }
+        }
+        IRExpr::Variable(v) => {
+            vars.insert(v.clone());
+        }
+        IRExpr::Aggregate { arg, .. } => collect_expr_variables(arg, vars),
+        IRExpr::Param(_) | IRExpr::Literal(_) | IRExpr::AliasRef(_) => {}
+    }
+}
+
+/// The set of binding variables a filter references, across both operands.
+fn filter_variables(filter: &IRFilter) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    collect_expr_variables(&filter.left, &mut vars);
+    collect_expr_variables(&filter.right, &mut vars);
+    vars
+}
+
 fn execute_pipeline<'a>(
     pipeline: &'a [IROp],
     params: &'a ParamMap,
@@ -668,21 +724,67 @@ fn execute_pipeline<'a>(
     search_mode: &'a SearchMode,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
-        // Pre-pass: collect search filters that need to be hoisted to NodeScan
+        // Pre-pass: hoist filters onto the op that introduces their binding.
+        // Search filters always move to the binding's NodeScan (applied via
+        // `scanner.full_text_search`). Scalar filters referencing exactly one
+        // binding move to that binding's NodeScan (`filter_expr`, which also
+        // arms `prefilter(true)` so a `nearest`/`bm25` on the same scanner is
+        // filtered BEFORE top-k instead of starved after it) or into the
+        // introducing Expand's `dst_filters` (applied during hydration).
+        // Multi-binding filters (e.g. the cycle-closing `temp.id = dst.id`)
+        // and filters on a variable not introduced here (an outer binding
+        // inside an anti-join pipeline) keep their end-of-pipeline placement.
+        let mut scan_vars: HashSet<&str> = HashSet::new();
+        let mut expand_dst_vars: HashSet<&str> = HashSet::new();
+        for op in pipeline {
+            match op {
+                IROp::NodeScan { variable, .. } => {
+                    scan_vars.insert(variable.as_str());
+                }
+                IROp::Expand { dst_var, .. } => {
+                    expand_dst_vars.insert(dst_var.as_str());
+                }
+                IROp::Filter(_) | IROp::AntiJoin { .. } => {}
+            }
+        }
+
         let mut hoisted_search_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
+        let mut hoisted_scan_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
+        let mut hoisted_dst_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
         let mut hoisted_indices: HashSet<usize> = HashSet::new();
         for (i, op) in pipeline.iter().enumerate() {
-            if let IROp::Filter(filter) = op {
-                if is_search_filter(filter) {
-                    if let Some(var) = search_filter_variable(filter) {
-                        hoisted_search_filters
-                            .entry(var.to_string())
-                            .or_default()
-                            .push(filter.clone());
-                        hoisted_indices.insert(i);
-                    }
+            let IROp::Filter(filter) = op else { continue };
+            if is_search_filter(filter) {
+                if let Some(var) = search_filter_variable(filter) {
+                    hoisted_search_filters
+                        .entry(var.to_string())
+                        .or_default()
+                        .push(filter.clone());
+                    hoisted_indices.insert(i);
                 }
+                continue;
             }
+            let mut vars = filter_variables(filter).into_iter();
+            let (Some(var), None) = (vars.next(), vars.next()) else {
+                continue;
+            };
+            // Only pushable filters may leave their in-memory position:
+            // `execute_node_scan` silently ignores filters `ir_filter_to_expr`
+            // cannot lower (no post-scan fallback there). The schema arg only
+            // affects a literal's type, never Some-vs-None, so `None` here
+            // gives the same verdict as the scan site.
+            if ir_filter_to_expr(filter, params, None).is_none() {
+                continue;
+            }
+            let target = if scan_vars.contains(var.as_str()) {
+                &mut hoisted_scan_filters
+            } else if expand_dst_vars.contains(var.as_str()) {
+                &mut hoisted_dst_filters
+            } else {
+                continue;
+            };
+            target.entry(var).or_default().push(filter.clone());
+            hoisted_indices.insert(i);
         }
 
         for (i, op) in pipeline.iter().enumerate() {
@@ -696,9 +798,12 @@ fn execute_pipeline<'a>(
                     type_name,
                     filters,
                 } => {
-                    // Merge inline filters with hoisted search filters
+                    // Merge inline filters with hoisted search + scalar filters
                     let mut all_filters: Vec<IRFilter> = filters.clone();
                     if let Some(extra) = hoisted_search_filters.get(variable) {
+                        all_filters.extend(extra.iter().cloned());
+                    }
+                    if let Some(extra) = hoisted_scan_filters.get(variable) {
                         all_filters.extend(extra.iter().cloned());
                     }
                     let batch = execute_node_scan(
@@ -732,6 +837,11 @@ fn execute_pipeline<'a>(
                     max_hops,
                     dst_filters,
                 } => {
+                    // Merge lowered destination filters with hoisted ones
+                    let mut all_dst_filters: Vec<IRFilter> = dst_filters.clone();
+                    if let Some(extra) = hoisted_dst_filters.get(dst_var) {
+                        all_dst_filters.extend(extra.iter().cloned());
+                    }
                     if let Some(batch) = wide.as_mut() {
                         execute_expand(
                             batch,
@@ -745,7 +855,7 @@ fn execute_pipeline<'a>(
                             dst_type,
                             *min_hops,
                             *max_hops,
-                            dst_filters,
+                            &all_dst_filters,
                             params,
                         )
                         .await?;
