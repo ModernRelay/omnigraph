@@ -548,6 +548,7 @@ gateway_surfaces! {
         "scan_proven_insert_delta_bounded",
         "materialize_blob_batch", "scan_stream", "scan_stream_bounded",
         "scan_stream_with", "scan", "scan_with", "scan_edges_by_endpoint",
+        "scan_edges_by_endpoint_projected",
         "key_column_index_coverage", "has_unindexed_fragments", "count_rows",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
         "scan_with_pending_materialized_blobs", "count_rows_with_staged",
