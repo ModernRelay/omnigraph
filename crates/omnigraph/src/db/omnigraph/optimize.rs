@@ -282,6 +282,9 @@ async fn optimize_all_tables_with_mode(
     // before a physical maintenance effect instead of acquiring a late lease.
     let admission_txn = db.open_write_txn(None).await?;
     let stream_admission_keys = Omnigraph::stream_admission_keys_for_snapshot(&admission_txn.base);
+    crate::failpoints::maybe_fail(
+        crate::failpoints::names::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
+    )?;
     // Every physical writer joins the root profile window, even when no lane
     // is enrolled in the table it happens to touch. RETIRED is graph-global,
     // and retirement must be able to drain ambient maintenance before fixing

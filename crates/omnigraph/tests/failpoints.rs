@@ -7422,6 +7422,99 @@ async fn seed_optimize_late_sidecar_race(dir: &tempfile::TempDir) {
     helpers::commit_many(&mut seed, 4).await;
 }
 
+/// Optimize captures a complete authority token before entering any writer
+/// gate, then revalidates it after schema -> main -> table (`optimize.rs`, the
+/// comment above `open_write_txn`). That revalidation is the only thing that
+/// stops a maintenance run from planning against a graph that moved while it
+/// waited — v6 had no such check, it used a bare fresh snapshot.
+///
+/// The token is carried in a binding named `admission_txn`, which reads as
+/// RFC-026 stream machinery. It is not: it is also the authority proof and the
+/// source of the recovery sidecar's `RecoveryAuthorityToken`. Nothing pinned
+/// that second duty, so removing the binding with the streaming code would
+/// have silently downgraded optimize/cleanup/repair from
+/// reject-on-authority-drift to read-whatever-is-fresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    seed_optimize_late_sidecar_race(&dir).await;
+
+    let optimize_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let mut writer_db = Omnigraph::open(&uri).await.unwrap();
+    let person_uri = node_table_uri(optimize_db.as_ref(), "Person").await;
+    let graph_head_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
+
+    // Park Optimize with its authority token captured but no gate held.
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(
+        names::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
+    );
+    let optimize_task_db = std::sync::Arc::clone(&optimize_db);
+    let optimize = tokio::spawn(async move { optimize_task_db.optimize().await });
+    rendezvous.wait_until_reached().await;
+
+    // Advance the graph head underneath it with an ordinary committed write, so
+    // Optimize's captured token is now stale in `graph_head`.
+    mutate_main(
+        &mut writer_db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "authority-mover")], &[("$age", 41)]),
+    )
+    .await
+    .expect("the concurrent write must commit while Optimize waits");
+    let graph_head_after = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    assert_ne!(
+        graph_head_before, graph_head_after,
+        "the fixture must actually move the graph head, or this test is vacuous",
+    );
+    // Baseline taken AFTER the concurrent write: that write legitimately moves
+    // Person. What must not move it again is Optimize.
+    let person_head_after_write = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+
+    rendezvous.release();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
+        .await
+        .expect("Optimize task hung after releasing the authority-capture rendezvous")
+        .unwrap();
+    drop(rendezvous);
+
+    let error = outcome.expect_err(
+        "Optimize must refuse a token whose graph head moved before it acquired its gates",
+    );
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("read set") || rendered.contains("graph_head") || rendered.contains("changed"),
+        "expected an authority-drift refusal, got: {rendered}",
+    );
+
+    assert_eq!(
+        lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .version()
+            .version,
+        person_head_after_write,
+        "the refusal must land before any physical maintenance effect",
+    );
+    let recovery_dir = dir.path().join("__recovery");
+    let sidecars: Vec<_> = std::fs::read_dir(&recovery_dir)
+        .map(|entries| entries.filter_map(|entry| entry.ok()).collect())
+        .unwrap_or_default();
+    assert!(
+        sidecars.is_empty(),
+        "a pre-effect authority refusal must leave no Optimize sidecar: {sidecars:?}",
+    );
+}
+
 /// Optimize's entry recovery probe is only a fast path. A graph-global
 /// SchemaApply can arm its durable sidecar after that probe while Optimize is
 /// waiting for the main-branch gate, then fail before staging any schema/table

@@ -141,6 +141,12 @@ pub mod names {
     pub const OPEN_BEFORE_SCHEMA_CONTRACT_READ: &str = "open.before_schema_contract_read";
     pub const OPTIMIZE_BEFORE_COMPACT: &str = "optimize.before_compact";
     pub const OPTIMIZE_INJECT_REINDEX_CONFLICT: &str = "optimize.inject_reindex_conflict";
+    /// After Optimize captures its authority token, before the schema -> main
+    /// -> table gates and the revalidation that consumes it. Tests advance the
+    /// graph in this window and prove Optimize refuses rather than planning
+    /// against authority that has already moved.
+    pub const OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES: &str =
+        "optimize.post_authority_capture_pre_gates";
     /// After Optimize's broad recovery fast-path check, before the main-branch
     /// writer gate is acquired. Tests arm a late recovery intent in this window
     /// and prove the under-branch-gate check refuses to advance around it.
