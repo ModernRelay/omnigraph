@@ -2,29 +2,17 @@
 
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, bail};
-use omnigraph::db::{
-    Omnigraph, ReadTarget, SnapshotId, StreamDataCorrectionAction, StreamDataCorrectionRequest,
-};
-use omnigraph::error::OmniError;
+use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
     ChangeOutput, CommitOutput, ErrorOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
-    SnapshotTableOutput, StreamDriverStateOutput, StreamEnsureIndicesOutput,
-    StreamIngestKindOutput, StreamLifecycleOutput, StreamOptimizeOutput, StreamPendingStatusOutput,
-    StreamProfileModeOutput, StreamRebuildBlockerOutput, StreamResumeOutput, StreamStatusOutput,
+    SnapshotTableOutput,
 };
 use omnigraph_cluster::{
     ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput,
-    StateSyncOutput, StatusOutput, StreamAuthorityRetirementConfirmOutput,
-    StreamAuthorityRetirementOptions, StreamAuthorityRetirementPlanOutput,
-    StreamBlockControlOptions, StreamBlockCorrectOutput, StreamBlockShowOutput,
-    StreamDeadLetterControlOptions, StreamDeadLetterExportOutput, StreamDeadLetterListOutput,
-    ValidateOutput, apply_config_dir_with_options, approve_config_dir,
-    confirm_stream_authority_retirement_config_dir, correct_stream_data_block_config_dir,
-    export_stream_dead_letters_config_dir, force_unlock_config_dir, import_config_dir,
-    list_stream_dead_letters_config_dir, plan_config_dir,
-    plan_stream_authority_retirement_config_dir, refresh_config_dir,
-    show_stream_data_block_config_dir, status_config_dir, validate_config_dir,
+    StateSyncOutput, StatusOutput, ValidateOutput, apply_config_dir_with_options,
+    approve_config_dir, force_unlock_config_dir, import_config_dir, plan_config_dir,
+    refresh_config_dir, status_config_dir, validate_config_dir,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -40,12 +28,12 @@ use omnigraph_server::{
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
+use std::path::PathBuf;
 
 mod embed;
 mod operator;
@@ -53,48 +41,6 @@ mod read_format;
 
 use embed::{EmbedArgs, EmbedOutput, execute_embed};
 use read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StreamDataCorrectionPlanFile {
-    version: u32,
-    actions: Vec<StreamDataCorrectionAction>,
-}
-
-fn read_stream_data_correction_plan(path: &Path) -> Result<Vec<u8>> {
-    read_stream_data_correction_plan_with_limit(
-        path,
-        StreamDataCorrectionRequest::MAX_SERIALIZED_BYTES,
-    )
-}
-
-fn read_stream_data_correction_plan_with_limit(path: &Path, byte_limit: u64) -> Result<Vec<u8>> {
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > byte_limit {
-        return Err(OmniError::ResourceLimitExceeded {
-            resource: "stream_correction_plan_file_bytes".to_string(),
-            limit: byte_limit,
-            actual: metadata.len(),
-        }
-        .into());
-    }
-
-    let file = fs::File::open(path)?;
-    let mut bounded = file.take(byte_limit.saturating_add(1));
-    let initial_capacity = usize::try_from(metadata.len().min(64 * 1024)).unwrap_or(0);
-    let mut bytes = Vec::with_capacity(initial_capacity);
-    bounded.read_to_end(&mut bytes)?;
-    let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    if actual > byte_limit {
-        return Err(OmniError::ResourceLimitExceeded {
-            resource: "stream_correction_plan_file_bytes".to_string(),
-            limit: byte_limit,
-            actual,
-        }
-        .into());
-    }
-    Ok(bytes)
-}
 
 mod cli;
 mod client;
@@ -731,86 +677,6 @@ async fn main() -> Result<()> {
                 .export(&branch, &type_names, &table_keys, &mut stdout)
                 .await?;
         }
-        Command::Stream { command } => match command {
-            StreamCommand::Ingest { data, graph_token } => {
-                let client = client::GraphClient::resolve_stream_ingest(
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    cli.as_actor.as_deref(),
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                echo_write_target(cli.quiet, "stream ingest", client.uri(), true);
-                let stdout = io::stdout();
-                let mut stdout = stdout.lock();
-                client
-                    .stream_ingest(&data, graph_token.as_deref(), &mut stdout)
-                    .await?;
-            }
-            StreamCommand::Status { json } => {
-                let client = client::GraphClient::resolve_stream_status(
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let output = client.stream_operational_status().await?;
-                finish_stream_status(&output, json)?;
-            }
-            StreamCommand::Resume { json } => {
-                let client = client::GraphClient::resolve_stream_control(
-                    "stream resume",
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                echo_write_target(cli.quiet, "stream resume", client.uri(), true);
-                let output = client.stream_resume().await?;
-                finish_stream_resume(&output, json)?;
-            }
-            StreamCommand::Maintenance { command } => match command {
-                StreamMaintenanceCommand::EnsureIndices { json } => {
-                    let client = client::GraphClient::resolve_stream_control(
-                        "stream maintenance ensure-indices",
-                        cli.server.as_deref(),
-                        cli.graph.as_deref(),
-                        cli.profile.as_deref(),
-                        cli.store.as_deref(),
-                    )
-                    .await?;
-                    echo_write_target(
-                        cli.quiet,
-                        "stream maintenance ensure-indices",
-                        client.uri(),
-                        true,
-                    );
-                    let output = client.stream_ensure_indices().await?;
-                    finish_stream_ensure_indices(&output, json)?;
-                }
-                StreamMaintenanceCommand::Optimize { json } => {
-                    let client = client::GraphClient::resolve_stream_control(
-                        "stream maintenance optimize",
-                        cli.server.as_deref(),
-                        cli.graph.as_deref(),
-                        cli.profile.as_deref(),
-                        cli.store.as_deref(),
-                    )
-                    .await?;
-                    echo_write_target(
-                        cli.quiet,
-                        "stream maintenance optimize",
-                        client.uri(),
-                        true,
-                    );
-                    let output = client.stream_optimize().await?;
-                    finish_stream_optimize(&output, json)?;
-                }
-            },
-        },
         Command::Query {
             name,
             query,
@@ -1275,170 +1141,6 @@ async fn main() -> Result<()> {
                 let output = force_unlock_config_dir(config, lock_id).await;
                 finish_cluster_force_unlock(&output, json)?;
             }
-            ClusterCommand::Stream { command } => match command {
-                ClusterStreamCommand::Block { command } => {
-                    let Some(graph_id) = cli.graph.as_deref() else {
-                        bail!("`cluster stream block` requires --graph <GRAPH_ID>");
-                    };
-                    let actor = resolve_cluster_actor(cli.as_actor.as_deref())?;
-                    match command {
-                        StreamBlockCommand::Show {
-                            config,
-                            block_token,
-                            cursor,
-                            confirm_stream_offline,
-                            json,
-                        } => {
-                            let output = show_stream_data_block_config_dir(
-                                config,
-                                graph_id,
-                                block_token,
-                                cursor.as_deref(),
-                                StreamBlockControlOptions {
-                                    actor,
-                                    confirm_stream_offline,
-                                },
-                            )
-                            .await;
-                            finish_stream_block_show(&output, json)?;
-                        }
-                        StreamBlockCommand::Correct {
-                            config,
-                            block_token,
-                            correction_id,
-                            expected_lifecycle_revision,
-                            plan,
-                            expected_plan_digest,
-                            confirm_stream_offline,
-                            json,
-                        } => {
-                            let plan_path = plan.display().to_string();
-                            let plan_bytes = read_stream_data_correction_plan(&plan)?;
-                            let plan: StreamDataCorrectionPlanFile = serde_json::from_slice(
-                                &plan_bytes,
-                            )
-                            .map_err(|error| {
-                                color_eyre::eyre::eyre!(
-                                    "could not parse stream correction plan '{plan_path}': {error}"
-                                )
-                            })?;
-                            if plan.version != 1 {
-                                bail!(
-                                    "stream correction plan '{plan_path}' has unsupported version {}; expected 1",
-                                    plan.version
-                                );
-                            }
-                            let request = StreamDataCorrectionRequest {
-                                protocol_version: plan.version,
-                                block_token,
-                                correction_id,
-                                expected_lifecycle_revision,
-                                actions: plan.actions,
-                                expected_plan_digest,
-                            };
-                            let output = correct_stream_data_block_config_dir(
-                                config,
-                                graph_id,
-                                request,
-                                StreamBlockControlOptions {
-                                    actor,
-                                    confirm_stream_offline,
-                                },
-                            )
-                            .await;
-                            finish_stream_block_correct(&output, json)?;
-                        }
-                    }
-                }
-                ClusterStreamCommand::DeadLetter { command } => {
-                    let Some(graph_id) = cli.graph.as_deref() else {
-                        bail!("`cluster stream dead-letter` requires --graph <GRAPH_ID>");
-                    };
-                    let actor = resolve_cluster_actor(cli.as_actor.as_deref())?;
-                    match command {
-                        StreamDeadLetterCommand::List {
-                            config,
-                            cursor,
-                            confirm_stream_offline,
-                            json,
-                        } => {
-                            let output = list_stream_dead_letters_config_dir(
-                                config,
-                                graph_id,
-                                cursor.as_deref(),
-                                StreamDeadLetterControlOptions {
-                                    actor,
-                                    confirm_stream_offline,
-                                },
-                            )
-                            .await;
-                            finish_stream_dead_letter_list(&output, json)?;
-                        }
-                        StreamDeadLetterCommand::Export {
-                            config,
-                            cursor,
-                            confirm_stream_offline,
-                            json,
-                        } => {
-                            let output = export_stream_dead_letters_config_dir(
-                                config,
-                                graph_id,
-                                cursor.as_deref(),
-                                StreamDeadLetterControlOptions {
-                                    actor,
-                                    confirm_stream_offline,
-                                },
-                            )
-                            .await;
-                            finish_stream_dead_letter_export(&output, json)?;
-                        }
-                    }
-                }
-                ClusterStreamCommand::RetireForRebuild { command } => {
-                    let Some(graph_id) = cli.graph.as_deref() else {
-                        bail!("`cluster stream retire-for-rebuild` requires --graph <GRAPH_ID>");
-                    };
-                    let actor = resolve_cluster_actor(cli.as_actor.as_deref())?;
-                    match command {
-                        StreamRetireForRebuildCommand::Plan {
-                            config,
-                            confirm_stream_offline,
-                            json,
-                        } => {
-                            let output = plan_stream_authority_retirement_config_dir(
-                                config,
-                                graph_id,
-                                StreamAuthorityRetirementOptions {
-                                    actor,
-                                    confirm_stream_offline,
-                                },
-                            )
-                            .await;
-                            finish_stream_authority_retirement_plan(&output, json)?;
-                        }
-                        StreamRetireForRebuildCommand::Confirm {
-                            config,
-                            retirement_id,
-                            expected_plan_digest,
-                            confirm_stream_offline,
-                            json,
-                        } => {
-                            let output = confirm_stream_authority_retirement_config_dir(
-                                config,
-                                graph_id,
-                                retirement_id,
-                                expected_plan_digest,
-                                StreamAuthorityRetirementOptions {
-                                    actor,
-                                    confirm_stream_offline,
-                                },
-                            )
-                            .await;
-                            finish_stream_authority_retirement_confirm(&output, json)?;
-                        }
-                    }
-                }
-            },
         },
         Command::Graphs { command } => match command {
             GraphsCommand::List { json } => {

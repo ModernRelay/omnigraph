@@ -16,7 +16,7 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
 URI): query, mutate, load, branch, snapshot, export, commit, schema show/apply.\n  \
-served — require a server: stream ingest/status/resume/maintenance (graph scope) and graphs (registry scope).\n  \
+served — require a server: graphs (registry scope).\n  \
 direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
 schema plan, lint).\n  \
 control — manage or inspect a cluster (cluster via --config; policy & queries via \
@@ -39,9 +39,8 @@ pub(crate) struct Cli {
     pub(crate) server: Option<String>,
 
     /// Select a graph within a multi-graph scope: on a `--server` it appends
-    /// `/graphs/<id>` to the server url; on `--cluster`, or the offline
-    /// `cluster stream` command's `--config`, it picks which cluster graph to
-    /// maintain. Rejected on a single-graph address (a positional URI /
+    /// `/graphs/<id>` to the server url; on `--cluster` it picks which cluster
+    /// graph to maintain. Rejected on a single-graph address (a positional URI /
     /// `--store`).
     #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
@@ -247,11 +246,6 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: GraphsCommand,
     },
-    /// Stream graph rows durably through a served firehose.
-    Stream {
-        #[command(subcommand)]
-        command: StreamCommand,
-    },
 
     // ── Storage / local graph ops ── direct storage or local files; reject --server.
     /// Initialize a new graph from a schema
@@ -377,54 +371,6 @@ pub(crate) enum Command {
 }
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum StreamCommand {
-    /// Stream newline-delimited graph rows to the served graph.
-    Ingest {
-        /// NDJSON input path, or `-` for stdin.
-        #[arg(long, value_name = "PATH|-", default_value = "-")]
-        data: PathBuf,
-        /// Opaque graph-ingest eligibility token. Omit it to obtain one with a
-        /// bodyless preflight before the input is opened.
-        #[arg(long, value_name = "TOKEN")]
-        graph_token: Option<String>,
-    },
-    /// Inspect the served graph's checked streaming health and readiness.
-    Status {
-        /// Emit the complete graph-logical status as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Reopen every sealed declaration in the served graph.
-    Resume {
-        /// Emit the graph-level result as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Run checked graph-wide maintenance; any enrolled declaration changed
-    /// by the operation must be sealed.
-    Maintenance {
-        #[command(subcommand)]
-        command: StreamMaintenanceCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum StreamMaintenanceCommand {
-    /// Reconcile declared indexes across the graph.
-    EnsureIndices {
-        /// Emit the graph-level result as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Compact the graph through one coordinated publish.
-    Optimize {
-        /// Emit the graph-level result as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 pub(crate) enum ProfileCommand {
     /// List the profiles defined in ~/.omnigraph/config.yaml.
     List {
@@ -524,149 +470,6 @@ pub(crate) enum ClusterCommand {
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Manage the experimental cluster-owned streaming profile offline.
-    Stream {
-        #[command(subcommand)]
-        command: ClusterStreamCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum ClusterStreamCommand {
-    /// Inspect or correct one exact strict stream block while writers are stopped.
-    Block {
-        #[command(subcommand)]
-        command: StreamBlockCommand,
-    },
-    /// Inspect current terminal dead-letter authority while writers are stopped.
-    #[command(name = "dead-letter")]
-    DeadLetter {
-        #[command(subcommand)]
-        command: StreamDeadLetterCommand,
-    },
-    /// Irreversibly freeze a terminal-authority graph for logical rebuild.
-    #[command(name = "retire-for-rebuild")]
-    RetireForRebuild {
-        #[command(subcommand)]
-        command: StreamRetireForRebuildCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum StreamDeadLetterCommand {
-    /// List one bounded page of current DEAD_LETTERED sequencing authority.
-    List {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Opaque cursor returned by a previous page.
-        #[arg(long)]
-        cursor: Option<String>,
-        /// Attest that every writer-capable process for the graph is stopped.
-        #[arg(long)]
-        confirm_stream_offline: bool,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Export descriptor-verified payloads for current DEAD_LETTERED keys.
-    Export {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Opaque cursor returned by a previous page.
-        #[arg(long)]
-        cursor: Option<String>,
-        /// Attest that every writer-capable process for the graph is stopped.
-        #[arg(long)]
-        confirm_stream_offline: bool,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum StreamBlockCommand {
-    /// Revalidate and print one bounded page of correction evidence.
-    Show {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Exact strict-block token returned by status or quiesce.
-        #[arg(long)]
-        block_token: String,
-        /// Opaque cursor returned by a previous page.
-        #[arg(long)]
-        cursor: Option<String>,
-        /// Attest that every writer-capable process for the graph is stopped.
-        #[arg(long)]
-        confirm_stream_offline: bool,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Apply one ordered REPLACE/WITHDRAW plan to the exact blocked cut.
-    Correct {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Exact strict-block token returned by `block show`.
-        #[arg(long)]
-        block_token: String,
-        /// New UUID occurrence key for this correction.
-        #[arg(long)]
-        correction_id: String,
-        /// Lifecycle revision returned by `block show`.
-        #[arg(long)]
-        expected_lifecycle_revision: u64,
-        /// Strict JSON correction plan file (maximum 256 MiB).
-        #[arg(long)]
-        plan: PathBuf,
-        /// Optional equality assertion for the engine-derived plan digest.
-        #[arg(long)]
-        expected_plan_digest: Option<String>,
-        /// Attest that every writer-capable process for the graph is stopped.
-        #[arg(long)]
-        confirm_stream_offline: bool,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum StreamRetireForRebuildCommand {
-    /// Prove and print the exact frozen cut that would be retired.
-    Plan {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Attest that every writer-capable process for the graph is stopped.
-        #[arg(long)]
-        confirm_stream_offline: bool,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Confirm the exact plan and permanently make the source read/export-only.
-    Confirm {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// New UUID occurrence key for this irreversible retirement.
-        #[arg(long)]
-        retirement_id: String,
-        /// Exact sha256 plan digest printed by `plan`.
-        #[arg(long)]
-        expected_plan_digest: String,
-        /// Attest that every writer-capable process for the graph is stopped.
-        #[arg(long)]
-        confirm_stream_offline: bool,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,

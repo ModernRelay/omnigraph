@@ -13,10 +13,7 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use crate::cli::{
-    Cli, ClusterCommand, ClusterStreamCommand, Command, GraphsCommand, QueriesCommand,
-    SchemaCommand, StreamBlockCommand, StreamCommand, StreamDeadLetterCommand,
-    StreamMaintenanceCommand,
-    StreamRetireForRebuildCommand,
+    Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand, SchemaCommand,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,11 +147,11 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
     let graph_ok = accepts_graph_selector(cmd);
     match flag {
         // Served addressing always needs a server. `graphs list` uses the bare
-        // registry scope; the `stream` family selects one graph on that server.
+        // registry scope.
         ScopeFlag::Server => matches!(capability, Any | Served),
         ScopeFlag::Cluster => cluster_ok,
-        // The one graph selector across scopes: a served graph (`any` or the
-        // served-only `stream` family), or a cluster graph on verbs that take
+        // The one graph selector across scopes: a served graph (`any`), or a
+        // cluster graph on verbs that take
         // cluster addressing. The other served-only command, `graphs list`,
         // rejects it because that command IS the registry enumeration.
         ScopeFlag::Graph => match capability {
@@ -176,17 +173,14 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // writes; served writes resolve the actor from the bearer token
         // (rejected downstream with its own message), and `direct`
         // maintenance verbs record no actor. `control` refines per command:
-        // `cluster apply`/`approve` and the actor-bound stream-control commands
-        // attribute an actor — the other read-only control verbs
-        // (status/plan/validate, policy, queries) never read it.
+        // `cluster apply`/`approve` attribute an actor — the other read-only
+        // control verbs (status/plan/validate, policy, queries) never read it.
         ScopeFlag::As => match capability {
             Any => true,
             Control => matches!(
                 cmd,
                 Command::Cluster {
-                    command: ClusterCommand::Apply { .. }
-                        | ClusterCommand::Approve { .. }
-                        | ClusterCommand::Stream { .. },
+                    command: ClusterCommand::Apply { .. } | ClusterCommand::Approve { .. },
                 }
             ),
             Served | Direct | Local => false,
@@ -210,13 +204,13 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
 }
 
 /// The capability a subcommand needs, derived from its `Plane` (the exhaustive
-/// classifier) plus the Data→Served refinements: graph-scoped `stream`
-/// commands and registry-scoped `graphs` are remote-only.
+/// classifier) plus the Data→Served refinement: registry-scoped `graphs`
+/// is remote-only.
 ///
 /// This reflects *current enforced behavior*, so messages stay truthful:
 /// `queries`/`policy` read a cluster's applied state (`Control`).
 pub(crate) fn command_capability(cmd: &Command) -> Capability {
-    if matches!(cmd, Command::Graphs { .. } | Command::Stream { .. }) {
+    if matches!(cmd, Command::Graphs { .. }) {
         return Capability::Served;
     }
     match command_plane(cmd) {
@@ -241,8 +235,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Snapshot { .. }
         | Command::Export { .. }
         | Command::Commit { .. }
-        | Command::Graphs { .. }
-        | Command::Stream { .. } => Plane::Data,
+        | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
             command: SchemaCommand::Show { .. } | SchemaCommand::Apply { .. },
         } => Plane::Data,
@@ -302,58 +295,9 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Optimize { .. } => "optimize",
         Command::Repair { .. } => "repair",
         Command::Cleanup { .. } => "cleanup",
-        Command::Cluster { command } => match command {
-            ClusterCommand::Stream {
-                command:
-                    ClusterStreamCommand::Block {
-                        command: StreamBlockCommand::Show { .. },
-                    },
-            } => "cluster stream block show",
-            ClusterCommand::Stream {
-                command:
-                    ClusterStreamCommand::Block {
-                        command: StreamBlockCommand::Correct { .. },
-                    },
-            } => "cluster stream block correct",
-            ClusterCommand::Stream {
-                command:
-                    ClusterStreamCommand::DeadLetter {
-                        command: StreamDeadLetterCommand::List { .. },
-                    },
-            } => "cluster stream dead-letter list",
-            ClusterCommand::Stream {
-                command:
-                    ClusterStreamCommand::DeadLetter {
-                        command: StreamDeadLetterCommand::Export { .. },
-                    },
-            } => "cluster stream dead-letter export",
-            ClusterCommand::Stream {
-                command:
-                    ClusterStreamCommand::RetireForRebuild {
-                        command: StreamRetireForRebuildCommand::Plan { .. },
-                    },
-            } => "cluster stream retire-for-rebuild plan",
-            ClusterCommand::Stream {
-                command:
-                    ClusterStreamCommand::RetireForRebuild {
-                        command: StreamRetireForRebuildCommand::Confirm { .. },
-                    },
-            } => "cluster stream retire-for-rebuild confirm",
-            _ => "cluster",
-        },
+        Command::Cluster { .. } => "cluster",
         Command::Graphs { command } => match command {
             GraphsCommand::List { .. } => "graphs list",
-        },
-        Command::Stream { command } => match command {
-            StreamCommand::Ingest { .. } => "stream ingest",
-            StreamCommand::Status { .. } => "stream status",
-            StreamCommand::Resume { .. } => "stream resume",
-            StreamCommand::Maintenance { command } => match command {
-                StreamMaintenanceCommand::EnsureIndices { .. } => {
-                    "stream maintenance ensure-indices"
-                }
-                StreamMaintenanceCommand::Optimize { .. } => "stream maintenance optimize",
-            },
         },
     }
 }
@@ -382,19 +326,10 @@ pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
     )
 }
 
-/// Commands that consume the global `--graph` selector. Most of these also
-/// consume global `--cluster`, but the nested `cluster stream` family is the
-/// intentional exception: it gets its cluster root from `--config` while
-/// selecting one graph from that cluster with `--graph`.
+/// Commands that consume the global `--graph` selector, which is exactly the
+/// set that consumes global `--cluster` addressing.
 fn accepts_graph_selector(cmd: &Command) -> bool {
     accepts_cluster_addressing(cmd)
-        || matches!(
-            cmd,
-            Command::Stream { .. }
-                | Command::Cluster {
-                    command: ClusterCommand::Stream { .. },
-                }
-        )
 }
 
 /// Reject a scope-addressing flag (`--server`/`--cluster`/`--graph`) on a verb
@@ -485,11 +420,9 @@ mod tests {
     #[test]
     fn scope_flag_matrix_matches_capabilities() {
         // The full flag × capability contract in one place. Rows cover every
-        // capability, both cluster_ok refinements of `direct` (optimize vs
-        // init) and of `control` (queries vs cluster), plus the graph-only
-        // stream-control selectors. Served commands split by scope: `graphs`
-        // is registry-only, while the `stream` family consumes --graph.
-        // Neither accepts --store/--as.
+        // capability, and both cluster_ok refinements of `direct` (optimize vs
+        // init) and of `control` (queries vs cluster). `graphs` is
+        // registry-only and accepts neither --store nor --as.
         let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
         // (command, [server, cluster, graph, store, as, profile])
         let rows = [
@@ -500,14 +433,6 @@ mod tests {
             (
                 parse(&["omnigraph", "graphs", "list"]),
                 [true, false, false, false, false, true],
-            ),
-            (
-                parse(&["omnigraph", "stream", "ingest"]),
-                [true, false, true, false, false, true],
-            ),
-            (
-                parse(&["omnigraph", "stream", "status"]),
-                [true, false, true, false, false, true],
             ),
             (
                 parse(&["omnigraph", "optimize", "g.omni"]),
@@ -521,9 +446,8 @@ mod tests {
                 [false, false, false, false, false, false],
             ),
             // Read-only control verbs never read the actor; `cluster
-            // apply`/`approve` and stream control do. The `cluster` family
-            // addresses its config with --config and never resolves a profile
-            // scope. Both stream-control families also select one graph.
+            // apply`/`approve` do. The `cluster` family addresses its config
+            // with --config and never resolves a profile scope.
             (
                 parse(&["omnigraph", "queries", "list"]),
                 [false, true, true, false, false, true],
@@ -535,30 +459,6 @@ mod tests {
             (
                 parse(&["omnigraph", "cluster", "apply", "--config", "."]),
                 [false, false, false, false, true, false],
-            ),
-            (
-                parse(&[
-                    "omnigraph",
-                    "cluster",
-                    "stream",
-                    "retire-for-rebuild",
-                    "plan",
-                    "--config",
-                    ".",
-                ]),
-                [false, false, true, false, true, false],
-            ),
-            (
-                parse(&[
-                    "omnigraph",
-                    "cluster",
-                    "stream",
-                    "block",
-                    "show",
-                    "--block-token",
-                    "block-1",
-                ]),
-                [false, false, true, false, true, false],
             ),
             (
                 parse(&["omnigraph", "version"]),
@@ -581,20 +481,8 @@ mod tests {
     #[test]
     fn command_capability_classifies_representative_verbs() {
         let cap = |args: &[&str]| command_capability(&Cli::try_parse_from(args).unwrap().command);
-        // Both Data→Served refinements are explicit: one registry-scoped and
-        // one graph-scoped family.
+        // The one Data→Served refinement: the registry-scoped `graphs` family.
         assert_eq!(cap(&["omnigraph", "graphs", "list"]), Capability::Served);
-        assert_eq!(cap(&["omnigraph", "stream", "ingest"]), Capability::Served);
-        assert_eq!(cap(&["omnigraph", "stream", "status"]), Capability::Served);
-        assert_eq!(cap(&["omnigraph", "stream", "resume"]), Capability::Served);
-        assert_eq!(
-            cap(&["omnigraph", "stream", "maintenance", "ensure-indices"]),
-            Capability::Served
-        );
-        assert_eq!(
-            cap(&["omnigraph", "stream", "maintenance", "optimize"]),
-            Capability::Served
-        );
         assert_eq!(cap(&["omnigraph", "alias", "who"]), Capability::Local);
         assert_eq!(
             cap(&["omnigraph", "optimize", "graph.omni"]),
@@ -615,46 +503,6 @@ mod tests {
             cap(&["omnigraph", "cluster", "status", "--config", "."]),
             Capability::Control
         );
-        assert_eq!(
-            cap(&[
-                "omnigraph",
-                "cluster",
-                "stream",
-                "block",
-                "correct",
-                "--block-token",
-                "block-1",
-                "--correction-id",
-                "00000000-0000-4000-8000-000000000002",
-                "--expected-lifecycle-revision",
-                "1",
-                "--plan",
-                "plan.json",
-            ]),
-            Capability::Control
-        );
-        assert_eq!(
-            cap(&["omnigraph", "cluster", "stream", "dead-letter", "list",]),
-            Capability::Control
-        );
-        assert_eq!(
-            cap(&["omnigraph", "cluster", "stream", "dead-letter", "export",]),
-            Capability::Control
-        );
-        assert_eq!(
-            cap(&[
-                "omnigraph",
-                "cluster",
-                "stream",
-                "retire-for-rebuild",
-                "confirm",
-                "--retirement-id",
-                "00000000-0000-4000-8000-000000000001",
-                "--expected-plan-digest",
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ]),
-            Capability::Control
-        );
         assert_eq!(cap(&["omnigraph", "version"]), Capability::Local);
         // `queries`/`policy` tooling reads cluster state now (control plane).
         assert_eq!(cap(&["omnigraph", "queries", "list"]), Capability::Control);
@@ -662,153 +510,6 @@ mod tests {
             cap(&["omnigraph", "policy", "validate"]),
             Capability::Control
         );
-    }
-
-    #[test]
-    fn stream_commands_are_served_only_before_dispatch() {
-        let cli = Cli::try_parse_from([
-            "omnigraph",
-            "stream",
-            "ingest",
-            "--store",
-            "file:///must-not-open.omni",
-            "--data",
-            "/must-not-open.ndjson",
-        ])
-        .unwrap();
-        let error = guard_addressing(&cli).unwrap_err().to_string();
-        assert!(error.contains("`stream ingest` is a served command"));
-        assert!(error.contains("--store addresses"));
-
-        let cli = Cli::try_parse_from([
-            "omnigraph",
-            "stream",
-            "ingest",
-            "--server",
-            "http://server.invalid:9",
-            "--graph",
-            "knowledge",
-        ])
-        .unwrap();
-        guard_addressing(&cli).unwrap();
-        match cli.command {
-            Command::Stream {
-                command:
-                    StreamCommand::Ingest {
-                        data, graph_token, ..
-                    },
-            } => {
-                assert_eq!(data, std::path::Path::new("-"));
-                assert_eq!(graph_token, None);
-            }
-            other => panic!("expected stream ingest, got {other:?}"),
-        }
-
-        let cli = Cli::try_parse_from([
-            "omnigraph",
-            "stream",
-            "status",
-            "--store",
-            "file:///must-not-open.omni",
-        ])
-        .unwrap();
-        let error = guard_addressing(&cli).unwrap_err().to_string();
-        assert!(error.contains("`stream status` is a served command"));
-        assert!(error.contains("--store addresses"));
-
-        let cli = Cli::try_parse_from([
-            "omnigraph",
-            "stream",
-            "status",
-            "--server",
-            "http://server.invalid:9",
-            "--graph",
-            "knowledge",
-            "--json",
-        ])
-        .unwrap();
-        guard_addressing(&cli).unwrap();
-        match cli.command {
-            Command::Stream {
-                command: StreamCommand::Status { json },
-            } => assert!(json),
-            other => panic!("expected stream status, got {other:?}"),
-        }
-
-        for args in [
-            vec!["omnigraph", "stream", "resume"],
-            vec!["omnigraph", "stream", "maintenance", "ensure-indices"],
-            vec!["omnigraph", "stream", "maintenance", "optimize"],
-        ] {
-            let mut served = args.clone();
-            served.extend([
-                "--server",
-                "http://server.invalid:9",
-                "--graph",
-                "knowledge",
-                "--json",
-            ]);
-            let cli = Cli::try_parse_from(served).unwrap();
-            guard_addressing(&cli).unwrap();
-
-            let mut direct = args;
-            direct.extend(["--store", "file:///must-not-open.omni"]);
-            let cli = Cli::try_parse_from(direct).unwrap();
-            let error = guard_addressing(&cli).unwrap_err().to_string();
-            assert!(error.contains("is a served command"), "{error}");
-            assert!(error.contains("--store addresses"), "{error}");
-        }
-
-        assert!(
-            Cli::try_parse_from([
-                "omnigraph",
-                "stream",
-                "resume",
-                "--type",
-                "Person",
-            ])
-            .is_err(),
-            "graph resume must not accept a declaration selector"
-        );
-    }
-
-    #[test]
-    fn policy_explain_accepts_stream_action_wire_names_and_kebab_aliases() {
-        let parse_action = |spelling: &str| {
-            let command = Cli::try_parse_from([
-                "omnigraph",
-                "policy",
-                "explain",
-                "--actor",
-                "act-operator",
-                "--action",
-                spelling,
-            ])
-            .unwrap()
-            .command;
-            match command {
-                Command::Policy {
-                    command: PolicyCommand::Explain { action, .. },
-                } => action,
-                other => panic!("expected policy explain command, got {other:?}"),
-            }
-        };
-
-        for (canonical, alias, expected) in [
-            (
-                "stream_ingest",
-                "stream-ingest",
-                omnigraph_policy::PolicyAction::StreamIngest,
-            ),
-            (
-                "stream_manage",
-                "stream-manage",
-                omnigraph_policy::PolicyAction::StreamManage,
-            ),
-        ] {
-            assert_eq!(parse_action(canonical), expected);
-            assert_eq!(parse_action(alias), expected);
-        }
     }
 
     #[test]
