@@ -30837,6 +30837,103 @@ mod tests {
         );
     }
 
+    /// The ordinary twin of `exact_recovery_base_head_ownership_proves_armed_sealed_create_index`.
+    ///
+    /// `EnsureIndices` and the RFC-026 sealed-maintenance bridge share the
+    /// `protocol_v8` arms of the base-head ownership predicates, and until now
+    /// only the *stream* half was pinned — by a test built on a v16 fixture.
+    /// Deleting a fused arm wholesale, rather than dropping only its
+    /// `StreamSealedMaintenance` alternative, drops ordinary EnsureIndices to
+    /// the `_ => Ok(false)` fallthrough: recovery disowns its own confirmed
+    /// CreateIndex effect and rolls back work it must roll forward. No error,
+    /// no panic — just missing indexes.
+    #[tokio::test]
+    async fn exact_recovery_base_head_ownership_proves_armed_ensure_indices_create_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_identity("node:Person");
+        let table_location =
+            crate::db::manifest::table_path_for_identity("node:Person", identity).unwrap();
+        let uri = format!("{}/{table_location}", dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
+        let mut dataset = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        for (id, age) in [("bob", 25), ("carol", 40), ("dave", 35), ("eve", 28)] {
+            store
+                .append_batch(&uri, &mut dataset, person_batch(&[(id, Some(age))]))
+                .await
+                .unwrap();
+        }
+        let selected = capture_current_head_witness(&dataset).await.unwrap();
+
+        let staged = store
+            .stage_create_indices(
+                &dataset,
+                &[IndexBuildSpec::BTree {
+                    column: "id".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        let planned = staged.transaction_identity();
+
+        let sidecar = new_ensure_indices_sidecar_v9(
+            None,
+            Some("act-index".to_string()),
+            vec![SidecarTablePin {
+                identity,
+                table_key: "node:Person".to_string(),
+                table_path: uri.clone(),
+                expected_version: selected.table_version,
+                post_commit_pin: selected.table_version.saturating_add(1),
+                confirmed_version: None,
+                table_branch: None,
+            }],
+            RecoveryAuthorityToken {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                graph_head: Some("01H000000000000000000000EA".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
+                schema_ir_hash: "accepted-schema".to_string(),
+                schema_identity_version: 1,
+            },
+            RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000EB".to_string(),
+                branch: None,
+                actor_id: Some("act-index".to_string()),
+                merged_parent_commit_id: None,
+                created_at: 902,
+                stream_fold_attribution_v2: None,
+            },
+            HashMap::from([(identity, planned.clone())]),
+            HashMap::new(),
+        )
+        .unwrap();
+        validate_sidecar_shape("<armed-ensure-indices-status>", &sidecar).unwrap();
+
+        let (indexed, committed) = store
+            .commit_staged_exact(Arc::new(dataset), staged)
+            .await
+            .unwrap();
+        assert_eq!(committed, planned);
+        let observed = capture_current_head_witness(&indexed).await.unwrap();
+        assert!(
+            super::recovery_sidecar_exactly_owns_canonical_main_base_head(
+                &sidecar,
+                identity,
+                &uri,
+                &selected,
+                &observed,
+                &indexed,
+            )
+            .await
+            .unwrap(),
+            "an Armed EnsureIndices sidecar must own its exact post-CreateIndex HEAD before confirmation"
+        );
+    }
+
     #[tokio::test]
     async fn branch_merge_v4_proves_exact_chain_and_interrupted_compensation() {
         let dir = tempfile::tempdir().unwrap();
