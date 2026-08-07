@@ -25,7 +25,9 @@
   parses Lance error text. If this signal escapes an enrolled writer, HTTP maps
   it to a generic **409** conflict.
 - `ResourceLimitExceeded { resource, limit, actual }` — a keyed Mutation/Load
-  table exceeded its single-transaction ceiling of 8,192 rows or 32 MiB of
+  table (`mutate`, `load --mode append`/`merge`; Overwrite stages a whole-table
+  replacement transaction and is not subject to the keyed ceiling) exceeded its
+  single-transaction ceiling of 8,192 rows or 32 MiB of
   staged Arrow memory (with an earlier conservative parsed-value/base64 guard
   to bound the load spool, and a streamed remaining-budget guard on mutation
   update matches); keyed external-URI or stored-update blob payloads exceeded

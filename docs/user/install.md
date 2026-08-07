@@ -82,13 +82,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -InstallDir "$
 Install a specific tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | VERSION=v0.1.0 bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | VERSION=v0.9.0 bash
 ```
 
 Windows:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.1.0
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.9.0
 ```
 
 Build from a specific git ref:
