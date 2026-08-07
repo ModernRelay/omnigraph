@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| **Status** | Proposed |
+| **Status** | Accepted |
 | **Author track** | Public contribution |
 | **Author(s)** | Roey Zalta ([@roy2392](https://github.com/roy2392)) |
 | **Discussion** | [ModernRelay/omnigraph#439](https://github.com/ModernRelay/omnigraph/discussions/439) |
-| **Implementation** | Planned as a separate PR after this RFC is accepted |
+| **Implementation** | Not yet implemented |
 
 ## Summary
 

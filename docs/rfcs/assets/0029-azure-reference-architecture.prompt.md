@@ -1,9 +1,9 @@
 # OmniGraph Azure reference architecture image prompt
 
 This is the reproducible source prompt for
-`0029-azure-reference-architecture.png`. It follows the target-platform diagram
-workflow from `msftse/azure-architecture-proposal` and is intentionally limited
-to the first supported public-cloud topology in RFC 0029.
+`0029-azure-reference-architecture.png`. It follows a target-platform
+architecture-diagram prompt workflow and is intentionally limited to the first
+supported public-cloud topology in RFC 0029.
 
 ```text
 Use case: infographic-diagram
