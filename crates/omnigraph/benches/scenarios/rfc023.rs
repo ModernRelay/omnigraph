@@ -71,6 +71,12 @@ pub(super) fn validate_args(args: &Args) -> Result<(), String> {
             if args.delta_rows == 0 {
                 return Err("--delta-rows must be greater than zero".to_string());
             }
+            if !matches!(args.source_mode.as_str(), "update" | "insert") {
+                return Err(format!(
+                    "--source-mode must be 'update' or 'insert', got '{}'",
+                    args.source_mode
+                ));
+            }
             // The branch's updates and main's divergence must address disjoint
             // key ranges, or the merge reports a row conflict instead of
             // measuring the general reconciliation route.
@@ -1514,25 +1520,37 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         .expect("create general-merge source branch");
     let branch_create_ms = branch_start.elapsed().as_millis() as u64;
 
-    // The branch delta: SAME keys, DIFFERENT embeddings. Upsert, so the row
-    // count never moves — every changed row must be reconciled against the
-    // target rather than adopted.
+    // The branch delta. In `update` mode: SAME keys, DIFFERENT embeddings, so
+    // the row count never moves and every changed row must be reconciled
+    // against the target. In `insert` mode: brand-new keys, which is the shape
+    // the proven adopt shortcut is built for — the question that mode answers
+    // is whether that shortcut survives the target having moved.
+    let inserting = args.source_mode == "insert";
+    let source_prefix = if inserting { "adopt-new" } else { "base" };
     let source_vectors = vector_json_patterns(args.dims, args.seed ^ 0x0230_0384);
     let source_start = Instant::now();
     let mut cursor = 0;
     let mut max_source_json_chunk_bytes = 0_u64;
     while cursor < args.delta_rows {
-        let end = cursor
-            .saturating_add(batch_rows)
-            .min(args.delta_rows);
-        let jsonl = graph_jsonl_chunk("base", cursor, end, &source_vectors);
+        let end = cursor.saturating_add(batch_rows).min(args.delta_rows);
+        let jsonl = graph_jsonl_chunk(source_prefix, cursor, end, &source_vectors);
         max_source_json_chunk_bytes = max_source_json_chunk_bytes.max(jsonl.len() as u64);
-        db.load(GENERAL_MERGE_SOURCE_BRANCH, &jsonl, LoadMode::Merge)
+        let mode = if inserting {
+            LoadMode::Append
+        } else {
+            LoadMode::Merge
+        };
+        db.load(GENERAL_MERGE_SOURCE_BRANCH, &jsonl, mode)
             .await
-            .unwrap_or_else(|error| panic!("update source rows {cursor}..{end}: {error}"));
+            .unwrap_or_else(|error| panic!("write source rows {cursor}..{end}: {error}"));
         cursor = end;
     }
     let source_load_ms = source_start.elapsed().as_millis() as u64;
+    let expected_source_rows = if inserting {
+        args.rows + args.delta_rows
+    } else {
+        args.rows
+    };
 
     // Advance main on a disjoint key range so the merge is genuinely diverged.
     let target_divergence_start = args.rows - GENERAL_MERGE_TARGET_DELTA_ROWS;
@@ -1581,8 +1599,8 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         .await
         .expect("count prepared source rows");
     assert_eq!(
-        setup_source_rows, args.rows,
-        "upsert-only branch delta must not change the source row count"
+        setup_source_rows, expected_source_rows,
+        "prepared source branch row count drift"
     );
     let setup_source_table_version = source_table.version();
     let setup_verify_ms = verify_start.elapsed().as_millis() as u64;
@@ -1606,6 +1624,7 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         "dims": args.dims,
         "delta_rows": args.delta_rows,
         "target_delta_rows": GENERAL_MERGE_TARGET_DELTA_ROWS,
+        "source_mode": args.source_mode,
         "setup_fingerprint": setup_fingerprint,
         "setup_main_rows": setup_main_rows,
         "setup_source_rows": setup_source_rows,
@@ -1653,25 +1672,37 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
         .filter(|increase| *increase > 0);
 
     // Structural assertions: keep the run honest about which road it took.
+    // The target always advanced after the fork, so this can never be a
+    // fast-forward regardless of source shape.
     assert_eq!(
         outcome,
         MergeOutcome::Merged,
         "a diverged target must produce a three-way merge, not a fast-forward"
     );
     let ordered_cursor_scan_calls = probes.ordered_cursor_scan_calls();
-    assert!(
-        ordered_cursor_scan_calls > 0,
-        "general-merge scenario did not enter the ordered diff — it took a shortcut path \
-         and is not measuring the route issue #384 reports"
-    );
-    assert_eq!(
-        probes.strict_insert_preflight_calls(),
-        0,
-        "an update-only delta must not preflight strict inserts"
-    );
+    let fenced_insert_calls = probes.stage_fenced_insert_calls();
+    // `update` mode must be on the general route — that is the whole point.
+    // `insert` mode deliberately asserts nothing about the route: it exists to
+    // DISCOVER whether the proven adopt shortcut survives a moved target, so
+    // the route is recorded as a result rather than pinned as a precondition.
+    if args.source_mode == "update" {
+        assert!(
+            ordered_cursor_scan_calls > 0,
+            "update-mode run did not enter the ordered diff — it took a shortcut path \
+             and is not measuring the route issue #384 reports"
+        );
+        assert_eq!(
+            probes.strict_insert_preflight_calls(),
+            0,
+            "an update-only delta must not preflight strict inserts"
+        );
+    }
+    let took_proven_shortcut = fenced_insert_calls > 0 && ordered_cursor_scan_calls == 0;
 
     serde_json::json!({
-        "routing": "production-omnigraph-branch-merge-general-ordered-diff",
+        "routing": "production-omnigraph-branch-merge-diverged-target",
+        "source_mode": args.source_mode,
+        "took_proven_shortcut": took_proven_shortcut,
         "measurement_boundary": "operation_wall_ms starts after the common fresh Omnigraph::open and covers Omnigraph::branch_merge; no post-op scan",
         "production_path": true,
         "baseline": false,
@@ -1722,9 +1753,14 @@ pub(super) async fn general_merge_verify(args: &Args) -> serde_json::Value {
         .count_rows(None)
         .await
         .expect("count merged main rows");
+    let expected_final_rows = if args.source_mode == "insert" {
+        args.rows + args.delta_rows
+    } else {
+        args.rows
+    };
     assert_eq!(
-        final_rows, args.rows,
-        "an upsert-only merge must not change the target row count"
+        final_rows, expected_final_rows,
+        "merged target row count drift"
     );
     let verify_wall_ms = verify_start.elapsed().as_millis() as u64;
 

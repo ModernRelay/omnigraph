@@ -12,60 +12,65 @@ LanceDB MemWAL integration on Lance 9.1.0-beta.4
 [Lance MemWAL PR](lance-memwal-pr.md), and
 [architectural invariants](invariants.md)
 
-## Executive summary
+---
+
+## 0. Decision at a glance
 
 OmniGraph has already chosen Lance MemWAL as its streaming substrate. The open
-decision is not whether to build a different WAL. It is how much lifecycle
+decision was never whether to build a different WAL; it was how much lifecycle
 machinery must be complete before OmniGraph exposes durable stream admission as
 a product feature.
 
-There are five relevant options:
+**The decision is Option 1 — unbounded retain-all — now.**
 
-1. **Unbounded retain-all on stock Lance:** never delete MemWAL objects inside
-   a root and do not advertise a file-count or retained-byte limit. Storage
-   grows monotonically; provider exhaustion is an accepted, loud operational
-   risk for this first profile.
-2. **A narrow local Lance patch with managed GC:** implement the missing
-   attempt, receipt, accounting, fencing, and reclamation primitives in Lance,
-   pin that reviewed revision now, and upstream it without depending on the
-   upstream review calendar.
-3. **Whole-root rotation or rebuild:** seal and fold a root, perform an external
-   operator/service cutover to a fresh root, and retire the old root as an
-   operational unit rather than deleting live MemWAL internals piecemeal.
-4. **A LanceDB-style approach that acknowledges WAL writes:** acknowledge after
-   the WAL write is durable, make graph visibility and compaction asynchronous,
-   and accept that the public contract does not yet include a hard retained-
-   storage bound or a complete online-GC proof.
-5. **Keep the current direct-write path:** retain the existing graph-visible
-   commit acknowledgement and use batching/group commit as latency relief.
-
-The decision is **Option 1 now**. Preserve direct writes as the safe default,
-run the first streaming profile on stock Lance with no OmniGraph MemWAL GC,
-and keep the row, memory, recovery, sequencing, lifecycle, and terminal-
-disposition contracts strict. The near-cap fold is now closed without lowering
-the 8,192-row/32-MiB admission cap: fold scanning charges logical slices and
-densifies selected rows before retention. The measured full-fold RSS delta was
-284,934,144 bytes (about 272 MiB), guarded by a 384-MiB remeasurement tripwire.
-
-Managed reclamation, a hard retained-storage envelope, whole-root rotation,
-and an upstream Lance patch are deferred optimizations. They can improve the
-operating lifetime later, but they are no longer activation dependencies.
-Option 4 remains useful precedent for the acknowledgement boundary; OmniGraph's
-selected profile keeps stronger fencing, recovery, sequencing, and terminal-
-disposition requirements than the surveyed LanceDB path.
+- **Selected:** run the first streaming profile on stock Lance with no
+  OmniGraph MemWAL GC and no advertised retained-byte or file-count limit.
+  Storage grows monotonically; provider exhaustion is an accepted, loud
+  operational risk.
+- **Kept strict:** the row, memory, recovery, sequencing, lifecycle, and
+  terminal-disposition contracts. Direct writes remain the production-safe
+  default.
+- **Closed:** the near-cap fold is fixed without lowering the
+  8,192-row/32-MiB admission cap — fold scanning charges logical slices and
+  densifies selected rows before retention. The measured full-fold RSS delta
+  was 284,934,144 bytes (about 272 MiB), guarded by a 384-MiB remeasurement
+  tripwire.
+- **Deferred:** managed reclamation, a hard retained-storage envelope,
+  whole-root rotation, and an upstream Lance patch are optimizations that can
+  improve operating lifetime later; they are no longer activation
+  dependencies.
 
 No option in this document authorizes public streaming today.
 
-## The contracts that must not be conflated
+The five options compared below:
 
-There are three different success points:
+1. **Unbounded retain-all on stock Lance** — never delete MemWAL objects
+   inside a root; no advertised storage limit. **Selected.**
+2. **A narrow local Lance patch with managed GC** — implement the missing
+   attempt, receipt, accounting, fencing, and reclamation primitives in Lance,
+   pin that reviewed revision, upstream it in parallel. Deferred.
+3. **Whole-root rotation or rebuild** — seal, fold, cut over to a fresh root,
+   retire the old root as one operational unit. Optional escape.
+4. **A LanceDB-style approach that acknowledges WAL writes** — precedent for
+   the acknowledgement boundary; OmniGraph keeps stronger fencing, recovery,
+   sequencing, and disposition requirements than the surveyed LanceDB path.
+5. **Keep the current direct-write path** — the safe default under every
+   option; batching/group commit as latency relief.
 
-```text
-durable stream admission
-        ↓
-fold into one or more Lance base tables
-        ↓
-one __manifest publication makes the graph change visible
+## 1. The contracts that must not be conflated
+
+There are three different success points, and each acknowledges something
+different:
+
+```mermaid
+flowchart TD
+    A["1 · WAL admission success<br/>data is durable and replayable<br/>after a crash"]
+    B["2 · Fold success<br/>data resolved against graph state and<br/>written into base Lance datasets"]
+    C["3 · Graph commit success<br/>one __manifest publication makes the<br/>complete transition authoritative"]
+    A -->|"asynchronous fold"| B
+    B -->|"one publication CAS"| C
+    S["stream API ack<br/>(selected profile)"] -.->|"acknowledges point 1 only"| A
+    M["interactive mutate / load ack"] -.->|"acknowledges point 3"| C
 ```
 
 - **WAL admission success** means the submitted data is durable and
@@ -84,7 +89,37 @@ path to fold, correction or terminal disposition, quiescence, and `SEALED`
 within the declared **row and memory** bounds. It deliberately does not promise
 a retained-byte, file-count, or provider-quota bound for the selected profile.
 
-## Current facts
+### 1.1 What one private B1 acknowledgement actually is
+
+A clean acknowledgement requires *both* Lance's durability watcher and the same
+writer's post-durability epoch check; every ambiguous outcome is typed
+`AckUnknown` plus worker retirement, and an `AckUnknown` row remains replayable
+and folds exactly once — never silently lost, never doubled:
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant W as B1 worker
+    participant L as Lance WAL
+    participant S as Shard manifest
+
+    C->>W: put(batch)
+    W->>W: charge rows/bytes, admission, same-key queue
+    W->>L: put_no_wait
+    L-->>W: durability watcher
+    alt watcher fails / times out
+        W-->>C: AckUnknown + worker retires
+    else watcher succeeds
+        W->>S: check_fenced() — same writer, post-durability
+        alt epoch lost / unreadable / unsettled
+            W-->>C: AckUnknown + worker retires<br/>(row stays durable, folds once via replay)
+        else epoch still owned
+            W-->>C: DurableBatchAck<br/>(durable + replayable, NOT graph-visible)
+        end
+    end
+```
+
+## 2. Why MemWAL lifecycle is hard — current facts
 
 The decision starts from these facts:
 
@@ -112,7 +147,54 @@ The decision starts from these facts:
   account. It may omit incomplete multipart uploads, provider-retained
   versions, delete markers, locked objects, and local staging residue.
 
-## Comparison
+Two of these facts deserve pictures, because they are the reason "just clean
+up old files" is not an option.
+
+### 2.1 Hazard: some WAL objects are fences, not data
+
+A successor writer fences its predecessor by occupying the next WAL slot with
+an empty sentinel; RC.1 re-checks epochs only on a PUT *collision*, never after
+a *successful* PUT. Deleting the sentinel therefore re-opens the slot and lets
+a stale writer land a durable write with clean watcher success (pinned by
+`mem_wal_deleted_fence_slot_allows_stale_writer_success_on_pinned_lance`):
+
+```mermaid
+sequenceDiagram
+    participant Old as Stale writer (epoch N)
+    participant OS as Object store
+    participant New as Successor (epoch N+1)
+
+    New->>OS: claim epoch N+1 (manifest CAS)
+    New->>OS: PUT empty fence sentinel at slot P
+    Note over Old,OS: with the sentinel intact
+    Old->>OS: PUT WAL entry at slot P
+    OS-->>Old: AlreadyExists → check_fenced → typed fence ✓
+    Note over Old,OS: if a cleanup deletes the sentinel
+    Old->>OS: PUT WAL entry at slot P
+    OS-->>Old: success — watcher reports durable ✗
+    Note over Old: stale writer believes its write<br/>was cleanly accepted
+```
+
+Age cannot distinguish the two cases: an idle stream makes the *live* sentinel
+arbitrarily old while a busy stream makes *dead* objects young.
+
+### 2.2 Hazard: materialization attempts leave unreceipted residue
+
+```mermaid
+flowchart TD
+    F["flush / materialization attempt"] --> D["mint fresh randomized dir<br/>shard_id/{random}_gen_N/"]
+    D --> O["write generation objects<br/>(data, manifests, PK/Bloom, indexes)"]
+    O --> CAS{"shard-manifest CAS"}
+    CAS -->|"success"| REF["generation referenced —<br/>owned, folded later"]
+    CAS -->|"crash / failure before CAS"| RES["unreferenced residue —<br/>no attempt ID, no receipt,<br/>indistinguishable from an<br/>attempt running right now"]
+    RES --> RET["retained forever under the<br/>selected retain-all profile"]
+```
+
+Stock RC.1 persists no cross-open attempt identity, cap, reservation, or
+terminal receipt, so no external observer can prove which unreferenced subtree
+is dead. Retain-all sidesteps the question by never deleting.
+
+## 3. Comparison
 
 | Option | Early durable acknowledgement | `__manifest` remains graph visibility | Hard retained-storage bound | Online reuse of reclaimed space | Requires Lance change | Current disposition |
 |---|---:|---:|---:|---:|---:|---|
@@ -122,7 +204,7 @@ The decision starts from these facts:
 | 4. LanceDB-style WAL acknowledgement | Yes | Yes for committed reads; optional fresh reads would be a separate mode | No hard proof on the public OSS shape | No on the surveyed public OSS shape | No | Precedent; OmniGraph keeps stronger correctness contracts |
 | 5. Direct-write path | No separate stream acknowledgement | Yes | Existing bounded request/recovery model | Ordinary Lance maintenance | No | Production default and safe fallback |
 
-## Option 1: unbounded retain-all on stock Lance — selected
+## 4. Option 1: unbounded retain-all on stock Lance — selected
 
 ### Basic idea
 
@@ -130,12 +212,12 @@ Delete nothing inside `_mem_wal`. OmniGraph uses stock Lance's durable writer,
 replay, generation, and fold machinery, but never interprets raw paths as safe
 garbage and never promises a maximum retained-object count or byte total.
 
-```text
-open/claim writer and append WAL
-        ↓
-materialize and fold
-        ↓
-retain every MemWAL object indefinitely
+```mermaid
+flowchart LR
+    A["open/claim writer<br/>append WAL"] --> B["materialize<br/>and fold"]
+    B --> C["retain every MemWAL<br/>object indefinitely"]
+    C -->|"storage grows monotonically"| A
+    C -.->|"provider capacity exhausted"| E["loud, typed failure through the<br/>existing write/recovery boundary —<br/>never silent loss, never a fake commit"]
 ```
 
 Storage use is monotonic. If the provider runs out of capacity or refuses a
@@ -186,7 +268,7 @@ generation must continue to fold or reach a typed terminal/recovery state. The
 near-cap closure cell remains a regression gate locally and on configured
 RustFS.
 
-## Option 2: a narrow local Lance patch with managed GC
+## 5. Option 2: a narrow local Lance patch with managed GC
 
 ### Basic idea
 
@@ -196,18 +278,16 @@ upstream-shaped change to Lance. OmniGraph does not wait for upstream review or
 a release to use it, but it also does not move Lance's physical ownership into
 an OmniGraph raw-path collector.
 
-The patch should expose an opaque Lance-owned protocol such as:
+The patch should expose an opaque Lance-owned protocol:
 
-```text
-inspect exact reclaimable cut
-        ↓
-durably persist attempt and exact plan
-        ↓
-fence/advance writer epoch and successor sentinel
-        ↓
-delete the Lance-owned object set
-        ↓
-persist terminal receipt
+```mermaid
+flowchart TD
+    I["inspect exact reclaimable cut"] --> P["durably persist attempt and exact plan"]
+    P --> F["fence/advance writer epoch<br/>and successor sentinel"]
+    F --> D["delete the Lance-owned object set"]
+    D --> R["persist terminal receipt"]
+    P -.->|"crash anywhere"| REC["idempotent recovery:<br/>same plan finishes or fails closed —<br/>never guesses success"]
+    D -.-> REC
 ```
 
 ### Required capabilities
@@ -253,7 +333,7 @@ arithmetic, and bounded history. Passing the Lance patch tests alone does not
 activate OmniGraph's public API; the common RFC-026 token, attribution,
 lifecycle, correction, authorization, and graph-history contracts still apply.
 
-## Option 3: whole-root rotation or rebuild
+## 6. Option 3: whole-root rotation or rebuild
 
 ### Basic idea
 
@@ -299,27 +379,58 @@ Option 3 is therefore an optional coarse operational escape, not part of the
 first retain-all activation contract and not a replacement for a future safe
 online-GC protocol.
 
-## Option 4: LanceDB-style acknowledgement of WAL writes
+### Deferred design note: the deletion-granularity ladder
+
+If a later bounded/managed profile needs reclamation, the deletion unit is a
+design dial with three settings, not a binary choice:
+
+```mermaid
+flowchart LR
+    G["per generation<br/>zero drain window<br/>needs the Lance patch<br/>(Option 2)"]
+    S["per shard/enrollment<br/>no Lance change<br/>drain window per rotation<br/>deletes a dead namespace"]
+    R["per root<br/>no Lance change<br/>whole-graph cutover<br/>(Option 3 as written)"]
+    G ---|"finer ← granularity → coarser"| S
+    S --- R
+```
+
+- **Per generation** (fine-grained, zero drain window) requires the Lance-owned
+  inspect/plan/execute protocol in
+  [lance-memwal-pr.md](lance-memwal-pr.md) — classification inside a live shard
+  and post-success writer fencing are irreducibly Lance's.
+- **Per shard/enrollment** (no Lance change) exploits the fact that RC.1's
+  layout is strictly shard-scoped under public path helpers
+  (`{table}/_mem_wal/{shard_id}/…`, `shard_base_path` et al.): drain to empty,
+  reach `SEALED`, re-enroll the same table under a fresh shard UUID, and the
+  retired subtree becomes a dead namespace deletable as one unit — no object
+  classification, no live-shard fencing interplay. Costs: a drain window per
+  rotation, `__lance_mem_wal` index-row hygiene for retired shards, a narrow
+  governed exception to the no-raw-`_mem_wal`-deletion rule, and refusal of
+  versioned/Object-Lock buckets. Because WAL state is transient by design,
+  fold-to-empty makes the retired subtree small; GC pressure scales with
+  rotation cadence, not proof machinery.
+- **Per root** is this option as written.
+
+Any age-based trigger is rejected at every granularity: an idle stream makes
+live fence sentinels arbitrarily old while a busy stream makes dead objects
+young, so age anti-correlates with safety exactly when it matters (§2.1).
+Eligibility is always the provable folded/superseded state Lance already
+exposes (`merged_generations`, replay cursor), evaluated on whatever cadence
+operations prefer.
+
+## 7. Option 4: LanceDB-style acknowledgement of WAL writes
 
 ### What LanceDB currently does
 
 The public LanceDB OSS path provides the clearest precedent for a narrower
 contract:
 
-```text
-restricted merge_insert upsert
-        ↓
-validate and collect the input for one shard
-        ↓
-reuse a cached ShardWriter
-        ↓
-ShardWriter::put
-        ↓
-put returns; with the default configuration the WAL is durable
-        ↓
-return version = 0
-        ↓
-separate LSM-aware read (open PR) / external compactor
+```mermaid
+flowchart TD
+    A["restricted merge_insert upsert"] --> B["validate and collect the<br/>input for one shard"]
+    B --> C["reuse a cached ShardWriter"]
+    C --> D["ShardWriter::put<br/>(default config: waits for WAL durability)"]
+    D --> E["return version = 0<br/>(insert/update split unknown<br/>until later compaction)"]
+    E -.-> F["separate LSM-aware read (open PR)<br/>external compactor / private server"]
 ```
 
 With Lance's default durable configuration, `put` waits for WAL persistence.
@@ -333,9 +444,13 @@ API precedent, not evidence for OmniGraph's acknowledgement guarantee.
 At the surveyed public revision, ordinary native scans do not merge this fresh
 tier; the proposed LSM-aware read path remains a separate open change. The
 public repository also contains no complete MemWAL fold worker, retained-byte
-quota, materialization-attempt ledger, or MemWAL-specific GC. Remote/Cloud
-lifecycle endpoints delegate to private server code and therefore do not
-provide public evidence for those guarantees.
+quota, materialization-attempt ledger, or MemWAL-specific GC, and no
+`check_fenced` call anywhere in its Rust tree. Remote/Cloud lifecycle endpoints
+delegate to private server code and therefore do not provide public evidence
+for those guarantees; the delegation target is named in source — LanceDB's
+REST DTOs "mirror sophon's `Sharding` enum," and Lance core comments note that
+"Sophon's reconcile" keys on the sealed marker — so the fold/lifecycle
+reconciler exists, by name, in the proprietary server rather than in OSS.
 
 This is not evidence that the missing lifecycle is impossible or that the
 public adapter is an end-to-end production lifecycle. It shows only that
@@ -465,23 +580,19 @@ worth monotonic-storage risk and delayed visibility. OmniGraph still promises
 recoverability and contract-defined disposition for acknowledged data; it does
 not promise indefinitely bounded retained storage.
 
-## Option 5: keep direct writes and improve batching
+## 8. Option 5: keep direct writes and improve batching
 
 ### Basic idea
 
 Do not activate a public WAL admission contract yet. Continue to use the
 implemented RFC-022 path:
 
-```text
-validate and stage
-        ↓
-arm recovery
-        ↓
-commit every affected Lance table
-        ↓
-publish once through __manifest
-        ↓
-acknowledge graph-visible success
+```mermaid
+flowchart TD
+    V["validate and stage"] --> R["arm recovery"]
+    R --> T["commit every affected Lance table"]
+    T --> P["publish once through __manifest"]
+    P --> A["acknowledge graph-visible success"]
 ```
 
 Reduce its fixed cost through caller batching, server-side group scheduling
@@ -508,7 +619,7 @@ Direct writes remain necessary under every other option. Streaming is an
 additional acknowledgement contract, not a replacement for transactions that
 must be graph-visible on return.
 
-## Routes that are not valid options
+## 9. Routes that are not valid options
 
 ### Blind periodic garbage collection
 
@@ -517,7 +628,7 @@ collector is the execution mechanism for Option 2 after Lance can prove an
 exact eligible cut, fence writers, recover a partial deletion, and issue a
 terminal receipt. “List everything unreferenced and old enough” may delete an
 in-progress generation, history/index-required data, or a WAL sentinel needed
-to fence a stale writer.
+to fence a stale writer (§2.1).
 
 ### A separate OmniGraph WAL
 
@@ -531,7 +642,16 @@ No option may convert a possible durable WAL effect into a fresh direct write
 without resolving the first attempt. That can duplicate, reorder, or overwrite
 logical changes while returning an apparently clean result.
 
-## Selected staged route
+## 10. Selected staged route
+
+```mermaid
+flowchart TD
+    S1["Stage 1 — baseline & closure<br/>direct writes stay default ·<br/>B1 stays private/feature-gated ·<br/>widest-shape fold cell stays green"]
+    S2["Stage 2 — public-contract prerequisites, privately<br/>compare-and-chain sequencing · attribution ·<br/>lifecycle/correction · terminal receipts ·<br/>authorization · status · shutdown ownership"]
+    S3["Stage 3 — product surfaces<br/>durable-admission vocabulary · fold/block status ·<br/>lifecycle controls · Cedar/SDK/HTTP/CLI/OpenAPI parity ·<br/>document monotonic storage posture"]
+    L["Later, only if operations justify it<br/>Option 3 rotation · Option 2 Lance patch ·<br/>any hard byte/file bound = new measured RFC"]
+    S1 --> S2 --> S3 -.-> L
+```
 
 ### Stage 1: preserve the baseline and keep closure green
 
@@ -570,7 +690,7 @@ logical changes while returning an apparently clean result.
 - Treat any hard byte/file admission bound or `GraphHistoryBudget` as a new
   measured RFC decision, not prerequisite scaffolding for retain-all.
 
-## Decision statement
+## 11. Decision statement
 
 OmniGraph chooses unbounded retain-all as the first streaming storage profile.
 Lance MemWAL remains the substrate, `__manifest` remains the only graph-
@@ -588,5 +708,33 @@ future improvements, not blockers for this profile.
 - [OmniGraph write-path state of affairs](writing-path-state-of-affairs.md)
 - [Lance MemWAL format](https://lance.org/format/table/mem_wal/)
 - [LanceDB MemWAL write integration](https://github.com/lancedb/lancedb/blob/8450683b2aba033b12d8fe4c6e1601cc4b733b91/rust/lancedb/src/table/merge/lsm.rs)
+  — surveyed repo-wide at that rev: `put`-only dispatch, `version = 0` result,
+  no fold worker, no GC, no quota, no `check_fenced`; lifecycle delegates to
+  the private `sophon` server
 - [LanceDB proposed LSM read path, PR #3489](https://github.com/lancedb/lancedb/pull/3489)
 - [LanceDB remote lifecycle integration, PR #3501](https://github.com/lancedb/lancedb/pull/3501)
+
+Prior art consulted for the acknowledgement and lifecycle-ownership shape
+(design references, not dependencies):
+
+- [SlateDB](https://github.com/slatedb/slatedb) — the reference object-store
+  WAL design: in-memory group commit flushed on a ~100ms interval, WAL files
+  reusing the SST format, `await_durable` acknowledgement semantics
+  (RFC-0008), and zombie-writer fencing via a manifest epoch plus
+  `PutMode::Create` on the next WAL slot (`fence.rs`) — the same
+  collision-fencing family MemWAL uses. Its `slatedb-dst` crate is the model
+  for a seeded deterministic-simulation harness.
+- [sleet](https://github.com/criccomini/sleet) — SlateDB's external fleet
+  manager for GC/compaction/mirroring. Its division of labor is the one this
+  document assumes for any future managed profile: the engine owns the safe
+  primitives (`Admin::run_gc`), the external scheduler owns only placement
+  (heartbeat objects + rendezvous hashing + CAS job claims), and "placement is
+  an efficiency mechanism; safety comes from fencing." A fleet layer for
+  OmniGraph maintenance would follow the same split and additionally requires
+  the still-missing cross-process fence — and note that a branch-local
+  publication epoch is *not* that fence: `__manifest` is itself natively
+  branched, so an epoch row inherited at a fork evolves independently and a
+  main-branch bump cannot fence a named-branch publication. A visibility check
+  at the publication door also cannot stop a paused process from later
+  resuming `Restore`, `cleanup_old_versions`, or a native ref mutation, none of
+  which condition their own commit on that row.

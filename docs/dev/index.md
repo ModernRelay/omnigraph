@@ -20,11 +20,13 @@ roadmap). The per-area docs below remain the mechanical authority.
 | Versioning & compatibility policy (release / wire / storage / Lance) | [versioning.md](versioning.md) |
 | Upstream Lance source-of-truth index | [lance.md](lance.md) |
 | Existing test coverage and test placement | [testing.md](testing.md) |
+| Test-harness library survey — deterministic simulation and fuzzing options (research note) | [test-harness-libs.md](test-harness-libs.md) |
 
 ## Architecture And Storage
 
 | Area | Read |
 |---|---|
+| System reference — vocabulary, operation catalog, key flows | [system.md](system.md) |
 | System structure, L1/L2 framing, component diagrams | [architecture.md](architecture.md) |
 | On-disk layout, manifest schema, URI behavior | [storage.md](../user/concepts/storage.md) |
 | Direct-publish writes, D2, staged writes, recovery sidecars | [writes.md](writes.md) |

@@ -85,6 +85,11 @@ struct Args {
     /// target size. Holding this small while `--rows` grows is the whole
     /// point of that scenario: it separates delta cost from target cost.
     delta_rows: usize,
+    /// `general-merge-updates` source shape: "update" rewrites committed rows,
+    /// "insert" adds brand-new rows. Both run against a target that advanced
+    /// after the fork, which is what distinguishes this from the adopt
+    /// scenario's untouched target.
+    source_mode: String,
     memory_cap_mb: Option<u64>,
     /// Results-log override; see `results_path`.
     out: Option<String>,
@@ -116,6 +121,7 @@ impl Args {
             selectivity: 0.05,
             k: 10,
             delta_rows: 50,
+            source_mode: "update".to_string(),
             memory_cap_mb: None,
             out: None,
             baseline: false,
@@ -142,6 +148,7 @@ impl Args {
                 "--delta-rows" => {
                     args.delta_rows = take("--delta-rows").parse().expect("--delta-rows")
                 }
+                "--source-mode" => args.source_mode = take("--source-mode"),
                 "--out" => args.out = Some(take("--out")),
                 "--memory-cap-mb" => {
                     args.memory_cap_mb = Some(take("--memory-cap-mb").parse().expect("cap"))
@@ -174,6 +181,8 @@ impl Args {
             self.k.to_string(),
             "--delta-rows".into(),
             self.delta_rows.to_string(),
+            "--source-mode".into(),
+            self.source_mode.clone(),
             "--child".into(),
         ];
         if self.baseline {
@@ -595,6 +604,7 @@ fn run_phased_adopt_once(args: &Args, run: usize) -> serde_json::Value {
             "selectivity": args.selectivity,
             "k": args.k,
             "delta_rows": args.delta_rows,
+            "source_mode": args.source_mode,
             "memory_cap_mb": args.memory_cap_mb,
             "baseline": args.baseline,
         },
