@@ -23,7 +23,9 @@ rank).
 - Match filters apply **before** the search: combining a `match` predicate with
   `nearest()` (or `bm25()`) returns the top-`limit` of the *matching* rows —
   never a post-filtered remainder of the global top-k. A selective filter
-  narrows the candidate set; it cannot starve the result count.
+  narrows the candidate set; it cannot starve the result count. This holds for
+  both predicate forms — inline props (`$d: Doc { status: "open" }`) and
+  standalone filter lines, including range predicates (`$d.priority <= 2`).
 - Scores and ranks propagate as ordinary columns, so you can `return` a score and
   `order` by it.
 

@@ -1,5 +1,9 @@
 # Lance MemWAL PR
 
+> **Historical record — no active consumer.** OmniGraph removed RFC-026 and no
+> longer needs MemWAL reclamation support. See
+> [the current direct graph-batch decision](wal-removal.md).
+
 **Status:** deferred optional managed-reclamation proposal; not an RFC-026
 retain-all activation dependency
 

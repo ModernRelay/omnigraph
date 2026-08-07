@@ -54,518 +54,12 @@ where
         .unwrap();
 }
 
-fn assert_open_stream_lifecycle_conflict(error: OmniError, operation: &str) {
-    let OmniError::Manifest(manifest_error) = error else {
-        panic!("expected typed manifest lifecycle conflict, got {error:?}");
-    };
-    assert!(
-        matches!(
-            manifest_error.details,
-            Some(omnigraph::error::ManifestConflictDetails::StreamLifecycleConflict {
-                ref lifecycle,
-                operation: ref actual_operation,
-                ..
-            }) if lifecycle == "OPEN" && actual_operation == operation
-        ),
-        "expected OPEN/{operation} lifecycle conflict, got {manifest_error:?}",
-    );
-}
-
 const RFC023_KEY_SCHEMA: &str = r#"
 node Person {
     name: String @key
     score: I32
 }
 "#;
-
-#[tokio::test]
-#[serial]
-async fn stream_enrollment_no_effect_crash_retires_intent_and_can_retry() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA_V1).await.unwrap();
-
-    {
-        let _failpoint =
-            ScopedFailPoint::new(names::STREAM_ENROLLMENT_POST_SIDECAR_PRE_INDEX, "return");
-        db.failpoint_enroll_stream_table_for_test("node:Person")
-            .await
-            .expect_err("pre-index crash must leave exact no-effect recovery intent");
-    }
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("__recovery"))
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .count(),
-        1
-    );
-    drop(db);
-
-    let reopened = Omnigraph::open(uri)
-        .await
-        .expect("read-write open must retire an exact no-effect enrollment");
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("__recovery"))
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .count(),
-        0
-    );
-    reopened
-        .failpoint_enroll_stream_table_for_test("node:Person")
-        .await
-        .expect("a fresh enrollment may retry after exact no-effect retirement");
-}
-
-#[tokio::test]
-#[serial]
-async fn stream_enrollment_index_only_crash_rolls_forward_and_fences_ordinary_writes() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA_V2_ADDED_TYPE).await.unwrap();
-
-    {
-        let _failpoint =
-            ScopedFailPoint::new(names::STREAM_ENROLLMENT_POST_INDEX_PRE_RECOVERY, "return");
-        db.failpoint_enroll_stream_table_for_test("node:Person")
-            .await
-            .expect_err("post-index crash must retain enrollment recovery authority");
-    }
-    drop(db);
-
-    let reopened = Omnigraph::open(uri)
-        .await
-        .expect("open recovery must provision the exact shard and publish OPEN");
-    let error = load_jsonl(
-        &reopened,
-        r#"{"type":"Person","data":{"name":"blocked"}}"#,
-        LoadMode::Merge,
-    )
-    .await
-    .expect_err("ordinary load must not advance an OPEN stream's base table");
-    let OmniError::Manifest(manifest_error) = error else {
-        panic!("expected typed manifest lifecycle conflict, got {error:?}");
-    };
-    assert!(matches!(
-        manifest_error.details,
-        Some(omnigraph::error::ManifestConflictDetails::StreamLifecycleConflict {
-            lifecycle,
-            ..
-        }) if lifecycle == "OPEN"
-    ));
-
-    load_jsonl(
-        &reopened,
-        r#"{"type":"Company","data":{"name":"still-writable"}}"#,
-        LoadMode::Merge,
-    )
-    .await
-    .expect("an OPEN Person stream must not fence an unrelated Company table");
-}
-
-#[tokio::test]
-#[serial]
-async fn stream_enrollment_empty_shard_crash_rolls_forward_without_reclaim_or_reclaiming_epoch() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA_V1).await.unwrap();
-
-    {
-        let _failpoint =
-            ScopedFailPoint::new(names::STREAM_ENROLLMENT_POST_SHARD_PRE_MANIFEST, "return");
-        let error = db
-            .failpoint_enroll_stream_table_for_test("node:Person")
-            .await
-            .expect_err("post-shard crash must retain exact recovery intent");
-        assert!(
-            matches!(error, OmniError::RecoveryRequired { .. }),
-            "a post-effect failure must stay typed as RecoveryRequired: {error:?}"
-        );
-    }
-    drop(db);
-
-    let reopened = Omnigraph::open(uri)
-        .await
-        .expect("recovery must publish the already-proven empty shard");
-    let error = reopened
-        .failpoint_enroll_stream_table_for_test("node:Person")
-        .await
-        .expect_err("visible OPEN binding must make repeated enrollment a typed conflict");
-    assert!(matches!(error, OmniError::Manifest(_)));
-}
-
-#[tokio::test]
-#[serial]
-async fn stream_enrollment_post_publish_audit_failure_remains_recoverable() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA_V1).await.unwrap();
-
-    {
-        let _failpoint = ScopedFailPoint::new(names::RECOVERY_RECORD_AUDIT, "return");
-        let error = db
-            .failpoint_enroll_stream_table_for_test("node:Person")
-            .await
-            .expect_err("audit failure after manifest publication must retain the sidecar");
-        assert!(
-            matches!(error, OmniError::RecoveryRequired { .. }),
-            "post-publication finalization failure must remain typed: {error:?}"
-        );
-    }
-    drop(db);
-
-    let reopened = Omnigraph::open(uri)
-        .await
-        .expect("reopen must recognize the fixed visible enrollment and finish audit cleanup");
-    let error = load_jsonl(
-        &reopened,
-        r#"{"type":"Person","data":{"name":"blocked"}}"#,
-        LoadMode::Merge,
-    )
-    .await
-    .expect_err("the recovered OPEN lifecycle must fence ordinary writes");
-    assert_open_stream_lifecycle_conflict(error, "load");
-}
-
-#[tokio::test]
-#[serial]
-async fn stream_enrollment_post_publish_delete_failure_keeps_visible_success_and_reopen_cleans() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA_V1).await.unwrap();
-    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
-
-    {
-        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_DELETE, "return");
-        db.failpoint_enroll_stream_table_for_test("node:Person")
-            .await
-            .expect("Phase-D sidecar deletion must not fail a visible, audited enrollment");
-        assert_eq!(
-            std::fs::read_dir(dir.path().join("__recovery"))
-                .unwrap()
-                .filter_map(std::result::Result::ok)
-                .count(),
-            1,
-            "the failed cleanup must leave one durable recovery sidecar"
-        );
-        let recovery_error = match Omnigraph::open(uri).await {
-            Ok(_) => panic!("open recovery must not swallow its own sidecar cleanup failure"),
-            Err(error) => error,
-        };
-        assert!(
-            matches!(recovery_error, OmniError::RecoveryRequired { .. }),
-            "open recovery must keep cleanup failure typed: {recovery_error:?}"
-        );
-    }
-
-    let commits_after_publish = db.list_commits(Some("main")).await.unwrap().len();
-    assert_eq!(commits_after_publish, commits_before + 1);
-    assert_eq!(
-        recovery_audit_kinds(dir.path()).await,
-        vec!["RolledForward"],
-        "the writer must audit the visible enrollment before best-effort cleanup"
-    );
-    drop(db);
-
-    let reopened = Omnigraph::open(uri)
-        .await
-        .expect("reopen must finalize the visible enrollment and retire its stale sidecar");
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("__recovery"))
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .count(),
-        0
-    );
-    assert_eq!(
-        reopened.list_commits(Some("main")).await.unwrap().len(),
-        commits_after_publish,
-        "stale-sidecar cleanup must not publish a second graph commit"
-    );
-    assert_eq!(
-        recovery_audit_kinds(dir.path()).await,
-        vec!["RolledForward"],
-        "stale-sidecar cleanup must not duplicate the recovery audit"
-    );
-    let error = reopened
-        .failpoint_enroll_stream_table_for_test("node:Person")
-        .await
-        .expect_err("the already-visible OPEN lifecycle must reject repeated enrollment");
-    assert!(matches!(error, OmniError::Manifest(_)));
-}
-
-#[tokio::test]
-#[serial]
-async fn stream_enrollment_refuses_when_a_named_graph_branch_exists() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA_V1).await.unwrap();
-    db.branch_create("feature").await.unwrap();
-
-    let error = db
-        .failpoint_enroll_stream_table_for_test("node:Person")
-        .await
-        .expect_err("bounded enrollment must not create branch-local lifecycle ambiguity");
-    assert!(
-        error.to_string().contains("requires a main-only graph"),
-        "unexpected topology refusal: {error}"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn open_refuses_uncovered_memwal_index_without_lifecycle_authority() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA_V1).await.unwrap();
-
-    {
-        let _failpoint =
-            ScopedFailPoint::new(names::STREAM_ENROLLMENT_POST_INDEX_PRE_RECOVERY, "return");
-        db.failpoint_enroll_stream_table_for_test("node:Person")
-            .await
-            .expect_err("post-index failpoint must leave the covered enrollment gap");
-    }
-    let sidecars = std::fs::read_dir(dir.path().join("__recovery"))
-        .unwrap()
-        .filter_map(std::result::Result::ok)
-        .collect::<Vec<_>>();
-    assert_eq!(sidecars.len(), 1, "the partial effect must remain covered");
-    std::fs::remove_file(sidecars[0].path()).unwrap();
-    drop(db);
-
-    let error = match Omnigraph::open(uri).await {
-        Ok(_) => panic!("uncovered MemWAL metadata must fail format consistency"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("stream format consistency failed"),
-        "unexpected partial-format refusal: {error}"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn open_refuses_uncovered_memwal_shard_residue_without_index_or_lifecycle() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA_V1).await.unwrap();
-    let person_uri = node_table_uri(&db, "Person").await;
-    let residue = std::path::Path::new(&person_uri)
-        .join("_mem_wal")
-        .join("99999999-9999-4999-8999-999999999999")
-        .join("foreign.bin");
-    std::fs::create_dir_all(residue.parent().unwrap()).unwrap();
-    std::fs::write(&residue, b"uncovered shard residue").unwrap();
-    drop(db);
-
-    let error = match Omnigraph::open(uri).await {
-        Ok(_) => panic!("raw MemWAL residue without authority must fail format consistency"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("stream format consistency failed"),
-        "unexpected raw-residue refusal: {error}"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn open_refuses_uncovered_head_advance_past_stream_lifecycle_witness() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA_V1).await.unwrap();
-    load_jsonl(
-        &db,
-        r#"{"type":"Person","data":{"name":"person"}}"#,
-        LoadMode::Merge,
-    )
-    .await
-    .unwrap();
-    db.failpoint_enroll_stream_table_for_test("node:Person")
-        .await
-        .unwrap();
-
-    let person_uri = node_table_uri(&db, "Person").await;
-    let mut person = helpers::open_dataset_head(&person_uri, None).await;
-    person.delete("name = 'person'").await.unwrap();
-    drop(person);
-    drop(db);
-
-    let error = match Omnigraph::open(uri).await {
-        Ok(_) => panic!("an uncovered HEAD beyond lifecycle authority must fail closed"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("stream format consistency failed"),
-        "unexpected uncovered-HEAD refusal: {error}"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn open_stream_fences_productive_maintenance_and_gc_but_allows_repair_preview() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, SCHEMA_V1).await.unwrap();
-
-    // Four independent commits are enough for Lance's default compaction plan
-    // to contain productive work (the maintenance suite pins the same shape).
-    for name in ["p0", "p1", "p2", "p3"] {
-        load_jsonl(
-            &db,
-            &format!(r#"{{"type":"Person","data":{{"name":"{name}"}}}}"#),
-            LoadMode::Merge,
-        )
-        .await
-        .unwrap();
-    }
-    db.failpoint_enroll_stream_table_for_test("node:Person")
-        .await
-        .unwrap();
-
-    let optimize_error = db
-        .optimize()
-        .await
-        .expect_err("productive optimize must not move an OPEN stream base");
-    assert_open_stream_lifecycle_conflict(optimize_error, "optimize");
-
-    let cleanup_error = db
-        .cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
-        .await
-        .expect_err("version GC must preserve OPEN stream recovery evidence");
-    assert_open_stream_lifecycle_conflict(cleanup_error, "cleanup");
-
-    // Manufacture uncovered external drift after enrollment. Preview remains
-    // read-only and useful to the operator, while adoption is a manifest
-    // effect and therefore remains fenced by OPEN.
-    let person_uri = node_table_uri(&db, "Person").await;
-    let mut person = helpers::open_dataset_head(&person_uri, None).await;
-    person.delete("name = 'p0'").await.unwrap();
-
-    let preview = db
-        .repair(omnigraph::db::RepairOptions::default())
-        .await
-        .expect("repair preview must remain read-only under OPEN");
-    assert!(preview.tables.iter().any(|table| {
-        table.table_key == "node:Person" && table.action == omnigraph::db::RepairAction::Preview
-    }));
-
-    let repair_error = db
-        .repair(omnigraph::db::RepairOptions {
-            confirm: true,
-            force: true,
-        })
-        .await
-        .expect_err("repair must not adopt an external HEAD over OPEN authority");
-    assert_open_stream_lifecycle_conflict(repair_error, "repair");
-}
-
-#[tokio::test]
-#[serial]
-async fn open_stream_fences_missing_index_materialization() {
-    use lance::index::DatasetIndexExt;
-
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, SCHEMA_V1).await.unwrap();
-    load_jsonl(
-        &db,
-        r#"{"type":"Person","data":{"name":"person"}}"#,
-        LoadMode::Merge,
-    )
-    .await
-    .unwrap();
-    db.ensure_indices().await.unwrap();
-
-    // Publish a consistent pre-enrollment manifest pin whose required id
-    // index is missing. Enrollment adds only the MemWAL system index, leaving
-    // EnsureIndices with real base-table work to fence.
-    let person_uri = node_table_uri(&db, "Person").await;
-    let mut person = helpers::open_dataset_head(&person_uri, None).await;
-    person.drop_index("id_idx").await.unwrap();
-    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Person", None)
-        .await
-        .unwrap();
-    db.failpoint_enroll_stream_table_for_test("node:Person")
-        .await
-        .unwrap();
-
-    let error = db
-        .ensure_indices()
-        .await
-        .expect_err("EnsureIndices must not rebuild an OPEN stream base");
-    assert_open_stream_lifecycle_conflict(error, "ensure_indices");
-}
-
-#[tokio::test]
-#[serial]
-async fn open_stream_allows_disjoint_optimize_and_repair_effects() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA_V2_ADDED_TYPE).await.unwrap();
-
-    // Reconcile empty-table required indexes before enrollment so Person has
-    // no productive maintenance work of its own after becoming OPEN.
-    db.ensure_indices().await.unwrap();
-    db.failpoint_enroll_stream_table_for_test("node:Person")
-        .await
-        .unwrap();
-    for name in ["c0", "c1", "c2", "c3"] {
-        load_jsonl(
-            &db,
-            &format!(r#"{{"type":"Company","data":{{"name":"{name}"}}}}"#),
-            LoadMode::Merge,
-        )
-        .await
-        .unwrap();
-    }
-
-    let optimized = db
-        .optimize()
-        .await
-        .expect("OPEN Person must not fence disjoint Company maintenance");
-    assert!(
-        optimized
-            .iter()
-            .any(|table| { table.table_key == "node:Company" && table.committed })
-    );
-
-    let company_uri = node_table_uri(&db, "Company").await;
-    let mut company = helpers::open_dataset_head(&company_uri, None).await;
-    company.delete("name = 'c0'").await.unwrap();
-    let repaired = db
-        .repair(omnigraph::db::RepairOptions {
-            confirm: true,
-            force: true,
-        })
-        .await
-        .expect("OPEN Person must not fence disjoint Company manifest adoption");
-    assert!(repaired.tables.iter().any(|table| {
-        table.table_key == "node:Company" && table.action == omnigraph::db::RepairAction::Forced
-    }));
-}
 
 const RFC023_EXTERNAL_WRITER_ENV: &str = "OMNIGRAPH_RFC023_EXTERNAL_WRITER";
 const RFC023_EXTERNAL_URI_ENV: &str = "OMNIGRAPH_RFC023_EXTERNAL_URI";
@@ -691,8 +185,7 @@ fn rfc023_external_writer_process() {
 /// an enrolled multi-table writer has committed table 1 and parked before
 /// table 2, where publishing a competing graph commit would be both unnecessary
 /// and semantically wrong for the recovery assertion. The source schema is
-/// restricted to the `name @key` fixture used by that test; the canonical
-/// hidden attribution column is supplied as physical null metadata.
+/// restricted to the `name @key` fixture used by that test.
 async fn commit_raw_fenced_name_row(table_uri: &str, id: &str) {
     let base = Arc::new(Dataset::open(table_uri).await.unwrap());
     let schema = Arc::new(Schema::from(base.schema()));
@@ -702,16 +195,14 @@ async fn commit_raw_fenced_name_row(table_uri: &str, id: &str) {
             .iter()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>(),
-        vec!["id", "name", "__omnigraph_stream_v1$"],
+        vec!["id", "name"],
         "raw conflict injector is intentionally limited to the name-only fixture"
     );
-    let hidden = arrow_array::new_null_array(schema.field(2).data_type(), 1);
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
             Arc::new(StringArray::from(vec![id])),
             Arc::new(StringArray::from(vec![id])),
-            hidden,
         ],
     )
     .unwrap();
@@ -2569,17 +2060,15 @@ async fn rfc023_disjoint_retryable_strict_conflict_reprepares_without_key_confli
             .iter()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>(),
-        ["id", "name", "score", "__omnigraph_stream_v1$"],
+        ["id", "name", "score"],
         "raw disjoint-conflict injector is schema-specific"
     );
-    let hidden = arrow_array::new_null_array(schema.field(3).data_type(), 1);
     let foreign = RecordBatch::try_new(
         schema,
         vec![
             Arc::new(StringArray::from(vec!["foreign-disjoint"])),
             Arc::new(StringArray::from(vec!["foreign-disjoint"])),
             Arc::new(Int32Array::from(vec![1])),
-            hidden,
         ],
     )
     .unwrap();
@@ -7926,6 +7415,99 @@ async fn seed_optimize_late_sidecar_race(dir: &tempfile::TempDir) {
     // Leave real compaction work behind so a missing barrier advances Person
     // instead of accidentally passing because Optimize was a no-op.
     helpers::commit_many(&mut seed, 4).await;
+}
+
+/// Optimize captures a complete authority token before entering any writer
+/// gate, then revalidates it after schema -> main -> table (`optimize.rs`, the
+/// comment above `open_write_txn`). That revalidation is the only thing that
+/// stops a maintenance run from planning against a graph that moved while it
+/// waited — v6 had no such check, it used a bare fresh snapshot.
+///
+/// The token carried in `admission_txn` is the authority proof and the source
+/// of the recovery sidecar's `RecoveryAuthorityToken`. Removing it would
+/// silently downgrade optimize/cleanup/repair from
+/// reject-on-authority-drift to read-whatever-is-fresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    seed_optimize_late_sidecar_race(&dir).await;
+
+    let optimize_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let mut writer_db = Omnigraph::open(&uri).await.unwrap();
+    let person_uri = node_table_uri(optimize_db.as_ref(), "Person").await;
+    let graph_head_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
+
+    // Park Optimize with its authority token captured but no gate held.
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(
+        names::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
+    );
+    let optimize_task_db = std::sync::Arc::clone(&optimize_db);
+    let optimize = tokio::spawn(async move { optimize_task_db.optimize().await });
+    rendezvous.wait_until_reached().await;
+
+    // Advance the graph head underneath it with an ordinary committed write, so
+    // Optimize's captured token is now stale in `graph_head`.
+    mutate_main(
+        &mut writer_db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "authority-mover")], &[("$age", 41)]),
+    )
+    .await
+    .expect("the concurrent write must commit while Optimize waits");
+    let graph_head_after = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    assert_ne!(
+        graph_head_before, graph_head_after,
+        "the fixture must actually move the graph head, or this test is vacuous",
+    );
+    // Baseline taken AFTER the concurrent write: that write legitimately moves
+    // Person. What must not move it again is Optimize.
+    let person_head_after_write = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+
+    rendezvous.release();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
+        .await
+        .expect("Optimize task hung after releasing the authority-capture rendezvous")
+        .unwrap();
+    drop(rendezvous);
+
+    let error = outcome.expect_err(
+        "Optimize must refuse a token whose graph head moved before it acquired its gates",
+    );
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("read set")
+            || rendered.contains("graph_head")
+            || rendered.contains("changed"),
+        "expected an authority-drift refusal, got: {rendered}",
+    );
+
+    assert_eq!(
+        lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .version()
+            .version,
+        person_head_after_write,
+        "the refusal must land before any physical maintenance effect",
+    );
+    let recovery_dir = dir.path().join("__recovery");
+    let sidecars: Vec<_> = std::fs::read_dir(&recovery_dir)
+        .map(|entries| entries.filter_map(|entry| entry.ok()).collect())
+        .unwrap_or_default();
+    assert!(
+        sidecars.is_empty(),
+        "a pre-effect authority refusal must leave no Optimize sidecar: {sidecars:?}",
+    );
 }
 
 /// Optimize's entry recovery probe is only a fast path. A graph-global

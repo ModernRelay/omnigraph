@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 
-use crate::db::manifest::stream_token::StreamFoldAttributionSummaryV2;
 use crate::error::Result;
 
 #[derive(Debug, Clone)]
@@ -12,9 +11,6 @@ pub struct GraphCommit {
     pub merged_parent_commit_id: Option<String>,
     pub actor_id: Option<String>,
     pub created_at: i64,
-    /// Protocol-private F5 fold commitment retained in the derived lineage
-    /// cache. It is not part of the public commit-list contract.
-    pub(crate) stream_fold_attribution_v2: Option<StreamFoldAttributionSummaryV2>,
 }
 
 impl GraphCommit {
@@ -297,7 +293,6 @@ fn build_commit_cache(
             merged_parent_commit_id: row.merged_parent_commit_id,
             actor_id: row.actor_id,
             created_at: row.created_at,
-            stream_fold_attribution_v2: row.stream_fold_attribution_v2,
         };
         if should_replace_head(head_commit.as_ref(), &commit) {
             head_commit = Some(commit.clone());

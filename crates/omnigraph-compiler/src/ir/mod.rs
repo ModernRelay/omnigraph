@@ -74,6 +74,11 @@ pub enum IROp {
         /// Expand so the executor can apply them during hydration (Lance
         /// SQL pushdown) rather than as a separate post-expand pass.
         dst_filters: Vec<IRFilter>,
+        /// Variable bound to the matched edge row (`$p $w:knows $f`), if any.
+        /// Changes the op's contract: one output row per matching edge ROW
+        /// (not per distinct endpoint pair), edge property columns carried
+        /// under this prefix. Always single-hop (typecheck T23).
+        edge_binding: Option<String>,
     },
     Filter(IRFilter),
     AntiJoin {

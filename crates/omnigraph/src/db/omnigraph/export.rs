@@ -12,40 +12,27 @@ pub const EXPORT_CHUNK_MAX_BYTES: usize = 64 * 1024;
 
 /// One immutable graph cut captured for served export.
 ///
-/// Capture validates stream terminality, recovery, the selected branch, and
-/// every requested table while all graph write domains are closed. An enrolled
-/// graph additionally requires checked cluster authority; a pristine graph has
-/// no stream authority to transfer. The cut retains only immutable Lance
-/// version pins and the sole exclusive root export gate; no writer gate remains
-/// held while bytes are produced.
+/// The cut retains immutable Lance version pins and the sole exclusive root
+/// export gate while bytes are produced. Ordinary writers may advance HEAD in
+/// parallel; cooperative cleanup, schema, branch, and root controls cannot
+/// remove or reuse the cut's exact coordinates until it is dropped.
 /// Private fields and the absence of `Clone`/serde/default constructors keep
 /// the cut non-forgeable.
 #[doc(hidden)]
-pub struct StreamExportCut {
+pub struct ExportCut {
     db: Arc<Omnigraph>,
     snapshot: Snapshot,
     catalog: Arc<Catalog>,
     selected_tables: Vec<String>,
-    retirement_provenance: Option<StreamAuthorityRetirementExportProvenance>,
-    _slot: crate::db::write_queue::StreamExportCutPermit,
+    _slot: crate::db::write_queue::ExportCutPermit,
 }
 
-impl StreamExportCut {
+impl ExportCut {
     async fn emit_chunks<Emit, EmitFuture>(&self, emit: &mut Emit) -> Result<()>
     where
         Emit: FnMut(Vec<u8>) -> EmitFuture,
         EmitFuture: Future<Output = Result<()>>,
     {
-        if let Some(provenance) = self.retirement_provenance.as_ref() {
-            emit_export_jsonl_row(
-                emit,
-                "_omnigraph_export_provenance",
-                &serde_json::json!({
-                    "_omnigraph_export_provenance": provenance,
-                }),
-            )
-            .await?;
-        }
         export_selected_tables(
             self.db.as_ref(),
             &self.snapshot,
@@ -99,122 +86,33 @@ impl StreamExportCut {
 impl Omnigraph {
     /// Capture one immutable served-export cut.
     ///
-    /// An enrolled `DISABLED` graph requires checked serving authority. The
-    /// ambient cases are a pristine `DISABLED` graph and the existing receipt-
-    /// verified irreversible `RETIRED` rebuild bridge; cluster-served retired
-    /// graphs normally carry checked authority too. The exclusive root gate is
-    /// non-waiting and this is the sole cut-capture surface used by served
-    /// transport.
+    /// The exclusive root gate is non-waiting and this is the sole cut-capture
+    /// surface used by served transport.
     #[doc(hidden)]
     pub async fn capture_served_export_cut(
         self: &Arc<Self>,
         branch: &str,
         type_names: &[String],
         table_keys: &[String],
-    ) -> Result<StreamExportCut> {
-        let slot = self
-            .write_queue()
-            .try_acquire_stream_export_cut()
-            .ok_or_else(|| OmniError::ResourceLimitExceeded {
+    ) -> Result<ExportCut> {
+        let slot = self.write_queue().try_acquire_export_cut().ok_or_else(|| {
+            OmniError::ResourceLimitExceeded {
                 resource: "stream_export_slots".to_string(),
                 limit: 1,
                 actual: 2,
-            })?;
-
-        let authority = self.checked_cluster_served_export_authority();
-        // Classify the request while sharing the profile gate with live
-        // writers. In particular, an ENABLED runtime-only server must refuse
-        // here instead of queueing the write-preferring exclusive cut gates
-        // and briefly draining the firehose for an export that cannot succeed.
-        // The complete capture below re-proves the same classification while
-        // every write domain is closed.
-        {
-            let _profile_gate = self.write_queue().acquire_stream_profile_shared().await;
-            let main = self.open_coordinator_for_branch(None).await?;
-            let snapshot = main.snapshot();
-            if let Some(authority) = authority {
-                authority.validate_profile(snapshot.stream_profile())?;
-            } else {
-                let profile = snapshot.stream_profile();
-                let ambient_allowed = profile.mode()
-                    == crate::db::manifest::StreamProfileMode::Retired
-                    || (profile.mode() == crate::db::manifest::StreamProfileMode::Disabled
-                        && snapshot.stream_lifecycles().next().is_none());
-                if !ambient_allowed {
-                    return Err(OmniError::StreamingRequiresClusterRuntime {
-                        mode: profile.mode().as_str().to_string(),
-                    });
-                }
             }
-        }
+        })?;
 
-        // The checked terminal serving capability is the only export owner
-        // allowed to settle recovery. Ambient pristine/retired compatibility
-        // remains read-only. The capability was re-proved above before the
-        // healer can mutate anything and is re-proved again after recovery
-        // while holding the complete cut gates.
-        if authority.is_some() {
-            self.heal_pending_recovery_sidecars_outcome().await?;
-        }
-        let gates = self
-            .acquire_stream_exclusive_cut_gates("stream_export")
-            .await?;
-        let catalog = gates.catalog();
-
-        let main = self.open_coordinator_for_branch(None).await?;
-        let main_snapshot = main.snapshot();
-        if let Some(authority) = authority {
-            authority.validate_profile(main_snapshot.stream_profile())?;
-        }
-
-        let normalized = Self::normalize_branch_name(branch)?;
-        let selected = self
-            .open_coordinator_for_branch(normalized.as_deref())
-            .await?;
-        let snapshot = selected.snapshot().clone();
-        validate_bound_catalog_against_snapshot(catalog.as_ref(), &snapshot)?;
+        self.heal_pending_recovery_sidecars_outcome().await?;
+        let (resolved, catalog) = self.capture_read_view(ReadTarget::branch(branch)).await?;
+        let snapshot = resolved.snapshot;
         let selected_tables = export_table_keys(&snapshot, type_names, table_keys)?;
 
-        let profile = main_snapshot.stream_profile();
-        let retirement_receipt = if authority.is_some() {
-            self.export_stream_authority_preflight_at(&main_snapshot)
-                .await?
-        } else if profile.mode() == crate::db::manifest::StreamProfileMode::Retired {
-            Some(
-                self.export_stream_authority_preflight_at(&main_snapshot)
-                    .await?
-                    .ok_or_else(|| {
-                        OmniError::manifest_internal(
-                            "RETIRED export preflight did not return retirement provenance",
-                        )
-                    })?,
-            )
-        } else if profile.mode() == crate::db::manifest::StreamProfileMode::Disabled
-            && main_snapshot.stream_lifecycles().next().is_none()
-        {
-            None
-        } else {
-            return Err(OmniError::StreamingRequiresClusterRuntime {
-                mode: profile.mode().as_str().to_string(),
-            });
-        };
-        let retirement_provenance = match retirement_receipt {
-            Some(receipt) => Some(
-                self.capture_retirement_export_provenance(branch, &snapshot, receipt)
-                    .await?,
-            ),
-            None => None,
-        };
-
-        crate::failpoints::maybe_fail(crate::failpoints::names::STREAM_EXPORT_POST_CUT_CAPTURE)?;
-        drop(gates);
-
-        Ok(StreamExportCut {
+        Ok(ExportCut {
             db: Arc::clone(self),
             snapshot,
             catalog,
             selected_tables,
-            retirement_provenance,
             _slot: slot,
         })
     }
@@ -264,63 +162,20 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
     table_keys: &[String],
     writer: &mut W,
 ) -> Result<()> {
-    // Reserve before the first manifest/profile read. Whole-root deletion does
-    // not take the stream-profile gate, so reading first would permit a
-    // delete/recreate ABA before this export acquired the exclusive root gate.
-    // Retain the exclusive cut for ordinary pristine exports too: cleanup, schema apply,
-    // branch replacement, and root deletion must not remove or reuse their
-    // exact snapshot coordinates while bytes are still being read.
-    let _export_cut = db
-        .write_queue()
-        .try_acquire_stream_export_cut()
-        .ok_or_else(|| OmniError::ResourceLimitExceeded {
+    // Reserve before the first manifest read. Cleanup, schema apply, branch
+    // replacement, and root deletion must not remove or reuse the selected
+    // coordinates while bytes are still being read.
+    let _export_cut = db.write_queue().try_acquire_export_cut().ok_or_else(|| {
+        OmniError::ResourceLimitExceeded {
             resource: "stream_export_slots".to_string(),
             limit: 1,
             actual: 2,
-        })?;
-    let _profile_gate = db.write_queue().acquire_stream_profile_shared().await;
-    let main = db.open_coordinator_for_branch(None).await?;
-    let main_snapshot = main.snapshot();
-    let profile = main_snapshot.stream_profile();
-    let retirement_receipt = if profile.mode() == crate::db::manifest::StreamProfileMode::Retired {
-        // Retirement is irreversible, so direct callers retain the existing
-        // receipt-verified rebuild bridge. Served callers use the same
-        // provenance rules through `capture_served_export_cut`.
-        Some(
-            db.export_stream_authority_preflight_at(&main_snapshot)
-                .await?
-                .ok_or_else(|| {
-                    OmniError::manifest_internal(
-                        "RETIRED export preflight did not return retirement provenance",
-                    )
-                })?,
-        )
-    } else if profile.mode() == crate::db::manifest::StreamProfileMode::Disabled
-        && main_snapshot.stream_lifecycles().next().is_none()
-    {
-        None
-    } else {
-        return Err(OmniError::StreamingRequiresClusterRuntime {
-            mode: profile.mode().as_str().to_string(),
-        });
-    };
+        }
+    })?;
     let (resolved, catalog) = db.capture_read_view(ReadTarget::branch(branch)).await?;
     let selected_tables = export_table_keys(&resolved.snapshot, type_names, table_keys)?;
     let mut emit =
         |chunk: Vec<u8>| std::future::ready(writer.write_all(&chunk).map_err(OmniError::from));
-    if let Some(receipt) = retirement_receipt {
-        let provenance = db
-            .capture_retirement_export_provenance(branch, &resolved.snapshot, receipt)
-            .await?;
-        emit_export_jsonl_row(
-            &mut emit,
-            "_omnigraph_export_provenance",
-            &serde_json::json!({
-                "_omnigraph_export_provenance": provenance,
-            }),
-        )
-        .await?;
-    }
     export_selected_tables(
         db,
         &resolved.snapshot,
@@ -556,13 +411,7 @@ where
                 "id".to_string(),
                 json_value_from_named_column(batch, "id", row)?,
             );
-            for field in node_type
-                .arrow_schema
-                .fields()
-                .iter()
-                .skip(1)
-                .filter(|field| field.name() != crate::db::STREAM_METADATA_COLUMN)
-            {
+            for field in node_type.arrow_schema.fields().iter().skip(1) {
                 data.insert(
                     field.name().clone(),
                     export_value_for_field(
@@ -599,13 +448,7 @@ where
                 "id".to_string(),
                 json_value_from_named_column(batch, "id", row)?,
             );
-            for field in edge_type
-                .arrow_schema
-                .fields()
-                .iter()
-                .skip(3)
-                .filter(|field| field.name() != crate::db::STREAM_METADATA_COLUMN)
-            {
+            for field in edge_type.arrow_schema.fields().iter().skip(3) {
                 data.insert(
                     field.name().clone(),
                     export_value_for_field(

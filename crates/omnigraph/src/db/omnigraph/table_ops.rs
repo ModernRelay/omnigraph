@@ -1,27 +1,5 @@
 use super::*;
 
-#[derive(Clone, Copy)]
-enum EnsureIndicesMode<'a> {
-    Ambient,
-    #[cfg_attr(not(feature = "failpoints"), allow(dead_code))]
-    SealedMaintenance {
-        actor_id: &'a str,
-    },
-}
-
-impl<'a> EnsureIndicesMode<'a> {
-    fn actor_id(self) -> Option<&'a str> {
-        match self {
-            Self::Ambient => None,
-            Self::SealedMaintenance { actor_id } => Some(actor_id),
-        }
-    }
-
-    fn is_sealed_maintenance(self) -> bool {
-        matches!(self, Self::SealedMaintenance { .. })
-    }
-}
-
 pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index::GraphIndex>> {
     let (resolved, catalog) = db.capture_current_read_view().await?;
     // Whole-graph entry point: cover every edge type. Query execution scopes to
@@ -49,27 +27,12 @@ pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<Vec<PendingIndex>> 
         .await
         .current_branch()
         .map(str::to_string);
-    ensure_indices_for_branch(db, current_branch.as_deref(), EnsureIndicesMode::Ambient).await
+    ensure_indices_for_branch(db, current_branch.as_deref()).await
 }
 
 pub(super) async fn ensure_indices_on(db: &Omnigraph, branch: &str) -> Result<Vec<PendingIndex>> {
     let branch = normalize_branch_name(branch)?;
-    ensure_indices_for_branch(db, branch.as_deref(), EnsureIndicesMode::Ambient).await
-}
-
-#[cfg_attr(not(feature = "failpoints"), allow(dead_code))]
-pub(super) async fn ensure_indices_sealed_as(
-    db: &Omnigraph,
-    actor_id: &str,
-) -> Result<Vec<PendingIndex>> {
-    db.enforce(
-        omnigraph_policy::PolicyAction::StreamManage,
-        &omnigraph_policy::ResourceScope::Graph,
-        Some(actor_id),
-    )?;
-    db.ensure_streaming_sealed_maintenance_runtime_authorized()
-        .await?;
-    ensure_indices_for_branch(db, None, EnsureIndicesMode::SealedMaintenance { actor_id }).await
+    ensure_indices_for_branch(db, branch.as_deref()).await
 }
 
 #[cfg(feature = "failpoints")]
@@ -116,16 +79,10 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
     .await
 }
 
-async fn ensure_indices_for_branch(
+pub(super) async fn ensure_indices_for_branch(
     db: &Omnigraph,
     branch: Option<&str>,
-    mode: EnsureIndicesMode<'_>,
 ) -> Result<Vec<PendingIndex>> {
-    if mode.is_sealed_maintenance() && branch.is_some() {
-        return Err(OmniError::manifest(
-            "SEALED stream maintenance is canonical-main only",
-        ));
-    }
     // RFC-022 entry recovery barrier: recovery may advance the manifest, so
     // resolve or refuse every relevant intent before capturing the index
     // plan's base.
@@ -133,19 +90,8 @@ async fn ensure_indices_for_branch(
     // between this entry barrier and the first table-HEAD effect.
     db.heal_pending_recovery_sidecars_for_write(&[branch])
         .await?;
-    // Join the graph-global profile window before planning can stage durable
-    // Lance index artifacts. Retirement takes this gate exclusively and must
-    // drain the complete physical writer, not merely its final HEAD publish.
-    let _stream_profile_guard = db.write_queue().acquire_stream_profile_shared().await;
-    if let Some(error) = db.current_canonical_stream_profile().await?.retired_error() {
-        return Err(error);
-    }
     db.ensure_schema_apply_idle("ensure_indices").await?;
     let txn = db.open_write_txn(branch).await?;
-    if mode.is_sealed_maintenance() {
-        db.ensure_streaming_sealed_maintenance_runtime_authorized()
-            .await?;
-    }
     let snapshot = txn.base.clone();
     let mut pending_by_table = HashMap::<String, Vec<PendingIndex>>::new();
     let active_branch = txn.branch.clone();
@@ -302,39 +248,6 @@ async fn ensure_indices_for_branch(
         .iter()
         .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
         .collect();
-    let stream_admission_keys = recovery_pins
-        .iter()
-        .map(|pin| {
-            crate::db::write_queue::StreamAdmissionKey::for_resolved_ref(
-                pin.identity,
-                pin.table_branch.as_deref(),
-            )
-        })
-        .collect::<Vec<_>>();
-    if mode.is_sealed_maintenance() {
-        // Recheck under the retained profile gate and immediately before the
-        // lower writer domains so stale checked runtime cannot authorize the
-        // effects.
-        db.ensure_streaming_sealed_maintenance_runtime_authorized()
-            .await?;
-    }
-    // RFC-026 admission is the outermost process-local gate. Enrollment/drain
-    // take the same identity + resolved-ref domain exclusively, so acquire all
-    // shared leases before entering schema -> branch -> table ordering and
-    // retain them through the final manifest publication.
-    let mut _shared_stream_admission_guards = Vec::new();
-    let mut _exclusive_stream_admission_guards = Vec::new();
-    if mode.is_sealed_maintenance() {
-        _exclusive_stream_admission_guards = db
-            .write_queue()
-            .acquire_stream_exclusive_many(&stream_admission_keys)
-            .await;
-    } else {
-        _shared_stream_admission_guards = db
-            .write_queue()
-            .acquire_stream_shared_many(&stream_admission_keys)
-            .await;
-    }
     let _schema_guard = db
         .write_queue()
         .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -343,7 +256,6 @@ async fn ensure_indices_for_branch(
         .write_queue()
         .acquire_branch(active_branch.as_deref())
         .await;
-    let _stream_token_guard = db.write_queue().acquire_stream_token().await;
     let _queue_guards = db.write_queue().acquire_many(&queue_keys).await;
 
     db.ensure_no_pending_recovery_sidecars_under_gates(
@@ -352,37 +264,6 @@ async fn ensure_indices_for_branch(
     )
     .await?;
     let live_snapshot = db.revalidate_write_txn(&txn).await?;
-    let mut prior_stream_lifecycles = Vec::new();
-    if mode.is_sealed_maintenance() {
-        for pin in &recovery_pins {
-            let Some(lifecycle) = live_snapshot.stream_lifecycle(pin.identity) else {
-                continue;
-            };
-            if lifecycle.lifecycle != crate::db::manifest::StreamLifecycle::Sealed {
-                return Err(OmniError::manifest_stream_lifecycle_conflict(
-                    pin.identity.stable_table_id,
-                    pin.identity.table_incarnation_id,
-                    &pin.table_key,
-                    lifecycle.lifecycle.as_str(),
-                    "sealed ensure_indices",
-                ));
-            }
-            if lifecycle.current_head_witness.table_version != pin.expected_version {
-                return Err(OmniError::manifest_read_set_changed(
-                    format!("stream_base_head:{}", pin.table_key),
-                    Some(pin.expected_version.to_string()),
-                    Some(lifecycle.current_head_witness.table_version.to_string()),
-                ));
-            }
-            prior_stream_lifecycles.push(lifecycle.clone());
-        }
-        prior_stream_lifecycles.sort_by_key(|entry| entry.identity);
-    } else {
-        live_snapshot.ensure_stream_effects_allowed(
-            "ensure_indices",
-            recovery_pins.iter().map(|pin| pin.identity),
-        )?;
-    }
 
     for pin in &recovery_pins {
         let prepared_entry = snapshot.entry(&pin.table_key).ok_or_else(|| {
@@ -428,21 +309,6 @@ async fn ensure_indices_for_branch(
                 ds,
             )
             .await?;
-            if mode.is_sealed_maintenance()
-                && let Some(lifecycle) = live_snapshot.stream_lifecycle(pin.identity)
-            {
-                let physical_head =
-                    crate::table_store::mem_wal::capture_current_head_witness(ds.dataset())
-                        .await
-                        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-                if physical_head != lifecycle.current_head_witness {
-                    return Err(OmniError::manifest_read_set_changed(
-                        format!("stream_base_head:{}", pin.table_key),
-                        Some(format!("{:?}", lifecycle.current_head_witness)),
-                        Some(format!("{physical_head:?}")),
-                    ));
-                }
-            }
         } else if let Some(source) = first_touch_sources.get(&pin.table_key) {
             let target_branch = active_branch.as_deref().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
@@ -466,13 +332,6 @@ async fn ensure_indices_for_branch(
         }
     }
 
-    let selected_claim_receipts = if prior_stream_lifecycles.is_empty() {
-        HashMap::new()
-    } else {
-        selected_claim_receipts_for_sealed_maintenance(&live_snapshot, &prior_stream_lifecycles)
-            .await?
-    };
-
     if recovery_pins.is_empty() {
         // Preserve the no-work failpoint contract without manufacturing durable
         // recovery state or graph lineage.
@@ -493,7 +352,7 @@ async fn ensure_indices_for_branch(
             })
             .collect::<crate::db::manifest::ExpectedTableVersions>();
         let lineage = db
-            .new_lineage_intent_for_branch(active_branch.as_deref(), mode.actor_id())
+            .new_lineage_intent_for_branch(active_branch.as_deref(), None)
             .await?;
         let authority = crate::db::manifest::RecoveryAuthorityToken {
             branch_identifier: txn.authority.branch_identifier.clone(),
@@ -508,32 +367,16 @@ async fn ensure_indices_for_branch(
             actor_id: lineage.actor_id.clone(),
             merged_parent_commit_id: lineage.merged_parent_commit_id.clone(),
             created_at: lineage.created_at,
-            stream_fold_attribution_v2: None,
         };
-        let mut sidecar = if prior_stream_lifecycles.is_empty() {
-            crate::db::manifest::new_ensure_indices_sidecar_v9(
-                active_branch.clone(),
-                mode.actor_id().map(str::to_string),
-                recovery_pins.clone(),
-                authority,
-                recovery_lineage,
-                planned_transactions.clone(),
-                first_touch_source_versions.clone(),
-            )?
-        } else {
-            crate::db::manifest::new_stream_sealed_ensure_indices_sidecar_v16(
-                mode.actor_id()
-                    .expect("SEALED lifecycle pins require maintenance mode")
-                    .to_string(),
-                recovery_pins.clone(),
-                authority,
-                recovery_lineage,
-                planned_transactions.clone(),
-                live_snapshot.stream_profile().clone(),
-                live_snapshot.stream_token_authority().clone(),
-                prior_stream_lifecycles.clone(),
-            )?
-        };
+        let mut sidecar = crate::db::manifest::new_ensure_indices_sidecar_v9(
+            active_branch.clone(),
+            None,
+            recovery_pins.clone(),
+            authority,
+            recovery_lineage,
+            planned_transactions.clone(),
+            first_touch_source_versions.clone(),
+        )?;
         let recovery_handle =
             crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
                 .await?;
@@ -549,7 +392,6 @@ async fn ensure_indices_for_branch(
             let mut updates = Vec::with_capacity(recovery_pins.len());
             let mut committed_transactions = HashMap::new();
             let mut confirmed_ref_identifiers = HashMap::new();
-            let mut confirmed_stream_heads = HashMap::new();
             for pin in &recovery_pins {
                 let table_key = pin.table_key.clone();
                 let entry = snapshot.entry(&table_key).ok_or_else(|| {
@@ -635,13 +477,6 @@ async fn ensure_indices_for_branch(
                 committed_transactions
                     .insert(pin.identity, outcome.committed_transaction().clone());
                 let ds = outcome.into_snapshot();
-                if selected_claim_receipts.contains_key(&pin.identity) {
-                    let head =
-                        crate::table_store::mem_wal::capture_current_head_witness(ds.dataset())
-                            .await
-                            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-                    confirmed_stream_heads.insert(pin.identity, head);
-                }
                 if first_touch {
                     confirmed_ref_identifiers
                         .insert(pin.identity, db.storage().branch_identifier(&ds).await?);
@@ -663,74 +498,28 @@ async fn ensure_indices_for_branch(
             crate::failpoints::maybe_fail(
                 crate::failpoints::names::ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM,
             )?;
-            let next_stream_lifecycles = prior_stream_lifecycles
-                .iter()
-                .map(|prior| {
-                    let receipt =
-                        selected_claim_receipts
-                            .get(&prior.identity)
-                            .ok_or_else(|| {
-                                OmniError::manifest_internal(
-                                    "SEALED EnsureIndices lost its selected ClaimReceipt",
-                                )
-                            })?;
-                    let head = confirmed_stream_heads.get(&prior.identity).ok_or_else(|| {
-                        OmniError::manifest_internal(
-                            "SEALED EnsureIndices lost its confirmed table HEAD",
-                        )
-                    })?;
-                    crate::db::build_sealed_maintenance_successor(prior, receipt, head.clone())
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if next_stream_lifecycles.is_empty() {
-                crate::db::manifest::confirm_ensure_indices_sidecar_v9(
-                    db.root_uri(),
-                    db.storage_adapter(),
-                    &mut sidecar,
-                    &updates,
-                    &committed_transactions,
-                    &confirmed_ref_identifiers,
-                )
-                .await?;
-            } else {
-                crate::db::manifest::confirm_stream_sealed_ensure_indices_sidecar_v16(
-                    db.root_uri(),
-                    db.storage_adapter(),
-                    &mut sidecar,
-                    &updates,
-                    &committed_transactions,
-                    next_stream_lifecycles.clone(),
-                )
-                .await?;
-            }
+            crate::db::manifest::confirm_ensure_indices_sidecar_v9(
+                db.root_uri(),
+                db.storage_adapter(),
+                &mut sidecar,
+                &updates,
+                &committed_transactions,
+                &confirmed_ref_identifiers,
+            )
+            .await?;
             crate::failpoints::maybe_fail(
                 crate::failpoints::names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
             )?;
-            if next_stream_lifecycles.is_empty() {
-                commit_updates_on_branch_with_expected(
-                    db,
-                    active_branch.as_deref(),
-                    &updates,
-                    &expected_versions,
-                    mode.actor_id(),
-                    &txn,
-                    lineage,
-                )
-                .await?;
-            } else {
-                commit_sealed_maintenance_on_main(
-                    db,
-                    "sealed ensure_indices",
-                    &updates,
-                    &expected_versions,
-                    &txn,
-                    lineage,
-                    &prior_stream_lifecycles,
-                    &next_stream_lifecycles,
-                    live_snapshot.stream_profile(),
-                )
-                .await?;
-            }
+            commit_updates_on_branch_with_expected(
+                db,
+                active_branch.as_deref(),
+                &updates,
+                &expected_versions,
+                None,
+                &txn,
+                lineage,
+            )
+            .await?;
             Ok::<(), OmniError>(())
         }
         .await;
@@ -771,51 +560,6 @@ fn pre_minted_index_transaction(
         read_version,
         uuid: format!("omnigraph-index-{}", ulid::Ulid::new()),
     }
-}
-
-pub(super) async fn selected_claim_receipts_for_sealed_maintenance(
-    snapshot: &crate::db::manifest::Snapshot,
-    lifecycles: &[crate::db::manifest::StreamLifecycleEntry],
-) -> Result<HashMap<crate::db::manifest::TableIdentity, crate::db::manifest::stream::ClaimReceipt>>
-{
-    let dataset = snapshot.open_stream_token_authority().await?;
-    let mut receipts = HashMap::with_capacity(lifecycles.len());
-    for lifecycle in lifecycles {
-        let record_id = lifecycle
-            .current_claim_receipt_id
-            .as_deref()
-            .ok_or_else(|| {
-                OmniError::manifest_internal(
-                    "SEALED maintenance requires a selected current ClaimReceipt",
-                )
-            })?;
-        let record = crate::db::manifest::lookup_lifecycle_ledger_record_by_id(
-            &dataset,
-            snapshot.stream_token_authority(),
-            crate::db::manifest::stream::CLAIM_RECEIPT_TAG,
-            record_id,
-        )
-        .await?
-        .ok_or_else(|| {
-            OmniError::manifest_internal(
-                "SEALED maintenance selected ClaimReceipt is absent from token authority",
-            )
-        })?;
-        let crate::db::manifest::LifecycleLedgerRecord::ClaimReceipt(receipt) = record else {
-            return Err(OmniError::manifest_internal(
-                "SEALED maintenance selected ClaimReceipt ID decoded another ledger family",
-            ));
-        };
-        if receipt.record_id != record_id
-            || lifecycle.claim_receipt_chain.head_record_id.as_deref() != Some(record_id)
-        {
-            return Err(OmniError::manifest_internal(
-                "SEALED maintenance ClaimReceipt is not the selected claim-chain head",
-            ));
-        }
-        receipts.insert(lifecycle.identity, receipt);
-    }
-    Ok(receipts)
 }
 
 /// The single scalar/vector index a node property receives from a one-column
@@ -1899,104 +1643,6 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         .cloned()
         .map(ManifestChange::Update)
         .collect::<Vec<_>>();
-    publish_changes_on_branch_with_expected(
-        db,
-        branch,
-        &changes,
-        expected_table_versions,
-        txn,
-        lineage_intent,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn commit_sealed_maintenance_on_main(
-    db: &Omnigraph,
-    operation: &str,
-    updates: &[crate::db::SubTableUpdate],
-    expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
-    txn: &crate::db::WriteTxn,
-    lineage_intent: crate::db::manifest::LineageIntent,
-    prior_lifecycles: &[crate::db::manifest::StreamLifecycleEntry],
-    next_lifecycles: &[crate::db::manifest::StreamLifecycleEntry],
-    profile: &crate::db::manifest::StreamProfileEntry,
-) -> Result<u64> {
-    db.ensure_schema_apply_not_locked(&format!("{operation} commit"))
-        .await?;
-    if prior_lifecycles.len() != next_lifecycles.len() {
-        return Err(OmniError::manifest_internal(format!(
-            "{operation} received {} prior lifecycle rows but {} successors",
-            prior_lifecycles.len(),
-            next_lifecycles.len(),
-        )));
-    }
-
-    let update_identities = updates
-        .iter()
-        .map(|update| update.identity)
-        .collect::<std::collections::HashSet<_>>();
-    if update_identities.len() != updates.len() {
-        return Err(OmniError::manifest_internal(format!(
-            "{operation} received duplicate productive table updates",
-        )));
-    }
-    let mut lifecycle_identities = std::collections::HashSet::new();
-    let mut lifecycle_changes = Vec::with_capacity(prior_lifecycles.len());
-    for (expected, next) in prior_lifecycles.iter().zip(next_lifecycles) {
-        if expected.identity != next.identity {
-            return Err(OmniError::manifest_internal(format!(
-                "{operation} lifecycle successor identity {:?} does not match prior identity {:?}",
-                next.identity, expected.identity,
-            )));
-        }
-        if !lifecycle_identities.insert(expected.identity) {
-            return Err(OmniError::manifest_internal(format!(
-                "{operation} received duplicate lifecycle identity {:?}",
-                expected.identity,
-            )));
-        }
-        if !update_identities.contains(&expected.identity) {
-            return Err(OmniError::manifest_internal(format!(
-                "{operation} lifecycle identity {:?} has no productive table update",
-                expected.identity,
-            )));
-        }
-        lifecycle_changes.push(ManifestChange::SetStreamLifecycle {
-            expected: Some(expected.clone()),
-            next: next.clone(),
-        });
-    }
-
-    let prepared = prepare_updates_for_commit(db, None, updates, Some(txn)).await?;
-    let mut changes = prepared
-        .into_iter()
-        .map(ManifestChange::Update)
-        .collect::<Vec<_>>();
-    changes.extend(lifecycle_changes);
-    changes.push(ManifestChange::SetStreamProfile {
-        expected: profile.clone(),
-        next: profile.clone(),
-    });
-    publish_changes_on_branch_with_expected(
-        db,
-        None,
-        &changes,
-        expected_table_versions,
-        txn,
-        lineage_intent,
-    )
-    .await
-}
-
-async fn publish_changes_on_branch_with_expected(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    changes: &[ManifestChange],
-    expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
-    txn: &crate::db::WriteTxn,
-    lineage_intent: crate::db::manifest::LineageIntent,
-) -> Result<u64> {
     let expectation = crate::db::manifest::GraphHeadExpectation::new(
         branch,
         txn.authority.branch_identifier.clone(),
@@ -2016,7 +1662,7 @@ async fn publish_changes_on_branch_with_expected(
             .write()
             .await
             .commit_changes_with_intent_and_expected(
-                changes,
+                &changes,
                 expected_table_versions,
                 lineage_intent,
                 &precondition,
@@ -2044,7 +1690,7 @@ async fn publish_changes_on_branch_with_expected(
         };
         coordinator
             .commit_changes_with_intent_and_expected(
-                changes,
+                &changes,
                 expected_table_versions,
                 lineage_intent,
                 &precondition,

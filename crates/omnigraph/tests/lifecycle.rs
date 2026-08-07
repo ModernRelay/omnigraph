@@ -3,7 +3,6 @@ mod helpers;
 use std::fs;
 
 use omnigraph::db::{InitOptions, Omnigraph, ReadTarget};
-use omnigraph::error::OmniError;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
     SchemaIR, SchemaIdentityDomain, compile_schema_shape, resolve_schema_ir, schema_ir_hash,
@@ -87,6 +86,13 @@ async fn init_creates_graph() {
     );
 
     let snap = snapshot_main(&db).await.unwrap();
+    assert_eq!(
+        db.internal_schema_version_of(ReadTarget::branch("main"))
+            .await
+            .unwrap(),
+        6,
+        "fresh graphs must use the restored pre-WAL v6 manifest format"
+    );
     assert!(snap.entry("node:Person").is_some());
     assert!(snap.entry("node:Company").is_some());
     assert!(snap.entry("edge:Knows").is_some());
@@ -104,110 +110,38 @@ async fn init_creates_graph() {
             ["id"],
             "fresh graph table {table_key} must be created with exactly `id` as its Lance unenforced primary key"
         );
+        assert!(
+            dataset.schema().field("__omnigraph_stream_v1$").is_none(),
+            "fresh v6 table {table_key} must not carry abandoned stream metadata"
+        );
+    }
+
+    assert!(
+        !dir.path().join("_stream_tokens.lance").exists(),
+        "fresh v6 roots must not create the abandoned token-authority dataset"
+    );
+    let mut pending = vec![dir.path().to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            assert_ne!(
+                entry.file_name().to_string_lossy(),
+                "_mem_wal",
+                "fresh v6 roots must not create MemWAL storage"
+            );
+            if path.is_dir() {
+                pending.push(path);
+            }
+        }
     }
 
     assert_eq!(db.catalog().node_types.len(), 2);
     assert_eq!(db.catalog().edge_types.len(), 2);
-    assert!(
-        db.catalog().node_types.values().all(|node| node
-            .arrow_schema
-            .field_with_name("__omnigraph_stream_v1$")
-            .is_err()),
-        "public catalog reflection must omit protocol-private stream metadata"
-    );
     assert_eq!(
         db.catalog().node_types["Person"].key_property(),
         Some("name")
     );
-    let person = snap.open("node:Person").await.unwrap();
-    assert!(person.schema().field("__omnigraph_stream_v1$").is_none());
-    assert!(
-        person
-            .load_indices()
-            .await
-            .unwrap()
-            .iter()
-            .all(|index| index.name != "__lance_mem_wal"),
-        "public index reflection must omit Lance's private MemWAL system index"
-    );
-    let private_filter = person
-        .count_rows(Some(r#""__OMNIGRAPH_STREAM_V1$" IS NULL"#.to_string()))
-        .await
-        .unwrap_err();
-    assert!(
-        private_filter
-            .to_string()
-            .contains("reserved for OmniGraph storage protocol metadata"),
-        "{private_filter:?}"
-    );
-    assert_eq!(
-        person
-            .count_rows(Some(
-                "name = '__omnigraph_stream_v1$'".to_string(),
-            ))
-            .await
-            .unwrap(),
-        0,
-        "the private spelling remains legal as ordinary user data"
-    );
-    let mut literal_filter = person.scan();
-    literal_filter
-        .filter("name = '__omnigraph_stream_v1$'")
-        .unwrap();
-    literal_filter.try_into_stream().await.unwrap();
-    let mut private_projection = person.scan();
-    let private_projection = match private_projection.project(&["__OMNIGRAPH_STREAM_V1$"]) {
-        Ok(_) => panic!("public projection must reject protocol-private stream metadata"),
-        Err(error) => error,
-    };
-    assert!(
-        private_projection
-            .to_string()
-            .contains("reserved for OmniGraph storage protocol metadata"),
-        "{private_projection:?}"
-    );
-    let mut structured_private_filter = person.scan();
-    structured_private_filter
-        .filter_expr(datafusion::prelude::col("__omnigraph_stream_v1$").is_null());
-    let structured_private_filter = match structured_private_filter.try_into_stream().await {
-        Ok(_) => panic!("structured filters must not expose protocol-private stream metadata"),
-        Err(error) => error,
-    };
-    assert!(
-        structured_private_filter
-            .to_string()
-            .contains("reserved for OmniGraph storage protocol metadata"),
-        "{structured_private_filter:?}"
-    );
-}
-
-#[tokio::test]
-async fn public_snapshot_wildcard_omits_protocol_metadata() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    omnigraph::loader::load_jsonl(
-        &mut db,
-        r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
-        omnigraph::loader::LoadMode::Merge,
-    )
-    .await
-    .unwrap();
-
-    let snapshot = snapshot_main(&db).await.unwrap();
-    let person = snapshot.open("node:Person").await.unwrap();
-    let mut scanner = person.scan();
-    scanner.project(&["*"]).unwrap();
-    let batches: Vec<arrow_array::RecordBatch> = futures::TryStreamExt::try_collect(
-        scanner.try_into_stream().await.unwrap(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(batches.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
-    assert!(batches.iter().all(|batch| batch
-        .schema()
-        .field_with_name("__omnigraph_stream_v1$")
-        .is_err()));
 }
 
 #[tokio::test]
@@ -245,26 +179,6 @@ async fn open_reads_existing_graph() {
             .schema_identity_domain
             .as_str(),
         identity_domain.as_str()
-    );
-}
-
-#[tokio::test]
-async fn open_refuses_a_missing_manifest_selected_stream_token_dataset() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    drop(db);
-
-    fs::remove_dir_all(dir.path().join("_stream_tokens.lance")).unwrap();
-    let error = match Omnigraph::open(uri).await {
-        Ok(_) => panic!("v9 open must validate its manifest-selected token authority"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("stream-token authority consistency failed"),
-        "{error:?}"
     );
 }
 
@@ -891,115 +805,4 @@ node Task {
         !dir.path().join("_schema.ir.json").exists(),
         "rejected init must not persist a schema IR"
     );
-}
-
-/// The embedded/direct-store surface cannot forge cluster ownership.
-///
-/// Profile transitions are owned by checked cluster apply. The retired
-/// ambient boolean API must refuse both targets without moving any live or
-/// historical branch view.
-#[tokio::test]
-async fn ambient_streaming_flip_requires_cluster_control_plane() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
-    db.branch_create("feature").await.unwrap();
-    mutate_branch(
-        &mut db,
-        "feature",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "feature-person")], &[("$age", 22)]),
-    )
-    .await
-    .unwrap();
-    let historical_feature = db.resolve_snapshot("feature").await.unwrap();
-    let branch_reader = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
-    branch_reader.sync_branch("feature").await.unwrap();
-    db.sync_branch("feature").await.unwrap();
-
-    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let status = before.streaming_status();
-    assert!(!status.enabled, "fresh graphs are born with streaming off");
-    assert!(!status.undrained, "fresh graphs hold no stream state");
-
-    for enabled in [true, false] {
-        assert!(matches!(
-            db.set_streaming_enabled_as(enabled, Some("act-ops")).await,
-            Err(OmniError::StreamingRequiresClusterControlPlane)
-        ));
-    }
-    assert_eq!(
-        db.snapshot_of(ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .version(),
-        before.version(),
-        "an ambient request must be effect-free"
-    );
-    assert!(
-        !db.snapshot_of(ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .streaming_status()
-            .enabled
-    );
-    assert!(
-        !db.snapshot_of(ReadTarget::branch("feature"))
-            .await
-            .unwrap()
-            .streaming_status()
-            .enabled,
-        "a named-branch view must remain disabled"
-    );
-    assert!(
-        !branch_reader
-            .snapshot_of(ReadTarget::branch("feature"))
-            .await
-            .unwrap()
-            .streaming_status()
-            .enabled,
-        "a warm named-branch reader must remain disabled"
-    );
-    assert!(
-        !db.snapshot_of(ReadTarget::Snapshot(historical_feature))
-            .await
-            .unwrap()
-            .streaming_status()
-            .enabled,
-        "a pinned historical view must remain disabled"
-    );
-
-    drop(db);
-    let reopened = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
-    let status = reopened
-        .snapshot_of(ReadTarget::branch("main"))
-        .await
-        .unwrap()
-        .streaming_status();
-    assert!(!status.enabled);
-    assert!(!status.undrained);
-}
-
-/// RFC-026 §4.6/§4.7: read-only stream status projects the exact durable mode
-/// and compare tokens without acquiring control-plane authority.
-#[tokio::test]
-async fn stream_status_projects_durable_authority_and_compare_tokens() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
-
-    // A graph with streaming off and no enrollment reports exactly that —
-    // not an error, and not an empty struct that hides the flag.
-    let status = db.stream_status().await.unwrap();
-    assert_eq!(status.profile_mode, "DISABLED");
-    assert!(!status.streaming_enabled);
-    assert_eq!(status.profile_revision, 1, "genesis profile revision");
-    assert!(status.tables.is_empty(), "no lane exists before enrollment");
-    assert!(!status.undrained());
-
-    // Status is read-only: observing it neither moves the profile revision
-    // nor mints a graph commit.
-    let commits_before = db.list_commits(None).await.unwrap().len();
-    let repeat = db.stream_status().await.unwrap();
-    assert_eq!(repeat, status, "status is a pure projection");
-    assert_eq!(db.list_commits(None).await.unwrap().len(), commits_before);
 }

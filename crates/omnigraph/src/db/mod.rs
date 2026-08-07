@@ -10,97 +10,41 @@ pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{Snapshot, SnapshotScanner, SnapshotTable, SubTableEntry, SubTableUpdate};
 pub(crate) use omnigraph::ensure_public_branch_ref;
-pub(crate) use omnigraph::stream_lifecycle::build_sealed_maintenance_successor;
 pub use omnigraph::{
-    CheckedClusterApplyAuthority, CheckedClusterBlockAuthority, CheckedClusterDeadLetterAuthority,
-    CheckedClusterMaintenanceAuthority, CheckedClusterRetirementAuthority,
-    CheckedClusterServedExportAuthority, CheckedClusterStreamRuntimeAuthority,
-    CleanupPolicyOptions, EXPORT_CHUNK_MAX_BYTES, InitOptions, MergeOutcome, Omnigraph, OpenMode,
-    PendingIndex, RepairAction, RepairClassification, RepairOptions, RepairStats,
-    SchemaApplyOptions, SchemaApplyResult, SkipReason, StreamAuthorityRetirementPlan,
-    StreamAuthorityRetirementResult, StreamDataBlockEntry, StreamDataBlockPage,
-    StreamDataCorrectionAction, StreamDataCorrectionRequest, StreamDataCorrectionResult,
-    StreamDeadLetterEntry, StreamDeadLetterPage, StreamDeadLetterPayloadEntry,
-    StreamDeadLetterPayloadPage, StreamExportCut, StreamStatus, StreamTableStatus,
-    StreamingProfileResult, TableCleanupStats, TableOptimizeStats, TableRepairStats,
+    CleanupPolicyOptions, EXPORT_CHUNK_MAX_BYTES, ExportCut, InitOptions, MergeOutcome, Omnigraph,
+    OpenMode, PendingIndex, RepairAction, RepairClassification, RepairOptions, RepairStats,
+    SchemaApplyOptions, SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats,
+    TableRepairStats,
 };
-#[doc(hidden)]
-pub use omnigraph::{
-    GraphStreamChunkSource, GraphStreamDeclaration, GraphStreamDeclarationStatus,
-    GraphStreamDrainStatus, GraphStreamDriverErrorStatus, GraphStreamDriverStatus,
-    GraphStreamIngestHandle, GraphStreamIngestStart, GraphStreamLastFoldStatus,
-    GraphStreamOperationalStatus, GraphStreamPendingStatus, GraphStreamRebuildBlocker,
-    GraphStreamRebuildStatus, GraphStreamStrictBlockStatus, GraphStreamTokenCounts,
-};
-pub(crate) use omnigraph::{
-    DeferredTableFork, StreamAuthorityRetirementExportProvenance, WriteAuthorityToken, WriteTxn,
-};
-#[cfg(test)]
-pub(crate) use omnigraph::{
-    StreamAuthorityRetirementExportMember, retirement_export_cut_digest,
-    retirement_live_branch_heads_digest,
-};
-#[cfg(feature = "failpoints")]
-#[doc(hidden)]
-pub use omnigraph::{
-    StreamDeadLetterEncodingCostForTest, failpoint_measure_stream_dead_letter_object_for_test,
-};
-#[cfg(feature = "failpoints")]
-#[doc(hidden)]
-pub use omnigraph::{
-    StreamDrainOperationalStatus, StreamDriverAdvisoryStatus, StreamDriverEventStatus,
-    StreamDriverPendingStatus, StreamLastFoldOperationalStatus, StreamOldestUncoveredAgeStatus,
-    StreamOperationalStatus, StreamPendingGenerationStatus, StreamRebuildBlockReason,
-    StreamRebuildReadiness, StreamReceiptHeadsStatus, StreamRecoveryOperationalStatus,
-    StreamShardOperationalStatus, StreamStrictBlockOperationalStatus, StreamTableOperationalStatus,
-    StreamTablePhysicalOperationalStatus, StreamTerminalTokenOperationalStatus,
-    StreamTokenIndexCoverageStatus, StreamTokenLedgerOperationalStatus,
-};
+pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
 
 use crate::error::{OmniError, Result};
 
 /// Process-local exclusion shared by immutable export cuts and cooperative
-/// whole-root destructive control. It grants no storage or graph authority;
-/// cluster deletion retains it only so a supported delete/recreate cannot ABA
-/// a cut's exact table paths and versions.
+/// whole-root destructive control. It grants no storage or graph authority.
 #[doc(hidden)]
 #[must_use = "dropping the guard releases destructive root control"]
-pub struct StreamExportRootExclusion {
-    _permit: write_queue::StreamExportDestructivePermit,
+pub struct ExportRootExclusion {
+    _permit: write_queue::ExportDestructivePermit,
 }
 
 /// Nonwaitingly reserve one graph root against a live immutable export cut.
-///
-/// This hidden bridge lets the upper cluster-control crate serialize approved
-/// graph deletion without exposing the engine's queue manager or a capability
-/// that can read, write, or delete storage.
 #[doc(hidden)]
-pub fn reserve_stream_export_root_exclusion(
-    graph_uri: &str,
-) -> Result<StreamExportRootExclusion> {
+pub fn reserve_export_root_exclusion(graph_uri: &str) -> Result<ExportRootExclusion> {
     let normalized = crate::storage::normalize_root_uri(graph_uri)?;
     let identity = crate::storage::write_queue_root_identity(&normalized)?;
     let manager = write_queue::WriteQueueManager::for_root(&identity);
-    let permit = manager
-        .try_acquire_stream_export_destructive()
-        .ok_or_else(|| OmniError::ResourceLimitExceeded {
+    let permit = manager.try_acquire_export_destructive().ok_or_else(|| {
+        OmniError::ResourceLimitExceeded {
             resource: "stream_export_slots".to_string(),
             limit: 1,
             actual: 2,
-        })?;
-    Ok(StreamExportRootExclusion { _permit: permit })
+        }
+    })?;
+    Ok(ExportRootExclusion { _permit: permit })
 }
 
 pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
-
-/// Physical-only RFC-026 trusted row metadata. The compiler reserves this
-/// exact name; logical reads, reflection, export, and user index selection must
-/// never expose it. A different wire shape requires a differently versioned
-/// name rather than permissive reinterpretation.
-/// Grammar-impossible physical protocol field. The trailing `$` prevents any
-/// historical or future `.pg` property from colliding with this v9-only row
-/// envelope while remaining a valid Arrow/Lance field name.
-pub(crate) const STREAM_METADATA_COLUMN: &str = "__omnigraph_stream_v1$";
 
 /// Mutation kind, threaded through the early table-version checks so the
 /// engine can apply an op-kind-aware staging policy. This check is not the

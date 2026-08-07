@@ -186,8 +186,8 @@ jobs:
       # a deep engine path (init -> write -> publish -> recovery -> Lance) can
       # approach a default 2 MiB spawned-thread stack. The depth is genuinely
       # environment-sensitive: the same tree overflowed `write_cost` on this
-      # Linux runner while macOS stayed under, and overflowed a different cell
-      # (`memwal_stream_cost`) on macOS. Individual offenders are still fixed at
+      # Linux runner while macOS stayed under. Individual offenders are still
+      # fixed at
       # the source with `Box::pin` (see `helpers::cost::cost_harness`); this
       # keeps CI deterministic across runners while that work continues.
       RUST_MIN_STACK: 16777216
@@ -223,52 +223,9 @@ jobs:
             --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
             -- --nocapture 2>&1 | tee "$test_log"
 
-          grep -Fq "Gate R0 widest local:" "$test_log" \
-            || { echo "::error::Gate R0 local closure cell did not produce evidence"; exit 1; }
-          for test_name in \
-            gate_r0_current_inventory_path_classifier_is_canonical_and_fail_closed \
-            gate_r0_source_audit_revision_tripwire_matches_surveyed_lance \
-            gate_r0_retain_all_current_object_growth_is_swept_explicitly \
-            gate_r0_referenced_cut_retry_reuses_the_same_generation_root_local \
-            gate_r0_widest_generation_closes_and_records_retain_all_growth_local
-          do
-            grep -Eq "test ${test_name} \.\.\. ok" "$test_log" \
-              || { echo "::error::required positive Gate R0 cell '${test_name}' did not execute normally"; exit 1; }
-          done
-          for test_name in \
-            gate_r0_current_inventory_refuses_manifest_for_another_shard \
-            gate_r0_current_inventory_refuses_duplicate_generation_authority \
-            gate_r0_current_inventory_refuses_zero_current_generation \
-            gate_r0_current_inventory_refuses_non_advanced_current_generation \
-            gate_r0_current_inventory_refuses_manifest_filename_body_version_mismatch \
-            gate_r0_current_inventory_refuses_gapped_manifest_version_chain \
-            gate_r0_current_inventory_refuses_listed_shard_without_manifest
-          do
-            grep -Eq "test ${test_name} - should panic \.\.\. ok" "$test_log" \
-              || { echo "::error::required negative Gate R0 cell '${test_name}' did not execute as should-panic"; exit 1; }
-          done
 
-          grep -Eq "test b2a_retained_history_small_depth_keeps_terms_and_old_roots_separate \.\.\. ok" "$test_log" \
-            || { echo "::error::required B2a retained-history regression cell did not execute normally"; exit 1; }
-          for test_name in \
-            b2a_retained_history_decision_scale_sweeps_to_128_generations \
-            b2a_retained_history_decision_scale_sweeps_to_128_generations_on_configured_rustfs
-          do
-            grep -Eq "test ${test_name} \.\.\. ignored" "$test_log" \
-              || { echo "::error::B2a decision-scale cell '${test_name}' did not remain explicitly ignored"; exit 1; }
-          done
-          grep -Fq "B2a retained-history ci depth=" "$test_log" \
-            || { echo "::error::B2a retained-history regression cell produced no evidence"; exit 1; }
-
-          # This is a one-sided peak-lift remeasurement tripwire for the current
-          # single-exclusive-fold shape, not a runtime allocator limit.
-          grep -Eq "test widest_legal_generation_records_no_roll_estimates_and_peak_rss \.\.\. ok" "$test_log" \
-            || { echo "::error::Gate R0 RSS remeasurement cell did not execute normally"; exit 1; }
-          grep -Fq "fold_delta_remeasure_bytes=402653184" "$test_log" \
-            || { echo "::error::Gate R0 RSS evidence line or 384-MiB tripwire changed"; exit 1; }
-
-  v18_v19_format_fence:
-    name: V18 ↔ V19 Format Fence
+  v5_v6_format_fence:
+    name: V5 ↔ V6 Format Fence
     needs: classify_changes
     if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
@@ -301,55 +258,55 @@ jobs:
         with:
           workspaces: |
             . -> target
-          key: crossversion-v18-v19
+          key: crossversion-v5-v6
 
       # CI pins only the immediate predecessor. Older seams remain env-gated
       # and on-demand, per docs/dev/testing.md.
-      - name: Build genuine final-v18 CLI
+      - name: Build genuine final-v5 CLI
         env:
-          # Merge of the final v18-writing PR before current-token-v3 and
-          # recovery-v21 dead-letter activation advances the format to v19.
-          # Keep this immutable: HEAD^ stopped being v18 at the first v19 merge.
-          FINAL_INTERNAL_V18_COMMIT: c7c81b186bed37989fe5ce591baf0965b5102648
+          # Final v5-writing main commit immediately before RFC-023 activated
+          # the exact non-null `id` primary-key contract in v6. Keep this
+          # immutable: HEAD^ is not a stable format reference.
+          FINAL_INTERNAL_V5_COMMIT: 46b6d9084fb629b88d4ac9e8c546e0a30d213d19
         run: |
           set -euo pipefail
-          v18_source="$RUNNER_TEMP/omnigraph-final-v18"
-          v18_bin="$RUNNER_TEMP/omnigraph-final-v18-bin"
-          git fetch --no-tags --depth=1 origin "$FINAL_INTERNAL_V18_COMMIT"
-          git worktree add --detach "$v18_source" "$FINAL_INTERNAL_V18_COMMIT"
+          v5_source="$RUNNER_TEMP/omnigraph-final-v5"
+          v5_bin="$RUNNER_TEMP/omnigraph-final-v5-bin"
+          git fetch --no-tags --depth=1 origin "$FINAL_INTERNAL_V5_COMMIT"
+          git worktree add --detach "$v5_source" "$FINAL_INTERNAL_V5_COMMIT"
           cargo build --locked \
-            --manifest-path "$v18_source/Cargo.toml" \
+            --manifest-path "$v5_source/Cargo.toml" \
             --package omnigraph-cli \
             --bin omnigraph \
             --target-dir "$GITHUB_WORKSPACE/target"
-          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v18_bin"
-          test -x "$v18_bin"
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v5_bin"
+          test -x "$v5_bin"
           # Clean path-package artifacts through both workspace manifests while
           # retaining shared registry dependencies. The predecessor and current
           # packages have the same names+versions, so either manifest alone can
           # miss a stale path identity and make the fence link the wrong rlib.
           cargo clean --workspace --locked \
-            --manifest-path "$v18_source/Cargo.toml" \
+            --manifest-path "$v5_source/Cargo.toml" \
             --target-dir "$GITHUB_WORKSPACE/target"
           cargo clean --workspace --locked \
             --target-dir "$GITHUB_WORKSPACE/target"
-          echo "OMNIGRAPH_V18_BIN=$v18_bin" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_V5_BIN=$v5_bin" >> "$GITHUB_ENV"
 
-      - name: Run exact v18↔v19 refusal and rebuild fence
+      - name: Run exact v5↔v6 refusal and rebuild fence
         run: |
           set -euo pipefail
-          test_log="$RUNNER_TEMP/v18-v19-format-fence.log"
+          test_log="$RUNNER_TEMP/v5-v6-format-fence.log"
           cargo test --locked -p omnigraph-cli --test crossversion_upgrade \
-            current_v19_refuses_and_rebuilds_genuine_v18_and_v18_refuses_v19 \
+            current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6 \
             -- --exact --nocapture 2>&1 | tee "$test_log"
-          if grep -Fq "skipping immediate-predecessor v18 upgrade test" "$test_log"; then
-            echo "::error::v18↔v19 format fence skipped despite a configured predecessor binary"
+          if grep -Fq "skipping immediate-predecessor v5 upgrade test" "$test_log"; then
+            echo "::error::v5↔v6 format fence skipped despite a configured predecessor binary"
             exit 1
           fi
-          grep -Eq "test current_v19_refuses_and_rebuilds_genuine_v18_and_v18_refuses_v19 \.\.\. ok" "$test_log" \
-            || { echo "::error::exact v18↔v19 format fence did not execute normally"; exit 1; }
+          grep -Eq "test current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6 \.\.\. ok" "$test_log" \
+            || { echo "::error::exact v5↔v6 format fence did not execute normally"; exit 1; }
           grep -Eq "test result: ok\. 1 passed; 0 failed" "$test_log" \
-            || { echo "::error::v18↔v19 format fence matched the wrong test set"; exit 1; }
+            || { echo "::error::v5↔v6 format fence matched the wrong test set"; exit 1; }
 
   test_aws_feature:
     name: Test omnigraph-server --features aws
@@ -465,7 +422,7 @@ jobs:
         # fixed in beta.10), matching the intermittent "error sending request"
         # PUT failures observed here on pooled connections. The S3 suites
         # (engine s3_storage, server s3, cluster s3_cluster, engine failpoints
-        # s3_, the memwal provider cell) were validated against the beta.12
+        # s3_) were validated against the beta.12
         # binary locally before this bump. Keep CI pinned to the immutable
         # multi-arch index digest so upgrades are deliberate.
         run: |
@@ -511,14 +468,13 @@ jobs:
             -p omnigraph-cli \
             --test s3_storage \
             --test lance_surface_guards \
-            --test memwal_enrollment_gate \
             --test s3 \
             --test s3_cluster \
             --test system_local \
             -- --nocapture 2>&1 | tee "$test_log"
 
           if grep -Eiq \
-            "SKIP (public_physical_ref_token_rejects_s3_same_version_aba|s3_memwal_enrollment_gate_positive_and_listing_negatives)|skipping s3 " \
+            "SKIP public_physical_ref_token_rejects_s3_same_version_aba|skipping s3 " \
             "$test_log"
           then
             echo "::error::a configured RustFS test emitted its unconfigured skip"
@@ -533,7 +489,6 @@ jobs:
             s3_schema_apply_migrates_live_graph \
             s3_fresh_branch_traversal_reuses_main_graph_index_with_etags \
             public_physical_ref_token_rejects_s3_same_version_aba \
-            s3_memwal_enrollment_gate_positive_and_listing_negatives \
             server_opens_s3_graph_directly_and_serves_snapshot_and_read \
             server_boots_cluster_from_bare_storage_uri_and_serves_query \
             s3_cluster_full_lifecycle_import_apply_serve_evolve_delete \
@@ -566,30 +521,6 @@ jobs:
           [ "$status" -eq 0 ] || exit "$status"
           echo "$output" | grep -Eq "test result: ok\. [1-9][0-9]* passed" \
             || { echo "::error::filter 's3_' matched no tests — vacuous pass"; exit 1; }
-
-          set +e
-          output=$(cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream s3_provider_shard_manifest_failure_retains_unreferenced_generation -- --exact --nocapture 2>&1); status=$?
-          set -e
-          echo "$output"
-          [ "$status" -eq 0 ] || exit "$status"
-          echo "$output" | grep -Fq "SKIP s3_provider_shard_manifest_failure_retains_unreferenced_generation" \
-            && { echo "::error::RustFS B2a provider-failure cell skipped — vacuous pass"; exit 1; }
-          echo "$output" | grep -Eq "test result: ok\. 1 passed" \
-            || { echo "::error::RustFS B2a provider-failure filter matched no test — vacuous pass"; exit 1; }
-          echo "$output" | grep -Eq "test s3_provider_shard_manifest_failure_retains_unreferenced_generation \.\.\. ok" \
-            || { echo "::error::RustFS B2a provider-failure cell did not execute normally"; exit 1; }
-
-          set +e
-          output=$(cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream_cost gate_r0_widest_generation_closes_and_records_retain_all_growth_on_configured_rustfs -- --exact --nocapture 2>&1); status=$?
-          set -e
-          echo "$output"
-          [ "$status" -eq 0 ] || exit "$status"
-          echo "$output" | grep -Eq "test result: ok\. 1 passed" \
-            || { echo "::error::RustFS Gate R0 filter matched no tests — vacuous pass"; exit 1; }
-          echo "$output" | grep -Eq "test gate_r0_widest_generation_closes_and_records_retain_all_growth_on_configured_rustfs \.\.\. ok" \
-            || { echo "::error::RustFS Gate R0 cell did not execute with positive-test polarity"; exit 1; }
-          echo "$output" | grep -Fq "Gate R0 widest rustfs:" \
-            || { echo "::error::RustFS Gate R0 test skipped instead of measuring configured storage"; exit 1; }
 
       - name: Dump RustFS logs on failure
         if: failure()

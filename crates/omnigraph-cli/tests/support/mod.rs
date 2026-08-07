@@ -559,12 +559,12 @@ query find_person($name: String) {
         root.join("base.policy.yaml"),
         r#"version: 1
 groups:
-  stream_operators: [act-cluster-test, act-operator, andrew]
+  cluster_operators: [act-cluster-test, act-operator, andrew]
 rules:
-  - id: stream-operators-manage
+  - id: cluster-operators-change
     allow:
-      actors: { group: stream_operators }
-      actions: [stream_manage]
+      actors: { group: cluster_operators }
+      actions: [change]
 "#,
     )
     .unwrap();
@@ -580,7 +580,6 @@ state:
 graphs:
   knowledge:
     schema: ./people.pg
-    streaming: true
     queries:
       find_person:
         file: ./people.gq
@@ -591,17 +590,6 @@ policies:
 "#,
     )
     .unwrap();
-}
-
-pub fn remove_streaming_from_cluster_fixture(root: &std::path::Path) {
-    let config_path = root.join("cluster.yaml");
-    let config = fs::read_to_string(&config_path).unwrap();
-    let config_without_streaming = config.replace("    streaming: true\n", "");
-    assert_ne!(
-        config, config_without_streaming,
-        "cluster fixture no longer contains the expected streaming declaration"
-    );
-    fs::write(config_path, config_without_streaming).unwrap();
 }
 
 pub fn init_cluster_derived_graph(root: &std::path::Path) {
@@ -633,13 +621,7 @@ pub fn write_cluster_lock(root: &std::path::Path, lock_id: &str, operation: &str
 }
 
 pub fn write_cluster_applyable_state(root: &std::path::Path) -> serde_json::Value {
-    // This helper fabricates a ledger with NO physical graph behind it, so
-    // the config must not manage streaming: the RFC-026 §4.7 flag is the one
-    // non-create per-graph resource whose apply opens the real graph, and a
-    // declared flag over a fabricated ledger would (correctly) fail. Real
-    // graphs get the fixture's `streaming: true` through the apply-create
-    // e2es instead.
-    remove_streaming_from_cluster_fixture(root);
+    // This helper fabricates a ledger with NO physical graph behind it.
     let validate = parse_stdout_json(&output_success(
         cli()
             .arg("cluster")
@@ -684,9 +666,6 @@ pub fn cluster_json(root: &std::path::Path, command: &str) -> serde_json::Value 
         .arg(command)
         .arg("--config")
         .arg(root);
-    if command == "apply" {
-        invocation.arg("--confirm-stream-offline");
-    }
     invocation.arg("--json");
     parse_stdout_json(&output_success(&mut invocation))
 }
@@ -717,11 +696,7 @@ query find_service($name: String) {
         "version: 1\nrules: []\n",
     )
     .unwrap();
-    fs::write(
-        root.join("shared.policy.yaml"),
-        "version: 1\nrules: []\n",
-    )
-    .unwrap();
+    fs::write(root.join("shared.policy.yaml"), "version: 1\nrules: []\n").unwrap();
     fs::write(
         root.join("cluster.yaml"),
         r#"

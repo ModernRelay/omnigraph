@@ -44,13 +44,14 @@ sequenceDiagram
 
 **Code paths:**
 
-- Entry: `Omnigraph::query` at `crates/omnigraph/src/exec/query.rs:7`
-- Search-mode extraction: `extract_search_mode` at `crates/omnigraph/src/exec/query.rs:110`
-- Pipeline runner: `execute_query` at `crates/omnigraph/src/exec/query.rs:347`
-- RRF fan-out: `execute_rrf_query` at `crates/omnigraph/src/exec/query.rs:393`
-- Per-source-row BFS: `execute_expand` at `crates/omnigraph/src/exec/query.rs:675`
-- Lance scan + pushdown: `execute_node_scan` at `crates/omnigraph/src/exec/query.rs:1027`
-- Filter → SQL pushdown: `build_lance_filter` at `crates/omnigraph/src/exec/query.rs:1158`
+- Entry: `Omnigraph::query` at `crates/omnigraph/src/exec/query.rs:31`
+- Search-mode extraction: `extract_search_mode` at `crates/omnigraph/src/exec/query.rs:149`
+- Pipeline runner: `execute_query` at `crates/omnigraph/src/exec/query.rs:419`
+- RRF fan-out: `execute_rrf_query` at `crates/omnigraph/src/exec/query.rs:478`
+- Per-source-row BFS: `execute_expand` at `crates/omnigraph/src/exec/query.rs:1297`
+- Filter hoist pre-pass: `execute_pipeline` at `crates/omnigraph/src/exec/query.rs:749` — search filters and single-binding pushable scalar filters move onto the introducing `NodeScan` (arming `prefilter(true)` for any search on the same scanner) or into the introducing `Expand`'s `dst_filters`; multi-binding and non-pushable filters stay in-memory at their lowered position
+- Lance scan + pushdown: `execute_node_scan` at `crates/omnigraph/src/exec/query.rs:2328`
+- Filter → Expr pushdown: `build_lance_filter_expr` at `crates/omnigraph/src/exec/query.rs:2594`
 
 ### Multi-modal search modes (`SearchMode`)
 
@@ -65,6 +66,7 @@ Hybrid example: `order { rrf(nearest($d.embedding, $q), bm25($d.body, $q_text)) 
 ### Joins / set operations
 
 - Joins are implicit: MATCH bindings + traversals are implemented as scans + CSR/CSC lookups.
+- A traversal with an edge binding (`$p $w:knows $f`) bypasses both unbound expand modes: it always scans the edge dataset (`execute_expand_bound` — CSR holds topology only, not edge properties), emits one row per matching edge row, and never triggers the lazy `GraphIndex` build on its own. It preserves the incoming wide-row order (including ANN/BM25 rank) and carries the physical edge ID as a hidden ordering tie-break so parallel rows remain deterministic.
 - `not { … }` lowers to an `AntiJoin` over the inner pipeline.
 
 ### Scoped reads
@@ -225,18 +227,20 @@ same pre-arm resource error above 32 MiB without reading payload bytes.
 Overwrite does accept `WriteParams` and preserves the external reference.
 
 `Append` is a user-facing mode name, not the selected Lance operation. On the
-current v19 format it preserves the v6 strict-insert contract and routes through
+current v6 format it follows the strict-insert contract and routes through
 filtered merge-insert with
 `WhenMatched::Fail`; bare Lance `Append` is unreachable from production graph
 writes. Use `Merge` when an existing `id` should be updated. This distinction is
 part of the public mutation contract, not an optimization choice.
 
-## `load` and the deprecated `ingest` shims
+## Load entry points and deprecated ingest compatibility
 
-- `load_as(branch, base, data, mode, actor)` — the unified entry (single publisher commit per call). `base: Some(b)` forks a missing `branch` from `b` first (via `branch_create_from_as`, which enforces `BranchCreate`); `base: None` requires the branch to exist — staging fails on an unknown branch, so a typo'd name can never create one.
-- `load(branch, data, mode)` — convenience wrapper with `base: None` and no actor.
-- Returns `LoadResult { branch, base_branch, branch_created, nodes_loaded, edges_loaded }`.
-- `ingest{,_as,_file,_file_as}` are `#[deprecated]` shims over `load_as` preserving the historical contract (`from: None` forks from `main`; returns `IngestResult`); they are slated for removal. The CLI `ingest` command is a deprecated alias of `load --from <base>`.
+- `load_graph_batch_as(branch, base, data, mode, actor)` is the canonical strict graph-batch boundary. Each nonblank line is exactly one logical node or edge envelope; recursive duplicate members, unknown or physical fields, compatibility coercions, and noncanonical supplied node IDs are rejected before effects. It still uses the ordinary Load transaction, validation, recovery, and single graph publication.
+- `load_graph_batch(branch, data, mode)` is its convenience wrapper with `base: None` and no actor.
+- `load_as(branch, base, data, mode, actor)` retains the loader-compatible parser for SDK and legacy-wire compatibility. It shares the same transaction machinery but is not the strict public graph-batch grammar.
+- `load(branch, data, mode)` is the loader-compatible convenience wrapper with `base: None` and no actor.
+- For either boundary, `base: Some(b)` forks a missing `branch` from `b` first (via `branch_create_from_as`, which enforces `BranchCreate`); `base: None` requires the branch to exist. The result is `LoadResult { branch, base_branch, branch_created, nodes_loaded, edges_loaded }`.
+- `ingest{,_as,_file,_file_as}` are `#[deprecated]` shims over loader-compatible `load_as`, preserving the historical contract (`from: None` forks from `main`; returns `IngestResult`). The CLI `ingest` command likewise retains that compatibility path; it is not an alias for strict CLI `load`.
 
 ## Embeddings during load
 

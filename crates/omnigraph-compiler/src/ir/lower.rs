@@ -306,6 +306,11 @@ fn lower_clauses(
                     min_hops: traversal.min_hops,
                     max_hops: traversal.max_hops,
                     dst_filters: vec![],
+                    edge_binding: traversal
+                        .edge_binding
+                        .as_deref()
+                        .filter(|binding| *binding != "_")
+                        .map(str::to_string),
                 });
                 pipeline.push(IROp::Filter(IRFilter {
                     left: IRExpr::PropAccess {
@@ -342,6 +347,11 @@ fn lower_clauses(
                     min_hops: traversal.min_hops,
                     max_hops: traversal.max_hops,
                     dst_filters: introduced_filters,
+                    edge_binding: traversal
+                        .edge_binding
+                        .as_deref()
+                        .filter(|binding| *binding != "_")
+                        .map(str::to_string),
                 });
                 if traversal.src != "_" {
                     bound_vars.insert(traversal.src.clone());
@@ -359,6 +369,11 @@ fn lower_clauses(
                     min_hops: traversal.min_hops,
                     max_hops: traversal.max_hops,
                     dst_filters: introduced_filters,
+                    edge_binding: traversal
+                        .edge_binding
+                        .as_deref()
+                        .filter(|binding| *binding != "_")
+                        .map(str::to_string),
                 });
                 if traversal.dst != "_" {
                     bound_vars.insert(traversal.dst.clone());

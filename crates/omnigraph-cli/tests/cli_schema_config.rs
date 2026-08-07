@@ -11,7 +11,6 @@ mod support;
 
 use support::*;
 
-
 #[test]
 fn version_command_prints_current_cli_version() {
     let output = output_success(cli().arg("version"));
@@ -628,9 +627,8 @@ fn graphs_list_rejects_store_scope() {
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         stderr.contains("`graphs list` is a served command")
-            && stderr.contains(
-                "--store addresses a single graph's storage directly and does not apply"
-            )
+            && stderr
+                .contains("--store addresses a single graph's storage directly and does not apply")
             && stderr.contains("Address the server with --server <name|url> or --profile <name>."),
         "expected the addressing-guard store rejection in stderr; got:\n{stderr}"
     );

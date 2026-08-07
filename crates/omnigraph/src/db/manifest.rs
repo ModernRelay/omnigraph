@@ -31,14 +31,6 @@ mod publisher;
 mod recovery;
 #[path = "manifest/state.rs"]
 mod state;
-#[path = "manifest/stream.rs"]
-pub(crate) mod stream;
-#[path = "manifest/stream_profile.rs"]
-pub(crate) mod stream_profile;
-#[path = "manifest/stream_token.rs"]
-pub(crate) mod stream_token;
-#[path = "manifest/token_store.rs"]
-pub(crate) mod token_store;
 
 use graph::{
     init_manifest_graph, open_manifest_graph, open_manifest_graph_with_lineage, snapshot_state_at,
@@ -59,84 +51,21 @@ pub(crate) use recovery::MAX_EFFECT_IDENTITY_SCAN_VERSIONS;
 pub(crate) use recovery::{
     HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryAuthorityToken,
     RecoveryBranchMergeEffect, RecoveryBranchMergeEffectKind, RecoveryLineageIntent,
-    RecoveryManifestDelta, RecoveryMode, RecoveryProtocolV14, RecoveryProtocolV15,
-    RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind, RecoverySidecar,
-    RecoverySidecarHandle, RecoveryStreamAdmissionScope,
-    RecoveryStreamAuthorityRetirementOutcomeV19, RecoveryStreamAuthorityRetirementOutcomeV21,
-    RecoveryStreamClaimAttemptV14, RecoveryStreamClaimContinuationV14,
-    RecoveryStreamClaimLedgerEffectV14, RecoveryStreamClaimOperationV14,
-    RecoveryStreamClaimOutcomeV14, RecoveryStreamClaimPhaseV14, RecoveryStreamClaimTerminalV14,
-    RecoveryStreamClaimV14, RecoveryStreamDeadLetterBaseConfirmationV21,
-    RecoveryStreamDeadLetterCandidateV21, RecoveryStreamDeadLetterFoldOutcomeV21,
-    RecoveryStreamDrainFoldAuthorityV14, RecoveryStreamFoldCut, RecoveryStreamFoldV14,
-    RecoveryStreamLifecycleReceiptKind, RecoveryStreamLifecycleReceiptV14,
-    RecoveryStreamOpenPlanV15, RecoveryStreamProfileChangeKind, RecoveryStreamProtocolV14Scaffold,
-    RecoveryStreamRebindOutcomeV18, RecoveryStreamResumeOutcomeV15, RecoveryStreamResumeRequestV15,
-    RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin, SidecarTableRegistration,
-    SidecarTableRename, SidecarTombstone, arm_stream_claim_checkpoint_sidecar_v14,
-    arm_stream_claim_terminal_sidecar_v14, arm_stream_resume_checkpoint_sidecar_v15,
-    arm_stream_resume_terminal_sidecar_v15, classify_effect_free_stream_claim_sidecar_v14,
-    classify_effect_free_stream_resume_sidecar_v15,
-    complete_stream_authority_retirement_sidecar_v19,
-    complete_stream_authority_retirement_sidecar_v21, complete_stream_claim_sidecar_v14,
-    complete_stream_correction_sidecar_v20, complete_stream_dead_letter_fold_sidecar_v21,
-    complete_stream_enrollment_sidecar_v14, complete_stream_fold_sidecar_v12,
-    complete_stream_fold_sidecar_v14, complete_stream_lifecycle_receipt_sidecar_v14,
-    complete_stream_profile_change_sidecar_v13, complete_stream_rebind_sidecar_v18,
-    complete_stream_resume_sidecar_v15, confirm_branch_merge_sidecar_v9,
-    confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9, confirm_schema_apply_sidecar_v9,
-    confirm_stream_authority_retirement_sidecar_v19,
-    confirm_stream_authority_retirement_sidecar_v21, confirm_stream_claim_sidecar_v14,
-    confirm_stream_correction_sidecar_v20, confirm_stream_dead_letter_fold_sidecar_v21,
-    confirm_stream_fold_sidecar_v12, confirm_stream_fold_sidecar_v14,
-    confirm_stream_lifecycle_receipt_sidecar_v14, confirm_stream_profile_change_sidecar_v13,
-    confirm_stream_resume_sidecar_v15, confirm_stream_sealed_ensure_indices_sidecar_v16,
-    confirm_stream_sealed_optimize_sidecar_v17, delete_sidecar, ensure_read_only_schema_coherent,
-    finalize_effect_free_occ_sidecar, finalize_effect_free_stream_fold_sidecar_v12,
-    finalize_effect_free_stream_fold_sidecar_v14, heal_pending_sidecars_roll_forward,
-    list_sidecars, list_sidecars_bounded, lookup_stream_claim_continuation_v14,
-    mint_recovery_operation_id, new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9,
-    new_occ_sidecar_v9, new_optimize_sidecar_v9, new_schema_apply_sidecar_v9,
-    new_stream_authority_retirement_sidecar_v19, new_stream_authority_retirement_sidecar_v21,
-    new_stream_claim_sidecar_v14, new_stream_correction_sidecar_v20,
-    new_stream_dead_letter_fold_sidecar_v21, new_stream_drain_fold_sidecar_v14,
-    new_stream_enrollment_sidecar_v14, new_stream_fold_sidecar_v12, new_stream_fold_v2_sidecar_v14,
-    new_stream_lifecycle_receipt_sidecar_v14, new_stream_profile_change_sidecar_v13,
-    new_stream_rebind_sidecar_v18, new_stream_resume_sidecar_v15,
-    new_stream_sealed_ensure_indices_sidecar_v16, new_stream_sealed_optimize_sidecar_v17,
-    prepared_stream_claim_attempt_v14, prepared_stream_resume_attempt_v15,
-    rearm_stream_claim_checkpoint_sidecar_v14, rearm_stream_resume_checkpoint_sidecar_v15,
-    receipt_first_rearm_stream_claim_sidecar_v14, recover_manifest_drift,
-    recovery_sidecar_exactly_owns_canonical_main_base_head, schema_apply_serial_queue_key,
-    write_sidecar,
+    RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
+    RecoverySidecar, RecoverySidecarHandle, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
+    SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
+    confirm_branch_merge_sidecar_v9, confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9,
+    confirm_schema_apply_sidecar_v9, delete_sidecar, ensure_read_only_schema_coherent,
+    finalize_effect_free_occ_sidecar, heal_pending_sidecars_roll_forward, list_sidecars,
+    new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
+    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, recover_manifest_drift,
+    schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
 #[cfg(test)]
 use state::string_column;
 pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 use state::{ManifestState, read_manifest_state};
-pub(crate) use stream::{
-    CurrentHeadWitness, EnrollmentReceipt, STREAM_CONFIG_VERSION, StreamLifecycle,
-    StreamLifecycleEntry, StreamPhysicalBinding, stream_enrollment_intent_digest_v1,
-};
-pub use stream_profile::StreamingStatus;
-pub(crate) use stream_profile::{
-    AuthorityRetirementReceipt, DisablePlan, FoldContinuation, FoldDelegation,
-    ProfileManagementReceipt, ProfileManagementResult, StreamProfileEntry, StreamProfileMode,
-    StreamProfileState, stream_authority_retirement_token_witness_digest,
-    stream_profile_cluster_root_digest, stream_profile_graph_identity_digest,
-    stream_profile_management_request_digest,
-};
-pub(crate) use stream_token::stream_token_authority_plan_digest;
-pub(crate) use token_store::{
-    LifecycleLedgerRecord, StreamTokenAuthorityEntry, lookup_authority_retirement_receipt,
-    lookup_claim_receipt, lookup_lifecycle_ledger_record_by_id, lookup_management_receipt,
-    lookup_profile_management_receipt, lookup_stream_correction_receipt,
-    open_stream_token_authority_at, open_stream_token_authority_head,
-    stage_authority_retirement_receipt, stage_lifecycle_ledger_records, stage_management_receipt,
-    stage_profile_management_receipt, stage_stream_correction_effect,
-    stream_token_authority_entry_for_dataset, validate_stream_token_plan_bounds,
-};
 
 /// The internal-schema (storage-format) version this binary writes and reads.
 /// A graph's on-disk per-branch stamp is read via [`internal_schema_stamp_at`];
@@ -155,12 +84,6 @@ const OBJECT_TYPE_GRAPH_COMMIT: &str = "graph_commit";
 /// Mutable per-branch head pointer for the graph lineage (RFC-013 Phase 7).
 /// `object_id` is `graph_head:<branch>` (`graph_head:main` for the main branch).
 const OBJECT_TYPE_GRAPH_HEAD: &str = "graph_head";
-const OBJECT_TYPE_STREAM_STATE: &str = "stream_state";
-const OBJECT_TYPE_STREAM_TOKEN_AUTHORITY: &str = "stream_token_authority";
-/// Graph-global RFC-026 §4.7 stream-profile enablement singleton (v10). One
-/// required row from genesis; moves only through `SetStreamProfile`'s exact
-/// CAS.
-const OBJECT_TYPE_STREAM_PROFILE: &str = "stream_profile";
 const TABLE_VERSION_MANAGEMENT_KEY: &str = "table_version_management";
 
 /// Stable head-key segment for the main branch in `graph_head:<branch>` rows.
@@ -219,16 +142,6 @@ pub struct Snapshot {
     root_uri: String,
     version: u64,
     entries: HashMap<String, SubTableEntry>,
-    /// Durable RFC-026 lifecycle authority keyed only by immutable physical
-    /// table identity. `table_key` inside each value is diagnostic and is never
-    /// used to select the authority row.
-    stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
-    /// Exact graph-global sequencing participant selected by this manifest
-    /// snapshot. Its raw Lance HEAD is never authority.
-    stream_token_authority: StreamTokenAuthorityEntry,
-    /// Graph-global RFC-026 §4.7 enablement authority (v10). Required from
-    /// genesis; every opener obeys it regardless of access path.
-    stream_profile: StreamProfileEntry,
     /// Per-graph read caches (shared `Session` + held-handle cache), injected by
     /// `Omnigraph::resolved_target` for live Branch reads so table opens reuse
     /// handles (0 IO on a warm repeat) and one `Session`. `None` for write-prelude
@@ -246,11 +159,6 @@ pub struct Snapshot {
 #[derive(Debug, Clone)]
 pub struct SnapshotTable {
     dataset: Dataset,
-    /// Public reflection view. The physical dataset additionally carries the
-    /// reserved RFC-026 attribution struct; keeping a separately owned schema
-    /// prevents a caller from recovering that protocol column through
-    /// `SnapshotTable::schema`.
-    public_schema: LanceSchema,
 }
 
 /// Read-only scan builder for a [`SnapshotTable`].
@@ -261,113 +169,19 @@ pub struct SnapshotTable {
 /// writable handle and bypass graph publication.
 pub struct SnapshotScanner {
     scanner: Scanner,
-    physical_schema: arrow_schema::SchemaRef,
-    public_projection: Vec<String>,
-    forbidden_protocol_column: Option<String>,
-}
-
-fn is_protocol_column_path(reference: &str) -> bool {
-    reference.split('.').any(|segment| {
-        segment
-            .trim_matches(|character| matches!(character, '`' | '"' | '[' | ']'))
-            .eq_ignore_ascii_case(crate::db::STREAM_METADATA_COLUMN)
-    })
-}
-
-fn ensure_expr_omits_protocol_column(filter: &Expr) -> Result<()> {
-    if filter.column_refs().iter().any(|column| {
-        column
-            .name
-            .eq_ignore_ascii_case(crate::db::STREAM_METADATA_COLUMN)
-    }) {
-        return Err(OmniError::manifest(format!(
-            "column '{}' is reserved for OmniGraph storage protocol metadata",
-            crate::db::STREAM_METADATA_COLUMN
-        )));
-    }
-    Ok(())
-}
-
-fn filter_text_references_protocol_column(filter: &str) -> bool {
-    let bytes = filter.as_bytes();
-    let needle = crate::db::STREAM_METADATA_COLUMN.as_bytes();
-    let is_identifier_byte = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$');
-    let mut index = 0;
-    let mut in_string_literal = false;
-    while index < bytes.len() {
-        if bytes[index] == b'\'' {
-            if in_string_literal && bytes.get(index + 1) == Some(&b'\'') {
-                index += 2;
-                continue;
-            }
-            in_string_literal = !in_string_literal;
-            index += 1;
-            continue;
-        }
-        if !in_string_literal && index + needle.len() <= bytes.len() {
-            let candidate = &bytes[index..index + needle.len()];
-            let left_boundary = index == 0 || !is_identifier_byte(bytes[index - 1]);
-            let right_boundary = index + needle.len() == bytes.len()
-                || !is_identifier_byte(bytes[index + needle.len()]);
-            if left_boundary && right_boundary && candidate.eq_ignore_ascii_case(needle) {
-                return true;
-            }
-        }
-        index += 1;
-    }
-    false
-}
-
-fn parse_public_filter(schema: arrow_schema::SchemaRef, filter: &str) -> Result<Expr> {
-    // The protocol field is deliberately outside the public schema grammar.
-    // Reject its literal spelling before SQL parsing as well: some parser
-    // paths treat `$` as placeholder syntax instead of a column reference.
-    if filter_text_references_protocol_column(filter) {
-        return Err(OmniError::manifest(format!(
-            "column '{}' is reserved for OmniGraph storage protocol metadata",
-            crate::db::STREAM_METADATA_COLUMN
-        )));
-    }
-    let expression = lance_datafusion::planner::Planner::new(schema)
-        .parse_filter(filter)
-        .map_err(|error| OmniError::Lance(error.to_string()))?;
-    ensure_expr_omits_protocol_column(&expression)?;
-    Ok(expression)
 }
 
 impl SnapshotScanner {
     /// Select the output columns.
     pub fn project<T: AsRef<str>>(&mut self, columns: &[T]) -> Result<&mut Self> {
-        if columns
-            .iter()
-            .any(|column| is_protocol_column_path(column.as_ref()))
-        {
-            return Err(OmniError::manifest(format!(
-                "column '{}' is reserved for OmniGraph storage protocol metadata",
-                crate::db::STREAM_METADATA_COLUMN
-            )));
-        }
-        // Lance expands `*` against the scanner's physical schema. Expand it
-        // here against the already-sealed public schema so callers cannot
-        // recover protocol metadata through wildcard projection.
-        let mut public_columns = Vec::with_capacity(columns.len());
-        for column in columns {
-            let column = column.as_ref();
-            if column.trim() == "*" {
-                public_columns.extend(self.public_projection.iter().cloned());
-            } else {
-                public_columns.push(column.to_string());
-            }
-        }
         self.scanner
-            .project(&public_columns)
+            .project(columns)
             .map_err(|error| OmniError::Lance(error.to_string()))?;
         Ok(self)
     }
 
     /// Apply a SQL filter expression.
     pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
-        parse_public_filter(Arc::clone(&self.physical_schema), filter)?;
         self.scanner
             .filter(filter)
             .map_err(|error| OmniError::Lance(error.to_string()))?;
@@ -376,10 +190,6 @@ impl SnapshotScanner {
 
     /// Apply a structured DataFusion filter expression.
     pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
-        if ensure_expr_omits_protocol_column(&filter).is_err() {
-            self.forbidden_protocol_column = Some(crate::db::STREAM_METADATA_COLUMN.to_string());
-            return self;
-        }
         self.scanner.filter_expr(filter);
         self
     }
@@ -430,11 +240,6 @@ impl SnapshotScanner {
 
     /// Execute the configured read without exposing its physical plan.
     pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
-        if let Some(column) = &self.forbidden_protocol_column {
-            return Err(OmniError::manifest(format!(
-                "column '{column}' is reserved for OmniGraph storage protocol metadata"
-            )));
-        }
         self.scanner
             .try_into_stream()
             .await
@@ -444,44 +249,18 @@ impl SnapshotScanner {
 
 impl SnapshotTable {
     fn new(dataset: Dataset) -> Self {
-        let mut public_schema = dataset.schema().clone();
-        public_schema
-            .fields
-            .retain(|field| field.name != crate::db::STREAM_METADATA_COLUMN);
-        Self {
-            dataset,
-            public_schema,
-        }
+        Self { dataset }
     }
 
     /// Build a read-only scanner over this pinned table version.
     pub fn scan(&self) -> SnapshotScanner {
-        let mut scanner = self.dataset.scan();
-        let public_projection = self
-            .public_schema
-            .fields
-            .iter()
-            .map(|field| field.name.clone())
-            .collect::<Vec<_>>();
-        scanner
-            .project(&public_projection)
-            .expect("manifest-validated public fields must project from their physical dataset");
         SnapshotScanner {
-            scanner,
-            physical_schema: Arc::new(arrow_schema::Schema::from(self.dataset.schema())),
-            public_projection,
-            forbidden_protocol_column: None,
+            scanner: self.dataset.scan(),
         }
     }
 
     /// Count rows in this pinned table version, optionally with a filter.
     pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
-        if let Some(filter) = filter.as_deref() {
-            parse_public_filter(
-                Arc::new(arrow_schema::Schema::from(self.dataset.schema())),
-                filter,
-            )?;
-        }
         self.dataset
             .count_rows(filter)
             .await
@@ -490,7 +269,7 @@ impl SnapshotTable {
 
     /// Lance schema of this pinned table version.
     pub fn schema(&self) -> &LanceSchema {
-        &self.public_schema
+        self.dataset.schema()
     }
 
     /// Lance manifest version of this pinned table.
@@ -498,27 +277,16 @@ impl SnapshotTable {
         self.dataset.version().version
     }
 
-    /// Read-only user-index metadata for this pinned table version. Lance's
-    /// MemWAL system index is part of OmniGraph's private write protocol and
-    /// is deliberately absent from SDK reflection.
+    /// Read-only physical index metadata for this pinned table version.
     pub async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        let indices = self
-            .dataset
+        self.dataset
             .load_indices()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
-        Ok(Arc::new(
-            indices
-                .iter()
-                .filter(|index| index.name != lance_index::mem_wal::MEM_WAL_INDEX_NAME)
-                .cloned()
-                .collect(),
-        ))
+            .map_err(|error| OmniError::Lance(error.to_string()))
     }
 
     /// Whether `column` has complete usable BTREE coverage.
     pub async fn index_coverage(&self, column: &str) -> Result<crate::IndexCoverage> {
-        self.ensure_public_column(column)?;
         crate::table_store::TableStore::key_column_index_coverage(&self.dataset, column).await
     }
 
@@ -529,30 +297,17 @@ impl SnapshotTable {
 
     /// Whether this table has a user BTREE index on `column`.
     pub async fn has_btree_index(&self, column: &str) -> Result<bool> {
-        self.ensure_public_column(column)?;
         crate::table_store::TableStore::has_btree_index_on(&self.dataset, column).await
     }
 
     /// Whether this table has a user full-text index on `column`.
     pub async fn has_fts_index(&self, column: &str) -> Result<bool> {
-        self.ensure_public_column(column)?;
         crate::table_store::TableStore::has_fts_index_on(&self.dataset, column).await
     }
 
     /// Whether this table has a user vector index on `column`.
     pub async fn has_vector_index(&self, column: &str) -> Result<bool> {
-        self.ensure_public_column(column)?;
         crate::table_store::TableStore::has_vector_index_on(&self.dataset, column).await
-    }
-
-    fn ensure_public_column(&self, column: &str) -> Result<()> {
-        if is_protocol_column_path(column) {
-            return Err(OmniError::manifest(format!(
-                "column '{}' is reserved for OmniGraph storage protocol metadata",
-                crate::db::STREAM_METADATA_COLUMN
-            )));
-        }
-        Ok(())
     }
 }
 
@@ -674,149 +429,6 @@ impl Snapshot {
 
     pub fn entries(&self) -> impl Iterator<Item = &SubTableEntry> {
         self.entries.values()
-    }
-
-    /// Durable stream authority for one immutable table lifetime.
-    pub(crate) fn stream_lifecycle(
-        &self,
-        identity: TableIdentity,
-    ) -> Option<&StreamLifecycleEntry> {
-        self.stream_lifecycles.get(&identity)
-    }
-
-    /// Iterate durable lifecycle authorities without another manifest scan.
-    pub(crate) fn stream_lifecycles(
-        &self,
-    ) -> impl Iterator<Item = (&TableIdentity, &StreamLifecycleEntry)> {
-        self.stream_lifecycles.iter()
-    }
-
-    /// Test-only seam for proving that public status resolves the live table
-    /// registration by immutable identity instead of trusting this explicitly
-    /// diagnostic alias.
-    #[cfg(all(test, feature = "failpoints"))]
-    pub(crate) fn set_stream_diagnostic_table_key_for_test(
-        &mut self,
-        identity: TableIdentity,
-        table_key: &str,
-    ) {
-        self.stream_lifecycles
-            .get_mut(&identity)
-            .expect("test snapshot must contain the requested stream lifecycle")
-            .diagnostic_table_key = table_key.to_string();
-    }
-
-    /// Exact durable pointer to the graph-global RFC-026 token participant.
-    pub(crate) fn stream_token_authority(&self) -> &StreamTokenAuthorityEntry {
-        &self.stream_token_authority
-    }
-
-    /// Exact durable RFC-026 §4.7 enablement authority for this snapshot.
-    pub(crate) fn stream_profile(&self) -> &StreamProfileEntry {
-        &self.stream_profile
-    }
-
-    /// Project canonical-main stream-profile authority into a live named-branch
-    /// snapshot.
-    ///
-    /// Native Lance branches retain the profile row they forked with, but the
-    /// profile is graph-global control authority rather than branch content.
-    /// `Omnigraph` calls this only for live `ReadTarget::Branch` resolution;
-    /// explicitly pinned historical snapshots keep their immutable row.
-    pub(crate) fn project_canonical_stream_profile(&mut self, profile: StreamProfileEntry) {
-        self.stream_profile = profile;
-    }
-
-    /// The graph's streaming posture, computed from state this snapshot
-    /// already holds (zero extra I/O): whether the experimental streaming
-    /// profile is enabled, and whether any stream lifecycle is non-terminal
-    /// (`undrained` — the condition that makes a disable refuse as
-    /// pending-until-drained).
-    pub fn streaming_status(&self) -> StreamingStatus {
-        StreamingStatus {
-            enabled: self.stream_profile.streaming_enabled(),
-            undrained: self
-                .stream_lifecycles
-                .values()
-                .any(|lifecycle| lifecycle.lifecycle != StreamLifecycle::Sealed),
-            profile_revision: self.stream_profile.profile_revision,
-            profile_mode: self.stream_profile.mode().as_str(),
-        }
-    }
-
-    /// Open `_stream_tokens.lance` only at the exact manifest-selected witness.
-    pub(crate) async fn open_stream_token_authority(&self) -> Result<Dataset> {
-        let session = self
-            .read_caches
-            .as_ref()
-            .map(|caches| Arc::clone(&caches.session))
-            .unwrap_or_else(crate::lance_access::control_session);
-        open_stream_token_authority_at(&self.root_uri, &self.stream_token_authority, &session).await
-    }
-
-    /// Refuse any physical table/schema effect that would bypass RFC-026
-    /// lifecycle authority. Phase A has no drain operation that can atomically
-    /// advance `CurrentHeadWitness`, so even SEALED is fenced here. Later
-    /// phases may replace this refusal with a sidecar-covered witness update;
-    /// silently advancing the table pointer alone is never valid.
-    pub(crate) fn ensure_stream_effects_allowed(
-        &self,
-        operation: &str,
-        identities: impl IntoIterator<Item = TableIdentity>,
-    ) -> Result<()> {
-        self.ensure_stream_lifecycles_allowed(operation, identities, false)
-    }
-
-    /// Native graph-branch ref controls do not advance an enrolled table HEAD.
-    /// They may therefore run after a complete SEALED barrier, while OPEN and
-    /// DRAINING still close the bounded main-only topology.
-    pub(crate) fn ensure_stream_branch_controls_allowed(
-        &self,
-        operation: &str,
-        identities: impl IntoIterator<Item = TableIdentity>,
-    ) -> Result<()> {
-        self.ensure_stream_lifecycles_allowed(operation, identities, true)
-    }
-
-    fn ensure_stream_lifecycles_allowed(
-        &self,
-        operation: &str,
-        identities: impl IntoIterator<Item = TableIdentity>,
-        allow_sealed: bool,
-    ) -> Result<()> {
-        if let Some(error) = self.stream_profile.retired_error() {
-            return Err(error);
-        }
-        let mut identities = identities.into_iter().collect::<Vec<_>>();
-        identities.sort_unstable();
-        identities.dedup();
-
-        for identity in identities {
-            let Some(lifecycle) = self.stream_lifecycles.get(&identity) else {
-                continue;
-            };
-            if allow_sealed && lifecycle.lifecycle == StreamLifecycle::Sealed {
-                continue;
-            }
-            let table_key = self
-                .entries
-                .values()
-                .find(|entry| entry.identity == identity)
-                .map(|entry| entry.table_key.as_str())
-                .ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "stream lifecycle authority exists for non-live table identity {identity}"
-                    ))
-                })?;
-            return Err(OmniError::manifest_stream_lifecycle_conflict(
-                identity.stable_table_id,
-                identity.table_incarnation_id,
-                table_key,
-                lifecycle.lifecycle.as_str(),
-                operation,
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -988,32 +600,6 @@ pub(crate) enum ManifestChange {
     RegisterTable(TableRegistration),
     RenameTable(TableRename),
     Tombstone(TableTombstone),
-    /// Materialize or transition one identity-keyed RFC-026 lifecycle row.
-    /// `expected` is exact durable authority (`None` means first enrollment),
-    /// preventing a transparent row-CAS retry from overwriting a concurrent
-    /// lifecycle transition. Callers pair this with [`ManifestChange::Update`]
-    /// when the physical table HEAD moves; both rows land in one manifest CAS.
-    SetStreamLifecycle {
-        expected: Option<StreamLifecycleEntry>,
-        next: StreamLifecycleEntry,
-    },
-    /// Advance the one graph-global stream-token participant pointer under an
-    /// exact manifest-row CAS. Genesis always provisions the row, so there is
-    /// no absent-pointer/bootstrap publish mode.
-    SetStreamTokenAuthority {
-        expected: StreamTokenAuthorityEntry,
-        next: StreamTokenAuthorityEntry,
-    },
-    /// Transition the graph-global RFC-026 §4.7 stream-profile row under an
-    /// exact full-entry CAS. Genesis always provisions the row (disabled), so
-    /// there is no absent-row/bootstrap publish mode. Receipt-chain-advancing
-    /// terminal transitions must share one manifest batch with an effective
-    /// [`ManifestChange::SetStreamTokenAuthority`] advance; the admission-closing
-    /// `ENABLED -> DISABLING` transition deliberately preserves the chain.
-    SetStreamProfile {
-        expected: StreamProfileEntry,
-        next: StreamProfileEntry,
-    },
 }
 
 /// One table-version authority assertion supplied to a publish attempt.
@@ -1158,9 +744,6 @@ impl ManifestCoordinator {
                 .into_iter()
                 .map(|entry| (entry.table_key.clone(), entry))
                 .collect(),
-            stream_lifecycles: state.stream_lifecycles,
-            stream_token_authority: state.stream_token_authority,
-            stream_profile: state.stream_profile,
             read_caches: None,
         }
     }

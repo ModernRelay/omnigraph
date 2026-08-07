@@ -5050,7 +5050,6 @@ version = "0.9.0"
 dependencies = [
  "fail",
  "omnigraph-compiler",
- "omnigraph-control-authority",
  "omnigraph-engine",
  "omnigraph-policy",
  "omnigraph-storage",
@@ -5087,21 +5086,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "omnigraph-control-authority"
-version = "0.9.0"
-dependencies = [
- "omnigraph-storage",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "ulid",
-]
-
-[[package]]
 name = "omnigraph-engine"
 version = "0.9.0"
 dependencies = [
@@ -5131,7 +5115,6 @@ dependencies = [
  "libc",
  "object_store",
  "omnigraph-compiler",
- "omnigraph-control-authority",
  "omnigraph-policy",
  "omnigraph-storage",
  "proptest",

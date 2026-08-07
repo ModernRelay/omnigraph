@@ -1,6 +1,10 @@
 # Architecture review: RFC-022 through RFC-028
 
-**Status:** RFC-022, RFC-023, and RFC-028 implemented; RFC-024, RFC-025, and
+> **Historical disposition ledger.** RFC-026 is now rejected and its MemWAL
+> implementation has been removed. The remaining review findings are retained
+> as historical evidence; see [the current decision](wal-removal.md).
+
+**Historical status at archival time:** RFC-022, RFC-023, and RFC-028 implemented; RFC-024, RFC-025, and
 RFC-027 research-blocked; RFC-026 Phase A implemented, private B1's legal
 near-cap closure repaired and green, private B2a unbounded retain-all gate
 implemented, the private common-B2 compare-and-chain/token-fold core

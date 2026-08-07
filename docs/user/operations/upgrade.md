@@ -17,7 +17,7 @@ message that **names the release line that wrote it** and the exact commands —
 so you can fetch the right old binary without guessing:
 
 ```
-__manifest is stamped at internal schema v4, but this omnigraph reads only v19.
+__manifest is stamped at internal schema v4, but this omnigraph reads only v6.
 This graph was created by omnigraph 0.8.x. Rebuild it: with an omnigraph
 0.8.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
 binary run `omnigraph init --schema <schema.pg> <new-graph>` and `omnigraph load
@@ -36,27 +36,12 @@ from that line (the latest is safest):
 | internal schema v2 | omnigraph 0.4.1–0.6.1 | the latest 0.6.x (e.g. 0.6.1) |
 | internal schema v3 | omnigraph 0.6.2–0.7.2 | the latest 0.7.x (e.g. 0.7.2) |
 | internal schema v4 | omnigraph 0.8.x | the latest 0.8.x (e.g. 0.8.1) |
-| internal schema v5–v8 | no published release (see below) | a source build at the matching commit |
-| internal schema v9 | omnigraph 0.9.x | the latest 0.9.x |
-| internal schema v10 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v11 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v12 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v13 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v14 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v15 | unreleased (earlier 0.10.0-dev source builds) | a source build at the matching commit |
-| internal schema v16 | unreleased (earlier 0.10.0-dev source builds) | final v16 source build at merge `ac59c4f6d1d83acc8118c410c39de2bed91f9c15` |
-| internal schema v17 | unreleased (earlier 0.10.0-dev source builds) | final v17 source build at merge `41a5990d53238d63d17e139859c66613f9c25867` |
-| internal schema v18 | unreleased (earlier 0.10.0-dev source builds) | final v18 source build at merge `c7c81b186bed37989fe5ce591baf0965b5102648` |
-| internal schema v19 | unreleased (current 0.10.0-dev source builds) | — current development format; a later pre-release strand may supersede it |
+| internal schema v5 | unreleased development builds | the exact source build that wrote the graph |
+| internal schema v6 | omnigraph 0.9.x | — current format; no rebuild needed |
 
-**Stamps v5–v8 never shipped.** The storage format advanced five times inside
-the single 0.8.1 → 0.9.0 development window, so the only graphs carrying those
-stamps came from source builds off `main`; no published binary reads them and
-the refusal message names them `0.9.0-dev`. If you have one, export it with a
-build of the commit that created it, then load into a fresh current-format
-graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10–v19 are
-pre-release formats written by matching 0.10.0-dev source builds. The final
-0.10.0 format may use a later stamp.
+Internal schemas v7-v19 were unreleased development formats from the rejected
+MemWAL experiment. They are not an upgrade ladder and the current binary does
+not reinterpret them; see the [decision record](../../dev/wal-removal.md).
 
 You can also check versions before you hit a refusal:
 
@@ -107,22 +92,6 @@ columns including vectors and blobs) of the chosen branch (default `main`; pass
 `--branch` for another) to stdout. `omnigraph load --mode overwrite` replaces the
 target graph's contents with that snapshot.
 
-The direct command above is for an unenrolled source. Once a graph has stream
-enrollment history, direct `--store` export refuses even when the profile is
-`DISABLED`, because an embedded opener cannot prove cluster serving ownership.
-With the source binary, apply `streaming: false`, stop old writers, restart the
-server from that exact cluster directory, and use the checked route instead:
-
-```bash
-old-omnigraph export --server <name-or-url> --graph <graph-id> > graph.jsonl
-```
-
-The served binary requires the exact terminal `DISABLED | RETIRED` cut;
-`RETIRED` emits its verified provenance row first. Export is streamed. If the
-client reports a response-body error after writing partial output, discard that
-file and retry from the beginning. Only a completely successful artifact may
-be loaded into a different, freshly initialized root.
-
 Once you have verified the rebuilt graph, retire the old one. If you rebuilt
 through a storage-format boundary, the target must be a different URI: keep the
 source root intact until row/vector/blob verification and fleet cutover are
@@ -140,415 +109,8 @@ complete. Do not use force-init to turn the old root into the new format.
   URI and the documented rebuild uses `--mode overwrite`, so verify that the new
   fleet can still read the referenced object before cutover. Later keyed
   `append`/`merge` writes copy external payloads instead, as described below.
-- **Server deployments**: unenrolled graphs may be taken out of the serving set
-  and exported directly. An enrolled graph must remain declared at exact
-  terminal `streaming: false`, be restarted under the old binary, and be
-  exported through `--server`. Rebuild a fresh root, verify it, then point the
-  cluster at that target (`cluster apply`).
-
-## Migrating from internal schema v18 to v19
-
-Internal schema v19 upgrades `_stream_tokens.lance` to schema v3 and adds
-recovery-v21 for deterministic mixed/all-diverted terminal folds. Valid winners
-publish normally; losing terminal candidates are bound to one canonical bounded
-object and become current `DEAD_LETTERED` authority. An all-diverted cut still
-advances the base through a marker-only transaction. Recovery-v21 also extends
-irreversible retirement from the historical `WITHDRAWN`-only v18 cut to exact
-`WITHDRAWN | DEAD_LETTERED` cuts. Recovery-v19 and recovery-v20 retain their
-historical meanings.
-
-For a clean v18 graph, use the matching final v18 source build:
-
-1. Gracefully stop every writer-capable process for the graph.
-2. Explicitly disable its streaming profile.
-3. Verify that it is clean and `DISABLED`, every enrolled lane is `SEALED`,
-   recovery is settled, base/token parity holds, and no current terminal token
-   remains. Ordinary export transfers logical rows, vectors, blobs, and
-   ordinary properties—not private lifecycle, WAL, token, receipt, correction,
-   or dead-letter authority.
-4. Export the visible logical graph.
-
-Then use the v19 binary to initialize a **different** root, load the export,
-apply cluster configuration, and restart serving. Verify row/vector/blob
-fidelity and the v19 stamp before cutover. Keep the v18 root unchanged through
-the rollback window. A v19 binary refuses v18, and a v18 binary refuses v19.
-
-If the v18 source has current `WITHDRAWN` authority, ordinary export remains
-blocked. Use that same v18 binary's exact stopped/offline
-`stream retire-for-rebuild plan|confirm` exit when its preconditions hold; a
-v19 binary cannot open the v18 root to retire it. V18 cannot contain current
-`DEAD_LETTERED` authority because that disposition first becomes reachable in
-v19. The recorded v17↔v18 binary result remains historical; the genuine
-v18↔v19 adjacent-binary cell now proves clean refusal/rebuild in both directions
-and loads retirement receipt-v1 bytes captured from the final-v18 production
-exporter. The rebuilt v19 graph imports logical rows but no stream authority.
-
-### Rebuilding a v19 graph blocked by terminal stream authority
-
-Ordinary v19 export refuses while any selected current token is `WITHDRAWN` or
-`DEAD_LETTERED`, because a row-only rebuild cannot preserve that per-key
-sequencing authority. With every writer-capable process stopped, the cluster
-state lock enabled, and an authorized actor, inspect current dead-letter keys
-and descriptor-verified payloads in bounded pages:
-
-```bash
-omnigraph --graph <graph-id> --as <actor> \
-  cluster stream dead-letter list \
-  --config <cluster-dir> --confirm-stream-offline --json
-
-omnigraph --graph <graph-id> --as <actor> \
-  cluster stream dead-letter export \
-  --config <cluster-dir> --confirm-stream-offline --json
-```
-
-Pass the returned `--cursor` to request the next page. Payload export is an
-inspection artifact, not a replay or import protocol. A corrected value is a
-fresh ordinary stream admission naming the current terminal token as its
-predecessor; while it remains current, exact retry returns the same terminal
-result. The graph-native HTTP/remote-CLI firehose can submit that successor only
-while the enabled declaration lane is absent or `OPEN`. A terminally disabled/
-`SEALED` lane cannot be reopened by F7a ingress; until public resume ships,
-retirement/rebuild remains the public exit there.
-
-If terminal authority must intentionally be discarded for a fresh-root
-rebuild, use the same v19 binary's irreversible
-`stream retire-for-rebuild plan|confirm` handshake described below. V19 binds
-exact `PRESENT | WITHDRAWN | DEAD_LETTERED` counts and the selected token cut.
-Once `RETIRED`, the source remains read/query/status/export-only and its export
-carries the verified retirement provenance. The rebuild does not import WAL,
-token, receipt, or dead-letter authority.
-
-Restart the v19 server from the exact applied cluster directory and run the
-export through `--server`; do not use direct `--store` for an enrolled
-`DISABLED` source. Treat any post-header/body failure as an incomplete artifact,
-discard it, and retry. Initialize a new root before loading the successful
-artifact; never overwrite the retired source.
-
-## Migrating from internal schema v17 to v18
-
-Internal schema v18 adds recovery-v20 for exact `DataBlock` correction. It
-does not reinterpret recovery-v14's frozen correction scaffold or
-recovery-v19's terminal-retirement envelope.
-
-For a clean v17 graph, use the final v17 source build at merge
-`41a5990d53238d63d17e139859c66613f9c25867`:
-
-1. Gracefully stop every writer-capable process for the graph.
-2. Explicitly disable its streaming profile.
-3. Verify that it is clean, disabled, and unenrolled. Ordinary v17 export
-   transfers logical rows, vectors, blobs, and ordinary properties—not private
-   lifecycle, WAL, token, receipt, maintenance, rebind, retirement, or
-   correction authority.
-4. Export the visible logical graph.
-
-Then use the v18 binary to initialize a **different** root, load the export,
-apply cluster configuration, and restart serving. Verify row/vector/blob
-fidelity and the v18 stamp before cutover. Keep the v17 root unchanged through
-the rollback window. A v18 binary refuses v17, and a v17 binary refuses v18.
-
-If the v17 source is enrolled, blocked, or carries private stream authority,
-keep it intact. A logical-row rebuild is not an authority-preserving migration;
-use the source format's documented retirement/export exit when its exact
-preconditions hold.
-
-## Migrating from internal schema v16 to v17
-
-Internal schema v17 adds recovery-v19 for the terminal stream-authority
-retirement/export exit. It does not reinterpret the frozen recovery-v14
-retirement scaffold. Recovery-v19 appends one immutable retirement receipt and
-then selects that exact token witness with `DISABLED → RETIRED`; the operation
-moves no graph or branch head and creates no graph commit or recovery-audit row.
-
-For a clean v16 graph, use the final v16 source build at merge
-`ac59c4f6d1d83acc8118c410c39de2bed91f9c15`:
-
-1. Gracefully stop every writer-capable process for the graph.
-2. Explicitly disable its streaming profile.
-3. Verify that it is clean, disabled, and unenrolled. Ordinary v16 export
-   transfers logical rows, vectors, blobs, and ordinary properties—not private
-   lifecycle, WAL, token, receipt, maintenance, rebind, or retirement authority.
-4. Export the visible logical graph.
-
-Then use the v17 binary to initialize a **different** root, load the export,
-apply cluster configuration, and restart serving. Verify row/vector/blob
-fidelity and the v17 stamp before cutover. Keep the v16 root unchanged through
-the rollback window. A v17 binary refuses v16, and a v16 binary refuses v17.
-
-The v17 retirement command cannot upgrade a v16 root: strict version refusal
-prevents a v17 binary from opening it. If the v16 source is enrolled or carries
-private stream authority, keep it intact; a logical-row rebuild is not an
-authority-preserving migration.
-
-### Rebuilding a v17 graph blocked by `WITHDRAWN` authority
-
-Ordinary v17 export refuses while any current token is `WITHDRAWN`, because a
-row-only rebuild would discard per-key sequencing authority. The explicit exit
-is available only on that same v17 source format. It is intentionally narrow:
-the graph must be cluster-managed, `state.lock: true`, stopped/offline,
-`DISABLED`, free of pending cluster and graph recovery, and every enrolled lane
-must be exactly `SEALED`. The plan also proves base/token parity and requires at
-least one current `WITHDRAWN` token; a fully `PRESENT` graph uses ordinary
-export.
-
-Run the read-only plan and save its JSON output:
-
-```bash
-omnigraph --graph <graph-id> --as <actor> \
-  cluster stream retire-for-rebuild plan \
-  --config <cluster-dir> --confirm-stream-offline --json
-```
-
-After reviewing the exact plan digest, confirm it with a new canonical UUID:
-
-```bash
-omnigraph --graph <graph-id> --as <actor> \
-  cluster stream retire-for-rebuild confirm \
-  --config <cluster-dir> \
-  --retirement-id <uuid> \
-  --expected-plan-digest <sha256:...> \
-  --confirm-stream-offline --json
-```
-
-Confirmation is irreversible. Any change since planning fails effect-free and
-requires a new plan. Once `RETIRED`, the source is permanently
-read/query/status/export-only; there is no transition back. Export re-proves the
-frozen cut and writes one `_omnigraph_export_provenance` row before the
-logical rows. The row pairs the root-wide receipt with a `branch_member`
-witness containing the canonical selected branch, its exact Lance branch
-identifier, graph head, manifest version, `table_witness_digest`, and a
-recomputable `branch_member_digest`. It also carries
-`source_schema_ir_hash`, the exact `ordered_branch_member_digests`, and
-`selected_member_index`. Loading the JSONL into a fresh v17 graph recomputes
-the selected member digest, proves that it occupies the selected slot, and
-recomputes the receipt's `export_cut_digest` from the source schema hash and
-ordered member digests. `source_schema_ir_hash` describes the retired source
-cut; it is not required to equal the fresh target's graph identity. Ordinary
-loader schema and row validation separately enforce compatibility with the
-target schema. The rebuild imports no lifecycle, WAL, token, receipt-chain, or
-sequencing authority. Keep the retired source root for audit and rollback
-evidence.
-
-This slice does not activate authority correction or any production path that
-creates `WITHDRAWN`; it installs the terminal exit before such a path can ship.
-
-## Migrating from internal schema v15 to v16
-
-Internal schema v16 adds recovery-v18 for the private physical-rebind owner.
-Recovery-v18 binds a complete prior `SEALED` lifecycle, one fresh enrollment
-and empty shard namespace, the immutable binding and fence-only claim receipts,
-and the exact next `SEALED` proof. It does not reinterpret recovery-v14's
-three-field rebind scaffold or recovery-v17's Optimize envelope. Rebind itself
-never opens admission; a separate resume is required.
-
-Before exporting, use the final v15 source build at merge
-`84f3af758947970d16040a987cb1d6ea0f0931e8`:
-
-1. Gracefully stop every writer-capable process for the graph.
-2. Explicitly disable its streaming profile.
-3. Verify that the graph is clean, disabled, and unenrolled. Ordinary export
-   transfers logical rows, not private lifecycle, WAL, token, receipt, or
-   pending rebind authority.
-4. Export the visible logical graph.
-
-If step 3 finds a lifecycle row or other private stream authority, stop and
-keep the v15 root intact. V16 does not add stream-aware export, authority
-retirement, or an authority-preserving v15→v16 transfer; a logical-row rebuild
-must not be presented as migration of sequencing authority.
-
-Then use the v16 binary to initialize a **different** root, load the export,
-apply cluster configuration, and restart serving. Verify row/vector/blob
-fidelity and the v16 stamp before cutover. Keep the v15 root unchanged through
-the rollback window. A v16 binary refuses v15, and a v15 binary refuses v16.
-
-## Migrating from internal schema v14 to v15
-
-Internal schema v15 adds recovery-v17 for the private, capability-bound,
-same-binding `SEALED` Optimize bridge. Lance's compaction and index-optimization
-operations commit internally, so recovery-v17 owns their bounded maintenance
-plan, achieved physical HEADs, and complete prior/next lifecycle proof rows;
-it does not reinterpret recovery-v16's caller-minted CreateIndex grammar. The
-bridge writes no token receipt and provides no public maintenance command.
-
-Before exporting, use the final v14 source build at merge
-`1afc89b8602dba6525a200916fab0fdf3f1eabd6`:
-
-1. Gracefully stop every writer-capable process for the graph.
-2. Explicitly disable its streaming profile.
-3. Verify that the graph is clean, disabled, and unenrolled. Ordinary export
-   transfers logical rows, not private lifecycle, WAL, token, receipt, or
-   pending maintenance authority.
-4. Export the visible logical graph.
-
-If step 3 finds a lifecycle row or other private stream authority, stop and
-keep the v14 root intact. V15 does not add stream-aware export, authority
-retirement, or an authority-preserving v14→v15 transfer; a logical-row rebuild
-must not be presented as migration of sequencing authority.
-
-Then use the v15 binary to initialize a **different** root, load the export,
-apply cluster configuration, and restart serving. Verify row/vector/blob
-fidelity and the v15 stamp before cutover. Keep the v14 root unchanged through
-the rollback window. A v15 binary refuses v14, and a v14 binary refuses v15.
-
-## Migrating from internal schema v13 to v14
-
-Internal schema v14 adds recovery-v16 for the private, capability-bound,
-same-binding `SEALED` EnsureIndices bridge. Recovery-v16 reuses the exact
-CreateIndex transaction grammar but also owns the prior and next lifecycle
-proof rows; recovery-v14's three-field sealed-maintenance scaffold remains
-frozen and is never reinterpreted. The bridge writes no token receipt and
-provides no public maintenance command.
-
-Before exporting, use the final v13 source build that created the graph:
-
-1. Gracefully stop every writer-capable process for the graph.
-2. Explicitly disable its streaming profile.
-3. Verify that the graph is clean, disabled, and unenrolled. Ordinary export
-   transfers logical rows, not private lifecycle, WAL, token, receipt, or
-   pending maintenance authority.
-4. Export the visible logical graph.
-
-If step 3 finds a lifecycle row or other private stream authority, stop and
-keep the v13 root intact. V14 does not add stream-aware export, authority
-retirement, or an authority-preserving v13→v14 transfer; a logical-row rebuild
-must not be presented as migration of sequencing authority.
-
-Then use the v14 binary to initialize a **different** root, load the export,
-apply cluster configuration, and restart serving. Verify row/vector/blob
-fidelity and the v14 stamp before cutover. Keep the v13 root unchanged through
-the rollback window. A v14 binary refuses v13, and a v13 binary refuses v14.
-
-## Migrating from internal schema v12 to v13
-
-Internal schema v13 preserves lifecycle-v3 but moves resume/abort-drain to a
-new recovery-v15 payload. The old v14 `StreamResume` scaffold did not encode
-the complete prior authority, physical claim attempt, or terminal claim and
-management receipts, so it is never reinterpreted in place.
-
-Before exporting, use the final v12 source build that created the graph:
-
-1. Gracefully stop every writer-capable process for the graph.
-2. Explicitly disable its streaming profile.
-3. Verify that the graph is clean, disabled, and unenrolled. Ordinary export
-   transfers logical rows, not private lifecycle, WAL, token, or receipt
-   authority.
-4. Export the visible logical graph.
-
-If step 3 finds a lifecycle row or any private stream authority, stop and keep
-the v12 root intact. This version does not add stream-aware export, authority
-retirement, or an authority-preserving v12→v13 transfer. A logical-row rebuild
-must not be presented as migration of that sequencing authority.
-
-Then use the v13 binary to initialize a **different** root, load the export,
-apply cluster configuration, and restart serving. Verify row/vector/blob
-fidelity and the v13 stamp before cutover. Keep the v12 root unchanged through
-the rollback window. A v13 binary refuses v12, and a v12 binary refuses v13.
-
-## Migrating from internal schema v11 to v12
-
-Internal schema v12 replaces lifecycle state-v2's inline receipt history with
-lifecycle-v3 fixed-size ledger-chain/current pointers and an authenticated
-WAL-tail commitment. Recovery-v14 owns the hidden enrollment, writer-claim,
-ordinary/drain-fold, and terminal lifecycle-receipt participants. This change
-is deliberately not an in-place reinterpretation of v11 state.
-
-Before exporting, use the final v11 source build that created the graph:
-
-1. Gracefully stop every writer-capable process for the graph.
-2. Explicitly disable the streaming profile.
-3. Verify that the graph is clean, disabled, and unenrolled. Ordinary export
-   does not encode lifecycle, WAL, claim, token-sequencing, or receipt
-   authority; do not treat it as an authority migration.
-4. Export the visible logical graph.
-
-Then use the v12 binary to initialize a **different** root, load the export,
-apply cluster configuration, and restart serving. Verify row/vector/blob
-fidelity and the v12 stamp before cutover. Keep the v11 root unchanged through
-the rollback window. A v12 binary refuses v11, and a v11 binary refuses v12.
-
-## Migrating from internal schema v10 to v11
-
-Internal schema v11 replaces the experimental boolean stream flag with the
-cluster-owned profile authority needed to fence ordinary writers. Recovery-v13
-owns exact profile-management receipts only and does not reinterpret historical
-recovery-v12 folds. Enrolled-lane claim/drain, correction, retirement, and
-maintenance require a later strict lifecycle strand.
-
-Before exporting, use the v10 source build that created the graph:
-
-1. Gracefully stop every writer-capable process for the graph.
-2. Apply an explicit `streaming: false` declaration and verify the profile is
-   disabled.
-3. Verify that there are no production stream enrollments. V10 exposed no
-   production enrollment path; any private/dev lifecycle, pending MemWAL
-   generation, or token authority is deliberately not transferable.
-4. Export the visible logical graph.
-
-Then use the v11 binary to initialize a **different** root, load the export,
-apply cluster configuration, and restart serving. Logical rows, vectors,
-blobs, primary-key metadata, and ordinary user properties survive the rebuild.
-Private stream metadata, lifecycle/WAL state, token sequencing authority,
-profile receipts, commit history, and branches do not. Keep the v10 root
-unchanged until the rebuilt graph and fleet cutover have been verified.
-
-A v11 binary refuses v10, and a v10 binary refuses v11. There is no mixed-fleet
-or in-place migration window.
-
-## Migrating from internal schema v9 to v10
-
-Internal schema v10 adds one piece of durable graph-wide state: the required
-`stream_profile` singleton in `__manifest` — the RFC-026 §4.7 enablement
-authority for the experimental, cluster-only streaming profile. Every fresh v10
-graph carries it from genesis with streaming disabled. The same bump added an
-explicit-null dead-letter compatibility placeholder inside the stream-fold
-attribution record. That v10 field is now frozen null: it is not a dead-letter
-protocol and does not pre-register a Replay origin,
-chunk chain, checkpoint ledger, or history-paging contract. The selected later
-F5 strand instead uses one measured, bounded deterministic NDJSON object per
-fold and one current `DEAD_LETTERED` token per losing key. A corrected successor
-is a fresh ordinary `Admission` naming that terminal token as predecessor.
-Dead-letter inspection/payload export, block correction, authority repair, and
-authority retirement remain cluster/offline-only for the experimental profile.
-Ordinary graph export remains blocked while current terminal sequencing
-authority would be lost; the same-format binary's explicit irreversible
-retirement records provenance and freezes the source before row-only export to
-a fresh graph. None of that later F5 behavior is active in v10.
-
-A v9 graph must use the standard rebuild recipe above: quiesce writers, export
-with the latest 0.9.x binary, initialize a **different** root with the v10
-(0.10.0-dev source build) binary, load the export, and verify the v10 stamp
-plus row/vector/blob fidelity before cutover. Keep the v9 root unchanged
-through the rollback window. A v10 binary refuses v9, and a v9 binary refuses
-v10.
-
-Why a full format bump for one flag: the flag is a safety property — every
-process that opens the graph must obey it, and a v9 binary would silently
-*skip* the unknown row and write as if streaming were off. The stamp is the
-only mechanism that turns "older binary" into a refusal instead of silent
-disobedience.
-
-## Migrating from internal schema v8 to v9
-
-Internal schema v9 activates RFC-026's private common-B2 storage contract:
-stream-config v3, lifecycle state v2, a manifest-selected
-`_stream_tokens.lance` authority, trusted per-row attribution, and
-recovery-v12's atomic base-plus-token publication. These are physical
-correctness foundations; v9 does not by itself expose a public streaming API.
-
-A v8 graph must use the standard rebuild recipe above. Because v8 never
-shipped in a release, this affects only source builds off `main` during 0.9.0
-development: quiesce every v8 writer, export with a build of the commit that
-created the graph, initialize a **different** root with the 0.9.x binary, load
-the export, and verify the v9 stamp plus row/vector/blob fidelity before
-cutover. Keep the v8 root unchanged through the rollback window. A v9 binary
-refuses v8, and a v8 binary refuses v9.
-
-V9's physical attribution field is named `__omnigraph_stream_v1$`. The trailing
-`$` is deliberately outside the `.pg` property-name grammar, so it cannot
-collide with a user property. In particular, v8 legitimately allowed a user
-property named `__omnigraph_stream_v1` (without `$`); export/init/load preserves
-that property and its values unchanged. Do not rename or delete it as protocol
-metadata. Conversely, v9 export omits only the exact physical `$`-suffixed
-field and never transfers token authority into the rebuilt logical snapshot.
+- **Server deployments**: take the graph out of the serving set, rebuild it offline
+  with the CLI, then point the cluster at the rebuilt graph (`cluster apply`).
 
 ## Migrating to v0.8.0
 
@@ -625,7 +187,7 @@ The two CLI checks are listed in
 `omnigraph snapshot`). New in v0.8.0, the server's `GET /healthz` response also
 reports `internal_schema_version`.
 
-## Migrating to internal schema v5
+## Unreleased internal schema v5
 
 Internal schema v5 activates RFC-028 stable schema identity. Accepted type and
 property IDs are allocated inside one graph identity domain and survive
@@ -634,13 +196,15 @@ logical lifetime. The `__manifest` journal keys table registrations, versions,
 and tombstones by stable table ID plus incarnation, and initial table paths are
 derived from that pair rather than a mutable type name.
 
-This is why a v4 graph must be rebuilt instead of opened in place: v4 has only
+V5 was never released. It is documented here only so a maintainer can recognize
+an old development root. This is why a v4 graph must be rebuilt instead of
+opened in place: v4 has only
 name-derived SchemaIR IDs and name-keyed manifest history, so there is no safe,
 unambiguous identity to backfill after renames or drop/recreate events. Export
-with the latest v0.8.x binary, initialize a different root with the v5 binary,
-load the export, verify it, and then cut clients over. The new root deliberately
-mints a new identity domain; identity continuity across export/import is not
-claimed.
+with the latest v0.8.x binary, initialize a different root with the current v6
+binary, load the export, verify it, and then cut clients over. The new root
+deliberately mints a new identity domain; identity continuity across
+export/import is not claimed.
 
 Tooling that reads `__manifest` directly must treat `stable_table_id` and
 `table_incarnation_id` as the table coordinate. `table_key` remains the current
@@ -673,14 +237,14 @@ payload bytes after enforcing a 32 MiB aggregate pre-read ceiling. `overwrite`
 retains Lance's external-reference behavior. This is intentional: Lance's
 merge-insert builder has no `WriteParams` hook, while Overwrite does.
 
-This format cannot be obtained by adding metadata to a live v5 root. Lance's
-filtered/unfiltered conflict behavior is directional, so every table image and
-every writer must cross the boundary together. Both v5 and v6 are 0.9.0-dev
-formats with no published binary, so this crossing uses source builds: quiesce
-writers, export with a source build at the final internal-v5 commit,
-initialize a **different** root with a final internal-v6 source build, load
-the export, verify the v6 stamp and data, then cut the whole fleet over. The
-v6 build refuses the v5 source root, and the v5 build refuses the new v6 root.
+This format cannot be obtained by adding metadata to a live v4 or development
+v5 root. Lance's filtered/unfiltered conflict behavior is directional, so every
+table image and every writer must cross the boundary together. For a released
+v4 graph, quiesce writers, export with the latest 0.8.x binary, initialize a
+**different** root with the current 0.9.x binary, load the export, verify the v6
+stamp and data, then cut the whole fleet over. A development v5 root must be
+exported with the exact source build that wrote it. The current binary refuses
+both older roots, and the old binary must never write the new v6 root.
 
 The v6 load checks the export for duplicate logical IDs before any table effect.
 Older bare-Append workloads could contain a committed collision; do not resolve
@@ -1031,45 +595,3 @@ graph enumeration and health before reopening writes. Never swap one graph
 pointer, mix replicas on old and new cluster roots, or delete the old root. A
 rollback likewise stops the whole new fleet and switches every replica back;
 retain both roots and all repair evidence through the rollback window.
-
-## Migrating to internal schema v7
-
-Internal schema v7 preserves v5 stable identity and v6 exact-`id` key fencing,
-then activates RFC-026 Phase A's stream-format foundation: identity-keyed
-lifecycle authority, a recoverable empty main-only/unsharded Lance MemWAL
-enrollment, process-local writer exclusion, and strict partial-format refusal.
-It does **not** expose streaming ingestion. There is no `@stream`, production
-enrollment command or API, WAL row acknowledgement, fold, drain/resume, or
-fresh-read surface in this format slice.
-
-Move a v6 graph to v7 with the ordinary recipe at the top of this page — both
-are 0.9.0-dev formats, so the crossing uses source builds: export with a final
-internal-v6 source build, initialize a **different** root with a final
-internal-v7 source build, load the export, verify the v7 stamp and logical
-data, and cut the whole fleet over together. The v7 build refuses the v6
-source root, and the v6 build refuses the new v7 root. Genuine cross-version
-tests pin both directions.
-
-V6 has no acknowledged MemWAL rows, so there is no stream backlog to drain
-before this particular rebuild. Export transfers only manifest-visible logical
-rows; it does not copy MemWAL indexes, shard manifests, lifecycle rows, recovery
-sidecars, or epochs. The new v7 root therefore starts with no physical stream
-enrollment. Keep the old root intact until row, vector, blob, policy, and
-application-integrity verification passes and the fleet cutover is complete.
-
-## Migrating to internal schema v8
-
-Internal schema v8 activates RFC-026 Phase B1's private data-bearing MemWAL
-core: exact persisted stream-config v2, one hard-bounded generation, durable
-watcher acknowledgement, conservative restart/replay, explicit seal/drain,
-and schema-v11 `StreamFold` recovery through the unified write path. It still
-does **not** expose public stream schema, SDK, HTTP, CLI, or operator controls;
-those remain Phase B2 gates.
-
-Move a v7 graph to v8 with the ordinary recipe at the top of this page — both
-are 0.9.0-dev formats, so the crossing uses source builds: export with a final
-internal-v7 source build, initialize a different root with a final internal-v8
-source build, load the export, and verify the v8 stamp and logical data. V7's
-config-v1 enrollment is never reinterpreted as data-bearing config-v2 state.
-The rebuild copies manifest-visible rows only, not MemWAL indexes, shard state,
-recovery intents, or epochs, so the new root starts unenrolled.

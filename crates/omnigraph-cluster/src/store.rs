@@ -6,20 +6,18 @@
 //! read from the operator's working tree (Terraform's config-local /
 //! state-remote split).
 //!
-//! Raw `fs::*` for cluster state outside this module and the lower
-//! authority crate's exact lock-release guard is a deny-list entry.
+//! Raw `fs::*` for cluster state outside this module and the exact lock-release
+//! guard in `state_lock` is a deny-list entry.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use omnigraph_control_authority::{
-    AuthorityError, StateLockAcquire, StateLockGuard, acquire_state_lock,
-};
 use omnigraph_storage::{
     StorageAdapter, StorageHandle, StorageKind, storage_for_uri, storage_handle_for_uri,
     storage_kind_for_uri,
 };
 
+use crate::state_lock::{StateLockAcquire, StateLockError, StateLockGuard, acquire_state_lock};
 use crate::{
     ApprovalArtifact, CLUSTER_APPROVALS_DIR, CLUSTER_LOCK_FILE, CLUSTER_RECOVERIES_DIR,
     CLUSTER_RESOURCES_DIR, CLUSTER_STATE_FILE, ClusterState, Diagnostic, RecoverySidecar,
@@ -53,12 +51,8 @@ impl ClusterStore {
     /// (`file://<abs config dir>`), byte-compatible with every pre-existing
     /// cluster on disk.
     pub(crate) fn for_config_dir(config_dir: &Path) -> Self {
-        let absolute =
-            std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
-        let display_root = absolute
-            .to_string_lossy()
-            .trim_end_matches('/')
-            .to_string();
+        let absolute = std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
+        let display_root = absolute.to_string_lossy().trim_end_matches('/').to_string();
         let root = format!("file://{display_root}");
         let storage = storage_handle_for_uri(&root)
             .expect("local storage adapter construction is infallible for file:// roots");
@@ -120,17 +114,6 @@ impl ClusterStore {
     /// Display-form storage root (plain local path for `file://`, URI for S3).
     pub(crate) fn display_root(&self) -> &str {
         &self.display_root
-    }
-
-    /// Normalized storage root used by lower control-authority validation.
-    pub(crate) fn root(&self) -> &str {
-        &self.root
-    }
-
-    /// Concrete, non-caller-implementable storage evidence for lower
-    /// control-authority validation.
-    pub(crate) fn storage_handle(&self) -> &StorageHandle {
-        &self.storage
     }
 
     /// Whether this root holds the cluster state ledger (`__cluster/state.json`)
@@ -231,7 +214,10 @@ impl ClusterStore {
     /// on the deletion (e.g. the pre-movement sidecar cleanup fast-path) can
     /// report it as a diagnostic instead of silently leaving stale state.
     pub(crate) async fn try_delete_object(&self, uri: &str) -> Result<(), String> {
-        self.adapter.delete(uri).await.map_err(|err| err.to_string())
+        self.adapter
+            .delete(uri)
+            .await
+            .map_err(|err| err.to_string())
     }
 
     /// Recursive prefix delete for graph roots (approved deletes). Idempotent;
@@ -408,16 +394,12 @@ impl ClusterStore {
             Ok(true) => {}
             Err(err) => return Err(err.to_string()),
         }
-        self.adapter
-            .read_text(&uri)
-            .await
-            .map(Some)
-            .map_err(|err| {
-                format!(
-                    "could not read catalog payload '{}': {err}",
-                    self.display(&relative)
-                )
-            })
+        self.adapter.read_text(&uri).await.map(Some).map_err(|err| {
+            format!(
+                "could not read catalog payload '{}': {err}",
+                self.display(&relative)
+            )
+        })
     }
 
     /// Idempotent content-addressed write: a payload already present at its
@@ -655,7 +637,7 @@ impl ClusterStore {
                     state_lock_held_message(observations),
                 ))
             }
-            Err(AuthorityError::LockEncode(err)) => Err(Diagnostic::error(
+            Err(StateLockError::LockEncode(err)) => Err(Diagnostic::error(
                 "state_lock_error",
                 CLUSTER_LOCK_FILE,
                 format!("could not encode state lock: {err}"),
@@ -726,12 +708,14 @@ impl ClusterStore {
                 observations.locked = true;
                 match StateLockFile::parse(&text) {
                     Ok(lock) => observations.observe_lock_metadata(&lock),
-                    Err(AuthorityError::LockVersion(version)) => diagnostics.push(Diagnostic::warning(
-                        "unsupported_state_lock_version",
-                        CLUSTER_LOCK_FILE,
-                        format!("unsupported cluster state lock version {version}"),
-                    )),
-                    Err(AuthorityError::LockParse(err)) => diagnostics.push(Diagnostic::warning(
+                    Err(StateLockError::LockVersion(version)) => {
+                        diagnostics.push(Diagnostic::warning(
+                            "unsupported_state_lock_version",
+                            CLUSTER_LOCK_FILE,
+                            format!("unsupported cluster state lock version {version}"),
+                        ))
+                    }
+                    Err(StateLockError::LockParse(err)) => diagnostics.push(Diagnostic::warning(
                         "invalid_state_lock",
                         CLUSTER_LOCK_FILE,
                         format!("could not parse state lock: {err}"),
@@ -752,10 +736,7 @@ impl ClusterStore {
         }
     }
 
-    pub(crate) async fn observe_lock_metadata_lossy(
-        &self,
-        observations: &mut StateObservations,
-    ) {
+    pub(crate) async fn observe_lock_metadata_lossy(&self, observations: &mut StateObservations) {
         observations.locked = true;
         let lock_uri = self.uri(CLUSTER_LOCK_FILE);
         if let Ok(Some((text, _))) = self.read_versioned_opt(&lock_uri).await {
@@ -777,12 +758,12 @@ fn state_cas_mismatch() -> Diagnostic {
 pub(crate) fn parse_lock_file_for_unlock(text: &str) -> Result<StateLockFile, Diagnostic> {
     match StateLockFile::parse(text) {
         Ok(lock) => Ok(lock),
-        Err(AuthorityError::LockVersion(version)) => Err(Diagnostic::error(
+        Err(StateLockError::LockVersion(version)) => Err(Diagnostic::error(
             "unsupported_state_lock_version",
             CLUSTER_LOCK_FILE,
             format!("unsupported cluster state lock version {version}"),
         )),
-        Err(AuthorityError::LockParse(err)) => Err(Diagnostic::error(
+        Err(StateLockError::LockParse(err)) => Err(Diagnostic::error(
             "invalid_state_lock",
             CLUSTER_LOCK_FILE,
             format!("could not parse state lock: {err}"),

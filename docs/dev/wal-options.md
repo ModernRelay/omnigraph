@@ -1,6 +1,9 @@
 # WAL Options
 
-**Status:** decision note; RFC-026 records the selected profile
+> **Historical record — decision reversed.** OmniGraph no longer has a MemWAL
+> ingestion path. See [the current direct graph-batch decision](wal-removal.md).
+
+**Status:** archived decision note
 
 **Updated:** 2026-07-21
 

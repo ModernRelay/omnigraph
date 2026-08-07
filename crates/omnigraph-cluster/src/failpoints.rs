@@ -38,6 +38,4 @@ pub mod names {
     pub const CLUSTER_APPLY_BEFORE_GRAPH_DELETE: &str = "cluster_apply.before_graph_delete";
     pub const CLUSTER_APPLY_BEFORE_SCHEMA_APPLY: &str = "cluster_apply.before_schema_apply";
     pub const CLUSTER_APPLY_BEFORE_STATE_WRITE: &str = "cluster_apply.before_state_write";
-    pub const CLUSTER_STREAM_RETIREMENT_BEFORE_STATE_WRITE: &str =
-        "cluster_stream_retirement.before_state_write";
 }

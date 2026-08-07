@@ -949,7 +949,7 @@
         "tags": [
           "mutations"
         ],
-        "summary": "Bulk-load NDJSON data into a branch (canonical load endpoint).",
+        "summary": "Compatibility-load NDJSON data through a JSON envelope.",
         "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting rows: `merge` upserts by id (default), `append` strictly inserts\nabsent ids, and `overwrite` replaces table contents. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.\n\nThe legacy `POST /ingest` route has identical semantics and is kept as a\ndeprecated alias.",
         "operationId": "cluster_load",
         "parameters": [
@@ -1026,6 +1026,185 @@
           },
           "413": {
             "description": "Keyed load exceeds the per-commit row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/load/ndjson": {
+      "post": {
+        "tags": [
+          "mutations"
+        ],
+        "summary": "Load one strict, bounded graph-level NDJSON batch.",
+        "description": "Bearer authentication runs in middleware. This handler completes both\nbranch authorization checks before polling the raw body. A successful\nresponse describes logical schema declarations only and is returned after\nthe ordinary graph commit is visible.",
+        "operationId": "cluster_loadNdjson",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "Target branch. Defaults to `main`. Without `from`, it must exist.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Parent branch used to create a missing target branch.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "mode",
+            "in": "query",
+            "description": "How existing rows are handled. Defaults to `merge`.",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/LoadMode"
+                }
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Strict raw graph-level NDJSON. Each nonblank line is exactly one node envelope {\"type\":\"<Node>\",\"data\":{...}} or edge envelope {\"edge\":\"<Edge>\",\"from\":\"<src-id>\",\"to\":\"<dst-id>\",\"data\":{...}}. `data` defaults to {}; optional `data.id` follows ordinary ID semantics. Duplicate, unknown, reserved physical, and noncanonical supplied node-ID members are refused.",
+          "content": {
+            "application/x-ndjson": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "One committed graph-batch result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphBatchLoadOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed query or graph batch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Target branch missing without `from`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Prepared load authority changed before effects",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request or keyed load exceeds a bounded ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Content-Type must be application/x-ndjson",
             "content": {
               "application/json": {
                 "schema": {
@@ -1773,267 +1952,6 @@
         ]
       }
     },
-    "/graphs/{graph_id}/stream/ingest": {
-      "post": {
-        "tags": [
-          "streaming"
-        ],
-        "summary": "Ingest a graph-native NDJSON firehose through the checked served runtime.",
-        "description": "A request without `If-Match` is authorized and preflighted without polling\nits body, then receives a 428 challenge. A malformed or stale precondition\nreceives 412 without replacement authority. An exact strong ETag transfers\nthe Axum body stream directly into the engine and streams one redacted\nnewline-delimited result per input row; neither direction is buffered as a\ncomplete request or response.",
-        "operationId": "cluster_stream_ingest",
-        "parameters": [
-          {
-            "name": "graph_id",
-            "in": "path",
-            "description": "Graph id to route the request to.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "If-Match",
-            "in": "header",
-            "description": "Strong ETag containing the opaque graph token returned by the 428 challenge.",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          }
-        ],
-        "requestBody": {
-          "description": "Graph-native node and edge rows, one JSON object per line. Results are emitted in caller order and the request is not atomic.",
-          "content": {
-            "application/x-ndjson": {
-              "schema": {
-                "type": "string"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Ordered graph-native ingest results",
-            "content": {
-              "application/x-ndjson": {
-                "schema": {
-                  "$ref": "#/components/schemas/StreamIngestLineOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Checked streaming runtime or lifecycle conflict",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "412": {
-            "description": "Malformed or stale graph token; no replacement token is disclosed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "Streaming request admission capacity exhausted",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Request Content-Type is not application/x-ndjson",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "428": {
-            "description": "Graph token required; retry with the strong ETag in If-Match",
-            "headers": {
-              "Cache-Control": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Always `no-store`; the challenge is authority-bearing"
-              },
-              "ETag": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Strong ETag containing the current opaque graph token"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StreamIngestChallenge"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Overlapping durable recovery must resolve before ingest",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/graphs/{graph_id}/stream/status": {
-      "get": {
-        "tags": [
-          "streaming"
-        ],
-        "summary": "Return one coherent, graph-redacted streaming operational cut.",
-        "description": "This is graph-wide read metadata, so Cedar authorizes it with `read`\nrather than the mutation-capable `stream_manage` action. The engine bridge\nalready removes every table, lane, binding, shard, epoch, generation,\ndataset, and recovery identity before the transport receives the value.",
-        "operationId": "cluster_stream_status",
-        "parameters": [
-          {
-            "name": "graph_id",
-            "in": "path",
-            "description": "Graph id to route the request to.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Checked graph-level streaming operational status",
-            "headers": {
-              "Cache-Control": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Always `no-store`; the response contains live advisory state and compare revisions"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StreamStatusOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "The current server does not own checked status authority for this profile state",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "The bounded status inventory exceeded its hard observation envelope",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Checked status failed without exposing physical diagnostics",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "A stable checked cut could not be obtained; retry",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
     "/healthz": {
       "get": {
         "tags": [
@@ -2449,6 +2367,77 @@
               "type": "string"
             },
             "description": "Restrict the export to these node/edge type names. Empty exports all types."
+          }
+        }
+      },
+      "GraphBatchDeclarationOutput": {
+        "type": "object",
+        "description": "One logical declaration touched by a graph-batch load.\n\nThis deliberately carries the accepted-schema name, not the backing\nmanifest table key, dataset path, or Lance identity.",
+        "required": [
+          "name",
+          "rows_loaded"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "rows_loaded": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "GraphBatchLoadOutput": {
+        "type": "object",
+        "description": "Terminal result for the raw graph-level NDJSON load surface.",
+        "required": [
+          "branch",
+          "branch_created",
+          "mode",
+          "nodes",
+          "edges",
+          "total_rows"
+        ],
+        "properties": {
+          "actor_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base branch a fork was requested from, even when the target already\nexisted. `null` when the request omitted `from`."
+          },
+          "branch": {
+            "type": "string"
+          },
+          "branch_created": {
+            "type": "boolean"
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphBatchDeclarationOutput"
+            },
+            "description": "Logical edge declarations touched by this batch, sorted by name."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/LoadMode"
+          },
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphBatchDeclarationOutput"
+            },
+            "description": "Logical node declarations touched by this batch, sorted by name."
+          },
+          "total_rows": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },
@@ -3151,722 +3140,6 @@
             "type": "string"
           },
           "table_version": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          }
-        }
-      },
-      "StreamDeclarationOutput": {
-        "type": "object",
-        "description": "Logical schema declaration with streaming state.",
-        "required": [
-          "kind",
-          "type"
-        ],
-        "properties": {
-          "kind": {
-            "$ref": "#/components/schemas/StreamIngestKindOutput"
-          },
-          "type": {
-            "type": "string"
-          }
-        }
-      },
-      "StreamDeclarationStatusOutput": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/StreamDeclarationOutput"
-          },
-          {
-            "type": "object",
-            "required": [
-              "lifecycle",
-              "lifecycle_revision",
-              "pending"
-            ],
-            "properties": {
-              "drain": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/StreamDrainStatusOutput"
-                  }
-                ]
-              },
-              "last_fold": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/StreamLastFoldStatusOutput"
-                  }
-                ]
-              },
-              "lifecycle": {
-                "$ref": "#/components/schemas/StreamLifecycleOutput"
-              },
-              "lifecycle_revision": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "pending": {
-                "$ref": "#/components/schemas/StreamPendingStatusOutput"
-              },
-              "strict_block": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/StreamStrictBlockStatusOutput"
-                  }
-                ]
-              }
-            }
-          }
-        ],
-        "description": "Checked status for one logical node or edge declaration."
-      },
-      "StreamDrainStatusOutput": {
-        "type": "object",
-        "description": "Active drain operation for one logical declaration.",
-        "required": [
-          "goal",
-          "phase",
-          "initiated_at"
-        ],
-        "properties": {
-          "goal": {
-            "type": "string"
-          },
-          "initiated_at": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "phase": {
-            "type": "string"
-          }
-        }
-      },
-      "StreamDriverErrorOutput": {
-        "type": "object",
-        "description": "Redacted most-recent driver error.",
-        "required": [
-          "kind"
-        ],
-        "properties": {
-          "kind": {
-            "type": "string"
-          },
-          "retry_in_ms": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "minimum": 0
-          }
-        }
-      },
-      "StreamDriverStateOutput": {
-        "type": "string",
-        "description": "Process-local fold-driver run state. Driver health is advisory and never\nsubstitutes for durable lifecycle or recovery authority.",
-        "enum": [
-          "stopped",
-          "running",
-          "stopping",
-          "failed"
-        ]
-      },
-      "StreamDriverStatusOutput": {
-        "type": "object",
-        "description": "Advisory health of the fold driver serving this graph.",
-        "required": [
-          "scope",
-          "authoritative",
-          "state",
-          "pending_count",
-          "published_open_folds"
-        ],
-        "properties": {
-          "authoritative": {
-            "type": "boolean"
-          },
-          "last_completion_kind": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "last_error": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/StreamDriverErrorOutput"
-              }
-            ]
-          },
-          "pending_count": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "published_open_folds": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "scope": {
-            "type": "string"
-          },
-          "state": {
-            "$ref": "#/components/schemas/StreamDriverStateOutput"
-          }
-        }
-      },
-      "StreamIngestChallenge": {
-        "type": "object",
-        "description": "Effect-free precondition challenge for graph-native streaming ingest.\n\nThe same value is returned as a strong `ETag` response header. Clients\nretry the request with that tag in `If-Match`; this convenience copy keeps\nthe graph authority token distinct from the per-row sequencing\n[`StreamIngestLineOutput::stream_token`].",
-        "required": [
-          "graph_token"
-        ],
-        "properties": {
-          "graph_token": {
-            "type": "string"
-          }
-        }
-      },
-      "StreamIngestKindOutput": {
-        "type": "string",
-        "description": "Logical declaration kind selected by one graph-native stream row.",
-        "enum": [
-          "node",
-          "edge"
-        ]
-      },
-      "StreamIngestLineOutput": {
-        "type": "object",
-        "description": "One ordered, newline-delimited result from graph-native streaming ingest.\n\nEvery field is caller-logical or directly actionable retry evidence.\nPhysical table and MemWAL identities are deliberately absent.",
-        "required": [
-          "ordinal",
-          "status",
-          "scope"
-        ],
-        "properties": {
-          "actual": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "minimum": 0
-          },
-          "blocking_ordinal": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "minimum": 0
-          },
-          "blocking_status": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/StreamIngestStatusOutput"
-              }
-            ]
-          },
-          "current_token": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Current per-row token returned with a sequencing or terminal outcome."
-          },
-          "id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "kind": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/StreamIngestKindOutput"
-              }
-            ]
-          },
-          "limit": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "minimum": 0
-          },
-          "message": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "ordinal": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "scope": {
-            "$ref": "#/components/schemas/StreamIngestScopeOutput"
-          },
-          "status": {
-            "$ref": "#/components/schemas/StreamIngestStatusOutput"
-          },
-          "stream_token": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Confirmed per-row sequencing token. This is not the graph-level ETag."
-          },
-          "type": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "unconfirmed_candidate_token": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Candidate token whose durability acknowledgement is unknown."
-          },
-          "write_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        }
-      },
-      "StreamIngestScopeOutput": {
-        "type": "string",
-        "description": "Whether one stream result applies to a single row or blocks the graph-wide\nremainder of the request.",
-        "enum": [
-          "row",
-          "graph"
-        ]
-      },
-      "StreamIngestStatusOutput": {
-        "type": "string",
-        "description": "Stable, graph-logical status vocabulary for one streaming-ingest line.\n\nSeveral private physical-authority transitions intentionally collapse to\n`stream_authority_changed`; the transport never exposes lane, binding,\nshard, epoch, generation, dataset, or recovery-sidecar identity.",
-        "enum": [
-          "durable",
-          "ack_unknown",
-          "already_durable",
-          "withdrawn",
-          "dead_lettered",
-          "invalid",
-          "stream_input_too_large",
-          "stream_authority_changed",
-          "stream_sequence_conflict",
-          "stream_idempotency_conflict",
-          "stream_fold_required",
-          "stream_backpressure",
-          "recovery_required",
-          "stream_retry_required"
-        ]
-      },
-      "StreamLastFoldStatusOutput": {
-        "type": "object",
-        "description": "Most recent durable fold summary, with physical operation and generation\ncoordinates removed.",
-        "required": [
-          "outcome",
-          "input_rows",
-          "input_bytes",
-          "visible_rows",
-          "visible_bytes",
-          "recorded_at"
-        ],
-        "properties": {
-          "input_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "input_rows": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "outcome": {
-            "type": "string"
-          },
-          "recorded_at": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "visible_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "visible_rows": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          }
-        }
-      },
-      "StreamLifecycleOutput": {
-        "type": "string",
-        "description": "Stable graph-level lifecycle state for one logical declaration.",
-        "enum": [
-          "open",
-          "draining",
-          "sealed"
-        ]
-      },
-      "StreamPendingStatusOutput": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "rows",
-              "arrow_bytes",
-              "batches",
-              "state"
-            ],
-            "properties": {
-              "arrow_bytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "batches": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "rows": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "state": {
-                "type": "string",
-                "enum": [
-                  "exact"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "cold_replay",
-              "flushed",
-              "recovery",
-              "state"
-            ],
-            "properties": {
-              "cold_replay": {
-                "type": "boolean"
-              },
-              "flushed": {
-                "type": "boolean"
-              },
-              "recovery": {
-                "type": "boolean"
-              },
-              "state": {
-                "type": "string",
-                "enum": [
-                  "unavailable"
-                ]
-              }
-            }
-          }
-        ],
-        "description": "Pending acknowledged work for one logical declaration.\n\nCounts are returned only when the checked status cut can observe them\nwithout claiming a writer or advancing replay state. An unavailable result\nnames only the graph-safe reason classes; it never exposes a shard,\ngeneration, dataset, or recovery operation."
-      },
-      "StreamProfileModeOutput": {
-        "type": "string",
-        "description": "Stable graph-level streaming profile state.",
-        "enum": [
-          "disabled",
-          "enabled",
-          "disabling",
-          "retired"
-        ]
-      },
-      "StreamRebuildBlockerOutput": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "reason"
-            ],
-            "properties": {
-              "reason": {
-                "type": "string",
-                "enum": [
-                  "profile_not_terminal"
-                ]
-              }
-            }
-          },
-          {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/StreamDeclarationOutput"
-              },
-              {
-                "type": "object",
-                "required": [
-                  "reason"
-                ],
-                "properties": {
-                  "reason": {
-                    "type": "string",
-                    "enum": [
-                      "declaration_not_sealed"
-                    ]
-                  }
-                }
-              }
-            ]
-          },
-          {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/StreamDeclarationOutput"
-              },
-              {
-                "type": "object",
-                "required": [
-                  "reason"
-                ],
-                "properties": {
-                  "reason": {
-                    "type": "string",
-                    "enum": [
-                      "strict_block"
-                    ]
-                  }
-                }
-              }
-            ]
-          },
-          {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/StreamDeclarationOutput"
-              },
-              {
-                "type": "object",
-                "required": [
-                  "reason"
-                ],
-                "properties": {
-                  "reason": {
-                    "type": "string",
-                    "enum": [
-                      "pending_work"
-                    ]
-                  }
-                }
-              }
-            ]
-          },
-          {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/StreamDeclarationOutput"
-              },
-              {
-                "type": "object",
-                "required": [
-                  "reason"
-                ],
-                "properties": {
-                  "reason": {
-                    "type": "string",
-                    "enum": [
-                      "pending_work_unavailable"
-                    ]
-                  }
-                }
-              }
-            ]
-          },
-          {
-            "type": "object",
-            "required": [
-              "count",
-              "reason"
-            ],
-            "properties": {
-              "count": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "reason": {
-                "type": "string",
-                "enum": [
-                  "recovery_pending"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "withdrawn_count",
-              "dead_lettered_count",
-              "reason"
-            ],
-            "properties": {
-              "dead_lettered_count": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "reason": {
-                "type": "string",
-                "enum": [
-                  "terminal_token_authority"
-                ]
-              },
-              "withdrawn_count": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              }
-            }
-          }
-        ],
-        "description": "One graph-safe reason an export/import rebuild is not currently allowed."
-      },
-      "StreamRebuildStatusOutput": {
-        "type": "object",
-        "description": "Whether the checked graph cut can be rebuilt without discarding streaming\nsequencing authority.",
-        "required": [
-          "ready",
-          "blockers"
-        ],
-        "properties": {
-          "blockers": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/StreamRebuildBlockerOutput"
-            }
-          },
-          "ready": {
-            "type": "boolean"
-          }
-        }
-      },
-      "StreamStatusOutput": {
-        "type": "object",
-        "description": "One coherent, graph-redacted operational status cut.",
-        "required": [
-          "manifest_version",
-          "profile_mode",
-          "profile_revision",
-          "enrolled_declarations",
-          "token_counts",
-          "recovery_pending_count",
-          "driver",
-          "rebuild"
-        ],
-        "properties": {
-          "driver": {
-            "$ref": "#/components/schemas/StreamDriverStatusOutput"
-          },
-          "enrolled_declarations": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/StreamDeclarationStatusOutput"
-            },
-            "description": "Logical node/edge declarations whose streaming state has initialized.\nAbsence here does not mean the graph schema has no declarations."
-          },
-          "manifest_version": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "profile_mode": {
-            "$ref": "#/components/schemas/StreamProfileModeOutput"
-          },
-          "profile_revision": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "rebuild": {
-            "$ref": "#/components/schemas/StreamRebuildStatusOutput"
-          },
-          "recovery_pending_count": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "token_counts": {
-            "$ref": "#/components/schemas/StreamTokenCountsOutput"
-          }
-        }
-      },
-      "StreamStrictBlockStatusOutput": {
-        "type": "object",
-        "description": "Current strict validation block for one logical declaration.",
-        "required": [
-          "kind",
-          "violation_code"
-        ],
-        "properties": {
-          "kind": {
-            "type": "string"
-          },
-          "violation_code": {
-            "type": "string"
-          }
-        }
-      },
-      "StreamTokenCountsOutput": {
-        "type": "object",
-        "description": "Current graph-wide sequencing-authority counts. Generic status deliberately\nomits the sampled logical IDs and per-key stream tokens used by the\ninternal proof.",
-        "required": [
-          "present",
-          "withdrawn",
-          "dead_lettered"
-        ],
-        "properties": {
-          "dead_lettered": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "present": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "withdrawn": {
             "type": "integer",
             "format": "int64",
             "minimum": 0

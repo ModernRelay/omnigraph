@@ -22,25 +22,23 @@ use crate::queries::{QueryRegistry, check, format_check_breakages};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
-    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
-    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
-    SchemaApplyRequest, SchemaOutput, SnapshotQuery, StreamIngestChallenge, StreamStatusOutput,
-    ingest_output, schema_apply_output, snapshot_payload, stream_status_output,
+    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
+    GraphBatchLoadQuery, GraphInfo, GraphListResponse, HealthOutput, IngestOutput, IngestRequest,
+    InvokeStoredQueryRequest, InvokeStoredQueryResponse, QueriesCatalogOutput, QueryRequest,
+    ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery,
+    graph_batch_load_output, ingest_output, schema_apply_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
 use axum::http::StatusCode;
-use axum::http::header::{
-    AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, ETAG, HeaderName, HeaderValue, IF_MATCH,
-};
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -63,7 +61,6 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -73,13 +70,6 @@ use utoipa::openapi::schema::{Object, Type};
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 
 type BearerTokenHash = [u8; 32];
-
-const STREAM_STATUS_PROCESS_MAX_INFLIGHT: usize = 1;
-
-fn process_stream_status_gate() -> Arc<Semaphore> {
-    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    Arc::clone(GATE.get_or_init(|| Arc::new(Semaphore::new(STREAM_STATUS_PROCESS_MAX_INFLIGHT))))
-}
 
 /// Machine-readable stdout record emitted after the HTTP listener owns its
 /// requested address. In particular, this exposes the OS-selected port for a
@@ -108,8 +98,6 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         #[allow(deprecated)] handlers::server_read,
         handlers::server_query,
         handlers::server_export,
-        handlers::server_stream_status,
-        handlers::server_stream_ingest,
         #[allow(deprecated)] handlers::server_change,
         handlers::server_mutate,
         handlers::server_list_queries,
@@ -117,6 +105,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_schema_apply,
         handlers::server_schema_get,
         handlers::server_load,
+        handlers::server_load_ndjson,
         // deprecated; the #[deprecated] attribute on the handler surfaces as
         // `deprecated: true` on the OpenAPI operation.
         #[allow(deprecated)] handlers::server_ingest,
@@ -231,15 +220,6 @@ pub struct GraphStartupConfig {
     pub graph_id: String,
     pub uri: String,
     pub policy: Option<PolicySource>,
-    /// Cloneable serving-snapshot evidence for an enabled stream profile.
-    /// This is not writer authority; `open_single_graph` rereads canonical
-    /// cluster state and consumes it into a non-cloneable runtime guard.
-    pub stream_runtime_authority: Option<omnigraph_cluster::RuntimeAuthorityBinding>,
-    /// Cloneable serving-snapshot evidence for a terminal stream profile.
-    /// This is not export authority; `open_single_graph` rereads canonical
-    /// cluster state and consumes it into a non-cloneable served-export guard.
-    pub stream_served_export_authority:
-        Option<omnigraph_cluster::ServedExportAuthorityBinding>,
     /// Pre-resolved embedding config from an applied cluster provider profile.
     /// Legacy config paths leave this unset and continue to use env resolution.
     pub embedding: Option<omnigraph::embedding::EmbeddingConfig>,
@@ -288,98 +268,13 @@ pub struct AppState {
     /// resource. Loaded from the cluster-scoped policy binding when
     /// configured. Per-graph policies live on each `GraphHandle.policy`.
     server_policy: Option<Arc<PolicyEngine>>,
-    /// Dormant resident-fold targets selected only by the checked cluster
-    /// runtime path. `serve` starts them after the listener is bound; ordinary
-    /// `AppState` construction (including router tests) never creates a
-    /// background task.
-    stream_fold_drivers: StreamFoldDrivers,
     /// Bounded process-wide ownership for queued served-export bytes. The
     /// response body and detached producer jointly retain each reservation.
     export_transport: export_transport::ExportTransport,
-    /// One process-wide checked-status observation. Each accepted observation
-    /// may retain its complete bounded recovery inventory while scanning exact
-    /// token/base authority, so per-graph slots alone would not bound a
-    /// multi-graph serving process.
-    stream_status_gate: Arc<Semaphore>,
-}
-
-#[derive(Clone)]
-struct StreamFoldDriverTarget {
-    graph_id: Arc<str>,
-    engine: Arc<Omnigraph>,
-}
-
-#[derive(Clone, Default)]
-struct StreamFoldDrivers {
-    targets: Arc<[StreamFoldDriverTarget]>,
-}
-
-impl StreamFoldDrivers {
-    fn new(targets: Vec<StreamFoldDriverTarget>) -> Self {
-        Self {
-            targets: targets.into(),
-        }
-    }
-
-    async fn start_all(&self) -> Result<()> {
-        for (index, target) in self.targets.iter().enumerate() {
-            if let Err(start_error) = target.engine.start_stream_fold_driver().await {
-                // Include the failing target in cleanup. The engine shutdown
-                // bridge is safe before start and closes any future partial
-                // start implementation without weakening this boundary.
-                let cleanup_result = Self::shutdown_targets(&self.targets[..=index]).await;
-                return match cleanup_result {
-                    Ok(()) => Err(eyre!(
-                        "start resident stream fold driver for graph '{}': {start_error}",
-                        target.graph_id
-                    )),
-                    Err(cleanup_error) => Err(eyre!(
-                        "start resident stream fold driver for graph '{}': {start_error}; cleanup after partial startup also failed: {cleanup_error}",
-                        target.graph_id
-                    )),
-                };
-            }
-        }
-        Ok(())
-    }
-
-    async fn shutdown_all(&self) -> Result<()> {
-        Self::shutdown_targets(&self.targets).await
-    }
-
-    async fn shutdown_targets(targets: &[StreamFoldDriverTarget]) -> Result<()> {
-        // Each engine enforces the same bounded, cancellation-safe stream
-        // runtime handoff. Join every graph concurrently so the serving-process
-        // deadline remains bounded once, rather than once per graph.
-        let outcomes = futures::future::join_all(targets.iter().map(|target| async move {
-            (
-                Arc::clone(&target.graph_id),
-                target.engine.shutdown_stream_fold_driver().await,
-            )
-        }))
-        .await;
-        let failures = outcomes
-            .into_iter()
-            .filter_map(|(graph_id, outcome)| {
-                outcome
-                    .err()
-                    .map(|error| format!("graph '{graph_id}': {error}"))
-            })
-            .collect::<Vec<_>>();
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            bail!(
-                "resident stream runtime shutdown failed: {}",
-                failures.join("; ")
-            )
-        }
-    }
 }
 
 struct OpenedGraph {
     handle: Arc<GraphHandle>,
-    stream_fold_driver: Option<StreamFoldDriverTarget>,
 }
 
 #[derive(Debug)]
@@ -609,9 +504,9 @@ impl AppState {
     ) -> Self {
         // Engine-layer policy gate (MR-722). With a per-graph policy
         // installed, every `_as` writer on `Omnigraph` calls into the
-        // PolicyChecker. Most handlers retain an HTTP-layer first gate;
-        // graph firehose deliberately uses the engine's single graph-scoped
-        // decision so lazy private-lane work cannot create policy drift.
+        // PolicyChecker. Handlers retain an HTTP-layer first gate so served
+        // requests fail before their write bodies are interpreted; the engine
+        // repeats the authoritative actor-aware decision at the write boundary.
         let db = if let Some(policy) = policy_engine.as_ref() {
             let checker = Arc::clone(policy) as Arc<dyn omnigraph_policy::PolicyChecker>;
             db.with_policy(checker)
@@ -643,9 +538,7 @@ impl AppState {
             workload,
             bearer_tokens,
             server_policy: None,
-            stream_fold_drivers: StreamFoldDrivers::default(),
             export_transport: export_transport::ExportTransport::with_defaults(),
-            stream_status_gate: process_stream_status_gate(),
         }
     }
 
@@ -672,9 +565,7 @@ impl AppState {
             workload: Arc::new(workload),
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
-            stream_fold_drivers: StreamFoldDrivers::default(),
             export_transport: export_transport::ExportTransport::with_defaults(),
-            stream_status_gate: process_stream_status_gate(),
         })
     }
 
@@ -811,20 +702,6 @@ impl ApiError {
         }
     }
 
-    fn precondition_failed(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::PRECONDITION_FAILED,
-            code: Some(ErrorCode::Conflict),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
-            manifest_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            recovery_required: None,
-        }
-    }
-
     fn unsupported_media_type(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -843,20 +720,6 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: Some(ErrorCode::Internal),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
-            manifest_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            recovery_required: None,
-        }
-    }
-
-    fn service_unavailable(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: None,
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
@@ -1044,39 +907,6 @@ impl ApiError {
                     actual,
                 },
             ),
-            // The graph firehose converts invoked row outcomes to its ordered
-            // NDJSON union inside the engine. Only request-level stream errors
-            // reach this ordinary JSON translation: fold-required and strict-
-            // blocked are retryable logical conflicts, while an invoked-but-
-            // unconfirmed append is unavailable/ambiguous.
-            err @ (OmniError::FoldRequired { .. } | OmniError::StreamDataBlocked { .. }) => {
-                Self::conflict(err.to_string())
-            }
-            // §4.7 P1: an effect-free pending-until-drained refusal — a
-            // retryable logical conflict, converged by a later cluster apply
-            // once the named streams fold. No HTTP caller can reach it in
-            // this slice (the flip is cluster-apply-only); the mapping exists
-            // so the taxonomy stays total.
-            err @ OmniError::StreamingDisablePending { .. } => Self::conflict(err.to_string()),
-            err @ (OmniError::StreamingRequiresClusterControlPlane
-            | OmniError::StreamingRequiresClusterRuntime { .. }
-            | OmniError::StreamingContentOperationUnsupported { .. }
-            | OmniError::StreamingAuthorityMismatch { .. }
-            | OmniError::StreamAuthorityRetired { .. }
-            | OmniError::StreamExportBlocked { .. }
-            | OmniError::StreamRetirementPlanChanged
-            | OmniError::StreamRetirementIdempotencyConflict { .. }) => {
-                Self::conflict(err.to_string())
-            }
-            err @ (OmniError::StreamLifecycleChanged { .. }
-            | OmniError::StreamLifecycleIdempotencyConflict { .. }
-            | OmniError::StreamBindingChanged { .. }
-            | OmniError::StreamSequenceConflict { .. }
-            | OmniError::StreamIdempotencyConflict { .. }) => Self::conflict(err.to_string()),
-            err @ (OmniError::StreamStatusBusy { .. } | OmniError::StreamStatusChanged { .. }) => {
-                Self::internal(err.to_string())
-            }
-            err @ OmniError::AckUnknown { .. } => Self::internal(err.to_string()),
             OmniError::RecoveryRequired {
                 operation_id,
                 reason,
@@ -1092,9 +922,7 @@ impl ApiError {
             // Engine-layer policy enforcement (MR-722). Authentication
             // middleware has already distinguished a missing/invalid bearer
             // (401); policy denials and evaluation failures surface as 403.
-            // Most legacy handlers also perform an HTTP-layer policy check,
-            // while graph firehose intentionally makes the engine's one
-            // graph-scoped decision authoritative.
+            // Most handlers also perform an HTTP-layer policy check.
             OmniError::Policy(message) => Self::forbidden(message),
             // `Omnigraph::init` against an existing graph URI in strict
             // mode. Not currently HTTP-reachable (POST /graphs was
@@ -1102,81 +930,6 @@ impl ApiError {
             // single canonical translation when a future runtime
             // create endpoint lands.
             err @ OmniError::AlreadyInitialized { .. } => Self::conflict(err.to_string()),
-        }
-    }
-
-    /// Translate failures before the graph firehose owns its request body.
-    ///
-    /// Generic engine errors legitimately carry table keys, lifecycle IDs,
-    /// recovery operation IDs, block tokens, and storage diagnostics for
-    /// trusted control-plane callers. None of that is part of the graph-only
-    /// row-ingest contract. Preserve the useful HTTP class while removing
-    /// every structured/private detail at this transport boundary.
-    fn from_graph_stream_start(err: OmniError, precondition_supplied: bool) -> Self {
-        if precondition_supplied && matches!(&err, OmniError::StreamingAuthorityMismatch { .. }) {
-            return Self::precondition_failed("graph stream ingest precondition failed");
-        }
-
-        let acknowledgement_unknown = matches!(&err, OmniError::AckUnknown { .. });
-        let mut translated = Self::from_omni(err);
-        if acknowledgement_unknown {
-            // A startup fold may already have invoked storage. Keep that
-            // ambiguity retryable/unavailable rather than presenting it as a
-            // generic server fault, while still suppressing every physical
-            // acknowledgement coordinate below.
-            translated.status = StatusCode::SERVICE_UNAVAILABLE;
-            translated.code = None;
-        }
-        translated.message = match translated.status {
-            StatusCode::BAD_REQUEST => "graph stream ingest preflight was refused",
-            StatusCode::FORBIDDEN => "graph stream ingest is forbidden",
-            StatusCode::NOT_FOUND => "graph stream ingest target was not found",
-            StatusCode::CONFLICT => "graph stream ingest is not ready",
-            StatusCode::PAYLOAD_TOO_LARGE => "graph stream request capacity is unavailable",
-            StatusCode::SERVICE_UNAVAILABLE => {
-                "graph recovery must complete before stream ingest can begin"
-            }
-            _ => "graph stream ingest preflight failed",
-        }
-        .to_string();
-        translated.merge_conflicts.clear();
-        translated.manifest_conflict = None;
-        translated.read_set_conflict = None;
-        translated.key_conflict = None;
-        translated.resource_limit = None;
-        translated.recovery_required = None;
-        translated
-    }
-
-    /// Translate checked operational-status failures without exposing the
-    /// physical member, authority binding, storage path, or recovery identity
-    /// that produced them. The status operation returns no partial cut.
-    fn from_graph_stream_status(err: OmniError) -> Self {
-        match err {
-            OmniError::StreamStatusBusy { .. } | OmniError::StreamStatusChanged { .. } => {
-                Self::service_unavailable(
-                    "graph stream status could not obtain a stable cut; retry",
-                )
-            }
-            OmniError::StreamingRequiresClusterRuntime { .. }
-            | OmniError::StreamingAuthorityMismatch { .. } => Self::conflict(
-                "graph stream status is unavailable for the current serving authority",
-            ),
-            OmniError::ResourceLimitExceeded {
-                resource: _,
-                limit,
-                actual,
-            } => Self::resource_limit(
-                format!(
-                    "graph stream status observation limit exceeded: actual {actual}, limit {limit}"
-                ),
-                api::ResourceLimitOutput {
-                    resource: "graph_stream_status_observation".to_string(),
-                    limit,
-                    actual,
-                },
-            ),
-            _ => Self::internal("graph stream status failed"),
         }
     }
 }
@@ -1242,23 +995,6 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod api_error_tests {
     use super::*;
-
-    #[test]
-    fn checked_stream_status_has_one_process_wide_observation_slot() {
-        let gate = process_stream_status_gate();
-        let held = Arc::clone(&gate)
-            .try_acquire_owned()
-            .expect("the first checked status observation must acquire");
-        assert!(
-            Arc::clone(&gate).try_acquire_owned().is_err(),
-            "another graph must not start a second bounded preflight in this process"
-        );
-        drop(held);
-        let reacquired = gate
-            .try_acquire_owned()
-            .expect("dropping status ownership must release the process slot");
-        drop(reacquired);
-    }
 
     #[tokio::test]
     async fn recovery_required_503_omits_closed_error_code() {
@@ -1326,232 +1062,6 @@ mod api_error_tests {
         assert_eq!(details.actual, 8193);
         assert!(error.recovery_required.is_none());
     }
-
-    #[tokio::test]
-    async fn graph_stream_start_errors_redact_private_engine_evidence() {
-        let cases = vec![
-            (
-                OmniError::FoldRequired {
-                    table_key: "node:PrivatePerson".to_string(),
-                    rows: 7,
-                    bytes: 11,
-                },
-                StatusCode::CONFLICT,
-                "PrivatePerson",
-            ),
-            (
-                OmniError::StreamDataBlocked {
-                    block_token: "private-block-token".to_string(),
-                },
-                StatusCode::CONFLICT,
-                "private-block-token",
-            ),
-            (
-                OmniError::RecoveryRequired {
-                    operation_id: "private-recovery-operation".to_string(),
-                    reason: "private recovery reason".to_string(),
-                },
-                StatusCode::SERVICE_UNAVAILABLE,
-                "private-recovery-operation",
-            ),
-            (
-                OmniError::StreamBindingChanged {
-                    stable_table_id: 41,
-                    table_incarnation_id: 43,
-                    current_stream_incarnation_id: "private-stream-incarnation".to_string(),
-                },
-                StatusCode::CONFLICT,
-                "private-stream-incarnation",
-            ),
-            (
-                OmniError::ResourceLimitExceeded {
-                    resource: "private-storage-scan-limit".to_string(),
-                    limit: 1,
-                    actual: 2,
-                },
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "private-storage-scan-limit",
-            ),
-            (
-                OmniError::Lance("private object-store URI".to_string()),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "private object-store URI",
-            ),
-            (
-                OmniError::AckUnknown {
-                    stable_table_id: 41,
-                    table_incarnation_id: 43,
-                    enrollment_id: "private-enrollment".to_string(),
-                    shard_id: "private-shard".to_string(),
-                    writer_epoch: 47,
-                    caller_ordinal_start: 0,
-                    caller_ordinal_end: 1,
-                    admission_attempt_id: Some("private-attempt".to_string()),
-                    logical_write_ids: vec!["private-write".to_string()],
-                    unconfirmed_candidate_token: Some("private-token".to_string()),
-                    reason: "private acknowledgement reason".to_string(),
-                },
-                StatusCode::SERVICE_UNAVAILABLE,
-                "private-enrollment",
-            ),
-            (
-                OmniError::StreamingAuthorityMismatch {
-                    reason: "private fold delegation".to_string(),
-                },
-                StatusCode::PRECONDITION_FAILED,
-                "private fold delegation",
-            ),
-        ];
-
-        for (engine_error, expected_status, private_evidence) in cases {
-            let response = ApiError::from_graph_stream_start(engine_error, true).into_response();
-            assert_eq!(response.status(), expected_status);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-            assert!(!error.error.contains(private_evidence), "{}", error.error);
-            assert!(error.merge_conflicts.is_empty());
-            assert!(error.manifest_conflict.is_none());
-            assert!(error.read_set_conflict.is_none());
-            assert!(error.key_conflict.is_none());
-            assert!(error.resource_limit.is_none());
-            assert!(error.recovery_required.is_none());
-        }
-
-        let response = ApiError::from_graph_stream_start(
-            OmniError::StreamingAuthorityMismatch {
-                reason: "private checked-runtime binding".to_string(),
-            },
-            false,
-        )
-        .into_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error.error, "graph stream ingest is not ready");
-        assert!(!error.error.contains("private checked-runtime binding"));
-    }
-
-    #[tokio::test]
-    async fn graph_stream_status_errors_redact_physical_cut_evidence() {
-        let cases = [
-            (
-                OmniError::StreamStatusBusy {
-                    phase: "private immutable scan".to_string(),
-                },
-                StatusCode::SERVICE_UNAVAILABLE,
-                "private immutable scan",
-            ),
-            (
-                OmniError::StreamStatusChanged {
-                    member: "private shard generation".to_string(),
-                },
-                StatusCode::SERVICE_UNAVAILABLE,
-                "private shard generation",
-            ),
-            (
-                OmniError::StreamingAuthorityMismatch {
-                    reason: "private binding receipt".to_string(),
-                },
-                StatusCode::CONFLICT,
-                "private binding receipt",
-            ),
-            (
-                OmniError::Lance("s3://private-bucket/private-table".to_string()),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "private-bucket",
-            ),
-        ];
-
-        for (engine_error, expected_status, private_evidence) in cases {
-            let response = ApiError::from_graph_stream_status(engine_error).into_response();
-            assert_eq!(response.status(), expected_status);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-            assert!(!error.error.contains(private_evidence), "{}", error.error);
-            assert!(error.merge_conflicts.is_empty());
-            assert!(error.manifest_conflict.is_none());
-            assert!(error.read_set_conflict.is_none());
-            assert!(error.key_conflict.is_none());
-            assert!(error.resource_limit.is_none());
-            assert!(error.recovery_required.is_none());
-        }
-
-        let response = ApiError::from_graph_stream_status(OmniError::ResourceLimitExceeded {
-            resource: "private table-key inventory".to_string(),
-            limit: 32,
-            actual: 33,
-        })
-        .into_response();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-        assert!(!error.error.contains("private table-key inventory"));
-        let details = error.resource_limit.expect("public status resource limit");
-        assert_eq!(details.resource, "graph_stream_status_observation");
-        assert_eq!(details.limit, 32);
-        assert_eq!(details.actual, 33);
-    }
-
-    #[tokio::test]
-    async fn stream_management_conflicts_serialize_as_409() {
-        let cases = [
-            (
-                OmniError::StreamLifecycleChanged {
-                    stable_table_id: 41,
-                    table_incarnation_id: 43,
-                    expected_revision: 7,
-                    current_revision: 9,
-                },
-                "stream lifecycle changed for table 0000000000000029:000000000000002b: expected revision 7, current revision 9",
-            ),
-            (
-                OmniError::StreamLifecycleIdempotencyConflict {
-                    stable_table_id: 41,
-                    table_incarnation_id: 43,
-                    operation_kind: "QUIESCE".to_string(),
-                    operation_id: "44444444-4444-4444-8444-444444444444".to_string(),
-                },
-                "stream lifecycle idempotency conflict for table 0000000000000029:000000000000002b, operation QUIESCE '44444444-4444-4444-8444-444444444444'",
-            ),
-            (
-                OmniError::StreamDataBlocked {
-                    block_token: "sha256:block-token".to_string(),
-                },
-                "stream fold is strict-blocked; correction requires block token sha256:block-token",
-            ),
-            (
-                OmniError::StreamExportBlocked {
-                    withdrawn_token_count: 2,
-                    dead_lettered_token_count: 3,
-                },
-                "stream export is blocked by 2 current WITHDRAWN and 3 current DEAD_LETTERED token(s); retire authority for rebuild or install PRESENT successors",
-            ),
-        ];
-
-        for (error, expected_message) in cases {
-            let response = ApiError::from_omni(error).into_response();
-            assert_eq!(response.status(), StatusCode::CONFLICT);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-            assert_eq!(error.code, Some(ErrorCode::Conflict));
-            assert_eq!(error.error, expected_message);
-            assert!(error.manifest_conflict.is_none());
-            assert!(error.read_set_conflict.is_none());
-            assert!(error.key_conflict.is_none());
-            assert!(error.resource_limit.is_none());
-            assert!(error.recovery_required.is_none());
-        }
-    }
 }
 
 pub fn init_tracing() {
@@ -1611,8 +1121,6 @@ pub fn build_app(state: AppState) -> Router {
     let per_graph_protected = Router::new()
         .route("/snapshot", get(server_snapshot))
         .route("/export", post(server_export))
-        .route("/stream/status", get(server_stream_status))
-        .route("/stream/ingest", post(server_stream_ingest))
         // /read and /change are kept indefinitely for back-compat;
         // their handlers carry #[deprecated] so the OpenAPI operation is
         // flagged and their responses include RFC 9745 Deprecation +
@@ -1642,6 +1150,7 @@ pub fn build_app(state: AppState) -> Router {
             "/load",
             post(server_load).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
         )
+        .route("/load/ndjson", post(server_load_ndjson))
         // /ingest is the deprecated alias of /load; its handler carries
         // #[deprecated] (OpenAPI operation flagged) and emits RFC 9745
         // Deprecation + RFC 8288 Link headers. Suppress the call-site warning.
@@ -1768,30 +1277,10 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         stdout.flush()?;
     }
 
-    // The registry and listener are both authoritative before any resident
-    // task starts. A graph discarded by strict startup, URI collision, or a
-    // bind failure therefore cannot retain its runtime-authority guard in a
-    // background task.
-    state.stream_fold_drivers.start_all().await?;
-    let stream_fold_drivers = state.stream_fold_drivers.clone();
-    let serve_result = axum::serve(listener, build_app(state))
+    axum::serve(listener, build_app(state))
         .with_graceful_shutdown(shutdown_signal())
-        .await;
-    // On graceful shutdown, Axum has stopped admission and settled every
-    // in-flight request before the driver stop is requested. A detached write
-    // therefore cannot create a new fold trigger after the driver observes an
-    // empty pending map. A server error takes this same best-effort cleanup
-    // path before its error is returned.
-    let driver_shutdown_result = stream_fold_drivers.shutdown_all().await;
-
-    match (serve_result, driver_shutdown_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(server_error), Ok(())) => Err(server_error.into()),
-        (Ok(()), Err(shutdown_error)) => Err(shutdown_error),
-        (Err(server_error), Err(shutdown_error)) => Err(eyre!(
-            "HTTP server failed: {server_error}; resident stream fold driver shutdown also failed: {shutdown_error}"
-        )),
-    }
+        .await?;
+    Ok(())
 }
 
 /// Load a graph-scoped policy bundle from either source kind.
@@ -1843,13 +1332,11 @@ pub async fn open_multi_graph_state(
         .collect::<Vec<_>>()
         .await;
     let mut handles = Vec::new();
-    let mut stream_fold_drivers = Vec::new();
     let mut failed = 0usize;
     for result in results {
         match result {
             Ok(opened) => {
                 handles.push(opened.handle);
-                stream_fold_drivers.extend(opened.stream_fold_driver);
             }
             Err((graph_id, err)) => {
                 failed += 1;
@@ -1877,10 +1364,8 @@ pub async fn open_multi_graph_state(
     }
 
     let workload = workload::WorkloadController::from_env();
-    let mut state =
-        AppState::new_multi(handles, tokens, server_policy, workload, Some(config_path))
-            .map_err(|err| color_eyre::eyre::eyre!("multi-graph registry: {err}"))?;
-    state.stream_fold_drivers = StreamFoldDrivers::new(stream_fold_drivers);
+    let state = AppState::new_multi(handles, tokens, server_policy, workload, Some(config_path))
+        .map_err(|err| color_eyre::eyre::eyre!("multi-graph registry: {err}"))?;
     Ok(state)
 }
 
@@ -1895,112 +1380,6 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<OpenedGraph> {
     let db = Omnigraph::open(&uri)
         .await
         .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, uri))?;
-    let has_checked_stream_runtime = cfg.stream_runtime_authority.is_some();
-    let db = match (
-        cfg.stream_runtime_authority,
-        cfg.stream_served_export_authority,
-    ) {
-        (Some(_), Some(_)) => {
-            return Err(color_eyre::eyre::eyre!(
-                "graph '{}' received both stream runtime and served-export authority",
-                graph_id
-            ));
-        }
-        (Some(binding), None) => {
-            let operation_id = format!(
-                "serve:{}:state-{}",
-                graph_id.as_str(),
-                binding.state_revision()
-            );
-            let guard = omnigraph_cluster::mint_runtime_guard(
-                binding,
-                &operation_id,
-                "omnigraph:server",
-            )
-            .await
-            .map_err(|err| {
-                color_eyre::eyre::eyre!(
-                    "validate stream runtime authority for graph '{}': {err}",
-                    graph_id
-                )
-            })?;
-            db.with_checked_cluster_stream_runtime(guard)
-                .await
-                .map_err(|err| {
-                    color_eyre::eyre::eyre!(
-                        "bind stream runtime authority for graph '{}': {err}",
-                        graph_id
-                    )
-                })?
-        }
-        (None, Some(binding)) => {
-            let bind_terminal = if binding.is_unmanaged_terminal() {
-                let status = db.stream_status().await.map_err(|err| {
-                    color_eyre::eyre::eyre!(
-                        "read unmanaged stream profile for graph '{}' during startup: {err}",
-                        graph_id
-                    )
-                })?;
-                match status.profile_mode {
-                    "RETIRED" => true,
-                    "DISABLED" => !status.tables.is_empty(),
-                    mode => {
-                        return Err(color_eyre::eyre::eyre!(
-                            "graph '{}' is {mode}, but its applied cluster snapshot has no matching managed streaming authority; reconcile with `cluster apply --confirm-stream-offline`, and restart",
-                            graph_id
-                        ));
-                    }
-                }
-            } else {
-                true
-            };
-            if bind_terminal {
-                let operation_id = format!(
-                    "serve-export:{}:state-{}",
-                    graph_id.as_str(),
-                    binding.state_revision()
-                );
-                let guard = omnigraph_cluster::mint_served_export_guard(
-                    binding,
-                    &operation_id,
-                    "omnigraph:server",
-                )
-                .await
-                .map_err(|err| {
-                    color_eyre::eyre::eyre!(
-                        "validate served-export authority for graph '{}': {err}",
-                        graph_id
-                    )
-                })?;
-                db.with_checked_cluster_served_export(guard)
-                    .await
-                    .map_err(|err| {
-                        color_eyre::eyre::eyre!(
-                            "bind served-export authority for graph '{}': {err}",
-                            graph_id
-                        )
-                    })?
-            } else {
-                db
-            }
-        }
-        (None, None) => {
-            let status = db.stream_status().await.map_err(|err| {
-                color_eyre::eyre::eyre!(
-                    "read stream profile for graph '{}' during startup: {err}",
-                    graph_id
-                )
-            })?;
-            if !matches!(status.profile_mode, "DISABLED" | "RETIRED") {
-                return Err(color_eyre::eyre::eyre!(
-                    "graph '{}' is {}, but the applied cluster snapshot supplied no matching stream serving authority; stop serving, reconcile with `cluster apply --confirm-stream-offline`, and restart",
-                    graph_id,
-                    status.profile_mode
-                ));
-            }
-            db
-        }
-    };
     let db = if let Some(embedding) = cfg.embedding {
         db.with_embedding_config(Arc::new(embedding))
     } else {
@@ -2023,21 +1402,14 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<OpenedGraph> {
         None => (None, db),
     };
 
-    let driver_graph_id: Arc<str> = Arc::from(graph_id.as_str());
-    let engine = Arc::new(db);
-    let stream_fold_driver = has_checked_stream_runtime.then(|| StreamFoldDriverTarget {
-        graph_id: driver_graph_id,
-        engine: Arc::clone(&engine),
-    });
     Ok(OpenedGraph {
         handle: Arc::new(GraphHandle {
             key: GraphKey::cluster(graph_id),
             uri,
-            engine,
+            engine: Arc::new(db),
             policy: policy_arc,
             queries,
         }),
-        stream_fold_driver,
     })
 }
 
