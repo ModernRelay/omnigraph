@@ -15,6 +15,12 @@ access shape; no retention format is active
 **Date:** 2026-07-10
 **Gate 0 evaluated:** 2026-07-17
 **Author track:** Maintainer design series
+
+> **RFC-026 disposition:** RFC-026 was later rejected and removed. References
+> below to quiescing MemWAL streams or to v7+ stream formats are historical
+> scenario analysis, not a retention prerequisite. See
+> [the removal decision](../dev/wal-removal.md).
+
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s publisher and
 recovery-sidecar protocol and
 [RFC-028](0028-stable-schema-identity.md)'s stable table identity/incarnation.
@@ -519,7 +525,7 @@ introduced here.
 ## 8. Format activation and rebuild compatibility
 
 Gate 0 was production-neutral and returned a no-go for the surveyed access
-shape. The current development format is internal schema v19, but none of the
+shape. The current development format is internal schema v6, but none of the
 activation or rebuild behavior below exists. The remainder of this section is
 the contingent format contract for a successor that first clears the same
 physical-I/O boundary; the Gate 0 result itself authorizes no implementation or

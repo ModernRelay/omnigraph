@@ -1,8 +1,8 @@
 ---
 type: spec
 title: "RFC-026 — MemWAL streaming ingest"
-description: Adopts Lance MemWAL as OmniGraph's strategic streaming-write architecture, with watcher-backed and post-durability epoch-checked acknowledgement, graph-atomic folds, epoch-fenced quiescence, and explicit fresh-read cuts on the RFC-022 unified write path.
-status: draft
+description: Historical implemented experiment using Lance MemWAL for streaming writes; rejected after benchmarking and removed in favor of direct commit-visible graph batches.
+status: rejected
 tags: [eng, rfc, streaming, ingest, wal, memwal, lance, omnigraph]
 timestamp: 2026-07-10
 owner: OmniGraph maintainers
@@ -10,90 +10,19 @@ owner: OmniGraph maintainers
 
 # RFC-026 — MemWAL streaming ingest
 
-**Status:** Draft / private B2 compare-and-chain/token-fold core, B2a
-unbounded retain-all profile, experimental activation P1, v11 profile
-authority, the hidden v12 lifecycle-v3/recovery-v14 claim/quiesce tranche, and
-private v13/recovery-v15 resume/abort-drain, v14/recovery-v16 checked-runtime
-`SEALED` EnsureIndices, v15/recovery-v17 checked-runtime `SEALED` Optimize,
-v16/recovery-v18 private physical rebind, v17/recovery-v19 terminal
-authority retirement/export, v18/recovery-v20 exact `DataBlock`
-inspection/correction, the hidden F4 caller-shaped ingest/prepare path,
-format-neutral F5a/F5b0 scheduling, and v19/token-schema-v3/recovery-v21 F5b
-terminal dead-letter folds plus three-disposition retirement implemented. F6a
-adds a typed failpoints-only process-local advisory driver snapshot and one
-hidden in-process composed candidate-runtime acceptance. F6b1 adds exact-
-terminal lower/engine served-export authority and one hidden immutable export
-cut without a format/recovery change or public route. F6b2 is the implemented
-no-format acceptance slice for Unix `SIGTERM`, sequential OS-process recovery,
-frozen-round node/edge fairness, physical rebind → re-enable → reopen → resume,
-combined maintenance, fresh-target import, and legacy writer refusal.
-F6b3 implements exact-selected uncovered-token-tail cost evidence behind
-failpoints-only read seams, with a fast local cell and ignored local/RustFS
-sweeps. It adds no reconciler, status, or transport. F6b7 preserves that
-historical baseline and adds a paired failpoints-only exact-selected index cut
-for current-token and profile-receipt lookup decision evidence. The helper owns
-no recovery sidecar and is not a production reconciler or scheduling threshold.
-F6b4 implements
-the isolated production-size dead-letter byte/capacity/timing and peak-RSS
-evidence behind one new source-guarded, doc-hidden failpoints-only measurement
-seam. It changes no format, recovery, or production route; its stopped/offline
-Rust payload DTO now retains raw JSON instead of a `serde_json::Value`, a
-source-shape change described below. F6b5 implements bounded-transport,
-stream-aware
-served export on the existing HTTP/remote-CLI/OpenAPI export surface, with
-pre-header cut validation, incremental exact-version scans using approximate
-Lance targets, strict chunks/queue ownership, complete per-response/process
-queue-envelope reservation, and disconnect-safe ownership. It
-also changes no format or recovery grammar.
-F6b6 implements the checked read-only operational-status core behind an
-engine-internal seam. It takes one exclusive authority cut, validates the
-current mode-appropriate checked owner, classifies recovery without resolving it,
-observes lifecycle/shard/token/driver/rebuild evidence, and rereads the
-independent authorities before release. It uses explicit checked cluster-apply
-status authority during `DISABLING`; ambient offline authority is insufficient.
-Every pending recovery sidecar within the hard status envelope is reported and
-rebuild-blocking; exceeding any discovery bound refuses the whole status. A
-sidecar that explains physical HEAD movement makes that physical projection
-unavailable rather than falsely inconsistent. Cold-replay pending accounting,
-flushed LWW projection accounting, and exact oldest-uncovered-token age are
-reported as unavailable rather than inferred. The already-public
-`Omnigraph::stream_status` remains the nonblocking manifest-only projection;
-F7b exposes a separate graph-redacted checked projection through served
-HTTP/OpenAPI and the remote CLI. Direct SDK transport remains in the F7
-remainder.
-F6b8 closes the format-neutral resume-to-driver ownership handoff: resume
-transfers its non-clone root producer permit into detached writer installation
-and arms an urgent trigger before that transfer can release. Under the
-exclusive root fence, the driver snapshots and retires only exact empty owners
-in a housekeeping prepass before its unchanged node-before-edge round. Driver-
-first, caller-cancelled resume-first, cross-lane reuse, and clean-shutdown cells
-are green. The broader post-claim install/retirement-failure matrix remains F6
-work. F7a activates graph-native mixed node/edge row streaming through one
-checked-runtime HTTP/remote-client/CLI/OpenAPI surface and strong graph-
-authority precondition. It reuses hidden lazy enrollment and the resident
-driver, exposes no lane selector or physical evidence, and changes no format
-or recovery grammar. F7b activates one read-only, non-cacheable graph status
-route plus remote CLI over F6b6's checked cut. Its DTO includes logical
-declarations whose streaming state has initialized, aggregate token/recovery/pending evidence, logical rebuild
-blockers, and advisory driver state. It omits table/lane/binding/dataset/writer/
-generation identities and opaque operation, actor, control-token, and graph-
-commit identifiers. An unmanaged graph or changed/busy cut fails closed; the
-route never invents or truncates evidence. One nonwaiting observation slot per
-graph root and one per serving process bound concurrent immutable scans. It changes no format, recovery
-grammar, coordinator, or lifecycle authority.
-F7c activates selector-free graph-wide `SEALED → OPEN` resume and graph-wide
-checked `SEALED` EnsureIndices/Optimize through HTTP/OpenAPI and the remote CLI.
-It composes the frozen recovery-v15/v16/v17 owners, exposes aggregate graph
-results rather than declaration/table/lane identities, and changes no format,
-recovery grammar, or coordinator. Public lane enrollment, per-declaration/
-general lifecycle verbs including abort-drain, public rebind, `AuthorityBlock` repair,
-the standalone production token-index reconciler deferred by F6b7's uncompacted-
-profile-cycle bounded NO-GO, the F6b-remainder
-guardrail acceptance, and direct SDK operational-status/control parity remain
-inactive.
-Stream-aware served export remains the separate terminal-cut transport.
-Retirement, DataBlock show/correct, and current dead-letter list/export are
-exposed only by narrow stopped/offline cluster controls.
+**Status:** Rejected (2026-08-06). The implementation and its unreleased
+manifest v7-v19 formats were removed. See
+[Streaming ingestion after RFC-026](../dev/wal-removal.md).
+
+The experiment proved that Lance MemWAL can durably accept per-dataset rows,
+but OmniGraph still needed separate graph-level validation, token authority,
+fold, correction, lifecycle, and cross-dataset publication machinery. That
+coordination dominated throughput and produced a durability-before-visibility
+contract the product did not need. Current high-rate ingestion is a bounded
+graph-level facade over the ordinary commit-visible `load_as` transaction.
+
+The remainder of this RFC is retained unchanged as historical design and
+implementation evidence. It is not an active contract.
 **Date:** 2026-07-10
 **Gate E0 evaluated:** 2026-07-18
 **Phase A foundation completed:** 2026-07-18

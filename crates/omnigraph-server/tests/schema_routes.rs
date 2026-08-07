@@ -16,7 +16,6 @@ use omnigraph_server::{
 };
 use serde_json::json;
 
-
 mod support;
 use support::*;
 
@@ -414,8 +413,8 @@ async fn schema_apply_route_can_add_index() {
         .split_once("pub(crate) async fn server_schema_apply")
         .expect("server_schema_apply handler must remain present");
     let (apply_handler, _) = after_apply_signature
-        .split_once("/// Shared body for `POST /load`")
-        .expect("schema apply handler must precede the load handler");
+        .split_once("async fn authorize_load_scope")
+        .expect("schema apply handler must precede load authorization");
     assert!(
         !apply_handler.contains("tokio::spawn") && !apply_handler.contains(".ensure_indices("),
         "schema apply must not schedule implicit physical index convergence"

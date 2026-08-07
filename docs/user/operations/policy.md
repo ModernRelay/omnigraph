@@ -14,44 +14,39 @@ Per-graph actions (bind to `Omnigraph::Graph::"<graph_id>"`):
 6. `branch_delete`
 7. `branch_merge`
 8. `admin` — reserved for policy-management surfaces (hot reload, audit log, approvals). No call site today.
-9. `stream_ingest` — **experimental (RFC-026)**; gates the graph-native firehose at `POST /graphs/{graph_id}/stream/ingest`. The graph is the authorization resource: logical node/edge declarations are row data, while the private Lance datasets and MemWAL lanes are never policy resources. The profile is main-only, so a rule that sets `branch_scope` or `target_branch_scope` is rejected at validation. Deliberately separate from `change`: a stream append acknowledges *durability* without graph visibility, so an operator can grant high-rate ingestion without granting direct-lane writes, or the reverse.
-10. `stream_manage` — **experimental (RFC-026)**; gates streaming lifecycle management: cluster-owned enable/disable and stopped controls, plus the served selector-free graph-wide resume and checked graph-wide EnsureIndices/Optimize controls. Graph-scoped for the same main-only reason. Split from `stream_ingest` because the blast radii differ in kind — ingestion adds rows, while management can quiesce acknowledged data, reopen sealed declarations at a new epoch, or move derived storage state. Read-only stream *status* is authorized like other graph operational metadata rather than by this action, so an operator can always see whether the graph is stuck even without the rights to act on it.
-11. `invoke_query` — gates invoking a server-side stored query (the `queries:` registry). Graph-scoped (like `admin`) — per-branch access is enforced by the inner `read` / `change` gate, so a rule that sets `branch_scope` on `invoke_query` is rejected. Coarse in this release: an `invoke_query` allow rule permits any stored query on the graph; a future, additive refinement adds an optional per-query-name scope without changing rules written against the coarse action. Enforced at `POST /queries/{name}` (see [server](server.md)). A stored *mutation* is double-gated: `invoke_query` to reach the tool, plus `change` for the write itself (the engine `_as` writers still enforce per the query body).
+9. `invoke_query` — gates invoking a server-side stored query (the `queries:` registry). Graph-scoped (like `admin`) — per-branch access is enforced by the inner `read` / `change` gate, so a rule that sets `branch_scope` on `invoke_query` is rejected. Coarse in this release: an `invoke_query` allow rule permits any stored query on the graph; a future, additive refinement adds an optional per-query-name scope without changing rules written against the coarse action. Enforced at `POST /queries/{name}` (see [server](server.md)). A stored *mutation* is double-gated: `invoke_query` to reach the tool, plus `change` for the write itself (the engine `_as` writers still enforce per the query body).
 
 Server-scoped action (v0.6.0+; binds to `Omnigraph::Server::"root"`):
 
-12. `graph_list` — `GET /graphs` registry enumeration (multi-graph mode)
+10. `graph_list` — `GET /graphs` registry enumeration (multi-graph mode)
 
-Server-scoped actions cannot use `branch_scope` or `target_branch_scope` — they operate on the registry, not on a graph's branches. A rule cannot mix server-scoped and per-graph actions; split into separate rules. (Runtime `graph_create` / `graph_delete` over HTTP are reserved but not shipped; operators add/remove graphs by editing the cluster's `cluster.yaml`, running `omnigraph cluster apply`, and restarting the server.)
-
-Policy YAML and `omnigraph policy explain --action` use `stream_ingest` and
-`stream_manage` as the canonical spellings. The CLI also accepts
-`stream-ingest` and `stream-manage` as aliases.
+Server-scoped actions cannot use `branch_scope` or `target_branch_scope` — they operate on the registry, not on a graph's branches. A policy bundle cannot mix server-scoped and per-graph actions; split them into separate files and cluster policy entries. (Runtime `graph_create` / `graph_delete` over HTTP are reserved but not shipped; operators add/remove graphs by editing the cluster's `cluster.yaml`, running `omnigraph cluster apply`, and restarting the server.)
 
 ## Scope kinds
 
 - `branch_scope` — applied to source branch (`read`, `export`, `change`)
 - `target_branch_scope` — applied to destination (`schema_apply`, branch ops, run ops)
 - `protected_branches` — named list with special rules; rule scopes are `any | protected | unprotected`
-- Graph-scoped per-graph actions (`admin`, `invoke_query`, `stream_ingest`, `stream_manage`) take **neither** scope; a rule that sets one is rejected at validation.
+- Graph-scoped per-graph actions (`admin`, `invoke_query`) take **neither** scope; a rule that sets one is rejected at validation.
 
 ## Per-graph vs. server-level policy
 
 A server boots from a cluster (`--cluster <dir>`), and the cluster's
 `cluster.yaml` declares its policy bundles in a `policies:` section. Each bundle
-names the scopes it `applies_to`: a graph id (per-graph rules — `read`, `change`,
-`branch_*`, `schema_apply`) or the literal `cluster` (server-level rules —
-`graph_list`).
+has exactly one runtime kind: it applies either to one or more graph ids
+(per-graph rules — `read`, `change`, `branch_*`, `schema_apply`) or to the
+literal `cluster` (server-level rules — `graph_list`), never both. One scope may
+have only one bundle; combine rules that govern the same scope into that file.
 
 ```yaml
 # cluster.yaml
 policies:
-  base:
-    file: base.policy.yaml
-    applies_to: [cluster, knowledge]   # cluster-level + the `knowledge` graph
-  alpha:
-    file: policies/alpha.yaml
-    applies_to: [alpha]                # per-graph: alpha only
+  server:
+    file: server.policy.yaml
+    applies_to: [cluster]              # server-level rules only
+  graphs:
+    file: graph.policy.yaml
+    applies_to: [knowledge, alpha]     # one graph policy shared by two graphs
 ```
 
 A graph with no bundle bound to it has no engine-layer Cedar enforcement. Each
@@ -61,16 +56,6 @@ graph's HTTP request flows through its bound bundle; the management endpoint
 `--unauthenticated`; with bearer tokens configured it returns 403 after admission
 control because `graph_list` is not a `read`-equivalent action. The operator must
 bind a `cluster`-scoped bundle granting `graph_list` to expose `/graphs`.
-
-Streaming-profile apply spans a cluster-state CAS, so `stream_manage` uses a
-fail-closed two-revision rule. The graph policy bound in the currently applied
-revision and the graph policy bound in the desired revision must both allow
-the actor; if only one side has a policy, that one governs. An unchanged
-address-and-digest pair is evaluated once. This prevents either the old or new
-policy from being skipped when a policy edit and profile change share one
-apply. A grant that is needed for the transition must therefore land in a
-policy-only apply first. Conversely, perform the profile transition while both
-revisions still grant `stream_manage`, then revoke it in a later apply.
 
 Example `cluster`-scoped bundle:
 

@@ -3,11 +3,7 @@
 pub mod cost;
 #[cfg(feature = "failpoints")]
 pub mod failpoint;
-#[cfg(feature = "failpoints")]
-pub mod memwal;
 pub mod recovery;
-#[cfg(feature = "failpoints")]
-pub mod stream_authority;
 
 use arrow_array::{Array, RecordBatch, StringArray};
 use futures::TryStreamExt;

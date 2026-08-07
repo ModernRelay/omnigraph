@@ -13,6 +13,12 @@ owner: OmniGraph maintainers
 **Status:** Implemented (2026-07-15) — all acceptance gates satisfied
 **Date:** 2026-07-10
 **Author track:** Maintainer design series
+
+> **RFC-026 disposition:** the key-fencing contract remains implemented in
+> internal schema v6. References below to a future MemWAL fold are historical;
+> RFC-026 was rejected and removed. See
+> [the removal decision](../dev/wal-removal.md).
+
 **Surveyed:** omnigraph 0.8.1 (`main`); Lance 9.0.0-rc.1 at git rev
 `cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance transaction,
 table-schema, read/write, branching, and MemWAL specifications; pinned Rust

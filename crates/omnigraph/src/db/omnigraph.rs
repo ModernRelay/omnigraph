@@ -25,7 +25,7 @@ use omnigraph_compiler::{
     plan_schema_migration,
 };
 
-use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot};
+use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot, ResolvedCommitRange};
 use crate::error::{OmniError, Result};
 use crate::runtime_cache::RuntimeCache;
 use crate::storage::{
@@ -38,92 +38,20 @@ mod export;
 mod optimize;
 mod repair;
 mod schema_apply;
-mod stream_correction;
-pub(crate) mod stream_dead_letter;
-mod stream_driver;
-mod stream_enrollment;
-mod stream_graph_ingest;
-mod stream_ingest;
-pub(crate) mod stream_lifecycle;
-mod stream_management;
-mod stream_ndjson;
-mod stream_profile;
-mod stream_rebind;
-mod stream_request;
-mod stream_retirement;
-// F6b6 is production-compiled but remains engine-internal until F7 attaches
-// the reviewed SDK/HTTP/CLI transport; suppress only that staged module's
-// reachability warnings in the interim.
-#[allow(dead_code)]
-mod stream_status;
 mod table_ops;
 
 #[doc(hidden)]
-pub use export::{EXPORT_CHUNK_MAX_BYTES, StreamExportCut};
+pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
 pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
 };
 pub use schema_apply::SchemaApplyOptions;
-pub use stream_correction::{
-    StreamDataBlockEntry, StreamDataBlockPage, StreamDataCorrectionAction,
-    StreamDataCorrectionRequest, StreamDataCorrectionResult,
-};
-#[cfg(feature = "failpoints")]
-#[doc(hidden)]
-pub use stream_dead_letter::{
-    StreamDeadLetterEncodingCostForTest, failpoint_measure_stream_dead_letter_object_for_test,
-};
-#[doc(hidden)]
-pub use stream_management::{
-    GraphStreamEnsureIndicesResult, GraphStreamOptimizeResult, GraphStreamResumeResult,
-};
-#[doc(hidden)]
-pub use stream_ndjson::{GraphStreamChunkSource, GraphStreamIngestHandle, GraphStreamIngestStart};
-#[doc(hidden)]
-pub use stream_profile::{
-    CheckedClusterApplyAuthority, CheckedClusterBlockAuthority, CheckedClusterDeadLetterAuthority,
-    CheckedClusterMaintenanceAuthority, CheckedClusterRetirementAuthority,
-    CheckedClusterServedExportAuthority, CheckedClusterStreamRuntimeAuthority,
-    StreamingProfileResult,
-};
-pub(crate) use stream_retirement::StreamAuthorityRetirementExportProvenance;
-#[cfg(test)]
-pub(crate) use stream_retirement::{
-    StreamAuthorityRetirementExportMember, retirement_export_cut_digest,
-    retirement_live_branch_heads_digest,
-};
-pub use stream_retirement::{
-    StreamAuthorityRetirementPlan, StreamAuthorityRetirementResult, StreamDeadLetterEntry,
-    StreamDeadLetterPage, StreamDeadLetterPayloadEntry, StreamDeadLetterPayloadPage,
-};
-#[cfg(feature = "failpoints")]
-#[doc(hidden)]
-pub use stream_status::{
-    StreamDrainOperationalStatus, StreamDriverAdvisoryStatus, StreamDriverEventStatus,
-    StreamDriverPendingStatus, StreamLastFoldOperationalStatus, StreamOldestUncoveredAgeStatus,
-    StreamOperationalStatus, StreamPendingGenerationStatus, StreamRebuildBlockReason,
-    StreamRebuildReadiness, StreamReceiptHeadsStatus, StreamRecoveryOperationalStatus,
-    StreamShardOperationalStatus, StreamStrictBlockOperationalStatus, StreamTableOperationalStatus,
-    StreamTablePhysicalOperationalStatus, StreamTerminalTokenOperationalStatus,
-    StreamTokenIndexCoverageStatus, StreamTokenLedgerOperationalStatus,
-};
-#[doc(hidden)]
-pub use stream_status::{
-    GraphStreamDeclaration, GraphStreamDeclarationStatus, GraphStreamDrainStatus,
-    GraphStreamDriverErrorStatus, GraphStreamDriverStatus, GraphStreamLastFoldStatus,
-    GraphStreamOperationalStatus, GraphStreamPendingStatus, GraphStreamRebuildBlocker,
-    GraphStreamRebuildStatus, GraphStreamStrictBlockStatus, GraphStreamTokenCounts,
-};
-pub use stream_status::{StreamStatus, StreamTableStatus};
 pub use table_ops::PendingIndex;
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
 
 use super::commit_graph::GraphCommit;
-use super::manifest::{
-    CapturedManifestProbe, ManifestChange, ManifestCoordinator, Snapshot, StreamProfileEntry,
-    TableRegistration, TableTombstone,
-};
+use super::manifest::{ManifestChange, Snapshot, TableRegistration, TableTombstone};
 use super::schema_state::{
     SCHEMA_SOURCE_FILENAME, load_validated_schema_contract,
     load_validated_schema_contract_for_source, read_accepted_schema_ir, read_schema_state_identity,
@@ -131,7 +59,6 @@ use super::schema_state::{
     schema_state_uri, validate_schema_contract, validate_schema_ir_against_snapshot,
     write_schema_contract, write_schema_contract_staging,
 };
-use super::write_queue::StreamAdmissionKey;
 use super::{
     ReadTarget, ResolvedTarget, SCHEMA_APPLY_LOCK_BRANCH, SnapshotId, is_internal_system_branch,
     is_schema_apply_lock_branch,
@@ -233,47 +160,10 @@ pub(crate) struct WriteTxn {
 /// combine an old source with a new identity-bearing catalog (or vice versa).
 #[derive(Debug)]
 struct HandleSchemaView {
-    /// Physical engine catalog, including storage-only fields and metadata.
     catalog: Arc<Catalog>,
-    /// Public reflection view derived atomically from `catalog`; it differs
-    /// only by omitting protocol-private fields.
-    public_catalog: Arc<Catalog>,
     source: Arc<String>,
     schema_ir_hash: String,
     schema_identity_domain: String,
-}
-
-/// Warm projection of the graph-global stream profile from canonical main.
-///
-/// Lance branches are independent manifest histories, so a named branch's
-/// physical profile row is only the value it inherited at fork time. Live
-/// named-branch reads instead use this main-pinned projection. The retained
-/// manifest probe makes the warm path one cheap freshness check; a full main
-/// manifest scan occurs only after that probe observes movement.
-#[derive(Debug, Clone)]
-struct CanonicalMainStreamProfile {
-    probe: CapturedManifestProbe,
-    profile: StreamProfileEntry,
-}
-
-impl CanonicalMainStreamProfile {
-    fn from_main_coordinator(coordinator: &GraphCoordinator) -> Self {
-        debug_assert!(
-            coordinator.current_branch().is_none(),
-            "canonical stream profile must be captured from main"
-        );
-        Self {
-            probe: coordinator.captured_manifest_probe(),
-            profile: coordinator.snapshot().stream_profile().clone(),
-        }
-    }
-
-    fn from_main_manifest(manifest: &ManifestCoordinator) -> Self {
-        Self {
-            probe: manifest.captured_probe(),
-            profile: manifest.snapshot().stream_profile().clone(),
-        }
-    }
 }
 
 /// Top-level handle to an Omnigraph database.
@@ -305,12 +195,6 @@ pub struct Omnigraph {
     /// workloads. Lock acquisition order: always before `runtime_cache`
     /// (when both are needed in one scope).
     coordinator: Arc<tokio::sync::RwLock<GraphCoordinator>>,
-    /// Canonical-main authority used only to project the graph-global stream
-    /// profile into live named-branch snapshots. It is initialized from the
-    /// already-open main coordinator (no second open), refreshed by a cheap
-    /// retained-handle probe, and reseeded when this handle leaves main or
-    /// publishes a profile flip. Historical snapshots never consult it.
-    canonical_main_stream_profile: Arc<tokio::sync::RwLock<CanonicalMainStreamProfile>>,
     table_store: TableStore,
     runtime_cache: RuntimeCache,
     /// Per-graph read caches: one shared Lance `Session` plus the held-`Dataset`
@@ -331,30 +215,6 @@ pub struct Omnigraph {
     /// paths, and both live/open-time recovery). Sharing across independently
     /// opened handles is required because Restore/ref deletion is destructive.
     write_queue: Arc<crate::db::write_queue::WriteQueueManager>,
-    /// Root-scoped RFC-026 Phase-B1 MemWAL workers. Independently opened
-    /// handles for the same canonical graph root must singleflight the exact
-    /// physical binding; a handle-local registry would permit two epoch claims
-    /// and two durability domains for one shard.
-    #[allow(dead_code)]
-    stream_workers: Arc<crate::table_store::mem_wal::MemWalWorkerRegistry>,
-    /// Root-shared ownership for hidden F4 request transport buffers. This is
-    /// deliberately separate from MemWAL worker accounting: raw NDJSON,
-    /// normalized-but-unsubmitted rows, and ordered result queues are
-    /// transport owners, not Lance generation state.
-    #[allow(dead_code)]
-    stream_requests: Arc<stream_request::StreamRequestRegistry>,
-    /// Root-scoped owner for the hidden resident fold supervisor. Every
-    /// independently opened handle for the same graph shares its trigger and
-    /// task state, so at most one automatic fold loop can run in-process.
-    stream_fold_driver: Arc<stream_driver::StreamFoldDriverRegistry>,
-    /// Non-cloneable checked authority retained for the lifetime of the sole
-    /// cluster-served writer handle. Ambient embedded/direct handles leave
-    /// this unset and therefore fail closed while the profile is enabled.
-    stream_runtime_authority: Option<CheckedClusterStreamRuntimeAuthority>,
-    /// Non-cloneable checked authority retained by a cluster-served terminal
-    /// graph handle. Ambient embedded/direct handles leave this unset and may
-    /// not capture stream-aware export cuts.
-    stream_served_export_authority: Option<CheckedClusterServedExportAuthority>,
     /// Handle-local mutex held across the swap → operate → restore window
     /// in `branch_merge_impl`. Two concurrent merges through the same handle
     /// with distinct targets
@@ -442,42 +302,6 @@ pub struct InitOptions {
     pub force: bool,
 }
 
-/// Conservative bounds for the private RFC-026 Phase-B1 evidence surface.
-/// There is no production caller in B1; the checked-in stream cost/RSS suite
-/// owns these values and Phase B2 must re-qualify them before exposing public
-/// admission. Keeping the limits explicit here prevents independently opened
-/// handles from silently selecting different resource contracts.
-fn private_b1_worker_limits() -> crate::table_store::mem_wal::B1WorkerLimits {
-    crate::table_store::mem_wal::B1WorkerLimits {
-        // The B1 evidence qualifies one resident writer and one exclusive
-        // fold. The widest legal admission added roughly 178 MiB of
-        // whole-process peak RSS; its full high-entropy fold added roughly
-        // 273 MiB over a small-fold baseline and carries a 384-MiB
-        // remeasurement tripwire. Admitting more residents would therefore be
-        // an unmeasured throughput choice. A later phase may raise this only
-        // with a multi-resident RSS cell.
-        max_resident_writers_root: 1,
-        max_resident_writers_per_table: 1,
-        max_reserved_arrow_bytes: 32 * 1024 * 1024,
-        // A B2 caller reserves the full worst-case preprocessing envelope
-        // before blob materialization or canonical encoding. Keeping one such
-        // envelopes root-wide is the minimum qualified concurrency contract:
-        // one stale provisional caller may wait while another becomes the
-        // winner whose authority it must later observe.
-        max_b2_preprocessing_bytes: crate::table_store::mem_wal::B2_MAX_PREPROCESSING_BYTES_ROOT,
-        // Every queued input is charged against the same aggregate Arrow
-        // reservation synchronously, before detachment or cold claim. This
-        // count therefore bounds scheduling/control overhead; it cannot admit
-        // 32 independent 32-MiB buffers.
-        max_inflight_calls: 32,
-        max_pending_generations: 4,
-        put_deadline: std::time::Duration::from_secs(30),
-        seal_deadline: std::time::Duration::from_secs(60),
-        abort_deadline: std::time::Duration::from_secs(60),
-        idle_timeout: std::time::Duration::from_secs(60),
-    }
-}
-
 impl Omnigraph {
     /// Create a new graph at `uri` from schema source.
     ///
@@ -511,15 +335,6 @@ impl Omnigraph {
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
-        let stream_workers = crate::table_store::mem_wal::MemWalWorkerRegistry::for_root(
-            &write_queue_identity,
-            private_b1_worker_limits(),
-        )
-        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-        let stream_requests =
-            stream_request::StreamRequestRegistry::for_root(&write_queue_identity);
-        let stream_fold_driver =
-            stream_driver::StreamFoldDriverRegistry::for_root(&write_queue_identity);
 
         // Preflight before parse or write. Strict init refuses any schema
         // artifact; force may recover orphan schema files but still refuses an
@@ -561,7 +376,6 @@ impl Omnigraph {
         let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_physical_schemas(&mut catalog)?;
-        let public_catalog = public_catalog_view(&catalog)?;
 
         // Establish an atomic ownership claim on `_schema.pg` before
         // writing the remaining init artifacts. A check-then-write preflight
@@ -623,17 +437,12 @@ impl Omnigraph {
             }
         };
 
-        let canonical_main_stream_profile =
-            CanonicalMainStreamProfile::from_main_coordinator(&coordinator);
         let session = lance_access.data_session();
         Ok(Self {
             root_uri: root.clone(),
             storage,
             lance_access,
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
-            canonical_main_stream_profile: Arc::new(tokio::sync::RwLock::new(
-                canonical_main_stream_profile,
-            )),
             // The graph-scoped data session keeps table metadata/index caches
             // warm across reads, writes, and maintenance. Mutable control
             // metadata uses the context's separate zero-cache session; both
@@ -646,17 +455,11 @@ impl Omnigraph {
             }),
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
                 catalog: Arc::new(catalog),
-                public_catalog: Arc::new(public_catalog),
                 source: Arc::new(schema_source.to_string()),
                 schema_ir_hash: accepted_schema_ir_hash,
                 schema_identity_domain,
             })),
             write_queue,
-            stream_workers,
-            stream_requests,
-            stream_fold_driver,
-            stream_runtime_authority: None,
-            stream_served_export_authority: None,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
@@ -669,35 +472,20 @@ impl Omnigraph {
     /// Reads `_schema.pg`, parses it, builds the catalog, and opens `__manifest`.
     /// Runs the open-time recovery sweep before returning — see [`OpenMode`].
     pub async fn open(uri: &str) -> Result<Self> {
-        Box::pin(Self::open_with_storage_and_mode(
-            uri,
-            storage_for_uri(uri)?,
-            OpenMode::ReadWrite,
-        ))
-        .await
+        Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadWrite).await
     }
 
     /// Open an existing graph for read-only consumers (NDJSON export,
     /// `commit list`, etc.). Skips the recovery sweep — see [`OpenMode`].
     pub async fn open_read_only(uri: &str) -> Result<Self> {
-        Box::pin(Self::open_with_storage_and_mode(
-            uri,
-            storage_for_uri(uri)?,
-            OpenMode::ReadOnly,
-        ))
-        .await
+        Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
     }
 
     /// Open with a caller-supplied [`StorageAdapter`]. Used by init/test paths
     /// and by embedding/test consumers that wrap storage (e.g. a counting
     /// decorator for IO-budget tests). Defaults to `OpenMode::ReadWrite`.
     pub async fn open_with_storage(uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<Self> {
-        Box::pin(Self::open_with_storage_and_mode(
-            uri,
-            storage,
-            OpenMode::ReadWrite,
-        ))
-        .await
+        Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
     }
 
     pub(crate) async fn open_with_storage_and_mode(
@@ -710,15 +498,6 @@ impl Omnigraph {
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
-        let stream_workers = crate::table_store::mem_wal::MemWalWorkerRegistry::for_root(
-            &write_queue_identity,
-            private_b1_worker_limits(),
-        )
-        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-        let stream_requests =
-            stream_request::StreamRequestRegistry::for_root(&write_queue_identity);
-        let stream_fold_driver =
-            stream_driver::StreamFoldDriverRegistry::for_root(&write_queue_identity);
         // Refuse a `__manifest` this binary cannot serve before the coordinator
         // reads any branch state — newer than CURRENT (an old binary must not
         // silently misread a newer graph) or below MIN_SUPPORTED (an older
@@ -732,59 +511,6 @@ impl Omnigraph {
         let mut coordinator =
             GraphCoordinator::open_with_session(&root, Arc::clone(&storage), &control_session)
                 .await?;
-        // Full recovery may change graph-global stream-profile authority or
-        // Restore/publish any table named by a pending sidecar. Every mutable
-        // cold open therefore owns the profile gate exclusively before sidecar
-        // discovery, then preserves the global profile -> admission -> schema
-        // -> branch -> table order through the full sweep. This waits out live
-        // shared-profile writers before classifying their sidecars and avoids a
-        // stale pre-list/guard-upgrade race. ReadOnly keeps its non-mutating
-        // behavior and takes no recovery profile guard.
-        // The recovery sweep re-lists under the schema gate; a sidecar created
-        // after this pre-list is either still protected by the writer's schema
-        // gate (so this open waits) or belongs to a writer that has already
-        // released every effect guard.
-        let _recovery_profile_guard = if matches!(mode, OpenMode::ReadWrite) {
-            Some(write_queue.acquire_stream_profile_exclusive().await)
-        } else {
-            None
-        };
-        let recovery_sidecars = if matches!(mode, OpenMode::ReadWrite) {
-            crate::db::manifest::list_sidecars(&root, storage.as_ref()).await?
-        } else {
-            Vec::new()
-        };
-        let recovery_admission_keys = if matches!(mode, OpenMode::ReadWrite) {
-            recovery_sidecars
-                .iter()
-                .flat_map(|sidecar| {
-                    if let Some(scope) = sidecar.stream_admission_scope() {
-                        vec![
-                            crate::db::write_queue::StreamAdmissionKey::for_resolved_ref(
-                                scope.identity,
-                                scope.table_branch.as_deref(),
-                            ),
-                        ]
-                    } else {
-                        sidecar
-                            .tables
-                            .iter()
-                            .map(|pin| {
-                                crate::db::write_queue::StreamAdmissionKey::for_resolved_ref(
-                                    pin.identity,
-                                    pin.table_branch.as_deref(),
-                                )
-                            })
-                            .collect()
-                    }
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let _recovery_admission_guards = write_queue
-            .acquire_stream_exclusive_many(&recovery_admission_keys)
-            .await;
         // Schema publication is a three-file promotion plus an in-memory catalog
         // swap.  Every handle — including ReadOnly — must hold the root-scoped
         // schema gate from its final coordinator refresh through the complete
@@ -809,24 +535,14 @@ impl Omnigraph {
         // SchemaApply manifest outcome cannot be served with the old schema
         // contract merely because promotion is pending.
         if matches!(mode, OpenMode::ReadWrite) {
-            // RETIRED is a terminal, root-wide writer fence. Mutable open may
-            // still construct a handle for reads/status/exact export, and may
-            // finish the exact v19 retirement sidecar after a lost
-            // acknowledgement, but it must not promote or delete schema
-            // staging residue. `recover_manifest_drift` applies the same
-            // canonical-main fence before every non-v19 sidecar effect.
-            let retired = coordinator.snapshot().stream_profile().retired_error();
             // Schema staging is itself mutable recovery state. Hold the shared
             // schema gate across BOTH its file pre-pass and the complete Full
             // sidecar sweep, so `schema_state_recovery` cannot go stale in a
             // release/reacquire gap. The sweep adds branch → sorted table gates
             // per sidecar under this outer guard.
-            let schema_state_recovery = if retired.is_some() {
-                crate::db::schema_state::SchemaStateRecovery::Noop
-            } else {
+            let schema_state_recovery =
                 recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot())
-                    .await?
-            };
+                    .await?;
             // Recovery sweep: close the Phase B → Phase C residual on
             // any sidecar left over from a crashed writer. Long-running
             // processes additionally converge in-process: the staged-
@@ -861,19 +577,13 @@ impl Omnigraph {
         let schema_identity_domain = accepted_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&accepted_ir)?;
         fixup_physical_schemas(&mut catalog)?;
-        let public_catalog = public_catalog_view(&catalog)?;
 
-        let canonical_main_stream_profile =
-            CanonicalMainStreamProfile::from_main_coordinator(&coordinator);
         let session = lance_access.data_session();
         let db = Self {
             root_uri: root.clone(),
             storage,
             lance_access,
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
-            canonical_main_stream_profile: Arc::new(tokio::sync::RwLock::new(
-                canonical_main_stream_profile,
-            )),
             // The graph-scoped data session keeps table metadata/index caches
             // warm across reads, writes, and maintenance. Mutable control
             // metadata uses the context's separate zero-cache session; both
@@ -886,26 +596,16 @@ impl Omnigraph {
             }),
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
                 catalog: Arc::new(catalog),
-                public_catalog: Arc::new(public_catalog),
                 source: Arc::new(schema_source),
                 schema_ir_hash: accepted_state.schema_ir_hash,
                 schema_identity_domain,
             })),
             write_queue,
-            stream_workers,
-            stream_requests,
-            stream_fold_driver,
-            stream_runtime_authority: None,
-            stream_served_export_authority: None,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
         };
-        // Keep the table-by-table Lance inventory validator off the already
-        // deep open/recovery future. The check is cold-path and boxing avoids
-        // inflating every caller's Tokio worker-stack requirement.
-        Box::pin(db.validate_stream_format_consistency()).await?;
         // The returned handle now owns one coherent schema source/catalog view.
         // Release only after both have been installed in the new object.
         drop(schema_contract_guard);
@@ -916,7 +616,7 @@ impl Omnigraph {
     /// catalog pointer; callers can hold the returned `Arc` across awaits
     /// without blocking concurrent `apply_schema`.
     pub fn catalog(&self) -> Arc<Catalog> {
-        Arc::clone(&self.schema_view.load().public_catalog)
+        Arc::clone(&self.schema_view.load().catalog)
     }
 
     /// Returns an `Arc<String>` snapshot of the schema source.
@@ -948,10 +648,8 @@ impl Omnigraph {
                     .to_string(),
             ));
         }
-        let public_catalog = public_catalog_view(&catalog)?;
         self.schema_view.store(Arc::new(HandleSchemaView {
             catalog: Arc::new(catalog),
-            public_catalog: Arc::new(public_catalog),
             source: Arc::new(schema_source),
             schema_ir_hash,
             schema_identity_domain: accepted_ir.schema_identity_domain.as_str().to_string(),
@@ -1233,72 +931,6 @@ impl Omnigraph {
                 )
                 .await
             }
-        }
-    }
-
-    /// Read the current graph-global stream profile from canonical main.
-    ///
-    /// When this handle is main-bound, its existing coordinator is the warm
-    /// authority. A named-branch-bound handle uses the dedicated main
-    /// projection captured before leaving main. Both paths perform a cheap
-    /// incarnation probe and scan the main manifest only after movement.
-    async fn current_canonical_stream_profile(&self) -> Result<StreamProfileEntry> {
-        {
-            let coordinator = self.coordinator.read().await;
-            if coordinator.current_branch().is_none() {
-                let held = coordinator.manifest_incarnation();
-                if coordinator.probe_latest_incarnation().await?.matches(&held) {
-                    return Ok(coordinator.snapshot().stream_profile().clone());
-                }
-            }
-        }
-
-        {
-            let mut coordinator = self.coordinator.write().await;
-            if coordinator.current_branch().is_none() {
-                let held = coordinator.manifest_incarnation();
-                let mut refreshed = false;
-                if !coordinator.probe_latest_incarnation().await?.matches(&held) {
-                    coordinator.refresh_manifest_only().await?;
-                    refreshed = true;
-                }
-                let profile = coordinator.snapshot().stream_profile().clone();
-                drop(coordinator);
-                if refreshed {
-                    self.invalidate_read_caches().await;
-                }
-                return Ok(profile);
-            }
-        }
-
-        {
-            let authority = self.canonical_main_stream_profile.read().await;
-            if authority.probe.is_current().await? {
-                return Ok(authority.profile.clone());
-            }
-        }
-
-        let mut authority = self.canonical_main_stream_profile.write().await;
-        if authority.probe.is_current().await? {
-            return Ok(authority.profile.clone());
-        }
-        let control_session = self.control_session();
-        let manifest = ManifestCoordinator::open_with_session(self.uri(), &control_session).await?;
-        *authority = CanonicalMainStreamProfile::from_main_manifest(&manifest);
-        Ok(authority.profile.clone())
-    }
-
-    /// Install an exact freshly-opened main coordinator after a profile call
-    /// (changed or idempotent). This keeps both a named-bound handle's profile
-    /// projection and a main-bound handle's ordinary coordinator current
-    /// without another scan.
-    async fn install_current_main_stream_profile(&self, coordinator: GraphCoordinator) {
-        let authority = CanonicalMainStreamProfile::from_main_coordinator(&coordinator);
-        *self.canonical_main_stream_profile.write().await = authority;
-
-        let mut active = self.coordinator.write().await;
-        if active.current_branch().is_none() {
-            *active = coordinator;
         }
     }
 
@@ -1897,14 +1529,7 @@ impl Omnigraph {
         let branch = normalize_branch_name(branch)?;
         let next = self.open_coordinator_for_branch(branch.as_deref()).await?;
         validate_schema_ir_against_snapshot(&schema_ir, &next.snapshot())?;
-        let mut profile = self.canonical_main_stream_profile.write().await;
-        let mut coordinator = self.coordinator.write().await;
-        if coordinator.current_branch().is_none() {
-            *profile = CanonicalMainStreamProfile::from_main_coordinator(&coordinator);
-        }
-        *coordinator = next;
-        drop(coordinator);
-        drop(profile);
+        *self.coordinator.write().await = next;
         self.invalidate_read_caches().await;
         Ok(())
     }
@@ -1936,9 +1561,9 @@ impl Omnigraph {
     /// 3. `heal_pending_sidecars_roll_forward` — close the
     ///    finalize→publisher residual via roll-forward; defer rollback
     ///    work to next ReadWrite open. Serializes against live writers
-    ///    by acquiring each sidecar's root-scoped stream-admission → schema →
-    ///    branch → sorted-table gates, so refresh never rolls forward an
-    ///    in-flight writer's sidecar from under it, even from another handle.
+    ///    by acquiring each sidecar's root-scoped schema → branch → sorted
+    ///    table gates, so refresh never rolls forward an in-flight writer's
+    ///    sidecar from under it, even from another handle.
     /// 4. `runtime_cache.invalidate_all` — drop stale per-snapshot caches.
     ///
     /// Steady-state cost: two empty `list_dir` probes of `__recovery/` (the
@@ -1973,14 +1598,6 @@ impl Omnigraph {
         // The heal also takes the locks itself (schema → branch → tables →
         // coordinator), so it must run after this guard is released.
         {
-            let _profile = self.write_queue.acquire_stream_profile_shared().await;
-            if let Some(error) = self
-                .current_canonical_stream_profile()
-                .await?
-                .retired_error()
-            {
-                return Err(error);
-            }
             // Hold the schema-apply serialization key across the
             // list-then-reconcile pair: without it, a live apply can
             // write its sidecar + staging between the empty check and
@@ -2017,7 +1634,7 @@ impl Omnigraph {
             &self.root_uri,
             Arc::clone(&self.storage),
             &self.coordinator,
-            Arc::clone(&self.write_queue),
+            &self.write_queue,
         )
         .await?;
         self.reload_schema_if_source_changed().await?;
@@ -2047,9 +1664,8 @@ impl Omnigraph {
 
     /// RFC-022 synchronous write/control recovery barrier. Run the live-safe
     /// healer, then reject any guarded unresolved intent on a relevant graph branch. A
-    /// SchemaApply is graph-global because it changes accepted schema identity;
-    /// StreamFold is graph-global because recovery-v12 owns an unpublished
-    /// `_stream_tokens.lance` HEAD shared by every table and branch.
+    /// SchemaApply intent is graph-global because it changes the accepted schema
+    /// identity used by every branch.
     ///
     /// `relevant_branches` must use the engine convention (`None` = main), but
     /// this helper defensively folds `Some("main")` as well so load's explicit
@@ -2060,7 +1676,7 @@ impl Omnigraph {
     ) -> Result<()> {
         let outcome = self.heal_pending_recovery_sidecars_outcome().await?;
         let blocking = outcome.unresolved.iter().find(|intent| {
-            intent.writer_kind.is_graph_global_barrier()
+            intent.writer_kind == crate::db::manifest::SidecarKind::SchemaApply
                 || relevant_branches
                     .iter()
                     .any(|branch| branch.filter(|name| *name != "main") == intent.branch.as_deref())
@@ -2092,26 +1708,20 @@ impl Omnigraph {
     /// sidecar's table effects are unreachable and the recovery sweep records an
     /// orphan-discard audit. Safety comes from branch_delete subsequently taking
     /// schema -> target branch -> every accepted-catalog table gate before the
-    /// ref mutation, which waits out any live in-process owner. Graph-global
-    /// recovery and bounded main StreamEnrollment can establish authority that
-    /// deletion must not bypass, so both still block deletion.
+    /// ref mutation, which waits out any live in-process owner. SchemaApply
+    /// remains graph-global and must still block deletion.
     async fn heal_pending_recovery_sidecars_for_branch_delete(&self, branch: &str) -> Result<()> {
         let outcome = self.heal_pending_recovery_sidecars_outcome().await?;
-        if let Some(intent) = outcome.unresolved.iter().find(|intent| {
-            matches!(
-                intent.writer_kind,
-                crate::db::manifest::SidecarKind::SchemaApply
-                    | crate::db::manifest::SidecarKind::StreamFold
-                    | crate::db::manifest::SidecarKind::StreamEnrollment
-                    | crate::db::manifest::SidecarKind::StreamProfileChange
-            )
-        }) {
+        if let Some(intent) = outcome
+            .unresolved
+            .iter()
+            .find(|intent| intent.writer_kind == crate::db::manifest::SidecarKind::SchemaApply)
+        {
             return Err(OmniError::recovery_required(
                 intent.operation_id.clone(),
                 format!(
-                    "pending {:?} recovery operation blocks deletion of branch '{branch}'; \
-                     reopen the graph read-write before retrying",
-                    intent.writer_kind
+                    "pending SchemaApply recovery operation blocks deletion of branch '{branch}'; \
+                     reopen the graph read-write before retrying"
                 ),
             ));
         }
@@ -2135,7 +1745,7 @@ impl Omnigraph {
             crate::db::manifest::list_sidecars(&self.root_uri, self.storage.as_ref()).await?;
         let blocking = sidecars.iter().find(|sidecar| {
             let sidecar_branch = sidecar.branch.as_deref().filter(|branch| *branch != "main");
-            sidecar.writer_kind.is_graph_global_barrier()
+            sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply
                 || relevant_branches
                     .iter()
                     .any(|branch| branch.filter(|name| *name != "main") == sidecar_branch)
@@ -2228,24 +1838,19 @@ impl Omnigraph {
     /// Final under-gate check for branch deletion. Target-branch sidecars are
     /// intentionally allowed: the held complete table envelope proves no live
     /// in-process owner can still be applying them, and deleting the branch
-    /// makes their effects unreachable. Graph-global schema recovery and a
-    /// canonical-main stream enrollment still invalidate the operation.
+    /// makes their effects unreachable. Only graph-global schema recovery can
+    /// still invalidate the operation.
     async fn ensure_branch_delete_recovery_safe_under_gates(&self, branch: &str) -> Result<()> {
         let sidecars =
             crate::db::manifest::list_sidecars(&self.root_uri, self.storage.as_ref()).await?;
-        if let Some(sidecar) = sidecars.iter().find(|sidecar| {
-            matches!(
-                sidecar.writer_kind,
-                crate::db::manifest::SidecarKind::SchemaApply
-                    | crate::db::manifest::SidecarKind::StreamEnrollment
-                    | crate::db::manifest::SidecarKind::StreamProfileChange
-            )
-        }) {
+        if let Some(sidecar) = sidecars
+            .iter()
+            .find(|sidecar| sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply)
+        {
             return Err(OmniError::recovery_required(
                 sidecar.operation_id.clone(),
                 format!(
-                    "pending {:?} recovery operation blocks deletion of branch '{branch}'",
-                    sidecar.writer_kind,
+                    "pending SchemaApply recovery operation blocks deletion of branch '{branch}'"
                 ),
             ));
         }
@@ -2259,7 +1864,7 @@ impl Omnigraph {
             &self.root_uri,
             Arc::clone(&self.storage),
             &self.coordinator,
-            Arc::clone(&self.write_queue),
+            &self.write_queue,
         )
         .await?;
         if outcome.processed_any {
@@ -2283,11 +1888,6 @@ impl Omnigraph {
             .write_queue
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        self.reload_schema_if_source_changed_with_schema_gate_held()
-            .await
-    }
-
-    async fn reload_schema_if_source_changed_with_schema_gate_held(&self) -> Result<()> {
         crate::failpoints::maybe_fail(
             crate::failpoints::names::SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
         )?;
@@ -2320,28 +1920,6 @@ impl Omnigraph {
         };
         drop(current);
         self.store_schema_view(catalog, schema_source, &accepted_ir)?;
-        Ok(())
-    }
-
-    /// Refresh a pre-effect Mutation/Load attempt while its outer shared
-    /// stream-profile window remains held.
-    ///
-    /// The ordinary write-entry healer already ran before that window was
-    /// acquired. Calling [`Self::refresh`] here would run recovery again and
-    /// attempt a nested profile-gate acquisition. Tokio's fair `RwLock` can
-    /// then block that nested read behind a queued profile writer while the
-    /// same operation still owns the earlier read guard. Refresh only the
-    /// coherent manifest/schema view; the next attempt re-lists pending
-    /// sidecars under its normal final gates and refuses any new residue.
-    pub(crate) async fn refresh_pre_effect_write_attempt(&self) -> Result<()> {
-        let _schema_guard = self
-            .write_queue
-            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
-            .await;
-        self.coordinator.write().await.refresh().await?;
-        self.reload_schema_if_source_changed_with_schema_gate_held()
-            .await?;
-        self.invalidate_read_caches().await;
         Ok(())
     }
 
@@ -2390,14 +1968,6 @@ impl Omnigraph {
         target: ReadTarget,
     ) -> Result<ResolvedTarget> {
         let mut resolved = self.resolve_target_inner(&target).await?;
-        // The stream profile is graph-global control authority. Native named
-        // branches retain their fork-time copy, so live branch resolution
-        // projects the current canonical-main value. Snapshot-id reads skip
-        // this projection and remain immutable historical views.
-        if matches!(&target, ReadTarget::Branch(_)) && resolved.branch.is_some() {
-            let profile = self.current_canonical_stream_profile().await?;
-            resolved.snapshot.project_canonical_stream_profile(profile);
-        }
         // Attach the read caches (shared Session + held-handle cache) for live
         // Branch reads so table opens reuse handles (0 IO on a warm repeat).
         // Snapshot-id reads are deliberately NOT cached: they pin a historical
@@ -2559,10 +2129,19 @@ impl Omnigraph {
         filter: &crate::changes::ChangeFilter,
     ) -> Result<crate::changes::ChangeSet> {
         let coord = self.coordinator.read().await;
-        let from_commit = coord
-            .resolve_commit(&SnapshotId::new(from_commit_id))
+        let range = coord
+            .resolve_commit_range(
+                &SnapshotId::new(from_commit_id),
+                &SnapshotId::new(to_commit_id),
+            )
             .await?;
-        let to_commit = coord.resolve_commit(&SnapshotId::new(to_commit_id)).await?;
+        // Classify direct adjacency from the child's persisted first-parent
+        // pointer without changing this API's net-current result shape. The
+        // future feed can reuse that relationship without an ancestry index.
+        let (from_commit, to_commit) = match range {
+            ResolvedCommitRange::FirstParent(edge) => (edge.parent, edge.child),
+            ResolvedCommitRange::Arbitrary { from, to } => (from, to),
+        };
         let from_snap = coord
             .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
                 from_commit.graph_commit_id.clone(),
@@ -2674,20 +2253,6 @@ impl Omnigraph {
         table_ops::ensure_indices_on(self, branch).await
     }
 
-    /// Feature-gated checked-runtime seam for the canonical-main,
-    /// same-binding SEALED EnsureIndices bridge. Public maintenance transport
-    /// remains an F7 concern.
-    #[cfg(feature = "failpoints")]
-    #[doc(hidden)]
-    pub async fn failpoint_stream_sealed_ensure_indices_for_test(
-        &self,
-        actor_id: &str,
-    ) -> Result<Vec<PendingIndex>> {
-        Ok(table_ops::ensure_indices_sealed_as(self, actor_id)
-            .await?
-            .pending)
-    }
-
     #[cfg(feature = "failpoints")]
     #[doc(hidden)]
     pub async fn failpoint_publish_table_head_without_index_rebuild_for_test(
@@ -2709,18 +2274,6 @@ impl Omnigraph {
     /// node + edge table on `main`. See [`optimize`] for details.
     pub async fn optimize(&self) -> Result<Vec<optimize::TableOptimizeStats>> {
         optimize::optimize_all_tables(self).await
-    }
-
-    /// Feature-gated checked-runtime seam for canonical-main Optimize across
-    /// ordinary and productive `SEALED` stream tables. Public maintenance
-    /// transport remains an F7 concern.
-    #[cfg(feature = "failpoints")]
-    #[doc(hidden)]
-    pub async fn failpoint_stream_sealed_optimize_for_test(
-        &self,
-        actor_id: &str,
-    ) -> Result<Vec<optimize::TableOptimizeStats>> {
-        optimize::optimize_all_tables_sealed_as(self, actor_id).await
     }
 
     /// Classify and explicitly repair uncovered manifest/head drift. See
@@ -2838,93 +2391,6 @@ impl Omnigraph {
             }
         }
         queue_keys
-    }
-
-    fn stream_admission_keys_for_snapshot(snapshot: &Snapshot) -> Vec<StreamAdmissionKey> {
-        snapshot
-            .entries()
-            .map(|entry| {
-                StreamAdmissionKey::for_resolved_ref(entry.identity, entry.table_branch.as_deref())
-            })
-            .collect()
-    }
-
-    /// Derive a conservative admission superset without a pre-gate manifest
-    /// open. Native branch controls already own a one-capture cost contract:
-    /// their operation-local source snapshot is loaded once under the inner
-    /// gates. The accepted catalog supplies immutable table lifetimes. Phase A
-    /// enrolls and closes admission only on canonical main, so branch controls
-    /// need the main domain for every lifetime: this excludes enrollment while
-    /// the control changes the named-branch topology. Deliberately do not guess
-    /// a named physical ref from the logical source branch. A lazy descendant
-    /// may still resolve to any live ancestor ref, and named-ref enrollment or
-    /// drain is outside the Phase-A support boundary.
-    fn branch_control_stream_admission_keys(catalog: &Catalog) -> Result<Vec<StreamAdmissionKey>> {
-        let schema_ir = catalog.bound_schema_ir().ok_or_else(|| {
-            OmniError::manifest_internal(
-                "native branch control requires an identity-bound catalog for stream admission",
-            )
-        })?;
-        let mut keys = BTreeSet::new();
-        for (stable_table_id, table_incarnation_id) in schema_ir
-            .nodes
-            .iter()
-            .map(|node| (node.type_id.get(), node.table_incarnation_id.get()))
-            .chain(
-                schema_ir
-                    .edges
-                    .iter()
-                    .map(|edge| (edge.type_id.get(), edge.table_incarnation_id.get())),
-            )
-        {
-            let identity =
-                super::manifest::TableIdentity::new(stable_table_id, table_incarnation_id)?;
-            keys.insert(StreamAdmissionKey::for_resolved_ref(identity, None));
-        }
-        Ok(keys.into_iter().collect())
-    }
-
-    /// Capture provisional admission domains from the durable schema contract,
-    /// not from `__manifest`. This keeps long-lived handles current across a
-    /// schema apply without spending the branch control's single authoritative
-    /// manifest capture before its gates. A concurrent schema transition is
-    /// caught by the fresh under-gate coverage check.
-    async fn capture_branch_control_stream_admission_keys(
-        &self,
-    ) -> Result<Vec<StreamAdmissionKey>> {
-        let (schema_ir, _) =
-            load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
-        let catalog = build_catalog_from_ir(&schema_ir)?;
-        Self::branch_control_stream_admission_keys(&catalog)
-    }
-
-    fn ensure_branch_control_stream_admission_covered(
-        operation: &str,
-        expected: &[StreamAdmissionKey],
-        source: &Snapshot,
-    ) -> Result<()> {
-        let mut actual = BTreeSet::new();
-        for entry in source.entries() {
-            actual.insert(StreamAdmissionKey::for_resolved_ref(entry.identity, None));
-        }
-        if actual
-            .iter()
-            .any(|key| expected.binary_search(key).is_err())
-        {
-            return Err(OmniError::manifest_read_set_changed(
-                format!("{operation}:stream_admission_domains"),
-                Some(format!("{expected:?}")),
-                Some(format!("{actual:?}")),
-            ));
-        }
-        Ok(())
-    }
-
-    fn ensure_branch_control_streams_sealed(operation: &str, source: &Snapshot) -> Result<()> {
-        source.ensure_stream_branch_controls_allowed(
-            operation,
-            source.entries().map(|entry| entry.identity),
-        )
     }
 
     fn ensure_branch_create_namespace_safe(target: &str, branches: &[String]) -> Result<()> {
@@ -3095,17 +2561,13 @@ impl Omnigraph {
         normalize_branch_name(branch)
     }
 
-    /// Cooperative destructive control can remove or reuse a table path or
-    /// exact numeric version, so it must own the shared side of the root gate
-    /// retained exclusively by an immutable export cut.
-    /// This is non-waiting to remain safe for loader composition that already
-    /// holds shared stream gates: either side owns the slot, never waits while
-    /// holding the opposite side's gates.
-    pub(super) fn reserve_stream_export_destructive_control(
+    /// Cooperatively exclude a live immutable export while a control may
+    /// remove or reuse its exact path/version coordinates.
+    pub(super) fn reserve_export_destructive_control(
         &self,
-    ) -> Result<crate::db::write_queue::StreamExportDestructivePermit> {
+    ) -> Result<crate::db::write_queue::ExportDestructivePermit> {
         self.write_queue()
-            .try_acquire_stream_export_destructive()
+            .try_acquire_export_destructive()
             .ok_or_else(|| OmniError::ResourceLimitExceeded {
                 resource: "stream_export_slots".to_string(),
                 limit: 1,
@@ -3133,10 +2595,10 @@ impl Omnigraph {
         ensure_public_branch_ref(name, "branch_create")?;
         let target = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
-        let _export_exclusion = self.reserve_stream_export_destructive_control()?;
+        let _export_exclusion = self.reserve_export_destructive_control()?;
         self.ensure_schema_state_valid().await?;
         let source = self.active_branch().await;
-        let relevant = [source.as_deref(), Some(target.as_str()), None];
+        let relevant = [source.as_deref(), Some(target.as_str())];
         // Native ref control follows the same closed barrier shape as data
         // writes: heal before accepting authority, then re-check under
         // schema -> source/target branch gates.
@@ -3145,46 +2607,29 @@ impl Omnigraph {
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
         )?;
-        let _stream_profile_guard = self.write_queue().acquire_stream_profile_shared().await;
-        if let Some(error) = self
-            .current_canonical_stream_profile()
-            .await?
-            .retired_error()
-        {
-            return Err(error);
-        }
-        let admission_keys = self.capture_branch_control_stream_admission_keys().await?;
-        let _stream_admission_guards = self
-            .write_queue()
-            .acquire_stream_shared_many(&admission_keys)
-            .await;
-        let control_branches = [source.clone(), Some(target.clone()), None];
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        let _branch_guards = self.write_queue().acquire_branches(&control_branches).await;
-        let _stream_token_guard = self.write_queue().acquire_stream_token().await;
+        let _branch_guards = self
+            .write_queue()
+            .acquire_branches(&[source.clone(), Some(target.clone())])
+            .await;
         self.ensure_schema_apply_not_locked("branch_create").await?;
         let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
-        let table_queue_keys =
-            self.table_queue_keys_for_branches(&control_branches, &control_catalog);
+        let table_queue_keys = self.table_queue_keys_for_branches(
+            &[source.clone(), Some(target.clone())],
+            &control_catalog,
+        );
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_no_pending_recovery_sidecars_under_gates(&relevant, "branch_create")
             .await?;
         self.ensure_schema_apply_not_locked("branch_create").await?;
         self.ensure_schema_state_valid().await?;
         let mut source_coord = self.open_coordinator_for_branch(source.as_deref()).await?;
-        let source_snapshot = source_coord.snapshot();
-        validate_bound_catalog_against_snapshot(&control_catalog, &source_snapshot)?;
-        Self::ensure_branch_control_stream_admission_covered(
-            "branch_create",
-            &admission_keys,
-            &source_snapshot,
-        )?;
+        validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())?;
         let branches = source_coord.all_branches().await?;
         Self::ensure_branch_create_namespace_safe(&target, &branches)?;
-        Self::ensure_branch_control_streams_sealed("branch_create", &source_snapshot)?;
         source_coord.branch_create(&target).await?;
         self.invalidate_read_caches().await;
         Ok(())
@@ -3211,34 +2656,6 @@ impl Omnigraph {
         name: &str,
         actor: Option<&str>,
     ) -> Result<()> {
-        self.branch_create_from_as_with_recovery_barrier(from, name, actor, true)
-            .await
-    }
-
-    /// Loader-only branch-create composition after its broad recovery barrier
-    /// and shared stream-profile admission are already held.
-    ///
-    /// Re-running the healer from that position could re-enter the profile
-    /// `RwLock` behind a queued exclusive transition and deadlock. The native
-    /// control still performs its normal final sidecar re-list under schema,
-    /// branch, token, and table gates before creating the ref.
-    pub(crate) async fn branch_create_from_as_after_recovery_barrier(
-        &self,
-        from: impl Into<ReadTarget>,
-        name: &str,
-        actor: Option<&str>,
-    ) -> Result<()> {
-        self.branch_create_from_as_with_recovery_barrier(from, name, actor, false)
-            .await
-    }
-
-    async fn branch_create_from_as_with_recovery_barrier(
-        &self,
-        from: impl Into<ReadTarget>,
-        name: &str,
-        actor: Option<&str>,
-        heal_recovery: bool,
-    ) -> Result<()> {
         let target = from.into();
         let source_branch = match &target {
             ReadTarget::Branch(b) => b.clone(),
@@ -3252,8 +2669,7 @@ impl Omnigraph {
             },
             actor,
         )?;
-        self.branch_create_from_impl(target, name, false, heal_recovery)
-            .await
+        self.branch_create_from_impl(target, name, false).await
     }
 
     async fn branch_create_from_impl(
@@ -3261,7 +2677,6 @@ impl Omnigraph {
         from: impl Into<ReadTarget>,
         name: &str,
         allow_internal_refs: bool,
-        heal_recovery: bool,
     ) -> Result<()> {
         let target = from.into();
         let ReadTarget::Branch(branch_name) = target else {
@@ -3276,48 +2691,29 @@ impl Omnigraph {
         let branch = normalize_branch_name(&branch_name)?;
         let target_branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
-        let _export_exclusion = self.reserve_stream_export_destructive_control()?;
+        let _export_exclusion = self.reserve_export_destructive_control()?;
         self.ensure_schema_state_valid().await?;
-        let relevant = [branch.as_deref(), Some(target_branch.as_str()), None];
-        if heal_recovery {
-            self.heal_pending_recovery_sidecars_for_write(&relevant)
-                .await?;
-        }
+        let relevant = [branch.as_deref(), Some(target_branch.as_str())];
+        self.heal_pending_recovery_sidecars_for_write(&relevant)
+            .await?;
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
         )?;
-        // Loader composition already retains this outermost gate. Direct
-        // branch control must acquire it here so terminal authority retirement
-        // can drain every graph writer before fixing the export cut.
-        let _stream_profile_guard = if heal_recovery {
-            Some(self.write_queue().acquire_stream_profile_shared().await)
-        } else {
-            None
-        };
-        if let Some(error) = self
-            .current_canonical_stream_profile()
-            .await?
-            .retired_error()
-        {
-            return Err(error);
-        }
-        let admission_keys = self.capture_branch_control_stream_admission_keys().await?;
-        let _stream_admission_guards = self
-            .write_queue()
-            .acquire_stream_shared_many(&admission_keys)
-            .await;
-        let control_branches = [branch.clone(), Some(target_branch.clone()), None];
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        let _branch_guards = self.write_queue().acquire_branches(&control_branches).await;
-        let _stream_token_guard = self.write_queue().acquire_stream_token().await;
+        let _branch_guards = self
+            .write_queue()
+            .acquire_branches(&[branch.clone(), Some(target_branch.clone())])
+            .await;
         self.ensure_schema_apply_not_locked("branch_create_from")
             .await?;
         let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
-        let table_queue_keys =
-            self.table_queue_keys_for_branches(&control_branches, &control_catalog);
+        let table_queue_keys = self.table_queue_keys_for_branches(
+            &[branch.clone(), Some(target_branch.clone())],
+            &control_catalog,
+        );
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_no_pending_recovery_sidecars_under_gates(&relevant, "branch_create_from")
             .await?;
@@ -3325,13 +2721,7 @@ impl Omnigraph {
             .await?;
         self.ensure_schema_state_valid().await?;
         let mut source_coord = self.open_coordinator_for_branch(branch.as_deref()).await?;
-        let source_snapshot = source_coord.snapshot();
-        validate_bound_catalog_against_snapshot(&control_catalog, &source_snapshot)?;
-        Self::ensure_branch_control_stream_admission_covered(
-            "branch_create_from",
-            &admission_keys,
-            &source_snapshot,
-        )?;
+        validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())?;
         let branches = source_coord.all_branches().await?;
         Self::ensure_branch_create_namespace_safe(&target_branch, &branches)?;
         // Operate on a freshly-opened source coordinator that's owned locally
@@ -3349,7 +2739,6 @@ impl Omnigraph {
         // handle issued it. Discarding `source_coord` after the call is the
         // right shape — the new branch is reachable from any subsequent
         // coordinator open.
-        Self::ensure_branch_control_streams_sealed("branch_create_from", &source_snapshot)?;
         source_coord.branch_create(&target_branch).await?;
         self.invalidate_read_caches().await;
         Ok(())
@@ -3380,37 +2769,22 @@ impl Omnigraph {
         ensure_public_branch_ref(name, "branch_delete")?;
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
-        let _export_exclusion = self.reserve_stream_export_destructive_control()?;
+        let _export_exclusion = self.reserve_export_destructive_control()?;
         self.ensure_schema_state_valid().await?;
         self.heal_pending_recovery_sidecars_for_branch_delete(&branch)
             .await?;
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
         )?;
-        let _stream_profile_guard = self.write_queue().acquire_stream_profile_shared().await;
-        if let Some(error) = self
-            .current_canonical_stream_profile()
-            .await?
-            .retired_error()
-        {
-            return Err(error);
-        }
-        let admission_keys = self.capture_branch_control_stream_admission_keys().await?;
-        let _stream_admission_guards = self
-            .write_queue()
-            .acquire_stream_shared_many(&admission_keys)
-            .await;
-        let control_branches = [Some(branch.clone()), None];
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        let _branch_guards = self.write_queue().acquire_branches(&control_branches).await;
-        let _stream_token_guard = self.write_queue().acquire_stream_token().await;
+        let _branch_guard = self.write_queue().acquire_branch(Some(&branch)).await;
         self.ensure_schema_apply_not_locked("branch_delete").await?;
         let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let table_queue_keys =
-            self.table_queue_keys_for_branches(&control_branches, &control_catalog);
+            self.table_queue_keys_for_branches(&[Some(branch.clone())], &control_catalog);
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_branch_delete_recovery_safe_under_gates(&branch)
             .await?;
@@ -3420,13 +2794,7 @@ impl Omnigraph {
         let mut target_control = self
             .open_coordinator_for_branch(Some(branch.as_str()))
             .await?;
-        let target_snapshot = target_control.snapshot();
-        validate_bound_catalog_against_snapshot(&control_catalog, &target_snapshot)?;
-        Self::ensure_branch_control_stream_admission_covered(
-            "branch_delete",
-            &admission_keys,
-            &target_snapshot,
-        )?;
+        validate_bound_catalog_against_snapshot(&control_catalog, &target_control.snapshot())?;
         let branches = target_control.branch_list().await?;
         if !branches.iter().any(|candidate| candidate == &branch) {
             return Err(OmniError::manifest_not_found(format!(
@@ -3437,7 +2805,6 @@ impl Omnigraph {
 
         self.ensure_branch_delete_safe(&target_control, &branch, &branches)
             .await?;
-        Self::ensure_branch_control_streams_sealed("branch_delete", &target_snapshot)?;
         self.delete_captured_branch_storage(&branch, &mut target_control)
             .await
     }
@@ -3777,8 +3144,7 @@ fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bo
 /// it can create, overwrite, or rebuild a physical graph table:
 ///
 /// - `ScalarType::Blob`'s `LargeBinary` placeholder becomes a blob-v2 field;
-/// - exactly the injected, non-null top-level `id` field is the Lance PK;
-/// - the internal-v9 nullable trusted-stream struct is appended once; and
+/// - exactly the injected, non-null top-level `id` field is the Lance PK; and
 /// - schema metadata and unrelated field metadata survive the reconstruction.
 ///
 /// RFC-023 makes this part of internal format v6. Older physical images are
@@ -3802,65 +3168,13 @@ fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
     Ok(())
 }
 
-/// Derive the warm public reflection catalog from one validated physical
-/// catalog. Keeping both views in the same `HandleSchemaView` publication
-/// preserves cheap `catalog()` snapshots without letting storage-protocol
-/// columns become SDK schema.
-fn public_catalog_view(physical: &Catalog) -> Result<Catalog> {
-    fn strip(schema: &Arc<Schema>, table_key: &str) -> Result<Arc<Schema>> {
-        let mut hidden_count = 0;
-        let fields = schema
-            .fields()
-            .iter()
-            .filter_map(|field| {
-                if field.name() == crate::db::STREAM_METADATA_COLUMN {
-                    hidden_count += 1;
-                    None
-                } else {
-                    Some(field.as_ref().clone())
-                }
-            })
-            .collect::<Vec<_>>();
-        if hidden_count != 1 {
-            return Err(OmniError::manifest_internal(format!(
-                "physical catalog for '{table_key}' must contain exactly one reserved field '{}'; found {hidden_count}",
-                crate::db::STREAM_METADATA_COLUMN
-            )));
-        }
-        Ok(Arc::new(Schema::new_with_metadata(
-            fields,
-            schema.metadata().clone(),
-        )))
-    }
-
-    let mut public = physical.clone();
-    for (name, node_type) in &mut public.node_types {
-        node_type.arrow_schema = strip(&node_type.arrow_schema, &format!("node:{name}"))?;
-    }
-    for (name, edge_type) in &mut public.edge_types {
-        edge_type.arrow_schema = strip(&edge_type.arrow_schema, &format!("edge:{name}"))?;
-    }
-    Ok(public)
-}
-
 fn physical_table_schema(
     schema: &Arc<Schema>,
     blob_properties: &HashSet<String>,
     table_key: &str,
 ) -> Result<Arc<Schema>> {
     let mut id_count = 0;
-    if schema
-        .fields()
-        .iter()
-        .any(|field| field.name() == crate::db::STREAM_METADATA_COLUMN)
-    {
-        return Err(OmniError::manifest_internal(format!(
-            "logical schema for '{table_key}' illegally supplies reserved field '{}'",
-            crate::db::STREAM_METADATA_COLUMN
-        )));
-    }
-
-    let mut fields = schema
+    let fields = schema
         .fields()
         .iter()
         .map(|field| {
@@ -3906,8 +3220,6 @@ fn physical_table_schema(
             "physical schema for '{table_key}' has a nullable `id` field"
         )));
     }
-
-    fields.push(crate::db::manifest::stream_token::trusted_stream_metadata_field());
 
     Ok(Arc::new(Schema::new_with_metadata(
         fields,
@@ -4047,198 +3359,12 @@ fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<Arc<Schema
 fn record_batch_row_to_json(batch: &RecordBatch, row: usize) -> Result<serde_json::Value> {
     let mut obj = serde_json::Map::new();
     for (i, field) in batch.schema().fields().iter().enumerate() {
-        if field.name() == crate::db::STREAM_METADATA_COLUMN {
-            continue;
-        }
         obj.insert(
             field.name().clone(),
             json_value_from_array(batch.column(i).as_ref(), row)?,
         );
     }
     Ok(serde_json::Value::Object(obj))
-}
-
-/// Canonical stream-payload encoding v1.
-///
-/// This deliberately writes object members in Arrow schema order instead of
-/// passing through `serde_json::Map`.  The latter changes iteration order when
-/// serde_json's `preserve_order` feature is unified into the workspace, which
-/// would make the same logical row derive a different durable stream token.
-/// The accepted schema hash already binds field types, so this encoding needs
-/// only a deterministic, lossless JSON representation of the normalized row.
-pub(super) fn canonical_stream_payload_v1(batch: &RecordBatch, row: usize) -> Result<Vec<u8>> {
-    canonical_stream_payload_v1_with_limit(
-        batch,
-        row,
-        crate::table_store::mem_wal::B2_MAX_CANONICAL_PAYLOAD_BYTES,
-    )
-}
-
-fn canonical_stream_payload_v1_with_limit(
-    batch: &RecordBatch,
-    row: usize,
-    byte_limit: u64,
-) -> Result<Vec<u8>> {
-    if row >= batch.num_rows() {
-        return Err(OmniError::manifest_internal(format!(
-            "canonical stream payload row {row} is outside a {}-row batch",
-            batch.num_rows()
-        )));
-    }
-    let limit = usize::try_from(byte_limit)
-        .map_err(|_| OmniError::manifest_internal("canonical stream payload cap exceeds usize"))?;
-    let mut writer = BoundedCanonicalWriter::new(limit);
-    let encoded = (|| -> Result<()> {
-        use std::io::Write as _;
-
-        writer.write_all(b"{").map_err(canonical_writer_error)?;
-        let mut first = true;
-        for (index, field) in batch.schema().fields().iter().enumerate() {
-            if field.name() == crate::db::STREAM_METADATA_COLUMN {
-                continue;
-            }
-            if !first {
-                writer.write_all(b",").map_err(canonical_writer_error)?;
-            }
-            first = false;
-            serde_json::to_writer(&mut writer, field.name()).map_err(canonical_json_error)?;
-            writer.write_all(b":").map_err(canonical_writer_error)?;
-            write_canonical_json_from_array(&mut writer, batch.column(index).as_ref(), row)?;
-        }
-        writer.write_all(b"}").map_err(canonical_writer_error)?;
-        Ok(())
-    })();
-    if writer.exceeded {
-        return Err(OmniError::resource_limit(
-            "stream_canonical_payload_bytes",
-            byte_limit,
-            u64::try_from(writer.attempted).unwrap_or(u64::MAX),
-        ));
-    }
-    encoded?;
-    Ok(writer.bytes)
-}
-
-struct BoundedCanonicalWriter {
-    bytes: Vec<u8>,
-    limit: usize,
-    attempted: usize,
-    exceeded: bool,
-}
-
-impl BoundedCanonicalWriter {
-    fn new(limit: usize) -> Self {
-        Self {
-            bytes: Vec::new(),
-            limit,
-            attempted: 0,
-            exceeded: false,
-        }
-    }
-}
-
-impl std::io::Write for BoundedCanonicalWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.attempted = self.bytes.len().saturating_add(bytes.len());
-        if self.attempted > self.limit {
-            self.exceeded = true;
-            return Err(std::io::Error::other(
-                "canonical stream payload exceeds its configured byte cap",
-            ));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn canonical_writer_error(error: std::io::Error) -> OmniError {
-    OmniError::manifest_internal(format!(
-        "failed to encode canonical stream payload: {error}"
-    ))
-}
-
-fn canonical_json_error(error: serde_json::Error) -> OmniError {
-    OmniError::manifest_internal(format!(
-        "failed to encode canonical stream payload: {error}"
-    ))
-}
-
-fn write_canonical_json_from_array(
-    writer: &mut BoundedCanonicalWriter,
-    array: &dyn Array,
-    row: usize,
-) -> Result<()> {
-    use std::io::Write as _;
-
-    if array.is_null(row) {
-        writer.write_all(b"null").map_err(canonical_writer_error)?;
-        return Ok(());
-    }
-    match array.data_type() {
-        DataType::List(_) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| OmniError::Lance("expected ListArray".to_string()))?;
-            write_canonical_json_list(writer, list.value(row).as_ref())
-        }
-        DataType::LargeList(_) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<LargeListArray>()
-                .ok_or_else(|| OmniError::Lance("expected LargeListArray".to_string()))?;
-            write_canonical_json_list(writer, list.value(row).as_ref())
-        }
-        DataType::FixedSizeList(_, _) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<FixedSizeListArray>()
-                .ok_or_else(|| OmniError::Lance("expected FixedSizeListArray".to_string()))?;
-            write_canonical_json_list(writer, list.value(row).as_ref())
-        }
-        DataType::Struct(fields) => {
-            let values = array
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| OmniError::Lance("expected StructArray".to_string()))?;
-            writer.write_all(b"{").map_err(canonical_writer_error)?;
-            for (index, field) in fields.iter().enumerate() {
-                if index != 0 {
-                    writer.write_all(b",").map_err(canonical_writer_error)?;
-                }
-                serde_json::to_writer(&mut *writer, field.name()).map_err(canonical_json_error)?;
-                writer.write_all(b":").map_err(canonical_writer_error)?;
-                write_canonical_json_from_array(writer, values.column(index).as_ref(), row)?;
-            }
-            writer.write_all(b"}").map_err(canonical_writer_error)?;
-            Ok(())
-        }
-        _ => {
-            let value = json_value_from_array(array, row)?;
-            serde_json::to_writer(writer, &value).map_err(canonical_json_error)
-        }
-    }
-}
-
-fn write_canonical_json_list(
-    writer: &mut BoundedCanonicalWriter,
-    values: &dyn Array,
-) -> Result<()> {
-    use std::io::Write as _;
-
-    writer.write_all(b"[").map_err(canonical_writer_error)?;
-    for index in 0..values.len() {
-        if index != 0 {
-            writer.write_all(b",").map_err(canonical_writer_error)?;
-        }
-        write_canonical_json_from_array(writer, values, index)?;
-    }
-    writer.write_all(b"]").map_err(canonical_writer_error)?;
-    Ok(())
 }
 
 fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Value> {
@@ -4414,7 +3540,6 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
 mod tests {
     use super::*;
     use crate::db::manifest::ManifestCoordinator;
-    use arrow_array::types::Int32Type;
     use async_trait::async_trait;
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
@@ -4434,80 +3559,6 @@ edge Knows: Person -> Person {
 }
 edge WorksAt: Person -> Company
 "#;
-
-    #[test]
-    fn canonical_stream_payload_v1_has_schema_ordered_known_answer() {
-        let nested_fields = vec![
-            Arc::new(Field::new("z_child", DataType::Utf8, false)),
-            Arc::new(Field::new("a_child", DataType::Int32, false)),
-        ];
-        let nested = StructArray::from(vec![
-            (
-                Arc::clone(&nested_fields[0]),
-                Arc::new(StringArray::from(vec!["nested"])) as Arc<dyn Array>,
-            ),
-            (
-                Arc::clone(&nested_fields[1]),
-                Arc::new(Int32Array::from(vec![9])) as Arc<dyn Array>,
-            ),
-        ]);
-        let list = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![Some(vec![
-            Some(1),
-            None,
-            Some(3),
-        ])]);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("z", DataType::Utf8, false),
-            Field::new("nil", DataType::Int32, true),
-            Field::new("integer", DataType::Int64, false),
-            Field::new("float", DataType::Float64, false),
-            Field::new("date", DataType::Date32, false),
-            Field::new("binary", DataType::Binary, false),
-            Field::new("list", list.data_type().clone(), false),
-            Field::new("struct", DataType::Struct(nested_fields.into()), false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["a\n\"b"])),
-                Arc::new(Int32Array::from(vec![None])),
-                Arc::new(Int64Array::from(vec![-4])),
-                Arc::new(Float64Array::from(vec![1.5])),
-                Arc::new(Date32Array::from(vec![7])),
-                Arc::new(BinaryArray::from_vec(vec![b"\x00\xff".as_slice()])),
-                Arc::new(list),
-                Arc::new(nested),
-            ],
-        )
-        .unwrap();
-
-        let encoded = canonical_stream_payload_v1(&batch, 0).unwrap();
-        assert_eq!(
-            String::from_utf8(encoded).unwrap(),
-            r#"{"z":"a\n\"b","nil":null,"integer":-4,"float":1.5,"date":7,"binary":"AP8=","list":[1,null,3],"struct":{"z_child":"nested","a_child":9}}"#
-        );
-    }
-
-    #[test]
-    fn canonical_stream_payload_v1_fails_with_typed_bound_before_retaining_excess() {
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
-            vec![Arc::new(StringArray::from(vec!["payload"]))],
-        )
-        .unwrap();
-        let error = canonical_stream_payload_v1_with_limit(&batch, 0, 8).unwrap_err();
-        assert!(
-            matches!(
-                error,
-                OmniError::ResourceLimitExceeded {
-                    ref resource,
-                    limit: 8,
-                    actual,
-                } if resource == "stream_canonical_payload_bytes" && actual > 8
-            ),
-            "{error:?}"
-        );
-    }
 
     #[derive(Debug)]
     struct RecordingStorageAdapter {
@@ -5057,157 +4108,6 @@ edge WorksAt: Person -> Company
             .unwrap();
         assert!(db.storage().has_btree_index(&ds, "id").await.unwrap());
         assert!(db.storage().has_fts_index(&ds, "name").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn schema_apply_refuses_open_stream_before_effect() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        db.enroll_stream_table_b1("node:Person", None)
-            .await
-            .unwrap();
-
-        let before = db.snapshot().await;
-        let before_manifest_version = before.version();
-        let before_person_version = before.entry("node:Person").unwrap().table_version;
-        let desired = TEST_SCHEMA.replace(
-            "    age: I32?\n}",
-            "    age: I32?\n    nickname: String?\n}",
-        );
-
-        let error = db.apply_schema(&desired).await.unwrap_err();
-        match error {
-            OmniError::Manifest(error) => assert!(matches!(
-                error.details,
-                Some(crate::error::ManifestConflictDetails::StreamLifecycleConflict {
-                    table_key,
-                    lifecycle,
-                    operation,
-                    ..
-                }) if table_key == "node:Person"
-                    && lifecycle == "OPEN"
-                    && operation == "schema_apply"
-            )),
-            other => panic!("expected typed stream lifecycle conflict, got {other:?}"),
-        }
-
-        let after = db.snapshot().await;
-        assert_eq!(after.version(), before_manifest_version);
-        assert_eq!(
-            after.entry("node:Person").unwrap().table_version,
-            before_person_version,
-            "schema apply must refuse before a table effect"
-        );
-        assert!(
-            crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
-                .await
-                .unwrap()
-                .is_empty(),
-            "schema apply lifecycle refusal must not arm recovery"
-        );
-    }
-
-    #[tokio::test]
-    async fn native_branch_controls_refuse_open_stream_and_allow_sealed() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
-        db.enroll_stream_table_b1("node:Person", None)
-            .await
-            .unwrap();
-
-        let create_error = db.branch_create("blocked-create").await.unwrap_err();
-        match create_error {
-            OmniError::Manifest(error) => assert!(matches!(
-                error.details,
-                Some(crate::error::ManifestConflictDetails::StreamLifecycleConflict {
-                    table_key,
-                    lifecycle,
-                    operation,
-                    ..
-                }) if table_key == "node:Person"
-                    && lifecycle == "OPEN"
-                    && operation == "branch_create"
-            )),
-            other => panic!("expected typed branch-create lifecycle conflict, got {other:?}"),
-        }
-
-        let create_from_error = db
-            .branch_create_from(ReadTarget::branch("main"), "blocked-create-from")
-            .await
-            .unwrap_err();
-        match create_from_error {
-            OmniError::Manifest(error) => assert!(matches!(
-                error.details,
-                Some(crate::error::ManifestConflictDetails::StreamLifecycleConflict {
-                    table_key,
-                    lifecycle,
-                    operation,
-                    ..
-                }) if table_key == "node:Person"
-                    && lifecycle == "OPEN"
-                    && operation == "branch_create_from"
-            )),
-            other => panic!("expected typed create-from lifecycle conflict, got {other:?}"),
-        }
-        assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
-
-        let mut manifest = ManifestCoordinator::open(uri).await.unwrap();
-        let current = manifest
-            .snapshot()
-            .stream_lifecycle(manifest.snapshot().entry("node:Person").unwrap().identity)
-            .cloned()
-            .unwrap();
-        let sealed = crate::db::manifest::stream::test_sealed_lifecycle_from(&current).unwrap();
-        manifest
-            .commit_changes(&[ManifestChange::SetStreamLifecycle {
-                expected: Some(current),
-                next: sealed,
-            }])
-            .await
-            .unwrap();
-
-        let person_identity = manifest.snapshot().entry("node:Person").unwrap().identity;
-        let admission_key = StreamAdmissionKey::for_resolved_ref(person_identity, None);
-        let exclusive = db
-            .write_queue()
-            .acquire_stream_exclusive(&admission_key)
-            .await;
-        let create_db = Arc::clone(&db);
-        let mut create =
-            tokio::spawn(async move { create_db.branch_create("sealed-control").await });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut create)
-                .await
-                .is_err(),
-            "branch create must wait behind the outer stream-admission lease"
-        );
-        drop(exclusive);
-        create.await.unwrap().unwrap();
-        assert!(
-            db.branch_list()
-                .await
-                .unwrap()
-                .contains(&"sealed-control".to_string())
-        );
-
-        let exclusive = db
-            .write_queue()
-            .acquire_stream_exclusive(&admission_key)
-            .await;
-        let delete_db = Arc::clone(&db);
-        let mut delete =
-            tokio::spawn(async move { delete_db.branch_delete("sealed-control").await });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut delete)
-                .await
-                .is_err(),
-            "branch delete must wait behind the outer stream-admission lease"
-        );
-        drop(exclusive);
-        delete.await.unwrap().unwrap();
-        assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
     }
 
     #[tokio::test]

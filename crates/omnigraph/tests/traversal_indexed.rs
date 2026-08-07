@@ -9,16 +9,21 @@
 
 mod helpers;
 
+use omnigraph::IndexCoverage;
 use omnigraph::db::Omnigraph;
 use omnigraph::instrumentation::with_traversal_mode;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph::IndexCoverage;
 use omnigraph_compiler::ir::ParamMap;
 
 use helpers::*;
 
 /// Run `name` on main under the cost-chooser (auto) Expand mode; first column sorted.
-async fn sorted_names(db: &mut Omnigraph, queries: &str, name: &str, params: &ParamMap) -> Vec<String> {
+async fn sorted_names(
+    db: &mut Omnigraph,
+    queries: &str,
+    name: &str,
+    params: &ParamMap,
+) -> Vec<String> {
     first_column_sorted(&query_main(db, queries, name, params).await.unwrap())
 }
 
@@ -27,7 +32,12 @@ async fn sorted_names(db: &mut Omnigraph, queries: &str, name: &str, params: &Pa
 /// scoped `with_traversal_mode` seam; the auto pass exercises `choose_expand_mode`
 /// end to end (whichever path it selects, the rows must match the forced paths —
 /// the chooser changes which path runs, never the result).
-async fn both_modes(db: &mut Omnigraph, queries: &str, name: &str, params: &ParamMap) -> Vec<String> {
+async fn both_modes(
+    db: &mut Omnigraph,
+    queries: &str,
+    name: &str,
+    params: &ParamMap,
+) -> Vec<String> {
     let csr = first_column_sorted(
         &with_traversal_mode("csr", query_main(db, queries, name, params))
             .await
@@ -117,7 +127,13 @@ async fn indexed_matches_csr_one_hop_same_type() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
     // friends_of: `$p knows $f` (Person -> Person, single hop).
-    let got = both_modes(&mut db, TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")])).await;
+    let got = both_modes(
+        &mut db,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Alice")]),
+    )
+    .await;
     assert_eq!(got, vec!["Bob", "Charlie"], "Alice knows Bob and Charlie");
 }
 
@@ -171,7 +187,13 @@ query connected($name: String) {
 }
 "#;
     // Alice: outgoing Bob, Charlie; incoming Diana (the fresh unindexed edge).
-    let got = both_modes(&mut db, queries, "connected", &params(&[("$name", "Alice")])).await;
+    let got = both_modes(
+        &mut db,
+        queries,
+        "connected",
+        &params(&[("$name", "Alice")]),
+    )
+    .await;
     assert_eq!(got, vec!["Bob", "Charlie", "Diana"]);
 }
 
@@ -215,7 +237,13 @@ async fn indexed_matches_csr_no_match() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
     // Diana has no outgoing Knows edges → empty in both modes.
-    let got = both_modes(&mut db, TEST_QUERIES, "friends_of", &params(&[("$name", "Diana")])).await;
+    let got = both_modes(
+        &mut db,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Diana")]),
+    )
+    .await;
     assert!(got.is_empty(), "Diana knows no one");
 }
 
@@ -241,7 +269,12 @@ async fn indexed_finds_unindexed_appended_edge() {
     let got = first_column_sorted(
         &with_traversal_mode(
             "indexed",
-            query_main(&mut db, TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")])),
+            query_main(
+                &mut db,
+                TEST_QUERIES,
+                "friends_of",
+                &params(&[("$name", "Alice")]),
+            ),
         )
         .await
         .unwrap(),
@@ -291,7 +324,9 @@ query reach($name: String) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-    load_jsonl(&mut db, DATA, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let got = both_modes(&mut db, QUERY, "reach", &params(&[("$name", "alice")])).await;
     assert_eq!(
@@ -328,7 +363,9 @@ async fn variable_hops_terminate_and_dedup_on_cycle() {
 {"edge":"Knows","from":"b","to":"c"}
 {"edge":"Knows","from":"c","to":"a"}"#;
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let got = both_modes(&mut db, REACH_5, "reach", &params(&[("$name", "a")])).await;
     // From a: b (1 hop), c (2 hops); the c->a back-edge hits the seeded source
@@ -347,7 +384,9 @@ async fn variable_hops_handle_self_loop() {
 {"edge":"Knows","from":"a","to":"a"}
 {"edge":"Knows","from":"a","to":"b"}"#;
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let got = both_modes(&mut db, REACH_5, "reach", &params(&[("$name", "a")])).await;
     // a->a hits the seeded source (pruned); only b is reached.

@@ -193,6 +193,7 @@ pub(crate) fn parse_cluster_config(config_dir: &Path) -> ParsedConfig {
 
     diagnostics.extend(duplicate_key_diagnostics(&text));
     diagnostics.extend(future_field_diagnostics(&text));
+    diagnostics.extend(removed_field_diagnostics(&text));
     if has_errors(&diagnostics) {
         return ParsedConfig {
             raw: None,
@@ -318,21 +319,12 @@ pub(crate) async fn observe_declared_graphs(
     for graph in &desired.graphs {
         let graph_address = graph_address(&graph.id);
         let schema_address = schema_address(&graph.id);
-        let streaming_address = streaming_address(&graph.id);
-        let prior_streaming_resource = state
-            .applied_revision
-            .resources
-            .get(&streaming_address)
-            .cloned();
-        let had_streaming_resource = prior_streaming_resource.is_some();
         let graph_uri = backend.graph_root(&graph.id);
         let observed_at = now_rfc3339();
 
         if !backend.graph_root_exists(&graph_uri).await {
             state.applied_revision.resources.remove(&graph_address);
             state.applied_revision.resources.remove(&schema_address);
-            state.applied_revision.resources.remove(&streaming_address);
-            state.resource_statuses.remove(&streaming_address);
             state.observations.insert(
                 graph_address.clone(),
                 graph_observation_json(GraphObservationJson {
@@ -344,11 +336,6 @@ pub(crate) async fn observe_declared_graphs(
                     schema_digest: None,
                     desired_schema_digest: &graph.schema_digest,
                     schema_matches_desired: Some(false),
-                    streaming_enabled: None,
-                    streaming_undrained: None,
-                    streaming_profile_mode: None,
-                    streaming_profile_revision: None,
-                    streaming_matches_desired: graph.streaming.map(|_| false),
                     error: Some("derived graph root is missing"),
                 }),
             );
@@ -366,15 +353,6 @@ pub(crate) async fn observe_declared_graphs(
                 "graph_missing",
                 "derived graph root is missing",
             );
-            if graph.streaming.is_some() {
-                set_resource_status(
-                    state,
-                    &streaming_address,
-                    ResourceLifecycleStatus::Drifted,
-                    "graph_missing",
-                    "derived graph root is missing",
-                );
-            }
             continue;
         }
 
@@ -388,68 +366,8 @@ pub(crate) async fn observe_declared_graphs(
                         applies_to: None,
                         embedding_provider: None,
                         embedding_profile: None,
-                        streaming_enabled: None,
-                        declaration_revision: None,
-                        profile_mode: None,
-                        profile_revision: None,
                     },
                 );
-                // Converge the streaming ledger row to ENGINE truth whenever
-                // the profile is managed, was managed, or is still live in a
-                // non-terminal mode. The last case is the crash-gap guard: an
-                // ENABLED/DISABLING manifest remains authoritative even when
-                // state.json never recorded (or later lost) its control row.
-                // Refresh must recreate that row so an absent declaration
-                // cannot silently abandon the only route to a safe disable.
-                let streaming_profile_is_active = !matches!(
-                    observation.streaming_profile_mode.as_str(),
-                    "DISABLED" | "RETIRED"
-                );
-                if graph.streaming.is_some()
-                    || had_streaming_resource
-                    || streaming_profile_is_active
-                {
-                    let (observed_digest, declaration_revision) =
-                        if observation.streaming_profile_mode == "RETIRED" {
-                            prior_streaming_resource
-                                .as_ref()
-                                .map(|resource| {
-                                    let digest = resource.digest.clone();
-                                    let declaration_revision = Some(
-                                        resource.declaration_revision.clone().unwrap_or_else(|| {
-                                            streaming_declaration_revision(&graph.id, &digest)
-                                        }),
-                                    );
-                                    (digest, declaration_revision)
-                                })
-                                .unwrap_or_else(|| {
-                                    let digest = streaming_digest(&graph.id, false);
-                                    let revision =
-                                        streaming_declaration_revision(&graph.id, &digest);
-                                    (digest, Some(revision))
-                                })
-                        } else {
-                            let digest = observed_streaming_digest(
-                                &graph.id,
-                                &observation.streaming_profile_mode,
-                            );
-                            let revision = streaming_declaration_revision(&graph.id, &digest);
-                            (digest, Some(revision))
-                        };
-                    state.applied_revision.resources.insert(
-                        streaming_address.clone(),
-                        StateResource {
-                            declaration_revision,
-                            digest: observed_digest,
-                            applies_to: None,
-                            embedding_provider: None,
-                            embedding_profile: None,
-                            streaming_enabled: Some(observation.streaming_enabled),
-                            profile_mode: Some(observation.streaming_profile_mode.clone()),
-                            profile_revision: Some(observation.streaming_profile_revision),
-                        },
-                    );
-                }
                 let query_digests = state_query_digests_for_graph(state, &graph.id);
                 let embedding_provider = state_graph_embedding_provider(state, &graph.id);
                 let embedding_provider_digest =
@@ -468,10 +386,6 @@ pub(crate) async fn observe_declared_graphs(
                         applies_to: None,
                         embedding_provider,
                         embedding_profile: None,
-                        streaming_enabled: None,
-                        declaration_revision: None,
-                        profile_mode: None,
-                        profile_revision: None,
                     },
                 );
                 state.observations.insert(
@@ -485,22 +399,6 @@ pub(crate) async fn observe_declared_graphs(
                         schema_digest: Some(observation.schema_digest.as_str()),
                         desired_schema_digest: &graph.schema_digest,
                         schema_matches_desired: Some(schema_matches),
-                        streaming_enabled: Some(observation.streaming_enabled),
-                        streaming_undrained: Some(observation.streaming_undrained),
-                        streaming_profile_mode: Some(
-                            observation.streaming_profile_mode.as_str(),
-                        ),
-                        streaming_profile_revision: Some(
-                            observation.streaming_profile_revision,
-                        ),
-                        streaming_matches_desired: graph
-                            .streaming
-                            .map(|desired| {
-                                streaming_mode_matches_desired(
-                                    &observation.streaming_profile_mode,
-                                    desired,
-                                )
-                            }),
                         error: None,
                     }),
                 );
@@ -523,30 +421,6 @@ pub(crate) async fn observe_declared_graphs(
                         "live schema digest differs from desired schema digest",
                     );
                 }
-                if let Some(desired_enabled) = graph.streaming {
-                    if streaming_mode_matches_desired(
-                        &observation.streaming_profile_mode,
-                        desired_enabled,
-                    ) {
-                        set_resource_status_applied(state, &streaming_address);
-                    } else {
-                        set_resource_status(
-                            state,
-                            &streaming_address,
-                            ResourceLifecycleStatus::Drifted,
-                            "streaming_mismatch",
-                            "live streaming enablement differs from desired streaming enablement",
-                        );
-                    }
-                } else if streaming_profile_is_active {
-                    set_resource_status(
-                        state,
-                        &streaming_address,
-                        ResourceLifecycleStatus::Drifted,
-                        "streaming_profile_must_disable_first",
-                        "live streaming profile is active without a managed declaration; add `streaming: false` and apply before unmanaging it",
-                    );
-                }
             }
             Err(error) => {
                 graph_error_count += 1;
@@ -561,11 +435,6 @@ pub(crate) async fn observe_declared_graphs(
                         schema_digest: None,
                         desired_schema_digest: &graph.schema_digest,
                         schema_matches_desired: None,
-                        streaming_enabled: None,
-                        streaming_undrained: None,
-                        streaming_profile_mode: None,
-                        streaming_profile_revision: None,
-                        streaming_matches_desired: None,
                         error: Some(error.as_str()),
                     }),
                 );
@@ -583,15 +452,6 @@ pub(crate) async fn observe_declared_graphs(
                     "graph_observation_error",
                     error.as_str(),
                 );
-                if graph.streaming.is_some() {
-                    set_resource_status(
-                        state,
-                        &streaming_address,
-                        ResourceLifecycleStatus::Error,
-                        "graph_observation_error",
-                        error.as_str(),
-                    );
-                }
             }
         }
     }
@@ -618,15 +478,6 @@ pub(crate) async fn preview_schema_migration(
 pub(crate) struct LiveGraphObservation {
     manifest_version: u64,
     schema_digest: String,
-    /// RFC-026 §4.7 P1: engine truth for the graph-wide streaming flag and
-    /// its drain state, read from the same snapshot with zero extra I/O.
-    /// Refresh converges the `streaming.<id>` ledger row to this value, so a
-    /// crashed apply or an out-of-band flip can never leave the ledger
-    /// permanently disagreeing with the graph.
-    streaming_enabled: bool,
-    streaming_undrained: bool,
-    streaming_profile_mode: String,
-    streaming_profile_revision: u64,
 }
 
 pub(crate) async fn observe_live_graph(graph_uri: &str) -> Result<LiveGraphObservation, String> {
@@ -638,14 +489,9 @@ pub(crate) async fn observe_live_graph(graph_uri: &str) -> Result<LiveGraphObser
         .await
         .map_err(|err| err.to_string())?;
     let schema_source = db.schema_source();
-    let streaming = snapshot.streaming_status();
     Ok(LiveGraphObservation {
         manifest_version: snapshot.version(),
         schema_digest: sha256_hex(schema_source.as_bytes()),
-        streaming_enabled: streaming.enabled,
-        streaming_undrained: streaming.undrained,
-        streaming_profile_mode: streaming.profile_mode.to_string(),
-        streaming_profile_revision: streaming.profile_revision,
     })
 }
 
@@ -658,11 +504,6 @@ pub(crate) struct GraphObservationJson<'a> {
     schema_digest: Option<&'a str>,
     desired_schema_digest: &'a str,
     schema_matches_desired: Option<bool>,
-    streaming_enabled: Option<bool>,
-    streaming_undrained: Option<bool>,
-    streaming_profile_mode: Option<&'a str>,
-    streaming_profile_revision: Option<u64>,
-    streaming_matches_desired: Option<bool>,
     error: Option<&'a str>,
 }
 
@@ -677,11 +518,6 @@ pub(crate) fn graph_observation_json(observation: GraphObservationJson<'_>) -> s
         "schema_digest": observation.schema_digest,
         "desired_schema_digest": observation.desired_schema_digest,
         "schema_matches_desired": observation.schema_matches_desired,
-        "streaming_enabled": observation.streaming_enabled,
-        "streaming_undrained": observation.streaming_undrained,
-        "streaming_profile_mode": observation.streaming_profile_mode,
-        "streaming_profile_revision": observation.streaming_profile_revision,
-        "streaming_matches_desired": observation.streaming_matches_desired,
         "error": observation.error,
     })
 }
@@ -776,26 +612,6 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                     ),
                 )),
             }
-        }
-
-        if let Some(enabled) = graph.streaming {
-            // Declared streaming converges like schema (a live engine call),
-            // so it gets its own first-class resource; the graph must exist
-            // before its flag can be applied.
-            let streaming_address = streaming_address(graph_id);
-            dependencies.insert(Dependency {
-                from: streaming_address.clone(),
-                to: graph_address.clone(),
-            });
-            resources.insert(
-                streaming_address.clone(),
-                ResourceSummary {
-                    address: streaming_address,
-                    kind: "streaming".to_string(),
-                    digest: streaming_digest(graph_id, enabled),
-                    path: None,
-                },
-            );
         }
 
         let schema_path = resolve_config_path(&config_dir, &graph.schema);
@@ -932,6 +748,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
     }
 
     let mut policy_bindings: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut policy_binding_owners: BTreeMap<String, String> = BTreeMap::new();
     for (policy_name, policy) in &raw.policies {
         validate_id(
             "policy name",
@@ -949,12 +766,16 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
 
         let policy_address = policy_address(policy_name);
         let mut normalized_bindings: Vec<String> = Vec::new();
+        let mut binds_cluster = false;
+        let mut graph_binding = None;
         for (idx, target) in policy.applies_to.iter().enumerate() {
             match normalize_policy_target(target) {
                 PolicyTarget::Cluster => {
+                    binds_cluster = true;
                     normalized_bindings.push("cluster".to_string());
                 }
                 PolicyTarget::Graph(graph_id) => {
+                    graph_binding.get_or_insert_with(|| graph_id.clone());
                     normalized_bindings.push(graph_address(&graph_id));
                     if raw.graphs.contains_key(&graph_id) {
                         dependencies.insert(Dependency {
@@ -981,20 +802,71 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
 
         normalized_bindings.sort();
         normalized_bindings.dedup();
-        policy_bindings.insert(policy_address.clone(), normalized_bindings);
+
+        let mixes_binding_kinds = binds_cluster && graph_binding.is_some();
+        if mixes_binding_kinds {
+            diagnostics.push(Diagnostic::error(
+                "policy_mixed_binding_kinds",
+                format!("policies.{policy_name}.applies_to"),
+                "one policy bundle cannot bind both `cluster` and graph scopes; split server and graph rules into separate bundles",
+            ));
+        }
+        for binding in &normalized_bindings {
+            match policy_binding_owners.entry(binding.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(policy_name.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    diagnostics.push(Diagnostic::error(
+                        "duplicate_policy_binding",
+                        format!("policies.{policy_name}.applies_to"),
+                        format!(
+                            "policy bundles `{}` and `{policy_name}` both bind `{binding}`; merge them or leave exactly one bundle for that scope",
+                            entry.get()
+                        ),
+                    ));
+                }
+            }
+        }
 
         let policy_path = resolve_config_path(&config_dir, &policy.file);
-        match fs::read(&policy_path) {
-            Ok(bytes) => {
+        match fs::read_to_string(&policy_path) {
+            Ok(source) => {
                 resources.insert(
                     policy_address.clone(),
                     ResourceSummary {
-                        address: policy_address,
+                        address: policy_address.clone(),
                         kind: "policy".to_string(),
-                        digest: sha256_hex(&bytes),
+                        digest: sha256_hex(source.as_bytes()),
                         path: Some(display_path(&policy_path)),
                     },
                 );
+                let validation =
+                    omnigraph_policy::PolicyConfig::from_source(&source).and_then(|_| {
+                        match (binds_cluster, graph_binding.as_deref()) {
+                            (true, None) => {
+                                omnigraph_policy::PolicyEngine::load_server_from_source(&source)
+                                    .map(|_| ())
+                            }
+                            (false, Some(graph_id)) => {
+                                omnigraph_policy::PolicyEngine::load_graph_from_source(
+                                    &source, graph_id,
+                                )
+                                .map(|_| ())
+                            }
+                            // Binding diagnostics above own the mixed/empty cases. Still parse the
+                            // source strictly, but do not pretend one policy can have both runtime
+                            // kinds or choose an arbitrary kind for an unbound bundle.
+                            _ => Ok(()),
+                        }
+                    });
+                if let Err(err) = validation {
+                    diagnostics.push(Diagnostic::error(
+                        "policy_invalid",
+                        format!("policies.{policy_name}.file"),
+                        format!("policy file '{}' is invalid: {err}", policy_path.display()),
+                    ));
+                }
             }
             Err(err) => diagnostics.push(Diagnostic::error(
                 "policy_file_missing",
@@ -1005,6 +877,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                 ),
             )),
         }
+        policy_bindings.insert(policy_address, normalized_bindings);
     }
 
     let mut resource_digests = BTreeMap::new();
@@ -1024,10 +897,6 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                 .cloned()
                 .unwrap_or_default(),
             embedding_provider: graph_embedding_providers.get(graph_id).cloned(),
-            streaming: raw
-                .graphs
-                .get(graph_id)
-                .and_then(|graph| graph.streaming),
         })
         .collect();
     let config_digest = desired_config_digest(&raw, &resource_digests);
@@ -1091,6 +960,33 @@ pub(crate) fn validate_query_source(
             err.to_string(),
         )),
     }
+}
+
+/// Keys that existed in an unreleased development line and were removed.
+///
+/// `GraphConfig` is `deny_unknown_fields`, so a stale key already fails — but
+/// with a raw serde message that reads like a typo. Name the removal instead,
+/// so an operator carrying a development `cluster.yaml` is told what happened
+/// and what to do.
+pub(crate) fn removed_field_diagnostics(text: &str) -> Vec<Diagnostic> {
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+        return Vec::new();
+    };
+    let Some(graphs) = value.get("graphs").and_then(|graphs| graphs.as_mapping()) else {
+        return Vec::new();
+    };
+    graphs
+        .iter()
+        .filter_map(|(id, decl)| {
+            let id = id.as_str()?;
+            decl.as_mapping()?.get("streaming")?;
+            Some(Diagnostic::error(
+                "removed_streaming_declaration",
+                format!("graphs.{id}.streaming"),
+                "`streaming` was removed: the MemWAL firehose is gone and graphs no longer carry a stream profile. Delete this key. A graph written by a development build that had it must be exported with that build and rebuilt.".to_string(),
+            ))
+        })
+        .collect()
 }
 
 pub(crate) fn future_field_diagnostics(text: &str) -> Vec<Diagnostic> {
@@ -1189,64 +1085,6 @@ pub(crate) fn policy_address(policy_name: &str) -> String {
 
 pub(crate) fn embedding_provider_address(provider_name: &str) -> String {
     format!("provider.embedding.{provider_name}")
-}
-
-/// RFC-026 §4.7 P1: the per-graph streaming-enablement resource. A dedicated
-/// address (not a fold into `graph.<id>`'s composite digest) because a
-/// `graph.<id>` Update classifies `Derived` and would "converge" in the
-/// ledger without the required engine call.
-pub(crate) fn streaming_address(graph_id: &str) -> String {
-    format!("streaming.{graph_id}")
-}
-
-pub(crate) fn streaming_digest(graph_id: &str, enabled: bool) -> String {
-    format!(
-        "sha256:{}",
-        sha256_hex(format!("streaming\0{graph_id}\0{enabled}").as_bytes())
-    )
-}
-
-/// Stable resource-local revision for one exact streaming declaration.
-///
-/// The global config digest advances for unrelated schemas, policies, and
-/// graphs. Binding runtime delegation to that global digest would invalidate
-/// an otherwise unchanged enabled graph without any supported renewal
-/// transition. This domain-separated revision changes only with this graph's
-/// declaration digest and can therefore be reconstructed by refresh.
-pub(crate) fn streaming_declaration_revision(
-    graph_id: &str,
-    declaration_digest: &str,
-) -> String {
-    sha256_hex(
-        format!(
-            "omnigraph.cluster.streaming-declaration-revision.v1\0{graph_id}\0{declaration_digest}"
-        )
-        .as_bytes(),
-    )
-}
-
-pub(crate) fn observed_streaming_digest(graph_id: &str, profile_mode: &str) -> String {
-    match profile_mode {
-        "ENABLED" => streaming_digest(graph_id, true),
-        "DISABLED" => streaming_digest(graph_id, false),
-        // Intermediate/terminal exceptional modes must never collide with a
-        // desired boolean digest. `DISABLING` therefore remains a visible
-        // Update until checked offline apply finishes its durable plan.
-        other => format!(
-            "sha256:{}",
-            sha256_hex(format!("streaming-mode\0{graph_id}\0{other}").as_bytes())
-        ),
-    }
-}
-
-pub(crate) fn streaming_mode_matches_desired(
-    profile_mode: &str,
-    desired_enabled: bool,
-) -> bool {
-    matches!(
-        (profile_mode, desired_enabled),
-        ("ENABLED", true) | ("DISABLED" | "RETIRED", false)
-    )
 }
 
 pub(crate) fn resolve_config_path(config_dir: &Path, path: &Path) -> PathBuf {

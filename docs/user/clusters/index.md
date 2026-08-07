@@ -143,7 +143,6 @@ What each change kind does:
 | a policy file | `Update policy.<n>` | same — new blob, ledger update |
 | a policy's `applies_to` | `Update policy.<n> [bindings]` | records the new bindings (the file digest is unchanged; bindings are first-class changes) |
 | a `.pg` schema | `Update schema.<g>` **with the real migration steps embedded** | runs the engine's schema apply on the live graph — soft drops only, sidecar-fenced |
-| `graphs.<g>.streaming` changes | `Create/Update streaming.<g>` | only after writers are stopped: requires `--as <actor> --confirm-stream-offline` and the state lock; publishes graph-owned profile authority |
 | `graphs:` gains an entry | `Create graph.<g>` (+ schema, queries) | initializes the graph at its derived root; dependents apply in the same run |
 | `graphs:` loses an entry | `Delete graph.<g>` — **blocked, `approval_required`** | nothing, until approved (see §4) |
 
@@ -160,170 +159,6 @@ Read the plan before applying when the change is non-trivial — for schema
 updates it embeds the engine's actual migration plan (`add_property`,
 `drop_property [soft]`, `unsupported: …`), so you see data impact before
 anything runs.
-
-### Experimental streaming profile: stop → apply → restart
-
-A streaming-profile change has a stricter process topology than an ordinary
-catalog edit:
-
-```bash
-# 1. Gracefully stop every writer-capable process for the affected graph.
-# 2. Apply while holding the normal state lock and attest the offline handoff.
-omnigraph cluster apply --config company-brain \
-  --as andrew --confirm-stream-offline
-# 3. Restart the cluster server after apply exits.
-```
-
-The confirmation flag is an explicit operator attestation, not a distributed
-lease. `state.lock: false` refuses a profile change, and running this apply
-concurrently with a writer server is unsupported.
-
-The apply actor must pass `stream_manage` under both the currently applied
-graph policy and the desired graph policy. If only one revision binds a
-policy, that policy governs; a simultaneous policy change must be allowed by
-both sides until the state CAS publishes the desired revision. If one side
-would deny the profile transition, split the work: grant first and change the
-profile second, or change the profile first and revoke the grant second. A
-blocked profile transition also blocks current- or desired-bound policy
-changes for that graph, preserving the currently applied policy authority for
-the retry instead of landing a simultaneous revoke.
-
-The retained profile receipt is also bound to the original apply actor. Retry
-a lost result with the same `--as` value. If that identity is unavailable
-after the graph effect landed but the state CAS did not, use `cluster refresh`
-to reconcile the ledger from manifest truth before replanning under another
-actor; a different actor cannot adopt the original receipt directly.
-
-In this release, `streaming: true` is not additive to the existing direct
-writer surfaces: it makes embedded SDK and direct `--store`
-Mutation/Load/delete fail before input reads or durable
-effects. Existing served mutations work only through the restarted
-cluster-booted server's checked runtime authority. Graph-native producers use
-the served [`/stream/ingest` firehose](../operations/server.md#streaming), which
-keeps physical datasets and lanes private. Ingest admits absent or `OPEN`
-internal declarations. After disable/re-enable, run the graph-wide served
-`omnigraph stream resume`; it opens every `SEALED` declaration and exposes no
-per-type, table, or lane selector. Branch merge remains refused while the profile is `ENABLED` or
-`DISABLING`, including through the checked server runtime. A later explicit
-`streaming: false` offline apply publishes `DISABLING`, derives one finite
-manifest lane cut, and serially drains `OPEN`, goal-`SEALED`, and adopted
-`OPEN_AFTER_FOLD` lanes. A selected `DataBlock` leaves the apply pending until
-stopped/offline correction and a retry. Only the no-lane case restores the
-direct physical lane. A disabled enrolled graph remains a checked
-served/export state; resume is available only after the profile is enabled and
-the cluster-booted server is restarted.
-
-The sealed window is also the supported maintenance window. After applying
-`streaming: true` and restarting—but before `stream resume`—run
-`stream maintenance ensure-indices` and/or `stream maintenance optimize`.
-These controls operate on the whole graph through the existing coordinated
-manifest/recovery paths. They do not accept a declaration selector and return
-only aggregate results. Resume is convergent rather than a new all-dataset
-transaction: it preflights the complete graph, then reopens internal
-declarations in deterministic order; if an unexpected race interrupts the
-sequence, retrying the same graph-level command skips declarations already
-`OPEN` and continues the remainder.
-
-### Strict drain blocks: inspect → correct → retry
-
-When a strict drain reports a `DataBlock`, stop every writer-capable process
-and inspect the exact blocked cut through the cluster control plane:
-
-```bash
-omnigraph --graph knowledge --as andrew \
-  cluster stream block show \
-  --config company-brain --block-token <token> \
-  --confirm-stream-offline --json
-
-omnigraph --graph knowledge --as andrew \
-  cluster stream block correct \
-  --config company-brain --block-token <token> \
-  --correction-id <uuid> --expected-lifecycle-revision <revision> \
-  --plan correction.json --confirm-stream-offline --json
-```
-
-`show` reconstructs validator evidence from the retained immutable WAL
-generation and returns a bounded page; the opaque block token resolves the
-affected internal declaration, so the user never supplies a type/table/lane
-selector. Follow `next_cursor` until it is absent.
-Build an ordered plan that chooses `REPLACE` or `WITHDRAW` for the entries it
-changes; unmentioned keys retain their blocked winner, and the resulting
-complete overlay must clear every violation. `correct` revalidates the block,
-profile revision, predecessor tokens, and complete corrected overlay before
-any graph effect. It then publishes the
-base rows, token dispositions, lifecycle state, and graph commit together under
-one correction UUID. Repeating the same actor, UUID, and plan returns the
-durable receipt; reusing the UUID for a different plan is refused. The cluster
-state lock plus `--confirm-stream-offline` bind the stopped-writer protocol,
-but do not replace the operator's responsibility to stop all processes first.
-
-### Current dead letters: list or export payloads
-
-When a fold diverts a data conflict, the key's selected current token becomes
-`DEAD_LETTERED`. With writers stopped, list the sequencing evidence or export
-descriptor-verified canonical payloads in bounded pages:
-
-```bash
-omnigraph --graph knowledge --as andrew \
-  cluster stream dead-letter list \
-  --config company-brain --confirm-stream-offline --json
-
-omnigraph --graph knowledge --as andrew \
-  cluster stream dead-letter export \
-  --config company-brain --confirm-stream-offline --json
-```
-
-Follow `next_cursor` with `--cursor` until it is absent. Both commands pin the
-manifest-selected token version; export verifies the recovery-owned object
-descriptor and does not prefix-list storage. Payload export is an inspection
-artifact, not replay or import. Each entry names its logical node/edge
-declaration while keeping the physical table and dataset private. A fresh ordinary stream occurrence can restore
-`PRESENT` by naming the terminal token as predecessor.
-The graph-native `stream ingest` command and
-`POST /graphs/{graph_id}/stream/ingest` route can submit that occurrence while
-the enabled lane is absent or `OPEN`; payload export itself does not replay it
-automatically. If the declaration is `SEALED`, re-enable/restart the served
-graph and run graph-wide `stream resume` before submitting the successor.
-Retirement and rebuild remain the irreversible exit when terminal sequencing
-authority must be discarded for export.
-
-### Terminal authority retirement: plan → confirm → rebuild
-
-If a graph has current `WITHDRAWN` or `DEAD_LETTERED` sequencing authority,
-ordinary export refuses rather than silently discarding it. After stopping every writer and
-reaching exact `DISABLED` with every enrolled lane `SEALED`, use the separate
-cluster-only retirement handshake:
-
-```bash
-omnigraph --graph knowledge --as andrew \
-  cluster stream retire-for-rebuild plan \
-  --config company-brain --confirm-stream-offline --json
-
-omnigraph --graph knowledge --as andrew \
-  cluster stream retire-for-rebuild confirm \
-  --config company-brain \
-  --retirement-id <uuid> \
-  --expected-plan-digest <sha256:...> \
-  --confirm-stream-offline --json
-```
-
-The plan is read-only and also proves the state lock, applied graph mapping,
-settled recovery, base/token parity, and exact frozen graph cut. Confirmation
-is irreversible: it records one actor- and plan-bound receipt and makes the
-source permanently read/query/status/export-only. Export then includes that
-root receipt and a closed witness naming the selected frozen branch member as
-provenance for loading logical rows into a fresh graph identity; it does not
-transfer live sequencing authority. A graph with only `PRESENT`
-tokens uses ordinary export. See the [upgrade guide](../operations/upgrade.md)
-for the full procedure.
-
-For an enrolled source, terminal state is necessary but direct storage access
-is not sufficient authority. Keep `streaming: false` applied, restart
-`omnigraph-server` from that exact cluster directory, and run `omnigraph export
---server <name-or-url> --graph <id> > graph.jsonl`. The server re-proves the
-`DISABLED | RETIRED` cut before `200`; `RETIRED` emits its provenance first.
-Discard any partial file if body streaming fails. Initialize and load a fresh
-target root—never load the artifact back over the enrolled source.
 
 ## 3. Inspect: status, refresh, drift
 
@@ -405,7 +240,7 @@ applied revision is not safely servable. Each refusal names its remedy:
 | `catalog_payload_missing` / `…_digest_mismatch` | catalog blob lost or tampered | `cluster refresh`, then `apply`, restart |
 | `policy_bindings_missing` | ledger predates binding metadata | re-run `cluster apply` (backfills), restart |
 | `cluster_empty` | applied revision has no graphs | apply a cluster with ≥1 graph |
-| multiple bundles bind one scope | serving holds one policy bundle per graph + one server-level | split or merge bundles |
+| multiple bundles bind one scope | legacy/tampered state violates the one-bundle-per-scope contract now enforced before apply | merge the rules into one bundle and re-run `cluster apply` |
 
 A held *state lock* is deliberately **not** a boot error — the server reads
 the atomically-replaced ledger without locking, so serving never contends

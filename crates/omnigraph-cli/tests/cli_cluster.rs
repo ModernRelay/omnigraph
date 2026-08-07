@@ -1,4 +1,4 @@
-//! Cluster command surface: validate/plan/apply/approve/status/sync/force-unlock/stream control.
+//! Cluster command surface: validate/plan/apply/approve/status/sync/force-unlock.
 //! Moved verbatim from tests/cli.rs in the modularization.
 
 use std::fs;
@@ -26,6 +26,115 @@ fn cluster_validate_config_success() {
 }
 
 #[test]
+fn cluster_validate_rejects_semantically_invalid_policy() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    fs::write(
+        temp.path().join("base.policy.yaml"),
+        r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: invalid-invoke-scope
+    allow:
+      actors: { group: team }
+      actions: [invoke_query]
+      branch_scope: any
+"#,
+    )
+    .unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(temp.path()),
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("ERROR policy_invalid policies.base.file"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("branch_scope") && stdout.contains("invoke_query"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn cluster_validate_rejects_policy_binding_kind_mismatch() {
+    for (applies_to, action, scope, expected_kind) in [
+        ("knowledge", "graph_list", "", "server-scoped"),
+        ("cluster", "read", "      branch_scope: any\n", "per-graph"),
+    ] {
+        let temp = tempdir().unwrap();
+        write_cluster_config_fixture(temp.path());
+        let config_path = temp.path().join("cluster.yaml");
+        let config = fs::read_to_string(&config_path).unwrap().replace(
+            "applies_to: [knowledge]",
+            &format!("applies_to: [{applies_to}]"),
+        );
+        fs::write(config_path, config).unwrap();
+        fs::write(
+            temp.path().join("base.policy.yaml"),
+            format!(
+                r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: wrong-kind
+    allow:
+      actors: {{ group: team }}
+      actions: [{action}]
+{scope}"#
+            ),
+        )
+        .unwrap();
+
+        let output = output_failure(
+            cli()
+                .arg("cluster")
+                .arg("validate")
+                .arg("--config")
+                .arg(temp.path()),
+        );
+        let stdout = stdout_string(&output);
+        assert!(
+            stdout.contains("ERROR policy_invalid policies.base.file"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(expected_kind) && stdout.contains(action),
+            "{stdout}"
+        );
+    }
+
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let config_path = temp.path().join("cluster.yaml");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "applies_to: [knowledge]",
+        "applies_to: [cluster, knowledge]",
+    );
+    fs::write(config_path, config).unwrap();
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(temp.path()),
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("ERROR policy_mixed_binding_kinds policies.base.applies_to"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn cluster_validate_json_is_stable() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
@@ -41,9 +150,6 @@ fn cluster_validate_json_is_stable() {
     assert_eq!(json["ok"], true);
     assert!(json["resource_digests"]["graph.knowledge"].is_string());
     assert!(json["resource_digests"]["query.knowledge.find_person"].is_string());
-    // The fixture declares `streaming: true`, so the §4.7 P1 first-class
-    // resource is part of the stable validate shape.
-    assert!(json["resource_digests"]["streaming.knowledge"].is_string());
     assert_eq!(json["dependencies"][0]["from"], "policy.base");
     assert_eq!(json["dependencies"][0]["to"], "graph.knowledge");
 }
@@ -722,7 +828,6 @@ fn cluster_apply_uses_operator_actor_from_omnigraph_home() {
             .arg("apply")
             .arg("--config")
             .arg(temp.path())
-            .arg("--confirm-stream-offline")
             .arg("--json")
             .output()
             .unwrap();
@@ -766,9 +871,6 @@ fn cluster_approve_uses_operator_actor_fallback() {
             .arg(subcommand)
             .arg("--config")
             .arg(temp.path());
-        if subcommand == "apply" {
-            command.arg("--confirm-stream-offline");
-        }
         let output = command.output().unwrap();
         assert!(output.status.success(), "cluster {subcommand} failed");
     }
@@ -820,7 +922,6 @@ fn cluster_commands_ignore_legacy_omnigraph_yaml() {
     // `operator.actor`, then to none (no loud failure on absence).
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
-    remove_streaming_from_cluster_fixture(temp.path());
     fs::write(temp.path().join("omnigraph.yaml"), "{{{{ not yaml").unwrap();
 
     for command in ["validate", "plan", "status"] {
@@ -989,7 +1090,7 @@ fn applied_two_graph_cluster() -> tempfile::TempDir {
         "node Person {\n  name: String @key\n  age: I32?\n}\n",
     )
     .unwrap();
-    fs::write(root.join("base.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(root.join("base.policy.yaml"), "version: 1\nrules: []\n").unwrap();
     fs::write(
         root.join("cluster.yaml"),
         r#"
@@ -1142,209 +1243,5 @@ fn optimize_by_cluster_works_when_catalog_payloads_are_degraded() {
     assert!(
         parse_stdout_json(&out)["tables"].as_array().is_some(),
         "optimize should resolve via the ledger despite degraded catalog payloads"
-    );
-}
-
-#[test]
-fn cluster_stream_retirement_requires_graph_and_accepts_only_config_scope() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-
-    let missing_graph = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-cluster-test")
-            .arg("cluster")
-            .arg("stream")
-            .arg("retire-for-rebuild")
-            .arg("plan")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--confirm-stream-offline"),
-    );
-    let stderr = String::from_utf8_lossy(&missing_graph.stderr);
-    assert!(stderr.contains("requires --graph"), "{stderr}");
-
-    let wrong_cluster_scope = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-cluster-test")
-            .arg("--graph")
-            .arg("knowledge")
-            .arg("--cluster")
-            .arg(temp.path())
-            .arg("cluster")
-            .arg("stream")
-            .arg("retire-for-rebuild")
-            .arg("plan")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--confirm-stream-offline"),
-    );
-    let stderr = String::from_utf8_lossy(&wrong_cluster_scope.stderr);
-    assert!(stderr.contains("--cluster"), "{stderr}");
-    assert!(stderr.contains("does not apply"), "{stderr}");
-}
-
-#[test]
-fn cluster_stream_retirement_reports_structured_offline_preflight_errors() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-
-    let output = output_failure(
-        cli()
-            .arg("--graph")
-            .arg("knowledge")
-            .arg("cluster")
-            .arg("stream")
-            .arg("retire-for-rebuild")
-            .arg("plan")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json"),
-    );
-    let json = parse_stdout_json(&output);
-    let codes = json["diagnostics"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|diagnostic| diagnostic["code"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert!(codes.contains(&"stream_authority_retirement_actor_required"));
-    assert!(codes.contains(&"streaming_offline_confirmation_required"));
-    assert!(!temp.path().join("__cluster/lock.json").exists());
-}
-
-#[test]
-fn cluster_stream_block_requires_graph_and_accepts_only_config_scope() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-
-    let missing_graph = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-cluster-test")
-            .arg("cluster")
-            .arg("stream")
-            .arg("block")
-            .arg("show")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--block-token")
-            .arg("block-1")
-            .arg("--confirm-stream-offline"),
-    );
-    let stderr = String::from_utf8_lossy(&missing_graph.stderr);
-    assert!(stderr.contains("requires --graph"), "{stderr}");
-
-    let wrong_cluster_scope = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-cluster-test")
-            .arg("--graph")
-            .arg("knowledge")
-            .arg("--cluster")
-            .arg(temp.path())
-            .arg("cluster")
-            .arg("stream")
-            .arg("block")
-            .arg("show")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--block-token")
-            .arg("block-1")
-            .arg("--confirm-stream-offline"),
-    );
-    let stderr = String::from_utf8_lossy(&wrong_cluster_scope.stderr);
-    assert!(stderr.contains("--cluster"), "{stderr}");
-    assert!(stderr.contains("does not apply"), "{stderr}");
-}
-
-#[test]
-fn cluster_stream_block_reports_structured_offline_preflight_errors() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-
-    let output = output_failure(
-        cli()
-            .arg("--graph")
-            .arg("knowledge")
-            .arg("cluster")
-            .arg("stream")
-            .arg("block")
-            .arg("show")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--block-token")
-            .arg("block-1")
-            .arg("--json"),
-    );
-    let json = parse_stdout_json(&output);
-    let codes = json["diagnostics"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|diagnostic| diagnostic["code"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert!(codes.contains(&"stream_block_actor_required"));
-    assert!(codes.contains(&"streaming_offline_confirmation_required"));
-    assert!(!temp.path().join("__cluster/lock.json").exists());
-}
-
-#[test]
-fn cluster_stream_block_correct_rejects_unknown_plan_fields_before_preflight() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-    let plan = temp.path().join("correction.json");
-    fs::write(&plan, r#"{"version":1,"actions":[],"unexpected":true}"#).unwrap();
-
-    let output = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-cluster-test")
-            .arg("--graph")
-            .arg("knowledge")
-            .arg("cluster")
-            .arg("stream")
-            .arg("block")
-            .arg("correct")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--block-token")
-            .arg("block-1")
-            .arg("--correction-id")
-            .arg("00000000-0000-4000-8000-000000000001")
-            .arg("--expected-lifecycle-revision")
-            .arg("1")
-            .arg("--plan")
-            .arg(&plan)
-            .arg("--confirm-stream-offline"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unknown field `unexpected`"), "{stderr}");
-    assert!(
-        !temp.path().join("__cluster/lock.json").exists(),
-        "plan parsing must precede cluster preflight"
-    );
-}
-
-#[test]
-fn cluster_stream_block_rejects_the_old_per_table_selector() {
-    let output = output_failure(
-        cli()
-            .arg("--graph")
-            .arg("knowledge")
-            .arg("cluster")
-            .arg("stream")
-            .arg("block")
-            .arg("show")
-            .arg("node:Person")
-            .arg("--block-token")
-            .arg("block-1"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("unexpected argument 'node:Person'"),
-        "{stderr}"
     );
 }

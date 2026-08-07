@@ -1,5 +1,9 @@
 # WAL Thinking
 
+> **Historical record — rejected architecture.** These notes explain the
+> RFC-018/026 experiment; they are not current product guidance. See
+> [the current direct graph-batch decision](wal-removal.md).
+
 Working notes, updated 2026-08-04. Plain-language grounding for the WAL/streaming
 discussion ([RFC-018](../rfcs/0018-ingest-wal.md) →
 [RFC-026](../rfcs/0026-memwal-streaming-ingest.md)). Three parts: the
@@ -7,7 +11,7 @@ contract difference between an interactive graph commit and durable stream
 admission, the expected performance shape and evidence still required, and the
 build inventory.
 
-Current boundary: RFC-026 Phase A, the Phase-B1 private core, private B2a
+Historical boundary at archival time: RFC-026 Phase A, the Phase-B1 private core, private B2a
 retain-all, the common-B2 compare-and-chain core, bounded profile authority,
 hidden lifecycle-v3 quiescence, private resume/maintenance, checked offline
 physical rebind, terminal authority retirement/export, and stopped/offline
@@ -360,9 +364,9 @@ complete end-to-end call count:
 - those counters overlap and do not identify sequential critical-path hops, so
   they cannot be added into a truthful “12 calls per write” result.
 
-See [`write_cost.rs`](../../crates/omnigraph/tests/write_cost.rs) and
-[`memwal_stream_cost.rs`](../../crates/omnigraph/tests/memwal_stream_cost.rs). B1 has
-accepted component evidence for its measured fixture set: the current
+See [`write_cost.rs`](../../crates/omnigraph/tests/write_cost.rs) and the
+historical `memwal_stream_cost.rs` instrument deleted with the rejected
+RFC-026 path. B1 has accepted component evidence for its measured fixture set: the current
 post-containment warm already-claimed acknowledgement result is local, while
 the configured-RustFS figures are a 2026-07-19 pre-containment baseline that
 must be rerun before a current object-store claim. Cold replay, retained

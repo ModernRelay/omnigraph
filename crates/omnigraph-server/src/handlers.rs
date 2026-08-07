@@ -84,7 +84,9 @@ pub(crate) async fn server_graphs_list(
     Ok(Json(GraphListResponse { graphs }))
 }
 
-pub(crate) async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::OpenApi> {
+pub(crate) async fn server_openapi(
+    State(state): State<AppState>,
+) -> Json<utoipa::openapi::OpenApi> {
     // `served_openapi` is the single nesting source — the protected
     // routes always live under `/graphs/{graph_id}/...` (public/management
     // paths `/healthz`, `/graphs` stay flat). Building from it here means
@@ -293,7 +295,11 @@ pub(crate) async fn resolve_graph_handle(
     Ok(next.run(request).await)
 }
 
-pub(crate) fn log_policy_decision(actor_id: &str, request: &PolicyRequest, decision: &PolicyDecision) {
+pub(crate) fn log_policy_decision(
+    actor_id: &str,
+    request: &PolicyRequest,
+    decision: &PolicyDecision,
+) {
     info!(
         actor_id = actor_id,
         action = %request.action,
@@ -509,7 +515,9 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
     ),
     security(("bearer_token" = [])),
 )]
-#[deprecated(note = "use POST /query instead; /read is kept indefinitely for byte-stable back-compat")]
+#[deprecated(
+    note = "use POST /query instead; /read is kept indefinitely for byte-stable back-compat"
+)]
 /// **Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.
 ///
 /// Execute a GQ read query. Behavior is unchanged from prior releases; the
@@ -681,390 +689,6 @@ pub(crate) async fn server_export(
         .into_response())
 }
 
-enum GraphIfMatch {
-    Missing,
-    Strong(String),
-    Malformed,
-}
-
-fn graph_stream_if_match(headers: &axum::http::HeaderMap) -> GraphIfMatch {
-    let mut values = headers.get_all(IF_MATCH).iter();
-    let Some(value) = values.next() else {
-        return GraphIfMatch::Missing;
-    };
-    if values.next().is_some() {
-        return GraphIfMatch::Malformed;
-    }
-    let Ok(value) = value.to_str() else {
-        return GraphIfMatch::Malformed;
-    };
-    let value = value.trim();
-    if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"') {
-        return GraphIfMatch::Malformed;
-    }
-    let opaque = &value[1..value.len() - 1];
-    if opaque.is_empty()
-        || !opaque
-            .bytes()
-            .all(|byte| byte == b'!' || (b'#'..=b'~').contains(&byte))
-    {
-        return GraphIfMatch::Malformed;
-    }
-    GraphIfMatch::Strong(opaque.to_string())
-}
-
-fn graph_stream_etag(authority_token: &str) -> std::result::Result<HeaderValue, ApiError> {
-    HeaderValue::try_from(format!("\"{authority_token}\""))
-        .map_err(|_| ApiError::internal("graph stream authority token is not a valid ETag"))
-}
-
-#[utoipa::path(
-    get,
-    path = "/stream/status",
-    tag = "streaming",
-    operation_id = "stream_status",
-    responses(
-        (status = 200, description = "Checked graph-level streaming operational status", body = StreamStatusOutput,
-            headers(("Cache-Control" = String, description = "Always `no-store`; the response contains live advisory state and compare revisions"))),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "The current server does not own checked status authority for this profile state", body = ErrorOutput),
-        (status = 413, description = "The bounded status inventory exceeded its hard observation envelope", body = ErrorOutput),
-        (status = 500, description = "Checked status failed without exposing physical diagnostics", body = ErrorOutput),
-        (status = 503, description = "A stable checked cut could not be obtained; retry", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Return one coherent, graph-redacted streaming operational cut.
-///
-/// This is graph-wide read metadata, so Cedar authorizes it with `read`
-/// rather than the mutation-capable `stream_manage` action. The engine bridge
-/// already removes every table, lane, binding, shard, epoch, generation,
-/// dataset, and recovery identity before the transport receives the value.
-pub(crate) async fn server_stream_status(
-    State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
-) -> std::result::Result<([(HeaderName, HeaderValue); 1], Json<StreamStatusOutput>), ApiError> {
-    authorize_request(
-        actor.as_ref().map(|Extension(actor)| actor),
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::Read,
-            branch: None,
-            target_branch: None,
-        },
-    )?;
-    let _process_observation = Arc::clone(&state.stream_status_gate)
-        .try_acquire_owned()
-        .map_err(|_| {
-            ApiError::service_unavailable(
-                "another graph stream status observation is already in progress; retry",
-            )
-        })?;
-    let status = handle
-        .engine
-        .capture_served_graph_stream_status()
-        .await
-        .map_err(ApiError::from_graph_stream_status)?;
-    let output = stream_status_output(status)
-        .map_err(|_| ApiError::internal("graph stream status projection failed"))?;
-    Ok((
-        [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
-        Json(output),
-    ))
-}
-
-fn authorize_graph_stream_management<'a>(
-    handle: &GraphHandle,
-    actor: Option<&'a ResolvedActor>,
-) -> std::result::Result<&'a str, ApiError> {
-    if handle.policy.is_none() {
-        // A configured graph policy is installed on the engine, which makes
-        // its graph-scoped StreamManage decision authoritative. Without one,
-        // preserve the server's open-mode / authenticated-default-deny
-        // contract before any management work starts.
-        authorize_request(
-            actor,
-            None,
-            PolicyRequest {
-                action: PolicyAction::StreamManage,
-                branch: None,
-                target_branch: None,
-            },
-        )?;
-    }
-    Ok(actor.map_or("anonymous", |actor| actor.actor_id.as_ref()))
-}
-
-async fn require_empty_graph_stream_management_body(
-    body: Body,
-) -> std::result::Result<(), ApiError> {
-    // A zero-byte collection limit accepts a genuinely empty body while
-    // refusing on the first data byte, so selector-shaped payloads are rejected
-    // without buffering them or reaching authorization/engine effects.
-    axum::body::to_bytes(body, 0).await.map_err(|_| {
-        ApiError::bad_request("graph stream management does not accept a request body")
-    })?;
-    Ok(())
-}
-
-#[utoipa::path(
-    post,
-    path = "/stream/resume",
-    tag = "streaming",
-    operation_id = "stream_resume",
-    responses(
-        (status = 200, description = "All sealed streaming declarations were reopened through graph authority", body = StreamResumeOutput),
-        (status = 400, description = "The bodyless graph control received a request body", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "The actor is not authorized for graph stream management", body = ErrorOutput),
-        (status = 409, description = "The graph streaming profile or lifecycle is not ready to resume", body = ErrorOutput),
-        (status = 413, description = "The bounded graph management operation exceeded a hard limit", body = ErrorOutput),
-        (status = 500, description = "Graph stream resume failed without exposing physical diagnostics", body = ErrorOutput),
-        (status = 503, description = "Graph recovery must complete before resume can proceed", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Reopen every sealed streaming declaration in the graph.
-///
-/// The operation is deliberately bodyless and graph-wide: callers cannot
-/// select a logical type, table, lane, dataset, or physical maintenance
-/// target. The server supplies the bearer-resolved actor and the engine
-/// performs the authoritative graph-scoped `stream_manage` check.
-pub(crate) async fn server_stream_resume(
-    Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
-    body: Body,
-) -> std::result::Result<Json<StreamResumeOutput>, ApiError> {
-    require_empty_graph_stream_management_body(body).await?;
-    let actor_id =
-        authorize_graph_stream_management(&handle, actor.as_ref().map(|Extension(actor)| actor))?;
-    let result = handle
-        .engine
-        .resume_served_graph_stream_as(actor_id)
-        .await
-        .map_err(|error| ApiError::from_graph_stream_management(error, "resume"))?;
-    Ok(Json(stream_resume_output(result)))
-}
-
-#[utoipa::path(
-    post,
-    path = "/stream/maintenance/ensure-indices",
-    tag = "streaming",
-    operation_id = "stream_ensure_indices",
-    responses(
-        (status = 200, description = "Indexes were checked across the graph; affected enrolled declarations were sealed", body = StreamEnsureIndicesOutput),
-        (status = 400, description = "The bodyless graph control received a request body", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "The actor is not authorized for graph stream management", body = ErrorOutput),
-        (status = 409, description = "The graph is not in the sealed maintenance posture", body = ErrorOutput),
-        (status = 413, description = "The bounded graph management operation exceeded a hard limit", body = ErrorOutput),
-        (status = 500, description = "Graph index maintenance failed without exposing physical diagnostics", body = ErrorOutput),
-        (status = 503, description = "Graph recovery must complete before maintenance can proceed", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Refresh graph index state; any enrolled declaration changed must be sealed.
-pub(crate) async fn server_stream_ensure_indices(
-    Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
-    body: Body,
-) -> std::result::Result<Json<StreamEnsureIndicesOutput>, ApiError> {
-    require_empty_graph_stream_management_body(body).await?;
-    let actor_id =
-        authorize_graph_stream_management(&handle, actor.as_ref().map(|Extension(actor)| actor))?;
-    let result = handle
-        .engine
-        .ensure_served_graph_stream_indices_as(actor_id)
-        .await
-        .map_err(|error| ApiError::from_graph_stream_management(error, "ensure indices"))?;
-    Ok(Json(stream_ensure_indices_output(result)))
-}
-
-#[utoipa::path(
-    post,
-    path = "/stream/maintenance/optimize",
-    tag = "streaming",
-    operation_id = "stream_optimize",
-    responses(
-        (status = 200, description = "The graph was considered for optimization; affected enrolled declarations were sealed", body = StreamOptimizeOutput),
-        (status = 400, description = "The bodyless graph control received a request body", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "The actor is not authorized for graph stream management", body = ErrorOutput),
-        (status = 409, description = "The graph is not in the sealed maintenance posture", body = ErrorOutput),
-        (status = 413, description = "The bounded graph management operation exceeded a hard limit", body = ErrorOutput),
-        (status = 500, description = "Graph stream optimization failed without exposing physical diagnostics", body = ErrorOutput),
-        (status = 503, description = "Graph recovery must complete before maintenance can proceed", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Optimize the graph; any enrolled declaration changed must be sealed.
-pub(crate) async fn server_stream_optimize(
-    Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
-    body: Body,
-) -> std::result::Result<Json<StreamOptimizeOutput>, ApiError> {
-    require_empty_graph_stream_management_body(body).await?;
-    let actor_id =
-        authorize_graph_stream_management(&handle, actor.as_ref().map(|Extension(actor)| actor))?;
-    let result = handle
-        .engine
-        .optimize_served_graph_stream_as(actor_id)
-        .await
-        .map_err(|error| ApiError::from_graph_stream_management(error, "optimize"))?;
-    Ok(Json(stream_optimize_output(result)))
-}
-
-fn require_graph_stream_content_type(
-    headers: &axum::http::HeaderMap,
-) -> std::result::Result<(), ApiError> {
-    let accepted = headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|media_type| {
-            media_type
-                .trim()
-                .eq_ignore_ascii_case("application/x-ndjson")
-        });
-    if accepted {
-        Ok(())
-    } else {
-        Err(ApiError::unsupported_media_type(
-            "graph stream ingest requires Content-Type application/x-ndjson",
-        ))
-    }
-}
-
-#[utoipa::path(
-    post,
-    path = "/stream/ingest",
-    tag = "streaming",
-    operation_id = "stream_ingest",
-    params(
-        ("If-Match" = Option<String>, Header, description = "Strong ETag containing the opaque graph token returned by the 428 challenge."),
-    ),
-    request_body(
-        content = String,
-        description = "Graph-native node and edge rows, one JSON object per line. Results are emitted in caller order and the request is not atomic.",
-        content_type = "application/x-ndjson",
-    ),
-    responses(
-        (status = 200, description = "Ordered graph-native ingest results", body = api::StreamIngestLineOutput, content_type = "application/x-ndjson"),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Checked streaming runtime or lifecycle conflict", body = ErrorOutput),
-        (status = 412, description = "Malformed or stale graph token; no replacement token is disclosed", body = ErrorOutput),
-        (status = 413, description = "Streaming request admission capacity exhausted", body = ErrorOutput),
-        (status = 415, description = "Request Content-Type is not application/x-ndjson", body = ErrorOutput),
-        (status = 428, description = "Graph token required; retry with the strong ETag in If-Match", body = StreamIngestChallenge,
-            headers(
-                ("ETag" = String, description = "Strong ETag containing the current opaque graph token"),
-                ("Cache-Control" = String, description = "Always `no-store`; the challenge is authority-bearing"),
-            )),
-        (status = 503, description = "Overlapping durable recovery must resolve before ingest", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Ingest a graph-native NDJSON firehose through the checked served runtime.
-///
-/// A request without `If-Match` is authorized and preflighted without polling
-/// its body, then receives a 428 challenge. A malformed or stale precondition
-/// receives 412 without replacement authority. An exact strong ETag transfers
-/// the Axum body stream directly into the engine and streams one redacted
-/// newline-delimited result per input row; neither direction is buffered as a
-/// complete request or response.
-pub(crate) async fn server_stream_ingest(
-    Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
-    headers: axum::http::HeaderMap,
-    body: Body,
-) -> std::result::Result<Response, ApiError> {
-    require_graph_stream_content_type(&headers)?;
-    let actor = actor.as_ref().map(|Extension(actor)| actor);
-    if handle.policy.is_none() {
-        // With a graph policy installed, the engine's graph-scoped check is
-        // the sole Cedar decision for this request. Without one the engine
-        // intentionally has no checker, so preserve the server's open-mode /
-        // authenticated-default-deny contract here before body ownership.
-        authorize_request(
-            actor,
-            None,
-            PolicyRequest {
-                action: PolicyAction::StreamIngest,
-                branch: None,
-                target_branch: None,
-            },
-        )?;
-    }
-
-    let supplied = graph_stream_if_match(&headers);
-    let precondition_supplied = !matches!(&supplied, GraphIfMatch::Missing);
-    // A malformed header still enters the checked engine preflight with an
-    // impossible token. This preserves policy/runtime ordering while keeping
-    // strong-ETag syntax part of the HTTP contract.
-    let supplied_token = match &supplied {
-        GraphIfMatch::Missing => None,
-        GraphIfMatch::Strong(token) => Some(token.as_str()),
-        GraphIfMatch::Malformed => Some(""),
-    };
-    let chunks = body.into_data_stream().map(|chunk| {
-        chunk.map(|bytes| bytes.to_vec()).map_err(|error| {
-            OmniError::Io(std::io::Error::other(format!(
-                "graph stream request body failed: {error}"
-            )))
-        })
-    });
-    let start = handle
-        .engine
-        .start_served_graph_stream_ingest_as(
-            actor.map_or("anonymous", |actor| actor.actor_id.as_ref()),
-            supplied_token,
-            Box::pin(chunks),
-        )
-        .await;
-    let start = start
-        .map_err(|error| ApiError::from_graph_stream_start(error, precondition_supplied))?;
-
-    match start {
-        omnigraph::db::GraphStreamIngestStart::TokenRequired { authority_token } => {
-            let etag = graph_stream_etag(&authority_token)?;
-            Ok((
-                StatusCode::PRECONDITION_REQUIRED,
-                [
-                    (ETAG, etag),
-                    (CACHE_CONTROL, HeaderValue::from_static("no-store")),
-                ],
-                Json(StreamIngestChallenge {
-                    graph_token: authority_token,
-                }),
-            )
-                .into_response())
-        }
-        omnigraph::db::GraphStreamIngestStart::Ready(result_handle) => {
-            if matches!(supplied, GraphIfMatch::Malformed | GraphIfMatch::Missing) {
-                return Err(ApiError::internal(
-                    "graph stream engine accepted a missing or malformed precondition",
-                ));
-            }
-            let results = futures::stream::try_unfold(result_handle, |mut result_handle| async {
-                match result_handle.recv().await {
-                    Ok(Some(line)) => Ok(Some((Bytes::from(line), result_handle))),
-                    Ok(None) => Ok(None),
-                    Err(error) => Err(std::io::Error::other(error.to_string())),
-                }
-            });
-            Ok((
-                StatusCode::OK,
-                [(CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
-                Body::from_stream(results),
-            )
-                .into_response())
-        }
-    }
-}
-
 /// Shared implementation behind `POST /mutate` (canonical) and
 /// `POST /change` (deprecated alias). Returns the bare `ChangeOutput`;
 /// each route handler wraps it (the alias also attaches Deprecation
@@ -1101,10 +725,8 @@ pub(crate) async fn run_mutate(
     // estimated bytes per actor. Cedar runs FIRST so denied requests
     // don't consume admission slots. Estimate uses the request body
     // size as a coarse proxy; engine memory pressure can run higher.
-    let est_bytes = query.len() as u64
-        + params_json
-            .map(|p| p.to_string().len() as u64)
-            .unwrap_or(0);
+    let est_bytes =
+        query.len() as u64 + params_json.map(|p| p.to_string().len() as u64).unwrap_or(0);
     let _admission = state
         .workload
         .try_admit(&actor_arc, est_bytes)
@@ -1178,8 +800,8 @@ pub(crate) async fn run_query(
             target_branch: None,
         },
     )?;
-    let query_decl =
-        select_named_query_decl(query, name).map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let query_decl = select_named_query_decl(query, name)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
     if reject_mutations && !query_decl.mutations.is_empty() {
         return Err(ApiError::bad_request(format!(
             "query '{}' contains mutations (insert/update/delete); use POST /mutate for write queries",
@@ -1640,7 +1262,54 @@ pub(crate) async fn server_schema_apply(
     Ok(Json(schema_apply_output(handle.uri.as_str(), result)))
 }
 
-/// Shared body for `POST /load` (canonical) and `POST /ingest` (deprecated):
+/// Authorize one load target without touching request data.
+async fn authorize_load_scope(
+    handle: &GraphHandle,
+    actor: Option<&ResolvedActor>,
+    branch: &str,
+    from: Option<&str>,
+) -> std::result::Result<(), ApiError> {
+    let branch_exists = handle
+        .engine
+        .branch_list()
+        .await
+        .map_err(ApiError::from_omni)?
+        .into_iter()
+        .any(|name| name == branch);
+
+    if !branch_exists {
+        match from {
+            // Fork-if-missing is opt-in by presence of `from`; without it a
+            // typo'd branch name must surface as an error, not silently
+            // create a fork and land the data there.
+            None => {
+                return Err(ApiError::not_found(format!(
+                    "branch '{branch}' not found; pass `from` to create it"
+                )));
+            }
+            Some(from) => authorize_request(
+                actor,
+                handle.policy.as_deref(),
+                PolicyRequest {
+                    action: PolicyAction::BranchCreate,
+                    branch: Some(from.to_string()),
+                    target_branch: Some(branch.to_string()),
+                },
+            )?,
+        }
+    }
+    authorize_request(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Change,
+            branch: Some(branch.to_string()),
+            target_branch: None,
+        },
+    )
+}
+
+/// Shared body for JSON `POST /load` and `POST /ingest` (deprecated):
 /// branch-exists / fork-if-`from` check, Cedar authorization, admission, the
 /// bulk `load_as`, and the `IngestOutput` mapping.
 async fn run_ingest(
@@ -1657,45 +1326,7 @@ async fn run_ingest(
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor.map(|actor| actor.actor_id.as_ref());
 
-    let branch_exists = {
-        let db = &handle.engine;
-        db.branch_list()
-            .await
-            .map_err(ApiError::from_omni)?
-            .into_iter()
-            .any(|name| name == branch)
-    };
-
-    if !branch_exists {
-        match from.as_deref() {
-            // Fork-if-missing is opt-in by presence of `from`; without it a
-            // typo'd branch name must surface as an error, not silently
-            // create a fork and land the data there.
-            None => {
-                return Err(ApiError::not_found(format!(
-                    "branch '{branch}' not found; pass `from` to create it"
-                )));
-            }
-            Some(from) => authorize_request(
-                actor,
-                handle.policy.as_deref(),
-                PolicyRequest {
-                    action: PolicyAction::BranchCreate,
-                    branch: Some(from.to_string()),
-                    target_branch: Some(branch.clone()),
-                },
-            )?,
-        }
-    }
-    authorize_request(
-        actor,
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::Change,
-            branch: Some(branch.clone()),
-            target_branch: None,
-        },
-    )?;
+    authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
     let est_bytes = request.data.len() as u64;
     let _admission = state
         .workload
@@ -1735,7 +1366,7 @@ async fn run_ingest(
     ),
     security(("bearer_token" = [])),
 )]
-/// Bulk-load NDJSON data into a branch (canonical load endpoint).
+/// Compatibility-load NDJSON data through a JSON envelope.
 ///
 /// `data` is NDJSON with one record per line. `mode` controls behavior on
 /// existing rows: `merge` upserts by id (default), `append` strictly inserts
@@ -1762,6 +1393,133 @@ pub(crate) async fn server_load(
         )
         .await?,
     ))
+}
+
+async fn collect_graph_batch_body(body: Body) -> std::result::Result<Bytes, ApiError> {
+    let mut body = body.into_data_stream();
+    let mut data = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|err| {
+            ApiError::bad_request(format!("failed to read graph-batch request body: {err}"))
+        })?;
+        let actual = data.len().saturating_add(chunk.len());
+        if actual > INGEST_REQUEST_BODY_LIMIT_BYTES {
+            return Err(ApiError::resource_limit(
+                format!(
+                    "graph-batch request body exceeds {} bytes",
+                    INGEST_REQUEST_BODY_LIMIT_BYTES
+                ),
+                api::ResourceLimitOutput {
+                    resource: "graph_batch_request_bytes".to_string(),
+                    limit: INGEST_REQUEST_BODY_LIMIT_BYTES as u64,
+                    actual: actual as u64,
+                },
+            ));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(data))
+}
+
+#[utoipa::path(
+    post,
+    path = "/load/ndjson",
+    tag = "mutations",
+    operation_id = "loadNdjson",
+    params(GraphBatchLoadQuery),
+    request_body(
+        content = String,
+        content_type = "application/x-ndjson",
+        description = "Strict raw graph-level NDJSON. Each nonblank line is exactly one node envelope {\"type\":\"<Node>\",\"data\":{...}} or edge envelope {\"edge\":\"<Edge>\",\"from\":\"<src-id>\",\"to\":\"<dst-id>\",\"data\":{...}}. `data` defaults to {}; optional `data.id` follows ordinary ID semantics. Duplicate, unknown, reserved physical, and noncanonical supplied node-ID members are refused."
+    ),
+    responses(
+        (status = 200, description = "One committed graph-batch result", body = GraphBatchLoadOutput),
+        (status = 400, description = "Malformed query or graph batch", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Target branch missing without `from`", body = ErrorOutput),
+        (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
+        (status = 413, description = "Request or keyed load exceeds a bounded ceiling", body = ErrorOutput),
+        (status = 415, description = "Content-Type must be application/x-ndjson", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Load one strict, bounded graph-level NDJSON batch.
+///
+/// Bearer authentication runs in middleware. This handler completes both
+/// branch authorization checks before polling the raw body. A successful
+/// response describes logical schema declarations only and is returned after
+/// the ordinary graph commit is visible.
+pub(crate) async fn server_load_ndjson(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Query(query): Query<GraphBatchLoadQuery>,
+    request: Request,
+) -> std::result::Result<Json<GraphBatchLoadOutput>, ApiError> {
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    let branch = query.branch.unwrap_or_else(|| "main".to_string());
+    let from = query.from;
+    let mode = query.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
+
+    authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
+
+    let content_type = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !matches!(content_type, Some(value) if value.eq_ignore_ascii_case("application/x-ndjson")) {
+        return Err(ApiError::unsupported_media_type(
+            "graph-batch load requires Content-Type: application/x-ndjson",
+        ));
+    }
+
+    if let Some(actual) = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|actual| *actual > INGEST_REQUEST_BODY_LIMIT_BYTES as u64)
+    {
+        return Err(ApiError::resource_limit(
+            format!(
+                "graph-batch request body exceeds {} bytes",
+                INGEST_REQUEST_BODY_LIMIT_BYTES
+            ),
+            api::ResourceLimitOutput {
+                resource: "graph_batch_request_bytes".to_string(),
+                limit: INGEST_REQUEST_BODY_LIMIT_BYTES as u64,
+                actual,
+            },
+        ));
+    }
+
+    let data = collect_graph_batch_body(request.into_body()).await?;
+    let data = std::str::from_utf8(&data)
+        .map_err(|_| ApiError::bad_request("graph-batch request body must be valid UTF-8"))?;
+    let actor_arc = actor
+        .map(|actor| Arc::clone(&actor.actor_id))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
+    let actor_id = actor.map(|actor| actor.actor_id.as_ref());
+    let _admission = state
+        .workload
+        .try_admit(&actor_arc, data.len() as u64)
+        .map_err(ApiError::from_workload_reject)?;
+
+    let result = handle
+        .engine
+        .load_graph_batch_as(&branch, from.as_deref(), data, mode, actor_id)
+        .await
+        .map_err(ApiError::from_omni)?;
+    Ok(Json(graph_batch_load_output(
+        &result,
+        mode,
+        actor_id.map(str::to_string),
+    )))
 }
 
 #[utoipa::path(
@@ -2055,8 +1813,12 @@ pub(crate) async fn server_branch_merge(
             .map_err(ApiError::from_omni)?
     };
     let (branch_deleted, branch_delete_error) = if request.delete_branch {
-        match delete_merged_source_branch(&handle, actor.as_ref().map(|Extension(a)| a), &request.source)
-            .await
+        match delete_merged_source_branch(
+            &handle,
+            actor.as_ref().map(|Extension(a)| a),
+            &request.source,
+        )
+        .await
         {
             Ok(()) => (Some(true), None),
             Err(message) => (Some(false), Some(message)),
@@ -2207,7 +1969,10 @@ pub(crate) async fn server_commit_show(
     Ok(Json(api::commit_output(&commit)))
 }
 
-pub(crate) fn read_target_from_request(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
+pub(crate) fn read_target_from_request(
+    branch: Option<String>,
+    snapshot: Option<String>,
+) -> ReadTarget {
     if let Some(snapshot) = snapshot {
         ReadTarget::snapshot(omnigraph::db::SnapshotId::new(snapshot))
     } else {

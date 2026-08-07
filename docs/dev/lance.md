@@ -34,7 +34,7 @@ Touching `db/manifest`, fragment lifecycle, dataset reconstruction, or anything 
 | Table schema metadata | https://lance.org/format/table/schema/ |
 | Table-level versioning | https://lance.org/format/table/versioning/ |
 | Transactions (commit semantics, conflict types) | https://lance.org/format/table/transaction/ |
-| MemWAL (durability story) | https://lance.org/format/table/mem_wal/ |
+| MemWAL (upstream reference; OmniGraph's RFC-026 path is rejected) | https://lance.org/format/table/mem_wal/ |
 | Row-ID lineage (stable row IDs) | https://lance.org/format/table/row_id_lineage/ |
 | Branches & tags (Lance native) | https://lance.org/format/table/branch_tag/ |
 
@@ -66,7 +66,7 @@ Adding/changing index types, fixing coverage, debugging FTS or vector recall, de
 | N-gram scalar index | https://lance.org/format/index/scalar/ngram/ |
 | Vector index | https://lance.org/format/index/vector/ |
 | Fragment-reuse system index | https://lance.org/format/index/system/frag_reuse/ |
-| MemWAL system index | https://lance.org/format/index/system/mem_wal/ |
+| MemWAL system index (upstream reference; no active OmniGraph consumer) | https://lance.org/format/index/system/mem_wal/ |
 | HNSW Rust example | https://lance.org/examples/rust/hnsw/ |
 | Distributed indexing | https://lance.org/guide/distributed_indexing/ |
 | Tokenizer (FTS, n-gram) | https://lance.org/guide/tokenizer/ |
@@ -99,6 +99,7 @@ or object-store environment variables.
 | Topic | URL |
 |---|---|
 | Object-store guide | https://lance.org/guide/object_store/ |
+| Observability (logical object-store operations, bytes, failures, retries) | https://lance.org/guide/observability/ |
 
 ### Data types
 
@@ -118,6 +119,7 @@ Optimizing scans, fragment counts, cache behavior, memory pool sizing.
 | Topic | URL |
 |---|---|
 | Performance guide | https://lance.org/guide/performance/ |
+| Observability (request duration, bytes, in-flight work, retry/throttle counters) | https://lance.org/guide/observability/ |
 
 ### Compaction & cleanup
 
@@ -157,6 +159,13 @@ If a future need pulls one of these into scope, add a row to the matching domain
 ## Maintenance
 
 When Lance ships a major release that changes any of the above (file format bump, new index type, transaction semantics change, new branching primitive), refresh this index in the same change as the omnigraph upgrade. Stale Lance pointers are worse than no pointers.
+
+> **Historical-audit boundary:** the dated audit stanzas below are retained as
+> evidence of what was inspected and tested at each dependency bump. Their
+> RFC-026, MemWAL, internal-schema-v7+ and stream-test statements describe the
+> now-rejected experiment at that date; they are not current OmniGraph product
+> contracts. Current ingestion reuses ordinary commit-visible graph Load and
+> current storage format is manifest v6. See [wal-removal.md](wal-removal.md).
 
 ### Last alignment audit: 2026-07-25 (Lance 9.0.0 stable; crates.io)
 

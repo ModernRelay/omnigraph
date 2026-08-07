@@ -1154,8 +1154,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
         cluster.path(),
         &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
     );
-    let insert =
-        "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }";
+    let insert = "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }";
 
     // Case 1: no token → the server refuses before any policy check.
     let no_token = cli()
@@ -1441,7 +1440,10 @@ fn local_cli_branch_create_enforces_engine_layer_policy() {
         .arg("bruno-feature")
         .output()
         .unwrap();
-    assert!(!denied.status.success(), "bruno branch create must be denied");
+    assert!(
+        !denied.status.success(),
+        "bruno branch create must be denied"
+    );
     let stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
         stderr.contains("denied"),
@@ -1505,7 +1507,10 @@ fn local_cli_branch_delete_enforces_engine_layer_policy() {
         .arg("doomed")
         .output()
         .unwrap();
-    assert!(!denied.status.success(), "bruno branch delete must be denied");
+    assert!(
+        !denied.status.success(),
+        "bruno branch delete must be denied"
+    );
     let stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
         stderr.contains("denied"),
@@ -1568,7 +1573,10 @@ fn local_cli_branch_merge_enforces_engine_layer_policy() {
         .arg("main")
         .output()
         .unwrap();
-    assert!(!denied.status.success(), "bruno branch merge must be denied");
+    assert!(
+        !denied.status.success(),
+        "bruno branch merge must be denied"
+    );
     let stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
         stderr.contains("denied"),
@@ -1870,262 +1878,6 @@ fn skip_system_e2e(test_name: &str) -> bool {
     false
 }
 
-fn write_firehose_cluster_config(dir: &std::path::Path, streaming: bool) {
-    std::fs::write(
-        dir.join("cluster.yaml"),
-        format!(
-            r#"
-version: 1
-state:
-  backend: cluster
-  lock: true
-graphs:
-  knowledge:
-    schema: ./firehose.pg
-    streaming: {streaming}
-    queries:
-      streamed_edge:
-        file: ./firehose.gq
-"#
-        ),
-    )
-    .unwrap();
-}
-
-fn stream_cli_json(base_url: &str, args: &[&str]) -> serde_json::Value {
-    let mut command = cli();
-    command
-        .arg("--server")
-        .arg(base_url)
-        .arg("--graph")
-        .arg("knowledge")
-        .arg("stream");
-    for arg in args {
-        command.arg(arg);
-    }
-    command.arg("--json");
-    parse_stdout_json(&output_success(&mut command))
-}
-
-fn ingest_firehose_round(dir: &std::path::Path, base_url: &str, round: u64) -> (i64, i64) {
-    let first_id = format!("firehose-{round}-a");
-    let second_id = format!("firehose-{round}-b");
-    let edge_id = format!("firehose-{round}-edge");
-    let first_score = (round * 10 + 1) as i64;
-    let second_score = first_score + 1;
-    let write_id = |ordinal: u64| format!("70000000-0000-4000-8000-{:012x}", round * 3 + ordinal);
-    let rows = [
-        serde_json::json!({
-            "type": "Person",
-            "data": {"id": first_id, "score": first_score},
-            "$stream": {"write_id": write_id(0), "predecessor_token": null},
-        }),
-        serde_json::json!({
-            "type": "Person",
-            "data": {"id": second_id, "score": second_score},
-            "$stream": {"write_id": write_id(1), "predecessor_token": null},
-        }),
-        serde_json::json!({
-            "edge": "Knows",
-            "from": first_id,
-            "to": second_id,
-            "data": {"id": edge_id},
-            "$stream": {"write_id": write_id(2), "predecessor_token": null},
-        }),
-    ];
-    let mut input = rows
-        .iter()
-        .map(|row| serde_json::to_string(row).unwrap())
-        .collect::<Vec<_>>()
-        .join("\n");
-    input.push('\n');
-    let data = dir.join(format!("firehose-round-{round}.ndjson"));
-    write_jsonl(&data, &input);
-
-    let output = output_success(
-        cli()
-            .arg("--server")
-            .arg(base_url)
-            .arg("--graph")
-            .arg("knowledge")
-            .arg("stream")
-            .arg("ingest")
-            .arg("--data")
-            .arg(&data),
-    );
-    let outcomes = stdout_string(&output)
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(outcomes.len(), 3, "unexpected ingest output: {outcomes:?}");
-    for (ordinal, outcome) in outcomes.iter().enumerate() {
-        assert_eq!(outcome["ordinal"], ordinal as u64, "{outcome}");
-        assert_eq!(outcome["status"], "durable", "{outcome}");
-        assert_eq!(outcome["scope"], "row", "{outcome}");
-        assert!(outcome["stream_token"].is_string(), "{outcome}");
-    }
-    (first_score, second_score)
-}
-
-fn wait_for_streamed_edge(base_url: &str, first_score: i64, second_score: i64) {
-    let client = Client::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let (status, body) = invoke_query(
-            &client,
-            base_url,
-            "knowledge",
-            "streamed_edge",
-            serde_json::json!({"score": first_score}),
-        );
-        assert_eq!(status, 200, "{body}");
-        if body["row_count"] == 1 {
-            assert_eq!(body["rows"][0]["p.score"], first_score, "{body}");
-            assert_eq!(body["rows"][0]["f.score"], second_score, "{body}");
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "resident fold driver did not publish streamed edge {first_score}->{second_score}: {body}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-}
-
-fn assert_stream_lifecycles(status: &serde_json::Value, expected: &str) {
-    let declarations = status["enrolled_declarations"].as_array().unwrap();
-    assert_eq!(declarations.len(), 2, "{status}");
-    assert!(
-        declarations
-            .iter()
-            .all(|declaration| declaration["lifecycle"] == expected),
-        "{status}"
-    );
-    let logical_declarations = declarations
-        .iter()
-        .map(|declaration| {
-            (
-                declaration["kind"].as_str().unwrap(),
-                declaration["type"].as_str().unwrap(),
-            )
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(
-        logical_declarations,
-        std::collections::BTreeSet::from([("edge", "Knows"), ("node", "Person")]),
-        "{status}"
-    );
-}
-
-/// The public firehose journey through the real binaries: cluster-owned
-/// enablement, graph-native CLI ingest, automatic node/edge folds, an offline
-/// disable/re-enable handoff, productive sealed maintenance, graph-wide
-/// resume, and a successful successor ingest. The test deliberately never
-/// names a physical table, dataset, or lane.
-#[test]
-fn local_cluster_firehose_golden_journey_uses_graph_only_controls() {
-    if skip_system_e2e("local_cluster_firehose_golden_journey_uses_graph_only_controls") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let dir = temp.path();
-    std::fs::write(
-        dir.join("firehose.pg"),
-        "node Person { score: I32 }\nedge Knows: Person -> Person\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.join("firehose.gq"),
-        r#"
-query streamed_edge($score: I32) {
-    match {
-        $p: Person { score: $score }
-        $p knows $f
-    }
-    return { $p.score, $f.score }
-}
-"#,
-    )
-    .unwrap();
-    write_firehose_cluster_config(dir, true);
-
-    assert_eq!(cluster_json(dir, "import")["ok"], true);
-    let enabled = cluster_json(dir, "apply");
-    assert_eq!(enabled["ok"], true, "{enabled}");
-    assert_eq!(enabled["converged"], true, "{enabled}");
-
-    // Each round waits for graph visibility before the next request. That
-    // forces four independently published node/edge fragments, so the later
-    // sealed EnsureIndices and Optimize calls exercise productive work rather
-    // than merely proving their no-op routing.
-    {
-        let server = spawn_server_with_cluster(dir);
-        for round in 0..4 {
-            let (first_score, second_score) = ingest_firehose_round(dir, &server.base_url, round);
-            wait_for_streamed_edge(&server.base_url, first_score, second_score);
-        }
-
-        let status = stream_cli_json(&server.base_url, &["status"]);
-        assert_eq!(status["profile_mode"], "enabled", "{status}");
-        assert_eq!(status["token_counts"]["present"], 12, "{status}");
-        assert_eq!(status["recovery_pending_count"], 0, "{status}");
-        assert_eq!(status["driver"]["state"], "running", "{status}");
-        assert_stream_lifecycles(&status, "open");
-    }
-
-    // The server process is gone before either profile change. Explicit false
-    // drains every initialized declaration to SEALED; true re-enables the
-    // profile without reopening those declarations as a side effect.
-    write_firehose_cluster_config(dir, false);
-    let disabled = cluster_json(dir, "apply");
-    assert_eq!(disabled["ok"], true, "{disabled}");
-    assert_eq!(disabled["converged"], true, "{disabled}");
-
-    write_firehose_cluster_config(dir, true);
-    let reenabled = cluster_json(dir, "apply");
-    assert_eq!(reenabled["ok"], true, "{reenabled}");
-    assert_eq!(reenabled["converged"], true, "{reenabled}");
-
-    let server = spawn_server_with_cluster(dir);
-    let sealed = stream_cli_json(&server.base_url, &["status"]);
-    assert_eq!(sealed["profile_mode"], "enabled", "{sealed}");
-    assert_eq!(sealed["recovery_pending_count"], 0, "{sealed}");
-    assert_stream_lifecycles(&sealed, "sealed");
-
-    let indices = stream_cli_json(&server.base_url, &["maintenance", "ensure-indices"]);
-    assert_eq!(indices["changed"], true, "{indices}");
-    assert_eq!(indices["pending_index_count"], 0, "{indices}");
-
-    let optimized = stream_cli_json(&server.base_url, &["maintenance", "optimize"]);
-    assert_eq!(optimized["changed"], true, "{optimized}");
-    assert_eq!(optimized["pending_index_count"], 0, "{optimized}");
-    assert_eq!(optimized["requires_repair"], false, "{optimized}");
-
-    let after_maintenance = stream_cli_json(&server.base_url, &["status"]);
-    assert_stream_lifecycles(&after_maintenance, "sealed");
-
-    let resumed = stream_cli_json(&server.base_url, &["resume"]);
-    assert_eq!(resumed["enrolled_declarations"], 2, "{resumed}");
-    assert_eq!(resumed["resumed_declarations"], 2, "{resumed}");
-    assert_eq!(resumed["already_open_declarations"], 0, "{resumed}");
-    let retry = stream_cli_json(&server.base_url, &["resume"]);
-    assert_eq!(retry["resumed_declarations"], 0, "{retry}");
-    assert_eq!(retry["already_open_declarations"], 2, "{retry}");
-
-    let open = stream_cli_json(&server.base_url, &["status"]);
-    assert_stream_lifecycles(&open, "open");
-    let (first_score, second_score) = ingest_firehose_round(dir, &server.base_url, 4);
-    wait_for_streamed_edge(&server.base_url, first_score, second_score);
-    let final_status = stream_cli_json(&server.base_url, &["status"]);
-    assert_eq!(
-        final_status["token_counts"]["present"], 15,
-        "{final_status}"
-    );
-    assert_eq!(final_status["recovery_pending_count"], 0, "{final_status}");
-    assert_stream_lifecycles(&final_status, "open");
-}
-
 /// The whole control-plane story in one test: declare two graphs → converge
 /// (apply creates them) → serve → evolve schema+query in one apply → restart
 /// serves the new shape → out-of-band drift converged back → approved graph
@@ -2144,8 +1896,16 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
     // Phase 3-4: one apply creates both graphs and publishes the catalog.
     let converge = cluster_cli(dir, &["apply"]);
     assert_eq!(converge["converged"], true, "{converge}");
-    seed_graph(dir, "knowledge", "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n");
-    seed_graph(dir, "engineering", "{\"type\":\"Service\",\"data\":{\"name\":\"billing\"}}\n");
+    seed_graph(
+        dir,
+        "knowledge",
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n",
+    );
+    seed_graph(
+        dir,
+        "engineering",
+        "{\"type\":\"Service\",\"data\":{\"name\":\"billing\"}}\n",
+    );
 
     // Phase 5: serve the applied revision.
     let client = Client::new();
@@ -2228,8 +1988,7 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
     });
     let refresh = cluster_cli(dir, &["refresh"]);
     assert_eq!(
-        refresh["resource_statuses"]["schema.knowledge"]["status"],
-        "drifted",
+        refresh["resource_statuses"]["schema.knowledge"]["status"], "drifted",
         "{refresh}"
     );
     let heal = cluster_cli(dir, &["apply"]);
@@ -2246,7 +2005,10 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
         String::from_utf8_lossy(&schema_show.stderr)
     );
     let shown = String::from_utf8_lossy(&schema_show.stdout);
-    assert!(shown.contains("Person"), "schema show produced no schema: {shown}");
+    assert!(
+        shown.contains("Person"),
+        "schema show produced no schema: {shown}"
+    );
     assert!(
         !shown.contains("rogue"),
         "drift must be soft-dropped back to the declared schema: {shown}"
@@ -2361,7 +2123,6 @@ rules:
         dir.join("server.policy.yaml"),
         r#"
 version: 1
-kind: server
 groups:
   admins: ["act-admin"]
 rules:
@@ -2395,7 +2156,11 @@ policies:
     assert_eq!(cluster_cli(dir, &["import"])["ok"], true);
     let converge = cluster_cli(dir, &["apply"]);
     assert_eq!(converge["converged"], true, "{converge}");
-    seed_graph(dir, "knowledge", "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n");
+    seed_graph(
+        dir,
+        "knowledge",
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n",
+    );
 
     let server = spawn_server_with_cluster_env(
         dir,
@@ -2532,7 +2297,10 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     let output = remote_read(&[]);
-    assert!(!output.status.success(), "wrong token must not authenticate");
+    assert!(
+        !output.status.success(),
+        "wrong token must not authenticate"
+    );
 
     // Re-login rotates to the right token (via --token); 0600 on disk.
     let output = cli()
@@ -2558,8 +2326,7 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
         output.status.success(),
         "keyed credential must authenticate the URL-matched server: {output:?}"
     );
-    let payload: serde_json::Value =
-        serde_json::from_slice(&output.stdout).unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["rows"][0]["p.name"], "Alice");
 
     // OMNIGRAPH_TOKEN_<NAME> env outranks the credentials file.
@@ -2622,8 +2389,20 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         "version: 1\nmetadata:\n  name: alias-sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  local:\n    schema: ./local.pg\n    queries:\n      find_person:\n        file: ./find-person.gq\n      insert_person:\n        file: ./insert-person.gq\npolicies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [local]\n",
     )
     .unwrap();
-    output_success(cli().arg("cluster").arg("import").arg("--config").arg(cluster.path()));
-    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(cluster.path()));
+    output_success(
+        cli()
+            .arg("cluster")
+            .arg("import")
+            .arg("--config")
+            .arg(cluster.path()),
+    );
+    output_success(
+        cli()
+            .arg("cluster")
+            .arg("apply")
+            .arg("--config")
+            .arg(cluster.path()),
+    );
     output_success(
         cli()
             .arg("load")
@@ -2754,7 +2533,10 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .arg("--json")
         .output()
         .unwrap();
-    assert!(output.status.success(), "by-name catalog invocation: {output:?}");
+    assert!(
+        output.status.success(),
+        "by-name catalog invocation: {output:?}"
+    );
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["rows"][0]["p.name"], "Alice", "{payload}");
 
@@ -2790,7 +2572,10 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unknown server 'nope'") && stderr.contains("dev"), "{stderr}");
+    assert!(
+        stderr.contains("unknown server 'nope'") && stderr.contains("dev"),
+        "{stderr}"
+    );
 
     // --server is exclusive with --store (two ways to address the graph).
     // (RFC-011 D3: there is no positional URI anymore — the positional is a

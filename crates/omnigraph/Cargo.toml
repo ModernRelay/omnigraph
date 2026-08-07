@@ -19,9 +19,6 @@ failpoints = ["dep:fail", "fail/failpoints"]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.9.0" }
 omnigraph-policy = { path = "../omnigraph-policy", version = "0.9.0" }
 omnigraph-storage = { path = "../omnigraph-storage", version = "0.9.0" }
-# Compile-level F2 DAG edge only. Complete checked writer/runtime/export
-# capabilities land in the leaf once all of their canonical fences are known.
-omnigraph-control-authority = { path = "../omnigraph-control-authority", version = "0.9.0" }
 lance = { workspace = true }
 lance-core = { workspace = true }
 lance-select = { workspace = true }
@@ -67,7 +64,7 @@ lance-io = { version = "9.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
 syn = { version = "2", features = ["full", "visit"] }
-# benches/scenarios.rs + memwal_stream_cost.rs: wait4/rusage peak-RSS; benchmark memory caps.
+# benches/scenarios.rs: wait4/rusage peak-RSS and benchmark memory caps.
 libc = "0.2"
 
 [[bench]]

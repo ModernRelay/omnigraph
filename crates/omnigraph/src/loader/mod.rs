@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-
+use std::fmt;
 use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
 
@@ -17,10 +17,11 @@ use base64::Engine;
 use lance::blob::BlobArrayBuilder;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::types::PropType;
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::db::{Omnigraph, StreamAuthorityRetirementExportProvenance};
+use crate::db::Omnigraph;
 use crate::error::{OmniError, Result};
 use crate::exec::staging::{MutationStaging, PendingMode};
 use crate::storage_layer::KEYED_WRITE_MAX_BYTES;
@@ -55,12 +56,6 @@ pub struct IngestResult {
     pub tables: Vec<IngestTableResult>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ExportProvenanceEnvelope {
-    _omnigraph_export_provenance: StreamAuthorityRetirementExportProvenance,
-}
-
 /// Load mode for data ingestion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,6 +66,12 @@ pub enum LoadMode {
     Append,
     /// Merge by `id` key (upsert).
     Merge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadInputShape {
+    LoaderCompatible,
+    StrictGraphBatch,
 }
 
 /// Convenience: load JSONL data onto the database handle's *active branch*
@@ -106,19 +107,6 @@ impl Omnigraph {
             None => None,
         };
         Ok((requested, base_branch))
-    }
-
-    async fn heal_load_scope_before_profile_gate(
-        &self,
-        requested: Option<&str>,
-        base_branch: Option<&str>,
-    ) -> Result<()> {
-        let mut recovery_branches = vec![requested];
-        if let Some(base) = base_branch {
-            recovery_branches.push(Some(base));
-        }
-        self.heal_pending_recovery_sidecars_for_write(&recovery_branches)
-            .await
     }
 
     #[deprecated(
@@ -206,6 +194,66 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<LoadResult> {
+        self.load_input_as(
+            branch,
+            base,
+            data,
+            mode,
+            actor_id,
+            LoadInputShape::LoaderCompatible,
+        )
+        .await
+    }
+
+    /// Load a strict graph-shaped NDJSON batch onto `branch`.
+    ///
+    /// Each nonblank line must be exactly one node or edge envelope. Unlike
+    /// [`Self::load_as`], this boundary rejects duplicate JSON members,
+    /// unknown or physical fields, noncanonical supplied ids, and compatibility
+    /// coercions. Omitted ids retain ordinary loader semantics: node `@key`
+    /// values derive canonical ids and other rows receive generated ids. The
+    /// operation otherwise uses the same transaction, validation, recovery,
+    /// and graph-level publication path as the ordinary loader.
+    pub async fn load_graph_batch_as(
+        &self,
+        branch: &str,
+        base: Option<&str>,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadResult> {
+        self.load_input_as(
+            branch,
+            base,
+            data,
+            mode,
+            actor_id,
+            LoadInputShape::StrictGraphBatch,
+        )
+        .await
+    }
+
+    /// Convenience wrapper around [`Self::load_graph_batch_as`] without an
+    /// actor or implicit branch creation.
+    pub async fn load_graph_batch(
+        &self,
+        branch: &str,
+        data: &str,
+        mode: LoadMode,
+    ) -> Result<LoadResult> {
+        self.load_graph_batch_as(branch, None, data, mode, None)
+            .await
+    }
+
+    async fn load_input_as(
+        &self,
+        branch: &str,
+        base: Option<&str>,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+        input_shape: LoadInputShape,
+    ) -> Result<LoadResult> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `Branch(branch)` to match the HTTP-layer Change convention.
         // When a fork happens below, `branch_create_from_as` additionally
@@ -218,17 +266,7 @@ impl Omnigraph {
             actor_id,
         )?;
         let (requested, base_branch) = Self::normalize_load_scope(branch, base)?;
-        // Recovery-v13 takes the profile gate exclusively. Complete the broad
-        // write-entry heal before acquiring a shared profile window.
-        self.heal_load_scope_before_profile_gate(requested.as_deref(), base_branch.as_deref())
-            .await?;
-        // Root-shared, graph-global admission for the future stream-profile
-        // preflight. Revalidate durable authority after acquisition and keep
-        // this guard across implicit branch creation, every load attempt,
-        // physical effects, and publication.
-        let _stream_profile_guard = self.write_queue().acquire_stream_profile_shared().await;
-        self.ensure_streaming_content_write_authorized().await?;
-        self.load_as_inner(requested, base_branch, data, mode, actor_id)
+        self.load_as_inner(requested, base_branch, data, mode, actor_id, input_shape)
             .await
     }
 
@@ -239,7 +277,19 @@ impl Omnigraph {
         data: &str,
         mode: LoadMode,
         actor_id: Option<&str>,
+        input_shape: LoadInputShape,
     ) -> Result<LoadResult> {
+        // Stage A precedes both an implicit target-branch fork and data staging.
+        // The target branch and an explicit base are read/write authority for the
+        // operation, so an unresolved intent on either closes the barrier. The
+        // helper folds `Some("main")` to main's canonical `None` identity.
+        let mut recovery_branches = vec![requested.as_deref()];
+        if base_branch.is_some() {
+            recovery_branches.push(base_branch.as_deref());
+        }
+        self.heal_pending_recovery_sidecars_for_write(&recovery_branches)
+            .await?;
+
         // Schema/catalog authority is captured once via the `WriteTxn` (plus its
         // cheap trailing identity-marker fence); the only second full validation
         // is the required pre-effect recheck under gates. Per-table resolution
@@ -256,7 +306,7 @@ impl Omnigraph {
                 // bypass BranchCreate enforcement when policy is installed —
                 // the footgun guard catches that case too, but threading is
                 // the correct fix.
-                self.branch_create_from_as_after_recovery_barrier(
+                self.branch_create_from_as(
                     crate::db::ReadTarget::branch(base_name),
                     target,
                     actor_id,
@@ -269,7 +319,7 @@ impl Omnigraph {
         // branch. Cross-table OCC is enforced by the publisher's
         // `expected_table_versions` CAS inside the load attempt.
         let mut result = self
-            .load_direct_on_branch(requested.as_deref(), data, mode, actor_id)
+            .load_direct_on_branch(requested.as_deref(), data, mode, actor_id, input_shape)
             .await?;
         result.branch = requested.unwrap_or_else(|| "main".to_string());
         result.base_branch = base_branch;
@@ -281,10 +331,9 @@ impl Omnigraph {
         self.load_file_as(branch, None, path, mode, None).await
     }
 
-    /// Read a file into memory and run the same inner load as `load_as`.
-    /// Used by the CLI's `omnigraph load` so file-path-based writes flow
-    /// through the same engine-layer policy gate and hold one graph-profile
-    /// guard from before file I/O through publication.
+    /// Read a file into memory and delegate to `load_as`. Used by the CLI's
+    /// `omnigraph load` so file-path-based writes flow through the same
+    /// engine-layer policy gate as in-memory `load_as` calls.
     pub async fn load_file_as(
         &self,
         branch: &str,
@@ -293,19 +342,8 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<LoadResult> {
-        self.enforce(
-            omnigraph_policy::PolicyAction::Change,
-            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
-            actor_id,
-        )?;
-        let (requested, base_branch) = Self::normalize_load_scope(branch, base)?;
-        self.heal_load_scope_before_profile_gate(requested.as_deref(), base_branch.as_deref())
-            .await?;
-        let _stream_profile_guard = self.write_queue().acquire_stream_profile_shared().await;
-        self.ensure_streaming_content_write_authorized().await?;
         let data = std::fs::read_to_string(path).map_err(OmniError::Io)?;
-        self.load_as_inner(requested, base_branch, &data, mode, actor_id)
-            .await
+        self.load_as(branch, base, &data, mode, actor_id).await
     }
 
     async fn load_direct_on_branch(
@@ -314,8 +352,9 @@ impl Omnigraph {
         data: &str,
         mode: LoadMode,
         actor_id: Option<&str>,
+        input_shape: LoadInputShape,
     ) -> Result<LoadResult> {
-        load_jsonl_data(self, branch, data, mode, actor_id).await
+        load_jsonl_data(self, branch, data, mode, actor_id, input_shape).await
     }
 }
 
@@ -369,6 +408,7 @@ async fn load_jsonl_data(
     data: &str,
     mode: LoadMode,
     actor_id: Option<&str>,
+    input_shape: LoadInputShape,
 ) -> Result<LoadResult> {
     const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -379,7 +419,7 @@ async fn load_jsonl_data(
     let retryable = matches!(mode, LoadMode::Append | LoadMode::Merge);
     for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
         let replay = BufReader::new(Cursor::new(data.as_bytes()));
-        match load_jsonl_reader_once(db, branch, replay, mode, actor_id).await {
+        match load_jsonl_reader_once(db, branch, replay, mode, actor_id, input_shape).await {
             Err(err)
                 if retryable
                     && err.is_read_set_changed()
@@ -390,7 +430,7 @@ async fn load_jsonl_data(
                     branch = branch.unwrap_or("main"),
                     "prepared load authority changed before effects; repreparing"
                 );
-                db.refresh_pre_effect_write_attempt().await?;
+                db.refresh().await?;
             }
             result => return result,
         }
@@ -404,6 +444,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     reader: R,
     mode: LoadMode,
     actor_id: Option<&str>,
+    input_shape: LoadInputShape,
 ) -> Result<LoadResult> {
     // Capture the manifest/schema authority before interpreting any input. The
     // catalog rides the WriteTxn and was built from the exact accepted IR named
@@ -416,122 +457,111 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // Phase 1: Parse all lines, spool into per-type collections
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
     let mut edge_rows: HashMap<String, Vec<(String, String, JsonValue)>> = HashMap::new();
+    let mut strict_rows = StrictGraphRows::default();
     let mut keyed_input_budget: HashMap<String, (usize, u64)> = HashMap::new();
+    // Strict syntax is independent of the keyed-write transaction ceiling.
+    // Append/Merge route through the bounded keyed adapter; Overwrite stages a
+    // Lance replacement transaction and must retain the bulk-replacement
+    // contract. Strict normalization still preflights its Arrow allocation.
     let bounded_keyed_input = matches!(mode, LoadMode::Append | LoadMode::Merge);
-    let mut saw_export_provenance = false;
-    let mut saw_logical_record = false;
 
-    // Parse a stream of JSON values. Accepts both compact JSONL (one object
-    // per line) and pretty-printed JSON where a single object spans multiple
-    // lines — serde's streaming deserializer treats any whitespace (including
-    // newlines) between top-level values as a separator.
-    for (idx, parsed) in serde_json::Deserializer::from_reader(reader)
-        .into_iter::<JsonValue>()
-        .enumerate()
-    {
-        let record_num = idx + 1;
-        let mut value: JsonValue = parsed.map_err(|e| {
-            OmniError::manifest(format!("invalid JSON at record {}: {}", record_num, e))
-        })?;
-
-        if value.get("_omnigraph_export_provenance").is_some() {
-            if saw_export_provenance || saw_logical_record {
-                return Err(OmniError::manifest(format!(
-                    "record {record_num}: export provenance must appear exactly once before logical rows"
-                )));
-            }
-            let envelope: ExportProvenanceEnvelope =
-                serde_json::from_value(value).map_err(|e| {
-                    OmniError::manifest(format!(
-                        "record {record_num}: invalid stream-authority retirement provenance: {e}"
-                    ))
-                })?;
-            let provenance = envelope._omnigraph_export_provenance;
-            provenance.validate_for_rebuild().map_err(|error| {
-                OmniError::manifest(format!(
-                    "record {record_num}: invalid stream-authority retirement provenance: {error}"
-                ))
+    if input_shape == LoadInputShape::StrictGraphBatch {
+        strict_rows = parse_strict_graph_rows(
+            reader,
+            &catalog,
+            bounded_keyed_input,
+            &mut keyed_input_budget,
+        )?;
+    } else {
+        // Parse a stream of JSON values. Accepts both compact JSONL (one object
+        // per line) and pretty-printed JSON where a single object spans multiple
+        // lines — serde's streaming deserializer treats any whitespace (including
+        // newlines) between top-level values as a separator.
+        for (idx, parsed) in serde_json::Deserializer::from_reader(reader)
+            .into_iter::<JsonValue>()
+            .enumerate()
+        {
+            let record_num = idx + 1;
+            let mut value: JsonValue = parsed.map_err(|e| {
+                OmniError::manifest(format!("invalid JSON at record {}: {}", record_num, e))
             })?;
-            saw_export_provenance = true;
-            continue;
-        }
-        saw_logical_record = true;
 
-        if let Some(type_name) = value
-            .get("type")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-        {
-            if !catalog.node_types.contains_key(&type_name) {
+            if let Some(type_name) = value
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            {
+                if !catalog.node_types.contains_key(&type_name) {
+                    return Err(OmniError::manifest(format!(
+                        "record {}: unknown node type '{}'",
+                        record_num, type_name
+                    )));
+                }
+                let data = value
+                    .get_mut("data")
+                    .map(JsonValue::take)
+                    .unwrap_or(JsonValue::Object(serde_json::Map::new()));
+                if bounded_keyed_input {
+                    account_keyed_json_row(
+                        &format!("node:{type_name}"),
+                        &data,
+                        0,
+                        &mut keyed_input_budget,
+                    )?;
+                }
+                node_rows.entry(type_name).or_default().push(data);
+            } else if let Some(edge_name) = value
+                .get("edge")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            {
+                if catalog.lookup_edge_by_name(&edge_name).is_none() {
+                    return Err(OmniError::manifest(format!(
+                        "record {}: unknown edge type '{}'",
+                        record_num, edge_name
+                    )));
+                }
+                let from = value
+                    .get("from")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        OmniError::manifest(format!("record {}: edge missing 'from'", record_num))
+                    })?
+                    .to_string();
+                let to = value
+                    .get("to")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        OmniError::manifest(format!("record {}: edge missing 'to'", record_num))
+                    })?
+                    .to_string();
+                let data = value
+                    .get_mut("data")
+                    .map(JsonValue::take)
+                    .unwrap_or(JsonValue::Object(serde_json::Map::new()));
+                let canonical = catalog
+                    .lookup_edge_by_name(&edge_name)
+                    .unwrap()
+                    .name
+                    .clone();
+                if bounded_keyed_input {
+                    account_keyed_json_row(
+                        &format!("edge:{canonical}"),
+                        &data,
+                        from.len().saturating_add(to.len()),
+                        &mut keyed_input_budget,
+                    )?;
+                }
+                edge_rows
+                    .entry(canonical)
+                    .or_default()
+                    .push((from, to, data));
+            } else {
                 return Err(OmniError::manifest(format!(
-                    "record {}: unknown node type '{}'",
-                    record_num, type_name
+                    "record {}: expected 'type' or 'edge' field",
+                    record_num
                 )));
             }
-            let data = value
-                .get_mut("data")
-                .map(JsonValue::take)
-                .unwrap_or(JsonValue::Object(serde_json::Map::new()));
-            if bounded_keyed_input {
-                account_keyed_json_row(
-                    &format!("node:{type_name}"),
-                    &data,
-                    0,
-                    &mut keyed_input_budget,
-                )?;
-            }
-            node_rows.entry(type_name).or_default().push(data);
-        } else if let Some(edge_name) = value
-            .get("edge")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-        {
-            if catalog.lookup_edge_by_name(&edge_name).is_none() {
-                return Err(OmniError::manifest(format!(
-                    "record {}: unknown edge type '{}'",
-                    record_num, edge_name
-                )));
-            }
-            let from = value
-                .get("from")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    OmniError::manifest(format!("record {}: edge missing 'from'", record_num))
-                })?
-                .to_string();
-            let to = value
-                .get("to")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    OmniError::manifest(format!("record {}: edge missing 'to'", record_num))
-                })?
-                .to_string();
-            let data = value
-                .get_mut("data")
-                .map(JsonValue::take)
-                .unwrap_or(JsonValue::Object(serde_json::Map::new()));
-            let canonical = catalog
-                .lookup_edge_by_name(&edge_name)
-                .unwrap()
-                .name
-                .clone();
-            if bounded_keyed_input {
-                account_keyed_json_row(
-                    &format!("edge:{canonical}"),
-                    &data,
-                    from.len().saturating_add(to.len()),
-                    &mut keyed_input_budget,
-                )?;
-            }
-            edge_rows
-                .entry(canonical)
-                .or_default()
-                .push((from, to, data));
-        } else {
-            return Err(OmniError::manifest(format!(
-                "record {}: expected 'type' or 'edge' field",
-                record_num
-            )));
         }
     }
 
@@ -568,12 +598,16 @@ async fn load_jsonl_reader_once<R: BufRead>(
         LoadMode::Merge => crate::db::MutationOpKind::Merge,
         LoadMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
     };
+    let StrictGraphRows {
+        nodes: strict_nodes,
+        edges: strict_edges,
+    } = strict_rows;
 
     // Phase 2a: build and validate every node batch up front. Cheap and
     // synchronous — surfaces validation errors before any S3 traffic.
     let mut node_id_remap = TypedNodeIdRemap::default();
-    let mut prepared_nodes: Vec<(String, String, RecordBatch, usize)> =
-        Vec::with_capacity(node_rows.len());
+    let mut prepared_nodes: Vec<(String, String, Vec<RecordBatch>, usize)> =
+        Vec::with_capacity(node_rows.len().saturating_add(strict_nodes.len()));
     for (type_name, rows) in &node_rows {
         let node_type = &catalog.node_types[type_name];
         let batch = build_node_batch(node_type, rows, &mut node_id_remap)?;
@@ -583,12 +617,21 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let _entry = snapshot
             .entry(&table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-        prepared_nodes.push((type_name.clone(), table_key, batch, loaded_count));
+        prepared_nodes.push((type_name.clone(), table_key, vec![batch], loaded_count));
+    }
+    for (type_name, rows) in strict_nodes {
+        let table_key = format!("node:{type_name}");
+        let _entry = snapshot
+            .entry(&table_key)
+            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {table_key}")))?;
+        let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
+        let loaded_count = batch.num_rows();
+        prepared_nodes.push((type_name, table_key, vec![batch], loaded_count));
     }
 
     // Phase 2b: accumulate every node type in memory. Fragment writes are
     // delayed until after all validation succeeds.
-    for (type_name, table_key, batch, loaded_count) in prepared_nodes {
+    for (type_name, table_key, batches, loaded_count) in prepared_nodes {
         // The loader only needs the captured expected version (the publisher's
         // CAS fence) for `ensure_path` — it discards the handle. With a
         // non-strict load op (Merge/Append) and a `WriteTxn`, collapse #1 skips
@@ -605,15 +648,17 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.expected_version,
             load_op_kind,
         )?;
-        let schema = batch.schema();
-        staging.append_batch(&table_key, schema, pending_mode, batch)?;
+        for batch in batches {
+            let schema = batch.schema();
+            staging.append_batch(&table_key, schema, pending_mode, batch)?;
+        }
         result.nodes_loaded.insert(type_name, loaded_count);
     }
 
     // Phase 2d: build edge batches. Edge referential integrity (and the rest)
     // runs end-of-load via the unified evaluator, below.
-    let mut prepared_edges: Vec<(String, String, RecordBatch, usize)> =
-        Vec::with_capacity(edge_rows.len());
+    let mut prepared_edges: Vec<(String, String, Vec<RecordBatch>, usize)> =
+        Vec::with_capacity(edge_rows.len().saturating_add(strict_edges.len()));
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
         let batch = build_edge_batch(edge_type, rows, &node_id_remap)?;
@@ -623,11 +668,20 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let _entry = snapshot
             .entry(&table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-        prepared_edges.push((edge_name.clone(), table_key, batch, loaded_count));
+        prepared_edges.push((edge_name.clone(), table_key, vec![batch], loaded_count));
+    }
+    for (edge_name, rows) in strict_edges {
+        let table_key = format!("edge:{edge_name}");
+        let _entry = snapshot
+            .entry(&table_key)
+            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {table_key}")))?;
+        let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
+        let loaded_count = batch.num_rows();
+        prepared_edges.push((edge_name, table_key, vec![batch], loaded_count));
     }
 
     // Phase 2e: accumulate every edge type. Same dispatch as Phase 2b.
-    for (edge_name, table_key, batch, loaded_count) in prepared_edges {
+    for (edge_name, table_key, batches, loaded_count) in prepared_edges {
         // Same as the node phase: only the captured expected version is used;
         // collapse #1 skips the open for a non-strict load op under a `WriteTxn`.
         let opened = db
@@ -642,8 +696,10 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.expected_version,
             load_op_kind,
         )?;
-        let schema = batch.schema();
-        staging.append_batch(&table_key, schema, pending_mode, batch)?;
+        for batch in batches {
+            let schema = batch.schema();
+            staging.append_batch(&table_key, schema, pending_mode, batch)?;
+        }
         result.edges_loaded.insert(edge_name, loaded_count);
     }
 
@@ -751,6 +807,376 @@ async fn load_jsonl_reader_once<R: BufRead>(
     }
 
     Ok(result)
+}
+
+#[derive(Default)]
+struct StrictGraphRows {
+    nodes: HashMap<String, Vec<JsonValue>>,
+    edges: HashMap<String, Vec<JsonValue>>,
+}
+
+const GRAPH_BATCH_MAX_LINE_BYTES: usize = KEYED_WRITE_MAX_BYTES as usize;
+const GRAPH_BATCH_JSON_DOM_STRUCTURE_BYTES: u64 = 64 * 1024 * 1024;
+const GRAPH_BATCH_JSON_BYTES_PER_STRUCTURAL_SLOT: u64 = 512;
+const GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS: u64 =
+    GRAPH_BATCH_JSON_DOM_STRUCTURE_BYTES / GRAPH_BATCH_JSON_BYTES_PER_STRUCTURAL_SLOT;
+
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedGraphBatchLine {
+    Line(Vec<u8>),
+    InputTooLarge { limit: usize, actual: usize },
+}
+
+/// Read one NDJSON line without ever retaining more than `max_line_bytes`
+/// (plus one possible CRLF delimiter byte). Once oversized, the retained
+/// prefix is released and the tail is consumed through the next newline so a
+/// caller that chooses to continue can frame the following line correctly.
+fn read_bounded_graph_batch_line<R: BufRead>(
+    reader: &mut R,
+    max_line_bytes: usize,
+) -> Result<Option<BoundedGraphBatchLine>> {
+    let mut line = Vec::new();
+    let mut current_line_bytes = 0_usize;
+    let mut last_byte_was_cr = false;
+    let mut discarding = false;
+
+    loop {
+        let available = reader.fill_buf().map_err(OmniError::Io)?;
+        if available.is_empty() {
+            if current_line_bytes == 0 {
+                return Ok(None);
+            }
+            if discarding || current_line_bytes > max_line_bytes {
+                return Ok(Some(BoundedGraphBatchLine::InputTooLarge {
+                    limit: max_line_bytes,
+                    actual: current_line_bytes,
+                }));
+            }
+            return Ok(Some(BoundedGraphBatchLine::Line(line)));
+        }
+
+        let mut consumed = 0_usize;
+        let mut delimited = false;
+        for &byte in available {
+            consumed = consumed.saturating_add(1);
+            if byte == b'\n' {
+                delimited = true;
+                break;
+            }
+
+            current_line_bytes = current_line_bytes.saturating_add(1);
+            last_byte_was_cr = byte == b'\r';
+            if discarding {
+                continue;
+            }
+            line.push(byte);
+            if line.len() > max_line_bytes {
+                let possible_crlf = line.len() == max_line_bytes + 1 && byte == b'\r';
+                if !possible_crlf {
+                    discarding = true;
+                    line.clear();
+                }
+            }
+        }
+        reader.consume(consumed);
+
+        if delimited {
+            let delimiter_bytes = usize::from(last_byte_was_cr);
+            let actual = current_line_bytes.saturating_sub(delimiter_bytes);
+            if discarding || actual > max_line_bytes {
+                return Ok(Some(BoundedGraphBatchLine::InputTooLarge {
+                    limit: max_line_bytes,
+                    actual,
+                }));
+            }
+            if last_byte_was_cr {
+                let removed = line.pop();
+                debug_assert_eq!(removed, Some(b'\r'));
+            }
+            return Ok(Some(BoundedGraphBatchLine::Line(line)));
+        }
+    }
+}
+
+fn validate_graph_batch_json_structure(raw_json: &[u8]) -> Result<()> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut slots = 1_u64;
+    for &byte in raw_json {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            continue;
+        }
+        if matches!(byte, b'{' | b'}' | b'[' | b']' | b',' | b':') {
+            slots = slots.checked_add(1).unwrap_or(u64::MAX);
+            if slots > GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS {
+                return Err(OmniError::resource_limit(
+                    "graph_batch_json_structural_slots",
+                    GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS,
+                    slots,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// JSON value decoded with duplicate-member rejection at every object depth.
+/// `serde_json::Value` normally keeps the last duplicate, which is unsuitable
+/// at a write authority boundary because two producers can disagree about the
+/// field that owns an id or edge endpoint.
+struct UniqueJsonValue(JsonValue);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_any(UniqueJsonVisitor)
+            .map(UniqueJsonValue)
+    }
+}
+
+struct UniqueJsonVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object members")
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::Null)
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::Null)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(JsonValue::Number)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::String(value.to_string()))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::String(value))
+    }
+
+    fn visit_seq<A>(self, mut values: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut out = Vec::new();
+        while let Some(UniqueJsonValue(value)) = values.next_element::<UniqueJsonValue>()? {
+            out.push(value);
+        }
+        Ok(JsonValue::Array(out))
+    }
+
+    fn visit_map<A>(self, mut values: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut out = serde_json::Map::new();
+        while let Some(key) = values.next_key::<String>()? {
+            if out.contains_key(&key) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate JSON member '{key}'"
+                )));
+            }
+            let UniqueJsonValue(value) = values.next_value::<UniqueJsonValue>()?;
+            out.insert(key, value);
+        }
+        Ok(JsonValue::Object(out))
+    }
+}
+
+fn parse_strict_graph_rows<R: BufRead>(
+    mut reader: R,
+    catalog: &Catalog,
+    bounded_keyed_input: bool,
+    keyed_input_budget: &mut HashMap<String, (usize, u64)>,
+) -> Result<StrictGraphRows> {
+    let mut rows = StrictGraphRows::default();
+    let mut line_number = 0_usize;
+
+    while let Some(frame) = read_bounded_graph_batch_line(&mut reader, GRAPH_BATCH_MAX_LINE_BYTES)?
+    {
+        line_number = line_number.saturating_add(1);
+        let line = match frame {
+            BoundedGraphBatchLine::Line(line) => line,
+            BoundedGraphBatchLine::InputTooLarge { limit, actual } => {
+                return Err(OmniError::resource_limit(
+                    "graph_batch_line_bytes",
+                    u64::try_from(limit).unwrap_or(u64::MAX),
+                    u64::try_from(actual).unwrap_or(u64::MAX),
+                ));
+            }
+        };
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        validate_graph_batch_json_structure(&line)?;
+        let UniqueJsonValue(value) =
+            serde_json::from_slice::<UniqueJsonValue>(&line).map_err(|e| {
+                OmniError::manifest(format!("invalid strict JSON at line {line_number}: {e}"))
+            })?;
+        let mut envelope = match value {
+            JsonValue::Object(envelope) => envelope,
+            _ => {
+                return Err(OmniError::manifest(format!(
+                    "line {line_number}: graph batch row must be one JSON object"
+                )));
+            }
+        };
+
+        match (envelope.contains_key("type"), envelope.contains_key("edge")) {
+            (true, false) => {
+                validate_strict_envelope_fields(line_number, &envelope, &["type", "data"])?;
+                let type_name = take_required_string(&mut envelope, "type", line_number)?;
+                let data = take_object_or_empty(&mut envelope, "data", line_number)?;
+                if !catalog.node_types.contains_key(&type_name) {
+                    return Err(OmniError::manifest(format!(
+                        "line {line_number}: unknown node type '{type_name}'"
+                    )));
+                }
+                let table_key = format!("node:{type_name}");
+                let row = JsonValue::Object(data);
+                if bounded_keyed_input {
+                    account_keyed_json_row(&table_key, &row, 0, keyed_input_budget)?;
+                }
+                rows.nodes.entry(type_name).or_default().push(row);
+            }
+            (false, true) => {
+                validate_strict_envelope_fields(
+                    line_number,
+                    &envelope,
+                    &["edge", "from", "to", "data"],
+                )?;
+                let edge_name = take_required_string(&mut envelope, "edge", line_number)?;
+                let from = take_required_string(&mut envelope, "from", line_number)?;
+                let to = take_required_string(&mut envelope, "to", line_number)?;
+                let mut data = take_object_or_empty(&mut envelope, "data", line_number)?;
+                for reserved in ["src", "dst"] {
+                    if data.contains_key(reserved) {
+                        return Err(OmniError::manifest(format!(
+                            "line {line_number}: edge data field '{reserved}' is reserved structural state"
+                        )));
+                    }
+                }
+                let edge_type = catalog.lookup_edge_by_name(&edge_name).ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "line {line_number}: unknown edge type '{edge_name}'"
+                    ))
+                })?;
+                let canonical = edge_type.name.clone();
+                let table_key = format!("edge:{canonical}");
+                if bounded_keyed_input {
+                    account_keyed_json_row(
+                        &table_key,
+                        &JsonValue::Object(data.clone()),
+                        from.len().saturating_add(to.len()),
+                        keyed_input_budget,
+                    )?;
+                }
+                data.insert("src".to_string(), JsonValue::String(from));
+                data.insert("dst".to_string(), JsonValue::String(to));
+                rows.edges
+                    .entry(canonical)
+                    .or_default()
+                    .push(JsonValue::Object(data));
+            }
+            _ => {
+                return Err(OmniError::manifest(format!(
+                    "line {line_number}: graph batch row must contain exactly one of 'type' or 'edge'"
+                )));
+            }
+        }
+    }
+
+    Ok(rows)
+}
+
+fn validate_strict_envelope_fields(
+    line_number: usize,
+    envelope: &serde_json::Map<String, JsonValue>,
+    allowed: &[&str],
+) -> Result<()> {
+    for field in envelope.keys() {
+        if is_reserved_physical_input_field(field) {
+            return Err(OmniError::manifest(format!(
+                "line {line_number}: top-level field '{field}' is reserved physical state"
+            )));
+        }
+        if !allowed.contains(&field.as_str()) {
+            return Err(OmniError::manifest(format!(
+                "line {line_number}: unknown top-level graph batch field '{field}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn take_required_string(
+    envelope: &mut serde_json::Map<String, JsonValue>,
+    field: &str,
+    line_number: usize,
+) -> Result<String> {
+    match envelope.remove(field) {
+        Some(JsonValue::String(value)) => Ok(value),
+        Some(value) => Err(OmniError::manifest(format!(
+            "line {line_number}: graph batch field '{field}' must be a string, got {value}"
+        ))),
+        None => Err(OmniError::manifest(format!(
+            "line {line_number}: graph batch row requires field '{field}'"
+        ))),
+    }
+}
+
+fn take_object_or_empty(
+    envelope: &mut serde_json::Map<String, JsonValue>,
+    field: &str,
+    line_number: usize,
+) -> Result<serde_json::Map<String, JsonValue>> {
+    match envelope.remove(field) {
+        Some(JsonValue::Object(value)) => Ok(value),
+        Some(value) => Err(OmniError::manifest(format!(
+            "line {line_number}: graph batch field '{field}' must be an object, got {value}"
+        ))),
+        None => Ok(serde_json::Map::new()),
+    }
 }
 
 /// Account a keyed JSON record before retaining it in the per-table parse
@@ -895,14 +1321,7 @@ fn build_node_batch(
     // U64 range), not an independent rendering of its input JSON token.
     let mut property_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len() - 1);
     for field in schema.fields().iter().skip(1) {
-        if field.name() == crate::db::STREAM_METADATA_COLUMN {
-            property_columns.push(
-                crate::db::manifest::stream_token::build_trusted_stream_metadata_array(
-                    &vec![None; rows.len()],
-                )
-                .map_err(|error| OmniError::manifest_internal(error.to_string()))?,
-            );
-        } else if node_type.blob_properties.contains(field.name()) {
+        if node_type.blob_properties.contains(field.name()) {
             let col = build_blob_column(field.name(), field.is_nullable(), rows)?;
             property_columns.push(col);
         } else {
@@ -1060,14 +1479,7 @@ fn build_edge_batch(
     // Build edge property columns (skip id, src, dst at indices 0-2)
     let data_values: Vec<JsonValue> = rows.iter().map(|(_, _, data)| data.clone()).collect();
     for field in schema.fields().iter().skip(3) {
-        if field.name() == crate::db::STREAM_METADATA_COLUMN {
-            columns.push(
-                crate::db::manifest::stream_token::build_trusted_stream_metadata_array(
-                    &vec![None; rows.len()],
-                )
-                .map_err(|error| OmniError::manifest_internal(error.to_string()))?,
-            );
-        } else if edge_type.blob_properties.contains(field.name()) {
+        if edge_type.blob_properties.contains(field.name()) {
             let col = build_blob_column(field.name(), field.is_nullable(), &data_values)?;
             columns.push(col);
         } else {
@@ -1085,158 +1497,213 @@ fn build_edge_batch(
     RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
 }
 
-/// Normalize one caller-shaped stream row into the exact logical Arrow schema
-/// consumed by the private B2 admission core.
-///
-/// Unlike the bulk loader, this path is intentionally strict: every row owns
-/// its sequencing identity, so it may not mint an id, ignore an unknown field,
-/// or turn a malformed nullable value into null. The caller removes and
-/// validates the `$stream` envelope and supplies the hidden-column-free public
-/// catalog before entering this helper.
-pub(crate) fn normalize_stream_json_row(
+/// Normalize a bounded group of caller-shaped rows into one dense logical
+/// Arrow batch. This keeps strict validation at the graph facade without
+/// paying one RecordBatch allocation per NDJSON line.
+pub(crate) fn normalize_strict_json_rows(
     catalog: &Catalog,
     table_key: &str,
-    row: JsonValue,
+    rows: &[JsonValue],
 ) -> Result<RecordBatch> {
-    let batch = if let Some(type_name) = table_key.strip_prefix("node:") {
+    if rows.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "strict row normalization requires at least one row",
+        ));
+    }
+    if let Some(type_name) = table_key.strip_prefix("node:") {
         let node_type = catalog
             .node_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown node type '{type_name}'")))?;
-        normalize_stream_node_row(node_type, row)
+        normalize_strict_node_rows(node_type, rows)
     } else if let Some(type_name) = table_key.strip_prefix("edge:") {
         let edge_type = catalog
             .edge_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{type_name}'")))?;
-        normalize_stream_edge_row(edge_type, row)
+        normalize_strict_edge_rows(edge_type, rows)
     } else {
         Err(OmniError::manifest(format!(
-            "invalid stream table key '{table_key}'"
+            "invalid table key '{table_key}'"
         )))
-    }?;
-
-    Ok(batch)
+    }
 }
 
-fn normalize_stream_node_row(node_type: &NodeType, row: JsonValue) -> Result<RecordBatch> {
-    let object = row
-        .as_object()
-        .ok_or_else(|| OmniError::manifest("stream input must be one JSON object"))?;
-    validate_stream_input_fields(
-        &format!("node:{}", node_type.name),
-        object,
-        &node_type.properties,
-        &[],
-    )?;
-    validate_explicit_stream_id(&node_type.name, object)?;
-    let mut embed_properties = node_type.embed_sources.keys().collect::<Vec<_>>();
-    embed_properties.sort();
-    for property in embed_properties {
-        if object.get(property).is_none_or(JsonValue::is_null) {
-            return Err(OmniError::manifest(format!(
-                "stream row for {} requires caller-supplied @embed vector '{}'",
-                node_type.name, property
-            )));
-        }
+fn normalize_strict_node_rows(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBatch> {
+    let objects = strict_row_objects(rows)?;
+    let table_key = format!("node:{}", node_type.name);
+    for object in &objects {
+        validate_strict_input_fields(&table_key, object, &node_type.properties, &[])?;
+        validate_optional_row_id(&node_type.name, object)?;
     }
 
     let schema = Arc::clone(&node_type.arrow_schema);
-    preflight_stream_row_arrow_bytes(&schema, object)?;
-    let mut columns = Vec::with_capacity(schema.fields().len());
-    let id = object
-        .get("id")
-        .and_then(JsonValue::as_str)
-        .expect("validated stream id");
-    columns.push(Arc::new(StringArray::from(vec![id])) as ArrayRef);
-    for field in schema.fields().iter().skip(1) {
-        let column = build_column_from_json(
-            field.name(),
-            field.data_type(),
-            field.is_nullable(),
-            std::slice::from_ref(&row),
-            JsonConversionMode::Strict,
-        )?;
-        columns.push(column);
-    }
-    let batch = RecordBatch::try_new(schema, columns)
-        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    preflight_strict_rows_arrow_bytes(
+        &schema,
+        &objects,
+        &node_type.blob_properties,
+        KEYED_WRITE_MAX_BYTES,
+    )?;
+    preflight_blob_decode_budget(
+        &table_key,
+        node_type.blob_properties.iter().map(String::as_str),
+        &rows.iter().collect::<Vec<_>>(),
+    )?;
 
-    if let Some(key_properties) = &node_type.key {
-        let key_columns = key_properties
-            .iter()
-            .map(|property| {
-                batch.column_by_name(property).cloned().ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "@key property '{property}' is missing from node {} stream schema",
+    let mut property_columns = Vec::with_capacity(schema.fields().len().saturating_sub(1));
+    for field in schema.fields().iter().skip(1) {
+        let column = if node_type.blob_properties.contains(field.name()) {
+            build_blob_column(field.name(), field.is_nullable(), rows)?
+        } else {
+            build_column_from_json(
+                field.name(),
+                field.data_type(),
+                field.is_nullable(),
+                rows,
+                JsonConversionMode::Strict,
+            )?
+        };
+        property_columns.push(column);
+    }
+
+    let key_columns = node_type
+        .key
+        .as_ref()
+        .map(|properties| {
+            properties
+                .iter()
+                .map(|property| {
+                    let schema_index = schema.index_of(property).map_err(|_| {
+                        OmniError::manifest_internal(format!(
+                            "@key property '{property}' is missing from node {} strict schema",
+                            node_type.name
+                        ))
+                    })?;
+                    property_columns
+                        .get(schema_index.saturating_sub(1))
+                        .cloned()
+                        .ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "@key property '{property}' has an invalid strict schema position"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+
+    let ids = objects
+        .iter()
+        .enumerate()
+        .map(|(row_index, object)| {
+            let explicit_id = optional_row_id(&node_type.name, object)?;
+            if let Some(key_columns) = &key_columns {
+                let canonical = canonical_node_id(key_columns, row_index)?.ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "node {} is missing a non-null @key value",
                         node_type.name
                     ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let canonical = canonical_node_id(&key_columns, 0)?.ok_or_else(|| {
-            OmniError::manifest(format!(
-                "node {} is missing a non-null @key value",
-                node_type.name
-            ))
-        })?;
-        if id != canonical {
-            return Err(OmniError::manifest(format!(
-                "node {} explicit id '{}' does not match its canonical @key id '{}'",
-                node_type.name, id, canonical
-            )));
-        }
-    }
-    Ok(batch)
+                })?;
+                if let Some(explicit_id) = explicit_id
+                    && explicit_id != canonical
+                {
+                    return Err(OmniError::manifest(format!(
+                        "node {} explicit id '{}' does not match its canonical @key id '{}'",
+                        node_type.name, explicit_id, canonical
+                    )));
+                }
+                Ok(canonical)
+            } else {
+                Ok(explicit_id.map(str::to_string).unwrap_or_else(generate_id))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    columns.push(Arc::new(StringArray::from(ids)) as ArrayRef);
+    columns.extend(property_columns);
+    RecordBatch::try_new(schema, columns).map_err(|error| OmniError::Lance(error.to_string()))
 }
 
-fn normalize_stream_edge_row(edge_type: &EdgeType, row: JsonValue) -> Result<RecordBatch> {
-    let object = row
-        .as_object()
-        .ok_or_else(|| OmniError::manifest("stream input must be one JSON object"))?;
-    validate_stream_input_fields(
-        &format!("edge:{}", edge_type.name),
-        object,
-        &edge_type.properties,
-        &["src", "dst"],
-    )?;
-    validate_explicit_stream_id(&edge_type.name, object)?;
-    let src = validate_required_stream_string(&edge_type.name, "src", object)?;
-    let dst = validate_required_stream_string(&edge_type.name, "dst", object)?;
+fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Result<RecordBatch> {
+    let objects = strict_row_objects(rows)?;
+    let table_key = format!("edge:{}", edge_type.name);
+    for object in &objects {
+        validate_strict_input_fields(&table_key, object, &edge_type.properties, &["src", "dst"])?;
+        validate_optional_row_id(&edge_type.name, object)?;
+        validate_required_row_string(&edge_type.name, "src", object)?;
+        validate_required_row_string(&edge_type.name, "dst", object)?;
+    }
 
     let schema = Arc::clone(&edge_type.arrow_schema);
-    preflight_stream_row_arrow_bytes(&schema, object)?;
+    preflight_strict_rows_arrow_bytes(
+        &schema,
+        &objects,
+        &edge_type.blob_properties,
+        KEYED_WRITE_MAX_BYTES,
+    )?;
+    preflight_blob_decode_budget(
+        &table_key,
+        edge_type.blob_properties.iter().map(String::as_str),
+        &rows.iter().collect::<Vec<_>>(),
+    )?;
+
+    let ids = objects
+        .iter()
+        .map(|object| {
+            optional_row_id(&edge_type.name, object)
+                .map(|id| id.map(str::to_string).unwrap_or_else(generate_id))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let srcs = objects
+        .iter()
+        .map(|object| validate_required_row_string(&edge_type.name, "src", object))
+        .collect::<Result<Vec<_>>>()?;
+    let dsts = objects
+        .iter()
+        .map(|object| validate_required_row_string(&edge_type.name, "dst", object))
+        .collect::<Result<Vec<_>>>()?;
+
     let mut columns = Vec::with_capacity(schema.fields().len());
-    let id = object
-        .get("id")
-        .and_then(JsonValue::as_str)
-        .expect("validated stream id");
-    columns.push(Arc::new(StringArray::from(vec![id])) as ArrayRef);
-    columns.push(Arc::new(StringArray::from(vec![src])) as ArrayRef);
-    columns.push(Arc::new(StringArray::from(vec![dst])) as ArrayRef);
+    columns.push(Arc::new(StringArray::from(ids)) as ArrayRef);
+    columns.push(Arc::new(StringArray::from(srcs)) as ArrayRef);
+    columns.push(Arc::new(StringArray::from(dsts)) as ArrayRef);
     for field in schema.fields().iter().skip(3) {
-        let column = build_column_from_json(
-            field.name(),
-            field.data_type(),
-            field.is_nullable(),
-            std::slice::from_ref(&row),
-            JsonConversionMode::Strict,
-        )?;
+        let column = if edge_type.blob_properties.contains(field.name()) {
+            build_blob_column(field.name(), field.is_nullable(), rows)?
+        } else {
+            build_column_from_json(
+                field.name(),
+                field.data_type(),
+                field.is_nullable(),
+                rows,
+                JsonConversionMode::Strict,
+            )?
+        };
         columns.push(column);
     }
     RecordBatch::try_new(schema, columns).map_err(|error| OmniError::Lance(error.to_string()))
 }
 
-fn validate_stream_input_fields(
+fn strict_row_objects(rows: &[JsonValue]) -> Result<Vec<&serde_json::Map<String, JsonValue>>> {
+    rows.iter()
+        .map(|row| {
+            row.as_object()
+                .ok_or_else(|| OmniError::manifest("strict input must be one JSON object"))
+        })
+        .collect()
+}
+
+fn validate_strict_input_fields(
     table_key: &str,
     object: &serde_json::Map<String, JsonValue>,
     properties: &HashMap<String, PropType>,
     structural_fields: &[&str],
 ) -> Result<()> {
     for field in object.keys() {
-        if is_reserved_stream_physical_field(field) {
+        if is_reserved_physical_input_field(field) {
             return Err(OmniError::manifest(format!(
-                "stream input field '{field}' is reserved physical state"
+                "input field '{field}' is reserved physical state"
             )));
         }
         if field == "id"
@@ -1246,13 +1713,13 @@ fn validate_stream_input_fields(
             continue;
         }
         return Err(OmniError::manifest(format!(
-            "unknown stream input field '{field}' for '{table_key}'"
+            "unknown input field '{field}' for '{table_key}'"
         )));
     }
     Ok(())
 }
 
-fn is_reserved_stream_physical_field(field: &str) -> bool {
+fn is_reserved_physical_input_field(field: &str) -> bool {
     matches!(
         field,
         "_tombstone"
@@ -1261,17 +1728,30 @@ fn is_reserved_stream_physical_field(field: &str) -> bool {
             | "_rowoffset"
             | "_row_created_at_version"
             | "_row_last_updated_at_version"
-    ) || field.eq_ignore_ascii_case(crate::db::STREAM_METADATA_COLUMN)
+    )
 }
 
-fn validate_explicit_stream_id(
+fn validate_optional_row_id(
     type_name: &str,
     object: &serde_json::Map<String, JsonValue>,
 ) -> Result<()> {
-    validate_required_stream_string(type_name, "id", object).map(|_| ())
+    optional_row_id(type_name, object).map(|_| ())
 }
 
-fn validate_required_stream_string<'a>(
+fn optional_row_id<'a>(
+    type_name: &str,
+    object: &'a serde_json::Map<String, JsonValue>,
+) -> Result<Option<&'a str>> {
+    match object.get("id") {
+        Some(JsonValue::String(value)) => Ok(Some(value)),
+        Some(value) => Err(OmniError::manifest(format!(
+            "strict row for {type_name} field 'id' must be a string, got {value}"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn validate_required_row_string<'a>(
     type_name: &str,
     field: &str,
     object: &'a serde_json::Map<String, JsonValue>,
@@ -1279,25 +1759,27 @@ fn validate_required_stream_string<'a>(
     match object.get(field) {
         Some(JsonValue::String(value)) => Ok(value),
         Some(JsonValue::Null) => Err(OmniError::manifest(format!(
-            "stream row for {type_name} requires non-null string field '{field}'"
+            "strict row for {type_name} requires non-null string field '{field}'"
         ))),
         Some(value) => Err(OmniError::manifest(format!(
-            "stream row for {type_name} field '{field}' must be a string, got {value}"
+            "strict row for {type_name} field '{field}' must be a string, got {value}"
         ))),
         None => Err(OmniError::manifest(format!(
-            "stream row for {type_name} requires explicit field '{field}'"
+            "strict row for {type_name} requires explicit field '{field}'"
         ))),
     }
 }
 
-fn preflight_stream_row_arrow_bytes(
+#[cfg(test)]
+fn preflight_strict_row_arrow_bytes(
     schema: &arrow_schema::Schema,
     object: &serde_json::Map<String, JsonValue>,
 ) -> Result<()> {
-    preflight_stream_row_arrow_bytes_with_limit(schema, object, KEYED_WRITE_MAX_BYTES)
+    preflight_strict_row_arrow_bytes_with_limit(schema, object, KEYED_WRITE_MAX_BYTES)
 }
 
-fn preflight_stream_row_arrow_bytes_with_limit(
+#[cfg(test)]
+fn preflight_strict_row_arrow_bytes_with_limit(
     schema: &arrow_schema::Schema,
     object: &serde_json::Map<String, JsonValue>,
     limit: u64,
@@ -1306,11 +1788,11 @@ fn preflight_stream_row_arrow_bytes_with_limit(
     for field in schema.fields() {
         let value = object.get(field.name()).unwrap_or(&JsonValue::Null);
         projected = projected
-            .checked_add(projected_stream_column_bytes(field.data_type(), value)?)
+            .checked_add(projected_strict_column_bytes(field.data_type(), value)?)
             .unwrap_or(u64::MAX);
         if projected > limit {
             return Err(OmniError::resource_limit(
-                "stream_input_arrow_bytes",
+                "strict_input_arrow_bytes",
                 limit,
                 projected,
             ));
@@ -1319,7 +1801,35 @@ fn preflight_stream_row_arrow_bytes_with_limit(
     Ok(())
 }
 
-fn projected_stream_column_bytes(data_type: &DataType, value: &JsonValue) -> Result<u64> {
+fn preflight_strict_rows_arrow_bytes(
+    schema: &arrow_schema::Schema,
+    objects: &[&serde_json::Map<String, JsonValue>],
+    blob_properties: &std::collections::HashSet<String>,
+    limit: u64,
+) -> Result<()> {
+    let mut projected = 0_u64;
+    for object in objects {
+        for field in schema.fields() {
+            let value = object.get(field.name()).unwrap_or(&JsonValue::Null);
+            let field_bytes = if blob_properties.contains(field.name()) {
+                16_u64.saturating_add(estimate_json_arrow_bytes(value)?)
+            } else {
+                projected_strict_column_bytes(field.data_type(), value)?
+            };
+            projected = projected.checked_add(field_bytes).unwrap_or(u64::MAX);
+            if projected > limit {
+                return Err(OmniError::resource_limit(
+                    "strict_input_arrow_bytes",
+                    limit,
+                    projected,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn projected_strict_column_bytes(data_type: &DataType, value: &JsonValue) -> Result<u64> {
     const ARRAY_BUFFER_OVERHEAD: u64 = 16;
     let bytes = match data_type {
         DataType::Utf8 => ARRAY_BUFFER_OVERHEAD.saturating_add(
@@ -1339,7 +1849,7 @@ fn projected_stream_column_bytes(data_type: &DataType, value: &JsonValue) -> Res
             if let Some(items) = value.as_array() {
                 for item in items {
                     bytes = bytes
-                        .checked_add(projected_stream_list_item_bytes(child.data_type(), item)?)
+                        .checked_add(projected_strict_list_item_bytes(child.data_type(), item)?)
                         .unwrap_or(u64::MAX);
                 }
             }
@@ -1348,24 +1858,24 @@ fn projected_stream_column_bytes(data_type: &DataType, value: &JsonValue) -> Res
         DataType::FixedSizeList(child, dimension) => {
             let dimension = u64::try_from(*dimension).map_err(|_| {
                 OmniError::manifest_internal(format!(
-                    "stream vector has invalid dimension {dimension}"
+                    "strict-row vector has invalid dimension {dimension}"
                 ))
             })?;
-            let child_width = projected_stream_fixed_width(child.data_type())?;
+            let child_width = projected_strict_fixed_width(child.data_type())?;
             ARRAY_BUFFER_OVERHEAD
                 .checked_add(dimension.checked_mul(child_width + 1).unwrap_or(u64::MAX))
                 .unwrap_or(u64::MAX)
         }
         other => {
             return Err(OmniError::manifest(format!(
-                "stream input has unsupported Arrow type {other:?}"
+                "strict input has unsupported Arrow type {other:?}"
             )));
         }
     };
     Ok(bytes)
 }
 
-fn projected_stream_list_item_bytes(data_type: &DataType, value: &JsonValue) -> Result<u64> {
+fn projected_strict_list_item_bytes(data_type: &DataType, value: &JsonValue) -> Result<u64> {
     match data_type {
         DataType::Utf8 => Ok(8_u64.saturating_add(
             value
@@ -1373,17 +1883,17 @@ fn projected_stream_list_item_bytes(data_type: &DataType, value: &JsonValue) -> 
                 .and_then(|value| u64::try_from(value.len()).ok())
                 .unwrap_or_default(),
         )),
-        other => projected_stream_fixed_width(other).map(|width| width + 1),
+        other => projected_strict_fixed_width(other).map(|width| width + 1),
     }
 }
 
-fn projected_stream_fixed_width(data_type: &DataType) -> Result<u64> {
+fn projected_strict_fixed_width(data_type: &DataType) -> Result<u64> {
     match data_type {
         DataType::Boolean => Ok(1),
         DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => Ok(4),
         DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Date64 => Ok(8),
         other => Err(OmniError::manifest(format!(
-            "stream input has unsupported nested Arrow type {other:?}"
+            "strict input has unsupported nested Arrow type {other:?}"
         ))),
     }
 }
@@ -1682,7 +2192,7 @@ fn build_column_from_json(
                 ))
             })?;
             if mode == JsonConversionMode::Strict {
-                // Strict stream normalization must reject malformed input and
+                // Strict row normalization must reject malformed input and
                 // prove the builder's lower-bound allocation before creating
                 // it. A legal compiler dimension can still approach i32::MAX;
                 // even one nullable null would otherwise reserve or append
@@ -1731,7 +2241,7 @@ fn build_column_from_json(
                     .unwrap_or(u64::MAX);
                 if allocation_bytes > KEYED_WRITE_MAX_BYTES {
                     return Err(OmniError::resource_limit(
-                        "stream_input_arrow_bytes",
+                        "strict_input_arrow_bytes",
                         KEYED_WRITE_MAX_BYTES,
                         allocation_bytes,
                     ));
@@ -1786,7 +2296,7 @@ fn build_column_from_json(
         }
         _ if mode == JsonConversionMode::Strict => {
             return Err(OmniError::manifest(format!(
-                "stream property '{name}' has unsupported Arrow type {data_type:?}"
+                "strict property '{name}' has unsupported Arrow type {data_type:?}"
             )));
         }
         _ => {
@@ -1801,7 +2311,7 @@ fn build_column_from_json(
             let input = row.get(name).unwrap_or(&JsonValue::Null);
             if !input.is_null() && array.is_null(row_index) {
                 return Err(OmniError::manifest(format!(
-                    "stream property '{name}' expects {data_type:?}, got {input}"
+                    "strict property '{name}' expects {data_type:?}, got {input}"
                 )));
             }
         }
@@ -1814,7 +2324,7 @@ fn build_column_from_json(
             for row_index in 0..list.len() {
                 if !list.is_null(row_index) && list.value(row_index).null_count() != 0 {
                     return Err(OmniError::manifest(format!(
-                        "stream list property '{name}' contains a null or invalid item"
+                        "strict list property '{name}' contains a null or invalid item"
                     )));
                 }
             }
@@ -2570,89 +3080,6 @@ edge WorksAt: Person -> Company
 {"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 "#;
 
-    fn retirement_digest(digit: char) -> String {
-        format!("sha256:{}", digit.to_string().repeat(64))
-    }
-
-    fn retirement_provenance_line(source_schema_ir_hash: &str) -> String {
-        let main_identifier = lance::dataset::refs::BranchIdentifier::main();
-        let archive_identifier = lance::dataset::refs::BranchIdentifier::new(&main_identifier, 3);
-        let archive_member = crate::db::StreamAuthorityRetirementExportMember::from_table_witness(
-            "archive",
-            archive_identifier,
-            Some("01H00000000000000000000002".to_string()),
-            4,
-            retirement_digest('8'),
-        )
-        .unwrap();
-        let main_member = crate::db::StreamAuthorityRetirementExportMember::from_table_witness(
-            "main",
-            main_identifier,
-            Some("01H00000000000000000000000".to_string()),
-            7,
-            retirement_digest('7'),
-        )
-        .unwrap();
-        let members = vec![archive_member, main_member.clone()];
-        let live_branch_heads_digest =
-            crate::db::retirement_live_branch_heads_digest(&members).unwrap();
-        let ordered_branch_member_digests = members
-            .iter()
-            .map(|member| member.branch_member_digest.clone())
-            .collect::<Vec<_>>();
-        let export_cut_digest = crate::db::retirement_export_cut_digest(
-            source_schema_ir_hash,
-            &ordered_branch_member_digests,
-        )
-        .unwrap();
-        let token_head = crate::db::manifest::CurrentHeadWitness {
-            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
-            table_version: 5,
-            transaction_uuid: "18181818-1818-4818-8818-181818181818".to_string(),
-            manifest_e_tag: None,
-        };
-        let token_witness =
-            crate::db::manifest::stream_token::stream_authority_retirement_token_witness_digest_v2(
-                &token_head,
-                3,
-                1,
-                0,
-            )
-            .unwrap();
-        let receipt = crate::db::manifest::stream_token::AuthorityRetirementReceiptV2::new(
-            retirement_digest('1'),
-            &crate::db::manifest::stream_profile::ReceiptChainRef::genesis(),
-            "11111111-1111-4111-8111-111111111111",
-            retirement_digest('2'),
-            "operator:alice",
-            crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
-            7,
-            live_branch_heads_digest,
-            2,
-            retirement_digest('4'),
-            token_head,
-            token_witness,
-            3,
-            1,
-            0,
-            export_cut_digest,
-            1_700_000_000_000_000,
-        )
-        .unwrap();
-        let provenance = crate::db::StreamAuthorityRetirementExportProvenance {
-            kind: "STREAM_AUTHORITY_RETIREMENT".to_string(),
-            receipt: receipt.into(),
-            source_schema_ir_hash: source_schema_ir_hash.to_string(),
-            ordered_branch_member_digests,
-            selected_member_index: 1,
-            branch_member: main_member,
-        };
-        serde_json::json!({
-            "_omnigraph_export_provenance": provenance,
-        })
-        .to_string()
-    }
-
     #[test]
     fn strict_json_conversion_rejects_nullable_wrong_types_and_list_items() {
         let wrong_scalar = vec![serde_json::json!({"score": "not-an-int"})];
@@ -2675,7 +3102,7 @@ edge WorksAt: Person -> Company
             &wrong_scalar,
             JsonConversionMode::Strict,
         )
-        .expect_err("stream normalization must not turn a wrong type into null");
+        .expect_err("strict normalization must not turn a wrong type into null");
         assert!(strict.to_string().contains("expects Int32"), "{strict:?}");
 
         let list_type = DataType::List(Arc::new(arrow_schema::Field::new(
@@ -2699,7 +3126,7 @@ edge WorksAt: Person -> Company
             &wrong_list,
             JsonConversionMode::Strict,
         )
-        .expect_err("stream normalization must reject a wrong list item");
+        .expect_err("strict normalization must reject a wrong list item");
         assert!(
             strict.to_string().contains("null or invalid item"),
             "{strict:?}"
@@ -2713,7 +3140,7 @@ edge WorksAt: Person -> Company
             &missing_nullable,
             JsonConversionMode::Strict,
         )
-        .expect("a missing nullable stream property remains null");
+        .expect("a missing nullable strict-row property remains null");
         assert!(strict.is_null(0));
 
         let pathological_vector = DataType::FixedSizeList(
@@ -2727,7 +3154,7 @@ edge WorksAt: Person -> Company
             &missing_nullable,
             JsonConversionMode::Strict,
         )
-        .expect_err("stream normalization must bound vector allocation before building");
+        .expect_err("strict normalization must bound vector allocation before building");
         assert!(
             matches!(
                 strict,
@@ -2735,7 +3162,7 @@ edge WorksAt: Person -> Company
                     ref resource,
                     limit: KEYED_WRITE_MAX_BYTES,
                     actual: 8_589_934_588,
-                } if resource == "stream_input_arrow_bytes"
+                } if resource == "strict_input_arrow_bytes"
             ),
             "{strict:?}"
         );
@@ -2753,7 +3180,7 @@ edge WorksAt: Person -> Company
             ),
         ]);
         let list_row = serde_json::json!({"id": "row", "tags": ["one", "two"]});
-        let error = preflight_stream_row_arrow_bytes_with_limit(
+        let error = preflight_strict_row_arrow_bytes_with_limit(
             &list_schema,
             list_row.as_object().unwrap(),
             32,
@@ -2765,8 +3192,211 @@ edge WorksAt: Person -> Company
                 ref resource,
                 limit: 32,
                 actual: 57,
-            } if resource == "stream_input_arrow_bytes"
+            } if resource == "strict_input_arrow_bytes"
         ));
+    }
+
+    #[test]
+    fn strict_graph_batch_framing_and_structure_are_bounded_before_dom() {
+        let mut reader = BufReader::new(Cursor::new(b"abcd\n{}\r\n"));
+        assert_eq!(
+            read_bounded_graph_batch_line(&mut reader, 3).unwrap(),
+            Some(BoundedGraphBatchLine::InputTooLarge {
+                limit: 3,
+                actual: 4,
+            })
+        );
+        assert_eq!(
+            read_bounded_graph_batch_line(&mut reader, 3).unwrap(),
+            Some(BoundedGraphBatchLine::Line(b"{}".to_vec())),
+            "the oversized tail must be consumed without corrupting the next CRLF line"
+        );
+
+        let amplified = format!(
+            "[{}0]",
+            "0,".repeat(GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS as usize)
+        );
+        let error = validate_graph_batch_json_structure(amplified.as_bytes())
+            .expect_err("many tiny JSON values must fail before DOM allocation");
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS,
+                actual,
+            } if resource == "graph_batch_json_structural_slots"
+                && actual == GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS + 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_graph_batch_loads_graph_rows_with_crlf_and_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let input = concat!(
+            "\r\n",
+            "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\r\n",
+            "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\"}}\r\n",
+            "\r\n",
+            "{\"edge\":\"Knows\",\"from\":\"Alice\",\"to\":\"Bob\"}\r\n",
+        );
+
+        let result = db
+            .load_graph_batch("main", input, LoadMode::Append)
+            .await
+            .unwrap();
+        assert_eq!(result.nodes_loaded["Person"], 2);
+        assert_eq!(result.edges_loaded["Knows"], 1);
+
+        let snapshot = db.snapshot().await;
+        assert_eq!(
+            snapshot
+                .open("node:Person")
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            snapshot
+                .open("edge:Knows")
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let nullable_dir = tempfile::tempdir().unwrap();
+        let nullable_uri = nullable_dir.path().to_str().unwrap();
+        let nullable_schema = r#"
+node Doc {
+    slug: String @key
+    body: String?
+    embedding: Vector(2)? @embed(body)
+}
+"#;
+        let nullable_db = Omnigraph::init(nullable_uri, nullable_schema)
+            .await
+            .unwrap();
+        nullable_db
+            .load_graph_batch(
+                "main",
+                r#"{"type":"Doc","data":{"slug":"doc-1","body":"hello"}}"#,
+                LoadMode::Append,
+            )
+            .await
+            .expect("a nullable @embed target may remain null");
+        let nullable_snapshot = nullable_db.snapshot().await;
+        let nullable_rows = nullable_snapshot
+            .open("node:Doc")
+            .await
+            .unwrap()
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        assert_eq!(nullable_rows.len(), 1);
+        assert!(
+            nullable_rows[0]
+                .column_by_name("embedding")
+                .unwrap()
+                .is_null(0),
+            "strict graph loading must preserve ordinary nullable-vector semantics"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_graph_batch_rejects_ambiguous_or_noncanonical_json_before_effects() {
+        let cases = [
+            (
+                "recursive duplicate",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","extra":{"x":1,"x":2}}}"#,
+                "duplicate JSON member 'x'",
+            ),
+            (
+                "two objects on one line",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"}} {"type":"Person","data":{"id":"Bob","name":"Bob"}}"#,
+                "invalid strict JSON",
+            ),
+            (
+                "node and edge",
+                r#"{"type":"Person","edge":"Knows","data":{"id":"Alice","name":"Alice"}}"#,
+                "exactly one of 'type' or 'edge'",
+            ),
+            (
+                "unknown top-level field",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"},"branch":"main"}"#,
+                "unknown top-level graph batch field 'branch'",
+            ),
+            (
+                "reserved top-level field",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"},"_rowid":7}"#,
+                "reserved physical state",
+            ),
+            (
+                "unknown data field",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","nickname":"Al"}}"#,
+                "unknown input field 'nickname'",
+            ),
+            (
+                "reserved data field",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","_rowid":7}}"#,
+                "reserved physical state",
+            ),
+            (
+                "non-string supplied id",
+                r#"{"type":"Person","data":{"id":7,"name":"Alice"}}"#,
+                "field 'id' must be a string",
+            ),
+            (
+                "noncanonical id",
+                r#"{"type":"Person","data":{"id":"person-1","name":"Alice"}}"#,
+                "does not match its canonical @key id 'Alice'",
+            ),
+            (
+                "nullable wrong type",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","age":"old"}}"#,
+                "expects Int32",
+            ),
+            (
+                "edge structural field in data",
+                r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"knows-1","src":"Mallory"}}"#,
+                "reserved structural state",
+            ),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let before = db.snapshot().await;
+        for (case, input, expected) in cases {
+            let error = db
+                .load_graph_batch("main", input, LoadMode::Append)
+                .await
+                .expect_err(case);
+            assert!(error.to_string().contains(expected), "{case}: {error}");
+            let after = db.snapshot().await;
+            assert_eq!(after.version(), before.version(), "{case} changed manifest");
+            assert_eq!(
+                after
+                    .open("node:Person")
+                    .await
+                    .unwrap()
+                    .count_rows(None)
+                    .await
+                    .unwrap(),
+                0,
+                "{case} wrote node rows"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2783,187 +3413,6 @@ edge WorksAt: Person -> Company
         assert_eq!(result.nodes_loaded["Company"], 1);
         assert_eq!(result.edges_loaded["Knows"], 1);
         assert_eq!(result.edges_loaded["WorksAt"], 1);
-    }
-
-    #[tokio::test]
-    async fn retired_export_provenance_is_validated_then_discarded_on_rebuild() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        let txn = db.open_write_txn(None).await.unwrap();
-        let schema_ir_hash = txn.authority.schema_ir_hash.clone();
-        drop(txn);
-        let provenance_line = retirement_provenance_line(&schema_ir_hash);
-        let input = format!("{}\n{}", provenance_line, TEST_DATA);
-
-        let result = load_jsonl(&mut db, &input, LoadMode::Overwrite)
-            .await
-            .unwrap();
-        assert_eq!(result.nodes_loaded["Person"], 2);
-        assert_eq!(db.stream_status().await.unwrap().profile_mode, "DISABLED");
-        let snapshot = db.snapshot().await;
-        assert_eq!(snapshot.stream_lifecycles().count(), 0);
-        let tokens = snapshot.open_stream_token_authority().await.unwrap();
-        assert_eq!(tokens.count_rows(None).await.unwrap(), 0);
-
-        let valid: JsonValue = serde_json::from_str(&provenance_line).unwrap();
-        let mut tampered_cases = Vec::new();
-
-        let mut graph_head = valid.clone();
-        graph_head["_omnigraph_export_provenance"]["branch_member"]["graph_head"] =
-            JsonValue::String("01H00000000000000000000001".to_string());
-        tampered_cases.push((
-            "graph head",
-            graph_head,
-            "branch-member witness/digest mismatch",
-        ));
-
-        let mut branch_identity = valid.clone();
-        branch_identity["_omnigraph_export_provenance"]["branch_member"]["branch"] =
-            JsonValue::String("archive".to_string());
-        branch_identity["_omnigraph_export_provenance"]["branch_member"]["branch_identifier"] =
-            serde_json::to_value(lance::dataset::refs::BranchIdentifier::new(
-                &lance::dataset::refs::BranchIdentifier::main(),
-                5,
-            ))
-            .unwrap();
-        tampered_cases.push((
-            "branch identity",
-            branch_identity,
-            "branch-member witness/digest mismatch",
-        ));
-
-        let mut manifest_version = valid.clone();
-        manifest_version["_omnigraph_export_provenance"]["branch_member"]["manifest_version"] =
-            JsonValue::from(8);
-        tampered_cases.push((
-            "manifest version",
-            manifest_version,
-            "branch-member witness/digest mismatch",
-        ));
-
-        let mut table_witness = valid.clone();
-        table_witness["_omnigraph_export_provenance"]["branch_member"]["table_witness_digest"] =
-            JsonValue::String(retirement_digest('9'));
-        tampered_cases.push((
-            "table witness",
-            table_witness,
-            "branch-member witness/digest mismatch",
-        ));
-
-        let mut member_digest = valid.clone();
-        member_digest["_omnigraph_export_provenance"]["branch_member"]["branch_member_digest"] =
-            JsonValue::String(retirement_digest('9'));
-        tampered_cases.push((
-            "member digest",
-            member_digest,
-            "branch-member witness/digest mismatch",
-        ));
-
-        let mut selected_sibling = valid.clone();
-        selected_sibling["_omnigraph_export_provenance"]["selected_member_index"] =
-            JsonValue::from(0);
-        tampered_cases.push((
-            "selected sibling",
-            selected_sibling,
-            "is not selected by the receipt-bound cut proof",
-        ));
-
-        let mut selected_outside = valid.clone();
-        selected_outside["_omnigraph_export_provenance"]["selected_member_index"] =
-            JsonValue::from(2);
-        tampered_cases.push((
-            "selected index outside cut",
-            selected_outside,
-            "selected member index is outside the receipt-bound cut",
-        ));
-
-        let mut sibling_digest = valid.clone();
-        sibling_digest["_omnigraph_export_provenance"]["ordered_branch_member_digests"][0] =
-            JsonValue::String(retirement_digest('a'));
-        tampered_cases.push((
-            "sibling digest",
-            sibling_digest,
-            "is not in the receipt-bound export cut",
-        ));
-
-        let mut schema_hash = valid;
-        schema_hash["_omnigraph_export_provenance"]["source_schema_ir_hash"] =
-            JsonValue::String(retirement_digest('b'));
-        tampered_cases.push((
-            "source schema hash",
-            schema_hash,
-            "is not in the receipt-bound export cut",
-        ));
-
-        for (case, tampered, expected) in tampered_cases {
-            let tampered_input = format!("{}\n{}", tampered, TEST_DATA);
-            let error = load_jsonl(&mut db, &tampered_input, LoadMode::Overwrite)
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains(expected), "{case}: {error}");
-        }
-
-        let misplaced = format!("{}{}\n", TEST_DATA, provenance_line);
-        let error = load_jsonl(&mut db, &misplaced, LoadMode::Overwrite)
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("export provenance must appear exactly once before logical rows"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn current_loader_accepts_frozen_v18_retired_export_provenance() {
-        const V18_RETIRED_EXPORT: &str =
-            include_str!("../../tests/fixtures/final_v18_retired_main.jsonl");
-        const V18_RETIRED_SCHEMA: &str = "node Person { score: I32 }\n";
-
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, V18_RETIRED_SCHEMA).await.unwrap();
-
-        let provenance_line = V18_RETIRED_EXPORT.lines().next().unwrap();
-        let encoded: JsonValue = serde_json::from_str(provenance_line).unwrap();
-        let receipt = &encoded["_omnigraph_export_provenance"]["receipt"];
-        assert_eq!(receipt["protocol_version"], 1);
-        assert_eq!(receipt["record_tag"], "AUTHORITY_RETIREMENT_RECEIPT_V1");
-        assert_eq!(receipt["source_internal_schema_version"], 18);
-        assert_eq!(receipt["withdrawn_token_count"], 1);
-        assert!(
-            receipt.get("dead_lettered_token_count").is_none(),
-            "the genuine final-v18 fixture must retain the exact frozen v1 receipt shape"
-        );
-
-        let result = load_jsonl(&mut db, V18_RETIRED_EXPORT, LoadMode::Overwrite)
-            .await
-            .expect("the current loader must rebuild a valid v18 retired export");
-        assert_eq!(result.nodes_loaded["Person"], 1);
-        assert_eq!(db.stream_status().await.unwrap().profile_mode, "DISABLED");
-        let snapshot = db.snapshot().await;
-        assert_eq!(snapshot.stream_lifecycles().count(), 0);
-        assert_eq!(
-            snapshot
-                .open_stream_token_authority()
-                .await
-                .unwrap()
-                .count_rows(None)
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            db.export_jsonl("main", &[], &[]).await.unwrap(),
-            V18_RETIRED_EXPORT
-                .lines()
-                .skip(1)
-                .map(|line| format!("{line}\n"))
-                .collect::<String>(),
-            "a rebuild imports the logical rows but no retirement provenance or sequencing authority"
-        );
     }
 
     #[tokio::test]

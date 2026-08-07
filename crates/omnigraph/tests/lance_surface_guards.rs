@@ -23,25 +23,17 @@
 //! Functions decorated `#[tokio::test]` actually run; they construct real
 //! values and assert field shapes / types.
 
-use std::collections::HashMap;
-use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+mod helpers;
 
-use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use async_trait::async_trait;
 use futures::TryStreamExt;
-use futures::stream::BoxStream;
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
-use lance::dataset::mem_wal::scanner::InMemoryMemTables;
-use lance::dataset::mem_wal::write::{BatchStore, StoredBatch};
-use lance::dataset::mem_wal::{
-    BatchDurableWatcher, DatasetMemWalExt, InitializeMemWalBuilder, LsmScanner, ShardManifestStore,
-    ShardSnapshot, ShardWriter, ShardWriterConfig, WalTailer, WriteResult,
-};
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::refs::BranchIdentifier;
 use lance::dataset::transaction::{Operation, Transaction};
@@ -55,7 +47,6 @@ use lance::dataset::{
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance::index::DatasetIndexExt;
 use lance::session::Session;
-use lance_core::error::FenceReason;
 use lance_core::{
     ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, ROW_OFFSET,
     is_system_column,
@@ -64,20 +55,12 @@ use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
-use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::object_store::ObjectStoreRegistry;
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
-use lance_table::system_index::mem_wal::{
-    IndexCatchupProgress, MemWalIndexDetails, MergedGeneration, ShardId, ShardManifest,
-    ShardStatus, ShardingField, ShardingSpec,
-};
-use object_store::path::Path;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    Result as ObjectStoreResult,
-};
 use omnigraph_compiler::schema::parser::parse_schema;
+
+use helpers::{init_and_load, open_dataset_head, snapshot_main};
 
 #[test]
 fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
@@ -290,26 +273,6 @@ fn pk_full_row(dataset: &Dataset, id: &str, value: i32) -> RecordBatch {
         ],
     )
     .unwrap()
-}
-
-/// Append one row using `fresh_pk_dataset`'s three-column PK schema. Its nullable
-/// `note` column distinguishes this from the two-column `append_guard_row`, while
-/// V2_2 and stable row IDs preserve the production-table write shape.
-async fn append_pk_guard_row(dataset: &mut Dataset, id: &str, value: i32) {
-    let batch = pk_full_row(dataset, id, value);
-    let schema = batch.schema();
-    dataset
-        .append(
-            RecordBatchIterator::new(vec![Ok(batch)], schema),
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                enable_stable_row_ids: true,
-                data_storage_version: Some(LanceFileVersion::V2_2),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
 }
 
 async fn stage_pk_merge(
@@ -859,656 +822,6 @@ async fn public_physical_ref_token_rejects_s3_same_version_aba() {
         .expect("configured S3/RustFS test prefix cleanup must succeed");
 }
 
-/// One-shot object-store write barrier used to expose RC.1's writer-global
-/// durability watermark across a MemTable generation rollover. The barrier is
-/// armed only after generation N is fully durable and drained, so the next
-/// object-store write is generation N+1's WAL append.
-#[derive(Debug, Clone)]
-struct BlockNextPut {
-    armed: Arc<AtomicBool>,
-    reached: Arc<tokio::sync::Semaphore>,
-    release: Arc<tokio::sync::Semaphore>,
-}
-
-impl Default for BlockNextPut {
-    fn default() -> Self {
-        Self {
-            armed: Arc::new(AtomicBool::new(false)),
-            reached: Arc::new(tokio::sync::Semaphore::new(0)),
-            release: Arc::new(tokio::sync::Semaphore::new(0)),
-        }
-    }
-}
-
-impl BlockNextPut {
-    fn arm(&self) {
-        assert!(
-            !self.armed.swap(true, Ordering::AcqRel),
-            "one-shot put barrier was already armed"
-        );
-    }
-
-    async fn wait_until_reached(&self) {
-        let permit = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.reached.acquire(),
-        )
-        .await
-        .expect("generation N+1 WAL append never reached the object-store barrier")
-        .expect("put-barrier semaphore closed");
-        permit.forget();
-    }
-
-    fn release(&self) {
-        self.release.add_permits(1);
-    }
-}
-
-impl lance::io::WrappingObjectStore for BlockNextPut {
-    fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
-        Arc::new(BlockNextPutStore {
-            target,
-            barrier: self.clone(),
-        })
-    }
-}
-
-#[derive(Debug)]
-struct BlockNextPutStore {
-    target: Arc<dyn ObjectStore>,
-    barrier: BlockNextPut,
-}
-
-impl fmt::Display for BlockNextPutStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "BlockNextPutStore({})", self.target)
-    }
-}
-
-#[async_trait]
-impl ObjectStore for BlockNextPutStore {
-    async fn put_opts(
-        &self,
-        location: &Path,
-        payload: PutPayload,
-        options: PutOptions,
-    ) -> ObjectStoreResult<PutResult> {
-        if self
-            .barrier
-            .armed
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.barrier.reached.add_permits(1);
-            let permit = self
-                .barrier
-                .release
-                .acquire()
-                .await
-                .expect("put-barrier release semaphore closed");
-            permit.forget();
-        }
-        self.target.put_opts(location, payload, options).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        options: PutMultipartOptions,
-    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.target.put_multipart_opts(location, options).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> ObjectStoreResult<GetResult> {
-        self.target.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, ObjectStoreResult<Path>>,
-    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
-        self.target.delete_stream(locations)
-    }
-
-    fn list(
-        &self,
-        prefix: Option<&Path>,
-    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.target.list(prefix)
-    }
-
-    fn list_with_offset(
-        &self,
-        prefix: Option<&Path>,
-        offset: &Path,
-    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.target.list_with_offset(prefix, offset)
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> ObjectStoreResult<ListResult> {
-        self.target.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: CopyOptions,
-    ) -> ObjectStoreResult<()> {
-        self.target.copy_opts(from, to, options).await
-    }
-}
-
-// --- Guard 2c: RFC-026 public MemWAL enrollment/admission surfaces --------
-//
-// Gate E0 consumes only public RC.1 shapes. The initializer still commits
-// internally and returns no receipt; shard claim is a separate writer-open
-// effect. Pin that exact boundary plus the public read-back, fencing, and
-// durability-watcher surfaces. Runtime classification belongs to the isolated
-// enrollment probe rather than being duplicated in this compatibility file.
-#[allow(
-    dead_code,
-    unreachable_code,
-    unused_variables,
-    unused_mut,
-    clippy::diverging_sub_expression
-)]
-async fn _compile_mem_wal_enrollment_and_admission_surfaces() -> lance::Result<()> {
-    let dataset: &mut Dataset = unimplemented!();
-
-    // RFC-026 Gate E0 deliberately consumes this doc-hidden, immediate
-    // attached-successor probe instead of resolving latest/listing history.
-    let _has_exact_successor: bool = dataset.has_successor_version().await?;
-
-    let initializer: InitializeMemWalBuilder<'_> = dataset.initialize_mem_wal();
-    let _: () = initializer
-        .unsharded()
-        .writer_config_defaults(ShardWriterConfig::default())
-        .add_writer_config_default("omnigraph.enrollment_id", "compile-guard")
-        .execute()
-        .await?;
-
-    let details: Option<MemWalIndexDetails> = dataset.mem_wal_index_details().await?;
-    if let Some(details) = details {
-        let _snapshot_ts_millis: i64 = details.snapshot_ts_millis;
-        let _num_shards: u32 = details.num_shards;
-        let _inline_snapshots: Option<Vec<u8>> = details.inline_snapshots;
-        let sharding_specs: Vec<ShardingSpec> = details.sharding_specs;
-        for spec in sharding_specs {
-            let _spec_id: u32 = spec.spec_id;
-            let fields: Vec<ShardingField> = spec.fields;
-            for field in fields {
-                let _field_id: String = field.field_id;
-                let _source_ids: Vec<i32> = field.source_ids;
-                let _transform: Option<String> = field.transform;
-                let _expression: Option<String> = field.expression;
-                let _result_type: String = field.result_type;
-                let _parameters: HashMap<String, String> = field.parameters;
-            }
-        }
-        let _maintained_indexes: Vec<String> = details.maintained_indexes;
-        let _merged_generations: Vec<MergedGeneration> = details.merged_generations;
-        let _index_catchup: Vec<IndexCatchupProgress> = details.index_catchup;
-        let _writer_config_defaults: HashMap<String, String> = details.writer_config_defaults;
-    }
-    let _shard_ids: Vec<ShardId> = dataset.list_mem_wal_latest_shard_ids().await?;
-
-    let shard_id = ShardWriterConfig::default().shard_id;
-    let config = ShardWriterConfig::new(shard_id)
-        .with_shard_spec_id(1)
-        .with_durable_write(true)
-        .with_max_wal_buffer_size(1024 * 1024);
-    let _config_shard_id: ShardId = config.shard_id;
-    let _config_shard_spec_id: u32 = config.shard_spec_id;
-    let _config_durable_write: bool = config.durable_write;
-    let _config_max_wal_buffer_size: usize = config.max_wal_buffer_size;
-    let writer: ShardWriter = dataset.mem_wal_writer(shard_id, config).await?;
-    let _writer_shard_id = writer.shard_id();
-    let _writer_epoch: u64 = writer.epoch();
-    let writer_manifest: Option<ShardManifest> = writer.manifest().await?;
-    if let Some(manifest) = writer_manifest {
-        let _version: u64 = manifest.version;
-        let _epoch: u64 = manifest.writer_epoch;
-        let _status: ShardStatus = manifest.status;
-        let _last_seen: u64 = manifest.wal_entry_position_last_seen;
-    }
-    let _: () = writer.check_fenced().await?;
-
-    let (write, watcher): (WriteResult, Option<BatchDurableWatcher>) =
-        writer.put_no_wait(Vec::new()).await?;
-    let _batch_positions: std::ops::Range<usize> = write.batch_positions;
-    if let Some(mut watcher) = watcher {
-        let _already_durable: bool = watcher.is_durable();
-        let _: () = watcher.wait().await?;
-    }
-
-    let memtable_stats = writer.memtable_stats().await?;
-    let _row_count: usize = memtable_stats.row_count;
-    let _batch_count: usize = memtable_stats.batch_count;
-    let _estimated_size: usize = memtable_stats.estimated_size;
-    let _generation: u64 = memtable_stats.generation;
-    let _max_buffered_batch_position: Option<usize> = memtable_stats.max_buffered_batch_position;
-    let _max_flushed_batch_position: Option<usize> = memtable_stats.max_flushed_batch_position;
-    let _pending_wal_start_batch_position: Option<usize> =
-        memtable_stats.pending_wal_start_batch_position;
-    let _pending_wal_end_batch_position: Option<usize> =
-        memtable_stats.pending_wal_end_batch_position;
-    let _pending_wal_batch_count: usize = memtable_stats.pending_wal_batch_count;
-    let _pending_wal_row_count: usize = memtable_stats.pending_wal_row_count;
-    let _pending_wal_estimated_bytes: usize = memtable_stats.pending_wal_estimated_bytes;
-
-    let wal_stats = writer.wal_stats();
-    let _next_wal_entry_position: u64 = wal_stats.next_wal_entry_position;
-
-    let _: () = writer.force_seal_active().await?;
-    let _: () = writer.wait_for_flush_drain().await?;
-
-    let write_stats = writer.stats();
-    let _put_count: u64 = write_stats.put_count;
-    let _put_time: std::time::Duration = write_stats.put_time;
-    let _wal_flush_count: u64 = write_stats.wal_flush_count;
-    let _wal_flush_time: std::time::Duration = write_stats.wal_flush_time;
-    let _wal_flush_bytes: u64 = write_stats.wal_flush_bytes;
-    let _wal_io_time: std::time::Duration = write_stats.wal_io_time;
-    let _wal_io_count: u64 = write_stats.wal_io_count;
-    let _index_update_time: std::time::Duration = write_stats.index_update_time;
-    let _index_update_count: u64 = write_stats.index_update_count;
-    let _index_update_rows: u64 = write_stats.index_update_rows;
-    let _memtable_flush_count: u64 = write_stats.memtable_flush_count;
-    let _memtable_flush_time: std::time::Duration = write_stats.memtable_flush_time;
-    let _memtable_flush_rows: u64 = write_stats.memtable_flush_rows;
-
-    let manifest_store: &ShardManifestStore = unimplemented!();
-    let initialized: ShardManifest = manifest_store.initialize_shard(1, HashMap::new()).await?;
-    let latest: Option<ShardManifest> = manifest_store.read_latest().await?;
-    if let Some(latest) = latest {
-        let reread: ShardManifest = manifest_store.read_version(latest.version).await?;
-        let _claim: (u64, ShardManifest) = manifest_store.claim_epoch(reread.shard_spec_id).await?;
-        let _: () = manifest_store.check_fenced(reread.writer_epoch).await?;
-    }
-    let _updated: ShardManifest = manifest_store
-        .commit_update(initialized.writer_epoch, |current| ShardManifest {
-            version: current.version + 1,
-            ..current.clone()
-        })
-        .await?;
-
-    let mut merge = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])?;
-    let _: &mut MergeInsertBuilder =
-        merge.mark_generations_as_merged(vec![MergedGeneration::new(shard_id, 1)]);
-
-    let _: () = writer.close().await?;
-
-    Ok(())
-}
-
-/// Phase B1 consumes public fresh-tier replay, seal/abort, and exact scanner
-/// surfaces in addition to Phase A's initializer. Keep these signatures pinned
-/// together so a Lance bump cannot silently weaken restart accounting or widen
-/// the fold cut.
-#[allow(
-    dead_code,
-    unreachable_code,
-    unused_variables,
-    unused_mut,
-    clippy::diverging_sub_expression
-)]
-async fn _compile_mem_wal_b1_replay_and_fold_surfaces() -> lance::Result<()> {
-    let dataset: &Dataset = unimplemented!();
-    let writer: &ShardWriter = unimplemented!();
-
-    let in_memory: InMemoryMemTables = writer.in_memory_memtable_refs().await?;
-    let _active_generation: u64 = in_memory.active.generation;
-    let active_store: Arc<BatchStore> = Arc::clone(&in_memory.active.batch_store);
-    let _frozen_count: usize = in_memory.frozen.len();
-    let _batch_count: usize = active_store.len();
-    let _row_count: usize = active_store.total_rows();
-    let _estimated_bytes: usize = active_store.estimated_bytes();
-    let _max_buffered: Option<usize> = active_store.max_buffered_batch_position();
-    let _max_flushed: Option<usize> = active_store.max_flushed_batch_position();
-    let _pending_wal: usize = active_store.pending_wal_flush_count();
-    for stored in active_store.iter() {
-        let _stored: &StoredBatch = stored;
-        let _data: &RecordBatch = &stored.data;
-        let _rows: usize = stored.num_rows;
-        let _batch_position: usize = stored.batch_position;
-    }
-    // B1 calls this only after proving the exact replayed contiguous prefix.
-    active_store.set_max_flushed_batch_position(active_store.len().saturating_sub(1));
-
-    let shard_id = writer.shard_id();
-    let snapshot = ShardSnapshot::new(shard_id)
-        .with_spec_id(1)
-        .with_current_generation(2)
-        .with_flushed_generation(1, "derived-generation-path".to_string());
-    let schema: Arc<Schema> = Arc::new(dataset.schema().into());
-    let mut scanner = LsmScanner::without_base_table(
-        schema,
-        dataset.uri().to_string(),
-        vec![snapshot],
-        vec!["id".to_string()],
-    )
-    .with_session(dataset.session());
-    if let Some(store_params) = dataset.store_params() {
-        scanner = scanner.with_store_params(store_params.clone());
-    }
-    let _fresh_only_stream = scanner.try_into_stream().await?;
-
-    let _: () = writer.force_seal_active().await?;
-    let _: () = writer.wait_for_flush_drain().await?;
-    let _: () = writer.abort().await?;
-    Ok(())
-}
-
-/// RC.1 durability watchers are keyed by MemTable-local batch position, while
-/// the published durability watermark is writer-global. After a rollover the
-/// new MemTable restarts at batch position zero, so generation N's watermark
-/// can satisfy generation N+1's watcher before N+1's WAL append completes.
-///
-/// B1 therefore forbids rollover on a live writer: it admits at most 8,192
-/// batches under an 8,193-batch trigger, then explicitly seals, drains, aborts,
-/// and reclaims at a higher epoch before another put. If this guard turns green
-/// in the opposite direction after a Lance upgrade, reconsider that no-roll
-/// restriction rather than preserving workaround complexity by habit.
-#[tokio::test]
-async fn mem_wal_watcher_watermark_is_not_generation_scoped_on_pinned_lance() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().join("memwal-watcher-rollover.lance");
-    drop(fresh_pk_dataset(uri.to_str().unwrap()).await);
-
-    let barrier = BlockNextPut::default();
-    let session = Arc::new(Session::default());
-    let mut dataset = DatasetBuilder::from_uri(uri.to_str().unwrap())
-        .with_session(Arc::clone(&session))
-        .with_store_params(ObjectStoreParams {
-            object_store_wrapper: Some(Arc::new(barrier.clone())),
-            ..Default::default()
-        })
-        .load()
-        .await
-        .unwrap();
-    dataset.initialize_mem_wal().unsharded().execute().await.unwrap();
-
-    let shard_id = ShardId::new_v4();
-    let config = ShardWriterConfig::new(shard_id)
-        .with_shard_spec_id(1)
-        .with_durable_write(true)
-        .with_sync_indexed_write(true)
-        .with_max_wal_buffer_size(1024 * 1024 * 1024)
-        .with_max_wal_flush_interval(std::time::Duration::from_secs(60))
-        .with_max_memtable_size(1024 * 1024 * 1024)
-        .with_max_memtable_rows(8_193)
-        .with_max_memtable_batches(8_193)
-        .with_max_unflushed_memtable_bytes(1024 * 1024 * 1024)
-        .with_enable_memtable(true);
-    let writer = dataset.mem_wal_writer(shard_id, config).await.unwrap();
-
-    let make_batch = |id: &str, value: i32| {
-        let schema = Arc::new(Schema::from(dataset.schema()));
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec![id])),
-                Arc::new(Int32Array::from(vec![value])),
-                Arc::new(StringArray::from(vec![None::<&str>])),
-            ],
-        )
-        .unwrap()
-    };
-
-    let (_, first_watcher) = writer
-        .put_no_wait(vec![make_batch("generation-n", 1)])
-        .await
-        .unwrap();
-    first_watcher
-        .expect("durable writer must return a watcher")
-        .wait()
-        .await
-        .unwrap();
-    writer.force_seal_active().await.unwrap();
-    writer.wait_for_flush_drain().await.unwrap();
-
-    let refs = writer.in_memory_memtable_refs().await.unwrap();
-    assert_eq!(refs.active.generation, 2);
-    assert_eq!(refs.active.batch_store.len(), 0);
-    assert!(refs.frozen.is_empty());
-
-    barrier.arm();
-    let (_, second_watcher) = writer
-        .put_no_wait(vec![make_batch("generation-n-plus-one", 2)])
-        .await
-        .unwrap();
-    let mut second_watcher = second_watcher.expect("durable writer must return a watcher");
-    barrier.wait_until_reached().await;
-
-    let refs = writer.in_memory_memtable_refs().await.unwrap();
-    assert_eq!(refs.active.generation, 2);
-    assert_eq!(refs.active.batch_store.len(), 1);
-    assert_eq!(
-        refs.active.batch_store.max_flushed_batch_position(),
-        None,
-        "generation N+1's blocked WAL append must still be unflushed"
-    );
-    assert!(
-        second_watcher.is_durable(),
-        "pinned Lance no longer exposes the cross-generation false-ack shape; revisit B1's no-roll workaround"
-    );
-
-    barrier.release();
-    second_watcher.wait().await.unwrap();
-    writer.abort().await.unwrap();
-}
-
-/// RC.1's ordinary dataset cleanup does not own `_mem_wal`.  Newer base-table
-/// versions therefore are not, by themselves, a reclamation primitive for the
-/// WAL, flushed generation, and shard-manifest state in this fixture. B2 counts
-/// the complete namespace—including separately classified orphans—toward its
-/// enforced retained-storage admission watermark and waits for a Lance-owned
-/// inspect/plan/execute API instead of routing these objects through generic
-/// version cleanup.
-#[tokio::test]
-async fn cleanup_old_versions_does_not_reclaim_mem_wal_objects() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().join("memwal-generic-cleanup.lance");
-    let mut dataset = fresh_pk_dataset(uri.to_str().unwrap()).await;
-    dataset
-        .initialize_mem_wal()
-        .unsharded()
-        .execute()
-        .await
-        .unwrap();
-
-    let shard_id = ShardId::new_v4();
-    let writer = dataset
-        .mem_wal_writer(
-            shard_id,
-            ShardWriterConfig::new(shard_id)
-                .with_shard_spec_id(1)
-                .with_durable_write(true),
-        )
-        .await
-        .unwrap();
-    let (_, watcher) = writer
-        .put_no_wait(vec![pk_full_row(&dataset, "memwal-retained", 7)])
-        .await
-        .unwrap();
-    watcher
-        .expect("durable MemWAL writer must return a watcher")
-        .wait()
-        .await
-        .unwrap();
-    writer.force_seal_active().await.unwrap();
-    writer.wait_for_flush_drain().await.unwrap();
-    writer.abort().await.unwrap();
-
-    let object_store = dataset.object_store(None).await.unwrap();
-    let mem_wal_root = dataset.branch_location().path.join("_mem_wal");
-    // Generic cleanup owns none of this state. Compare bytes as well as paths so
-    // an unexpected rewrite fails just as loudly as object creation or deletion.
-    let inventory = || async {
-        let objects = object_store
-            .inner
-            .list(Some(&mem_wal_root))
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        let mut objects_with_bytes = Vec::with_capacity(objects.len());
-        for object in objects {
-            let bytes = object_store
-                .inner
-                .get(&object.location)
-                .await
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap();
-            objects_with_bytes.push((object.location.to_string(), bytes.to_vec()));
-        }
-        let mut objects = objects_with_bytes;
-        objects.sort();
-        objects
-    };
-    let before = inventory().await;
-    assert!(
-        before.iter().any(|(path, _)| path.contains("/wal/")),
-        "fixture must contain durable WAL state"
-    );
-    assert!(
-        before.iter().any(|(path, _)| path.contains("_gen_")),
-        "fixture must contain a flushed generation"
-    );
-    assert!(
-        before.iter().any(|(path, _)| path.contains("/manifest/")),
-        "fixture must contain shard-manifest state"
-    );
-
-    append_pk_guard_row(&mut dataset, "cleanup-v3", 30).await;
-    append_pk_guard_row(&mut dataset, "cleanup-v4", 40).await;
-    let current = dataset.version().version;
-    let removed = cleanup_old_versions(
-        &dataset,
-        CleanupPolicy {
-            before_version: Some(current),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    assert!(
-        removed.old_versions > 0,
-        "control must actually remove ordinary Lance versions"
-    );
-    assert_eq!(
-        inventory().await,
-        before,
-        "generic cleanup created, deleted, or rewrote MemWAL state; re-audit RFC-026 reclamation"
-    );
-}
-
-/// Lance's MemWAL specification warns that deleting WAL files can weaken
-/// epoch fencing.  Pinned RC.1 checks the shard epoch after a PUT collision or
-/// error, but not after a successful PUT.  If GC removes the successor's empty
-/// WAL fence sentinel, the stale predecessor can therefore recreate that slot
-/// and receive a successful durability watcher even though a fresh fence check
-/// rejects it.
-///
-/// This is deliberately a production-neutral negative guard: only the test
-/// deletes a WAL object. OmniGraph's private B1 worker contains the gap by
-/// rechecking `ShardWriter::check_fenced` after watcher success and before its
-/// own acknowledgement, but stock Lance still permits the raw stale write.
-/// Keep this assertion negative until the Lance-owned append path itself gains
-/// the post-success check; it remains one reason OmniGraph must not delete raw
-/// `_mem_wal` objects.
-#[tokio::test]
-async fn mem_wal_deleted_fence_slot_allows_stale_writer_success_on_pinned_lance() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().join("memwal-deleted-fence-slot.lance");
-    let mut dataset = fresh_pk_dataset(uri.to_str().unwrap()).await;
-    dataset
-        .initialize_mem_wal()
-        .unsharded()
-        .execute()
-        .await
-        .unwrap();
-
-    let shard_id = ShardId::new_v4();
-    let config = || {
-        ShardWriterConfig::new(shard_id)
-            .with_shard_spec_id(1)
-            .with_durable_write(true)
-    };
-    let stale = dataset.mem_wal_writer(shard_id, config()).await.unwrap();
-    assert_eq!(stale.epoch(), 1);
-    let successor = dataset.mem_wal_writer(shard_id, config()).await.unwrap();
-    assert_eq!(successor.epoch(), 2);
-
-    let object_store = dataset.object_store(None).await.unwrap();
-    let wal_root = dataset
-        .branch_location()
-        .path
-        .join("_mem_wal")
-        .join(shard_id.as_hyphenated().to_string())
-        .join("wal");
-    let sentinel_objects = object_store
-        .inner
-        .list(Some(&wal_root))
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
-    assert_eq!(
-        sentinel_objects.len(),
-        1,
-        "epoch-2 claim must leave exactly one data-less fence sentinel"
-    );
-    let tailer = WalTailer::new(
-        object_store.clone(),
-        dataset.branch_location().path.clone(),
-        shard_id,
-    );
-    let sentinel_position = tailer.first_position().await.unwrap();
-    let sentinel = tailer
-        .read_entry(sentinel_position)
-        .await
-        .unwrap()
-        .expect("the listed successor fence sentinel must decode");
-    assert_eq!(sentinel.writer_epoch, successor.epoch());
-    assert!(
-        sentinel.batches.is_empty(),
-        "the deleted WAL object must be the successor's empty fence sentinel"
-    );
-    object_store
-        .inner
-        .delete(&sentinel_objects[0].location)
-        .await
-        .unwrap();
-
-    let (_, watcher) = stale
-        .put_no_wait(vec![pk_full_row(&dataset, "stale-after-gc", 9)])
-        .await
-        .unwrap();
-    watcher
-        .expect("durable MemWAL writer must return a watcher")
-        .wait()
-        .await
-        .expect("pinned RC.1 demonstrates the unsafe post-delete success gap");
-    let error = stale.check_fenced().await.unwrap_err();
-    assert_eq!(
-        error.fence_reason(),
-        Some(FenceReason::PeerClaimedEpoch),
-        "the stale predecessor must be rejected specifically because its peer claimed epoch 2"
-    );
-
-    stale.abort().await.unwrap();
-    successor.abort().await.unwrap();
-}
-
 // --- Guard 3: checkout_version + restore async chain -----------------------
 //
 // `db/manifest/recovery.rs:505-522` chains `Dataset::open(...).await?
@@ -1734,18 +1047,12 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
     use lance_select::mask::RowAddrTreeMap;
     let ds: Arc<Dataset> = unimplemented!();
     let source: Box<dyn arrow_array::RecordBatchReader + Send> = unimplemented!();
-    let marker = MergedGeneration::new(ShardId::new_v4(), 1);
-    let mut builder = MergeInsertBuilder::try_new(ds, vec!["x".to_string()])?;
-    let _: &mut MergeInsertBuilder = builder.mark_generations_as_merged(vec![marker.clone()]);
+    let builder = MergeInsertBuilder::try_new(ds, vec!["x".to_string()])?;
     let job = builder.try_build()?;
     let staged = job.execute_uncommitted(source).await?;
-    let Operation::Update {
-        merged_generations, ..
-    } = &staged.transaction.operation
-    else {
+    let Operation::Update { .. } = &staged.transaction.operation else {
         unreachable!()
     };
-    let _merged_generations: &Vec<MergedGeneration> = merged_generations;
     let _txn: lance::dataset::transaction::Transaction = staged.transaction;
     let _affected: Option<RowAddrTreeMap> = staged.affected_rows;
     let _stats = staged.stats;
@@ -2138,6 +1445,251 @@ async fn _compile_scalar_index_coverage_surface() -> lance::Result<()> {
         let _covered: Option<bool> = index.fragment_bitmap.as_ref().map(|b| b.contains(0u32));
     }
     Ok(())
+}
+
+// --- CDC C0 guards: exact-end deltas and production row-version shape -------
+//
+// Lance's explicit delta range controls the version-column predicate, but the
+// row images are scanned from the `Dataset` handle used to build the delta. A
+// historical interval therefore needs a handle checked out at its exact end:
+// asking a later HEAD for the same interval can lose a row that changed again.
+// Keep this regression beside the other Lance surface probes so a dependency
+// bump cannot silently invalidate RFC-030's candidate-pruning contract.
+
+#[tokio::test]
+async fn dataset_delta_historical_images_require_the_exact_end_handle() {
+    async fn commit_alice_value(dataset: Dataset, value: i32) -> Dataset {
+        let batch = pk_full_row(&dataset, "alice", value);
+        let staged = stage_pk_merge(
+            Arc::new(dataset.clone()),
+            batch,
+            "id",
+            WhenMatched::UpdateAll,
+            WhenNotMatched::InsertAll,
+            Some(false),
+        )
+        .await;
+        CommitBuilder::new(Arc::new(dataset))
+            .with_skip_auto_cleanup(true)
+            .execute(staged.transaction)
+            .await
+            .expect("the guard update must commit")
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("cdc-exact-end-delta.lance");
+    let initial = fresh_pk_dataset(uri.to_str().unwrap()).await;
+    let begin_version = initial.version().version;
+
+    let exact_end = commit_alice_value(initial, 20).await;
+    let end_version = exact_end.version().version;
+    assert_eq!(
+        end_version,
+        begin_version + 1,
+        "the exact-end fixture needs one adjacent update"
+    );
+
+    let current_head = commit_alice_value(exact_end.clone(), 30).await;
+    assert_eq!(
+        current_head.version().version,
+        end_version + 1,
+        "the negative control needs the same row updated after the selected end"
+    );
+
+    let exact_delta = exact_end
+        .delta()
+        .with_begin_version(begin_version)
+        .with_end_version(end_version)
+        .build()
+        .unwrap();
+    let exact_batches: Vec<RecordBatch> = exact_delta
+        .get_updated_rows()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let exact_rows = exact_batches
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    assert_eq!(
+        exact_rows, 1,
+        "the exact-end delta must retain the one row changed in the interval"
+    );
+    let exact_batch = exact_batches
+        .iter()
+        .find(|batch| batch.num_rows() == 1)
+        .expect("the one changed row must be materialized");
+    let exact_ids = exact_batch["id"]
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let exact_values = exact_batch["value"]
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let exact_updated_versions = exact_batch[ROW_LAST_UPDATED_AT_VERSION]
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(exact_ids.value(0), "alice");
+    assert_eq!(
+        exact_values.value(0),
+        20,
+        "the delta must return the image at the selected end, not a later image"
+    );
+    assert_eq!(exact_updated_versions.value(0), end_version);
+
+    let stale_interval_on_head = current_head
+        .delta()
+        .with_begin_version(begin_version)
+        .with_end_version(end_version)
+        .build()
+        .unwrap();
+    let head_batches: Vec<RecordBatch> = stale_interval_on_head
+        .get_updated_rows()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        head_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        0,
+        "pinned Lance scans row images from the builder's handle: a later HEAD is \
+         not a valid source for an older interval whose row changed again; RFC-030 \
+         must check out the exact end version before constructing DatasetDelta"
+    );
+}
+
+#[tokio::test]
+async fn omnigraph_graph_tables_enable_stable_row_ids_and_version_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let snapshot = snapshot_main(&db).await.unwrap();
+    let entries = snapshot
+        .entries()
+        .map(|entry| {
+            (
+                entry.table_key.clone(),
+                entry.table_path.clone(),
+                entry.table_version,
+                entry.table_branch.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries.len(),
+        4,
+        "the shared fixture must exercise every declared node and edge table"
+    );
+
+    for (table_key, table_path, table_version, table_branch) in entries {
+        let table_uri = dir.path().join(table_path);
+        let head = open_dataset_head(table_uri.to_str().unwrap(), table_branch.as_deref()).await;
+        let table = if head.version().version == table_version {
+            head
+        } else {
+            head.checkout_version(table_version).await.unwrap()
+        };
+
+        assert!(
+            table.manifest().uses_stable_row_ids(),
+            "OmniGraph-created graph table {table_key} must keep Lance stable row IDs enabled"
+        );
+
+        let selected_version = table.version().version;
+        let mut scanner = table.scan();
+        scanner
+            .project(&[
+                "id",
+                ROW_ID,
+                ROW_CREATED_AT_VERSION,
+                ROW_LAST_UPDATED_AT_VERSION,
+            ])
+            .expect("stable row-id and row-version columns must be projectable");
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert_ne!(
+            row_count, 0,
+            "the shared loaded fixture must contain rows in {table_key}"
+        );
+
+        let mut row_ids = HashSet::new();
+        for batch in &batches {
+            let ids = batch[ROW_ID]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("_rowid must retain Lance's UInt64 surface");
+            let created = batch[ROW_CREATED_AT_VERSION]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("_row_created_at_version must retain Lance's UInt64 surface");
+            let updated = batch[ROW_LAST_UPDATED_AT_VERSION]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("_row_last_updated_at_version must retain Lance's UInt64 surface");
+            assert_eq!(
+                ids.null_count(),
+                0,
+                "live {table_key} rows need concrete stable row IDs"
+            );
+            assert_eq!(
+                created.null_count(),
+                0,
+                "live {table_key} rows need a creation version"
+            );
+            assert_eq!(
+                updated.null_count(),
+                0,
+                "live {table_key} rows need an update version"
+            );
+            for row in 0..batch.num_rows() {
+                assert!(
+                    row_ids.insert(ids.value(row)),
+                    "stable row IDs must be unique within {table_key}"
+                );
+                assert!(created.value(row) <= updated.value(row));
+                assert!(updated.value(row) <= selected_version);
+            }
+        }
+
+        let version_predicate = format!(
+            "{ROW_CREATED_AT_VERSION} <= {ROW_LAST_UPDATED_AT_VERSION} AND \
+             {ROW_LAST_UPDATED_AT_VERSION} <= {selected_version}"
+        );
+        let mut predicate_probe = table.scan();
+        predicate_probe
+            .project(&["id"])
+            .expect("the predicate probe must project a logical column");
+        predicate_probe
+            .filter(&version_predicate)
+            .expect("row-version columns must be usable in a scan predicate");
+        let filtered_rows = predicate_probe
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_fold(
+                0usize,
+                |rows, batch| async move { Ok(rows + batch.num_rows()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered_rows, row_count,
+            "the row-version predicate must retain every validated live row in {table_key}"
+        );
+    }
 }
 
 // --- Guard 12: can a scalar BTREE be built on a system version column? --------

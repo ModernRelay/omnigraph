@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 
-use crate::db::manifest::stream_token::StreamFoldAttributionSummaryV2;
 use crate::error::Result;
 
 #[derive(Debug, Clone)]
@@ -12,16 +11,12 @@ pub struct GraphCommit {
     pub merged_parent_commit_id: Option<String>,
     pub actor_id: Option<String>,
     pub created_at: i64,
-    /// Protocol-private F5 fold commitment retained in the derived lineage
-    /// cache. It is not part of the public commit-list contract.
-    pub(crate) stream_fold_attribution_v2: Option<StreamFoldAttributionSummaryV2>,
 }
 
 impl GraphCommit {
-    /// The one total order on graph lineage. Every ordered view of commits —
-    /// the projection's sorted listing, head selection, and any future keyset
-    /// pagination cursor — derives from this key; no other comparator may
-    /// define commit order.
+    /// The one total order for deterministic lineage listing, head selection,
+    /// and any future commit-list keyset cursor. Ancestry and CDC traversal use
+    /// persisted first-parent links instead; this key never defines feed order.
     pub fn lineage_key(&self) -> (u64, i64, &str) {
         (
             self.manifest_version,
@@ -29,6 +24,18 @@ impl GraphCommit {
             &self.graph_commit_id,
         )
     }
+}
+
+/// One observable graph transition on a branch's first-parent lineage.
+///
+/// CDC compares exactly these two immutable graph commits. A merge commit is
+/// compared with the branch state it landed on (`parent`); its
+/// `merged_parent_commit_id` remains provenance and is never traversed as a
+/// second feed path.
+#[derive(Debug, Clone)]
+pub(crate) struct FirstParentEdge {
+    pub(crate) parent: GraphCommit,
+    pub(crate) child: GraphCommit,
 }
 
 /// A pure projection of the graph lineage that lives in `__manifest`
@@ -297,7 +304,6 @@ fn build_commit_cache(
             merged_parent_commit_id: row.merged_parent_commit_id,
             actor_id: row.actor_id,
             created_at: row.created_at,
-            stream_fold_attribution_v2: row.stream_fold_attribution_v2,
         };
         if should_replace_head(head_commit.as_ref(), &commit) {
             head_commit = Some(commit.clone());

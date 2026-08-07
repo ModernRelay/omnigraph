@@ -33,7 +33,7 @@ rules:
   - id: admins-full-access
     allow:
       actors: { group: admins }
-      actions: [read, change, schema_apply, branch_create, branch_delete, branch_merge, stream_manage]
+      actions: [read, change, schema_apply, branch_create, branch_delete, branch_merge]
 "#;
 
 /// Unique per-run storage root under the test bucket, or None to skip.
@@ -42,7 +42,7 @@ fn s3_storage_root(suite: &str) -> Option<String> {
     Some(format!("s3://{bucket}/cluster-e2e/{suite}-{}", Ulid::new()))
 }
 
-fn write_cluster_fixture(dir: &std::path::Path, storage_root: &str, schema: &str, streaming: bool) {
+fn write_cluster_fixture(dir: &std::path::Path, storage_root: &str, schema: &str) {
     fs::write(dir.join("people.pg"), schema).unwrap();
     fs::create_dir_all(dir.join("queries")).unwrap();
     fs::write(dir.join("queries/people.gq"), FIND_PERSON_GQ).unwrap();
@@ -55,7 +55,6 @@ storage: {storage_root}
 graphs:
   knowledge:
     schema: people.pg
-    streaming: {streaming}
     queries: queries/
 policies:
   intel:
@@ -70,7 +69,6 @@ policies:
 fn e2e_apply_options() -> ApplyOptions {
     ApplyOptions {
         actor: Some("act-admin".to_string()),
-        confirm_stream_offline: true,
     }
 }
 
@@ -81,7 +79,7 @@ async fn s3_cluster_full_lifecycle_import_apply_serve_evolve_delete() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    write_cluster_fixture(dir.path(), &root, SCHEMA_V1, true);
+    write_cluster_fixture(dir.path(), &root, SCHEMA_V1);
 
     // validate is config-only and must pass before any bucket I/O.
     let validate = validate_config_dir(dir.path());
@@ -135,15 +133,9 @@ async fn s3_cluster_full_lifecycle_import_apply_serve_evolve_delete() {
     assert_eq!(via_uri.policies.len(), 1);
 
     // Schema evolution converges on the bucket.
-    write_cluster_fixture(dir.path(), &root, SCHEMA_V2, true);
+    write_cluster_fixture(dir.path(), &root, SCHEMA_V2);
     let evolve = apply_config_dir_with_options(dir.path(), e2e_apply_options()).await;
     assert!(evolve.ok && evolve.converged, "{:?}", evolve.diagnostics);
-
-    // The graph cannot be deleted while its streaming profile is active.
-    // Disable it explicitly under the same checked offline authority first.
-    write_cluster_fixture(dir.path(), &root, SCHEMA_V2, false);
-    let disable = apply_config_dir_with_options(dir.path(), e2e_apply_options()).await;
-    assert!(disable.ok && disable.converged, "{:?}", disable.diagnostics);
 
     // Approved delete: drop the graph from the config; the plan demands an
     // approval, the approved apply prefix-deletes the bucket root.

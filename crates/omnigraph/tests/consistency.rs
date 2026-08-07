@@ -149,10 +149,12 @@ async fn load_append_rejects_existing_id_without_update() {
 }
 
 /// RFC-023's in-memory keyed adapter has a hard 8,192-row ceiling per
-/// mutation/load attempt. The boundary is inclusive; one row over must fail
-/// before recovery is armed or either graph/table visibility moves.
+/// Append/Merge attempt. The boundary is inclusive; one row over must fail
+/// before recovery is armed or either graph/table visibility moves. Overwrite
+/// uses Lance's replacement transaction rather than the keyed adapter, so the
+/// canonical strict graph-batch boundary must not impose that row ceiling.
 #[tokio::test]
-async fn load_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_effect() {
+async fn load_keyed_write_row_cap_excludes_strict_overwrite() {
     const LIMIT: usize = 8192;
     const SCHEMA: &str = "node Thing { key: String @key }\n";
 
@@ -220,6 +222,11 @@ async fn load_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_effect(
         !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
         "one-over load must fail before writing a recovery sidecar"
     );
+
+    over.load_graph_batch("main", &jsonl(LIMIT + 1), LoadMode::Overwrite)
+        .await
+        .expect("a keyed-limit refusal must not poison a following strict Overwrite");
+    assert_eq!(count_rows(&over, "node:Thing").await, LIMIT + 1);
 }
 
 /// The sibling 32 MiB cap is measured from the staged Arrow batch, not JSON
@@ -844,9 +851,7 @@ node ExternalID {
     // message reads `(external_id, source)`; assert order-agnostically that
     // both composite columns are named (not just the first, as pre-fix).
     assert!(
-        msg.contains("@unique violation")
-            && msg.contains("source")
-            && msg.contains("external_id"),
+        msg.contains("@unique violation") && msg.contains("source") && msg.contains("external_id"),
         "composite violation must name both columns (got: {msg})"
     );
 }

@@ -1,6 +1,7 @@
 //! Data-plane routes: read/query/change/ingest/branches/snapshot/export.
 //! Moved verbatim from tests/server.rs in the modularization.
 
+use std::convert::Infallible;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,13 +13,12 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph_server::api::{
     BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
-    IngestRequest, QueryRequest, ReadRequest,
+    GraphBatchLoadOutput, IngestRequest, QueryRequest, ReadRequest,
 };
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
 use serial_test::serial;
 use tower::ServiceExt;
-
 
 mod support;
 use support::*;
@@ -106,69 +106,6 @@ fn export_request(type_names: Vec<String>) -> Request<Body> {
             .unwrap(),
         ))
         .unwrap()
-}
-
-fn body_poll_probe(polled: Arc<AtomicBool>) -> Body {
-    Body::from_stream(futures::stream::once(async move {
-        polled.store(true, Ordering::SeqCst);
-        Ok::<_, std::io::Error>(Bytes::from_static(
-            b"{\"type\":\"Person\",\"data\":{\"id\":\"must-not-run\",\"age\":1},\"$stream\":{\"write_id\":\"00000000-0000-4000-8000-000000000001\",\"predecessor_token\":null}}\n",
-        ))
-    }))
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn stream_ingest_media_and_runtime_refusals_do_not_poll_the_body() {
-    let (_temp, app) = app_for_loaded_graph().await;
-
-    let wrong_media_polled = Arc::new(AtomicBool::new(false));
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(g("/stream/ingest"))
-                .method(Method::POST)
-                .header("content-type", "application/json")
-                .body(body_poll_probe(Arc::clone(&wrong_media_polled)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    assert!(!wrong_media_polled.load(Ordering::SeqCst));
-
-    let missing_media_polled = Arc::new(AtomicBool::new(false));
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(g("/stream/ingest"))
-                .method(Method::POST)
-                .body(body_poll_probe(Arc::clone(&missing_media_polled)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    assert!(!missing_media_polled.load(Ordering::SeqCst));
-
-    let no_runtime_polled = Arc::new(AtomicBool::new(false));
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri(g("/stream/ingest"))
-                .method(Method::POST)
-                .header("content-type", "application/x-ndjson")
-                .body(body_poll_probe(Arc::clone(&no_runtime_polled)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert!(!no_runtime_polled.load(Ordering::SeqCst));
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-    assert_eq!(error.error, "graph stream ingest is not ready");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -811,6 +748,227 @@ async fn load_endpoint_loads_into_existing_branch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn raw_graph_batch_load_publishes_mixed_declarations_in_one_commit() {
+    let (temp, app) = app_for_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let commits_before = Omnigraph::open(graph.to_str().unwrap())
+        .await
+        .unwrap()
+        .list_commits(Some("main"))
+        .await
+        .unwrap()
+        .len();
+    let batch = concat!(
+        r#"{"type":"Person","data":{"name":"Raw Ada","age":31}}"#,
+        "\n",
+        r#"{"type":"Company","data":{"name":"Raw Labs"}}"#,
+        "\n",
+        r#"{"edge":"WorksAt","from":"Raw Ada","to":"Raw Labs","data":{}}"#,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/load/ndjson?branch=main&mode=append"))
+                .method(Method::POST)
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(batch))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        !text.contains("table_key"),
+        "graph-batch responses must not expose physical table identity: {text}"
+    );
+    let output: GraphBatchLoadOutput = serde_json::from_slice(&body).unwrap();
+    assert_eq!(output.branch, "main");
+    assert_eq!(output.total_rows, 3);
+    assert_eq!(
+        output
+            .nodes
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.rows_loaded))
+            .collect::<Vec<_>>(),
+        [("Company", 1), ("Person", 1)]
+    );
+    assert_eq!(
+        output
+            .edges
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.rows_loaded))
+            .collect::<Vec<_>>(),
+        [("WorksAt", 1)]
+    );
+
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before + 1,
+        "one mixed graph batch must append exactly one graph commit"
+    );
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        snapshot
+            .open("node:Person")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        snapshot
+            .open("node:Company")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        snapshot
+            .open("edge:WorksAt")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        3
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_raw_graph_batch_has_no_effect() {
+    let (temp, app) = app_for_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
+    let rows_before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .open("node:Person")
+        .await
+        .unwrap()
+        .count_rows(None)
+        .await
+        .unwrap();
+    drop(db);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/load/ndjson?branch=main&mode=append"))
+                .method(Method::POST)
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(concat!(
+                    r#"{"type":"Person","data":{"name":"Must Not Land","age":9}}"#,
+                    "\nnot-json"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .open("node:Person")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        rows_before
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_graph_batch_requires_ndjson_and_enforces_body_cap() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let wrong_type = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/load/ndjson?branch=main"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let oversized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/load/ndjson?branch=main"))
+                .method(Method::POST)
+                .header("content-type", "application/x-ndjson")
+                .header("content-length", (32_u64 * 1024 * 1024 + 1).to_string())
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_graph_batch_policy_refusal_does_not_poll_body() {
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
+        &[("act-bruno", "team-token")],
+        INGEST_CREATE_ONLY_POLICY_YAML,
+    )
+    .await;
+    let polled = Arc::new(AtomicBool::new(false));
+    let body_polled = Arc::clone(&polled);
+    let body = Body::from_stream(futures::stream::once(async move {
+        body_polled.store(true, Ordering::SeqCst);
+        Ok::<Bytes, Infallible>(Bytes::from_static(
+            br#"{"type":"Person","data":{"name":"Denied","age":1}}"#,
+        ))
+    }));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/load/ndjson?branch=main"))
+                .method(Method::POST)
+                .header("authorization", "Bearer team-token")
+                .header("content-type", "application/x-ndjson")
+                .body(body)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "Cedar refusal must happen before the NDJSON body is polled"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ingest_endpoint_emits_deprecation_headers() {
     // `/ingest` is the deprecated alias of `/load` (RFC-009 Phase 5): flagged
     // at runtime per RFC 9745 (`Deprecation: true`) + RFC 8288 (`Link: <load>;
@@ -1279,7 +1437,10 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
     )
     .await;
     assert_eq!(list_status, StatusCode::OK);
-    assert_eq!(list_body["branches"], json!(["feature", "feature-child", "main"]));
+    assert_eq!(
+        list_body["branches"],
+        json!(["feature", "feature-child", "main"])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

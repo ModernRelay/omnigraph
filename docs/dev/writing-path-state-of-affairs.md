@@ -1,8 +1,14 @@
 # Write Path: State of Affairs
 
-**Type:** living architecture and execution summary
-**Status:** current as of 2026-08-03
-**Surveyed:** OmniGraph 0.9.0 development, internal manifest schema v19,
+> **Historical snapshot (2026-08-03).** The RFC-026 portions below describe a
+> removed experiment and are not current architecture. Current writes use
+> manifest schema v6, ordinary recovery-v9, and direct commit-visible graph
+> batches. See [Streaming ingestion after RFC-026](wal-removal.md) and
+> [writes.md](writes.md).
+
+**Type:** archived architecture snapshot
+**Status:** superseded 2026-08-06
+**Historical surveyed state:** OmniGraph 0.9.0 development, internal manifest schema v19,
 Lance 9.0.0
 **Scope:** the direct-publish graph write path, its RFC-022–028 family,
 adjacent control and maintenance operations, known blockers, and the next
@@ -526,12 +532,12 @@ Do not:
 | Warm read/write and merge cost at history depth | [`warm_read_cost.rs`](../../crates/omnigraph/tests/warm_read_cost.rs), [`write_cost.rs`](../../crates/omnigraph/tests/write_cost.rs), [`merge_cost.rs`](../../crates/omnigraph/tests/merge_cost.rs) |
 | Durable-head decision gate | [`durable_head_lookup_cost.rs`](../../crates/omnigraph/tests/durable_head_lookup_cost.rs), [RFC-024](../rfcs/0024-durable-table-heads.md) |
 | Checkpoint-retention Gate 0 | [`checkpoint_retention_cost.rs`](../../crates/omnigraph/tests/checkpoint_retention_cost.rs), [RFC-025](../rfcs/0025-checkpoint-retention.md) |
-| MemWAL bounded-enrollment Gate E0 (green decision harness; no row path) | [`memwal_enrollment_gate.rs`](../../crates/omnigraph/tests/memwal_enrollment_gate.rs), [`lance_surface_guards.rs`](../../crates/omnigraph/tests/lance_surface_guards.rs), [RFC-026 §12.1](../rfcs/0026-memwal-streaming-ingest.md) |
+| MemWAL bounded-enrollment Gate E0 (green decision harness; no row path) | historical `memwal_enrollment_gate.rs` (deleted with RFC-026), [`lance_surface_guards.rs`](../../crates/omnigraph/tests/lance_surface_guards.rs), [RFC-026 §12.1](../rfcs/0026-memwal-streaming-ingest.md) |
 | MemWAL Phase A lifecycle/exclusion/recovery | [`failpoints.rs`](../../crates/omnigraph/tests/failpoints.rs), [`forbidden_apis.rs`](../../crates/omnigraph/tests/forbidden_apis.rs), manifest/write-queue unit tests, [RFC-026 §12.2](../rfcs/0026-memwal-streaming-ingest.md) |
-| MemWAL private Phase B1 admission/fold/crash and cost evidence | [`memwal_stream.rs`](../../crates/omnigraph/tests/memwal_stream.rs), [`memwal_stream_cost.rs`](../../crates/omnigraph/tests/memwal_stream_cost.rs), worker/recovery unit tests, [RFC-026 §12.3](../rfcs/0026-memwal-streaming-ingest.md) |
-| MemWAL Gate R0 retention decision, current-object census, attempt reuse, repaired near-cap closure, and fold RSS tripwire | [`memwal_stream_cost.rs`](../../crates/omnigraph/tests/memwal_stream_cost.rs), [RFC-026 §0.2 and §12.4](../rfcs/0026-memwal-streaming-ingest.md) |
-| MemWAL private B2a no-delete structure, provider-failure/orphan behavior, and 1/8/32/128 retained-history instrument | [`forbidden_apis.rs`](../../crates/omnigraph/tests/forbidden_apis.rs), [`memwal_stream.rs`](../../crates/omnigraph/tests/memwal_stream.rs), [`memwal_stream_cost.rs`](../../crates/omnigraph/tests/memwal_stream_cost.rs), shared [`helpers/memwal.rs`](../../crates/omnigraph/tests/helpers/memwal.rs), [RFC-026 §12.5](../rfcs/0026-memwal-streaming-ingest.md) |
-| MemWAL private B2 canonical token/admission, lifecycle-v3 claim/quiesce, v14 base+token fold, and attribution | [`memwal_stream.rs`](../../crates/omnigraph/tests/memwal_stream.rs), manifest/recovery/token/ledger unit tests, [`forbidden_apis.rs`](../../crates/omnigraph/tests/forbidden_apis.rs), [RFC-026 §12.6](../rfcs/0026-memwal-streaming-ingest.md) |
+| MemWAL private Phase B1 admission/fold/crash and cost evidence | historical `memwal_stream.rs` and `memwal_stream_cost.rs` (deleted with RFC-026), worker/recovery unit tests, [RFC-026 §12.3](../rfcs/0026-memwal-streaming-ingest.md) |
+| MemWAL Gate R0 retention decision, current-object census, attempt reuse, repaired near-cap closure, and fold RSS tripwire | historical `memwal_stream_cost.rs` (deleted with RFC-026), [RFC-026 §0.2 and §12.4](../rfcs/0026-memwal-streaming-ingest.md) |
+| MemWAL private B2a no-delete structure, provider-failure/orphan behavior, and 1/8/32/128 retained-history instrument | [`forbidden_apis.rs`](../../crates/omnigraph/tests/forbidden_apis.rs), historical `memwal_stream.rs`, `memwal_stream_cost.rs`, and `helpers/memwal.rs` (deleted with RFC-026), [RFC-026 §12.5](../rfcs/0026-memwal-streaming-ingest.md) |
+| MemWAL private B2 canonical token/admission, lifecycle-v3 claim/quiesce, v14 base+token fold, and attribution | historical `memwal_stream.rs` (deleted with RFC-026), manifest/recovery/token/ledger unit tests, [`forbidden_apis.rs`](../../crates/omnigraph/tests/forbidden_apis.rs), [RFC-026 §12.6](../rfcs/0026-memwal-streaming-ingest.md) |
 | MemWAL B2b reclamation ownership/no-go guards | [`lance_surface_guards.rs`](../../crates/omnigraph/tests/lance_surface_guards.rs), [RFC-026 §4.5.2](../rfcs/0026-memwal-streaming-ingest.md) |
 | Cross-version refusal/rebuild, including historical source binaries → CURRENT; v17↔v18 remains historical while the CI-owned genuine v18↔v19 adjacent cell also pins frozen final-v18 retirement-receipt compatibility | [`crossversion_upgrade.rs`](../../crates/omnigraph-cli/tests/crossversion_upgrade.rs), [CI workflow](../../.github/workflows/ci.yml) |
 

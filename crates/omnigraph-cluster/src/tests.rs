@@ -3,48 +3,39 @@
 //! (cluster.yaml/JSON bodies) are content, not formatting.
 #![allow(clippy::all)]
 
-    use std::fs;
-    #[cfg(feature = "failpoints")]
-    use std::future::Future;
-    use std::path::Path;
-    #[cfg(feature = "failpoints")]
-    use std::sync::Arc;
+use std::fs;
+use std::path::Path;
 
-    use omnigraph::db::Omnigraph;
-    #[cfg(feature = "failpoints")]
-    use omnigraph_compiler::ir::ParamMap;
-    #[cfg(feature = "failpoints")]
-    use omnigraph_compiler::query::ast::Literal;
-    use serde_json::json;
-    use tempfile::tempdir;
+use omnigraph::db::Omnigraph;
+use serde_json::json;
+use tempfile::tempdir;
 
-    use crate::config::{
-        observed_streaming_digest, streaming_digest, streaming_mode_matches_desired,
-    };
-    use super::*;
+use super::*;
 
-    const SCHEMA: &str = r#"
+const SCHEMA: &str = r#"
 node Person {
   name: String @key
   age: I32?
 }
 "#;
 
-    const QUERY: &str = r#"
+const QUERY: &str = r#"
 query find_person($name: String) {
   match { $p: Person { name: $name } }
   return { $p.name, $p.age }
 }
 "#;
 
-    fn fixture() -> tempfile::TempDir {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
-        fs::write(dir.path().join("people.gq"), QUERY).unwrap();
-        fs::write(dir.path().join("base.policy.yaml"), "rules: []\n").unwrap();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
+const POLICY: &str = "version: 1\nrules: []\n";
+
+fn fixture() -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
+    fs::write(dir.path().join("people.gq"), QUERY).unwrap();
+    fs::write(dir.path().join("base.policy.yaml"), POLICY).unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
 version: 1
 metadata:
   name: test
@@ -62,38 +53,16 @@ policies:
     file: ./base.policy.yaml
     applies_to: [knowledge]
 "#,
-        )
-        .unwrap();
-        dir
-    }
+    )
+    .unwrap();
+    dir
+}
 
-    /// Run a composed streaming lifecycle scenario outside libtest's 2-MiB
-    /// thread. Individual operations run on ordinary stacks elsewhere; this
-    /// only bounds the large debug future assembled by an end-to-end test.
-    #[cfg(feature = "failpoints")]
-    fn on_big_stack<F>(body: impl FnOnce() -> F + Send + 'static)
-    where
-        F: Future<Output = ()>,
-    {
-        std::thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
-            .spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(body());
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    fn write_mock_embedding_cluster(config_dir: &Path, model: &str) {
-        fs::write(
-            config_dir.join(CLUSTER_CONFIG_FILE),
-            format!(
-                r#"
+fn write_mock_embedding_cluster(config_dir: &Path, model: &str) {
+    fs::write(
+        config_dir.join(CLUSTER_CONFIG_FILE),
+        format!(
+            r#"
 version: 1
 metadata:
   name: test
@@ -117,104 +86,103 @@ policies:
     file: ./base.policy.yaml
     applies_to: [knowledge]
 "#
-            ),
-        )
+        ),
+    )
+    .unwrap();
+}
+
+async fn init_derived_graph(root: &Path) {
+    let graph_dir = root.join(CLUSTER_GRAPHS_DIR);
+    fs::create_dir_all(&graph_dir).unwrap();
+    let graph = graph_dir.join("knowledge.omni");
+    Omnigraph::init(graph.to_string_lossy().as_ref(), SCHEMA)
+        .await
         .unwrap();
-    }
+}
 
-    async fn init_derived_graph(root: &Path) {
-        let graph_dir = root.join(CLUSTER_GRAPHS_DIR);
-        fs::create_dir_all(&graph_dir).unwrap();
-        let graph = graph_dir.join("knowledge.omni");
-        Omnigraph::init(graph.to_string_lossy().as_ref(), SCHEMA)
-            .await
-            .unwrap();
-    }
+fn write_lock_file(config_dir: &Path, lock_id: &str, operation: &str) {
+    let state_dir = config_dir.join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("lock.json"),
+        json!({
+            "version": 1,
+            "lock_id": lock_id,
+            "operation": operation,
+            "created_at": "1970-01-01T00:00:00Z",
+            "pid": 123
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
 
-    fn write_lock_file(config_dir: &Path, lock_id: &str, operation: &str) {
-        let state_dir = config_dir.join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("lock.json"),
-            json!({
-                "version": 1,
-                "lock_id": lock_id,
-                "operation": operation,
-                "created_at": "1970-01-01T00:00:00Z",
-                "pid": 123
-            })
-            .to_string(),
-        )
-        .unwrap();
-    }
+#[test]
+fn valid_minimal_config() {
+    let dir = fixture();
+    let out = validate_config_dir(dir.path());
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.resource_digests.contains_key("graph.knowledge"));
+    assert!(out.resource_digests.contains_key("schema.knowledge"));
+    assert!(
+        out.dependencies
+            .iter()
+            .any(|dep| dep.from == "policy.base" && dep.to == "graph.knowledge")
+    );
+}
 
-    #[test]
-    fn valid_minimal_config() {
-        let dir = fixture();
-        let out = validate_config_dir(dir.path());
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.resource_digests.contains_key("graph.knowledge"));
-        assert!(out.resource_digests.contains_key("schema.knowledge"));
-        assert!(
-            out.dependencies
-                .iter()
-                .any(|dep| dep.from == "policy.base" && dep.to == "graph.knowledge")
-        );
-    }
+#[test]
+fn unknown_field_rejection() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs: {}\nwat: true\n",
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(out.diagnostics[0].message.contains("unknown field"));
+}
 
-    #[test]
-    fn unknown_field_rejection() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            "version: 1\ngraphs: {}\nwat: true\n",
-        )
-        .unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(!out.ok);
-        assert!(out.diagnostics[0].message.contains("unknown field"));
-    }
+#[test]
+fn future_phase_field_rejection() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs: {}\npipelines: {}\n",
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert_eq!(out.diagnostics[0].code, "future_phase_field");
+}
 
-    #[test]
-    fn future_phase_field_rejection() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            "version: 1\ngraphs: {}\npipelines: {}\n",
-        )
-        .unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(!out.ok);
-        assert_eq!(out.diagnostics[0].code, "future_phase_field");
-    }
+#[test]
+fn duplicate_yaml_key_rejection() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs: {}\ngraphs: {}\n",
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert_eq!(out.diagnostics[0].code, "duplicate_yaml_key");
+}
 
-    #[test]
-    fn duplicate_yaml_key_rejection() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            "version: 1\ngraphs: {}\ngraphs: {}\n",
-        )
-        .unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(!out.ok);
-        assert_eq!(out.diagnostics[0].code, "duplicate_yaml_key");
-    }
+#[test]
+fn duplicate_yaml_key_rejection_keeps_quoted_hashes() {
+    let diagnostics = duplicate_key_diagnostics("\"name#display\": one\n\"name#display\": two\n");
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code, "duplicate_yaml_key");
+}
 
-    #[test]
-    fn duplicate_yaml_key_rejection_keeps_quoted_hashes() {
-        let diagnostics =
-            duplicate_key_diagnostics("\"name#display\": one\n\"name#display\": two\n");
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code, "duplicate_yaml_key");
-    }
-
-    #[test]
-    fn missing_schema_query_and_policy_files() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
+#[test]
+fn missing_schema_query_and_policy_files() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
 version: 1
 graphs:
   knowledge:
@@ -226,22 +194,199 @@ policies:
     file: ./missing.policy.yaml
     applies_to: [knowledge]
 "#,
-        )
-        .unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(!out.ok);
-        let codes: BTreeSet<_> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
-        assert!(codes.contains("schema_file_missing"));
-        assert!(codes.contains("query_file_missing"));
-        assert!(codes.contains("policy_file_missing"));
-    }
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    let codes: BTreeSet<_> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
+    assert!(codes.contains("schema_file_missing"));
+    assert!(codes.contains("query_file_missing"));
+    assert!(codes.contains("policy_file_missing"));
+}
 
-    #[test]
-    fn wrong_kind_and_dangling_refs_fail() {
+#[test]
+fn semantically_invalid_policy_bundle_fails_validation() {
+    for (action, scope) in [
+        ("invoke_query", "branch_scope"),
+        ("schema_apply", "branch_scope"),
+    ] {
         let dir = fixture();
         fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
+            dir.path().join("base.policy.yaml"),
+            format!(
+                r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: invalid-scope
+    allow:
+      actors: {{ group: team }}
+      actions: [{action}]
+      {scope}: any
+"#
+            ),
+        )
+        .unwrap();
+
+        let out = validate_config_dir(dir.path());
+        assert!(!out.ok, "{action} with {scope} must be rejected");
+        let diagnostic = out
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "policy_invalid")
+            .unwrap_or_else(|| panic!("missing policy_invalid diagnostic: {:?}", out.diagnostics));
+        assert_eq!(diagnostic.path, "policies.base.file");
+        assert!(
+            diagnostic.message.contains(scope) && diagnostic.message.contains(action),
+            "unexpected diagnostic: {diagnostic:?}"
+        );
+    }
+
+    let dir = fixture();
+    fs::write(
+        dir.path().join("base.policy.yaml"),
+        r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: typo-must-not-widen-access
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scpoe: protected
+"#,
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    let diagnostic = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "policy_invalid")
+        .unwrap_or_else(|| panic!("missing policy_invalid diagnostic: {:?}", out.diagnostics));
+    assert_eq!(diagnostic.path, "policies.base.file");
+    assert!(
+        diagnostic.message.contains("branch_scpoe"),
+        "unexpected diagnostic: {diagnostic:?}"
+    );
+}
+
+#[test]
+fn policy_binding_contract_fails_validation() {
+    for (applies_to, action, scope, expected_kind) in [
+        ("knowledge", "graph_list", "", "server-scoped"),
+        ("cluster", "read", "      branch_scope: any\n", "per-graph"),
+    ] {
+        let dir = fixture();
+        let config_path = dir.path().join(CLUSTER_CONFIG_FILE);
+        let config = fs::read_to_string(&config_path).unwrap().replace(
+            "applies_to: [knowledge]",
+            &format!("applies_to: [{applies_to}]"),
+        );
+        fs::write(config_path, config).unwrap();
+        fs::write(
+            dir.path().join("base.policy.yaml"),
+            format!(
+                r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: wrong-kind
+    allow:
+      actors: {{ group: team }}
+      actions: [{action}]
+{scope}"#
+            ),
+        )
+        .unwrap();
+
+        let out = validate_config_dir(dir.path());
+        assert!(!out.ok, "{action} must be rejected for {applies_to}");
+        let diagnostic = out
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "policy_invalid")
+            .unwrap_or_else(|| panic!("missing policy_invalid diagnostic: {:?}", out.diagnostics));
+        assert_eq!(diagnostic.path, "policies.base.file");
+        assert!(
+            diagnostic.message.contains(expected_kind) && diagnostic.message.contains(action),
+            "unexpected diagnostic: {diagnostic:?}"
+        );
+    }
+
+    let dir = fixture();
+    let config_path = dir.path().join(CLUSTER_CONFIG_FILE);
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "applies_to: [knowledge]",
+        "applies_to: [cluster, knowledge]",
+    );
+    fs::write(config_path, config).unwrap();
+    let out = validate_config_dir(dir.path());
+    let diagnostic = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "policy_mixed_binding_kinds")
+        .unwrap_or_else(|| {
+            panic!(
+                "missing policy_mixed_binding_kinds diagnostic: {:?}",
+                out.diagnostics
+            )
+        });
+    assert_eq!(diagnostic.path, "policies.base.applies_to");
+    assert!(
+        !out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "policy_invalid"),
+        "an empty, structurally valid policy must not acquire a spurious kind error: {:?}",
+        out.diagnostics
+    );
+
+    for target in ["knowledge", "cluster"] {
+        let dir = fixture();
+        fs::write(dir.path().join("second.policy.yaml"), POLICY).unwrap();
+        let config_path = dir.path().join(CLUSTER_CONFIG_FILE);
+        let mut config = fs::read_to_string(&config_path).unwrap();
+        if target == "cluster" {
+            config = config.replace("applies_to: [knowledge]", "applies_to: [cluster]");
+        }
+        config.push_str(&format!(
+            "  second:\n    file: ./second.policy.yaml\n    applies_to: [{target}]\n"
+        ));
+        fs::write(config_path, config).unwrap();
+
+        let out = validate_config_dir(dir.path());
+        let diagnostic = out
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "duplicate_policy_binding")
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing duplicate_policy_binding diagnostic for {target}: {:?}",
+                    out.diagnostics
+                )
+            });
+        assert_eq!(diagnostic.path, "policies.second.applies_to");
+        assert!(
+            diagnostic.message.contains("`base`")
+                && diagnostic.message.contains("`second`")
+                && diagnostic.message.contains(if target == "cluster" {
+                    "`cluster`"
+                } else {
+                    "`graph.knowledge`"
+                }),
+            "unexpected diagnostic: {diagnostic:?}"
+        );
+    }
+}
+
+#[test]
+fn wrong_kind_and_dangling_refs_fail() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
 version: 1
 graphs:
   knowledge:
@@ -251,68 +396,68 @@ policies:
     file: ./base.policy.yaml
     applies_to: [query.knowledge.find_person, missing]
 "#,
-        )
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    let codes: BTreeSet<_> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
+    assert!(codes.contains("wrong_kind_reference"));
+    assert!(codes.contains("dangling_graph_reference"));
+}
+
+#[test]
+fn embedding_provider_config_accepts_provider_resources_and_graph_refs() {
+    let dir = fixture();
+    write_mock_embedding_cluster(dir.path(), "recorded-x");
+
+    let out = validate_config_dir(dir.path());
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let provider_digest = out
+        .resource_digests
+        .get("provider.embedding.default")
+        .expect("provider resource digest");
+    assert!(
+        out.resources
+            .iter()
+            .any(|resource| resource.address == "provider.embedding.default"
+                && resource.kind == "embedding_provider"
+                && resource.path.is_none())
+    );
+    assert!(
+        out.dependencies
+            .iter()
+            .any(|dep| dep.from == "graph.knowledge" && dep.to == "provider.embedding.default"),
+        "{:?}",
+        out.dependencies
+    );
+    let schema_digest = out.resource_digests.get("schema.knowledge").unwrap();
+    let query_digest = out
+        .resource_digests
+        .get("query.knowledge.find_person")
         .unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(!out.ok);
-        let codes: BTreeSet<_> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
-        assert!(codes.contains("wrong_kind_reference"));
-        assert!(codes.contains("dangling_graph_reference"));
-    }
+    let expected_graph_digest = graph_digest(
+        "knowledge",
+        Some(schema_digest),
+        Some(
+            &[("find_person".to_string(), query_digest.clone())]
+                .into_iter()
+                .collect(),
+        ),
+        Some("provider.embedding.default"),
+        Some(provider_digest),
+    );
+    assert_eq!(
+        out.resource_digests["graph.knowledge"],
+        expected_graph_digest
+    );
+}
 
-    #[test]
-    fn embedding_provider_config_accepts_provider_resources_and_graph_refs() {
-        let dir = fixture();
-        write_mock_embedding_cluster(dir.path(), "recorded-x");
-
-        let out = validate_config_dir(dir.path());
-        assert!(out.ok, "{:?}", out.diagnostics);
-        let provider_digest = out
-            .resource_digests
-            .get("provider.embedding.default")
-            .expect("provider resource digest");
-        assert!(
-            out.resources
-                .iter()
-                .any(|resource| resource.address == "provider.embedding.default"
-                    && resource.kind == "embedding_provider"
-                    && resource.path.is_none())
-        );
-        assert!(
-            out.dependencies
-                .iter()
-                .any(|dep| dep.from == "graph.knowledge" && dep.to == "provider.embedding.default"),
-            "{:?}",
-            out.dependencies
-        );
-        let schema_digest = out.resource_digests.get("schema.knowledge").unwrap();
-        let query_digest = out
-            .resource_digests
-            .get("query.knowledge.find_person")
-            .unwrap();
-        let expected_graph_digest = graph_digest(
-            "knowledge",
-            Some(schema_digest),
-            Some(
-                &[("find_person".to_string(), query_digest.clone())]
-                    .into_iter()
-                    .collect(),
-            ),
-            Some("provider.embedding.default"),
-            Some(provider_digest),
-        );
-        assert_eq!(
-            out.resource_digests["graph.knowledge"],
-            expected_graph_digest
-        );
-    }
-
-    #[test]
-    fn embedding_provider_config_rejects_bad_refs_and_inline_secrets() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
+#[test]
+fn embedding_provider_config_rejects_bad_refs_and_inline_secrets() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
 version: 1
 providers:
   embedding:
@@ -327,34 +472,34 @@ graphs:
     schema: ./people.pg
     embedding_provider: absent
 "#,
-        )
-        .unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(!out.ok);
-        let codes: BTreeSet<_> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
-        assert!(
-            codes.contains("embedding_api_key_inline"),
-            "{:?}",
-            out.diagnostics
-        );
-        assert!(
-            codes.contains("wrong_kind_reference"),
-            "{:?}",
-            out.diagnostics
-        );
-        assert!(
-            codes.contains("dangling_embedding_provider_reference"),
-            "{:?}",
-            out.diagnostics
-        );
-    }
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    let codes: BTreeSet<_> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
+    assert!(
+        codes.contains("embedding_api_key_inline"),
+        "{:?}",
+        out.diagnostics
+    );
+    assert!(
+        codes.contains("wrong_kind_reference"),
+        "{:?}",
+        out.diagnostics
+    );
+    assert!(
+        codes.contains("dangling_embedding_provider_reference"),
+        "{:?}",
+        out.diagnostics
+    );
+}
 
-    #[test]
-    fn query_key_mismatch_fails() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
+#[test]
+fn query_key_mismatch_fails() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
 version: 1
 graphs:
   knowledge:
@@ -362,56 +507,56 @@ graphs:
     queries:
       different: { file: ./people.gq }
 "#,
-        )
-        .unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(!out.ok);
-        assert_eq!(out.diagnostics[0].code, "query_key_mismatch");
-    }
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert_eq!(out.diagnostics[0].code, "query_key_mismatch");
+}
 
-    #[test]
-    fn query_typecheck_failure_fails() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join("people.gq"),
-            "query find_person() { match { $d: DoesNotExist } return { $d.name } }\n",
-        )
-        .unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "query_typecheck_error")
-        );
-    }
+#[test]
+fn query_typecheck_failure_fails() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join("people.gq"),
+        "query find_person() { match { $d: DoesNotExist } return { $d.name } }\n",
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "query_typecheck_error")
+    );
+}
 
-    #[tokio::test]
-    async fn missing_state_plans_creates() {
-        let dir = fixture();
-        let out = plan_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(!out.state_observations.state_found);
-        assert!(!out.state_observations.locked);
-        assert!(out.state_observations.lock_acquired);
-        assert!(
-            out.changes
-                .iter()
-                .all(|c| c.operation == PlanOperation::Create)
-        );
-        assert!(out.changes.iter().any(|c| c.resource == "graph.knowledge"));
-        assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
-    }
+#[tokio::test]
+async fn missing_state_plans_creates() {
+    let dir = fixture();
+    let out = plan_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(!out.state_observations.state_found);
+    assert!(!out.state_observations.locked);
+    assert!(out.state_observations.lock_acquired);
+    assert!(
+        out.changes
+            .iter()
+            .all(|c| c.operation == PlanOperation::Create)
+    );
+    assert!(out.changes.iter().any(|c| c.resource == "graph.knowledge"));
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+}
 
-    #[tokio::test]
-    async fn config_digest_ignores_yaml_comments_and_formatting() {
-        let dir = fixture();
-        let first = plan_config_dir(dir.path()).await;
-        assert!(first.ok, "{:?}", first.diagnostics);
+#[tokio::test]
+async fn config_digest_ignores_yaml_comments_and_formatting() {
+    let dir = fixture();
+    let first = plan_config_dir(dir.path()).await;
+    assert!(first.ok, "{:?}", first.diagnostics);
 
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
 # Same semantic config as the fixture, intentionally rendered differently.
 version: 1
 metadata: { name: test }
@@ -426,66 +571,66 @@ policies:
     applies_to:
       - knowledge
 "#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
-        let second = plan_config_dir(dir.path()).await;
-        assert!(second.ok, "{:?}", second.diagnostics);
-        assert_eq!(
-            first.desired_revision.config_digest,
-            second.desired_revision.config_digest
-        );
-    }
+    let second = plan_config_dir(dir.path()).await;
+    assert!(second.ok, "{:?}", second.diagnostics);
+    assert_eq!(
+        first.desired_revision.config_digest,
+        second.desired_revision.config_digest
+    );
+}
 
-    #[tokio::test]
-    async fn existing_state_plans_update_and_delete_deterministically() {
-        let dir = fixture();
-        let first = plan_config_dir(dir.path()).await;
-        let state_dir = dir.path().join("__cluster");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("state.json"),
-            serde_json::to_string_pretty(&json!({
-                "version": 1,
-                "applied_revision": {
-                    "config_digest": "old",
-                    "resources": {
-                        "graph.knowledge": { "digest": first.resource_digests["graph.knowledge"] },
-                        "policy.old": { "digest": "abc" },
-                        "schema.knowledge": { "digest": "old-schema" }
-                    }
+#[tokio::test]
+async fn existing_state_plans_update_and_delete_deterministically() {
+    let dir = fixture();
+    let first = plan_config_dir(dir.path()).await;
+    let state_dir = dir.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "applied_revision": {
+                "config_digest": "old",
+                "resources": {
+                    "graph.knowledge": { "digest": first.resource_digests["graph.knowledge"] },
+                    "policy.old": { "digest": "abc" },
+                    "schema.knowledge": { "digest": "old-schema" }
                 }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
-        let out = plan_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        let rendered: Vec<_> = out
-            .changes
-            .iter()
-            .map(|change| (change.resource.as_str(), &change.operation))
-            .collect();
-        assert_eq!(
-            rendered,
-            vec![
-                ("policy.base", &PlanOperation::Create),
-                ("policy.old", &PlanOperation::Delete),
-                ("query.knowledge.find_person", &PlanOperation::Create),
-                ("schema.knowledge", &PlanOperation::Update),
-            ]
-        );
-    }
+    let out = plan_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let rendered: Vec<_> = out
+        .changes
+        .iter()
+        .map(|change| (change.resource.as_str(), &change.operation))
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![
+            ("policy.base", &PlanOperation::Create),
+            ("policy.old", &PlanOperation::Delete),
+            ("query.knowledge.find_person", &PlanOperation::Create),
+            ("schema.knowledge", &PlanOperation::Update),
+        ]
+    );
+}
 
-    #[tokio::test]
-    async fn old_minimal_state_json_still_plans_with_default_revision() {
-        let dir = fixture();
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("state.json"),
-            r#"{
+#[tokio::test]
+async fn old_minimal_state_json_still_plans_with_default_revision() {
+    let dir = fixture();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"{
   "version": 1,
   "applied_revision": {
     "config_digest": "old",
@@ -494,24 +639,24 @@ policies:
     }
   }
 }"#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
-        let out = plan_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert_eq!(out.state_observations.state_revision, 0);
-        assert!(out.state_observations.state_cas.is_some());
-        assert!(out.changes.iter().any(|change| {
-            change.resource == "graph.knowledge" && change.operation == PlanOperation::Update
-        }));
-    }
+    let out = plan_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(out.state_observations.state_revision, 0);
+    assert!(out.state_observations.state_cas.is_some());
+    assert!(out.changes.iter().any(|change| {
+        change.resource == "graph.knowledge" && change.operation == PlanOperation::Update
+    }));
+}
 
-    #[tokio::test]
-    async fn extended_state_json_status_surfaces_statuses() {
-        let dir = fixture();
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        let state = r#"{
+#[tokio::test]
+async fn extended_state_json_status_surfaces_statuses() {
+    let dir = fixture();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    let state = r#"{
   "version": 1,
   "state_revision": 42,
   "applied_revision": {
@@ -533,175 +678,175 @@ policies:
     "graph.knowledge": { "manifest_version": 12 }
   }
 }"#;
-        fs::write(state_dir.join("state.json"), state).unwrap();
+    fs::write(state_dir.join("state.json"), state).unwrap();
 
-        let out = status_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.state_observations.state_found);
-        assert_eq!(out.state_observations.state_revision, 42);
-        assert_eq!(
-            out.state_observations.state_cas.as_deref(),
-            Some(format!("sha256:{}", sha256_hex(state.as_bytes())).as_str())
-        );
-        assert_eq!(
-            out.resource_digests
-                .get("graph.knowledge")
-                .map(String::as_str),
-            Some("graph-digest")
-        );
-        assert_eq!(
-            out.resource_statuses["graph.knowledge"].status,
-            ResourceLifecycleStatus::Applied
-        );
-    }
+    let out = status_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.state_observations.state_found);
+    assert_eq!(out.state_observations.state_revision, 42);
+    assert_eq!(
+        out.state_observations.state_cas.as_deref(),
+        Some(format!("sha256:{}", sha256_hex(state.as_bytes())).as_str())
+    );
+    assert_eq!(
+        out.resource_digests
+            .get("graph.knowledge")
+            .map(String::as_str),
+        Some("graph-digest")
+    );
+    assert_eq!(
+        out.resource_statuses["graph.knowledge"].status,
+        ResourceLifecycleStatus::Applied
+    );
+}
 
-    #[tokio::test]
-    async fn missing_state_status_succeeds_with_warning() {
-        let dir = fixture();
-        let out = status_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(!out.state_observations.state_found);
-        assert_eq!(out.state_observations.state_revision, 0);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_missing")
-        );
-    }
+#[tokio::test]
+async fn missing_state_status_succeeds_with_warning() {
+    let dir = fixture();
+    let out = status_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(!out.state_observations.state_found);
+    assert_eq!(out.state_observations.state_revision, 0);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "state_missing")
+    );
+}
 
-    #[tokio::test]
-    async fn invalid_state_status_fails() {
-        let dir = fixture();
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(state_dir.join("state.json"), "{").unwrap();
+#[tokio::test]
+async fn invalid_state_status_fails() {
+    let dir = fixture();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(state_dir.join("state.json"), "{").unwrap();
 
-        let out = status_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        assert!(out.state_observations.state_found);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "invalid_state_json")
-        );
-    }
+    let out = status_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(out.state_observations.state_found);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "invalid_state_json")
+    );
+}
 
-    #[tokio::test]
-    async fn status_surfaces_full_lock_metadata() {
-        let dir = fixture();
-        write_lock_file(dir.path(), "held-lock", "refresh");
+#[tokio::test]
+async fn status_surfaces_full_lock_metadata() {
+    let dir = fixture();
+    write_lock_file(dir.path(), "held-lock", "refresh");
 
-        let out = status_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.state_observations.locked);
-        assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
-        assert_eq!(
-            out.state_observations.lock_operation.as_deref(),
-            Some("refresh")
-        );
-        assert_eq!(
-            out.state_observations.lock_created_at.as_deref(),
-            Some("1970-01-01T00:00:00Z")
-        );
-        assert_eq!(out.state_observations.lock_pid, Some(123));
-        assert!(out.state_observations.lock_age_seconds.is_some());
-    }
+    let out = status_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.state_observations.locked);
+    assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
+    assert_eq!(
+        out.state_observations.lock_operation.as_deref(),
+        Some("refresh")
+    );
+    assert_eq!(
+        out.state_observations.lock_created_at.as_deref(),
+        Some("1970-01-01T00:00:00Z")
+    );
+    assert_eq!(out.state_observations.lock_pid, Some(123));
+    assert!(out.state_observations.lock_age_seconds.is_some());
+}
 
-    #[tokio::test]
-    async fn force_unlock_matching_id_removes_lock() {
-        let dir = fixture();
-        write_lock_file(dir.path(), "held-lock", "plan");
+#[tokio::test]
+async fn force_unlock_matching_id_removes_lock() {
+    let dir = fixture();
+    write_lock_file(dir.path(), "held-lock", "plan");
 
-        let out = force_unlock_config_dir(dir.path(), "held-lock").await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.lock_removed);
-        assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
-        assert_eq!(
-            out.state_observations.lock_operation.as_deref(),
-            Some("plan")
-        );
-        assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
-    }
+    let out = force_unlock_config_dir(dir.path(), "held-lock").await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.lock_removed);
+    assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
+    assert_eq!(
+        out.state_observations.lock_operation.as_deref(),
+        Some("plan")
+    );
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+}
 
-    #[tokio::test]
-    async fn force_unlock_wrong_id_fails_and_preserves_lock() {
-        let dir = fixture();
-        write_lock_file(dir.path(), "held-lock", "plan");
+#[tokio::test]
+async fn force_unlock_wrong_id_fails_and_preserves_lock() {
+    let dir = fixture();
+    write_lock_file(dir.path(), "held-lock", "plan");
 
-        let out = force_unlock_config_dir(dir.path(), "other-lock").await;
-        assert!(!out.ok);
-        assert!(!out.lock_removed);
-        assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_lock_id_mismatch")
-        );
-        assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
-    }
+    let out = force_unlock_config_dir(dir.path(), "other-lock").await;
+    assert!(!out.ok);
+    assert!(!out.lock_removed);
+    assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "state_lock_id_mismatch")
+    );
+    assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+}
 
-    #[tokio::test]
-    async fn force_unlock_missing_lock_fails() {
-        let dir = fixture();
+#[tokio::test]
+async fn force_unlock_missing_lock_fails() {
+    let dir = fixture();
 
-        let out = force_unlock_config_dir(dir.path(), "held-lock").await;
-        assert!(!out.ok);
-        assert!(!out.lock_removed);
-        assert!(!out.state_observations.locked);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_lock_missing")
-        );
-    }
+    let out = force_unlock_config_dir(dir.path(), "held-lock").await;
+    assert!(!out.ok);
+    assert!(!out.lock_removed);
+    assert!(!out.state_observations.locked);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "state_lock_missing")
+    );
+}
 
-    #[tokio::test]
-    async fn force_unlock_invalid_lock_json_fails_and_preserves_lock() {
-        let dir = fixture();
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(state_dir.join("lock.json"), "{").unwrap();
+#[tokio::test]
+async fn force_unlock_invalid_lock_json_fails_and_preserves_lock() {
+    let dir = fixture();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(state_dir.join("lock.json"), "{").unwrap();
 
-        let out = force_unlock_config_dir(dir.path(), "held-lock").await;
-        assert!(!out.ok);
-        assert!(!out.lock_removed);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "invalid_state_lock")
-        );
-        assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
-    }
+    let out = force_unlock_config_dir(dir.path(), "held-lock").await;
+    assert!(!out.ok);
+    assert!(!out.lock_removed);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "invalid_state_lock")
+    );
+    assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+}
 
-    #[tokio::test]
-    async fn force_unlock_unsupported_lock_version_fails_and_preserves_lock() {
-        let dir = fixture();
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
+#[tokio::test]
+async fn force_unlock_unsupported_lock_version_fails_and_preserves_lock() {
+    let dir = fixture();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
             state_dir.join("lock.json"),
             r#"{"version":2,"lock_id":"held-lock","operation":"plan","created_at":"1970-01-01T00:00:00Z","pid":123}"#,
         )
         .unwrap();
 
-        let out = force_unlock_config_dir(dir.path(), "held-lock").await;
-        assert!(!out.ok);
-        assert!(!out.lock_removed);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "unsupported_state_lock_version")
-        );
-        assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
-    }
+    let out = force_unlock_config_dir(dir.path(), "held-lock").await;
+    assert!(!out.ok);
+    assert!(!out.lock_removed);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "unsupported_state_lock_version")
+    );
+    assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+}
 
-    #[tokio::test]
-    async fn force_unlock_external_state_backend_rejected() {
-        let dir = fixture();
-        write_lock_file(dir.path(), "held-lock", "plan");
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
+#[tokio::test]
+async fn force_unlock_external_state_backend_rejected() {
+    let dir = fixture();
+    write_lock_file(dir.path(), "held-lock", "plan");
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
 version: 1
 state:
   backend: s3://state-bucket/cluster
@@ -709,47 +854,47 @@ graphs:
   knowledge:
     schema: ./people.pg
 "#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
-        let out = force_unlock_config_dir(dir.path(), "held-lock").await;
-        assert!(!out.ok);
-        assert!(!out.lock_removed);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "unsupported_state_backend")
-        );
-        assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
-    }
+    let out = force_unlock_config_dir(dir.path(), "held-lock").await;
+    assert!(!out.ok);
+    assert!(!out.lock_removed);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "unsupported_state_backend")
+    );
+    assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+}
 
-    #[tokio::test]
-    async fn plan_succeeds_after_force_unlock() {
-        let dir = fixture();
-        write_lock_file(dir.path(), "held-lock", "plan");
+#[tokio::test]
+async fn plan_succeeds_after_force_unlock() {
+    let dir = fixture();
+    write_lock_file(dir.path(), "held-lock", "plan");
 
-        let locked = plan_config_dir(dir.path()).await;
-        assert!(!locked.ok);
-        assert!(
-            locked
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_lock_held")
-        );
+    let locked = plan_config_dir(dir.path()).await;
+    assert!(!locked.ok);
+    assert!(
+        locked
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "state_lock_held")
+    );
 
-        let unlocked = force_unlock_config_dir(dir.path(), "held-lock").await;
-        assert!(unlocked.ok, "{:?}", unlocked.diagnostics);
+    let unlocked = force_unlock_config_dir(dir.path(), "held-lock").await;
+    assert!(unlocked.ok, "{:?}", unlocked.diagnostics);
 
-        let out = plan_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-    }
+    let out = plan_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+}
 
-    #[tokio::test]
-    async fn plan_reports_state_cas_revision_and_removes_lock() {
-        let dir = fixture();
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        let state = r#"{
+#[tokio::test]
+async fn plan_reports_state_cas_revision_and_removes_lock() {
+    let dir = fixture();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    let state = r#"{
   "version": 1,
   "state_revision": 7,
   "applied_revision": {
@@ -759,69 +904,69 @@ graphs:
     }
   }
 }"#;
-        fs::write(state_dir.join("state.json"), state).unwrap();
+    fs::write(state_dir.join("state.json"), state).unwrap();
 
-        let out = plan_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert_eq!(out.state_observations.state_revision, 7);
-        assert_eq!(
-            out.state_observations.state_cas.as_deref(),
-            Some(format!("sha256:{}", sha256_hex(state.as_bytes())).as_str())
-        );
-        assert!(!out.state_observations.locked);
-        assert!(out.state_observations.lock_id.is_none());
-        assert!(out.state_observations.lock_acquired);
-        assert!(out.state_observations.acquired_lock_id.is_some());
-        assert!(
-            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
-            "plan must release lock before returning"
-        );
-    }
+    let out = plan_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(out.state_observations.state_revision, 7);
+    assert_eq!(
+        out.state_observations.state_cas.as_deref(),
+        Some(format!("sha256:{}", sha256_hex(state.as_bytes())).as_str())
+    );
+    assert!(!out.state_observations.locked);
+    assert!(out.state_observations.lock_id.is_none());
+    assert!(out.state_observations.lock_acquired);
+    assert!(out.state_observations.acquired_lock_id.is_some());
+    assert!(
+        !dir.path().join(CLUSTER_LOCK_FILE).exists(),
+        "plan must release lock before returning"
+    );
+}
 
-    #[tokio::test]
-    async fn existing_lock_makes_plan_fail() {
-        let dir = fixture();
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("lock.json"),
-            r#"{
+#[tokio::test]
+async fn existing_lock_makes_plan_fail() {
+    let dir = fixture();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("lock.json"),
+        r#"{
   "version": 1,
   "lock_id": "held-lock",
   "operation": "plan",
   "created_at": "2026-06-08T00:00:00Z",
   "pid": 123
 }"#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
-        let out = plan_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        assert!(out.state_observations.locked);
-        assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
-        assert!(!out.state_observations.lock_acquired);
-        assert!(out.state_observations.acquired_lock_id.is_none());
-        assert_eq!(
-            out.state_observations.lock_operation.as_deref(),
-            Some("plan")
-        );
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_lock_held")
-        );
-        assert!(out.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "state_lock_held"
-                && diagnostic.message.contains("force-unlock held-lock")
-        }));
-    }
+    let out = plan_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(out.state_observations.locked);
+    assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
+    assert!(!out.state_observations.lock_acquired);
+    assert!(out.state_observations.acquired_lock_id.is_none());
+    assert_eq!(
+        out.state_observations.lock_operation.as_deref(),
+        Some("plan")
+    );
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "state_lock_held")
+    );
+    assert!(out.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "state_lock_held"
+            && diagnostic.message.contains("force-unlock held-lock")
+    }));
+}
 
-    #[tokio::test]
-    async fn state_lock_false_bypasses_lock_with_warning() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
+#[tokio::test]
+async fn state_lock_false_bypasses_lock_with_warning() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
 version: 1
 state:
   backend: cluster
@@ -830,294 +975,276 @@ graphs:
   knowledge:
     schema: ./people.pg
 "#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
-        let out = plan_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(!out.state_observations.locked);
-        assert!(!out.state_observations.lock_acquired);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_lock_disabled")
-        );
-        assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
-    }
+    let out = plan_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(!out.state_observations.locked);
+    assert!(!out.state_observations.lock_acquired);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "state_lock_disabled")
+    );
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+}
 
-    #[test]
-    fn external_state_backend_rejected() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            "version: 1\nstate:\n  backend: s3://bucket/state\ngraphs: {}\n",
-        )
-        .unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(!out.ok);
-        assert_eq!(out.diagnostics[0].code, "unsupported_state_backend");
-    }
+#[test]
+fn external_state_backend_rejected() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\nstate:\n  backend: s3://bucket/state\ngraphs: {}\n",
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert_eq!(out.diagnostics[0].code, "unsupported_state_backend");
+}
 
-    #[tokio::test]
-    async fn external_state_backend_plan_rejected() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            "version: 1\nstate:\n  backend: s3://bucket/state\ngraphs: {}\n",
-        )
-        .unwrap();
-        let out = plan_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "unsupported_state_backend")
-        );
-    }
+#[tokio::test]
+async fn external_state_backend_plan_rejected() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\nstate:\n  backend: s3://bucket/state\ngraphs: {}\n",
+    )
+    .unwrap();
+    let out = plan_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "unsupported_state_backend")
+    );
+}
 
-    #[tokio::test]
-    async fn import_missing_state_creates_state_with_graph_observation() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
+#[tokio::test]
+async fn import_missing_state_creates_state_with_graph_observation() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
 
-        let out = import_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert_eq!(out.state_observations.state_revision, 1);
-        assert!(out.state_observations.state_cas.is_some());
-        assert!(!out.state_observations.locked);
-        assert!(out.state_observations.lock_acquired);
-        assert!(out.state_observations.acquired_lock_id.is_some());
-        assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
-        assert_eq!(
-            out.resource_digests
-                .get("schema.knowledge")
-                .map(String::as_str),
-            Some(sha256_hex(SCHEMA.as_bytes()).as_str())
-        );
-        assert!(out.observations["graph.knowledge"]["manifest_version"].is_number());
-        assert_eq!(
-            out.observations["graph.knowledge"]["schema_matches_desired"],
-            true
-        );
+    let out = import_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(out.state_observations.state_revision, 1);
+    assert!(out.state_observations.state_cas.is_some());
+    assert!(!out.state_observations.locked);
+    assert!(out.state_observations.lock_acquired);
+    assert!(out.state_observations.acquired_lock_id.is_some());
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+    assert_eq!(
+        out.resource_digests
+            .get("schema.knowledge")
+            .map(String::as_str),
+        Some(sha256_hex(SCHEMA.as_bytes()).as_str())
+    );
+    assert!(out.observations["graph.knowledge"]["manifest_version"].is_number());
+    assert_eq!(
+        out.observations["graph.knowledge"]["schema_matches_desired"],
+        true
+    );
 
-        let state: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap())
-                .unwrap();
-        assert_eq!(state["state_revision"], 1);
-        assert_eq!(
-            state["resource_statuses"]["graph.knowledge"]["status"],
-            "applied"
-        );
-    }
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(state["state_revision"], 1);
+    assert_eq!(
+        state["resource_statuses"]["graph.knowledge"]["status"],
+        "applied"
+    );
+}
 
-    #[tokio::test]
-    async fn import_existing_state_fails() {
-        let dir = fixture();
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("state.json"),
-            r#"{"version":1,"applied_revision":{"resources":{}}}"#,
-        )
-        .unwrap();
+#[tokio::test]
+async fn import_existing_state_fails() {
+    let dir = fixture();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"{"version":1,"applied_revision":{"resources":{}}}"#,
+    )
+    .unwrap();
 
-        let out = import_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_already_exists")
-        );
-    }
+    let out = import_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "state_already_exists")
+    );
+}
 
-    #[tokio::test]
-    async fn refresh_missing_state_fails() {
-        let dir = fixture();
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_missing")
-        );
-    }
+#[tokio::test]
+async fn refresh_missing_state_fails() {
+    let dir = fixture();
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "state_missing")
+    );
+}
 
-    #[tokio::test]
-    async fn refresh_existing_minimal_state_increments_revision_and_updates_cas() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
+#[tokio::test]
+async fn refresh_existing_minimal_state_increments_revision_and_updates_cas() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
             state_dir.join("state.json"),
             r#"{"version":1,"applied_revision":{"config_digest":"old","resources":{"graph.knowledge":{"digest":"old"}}}}"#,
         )
         .unwrap();
 
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert_eq!(out.state_observations.state_revision, 1);
-        assert!(out.state_observations.state_cas.is_some());
-        assert!(!out.state_observations.locked);
-        assert!(out.state_observations.lock_acquired);
-        assert_eq!(
-            out.resource_statuses["graph.knowledge"].status,
-            ResourceLifecycleStatus::Applied
-        );
-        assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
-    }
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(out.state_observations.state_revision, 1);
+    assert!(out.state_observations.state_cas.is_some());
+    assert!(!out.state_observations.locked);
+    assert!(out.state_observations.lock_acquired);
+    assert_eq!(
+        out.resource_statuses["graph.knowledge"].status,
+        ResourceLifecycleStatus::Applied
+    );
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+}
 
-    #[tokio::test]
-    async fn refresh_records_live_schema_digest_and_manifest_version() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("state.json"),
-            r#"{"version":1,"state_revision":4,"applied_revision":{"resources":{}}}"#,
-        )
-        .unwrap();
+#[tokio::test]
+async fn refresh_records_live_schema_digest_and_manifest_version() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"{"version":1,"state_revision":4,"applied_revision":{"resources":{}}}"#,
+    )
+    .unwrap();
 
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert_eq!(out.state_observations.state_revision, 5);
-        assert_eq!(
-            out.observations["graph.knowledge"]["schema_digest"],
-            sha256_hex(SCHEMA.as_bytes())
-        );
-        assert!(out.observations["graph.knowledge"]["manifest_version"].is_u64());
-    }
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(out.state_observations.state_revision, 5);
+    assert_eq!(
+        out.observations["graph.knowledge"]["schema_digest"],
+        sha256_hex(SCHEMA.as_bytes())
+    );
+    assert!(out.observations["graph.knowledge"]["manifest_version"].is_u64());
+}
 
-    #[tokio::test]
-    async fn missing_derived_graph_root_marks_drifted_and_plans_creates() {
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        let streaming_digest = validate_config_dir(dir.path()).resource_digests
-            ["streaming.knowledge"]
-            .clone();
-        write_state_resources(
-            dir.path(),
-            &[
-                ("graph.knowledge", "old-graph"),
-                ("schema.knowledge", "old-schema"),
-                ("streaming.knowledge", streaming_digest.as_str()),
-            ],
-        );
+#[tokio::test]
+async fn missing_derived_graph_root_marks_drifted_and_plans_creates() {
+    let dir = fixture();
+    write_state_resources(
+        dir.path(),
+        &[
+            ("graph.knowledge", "old-graph"),
+            ("schema.knowledge", "old-schema"),
+        ],
+    );
 
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert_eq!(
-            out.resource_statuses["graph.knowledge"].status,
-            ResourceLifecycleStatus::Drifted
-        );
-        assert!(!out.resource_digests.contains_key("graph.knowledge"));
-        assert!(!out.resource_digests.contains_key("streaming.knowledge"));
-        assert_eq!(out.observations["graph.knowledge"]["exists"], false);
-        assert_eq!(
-            out.resource_statuses["streaming.knowledge"].status,
-            ResourceLifecycleStatus::Drifted
-        );
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(
+        out.resource_statuses["graph.knowledge"].status,
+        ResourceLifecycleStatus::Drifted
+    );
+    assert!(!out.resource_digests.contains_key("graph.knowledge"));
+    assert_eq!(out.observations["graph.knowledge"]["exists"], false);
 
-        let plan = plan_config_dir(dir.path()).await;
-        assert!(plan.ok, "{:?}", plan.diagnostics);
-        assert!(plan.changes.iter().any(|change| {
-            change.resource == "graph.knowledge" && change.operation == PlanOperation::Create
-        }));
-        assert!(plan.changes.iter().any(|change| {
-            change.resource == "schema.knowledge" && change.operation == PlanOperation::Create
-        }));
-        assert!(plan.changes.iter().any(|change| {
-            change.resource == "streaming.knowledge"
-                && change.operation == PlanOperation::Create
-        }));
+    let plan = plan_config_dir(dir.path()).await;
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert!(plan.changes.iter().any(|change| {
+        change.resource == "graph.knowledge" && change.operation == PlanOperation::Create
+    }));
+    assert!(plan.changes.iter().any(|change| {
+        change.resource == "schema.knowledge" && change.operation == PlanOperation::Create
+    }));
 
-        let applied = confirmed_streaming_apply(dir.path()).await;
-        assert!(applied.ok && applied.converged, "{applied:?}");
-        assert!(
-            live_streaming_enabled(dir.path()).await,
-            "a recreated graph must receive the managed streaming authority"
-        );
-    }
+    let applied = apply_config_dir(dir.path()).await;
+    assert!(applied.ok && applied.converged, "{applied:?}");
+}
 
-    #[tokio::test]
-    async fn live_schema_mismatch_marks_drifted_and_causes_plan_update() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        fs::write(
-            dir.path().join("people.pg"),
-            SCHEMA.replace("age: I32?", "age: I32?\n  nickname: String?"),
-        )
-        .unwrap();
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
+#[tokio::test]
+async fn live_schema_mismatch_marks_drifted_and_causes_plan_update() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    fs::write(
+        dir.path().join("people.pg"),
+        SCHEMA.replace("age: I32?", "age: I32?\n  nickname: String?"),
+    )
+    .unwrap();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
             state_dir.join("state.json"),
             r#"{"version":1,"applied_revision":{"resources":{"graph.knowledge":{"digest":"old-graph"},"schema.knowledge":{"digest":"old-schema"}}}}"#,
         )
         .unwrap();
 
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert_eq!(
-            out.resource_statuses["schema.knowledge"].status,
-            ResourceLifecycleStatus::Drifted
-        );
-        assert_eq!(
-            out.observations["graph.knowledge"]["schema_matches_desired"],
-            false
-        );
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(
+        out.resource_statuses["schema.knowledge"].status,
+        ResourceLifecycleStatus::Drifted
+    );
+    assert_eq!(
+        out.observations["graph.knowledge"]["schema_matches_desired"],
+        false
+    );
 
-        let plan = plan_config_dir(dir.path()).await;
-        assert!(plan.ok, "{:?}", plan.diagnostics);
-        assert!(plan.changes.iter().any(|change| {
-            change.resource == "schema.knowledge" && change.operation == PlanOperation::Update
-        }));
-    }
+    let plan = plan_config_dir(dir.path()).await;
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert!(plan.changes.iter().any(|change| {
+        change.resource == "schema.knowledge" && change.operation == PlanOperation::Update
+    }));
+}
 
-    #[tokio::test]
-    async fn existing_lock_makes_refresh_fail() {
-        let dir = fixture();
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("state.json"),
-            r#"{"version":1,"applied_revision":{"resources":{}}}"#,
-        )
-        .unwrap();
-        fs::write(
+#[tokio::test]
+async fn existing_lock_makes_refresh_fail() {
+    let dir = fixture();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"{"version":1,"applied_revision":{"resources":{}}}"#,
+    )
+    .unwrap();
+    fs::write(
             state_dir.join("lock.json"),
             r#"{"version":1,"lock_id":"held-lock","operation":"refresh","created_at":"2026-06-08T00:00:00Z","pid":123}"#,
         )
         .unwrap();
 
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        assert!(out.state_observations.locked);
-        assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
-        assert!(!out.state_observations.lock_acquired);
-        assert_eq!(
-            out.state_observations.lock_operation.as_deref(),
-            Some("refresh")
-        );
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_lock_held")
-        );
-        assert!(out.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "state_lock_held"
-                && diagnostic.message.contains("force-unlock held-lock")
-        }));
-    }
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(out.state_observations.locked);
+    assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
+    assert!(!out.state_observations.lock_acquired);
+    assert_eq!(
+        out.state_observations.lock_operation.as_deref(),
+        Some("refresh")
+    );
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "state_lock_held")
+    );
+    assert!(out.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "state_lock_held"
+            && diagnostic.message.contains("force-unlock held-lock")
+    }));
+}
 
-    #[tokio::test]
-    async fn state_lock_false_bypasses_refresh_lock_with_warning() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
+#[tokio::test]
+async fn state_lock_false_bypasses_refresh_lock_with_warning() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
 version: 1
 state:
   backend: cluster
@@ -1126,1683 +1253,1710 @@ graphs:
   knowledge:
     schema: ./people.pg
 "#,
-        )
-        .unwrap();
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("state.json"),
-            r#"{"version":1,"applied_revision":{"resources":{}}}"#,
-        )
-        .unwrap();
+    )
+    .unwrap();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"{"version":1,"applied_revision":{"resources":{}}}"#,
+    )
+    .unwrap();
 
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(!out.state_observations.locked);
-        assert!(!out.state_observations.lock_acquired);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_lock_disabled")
-        );
-    }
-
-    #[tokio::test]
-    async fn external_state_backend_refresh_rejected() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            "version: 1\nstate:\n  backend: s3://bucket/state\ngraphs: {}\n",
-        )
-        .unwrap();
-
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "unsupported_state_backend")
-        );
-    }
-
-    #[tokio::test]
-    async fn import_graph_open_error_does_not_create_state() {
-        let dir = fixture();
-        fs::create_dir_all(dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni")).unwrap();
-
-        let out = import_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "graph_observation_error")
-        );
-        assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
-    }
-
-    // ---- config-only apply (Stage 3A) ----
-
-    /// Seed a state.json that simulates "graph exists with the desired schema,
-    /// queries/policies not yet applied" by borrowing the desired digests.
-    fn write_applyable_state(config_dir: &Path) {
-        let out = validate_config_dir(config_dir);
-        assert!(out.ok, "{:?}", out.diagnostics);
-        let schema_digest = out.resource_digests.get("schema.knowledge").unwrap().clone();
-        let graph_composite = graph_digest(
-            "knowledge",
-            Some(&schema_digest),
-            Some(&BTreeMap::new()),
-            None,
-            None,
-        );
-        write_state_resources(
-            config_dir,
-            &[
-                ("graph.knowledge", graph_composite.as_str()),
-                ("schema.knowledge", schema_digest.as_str()),
-            ],
-        );
-    }
-
-    fn write_state_resources(config_dir: &Path, resources: &[(&str, &str)]) {
-        let resource_map: serde_json::Map<String, serde_json::Value> = resources
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(!out.state_observations.locked);
+    assert!(!out.state_observations.lock_acquired);
+    assert!(
+        out.diagnostics
             .iter()
-            .map(|(address, digest)| ((*address).to_string(), json!({ "digest": digest })))
-            .collect();
-        let state_dir = config_dir.join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("state.json"),
-            serde_json::to_string_pretty(&json!({
-                "version": 1,
-                "state_revision": 1,
-                "applied_revision": { "resources": resource_map }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    }
+            .any(|diagnostic| diagnostic.code == "state_lock_disabled")
+    );
+}
 
-    fn read_state_json(config_dir: &Path) -> serde_json::Value {
-        serde_json::from_str(&fs::read_to_string(config_dir.join(CLUSTER_STATE_FILE)).unwrap())
-            .unwrap()
-    }
+#[tokio::test]
+async fn external_state_backend_refresh_rejected() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\nstate:\n  backend: s3://bucket/state\ngraphs: {}\n",
+    )
+    .unwrap();
 
-    fn recovery_sidecars(config_dir: &Path) -> Vec<std::path::PathBuf> {
-        let dir = config_dir.join(CLUSTER_RECOVERIES_DIR);
-        if !dir.exists() {
-            return Vec::new();
-        }
-        let mut sidecars: Vec<_> = fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        sidecars.sort();
-        sidecars
-    }
-
-    fn query_payload_path(config_dir: &Path, digest: &str) -> std::path::PathBuf {
-        config_dir
-            .join(CLUSTER_RESOURCES_DIR)
-            .join("query/knowledge/find_person")
-            .join(format!("{digest}.gq"))
-    }
-
-    fn policy_payload_path(config_dir: &Path, digest: &str) -> std::path::PathBuf {
-        config_dir
-            .join(CLUSTER_RESOURCES_DIR)
-            .join("policy/base")
-            .join(format!("{digest}.yaml"))
-    }
-
-    #[tokio::test]
-    async fn apply_without_state_fails_with_state_missing() {
-        let dir = fixture();
-        let out = apply_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_missing"
-                    && diagnostic.message.contains("cluster import"))
-        );
-        assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
-        assert!(!dir.path().join(CLUSTER_RESOURCES_DIR).exists());
-        assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
-    }
-
-    #[tokio::test]
-    async fn apply_writes_payloads_state_and_statuses() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-        let desired = validate_config_dir(dir.path());
-        let query_digest = desired
-            .resource_digests
-            .get("query.knowledge.find_person")
-            .unwrap()
-            .clone();
-        let policy_digest = desired.resource_digests.get("policy.base").unwrap().clone();
-        let schema_digest = desired
-            .resource_digests
-            .get("schema.knowledge")
-            .unwrap()
-            .clone();
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert_eq!(out.applied_count, 2);
-        assert_eq!(out.deferred_count, 0);
-        assert!(out.converged);
-        assert!(out.state_written);
-
-        let query_blob = query_payload_path(dir.path(), &query_digest);
-        assert_eq!(fs::read_to_string(&query_blob).unwrap(), QUERY);
-        let policy_blob = policy_payload_path(dir.path(), &policy_digest);
-        assert_eq!(fs::read_to_string(&policy_blob).unwrap(), "rules: []\n");
-
-        let state = read_state_json(dir.path());
-        assert_eq!(state["state_revision"], 2);
-        let resources = &state["applied_revision"]["resources"];
-        assert_eq!(
-            resources["query.knowledge.find_person"]["digest"],
-            query_digest
-        );
-        assert_eq!(resources["policy.base"]["digest"], policy_digest);
-        let expected_composite = graph_digest(
-            "knowledge",
-            Some(&schema_digest),
-            Some(
-                &[("find_person".to_string(), query_digest.clone())]
-                    .into_iter()
-                    .collect(),
-            ),
-            None,
-            None,
-        );
-        assert_eq!(resources["graph.knowledge"]["digest"], expected_composite);
-        assert_eq!(
-            state["applied_revision"]["config_digest"],
-            desired_revision_digest(&out)
-        );
-        assert_eq!(
-            state["resource_statuses"]["query.knowledge.find_person"]["status"],
-            "applied"
-        );
-        assert_eq!(state["resource_statuses"]["policy.base"]["status"], "applied");
-        assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
-    }
-
-    #[tokio::test]
-    async fn apply_records_embedding_provider_profile_and_graph_binding() {
-        let dir = fixture();
-        write_mock_embedding_cluster(dir.path(), "recorded-x");
-        write_applyable_state(dir.path());
-        let desired = validate_config_dir(dir.path());
-        let query_digest = desired
-            .resource_digests
-            .get("query.knowledge.find_person")
-            .unwrap()
-            .clone();
-        let schema_digest = desired
-            .resource_digests
-            .get("schema.knowledge")
-            .unwrap()
-            .clone();
-        let provider_digest = desired
-            .resource_digests
-            .get("provider.embedding.default")
-            .unwrap()
-            .clone();
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.converged, "{out:?}");
-
-        let state = read_state_json(dir.path());
-        let resources = &state["applied_revision"]["resources"];
-        let provider = resources["provider.embedding.default"]
-            .as_object()
-            .expect("provider resource");
-        assert_eq!(provider["digest"], provider_digest);
-        assert_eq!(provider["embedding_profile"]["kind"], "mock");
-        assert_eq!(provider["embedding_profile"]["model"], "recorded-x");
-        assert!(provider["embedding_profile"].get("api_key").is_none());
-        assert_eq!(
-            resources["graph.knowledge"]["embedding_provider"],
-            "provider.embedding.default"
-        );
-        let expected_graph_digest = graph_digest(
-            "knowledge",
-            Some(&schema_digest),
-            Some(
-                &[("find_person".to_string(), query_digest)]
-                    .into_iter()
-                    .collect(),
-            ),
-            Some("provider.embedding.default"),
-            Some(&provider_digest),
-        );
-        assert_eq!(resources["graph.knowledge"]["digest"], expected_graph_digest);
-    }
-
-    #[tokio::test]
-    async fn embedding_provider_changes_update_provider_and_graph_plan() {
-        let dir = fixture();
-        write_mock_embedding_cluster(dir.path(), "recorded-x");
-        write_applyable_state(dir.path());
-        let first = apply_config_dir(dir.path()).await;
-        assert!(first.ok && first.converged, "{first:?}");
-
-        write_mock_embedding_cluster(dir.path(), "recorded-y");
-        let plan = plan_config_dir(dir.path()).await;
-        assert!(plan.ok, "{:?}", plan.diagnostics);
-        let by_resource: BTreeMap<&str, &PlanChange> = plan
-            .changes
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
             .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        assert_eq!(
-            by_resource["provider.embedding.default"].operation,
-            PlanOperation::Update
-        );
-        assert_eq!(
-            by_resource["provider.embedding.default"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        assert_eq!(
-            by_resource["graph.knowledge"].operation,
-            PlanOperation::Update
-        );
-        assert_eq!(
-            by_resource["graph.knowledge"].disposition,
-            Some(ApplyDisposition::Derived)
-        );
+            .any(|diagnostic| diagnostic.code == "unsupported_state_backend")
+    );
+}
+
+#[tokio::test]
+async fn import_graph_open_error_does_not_create_state() {
+    let dir = fixture();
+    fs::create_dir_all(dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni")).unwrap();
+
+    let out = import_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "graph_observation_error")
+    );
+    assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
+}
+
+// ---- config-only apply (Stage 3A) ----
+
+/// Seed a state.json that simulates "graph exists with the desired schema,
+/// queries/policies not yet applied" by borrowing the desired digests.
+fn write_applyable_state(config_dir: &Path) {
+    let out = validate_config_dir(config_dir);
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let schema_digest = out
+        .resource_digests
+        .get("schema.knowledge")
+        .unwrap()
+        .clone();
+    let graph_composite = graph_digest(
+        "knowledge",
+        Some(&schema_digest),
+        Some(&BTreeMap::new()),
+        None,
+        None,
+    );
+    write_state_resources(
+        config_dir,
+        &[
+            ("graph.knowledge", graph_composite.as_str()),
+            ("schema.knowledge", schema_digest.as_str()),
+        ],
+    );
+}
+
+fn write_state_resources(config_dir: &Path, resources: &[(&str, &str)]) {
+    let resource_map: serde_json::Map<String, serde_json::Value> = resources
+        .iter()
+        .map(|(address, digest)| ((*address).to_string(), json!({ "digest": digest })))
+        .collect();
+    let state_dir = config_dir.join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "state_revision": 1,
+            "applied_revision": { "resources": resource_map }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn read_state_json(config_dir: &Path) -> serde_json::Value {
+    serde_json::from_str(&fs::read_to_string(config_dir.join(CLUSTER_STATE_FILE)).unwrap()).unwrap()
+}
+
+fn recovery_sidecars(config_dir: &Path) -> Vec<std::path::PathBuf> {
+    let dir = config_dir.join(CLUSTER_RECOVERIES_DIR);
+    if !dir.exists() {
+        return Vec::new();
     }
+    let mut sidecars: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    sidecars.sort();
+    sidecars
+}
 
-    #[tokio::test]
-    async fn embedding_binding_survives_refresh() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_mock_embedding_cluster(dir.path(), "recorded-x");
-        write_applyable_state(dir.path());
-        let apply = apply_config_dir(dir.path()).await;
-        assert!(apply.ok && apply.converged, "{apply:?}");
+fn query_payload_path(config_dir: &Path, digest: &str) -> std::path::PathBuf {
+    config_dir
+        .join(CLUSTER_RESOURCES_DIR)
+        .join("query/knowledge/find_person")
+        .join(format!("{digest}.gq"))
+}
 
-        let refresh = refresh_config_dir(dir.path()).await;
-        assert!(refresh.ok, "{:?}", refresh.diagnostics);
+fn policy_payload_path(config_dir: &Path, digest: &str) -> std::path::PathBuf {
+    config_dir
+        .join(CLUSTER_RESOURCES_DIR)
+        .join("policy/base")
+        .join(format!("{digest}.yaml"))
+}
 
-        let state = read_state_json(dir.path());
-        let resources = &state["applied_revision"]["resources"];
-        assert_eq!(
-            resources["graph.knowledge"]["embedding_provider"],
-            "provider.embedding.default"
-        );
-        assert_eq!(
-            resources["provider.embedding.default"]["embedding_profile"]["model"],
-            "recorded-x"
-        );
-    }
+#[tokio::test]
+async fn apply_without_state_fails_with_state_missing() {
+    let dir = fixture();
+    let out = apply_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "state_missing"
+                && diagnostic.message.contains("cluster import"))
+    );
+    assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
+    assert!(!dir.path().join(CLUSTER_RESOURCES_DIR).exists());
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+}
 
-    fn desired_revision_digest(out: &ApplyOutput) -> String {
-        out.desired_revision.config_digest.clone().unwrap()
-    }
+#[tokio::test]
+async fn apply_writes_payloads_state_and_statuses() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    let desired = validate_config_dir(dir.path());
+    let query_digest = desired
+        .resource_digests
+        .get("query.knowledge.find_person")
+        .unwrap()
+        .clone();
+    let policy_digest = desired.resource_digests.get("policy.base").unwrap().clone();
+    let schema_digest = desired
+        .resource_digests
+        .get("schema.knowledge")
+        .unwrap()
+        .clone();
 
-    #[tokio::test]
-    async fn apply_update_changes_query_digest_and_keeps_old_blob() {
-        let dir = fixture();
-        let desired = validate_config_dir(dir.path());
-        let schema_digest = desired
-            .resource_digests
-            .get("schema.knowledge")
-            .unwrap()
-            .clone();
-        let old_digest = "0".repeat(64);
-        let graph_composite = graph_digest(
-            "knowledge",
-            Some(&schema_digest),
-            Some(&BTreeMap::new()),
-            None,
-            None,
-        );
-        write_state_resources(
-            dir.path(),
-            &[
-                ("graph.knowledge", graph_composite.as_str()),
-                ("schema.knowledge", schema_digest.as_str()),
-                ("query.knowledge.find_person", old_digest.as_str()),
-            ],
-        );
-        let old_blob = query_payload_path(dir.path(), &old_digest);
-        fs::create_dir_all(old_blob.parent().unwrap()).unwrap();
-        fs::write(&old_blob, "old query source").unwrap();
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(out.applied_count, 2);
+    assert_eq!(out.deferred_count, 0);
+    assert!(out.converged);
+    assert!(out.state_written);
 
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        let new_digest = desired
-            .resource_digests
-            .get("query.knowledge.find_person")
-            .unwrap();
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["query.knowledge.find_person"]["digest"],
-            *new_digest
-        );
-        assert_eq!(fs::read_to_string(&old_blob).unwrap(), "old query source");
-        assert!(query_payload_path(dir.path(), new_digest).exists());
-    }
+    let query_blob = query_payload_path(dir.path(), &query_digest);
+    assert_eq!(fs::read_to_string(&query_blob).unwrap(), QUERY);
+    let policy_blob = policy_payload_path(dir.path(), &policy_digest);
+    assert_eq!(fs::read_to_string(&policy_blob).unwrap(), POLICY);
 
-    #[tokio::test]
-    async fn apply_deletes_removed_resources_but_keeps_blobs() {
-        let dir = fixture();
-        let desired = validate_config_dir(dir.path());
-        let schema_digest = desired
-            .resource_digests
-            .get("schema.knowledge")
-            .unwrap()
-            .clone();
-        let stale_query_digest = "1".repeat(64);
-        let stale_policy_digest = "2".repeat(64);
-        let graph_composite = graph_digest(
-            "knowledge",
-            Some(&schema_digest),
-            Some(&BTreeMap::new()),
-            None,
-            None,
-        );
-        write_state_resources(
-            dir.path(),
-            &[
-                ("graph.knowledge", graph_composite.as_str()),
-                ("schema.knowledge", schema_digest.as_str()),
-                ("query.knowledge.orphan", stale_query_digest.as_str()),
-                ("policy.old", stale_policy_digest.as_str()),
-            ],
-        );
-        let stale_blob = dir
-            .path()
-            .join(CLUSTER_RESOURCES_DIR)
-            .join("policy/old")
-            .join(format!("{stale_policy_digest}.yaml"));
-        fs::create_dir_all(stale_blob.parent().unwrap()).unwrap();
-        fs::write(&stale_blob, "old policy").unwrap();
+    let state = read_state_json(dir.path());
+    assert_eq!(state["state_revision"], 2);
+    let resources = &state["applied_revision"]["resources"];
+    assert_eq!(
+        resources["query.knowledge.find_person"]["digest"],
+        query_digest
+    );
+    assert_eq!(resources["policy.base"]["digest"], policy_digest);
+    let expected_composite = graph_digest(
+        "knowledge",
+        Some(&schema_digest),
+        Some(
+            &[("find_person".to_string(), query_digest.clone())]
+                .into_iter()
+                .collect(),
+        ),
+        None,
+        None,
+    );
+    assert_eq!(resources["graph.knowledge"]["digest"], expected_composite);
+    assert_eq!(
+        state["applied_revision"]["config_digest"],
+        desired_revision_digest(&out)
+    );
+    assert_eq!(
+        state["resource_statuses"]["query.knowledge.find_person"]["status"],
+        "applied"
+    );
+    assert_eq!(
+        state["resource_statuses"]["policy.base"]["status"],
+        "applied"
+    );
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+}
 
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.converged);
-        let state = read_state_json(dir.path());
-        let resources = &state["applied_revision"]["resources"];
-        assert!(resources.get("query.knowledge.orphan").is_none());
-        assert!(resources.get("policy.old").is_none());
-        assert!(
-            state["resource_statuses"]
-                .get("query.knowledge.orphan")
-                .is_none()
-        );
-        // Deleted resources leave their content-addressed blobs in place; GC is
-        // a later stage.
-        assert_eq!(fs::read_to_string(&stale_blob).unwrap(), "old policy");
-        // The composite no longer includes the orphan query.
-        let query_digest = desired
-            .resource_digests
-            .get("query.knowledge.find_person")
-            .unwrap()
-            .clone();
-        let expected_composite = graph_digest(
-            "knowledge",
-            Some(&schema_digest),
-            Some(&[("find_person".to_string(), query_digest)].into_iter().collect()),
-            None,
-            None,
-        );
-        assert_eq!(resources["graph.knowledge"]["digest"], expected_composite);
-    }
+#[tokio::test]
+async fn apply_records_embedding_provider_profile_and_graph_binding() {
+    let dir = fixture();
+    write_mock_embedding_cluster(dir.path(), "recorded-x");
+    write_applyable_state(dir.path());
+    let desired = validate_config_dir(dir.path());
+    let query_digest = desired
+        .resource_digests
+        .get("query.knowledge.find_person")
+        .unwrap()
+        .clone();
+    let schema_digest = desired
+        .resource_digests
+        .get("schema.knowledge")
+        .unwrap()
+        .clone();
+    let provider_digest = desired
+        .resource_digests
+        .get("provider.embedding.default")
+        .unwrap()
+        .clone();
 
-    #[tokio::test]
-    async fn apply_schema_update_and_dependent_query_in_one_run() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_applyable_state(dir.path());
-        // Schema update + a query update that depends on the new field: one
-        // apply executes the schema migration first, then the catalog write.
-        fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
-        fs::write(
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.converged, "{out:?}");
+
+    let state = read_state_json(dir.path());
+    let resources = &state["applied_revision"]["resources"];
+    let provider = resources["provider.embedding.default"]
+        .as_object()
+        .expect("provider resource");
+    assert_eq!(provider["digest"], provider_digest);
+    assert_eq!(provider["embedding_profile"]["kind"], "mock");
+    assert_eq!(provider["embedding_profile"]["model"], "recorded-x");
+    assert!(provider["embedding_profile"].get("api_key").is_none());
+    assert_eq!(
+        resources["graph.knowledge"]["embedding_provider"],
+        "provider.embedding.default"
+    );
+    let expected_graph_digest = graph_digest(
+        "knowledge",
+        Some(&schema_digest),
+        Some(
+            &[("find_person".to_string(), query_digest)]
+                .into_iter()
+                .collect(),
+        ),
+        Some("provider.embedding.default"),
+        Some(&provider_digest),
+    );
+    assert_eq!(
+        resources["graph.knowledge"]["digest"],
+        expected_graph_digest
+    );
+}
+
+#[tokio::test]
+async fn embedding_provider_changes_update_provider_and_graph_plan() {
+    let dir = fixture();
+    write_mock_embedding_cluster(dir.path(), "recorded-x");
+    write_applyable_state(dir.path());
+    let first = apply_config_dir(dir.path()).await;
+    assert!(first.ok && first.converged, "{first:?}");
+
+    write_mock_embedding_cluster(dir.path(), "recorded-y");
+    let plan = plan_config_dir(dir.path()).await;
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    let by_resource: BTreeMap<&str, &PlanChange> = plan
+        .changes
+        .iter()
+        .map(|change| (change.resource.as_str(), change))
+        .collect();
+    assert_eq!(
+        by_resource["provider.embedding.default"].operation,
+        PlanOperation::Update
+    );
+    assert_eq!(
+        by_resource["provider.embedding.default"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["graph.knowledge"].operation,
+        PlanOperation::Update
+    );
+    assert_eq!(
+        by_resource["graph.knowledge"].disposition,
+        Some(ApplyDisposition::Derived)
+    );
+}
+
+#[tokio::test]
+async fn embedding_binding_survives_refresh() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_mock_embedding_cluster(dir.path(), "recorded-x");
+    write_applyable_state(dir.path());
+    let apply = apply_config_dir(dir.path()).await;
+    assert!(apply.ok && apply.converged, "{apply:?}");
+
+    let refresh = refresh_config_dir(dir.path()).await;
+    assert!(refresh.ok, "{:?}", refresh.diagnostics);
+
+    let state = read_state_json(dir.path());
+    let resources = &state["applied_revision"]["resources"];
+    assert_eq!(
+        resources["graph.knowledge"]["embedding_provider"],
+        "provider.embedding.default"
+    );
+    assert_eq!(
+        resources["provider.embedding.default"]["embedding_profile"]["model"],
+        "recorded-x"
+    );
+}
+
+fn desired_revision_digest(out: &ApplyOutput) -> String {
+    out.desired_revision.config_digest.clone().unwrap()
+}
+
+#[tokio::test]
+async fn apply_update_changes_query_digest_and_keeps_old_blob() {
+    let dir = fixture();
+    let desired = validate_config_dir(dir.path());
+    let schema_digest = desired
+        .resource_digests
+        .get("schema.knowledge")
+        .unwrap()
+        .clone();
+    let old_digest = "0".repeat(64);
+    let graph_composite = graph_digest(
+        "knowledge",
+        Some(&schema_digest),
+        Some(&BTreeMap::new()),
+        None,
+        None,
+    );
+    write_state_resources(
+        dir.path(),
+        &[
+            ("graph.knowledge", graph_composite.as_str()),
+            ("schema.knowledge", schema_digest.as_str()),
+            ("query.knowledge.find_person", old_digest.as_str()),
+        ],
+    );
+    let old_blob = query_payload_path(dir.path(), &old_digest);
+    fs::create_dir_all(old_blob.parent().unwrap()).unwrap();
+    fs::write(&old_blob, "old query source").unwrap();
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let new_digest = desired
+        .resource_digests
+        .get("query.knowledge.find_person")
+        .unwrap();
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["applied_revision"]["resources"]["query.knowledge.find_person"]["digest"],
+        *new_digest
+    );
+    assert_eq!(fs::read_to_string(&old_blob).unwrap(), "old query source");
+    assert!(query_payload_path(dir.path(), new_digest).exists());
+}
+
+#[tokio::test]
+async fn apply_deletes_removed_resources_but_keeps_blobs() {
+    let dir = fixture();
+    let desired = validate_config_dir(dir.path());
+    let schema_digest = desired
+        .resource_digests
+        .get("schema.knowledge")
+        .unwrap()
+        .clone();
+    let stale_query_digest = "1".repeat(64);
+    let stale_policy_digest = "2".repeat(64);
+    let graph_composite = graph_digest(
+        "knowledge",
+        Some(&schema_digest),
+        Some(&BTreeMap::new()),
+        None,
+        None,
+    );
+    write_state_resources(
+        dir.path(),
+        &[
+            ("graph.knowledge", graph_composite.as_str()),
+            ("schema.knowledge", schema_digest.as_str()),
+            ("query.knowledge.orphan", stale_query_digest.as_str()),
+            ("policy.old", stale_policy_digest.as_str()),
+        ],
+    );
+    let stale_blob = dir
+        .path()
+        .join(CLUSTER_RESOURCES_DIR)
+        .join("policy/old")
+        .join(format!("{stale_policy_digest}.yaml"));
+    fs::create_dir_all(stale_blob.parent().unwrap()).unwrap();
+    fs::write(&stale_blob, "old policy").unwrap();
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.converged);
+    let state = read_state_json(dir.path());
+    let resources = &state["applied_revision"]["resources"];
+    assert!(resources.get("query.knowledge.orphan").is_none());
+    assert!(resources.get("policy.old").is_none());
+    assert!(
+        state["resource_statuses"]
+            .get("query.knowledge.orphan")
+            .is_none()
+    );
+    // Deleted resources leave their content-addressed blobs in place; GC is
+    // a later stage.
+    assert_eq!(fs::read_to_string(&stale_blob).unwrap(), "old policy");
+    // The composite no longer includes the orphan query.
+    let query_digest = desired
+        .resource_digests
+        .get("query.knowledge.find_person")
+        .unwrap()
+        .clone();
+    let expected_composite = graph_digest(
+        "knowledge",
+        Some(&schema_digest),
+        Some(
+            &[("find_person".to_string(), query_digest)]
+                .into_iter()
+                .collect(),
+        ),
+        None,
+        None,
+    );
+    assert_eq!(resources["graph.knowledge"]["digest"], expected_composite);
+}
+
+#[tokio::test]
+async fn apply_schema_update_and_dependent_query_in_one_run() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path());
+    // Schema update + a query update that depends on the new field: one
+    // apply executes the schema migration first, then the catalog write.
+    fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
+    fs::write(
             dir.path().join("people.gq"),
             "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name, $p.bio }\n}\n",
         )
         .unwrap();
 
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.converged, "{out:?}");
-        let by_resource: BTreeMap<&str, &PlanChange> = out
-            .changes
-            .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        assert_eq!(
-            by_resource["schema.knowledge"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        assert_eq!(
-            by_resource["query.knowledge.find_person"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        assert_eq!(
-            by_resource["graph.knowledge"].disposition,
-            Some(ApplyDisposition::Derived)
-        );
-        // The live graph carries the new schema.
-        let db = Omnigraph::open_read_only(&derived_graph_uri(dir.path(), "knowledge"))
-            .await
-            .unwrap();
-        let desired = validate_config_dir(dir.path());
-        assert_eq!(
-            sha256_hex(db.schema_source().as_bytes()),
-            desired.resource_digests["schema.knowledge"]
-        );
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
-            desired.resource_digests["schema.knowledge"]
-        );
-        // Sidecar retired after the CAS landed.
-        assert!(
-            !dir.path().join(CLUSTER_RECOVERIES_DIR).exists()
-                || fs::read_dir(dir.path().join(CLUSTER_RECOVERIES_DIR))
-                    .unwrap()
-                    .next()
-                    .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_unsupported_schema_change_fails_loudly() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_applyable_state(dir.path());
-        write_streaming_cluster(dir.path(), Some(true));
-        // Property type changes are unsupported by the engine planner.
-        fs::write(
-            dir.path().join("people.pg"),
-            "\nnode Person {\n  name: String @key\n  age: I64?\n}\n",
-        )
-        .unwrap();
-
-        let out = confirmed_streaming_apply(dir.path()).await;
-        assert!(!out.ok);
-        assert!(out.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "schema_apply_failed"
-                && diagnostic.message.contains("changing property type")
-        }));
-        let by_resource: BTreeMap<&str, &PlanChange> = out
-            .changes
-            .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        assert_eq!(
-            by_resource["schema.knowledge"].disposition,
-            Some(ApplyDisposition::Blocked)
-        );
-        assert_eq!(
-            by_resource["schema.knowledge"].reason.as_deref(),
-            Some("schema_apply_failed")
-        );
-        assert_eq!(
-            by_resource["streaming.knowledge"].disposition,
-            Some(ApplyDisposition::Blocked)
-        );
-        assert_eq!(
-            by_resource["streaming.knowledge"].reason.as_deref(),
-            Some("dependency_not_applied")
-        );
-        // The live schema and the ledger are unchanged.
-        let state = read_state_json(dir.path());
-        let desired = validate_config_dir(dir.path());
-        assert_ne!(
-            state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
-            desired.resource_digests["schema.knowledge"]
-        );
-        let db = Omnigraph::open_read_only(&derived_graph_uri(dir.path(), "knowledge"))
-            .await
-            .unwrap();
-        assert_eq!(db.schema_source().as_str(), SCHEMA);
-        assert!(!db.snapshot_of("main").await.unwrap().streaming_status().enabled);
-        assert!(
-            state["applied_revision"]["resources"]
-                .get("streaming.knowledge")
-                .is_none()
-        );
-        assert!(
-            recovery_sidecars(dir.path()).is_empty(),
-            "{:?}",
-            recovery_sidecars(dir.path())
-        );
-        // Second run fails just as loudly and still leaves no sidecar because
-        // the engine preview rejects before graph state can move.
-        let second = confirmed_streaming_apply(dir.path()).await;
-        assert!(!second.ok);
-        assert!(
-            second
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "schema_apply_failed")
-        );
-        assert!(
-            recovery_sidecars(dir.path()).is_empty(),
-            "{:?}",
-            recovery_sidecars(dir.path())
-        );
-
-        // Once the graph failure is corrected, the unapplied streaming
-        // resource remains in the diff and is retried.
-        fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
-        let recovered = confirmed_streaming_apply(dir.path()).await;
-        assert!(recovered.ok && recovered.converged, "{recovered:?}");
-        assert!(live_streaming_enabled(dir.path()).await);
-    }
-
-    #[tokio::test]
-    async fn apply_schema_update_blocked_by_non_main_branch_leaves_no_sidecar() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_applyable_state(dir.path());
-        let graph_uri = derived_graph_uri(dir.path(), "knowledge");
-        let db = Omnigraph::open(&graph_uri).await.unwrap();
-        db.branch_create("feature").await.unwrap();
-        drop(db);
-        let before_state = read_state_json(dir.path());
-        fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        assert!(out.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "schema_apply_failed"
-                && diagnostic
-                    .message
-                    .contains("schema apply requires a graph with only main")
-        }));
-        assert!(
-            recovery_sidecars(dir.path()).is_empty(),
-            "{:?}",
-            recovery_sidecars(dir.path())
-        );
-        let after_state = read_state_json(dir.path());
-        assert_eq!(
-            after_state["applied_revision"]["resources"],
-            before_state["applied_revision"]["resources"]
-        );
-        let reopened = Omnigraph::open_read_only(&graph_uri).await.unwrap();
-        assert_eq!(reopened.schema_source().as_str(), SCHEMA);
-    }
-
-    #[tokio::test]
-    async fn apply_blocks_schema_update_while_recovery_pending() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_state_resources(dir.path(), &[("schema.knowledge", "stale-digest")]);
-        fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
-        // A pending sidecar whose intent matches neither live nor recorded.
-        write_schema_apply_sidecar(dir.path(), "knowledge", "intended-digest", "01PENDS");
-
-        let out = apply_config_dir(dir.path()).await;
-        let by_resource: BTreeMap<&str, &PlanChange> = out
-            .changes
-            .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        assert_eq!(
-            by_resource["schema.knowledge"].disposition,
-            Some(ApplyDisposition::Blocked)
-        );
-        assert_eq!(
-            by_resource["schema.knowledge"].reason.as_deref(),
-            Some("cluster_recovery_pending")
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_creates_graph_and_unblocks_dependents() {
-        let dir = fixture();
-        write_state_resources(dir.path(), &[]);
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.converged, "{out:?}");
-        let by_resource: BTreeMap<&str, &PlanChange> = out
-            .changes
-            .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        // Stage 4A: the create executes, and its dependents apply in-run.
-        assert_eq!(
-            by_resource["graph.knowledge"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        assert_eq!(
-            by_resource["schema.knowledge"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        assert_eq!(
-            by_resource["query.knowledge.find_person"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        assert_eq!(
-            by_resource["policy.base"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        // The graph exists on disk and opens; state records everything.
-        let graph_uri = derived_graph_uri(dir.path(), "knowledge");
-        let db = Omnigraph::open_read_only(&graph_uri).await.unwrap();
-        let desired = validate_config_dir(dir.path());
-        assert_eq!(
-            sha256_hex(db.schema_source().as_bytes()),
-            desired.resource_digests["schema.knowledge"]
-        );
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
-            desired.resource_digests["schema.knowledge"]
-        );
-        assert_eq!(
-            state["resource_statuses"]["graph.knowledge"]["status"],
-            "applied"
-        );
-        // The create's sidecar was retired after the state CAS landed.
-        assert!(
-            !dir.path().join(CLUSTER_RECOVERIES_DIR).exists()
-                || fs::read_dir(dir.path().join(CLUSTER_RECOVERIES_DIR))
-                    .unwrap()
-                    .next()
-                    .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_create_failure_blocks_dependents_and_keeps_sidecar() {
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        write_state_resources(dir.path(), &[]);
-        // Make the init fail its strict preflight: a junk _schema.pg already
-        // sits at the derived root (the engine refuses to overwrite it).
-        let root = dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("_schema.pg"), "junk").unwrap();
-
-        let out = confirmed_streaming_apply(dir.path()).await;
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "graph_create_failed")
-        );
-        let by_resource: BTreeMap<&str, &PlanChange> = out
-            .changes
-            .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        // Dependents are demoted: the run tells the truth about what executed.
-        assert_eq!(
-            by_resource["graph.knowledge"].disposition,
-            Some(ApplyDisposition::Blocked)
-        );
-        assert_eq!(
-            by_resource["query.knowledge.find_person"].disposition,
-            Some(ApplyDisposition::Blocked)
-        );
-        assert_eq!(
-            by_resource["query.knowledge.find_person"].reason.as_deref(),
-            Some("dependency_not_applied")
-        );
-        assert_eq!(
-            by_resource["policy.base"].disposition,
-            Some(ApplyDisposition::Blocked)
-        );
-        assert_eq!(
-            by_resource["streaming.knowledge"].disposition,
-            Some(ApplyDisposition::Blocked)
-        );
-        assert_eq!(
-            by_resource["streaming.knowledge"].reason.as_deref(),
-            Some("dependency_not_applied")
-        );
-        assert!(!out.converged);
-        // The sidecar stays for the sweep to classify next run.
-        assert!(
-            fs::read_dir(dir.path().join(CLUSTER_RECOVERIES_DIR))
-                .unwrap()
-                .next()
-                .is_some()
-        );
-        // No graph digests moved.
-        let state = read_state_json(dir.path());
-        assert!(
-            state["applied_revision"]["resources"]
-                .as_object()
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_blocks_graph_delete_without_approval() {
-        let dir = fixture();
-        let desired = validate_config_dir(dir.path());
-        let schema_digest = desired
-            .resource_digests
-            .get("schema.knowledge")
-            .unwrap()
-            .clone();
-        let graph_composite = graph_digest(
-            "knowledge",
-            Some(&schema_digest),
-            Some(&BTreeMap::new()),
-            None,
-            None,
-        );
-        write_state_resources(
-            dir.path(),
-            &[
-                ("graph.knowledge", graph_composite.as_str()),
-                ("schema.knowledge", schema_digest.as_str()),
-                ("graph.old", "3333"),
-                ("schema.old", "4444"),
-                ("query.old.q", "5555"),
-            ],
-        );
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(!out.converged);
-        let by_resource: BTreeMap<&str, &PlanChange> = out
-            .changes
-            .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        // Stage 4C: deletes are gated, not deferred — every subtree change
-        // blocks on the single graph-level approval.
-        assert_eq!(
-            by_resource["graph.old"].disposition,
-            Some(ApplyDisposition::Blocked)
-        );
-        assert_eq!(
-            by_resource["graph.old"].reason.as_deref(),
-            Some("approval_required")
-        );
-        assert_eq!(
-            by_resource["schema.old"].reason.as_deref(),
-            Some("approval_required")
-        );
-        assert_eq!(
-            by_resource["query.old.q"].reason.as_deref(),
-            Some("approval_required")
-        );
-        // State intact; nothing destroyed without the artifact.
-        let state = read_state_json(dir.path());
-        let resources = &state["applied_revision"]["resources"];
-        assert_eq!(resources["graph.old"]["digest"], "3333");
-        assert_eq!(resources["schema.old"]["digest"], "4444");
-        assert_eq!(resources["query.old.q"]["digest"], "5555");
-    }
-
-    #[tokio::test]
-    async fn approve_writes_digest_bound_artifact() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-        // Seed a deletable subtree.
-        let state = read_state_json(dir.path());
-        let graph_digest_str = state["applied_revision"]["resources"]["graph.knowledge"]["digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let schema_digest_str = state["applied_revision"]["resources"]["schema.knowledge"]
-            ["digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        write_state_resources(
-            dir.path(),
-            &[
-                ("graph.knowledge", graph_digest_str.as_str()),
-                ("schema.knowledge", schema_digest_str.as_str()),
-                ("graph.old", "3333"),
-                ("schema.old", "4444"),
-            ],
-        );
-
-        let out = approve_config_dir(dir.path(), "graph.old", "andrew").await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        let approval_id = out.approval_id.clone().unwrap();
-        let artifact: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(
-                dir.path()
-                    .join(CLUSTER_APPROVALS_DIR)
-                    .join(format!("{approval_id}.json")),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(artifact["resource"], "graph.old");
-        assert_eq!(artifact["operation"], "delete");
-        assert_eq!(artifact["approved_by"], "andrew");
-        assert_eq!(artifact["bound_before_digest"], "3333");
-        assert!(artifact["bound_after_digest"].is_null());
-        assert!(artifact["bound_config_digest"].is_string());
-        assert!(artifact["consumed_at"].is_null());
-
-        // A non-gated address is refused.
-        let not_gated = approve_config_dir(dir.path(), "query.knowledge.find_person", "andrew").await;
-        assert!(!not_gated.ok);
-        assert!(
-            not_gated
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "approval_not_required")
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_approval_is_ignored() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-        let state = read_state_json(dir.path());
-        let graph_digest_str = state["applied_revision"]["resources"]["graph.knowledge"]["digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let schema_digest_str = state["applied_revision"]["resources"]["schema.knowledge"]
-            ["digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        write_state_resources(
-            dir.path(),
-            &[
-                ("graph.knowledge", graph_digest_str.as_str()),
-                ("schema.knowledge", schema_digest_str.as_str()),
-                ("graph.old", "3333"),
-            ],
-        );
-        let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
-        assert!(approved.ok, "{:?}", approved.diagnostics);
-        // The config moves after approval: the bound config digest no longer
-        // matches and the artifact authorizes nothing.
-        fs::write(dir.path().join("base.policy.yaml"), "rules: [] # moved\n").unwrap();
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "approval_stale"),
-            "{:?}",
-            out.diagnostics
-        );
-        let by_resource: BTreeMap<&str, &PlanChange> = out
-            .changes
-            .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        assert_eq!(
-            by_resource["graph.old"].reason.as_deref(),
-            Some("approval_required")
-        );
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["graph.old"]["digest"],
-            "3333"
-        );
-    }
-
-    #[tokio::test]
-    async fn compute_approvals_one_gate_per_subtree() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-        let state = read_state_json(dir.path());
-        let g = state["applied_revision"]["resources"]["graph.knowledge"]["digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let sc = state["applied_revision"]["resources"]["schema.knowledge"]["digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        write_state_resources(
-            dir.path(),
-            &[
-                ("graph.knowledge", g.as_str()),
-                ("schema.knowledge", sc.as_str()),
-                ("graph.old", "3333"),
-                ("schema.old", "4444"),
-                ("query.old.q", "5555"),
-            ],
-        );
-        let plan = plan_config_dir(dir.path()).await;
-        let gated: Vec<&str> = plan
-            .approvals_required
-            .iter()
-            .map(|gate| gate.resource.as_str())
-            .collect();
-        assert_eq!(gated, vec!["graph.old"], "{plan:?}");
-        assert!(!plan.approvals_required[0].satisfied);
-    }
-
-    #[tokio::test]
-    async fn apply_is_idempotent() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-
-        let first = apply_config_dir(dir.path()).await;
-        assert!(first.ok, "{:?}", first.diagnostics);
-        assert!(first.state_written);
-        let state_after_first = fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
-
-        let second = apply_config_dir(dir.path()).await;
-        assert!(second.ok, "{:?}", second.diagnostics);
-        assert!(second.changes.is_empty());
-        assert_eq!(second.applied_count, 0);
-        assert!(second.converged);
-        assert!(!second.state_written);
-        let state_after_second = fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
-        assert_eq!(state_after_first, state_after_second);
-        assert_eq!(second.state_observations.state_revision, 2);
-    }
-
-    #[tokio::test]
-    async fn apply_respects_held_lock() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-        write_lock_file(dir.path(), "held-lock", "plan");
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_lock_held")
-        );
-        // The held lock survives a refused apply, and nothing was written.
-        assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
-        assert!(!dir.path().join(CLUSTER_RESOURCES_DIR).exists());
-        let state = read_state_json(dir.path());
-        assert_eq!(state["state_revision"], 1);
-    }
-
-    #[tokio::test]
-    async fn apply_state_lock_false_bypasses_with_warning() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
-version: 1
-state:
-  backend: cluster
-  lock: false
-graphs:
-  knowledge:
-    schema: ./people.pg
-    queries:
-      find_person:
-        file: ./people.gq
-"#,
-        )
-        .unwrap();
-        write_applyable_state(dir.path());
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.state_written);
-        assert!(!out.state_observations.lock_acquired);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_lock_disabled")
-        );
-        assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
-    }
-
-    #[tokio::test]
-    async fn apply_skips_existing_payload_blob() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-        let desired = validate_config_dir(dir.path());
-        let query_digest = desired
-            .resource_digests
-            .get("query.knowledge.find_person")
-            .unwrap()
-            .clone();
-        // Content-addressed blobs are trusted by name: an existing file is
-        // never rewritten.
-        let blob = query_payload_path(dir.path(), &query_digest);
-        fs::create_dir_all(blob.parent().unwrap()).unwrap();
-        fs::write(&blob, "pre-existing").unwrap();
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert_eq!(fs::read_to_string(&blob).unwrap(), "pre-existing");
-    }
-
-    #[tokio::test]
-    async fn apply_invalid_config_fails_before_lock() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            "version: 1\nnot_a_field: true\n",
-        )
-        .unwrap();
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        // Config errors bail before the lock or any state directory exists.
-        assert!(!dir.path().join(CLUSTER_STATE_DIR).exists());
-    }
-
-    /// When the state write fails after payloads landed, the output must
-    /// report the statuses actually on disk — not the unpersisted in-memory
-    /// mutations (phantom `applied` entries would mislead automation that
-    /// reads `resource_statuses` independently of `ok`).
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn apply_state_write_failure_reports_persisted_statuses() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = fixture();
-        // lock: false so the only write into __cluster/ is state.json itself.
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
-version: 1
-state:
-  backend: cluster
-  lock: false
-graphs:
-  knowledge:
-    schema: ./people.pg
-    queries:
-      find_person:
-        file: ./people.gq
-"#,
-        )
-        .unwrap();
-        write_applyable_state(dir.path());
-        // Pre-create the payload blob so the payload phase is a no-op and the
-        // failure lands exactly at the state write.
-        let desired = validate_config_dir(dir.path());
-        let query_digest = desired
-            .resource_digests
-            .get("query.knowledge.find_person")
-            .unwrap();
-        let blob = query_payload_path(dir.path(), query_digest);
-        fs::create_dir_all(blob.parent().unwrap()).unwrap();
-        fs::write(&blob, QUERY).unwrap();
-
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o555)).unwrap();
-        // Running as root ignores permission bits; skip rather than flake.
-        if fs::write(state_dir.join("probe"), b"x").is_ok() {
-            let _ = fs::remove_file(state_dir.join("probe"));
-            fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755)).unwrap();
-            eprintln!("skipping: permissions are not enforced (running as root)");
-            return;
-        }
-
-        let out = apply_config_dir(dir.path()).await;
-        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert!(!out.ok);
-        assert!(!out.state_written);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "state_write_error"),
-            "{:?}",
-            out.diagnostics
-        );
-        // The seeded state has no statuses; the failed apply must not invent
-        // the in-memory `applied` ones it failed to persist.
-        assert!(
-            out.resource_statuses.is_empty(),
-            "unpersisted statuses leaked into output: {:?}",
-            out.resource_statuses
-        );
-    }
-
-    // ---- catalog payload verification (Stage 3B) ----
-
-    /// Converge a fixture dir and return the query blob path.
-    async fn converge_fixture(config_dir: &Path) -> std::path::PathBuf {
-        write_applyable_state(config_dir);
-        let out = apply_config_dir(config_dir).await;
-        assert!(out.ok && out.converged, "{:?}", out.diagnostics);
-        let desired = validate_config_dir(config_dir);
-        query_payload_path(
-            config_dir,
-            desired
-                .resource_digests
-                .get("query.knowledge.find_person")
-                .unwrap(),
-        )
-    }
-
-    #[tokio::test]
-    async fn status_reports_missing_payload_read_only() {
-        let dir = fixture();
-        let blob = converge_fixture(dir.path()).await;
-        let state_before = fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
-        fs::remove_file(&blob).unwrap();
-
-        let out = status_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "catalog_payload_missing"
-                && diagnostic.path == "query.knowledge.find_person"
-        }));
-        // Read-only: persisted statuses and state bytes untouched.
-        assert_eq!(
-            out.resource_statuses["query.knowledge.find_person"].status,
-            ResourceLifecycleStatus::Applied
-        );
-        assert_eq!(
-            fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
-            state_before
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_removes_digest_and_drifts_on_missing_payload() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        let blob = converge_fixture(dir.path()).await;
-        fs::remove_file(&blob).unwrap();
-
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "catalog_payload_missing")
-        );
-        let status = &out.resource_statuses["query.knowledge.find_person"];
-        assert_eq!(status.status, ResourceLifecycleStatus::Drifted);
-        assert!(status.conditions.contains(&"payload_missing".to_string()));
-        let state = read_state_json(dir.path());
-        assert!(
-            state["applied_revision"]["resources"]
-                .get("query.knowledge.find_person")
-                .is_none(),
-            "{state}"
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_drifts_on_corrupted_payload() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        let blob = converge_fixture(dir.path()).await;
-        fs::write(&blob, "corrupted content").unwrap();
-
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        let status = &out.resource_statuses["query.knowledge.find_person"];
-        assert_eq!(status.status, ResourceLifecycleStatus::Drifted);
-        assert!(status.conditions.contains(&"payload_mismatch".to_string()));
-        let state = read_state_json(dir.path());
-        assert!(
-            state["applied_revision"]["resources"]
-                .get("query.knowledge.find_person")
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn refresh_flags_unreadable_payload_as_error() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        let blob = converge_fixture(dir.path()).await;
-        // Make the payload unreadable without removing it: permission
-        // denied is a genuine non-NotFound IO error. (A same-named
-        // directory no longer triggers this path: object-store semantics
-        // classify a directory at an object path as NotFound — "only
-        // objects exist" — which is the missing-payload case, not the
-        // unreadable one.)
-        let mut perms = fs::metadata(&blob).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
-        fs::set_permissions(&blob, perms).unwrap();
-        // Root reads straight through mode 000 (container dev runners
-        // commonly run as root): skip rather than fail — the contract
-        // under test needs a genuine permission error.
-        if fs::read(&blob).is_ok() {
-            eprintln!(
-                "skipping refresh_flags_unreadable_payload_as_error:                  running as root (mode 000 is still readable)"
-            );
-            return;
-        }
-
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "catalog_payload_read_error")
-        );
-        let status = &out.resource_statuses["query.knowledge.find_person"];
-        assert_eq!(status.status, ResourceLifecycleStatus::Error);
-        assert!(status.conditions.contains(&"payload_read_error".to_string()));
-        // Transient IO keeps the digest: no spurious republish.
-        let state = read_state_json(dir.path());
-        assert!(
-            state["applied_revision"]["resources"]
-                .get("query.knowledge.find_person")
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn payload_drift_self_heals_through_refresh_plan_apply() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        let blob = converge_fixture(dir.path()).await;
-        let original = fs::read_to_string(&blob).unwrap();
-        fs::remove_file(&blob).unwrap();
-
-        let refresh = refresh_config_dir(dir.path()).await;
-        assert!(refresh.ok, "{:?}", refresh.diagnostics);
-
-        let plan = plan_config_dir(dir.path()).await;
-        let query_change = plan
-            .changes
-            .iter()
-            .find(|change| change.resource == "query.knowledge.find_person")
-            .expect("plan must propose recreating the query");
-        assert_eq!(query_change.operation, PlanOperation::Create);
-        assert_eq!(query_change.disposition, Some(ApplyDisposition::Applied));
-
-        let apply = apply_config_dir(dir.path()).await;
-        assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
-        assert_eq!(fs::read_to_string(&blob).unwrap(), original);
-
-        let status = status_config_dir(dir.path()).await;
-        assert!(
-            !status
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code.starts_with("catalog_payload")),
-            "{:?}",
-            status.diagnostics
-        );
-    }
-
-    #[tokio::test]
-    async fn verification_skips_graph_and_schema_resources() {
-        let dir = fixture();
-        write_applyable_state(dir.path()); // graph + schema digests only, no blobs
-
-        let out = status_config_dir(dir.path()).await;
-        assert!(
-            !out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code.starts_with("catalog_payload")),
-            "{:?}",
-            out.diagnostics
-        );
-    }
-
-    // ---- recovery sidecars + sweep (Stage 4A) ----
-
-    fn derived_graph_uri(config_dir: &Path, graph_id: &str) -> String {
-        display_path(
-            &config_dir
-                .join(CLUSTER_GRAPHS_DIR)
-                .join(format!("{graph_id}.omni")),
-        )
-    }
-
-    fn write_create_sidecar(
-        config_dir: &Path,
-        graph_id: &str,
-        desired_schema_digest: &str,
-        operation_id: &str,
-    ) -> PathBuf {
-        let dir = config_dir.join(CLUSTER_RECOVERIES_DIR);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{operation_id}.json"));
-        fs::write(
-            &path,
-            serde_json::to_string_pretty(&json!({
-                "schema_version": 1,
-                "operation_id": operation_id,
-                "started_at": "1970-01-01T00:00:00Z",
-                "kind": "graph_create",
-                "graph_id": graph_id,
-                "graph_uri": derived_graph_uri(config_dir, graph_id),
-                "desired_schema_digest": desired_schema_digest,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        path
-    }
-
-    #[tokio::test]
-    async fn sweep_removes_sidecar_when_root_absent() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-        let sidecar = write_create_sidecar(dir.path(), "knowledge", "irrelevant", "01ROW1");
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        // Row 1: nothing moved; intent removed, run proceeds normally.
-        assert!(!sidecar.exists());
-        assert!(out.converged);
-    }
-
-    #[tokio::test]
-    async fn sweep_rolls_forward_completed_create() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_state_resources(dir.path(), &[]); // state predates the create
-        let desired = validate_config_dir(dir.path());
-        let schema_digest = desired.resource_digests["schema.knowledge"].clone();
-        let sidecar = write_create_sidecar(dir.path(), "knowledge", &schema_digest, "01ROW4");
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "cluster_recovery_rolled_forward")
-        );
-        // Row 4: ledger converged to observable reality, audit recorded,
-        // sidecar retired after the CAS landed.
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
-            schema_digest
-        );
-        assert!(
-            state["recovery_records"]
-                .as_object()
-                .unwrap()
-                .values()
-                .any(|record| record["outcome"] == "rolled_forward"
-                    && record["graph_id"] == "knowledge")
-        );
-        assert!(!sidecar.exists());
-        // With the graph rolled forward, the same run converges the catalog.
-        assert!(out.converged, "{out:?}");
-    }
-
-    #[tokio::test]
-    async fn sweep_completes_already_recorded_create() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_applyable_state(dir.path()); // state already records graph+schema
-        let desired = validate_config_dir(dir.path());
-        let sidecar = write_create_sidecar(
-            dir.path(),
-            "knowledge",
-            &desired.resource_digests["schema.knowledge"],
-            "01ROW2",
-        );
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        // Row 2: outcome was already durable; no audit entry, sidecar retired.
-        assert!(!sidecar.exists());
-        let state = read_state_json(dir.path());
-        assert!(
-            state["recovery_records"]
-                .as_object()
-                .is_none_or(|records| records.is_empty()),
-            "{state}"
-        );
-    }
-
-    #[tokio::test]
-    async fn sweep_keeps_sidecar_for_incomplete_root() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-        // A root that exists but cannot be opened: the engine's partial-init gap.
-        let root = dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("_schema.pg"), "junk").unwrap();
-        let sidecar = write_create_sidecar(dir.path(), "knowledge", "whatever", "01ROW5");
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "graph_create_incomplete")
-        );
-        // Row 5: never auto-delete; sidecar and root stay for the operator,
-        // and the Error status is persisted by the run's state write.
-        assert!(sidecar.exists());
-        assert!(root.exists());
-        let state = read_state_json(dir.path());
-        assert_eq!(state["resource_statuses"]["graph.knowledge"]["status"], "error");
-        assert!(
-            state["resource_statuses"]["graph.knowledge"]["conditions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|condition| condition == "graph_create_incomplete")
-        );
-    }
-
-    #[tokio::test]
-    async fn sweep_flags_unexpected_schema_as_pending() {
-        let dir = fixture();
-        write_state_resources(dir.path(), &[]);
-        // Live graph exists with a schema the sidecar never intended.
-        let graph_dir = dir.path().join(CLUSTER_GRAPHS_DIR);
-        fs::create_dir_all(&graph_dir).unwrap();
-        Omnigraph::init(
-            &derived_graph_uri(dir.path(), "knowledge"),
-            "\nnode Other {\n  name: String @key\n}\n",
-        )
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.converged, "{out:?}");
+    let by_resource: BTreeMap<&str, &PlanChange> = out
+        .changes
+        .iter()
+        .map(|change| (change.resource.as_str(), change))
+        .collect();
+    assert_eq!(
+        by_resource["schema.knowledge"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["query.knowledge.find_person"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["graph.knowledge"].disposition,
+        Some(ApplyDisposition::Derived)
+    );
+    // The live graph carries the new schema.
+    let db = Omnigraph::open_read_only(&derived_graph_uri(dir.path(), "knowledge"))
         .await
         .unwrap();
-        let desired = validate_config_dir(dir.path());
-        let sidecar = write_create_sidecar(
-            dir.path(),
-            "knowledge",
-            &desired.resource_digests["schema.knowledge"],
-            "01ROW6",
-        );
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics); // warning, not error
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "cluster_recovery_pending")
-        );
-        // Row 6: refuse to guess; sidecar kept, Drifted persisted.
-        assert!(sidecar.exists());
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["resource_statuses"]["graph.knowledge"]["status"],
-            "drifted"
-        );
-        assert!(
-            state["resource_statuses"]["graph.knowledge"]["conditions"]
-                .as_array()
+    let desired = validate_config_dir(dir.path());
+    assert_eq!(
+        sha256_hex(db.schema_source().as_bytes()),
+        desired.resource_digests["schema.knowledge"]
+    );
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        desired.resource_digests["schema.knowledge"]
+    );
+    // Sidecar retired after the CAS landed.
+    assert!(
+        !dir.path().join(CLUSTER_RECOVERIES_DIR).exists()
+            || fs::read_dir(dir.path().join(CLUSTER_RECOVERIES_DIR))
                 .unwrap()
-                .iter()
-                .any(|condition| condition == "actual_applied_state_pending")
-        );
-    }
+                .next()
+                .is_none()
+    );
+}
 
-    #[tokio::test]
-    async fn apply_blocks_create_while_recovery_pending() {
-        let dir = fixture();
-        write_state_resources(dir.path(), &[]);
-        // A kept (row 5) sidecar: partial root that cannot be opened.
-        let root = dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("_schema.pg"), "junk").unwrap();
-        let sidecar = write_create_sidecar(dir.path(), "knowledge", "whatever", "01PEND");
+#[tokio::test]
+async fn apply_unsupported_schema_change_fails_loudly() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path());
+    // Property type changes are unsupported by the engine planner.
+    fs::write(
+        dir.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n  age: I64?\n}\n",
+    )
+    .unwrap();
 
-        let out = apply_config_dir(dir.path()).await;
-        assert!(!out.ok); // row 5 is an error condition
-        let by_resource: BTreeMap<&str, &PlanChange> = out
-            .changes
-            .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        // The pending recovery blocks the create and its dependents; the
-        // executor never attempts the init.
-        assert_eq!(
-            by_resource["graph.knowledge"].disposition,
-            Some(ApplyDisposition::Blocked)
-        );
-        assert_eq!(
-            by_resource["graph.knowledge"].reason.as_deref(),
-            Some("cluster_recovery_pending")
-        );
-        assert_eq!(
-            by_resource["query.knowledge.find_person"].reason.as_deref(),
-            Some("cluster_recovery_pending")
-        );
-        assert_eq!(
-            by_resource["policy.base"].reason.as_deref(),
-            Some("cluster_recovery_pending")
-        );
-        assert!(sidecar.exists());
-        // The sweep's Error status is what persists — not a generic Blocked.
-        let state = read_state_json(dir.path());
-        assert_eq!(state["resource_statuses"]["graph.knowledge"]["status"], "error");
-    }
-
-    #[tokio::test]
-    async fn plan_embeds_migration_preview_for_schema_update() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_applyable_state(dir.path());
-        fs::write(
-            dir.path().join("people.pg"),
-            "\nnode Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n",
-        )
+    let out = apply_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(out.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "schema_apply_failed"
+            && diagnostic.message.contains("changing property type")
+    }));
+    let by_resource: BTreeMap<&str, &PlanChange> = out
+        .changes
+        .iter()
+        .map(|change| (change.resource.as_str(), change))
+        .collect();
+    assert_eq!(
+        by_resource["schema.knowledge"].disposition,
+        Some(ApplyDisposition::Blocked)
+    );
+    assert_eq!(
+        by_resource["schema.knowledge"].reason.as_deref(),
+        Some("schema_apply_failed")
+    );
+    // The live schema and the ledger are unchanged.
+    let state = read_state_json(dir.path());
+    let desired = validate_config_dir(dir.path());
+    assert_ne!(
+        state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        desired.resource_digests["schema.knowledge"]
+    );
+    let db = Omnigraph::open_read_only(&derived_graph_uri(dir.path(), "knowledge"))
+        .await
         .unwrap();
-
-        let out = plan_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        let schema_change = out
-            .changes
+    assert_eq!(db.schema_source().as_str(), SCHEMA);
+    assert!(
+        recovery_sidecars(dir.path()).is_empty(),
+        "{:?}",
+        recovery_sidecars(dir.path())
+    );
+    // Second run fails just as loudly and still leaves no sidecar because
+    // the engine preview rejects before graph state can move.
+    let second = apply_config_dir(dir.path()).await;
+    assert!(!second.ok);
+    assert!(
+        second
+            .diagnostics
             .iter()
-            .find(|change| change.resource == "schema.knowledge")
-            .unwrap();
-        let migration = schema_change.migration.as_ref().expect("preview embedded");
-        assert!(migration.supported);
-        assert!(
-            serde_json::to_string(&migration.steps)
+            .any(|diagnostic| diagnostic.code == "schema_apply_failed")
+    );
+    assert!(
+        recovery_sidecars(dir.path()).is_empty(),
+        "{:?}",
+        recovery_sidecars(dir.path())
+    );
+
+    // Once the graph failure is corrected, the run converges.
+    fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
+    let recovered = apply_config_dir(dir.path()).await;
+    assert!(recovered.ok && recovered.converged, "{recovered:?}");
+}
+
+#[tokio::test]
+async fn apply_schema_update_blocked_by_non_main_branch_leaves_no_sidecar() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path());
+    let graph_uri = derived_graph_uri(dir.path(), "knowledge");
+    let db = Omnigraph::open(&graph_uri).await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    drop(db);
+    let before_state = read_state_json(dir.path());
+    fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(out.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "schema_apply_failed"
+            && diagnostic
+                .message
+                .contains("schema apply requires a graph with only main")
+    }));
+    assert!(
+        recovery_sidecars(dir.path()).is_empty(),
+        "{:?}",
+        recovery_sidecars(dir.path())
+    );
+    let after_state = read_state_json(dir.path());
+    assert_eq!(
+        after_state["applied_revision"]["resources"],
+        before_state["applied_revision"]["resources"]
+    );
+    let reopened = Omnigraph::open_read_only(&graph_uri).await.unwrap();
+    assert_eq!(reopened.schema_source().as_str(), SCHEMA);
+}
+
+#[tokio::test]
+async fn apply_blocks_schema_update_while_recovery_pending() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_state_resources(dir.path(), &[("schema.knowledge", "stale-digest")]);
+    fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
+    // A pending sidecar whose intent matches neither live nor recorded.
+    write_schema_apply_sidecar(dir.path(), "knowledge", "intended-digest", "01PENDS");
+
+    let out = apply_config_dir(dir.path()).await;
+    let by_resource: BTreeMap<&str, &PlanChange> = out
+        .changes
+        .iter()
+        .map(|change| (change.resource.as_str(), change))
+        .collect();
+    assert_eq!(
+        by_resource["schema.knowledge"].disposition,
+        Some(ApplyDisposition::Blocked)
+    );
+    assert_eq!(
+        by_resource["schema.knowledge"].reason.as_deref(),
+        Some("cluster_recovery_pending")
+    );
+}
+
+#[tokio::test]
+async fn apply_creates_graph_and_unblocks_dependents() {
+    let dir = fixture();
+    write_state_resources(dir.path(), &[]);
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.converged, "{out:?}");
+    let by_resource: BTreeMap<&str, &PlanChange> = out
+        .changes
+        .iter()
+        .map(|change| (change.resource.as_str(), change))
+        .collect();
+    // Stage 4A: the create executes, and its dependents apply in-run.
+    assert_eq!(
+        by_resource["graph.knowledge"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["schema.knowledge"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["query.knowledge.find_person"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["policy.base"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    // The graph exists on disk and opens; state records everything.
+    let graph_uri = derived_graph_uri(dir.path(), "knowledge");
+    let db = Omnigraph::open_read_only(&graph_uri).await.unwrap();
+    let desired = validate_config_dir(dir.path());
+    assert_eq!(
+        sha256_hex(db.schema_source().as_bytes()),
+        desired.resource_digests["schema.knowledge"]
+    );
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        desired.resource_digests["schema.knowledge"]
+    );
+    assert_eq!(
+        state["resource_statuses"]["graph.knowledge"]["status"],
+        "applied"
+    );
+    // The create's sidecar was retired after the state CAS landed.
+    assert!(
+        !dir.path().join(CLUSTER_RECOVERIES_DIR).exists()
+            || fs::read_dir(dir.path().join(CLUSTER_RECOVERIES_DIR))
                 .unwrap()
-                .contains("add_property"),
-            "{migration:?}"
-        );
-    }
+                .next()
+                .is_none()
+    );
+}
 
-    #[tokio::test]
-    async fn plan_warns_when_preview_unavailable() {
-        let dir = fixture();
-        write_applyable_state(dir.path()); // digests recorded, but no live root
-        fs::write(
-            dir.path().join("people.pg"),
-            "\nnode Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n",
-        )
-        .unwrap();
+#[tokio::test]
+async fn apply_create_failure_blocks_dependents_and_keeps_sidecar() {
+    let dir = fixture();
+    write_state_resources(dir.path(), &[]);
+    // Make the init fail its strict preflight: a junk _schema.pg already
+    // sits at the derived root (the engine refuses to overwrite it).
+    let root = dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("_schema.pg"), "junk").unwrap();
 
-        let out = plan_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        let schema_change = out
-            .changes
+    let out = apply_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
             .iter()
-            .find(|change| change.resource == "schema.knowledge")
-            .unwrap();
-        assert!(schema_change.migration.is_none());
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "schema_preview_unavailable")
-        );
+            .any(|diagnostic| diagnostic.code == "graph_create_failed")
+    );
+    let by_resource: BTreeMap<&str, &PlanChange> = out
+        .changes
+        .iter()
+        .map(|change| (change.resource.as_str(), change))
+        .collect();
+    // Dependents are demoted: the run tells the truth about what executed.
+    assert_eq!(
+        by_resource["graph.knowledge"].disposition,
+        Some(ApplyDisposition::Blocked)
+    );
+    assert_eq!(
+        by_resource["query.knowledge.find_person"].disposition,
+        Some(ApplyDisposition::Blocked)
+    );
+    assert_eq!(
+        by_resource["query.knowledge.find_person"].reason.as_deref(),
+        Some("dependency_not_applied")
+    );
+    assert_eq!(
+        by_resource["policy.base"].disposition,
+        Some(ApplyDisposition::Blocked)
+    );
+    assert!(!out.converged);
+    // The sidecar stays for the sweep to classify next run.
+    assert!(
+        fs::read_dir(dir.path().join(CLUSTER_RECOVERIES_DIR))
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    // No graph digests moved.
+    let state = read_state_json(dir.path());
+    assert!(
+        state["applied_revision"]["resources"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn apply_blocks_graph_delete_without_approval() {
+    let dir = fixture();
+    let desired = validate_config_dir(dir.path());
+    let schema_digest = desired
+        .resource_digests
+        .get("schema.knowledge")
+        .unwrap()
+        .clone();
+    let graph_composite = graph_digest(
+        "knowledge",
+        Some(&schema_digest),
+        Some(&BTreeMap::new()),
+        None,
+        None,
+    );
+    write_state_resources(
+        dir.path(),
+        &[
+            ("graph.knowledge", graph_composite.as_str()),
+            ("schema.knowledge", schema_digest.as_str()),
+            ("graph.old", "3333"),
+            ("schema.old", "4444"),
+            ("query.old.q", "5555"),
+        ],
+    );
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(!out.converged);
+    let by_resource: BTreeMap<&str, &PlanChange> = out
+        .changes
+        .iter()
+        .map(|change| (change.resource.as_str(), change))
+        .collect();
+    // Stage 4C: deletes are gated, not deferred — every subtree change
+    // blocks on the single graph-level approval.
+    assert_eq!(
+        by_resource["graph.old"].disposition,
+        Some(ApplyDisposition::Blocked)
+    );
+    assert_eq!(
+        by_resource["graph.old"].reason.as_deref(),
+        Some("approval_required")
+    );
+    assert_eq!(
+        by_resource["schema.old"].reason.as_deref(),
+        Some("approval_required")
+    );
+    assert_eq!(
+        by_resource["query.old.q"].reason.as_deref(),
+        Some("approval_required")
+    );
+    // State intact; nothing destroyed without the artifact.
+    let state = read_state_json(dir.path());
+    let resources = &state["applied_revision"]["resources"];
+    assert_eq!(resources["graph.old"]["digest"], "3333");
+    assert_eq!(resources["schema.old"]["digest"], "4444");
+    assert_eq!(resources["query.old.q"]["digest"], "5555");
+}
+
+#[tokio::test]
+async fn approve_writes_digest_bound_artifact() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    // Seed a deletable subtree.
+    let state = read_state_json(dir.path());
+    let graph_digest_str = state["applied_revision"]["resources"]["graph.knowledge"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let schema_digest_str = state["applied_revision"]["resources"]["schema.knowledge"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    write_state_resources(
+        dir.path(),
+        &[
+            ("graph.knowledge", graph_digest_str.as_str()),
+            ("schema.knowledge", schema_digest_str.as_str()),
+            ("graph.old", "3333"),
+            ("schema.old", "4444"),
+        ],
+    );
+
+    let out = approve_config_dir(dir.path(), "graph.old", "andrew").await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let approval_id = out.approval_id.clone().unwrap();
+    let artifact: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(
+            dir.path()
+                .join(CLUSTER_APPROVALS_DIR)
+                .join(format!("{approval_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(artifact["resource"], "graph.old");
+    assert_eq!(artifact["operation"], "delete");
+    assert_eq!(artifact["approved_by"], "andrew");
+    assert_eq!(artifact["bound_before_digest"], "3333");
+    assert!(artifact["bound_after_digest"].is_null());
+    assert!(artifact["bound_config_digest"].is_string());
+    assert!(artifact["consumed_at"].is_null());
+
+    // A non-gated address is refused.
+    let not_gated = approve_config_dir(dir.path(), "query.knowledge.find_person", "andrew").await;
+    assert!(!not_gated.ok);
+    assert!(
+        not_gated
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "approval_not_required")
+    );
+}
+
+#[tokio::test]
+async fn stale_approval_is_ignored() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    let state = read_state_json(dir.path());
+    let graph_digest_str = state["applied_revision"]["resources"]["graph.knowledge"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let schema_digest_str = state["applied_revision"]["resources"]["schema.knowledge"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    write_state_resources(
+        dir.path(),
+        &[
+            ("graph.knowledge", graph_digest_str.as_str()),
+            ("schema.knowledge", schema_digest_str.as_str()),
+            ("graph.old", "3333"),
+        ],
+    );
+    let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
+    assert!(approved.ok, "{:?}", approved.diagnostics);
+    // The config moves after approval: the bound config digest no longer
+    // matches and the artifact authorizes nothing.
+    fs::write(
+        dir.path().join("base.policy.yaml"),
+        "version: 1\nrules: [] # moved\n",
+    )
+    .unwrap();
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "approval_stale"),
+        "{:?}",
+        out.diagnostics
+    );
+    let by_resource: BTreeMap<&str, &PlanChange> = out
+        .changes
+        .iter()
+        .map(|change| (change.resource.as_str(), change))
+        .collect();
+    assert_eq!(
+        by_resource["graph.old"].reason.as_deref(),
+        Some("approval_required")
+    );
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["applied_revision"]["resources"]["graph.old"]["digest"],
+        "3333"
+    );
+}
+
+#[tokio::test]
+async fn compute_approvals_one_gate_per_subtree() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    let state = read_state_json(dir.path());
+    let g = state["applied_revision"]["resources"]["graph.knowledge"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sc = state["applied_revision"]["resources"]["schema.knowledge"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    write_state_resources(
+        dir.path(),
+        &[
+            ("graph.knowledge", g.as_str()),
+            ("schema.knowledge", sc.as_str()),
+            ("graph.old", "3333"),
+            ("schema.old", "4444"),
+            ("query.old.q", "5555"),
+        ],
+    );
+    let plan = plan_config_dir(dir.path()).await;
+    let gated: Vec<&str> = plan
+        .approvals_required
+        .iter()
+        .map(|gate| gate.resource.as_str())
+        .collect();
+    assert_eq!(gated, vec!["graph.old"], "{plan:?}");
+    assert!(!plan.approvals_required[0].satisfied);
+}
+
+#[tokio::test]
+async fn apply_is_idempotent() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+
+    let first = apply_config_dir(dir.path()).await;
+    assert!(first.ok, "{:?}", first.diagnostics);
+    assert!(first.state_written);
+    let state_after_first = fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+
+    let second = apply_config_dir(dir.path()).await;
+    assert!(second.ok, "{:?}", second.diagnostics);
+    assert!(second.changes.is_empty());
+    assert_eq!(second.applied_count, 0);
+    assert!(second.converged);
+    assert!(!second.state_written);
+    let state_after_second = fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    assert_eq!(state_after_first, state_after_second);
+    assert_eq!(second.state_observations.state_revision, 2);
+}
+
+#[tokio::test]
+async fn apply_respects_held_lock() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    write_lock_file(dir.path(), "held-lock", "plan");
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "state_lock_held")
+    );
+    // The held lock survives a refused apply, and nothing was written.
+    assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+    assert!(!dir.path().join(CLUSTER_RESOURCES_DIR).exists());
+    let state = read_state_json(dir.path());
+    assert_eq!(state["state_revision"], 1);
+}
+
+#[tokio::test]
+async fn apply_state_lock_false_bypasses_with_warning() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
+version: 1
+state:
+  backend: cluster
+  lock: false
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries:
+      find_person:
+        file: ./people.gq
+"#,
+    )
+    .unwrap();
+    write_applyable_state(dir.path());
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.state_written);
+    assert!(!out.state_observations.lock_acquired);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "state_lock_disabled")
+    );
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+}
+
+#[tokio::test]
+async fn apply_skips_existing_payload_blob() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    let desired = validate_config_dir(dir.path());
+    let query_digest = desired
+        .resource_digests
+        .get("query.knowledge.find_person")
+        .unwrap()
+        .clone();
+    // Content-addressed blobs are trusted by name: an existing file is
+    // never rewritten.
+    let blob = query_payload_path(dir.path(), &query_digest);
+    fs::create_dir_all(blob.parent().unwrap()).unwrap();
+    fs::write(&blob, "pre-existing").unwrap();
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(fs::read_to_string(&blob).unwrap(), "pre-existing");
+}
+
+#[tokio::test]
+async fn apply_invalid_config_or_policy_fails_before_lock() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\nnot_a_field: true\n",
+    )
+    .unwrap();
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    // Config errors bail before the lock or any state directory exists.
+    assert!(!dir.path().join(CLUSTER_STATE_DIR).exists());
+
+    let dir = fixture();
+    fs::write(
+        dir.path().join("base.policy.yaml"),
+        r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: wrong-kind
+    allow:
+      actors: { group: team }
+      actions: [graph_list]
+"#,
+    )
+    .unwrap();
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "policy_invalid"),
+        "{:?}",
+        out.diagnostics
+    );
+    // Policy errors share the same pre-lock, pre-state refusal boundary.
+    assert!(!dir.path().join(CLUSTER_STATE_DIR).exists());
+}
+
+/// When the state write fails after payloads landed, the output must
+/// report the statuses actually on disk — not the unpersisted in-memory
+/// mutations (phantom `applied` entries would mislead automation that
+/// reads `resource_statuses` independently of `ok`).
+#[cfg(unix)]
+#[tokio::test]
+async fn apply_state_write_failure_reports_persisted_statuses() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fixture();
+    // lock: false so the only write into __cluster/ is state.json itself.
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
+version: 1
+state:
+  backend: cluster
+  lock: false
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries:
+      find_person:
+        file: ./people.gq
+"#,
+    )
+    .unwrap();
+    write_applyable_state(dir.path());
+    // Pre-create the payload blob so the payload phase is a no-op and the
+    // failure lands exactly at the state write.
+    let desired = validate_config_dir(dir.path());
+    let query_digest = desired
+        .resource_digests
+        .get("query.knowledge.find_person")
+        .unwrap();
+    let blob = query_payload_path(dir.path(), query_digest);
+    fs::create_dir_all(blob.parent().unwrap()).unwrap();
+    fs::write(&blob, QUERY).unwrap();
+
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    // Running as root ignores permission bits; skip rather than flake.
+    if fs::write(state_dir.join("probe"), b"x").is_ok() {
+        let _ = fs::remove_file(state_dir.join("probe"));
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: permissions are not enforced (running as root)");
+        return;
     }
 
-    fn write_schema_apply_sidecar(
-        config_dir: &Path,
-        graph_id: &str,
-        desired_schema_digest: &str,
-        operation_id: &str,
-    ) -> PathBuf {
-        let dir = config_dir.join(CLUSTER_RECOVERIES_DIR);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{operation_id}.json"));
-        fs::write(
-            &path,
-            serde_json::to_string_pretty(&json!({
-                "schema_version": 1,
-                "operation_id": operation_id,
-                "started_at": "1970-01-01T00:00:00Z",
-                "kind": "schema_apply",
-                "graph_id": graph_id,
-                "graph_uri": derived_graph_uri(config_dir, graph_id),
-                "desired_schema_digest": desired_schema_digest,
-            }))
+    let out = apply_config_dir(dir.path()).await;
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(!out.ok);
+    assert!(!out.state_written);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "state_write_error"),
+        "{:?}",
+        out.diagnostics
+    );
+    // The seeded state has no statuses; the failed apply must not invent
+    // the in-memory `applied` ones it failed to persist.
+    assert!(
+        out.resource_statuses.is_empty(),
+        "unpersisted statuses leaked into output: {:?}",
+        out.resource_statuses
+    );
+}
+
+// ---- catalog payload verification (Stage 3B) ----
+
+/// Converge a fixture dir and return the query blob path.
+async fn converge_fixture(config_dir: &Path) -> std::path::PathBuf {
+    write_applyable_state(config_dir);
+    let out = apply_config_dir(config_dir).await;
+    assert!(out.ok && out.converged, "{:?}", out.diagnostics);
+    let desired = validate_config_dir(config_dir);
+    query_payload_path(
+        config_dir,
+        desired
+            .resource_digests
+            .get("query.knowledge.find_person")
             .unwrap(),
-        )
+    )
+}
+
+#[tokio::test]
+async fn status_reports_missing_payload_read_only() {
+    let dir = fixture();
+    let blob = converge_fixture(dir.path()).await;
+    let state_before = fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    fs::remove_file(&blob).unwrap();
+
+    let out = status_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "catalog_payload_missing"
+            && diagnostic.path == "query.knowledge.find_person"
+    }));
+    // Read-only: persisted statuses and state bytes untouched.
+    assert_eq!(
+        out.resource_statuses["query.knowledge.find_person"].status,
+        ResourceLifecycleStatus::Applied
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        state_before
+    );
+}
+
+#[tokio::test]
+async fn refresh_removes_digest_and_drifts_on_missing_payload() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    let blob = converge_fixture(dir.path()).await;
+    fs::remove_file(&blob).unwrap();
+
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "catalog_payload_missing")
+    );
+    let status = &out.resource_statuses["query.knowledge.find_person"];
+    assert_eq!(status.status, ResourceLifecycleStatus::Drifted);
+    assert!(status.conditions.contains(&"payload_missing".to_string()));
+    let state = read_state_json(dir.path());
+    assert!(
+        state["applied_revision"]["resources"]
+            .get("query.knowledge.find_person")
+            .is_none(),
+        "{state}"
+    );
+}
+
+#[tokio::test]
+async fn refresh_drifts_on_corrupted_payload() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    let blob = converge_fixture(dir.path()).await;
+    fs::write(&blob, "corrupted content").unwrap();
+
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let status = &out.resource_statuses["query.knowledge.find_person"];
+    assert_eq!(status.status, ResourceLifecycleStatus::Drifted);
+    assert!(status.conditions.contains(&"payload_mismatch".to_string()));
+    let state = read_state_json(dir.path());
+    assert!(
+        state["applied_revision"]["resources"]
+            .get("query.knowledge.find_person")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn refresh_flags_unreadable_payload_as_error() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    let blob = converge_fixture(dir.path()).await;
+    // Make the payload unreadable without removing it: permission
+    // denied is a genuine non-NotFound IO error. (A same-named
+    // directory no longer triggers this path: object-store semantics
+    // classify a directory at an object path as NotFound — "only
+    // objects exist" — which is the missing-payload case, not the
+    // unreadable one.)
+    let mut perms = fs::metadata(&blob).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+    fs::set_permissions(&blob, perms).unwrap();
+    // Root reads straight through mode 000 (container dev runners
+    // commonly run as root): skip rather than fail — the contract
+    // under test needs a genuine permission error.
+    if fs::read(&blob).is_ok() {
+        eprintln!(
+            "skipping refresh_flags_unreadable_payload_as_error:                  running as root (mode 000 is still readable)"
+        );
+        return;
+    }
+
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "catalog_payload_read_error")
+    );
+    let status = &out.resource_statuses["query.knowledge.find_person"];
+    assert_eq!(status.status, ResourceLifecycleStatus::Error);
+    assert!(
+        status
+            .conditions
+            .contains(&"payload_read_error".to_string())
+    );
+    // Transient IO keeps the digest: no spurious republish.
+    let state = read_state_json(dir.path());
+    assert!(
+        state["applied_revision"]["resources"]
+            .get("query.knowledge.find_person")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn payload_drift_self_heals_through_refresh_plan_apply() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    let blob = converge_fixture(dir.path()).await;
+    let original = fs::read_to_string(&blob).unwrap();
+    fs::remove_file(&blob).unwrap();
+
+    let refresh = refresh_config_dir(dir.path()).await;
+    assert!(refresh.ok, "{:?}", refresh.diagnostics);
+
+    let plan = plan_config_dir(dir.path()).await;
+    let query_change = plan
+        .changes
+        .iter()
+        .find(|change| change.resource == "query.knowledge.find_person")
+        .expect("plan must propose recreating the query");
+    assert_eq!(query_change.operation, PlanOperation::Create);
+    assert_eq!(query_change.disposition, Some(ApplyDisposition::Applied));
+
+    let apply = apply_config_dir(dir.path()).await;
+    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+    assert_eq!(fs::read_to_string(&blob).unwrap(), original);
+
+    let status = status_config_dir(dir.path()).await;
+    assert!(
+        !status
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.starts_with("catalog_payload")),
+        "{:?}",
+        status.diagnostics
+    );
+}
+
+#[tokio::test]
+async fn verification_skips_graph_and_schema_resources() {
+    let dir = fixture();
+    write_applyable_state(dir.path()); // graph + schema digests only, no blobs
+
+    let out = status_config_dir(dir.path()).await;
+    assert!(
+        !out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.starts_with("catalog_payload")),
+        "{:?}",
+        out.diagnostics
+    );
+}
+
+// ---- recovery sidecars + sweep (Stage 4A) ----
+
+fn derived_graph_uri(config_dir: &Path, graph_id: &str) -> String {
+    display_path(
+        &config_dir
+            .join(CLUSTER_GRAPHS_DIR)
+            .join(format!("{graph_id}.omni")),
+    )
+}
+
+fn write_create_sidecar(
+    config_dir: &Path,
+    graph_id: &str,
+    desired_schema_digest: &str,
+    operation_id: &str,
+) -> PathBuf {
+    let dir = config_dir.join(CLUSTER_RECOVERIES_DIR);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{operation_id}.json"));
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "operation_id": operation_id,
+            "started_at": "1970-01-01T00:00:00Z",
+            "kind": "graph_create",
+            "graph_id": graph_id,
+            "graph_uri": derived_graph_uri(config_dir, graph_id),
+            "desired_schema_digest": desired_schema_digest,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    path
+}
+
+#[tokio::test]
+async fn sweep_removes_sidecar_when_root_absent() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    let sidecar = write_create_sidecar(dir.path(), "knowledge", "irrelevant", "01ROW1");
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    // Row 1: nothing moved; intent removed, run proceeds normally.
+    assert!(!sidecar.exists());
+    assert!(out.converged);
+}
+
+#[tokio::test]
+async fn sweep_rolls_forward_completed_create() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_state_resources(dir.path(), &[]); // state predates the create
+    let desired = validate_config_dir(dir.path());
+    let schema_digest = desired.resource_digests["schema.knowledge"].clone();
+    let sidecar = write_create_sidecar(dir.path(), "knowledge", &schema_digest, "01ROW4");
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "cluster_recovery_rolled_forward")
+    );
+    // Row 4: ledger converged to observable reality, audit recorded,
+    // sidecar retired after the CAS landed.
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        schema_digest
+    );
+    assert!(
+        state["recovery_records"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(
+                |record| record["outcome"] == "rolled_forward" && record["graph_id"] == "knowledge"
+            )
+    );
+    assert!(!sidecar.exists());
+    // With the graph rolled forward, the same run converges the catalog.
+    assert!(out.converged, "{out:?}");
+}
+
+#[tokio::test]
+async fn sweep_completes_already_recorded_create() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path()); // state already records graph+schema
+    let desired = validate_config_dir(dir.path());
+    let sidecar = write_create_sidecar(
+        dir.path(),
+        "knowledge",
+        &desired.resource_digests["schema.knowledge"],
+        "01ROW2",
+    );
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    // Row 2: outcome was already durable; no audit entry, sidecar retired.
+    assert!(!sidecar.exists());
+    let state = read_state_json(dir.path());
+    assert!(
+        state["recovery_records"]
+            .as_object()
+            .is_none_or(|records| records.is_empty()),
+        "{state}"
+    );
+}
+
+#[tokio::test]
+async fn sweep_keeps_sidecar_for_incomplete_root() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    // A root that exists but cannot be opened: the engine's partial-init gap.
+    let root = dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("_schema.pg"), "junk").unwrap();
+    let sidecar = write_create_sidecar(dir.path(), "knowledge", "whatever", "01ROW5");
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "graph_create_incomplete")
+    );
+    // Row 5: never auto-delete; sidecar and root stay for the operator,
+    // and the Error status is persisted by the run's state write.
+    assert!(sidecar.exists());
+    assert!(root.exists());
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["resource_statuses"]["graph.knowledge"]["status"],
+        "error"
+    );
+    assert!(
+        state["resource_statuses"]["graph.knowledge"]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|condition| condition == "graph_create_incomplete")
+    );
+}
+
+#[tokio::test]
+async fn sweep_flags_unexpected_schema_as_pending() {
+    let dir = fixture();
+    write_state_resources(dir.path(), &[]);
+    // Live graph exists with a schema the sidecar never intended.
+    let graph_dir = dir.path().join(CLUSTER_GRAPHS_DIR);
+    fs::create_dir_all(&graph_dir).unwrap();
+    Omnigraph::init(
+        &derived_graph_uri(dir.path(), "knowledge"),
+        "\nnode Other {\n  name: String @key\n}\n",
+    )
+    .await
+    .unwrap();
+    let desired = validate_config_dir(dir.path());
+    let sidecar = write_create_sidecar(
+        dir.path(),
+        "knowledge",
+        &desired.resource_digests["schema.knowledge"],
+        "01ROW6",
+    );
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics); // warning, not error
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "cluster_recovery_pending")
+    );
+    // Row 6: refuse to guess; sidecar kept, Drifted persisted.
+    assert!(sidecar.exists());
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["resource_statuses"]["graph.knowledge"]["status"],
+        "drifted"
+    );
+    assert!(
+        state["resource_statuses"]["graph.knowledge"]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|condition| condition == "actual_applied_state_pending")
+    );
+}
+
+#[tokio::test]
+async fn apply_blocks_create_while_recovery_pending() {
+    let dir = fixture();
+    write_state_resources(dir.path(), &[]);
+    // A kept (row 5) sidecar: partial root that cannot be opened.
+    let root = dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("_schema.pg"), "junk").unwrap();
+    let sidecar = write_create_sidecar(dir.path(), "knowledge", "whatever", "01PEND");
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(!out.ok); // row 5 is an error condition
+    let by_resource: BTreeMap<&str, &PlanChange> = out
+        .changes
+        .iter()
+        .map(|change| (change.resource.as_str(), change))
+        .collect();
+    // The pending recovery blocks the create and its dependents; the
+    // executor never attempts the init.
+    assert_eq!(
+        by_resource["graph.knowledge"].disposition,
+        Some(ApplyDisposition::Blocked)
+    );
+    assert_eq!(
+        by_resource["graph.knowledge"].reason.as_deref(),
+        Some("cluster_recovery_pending")
+    );
+    assert_eq!(
+        by_resource["query.knowledge.find_person"].reason.as_deref(),
+        Some("cluster_recovery_pending")
+    );
+    assert_eq!(
+        by_resource["policy.base"].reason.as_deref(),
+        Some("cluster_recovery_pending")
+    );
+    assert!(sidecar.exists());
+    // The sweep's Error status is what persists — not a generic Blocked.
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["resource_statuses"]["graph.knowledge"]["status"],
+        "error"
+    );
+}
+
+#[tokio::test]
+async fn plan_embeds_migration_preview_for_schema_update() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path());
+    fs::write(
+        dir.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n",
+    )
+    .unwrap();
+
+    let out = plan_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let schema_change = out
+        .changes
+        .iter()
+        .find(|change| change.resource == "schema.knowledge")
         .unwrap();
-        path
-    }
+    let migration = schema_change.migration.as_ref().expect("preview embedded");
+    assert!(migration.supported);
+    assert!(
+        serde_json::to_string(&migration.steps)
+            .unwrap()
+            .contains("add_property"),
+        "{migration:?}"
+    );
+}
 
-    const SCHEMA_V2: &str = "\nnode Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n";
+#[tokio::test]
+async fn plan_warns_when_preview_unavailable() {
+    let dir = fixture();
+    write_applyable_state(dir.path()); // digests recorded, but no live root
+    fs::write(
+        dir.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n",
+    )
+    .unwrap();
 
-    #[tokio::test]
-    async fn sweep_retires_schema_sidecar_when_ledger_consistent() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_applyable_state(dir.path()); // state digest == live digest
-        let sidecar =
-            write_schema_apply_sidecar(dir.path(), "knowledge", "never-applied", "01SROW1");
+    let out = plan_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let schema_change = out
+        .changes
+        .iter()
+        .find(|change| change.resource == "schema.knowledge")
+        .unwrap();
+    assert!(schema_change.migration.is_none());
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "schema_preview_unavailable")
+    );
+}
 
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(!sidecar.exists());
-        let state = read_state_json(dir.path());
-        assert!(
-            state["recovery_records"]
-                .as_object()
-                .is_none_or(|records| records.is_empty())
-        );
-    }
+fn write_schema_apply_sidecar(
+    config_dir: &Path,
+    graph_id: &str,
+    desired_schema_digest: &str,
+    operation_id: &str,
+) -> PathBuf {
+    let dir = config_dir.join(CLUSTER_RECOVERIES_DIR);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{operation_id}.json"));
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "operation_id": operation_id,
+            "started_at": "1970-01-01T00:00:00Z",
+            "kind": "schema_apply",
+            "graph_id": graph_id,
+            "graph_uri": derived_graph_uri(config_dir, graph_id),
+            "desired_schema_digest": desired_schema_digest,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    path
+}
 
-    #[tokio::test]
-    async fn sweep_rolls_forward_completed_schema_apply() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_applyable_state(dir.path());
-        // The schema apply completed on the graph out-of-process...
-        let graph_uri = derived_graph_uri(dir.path(), "knowledge");
-        let db = Omnigraph::open(&graph_uri).await.unwrap();
-        db.apply_schema(SCHEMA_V2).await.unwrap();
-        // ...the desired config matches it, and the sidecar records the intent.
-        fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
-        let desired = validate_config_dir(dir.path());
-        let v2_digest = desired.resource_digests["schema.knowledge"].clone();
-        let sidecar = write_schema_apply_sidecar(dir.path(), "knowledge", &v2_digest, "01SROW3");
+const SCHEMA_V2: &str = "\nnode Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n";
 
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "cluster_recovery_rolled_forward")
-        );
-        assert!(!sidecar.exists());
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
-            v2_digest
-        );
-        assert!(
+#[tokio::test]
+async fn sweep_retires_schema_sidecar_when_ledger_consistent() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path()); // state digest == live digest
+    let sidecar = write_schema_apply_sidecar(dir.path(), "knowledge", "never-applied", "01SROW1");
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(!sidecar.exists());
+    let state = read_state_json(dir.path());
+    assert!(
+        state["recovery_records"]
+            .as_object()
+            .is_none_or(|records| records.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn sweep_rolls_forward_completed_schema_apply() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path());
+    // The schema apply completed on the graph out-of-process...
+    let graph_uri = derived_graph_uri(dir.path(), "knowledge");
+    let db = Omnigraph::open(&graph_uri).await.unwrap();
+    db.apply_schema(SCHEMA_V2).await.unwrap();
+    // ...the desired config matches it, and the sidecar records the intent.
+    fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
+    let desired = validate_config_dir(dir.path());
+    let v2_digest = desired.resource_digests["schema.knowledge"].clone();
+    let sidecar = write_schema_apply_sidecar(dir.path(), "knowledge", &v2_digest, "01SROW3");
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "cluster_recovery_rolled_forward")
+    );
+    assert!(!sidecar.exists());
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        v2_digest
+    );
+    assert!(
             state["recovery_records"]
                 .as_object()
                 .unwrap()
@@ -2810,327 +2964,328 @@ graphs:
                 .any(|record| record["kind"] == "schema_apply"
                     && record["outcome"] == "rolled_forward")
         );
-        assert!(out.converged, "{out:?}");
-    }
+    assert!(out.converged, "{out:?}");
+}
 
-    #[tokio::test]
-    async fn sweep_flags_unexpected_schema_apply_state_as_pending() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await; // live = v1
-        write_state_resources(dir.path(), &[("schema.knowledge", "stale-digest")]);
-        // Sidecar intended a digest that is neither live nor recorded.
-        let sidecar =
-            write_schema_apply_sidecar(dir.path(), "knowledge", "intended-digest", "01SROW6");
+#[tokio::test]
+async fn sweep_flags_unexpected_schema_apply_state_as_pending() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await; // live = v1
+    write_state_resources(dir.path(), &[("schema.knowledge", "stale-digest")]);
+    // Sidecar intended a digest that is neither live nor recorded.
+    let sidecar = write_schema_apply_sidecar(dir.path(), "knowledge", "intended-digest", "01SROW6");
 
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics); // warnings only
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "cluster_recovery_pending")
-        );
-        assert!(sidecar.exists());
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["resource_statuses"]["schema.knowledge"]["status"],
-            "drifted"
-        );
-    }
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics); // warnings only
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "cluster_recovery_pending")
+    );
+    assert!(sidecar.exists());
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["resource_statuses"]["schema.knowledge"]["status"],
+        "drifted"
+    );
+}
 
-    #[tokio::test]
-    async fn sweep_keeps_schema_sidecar_for_unopenable_root() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-        let root = dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni");
-        fs::create_dir_all(&root).unwrap(); // exists, won't open
-        let sidecar =
-            write_schema_apply_sidecar(dir.path(), "knowledge", "whatever", "01SROWX");
+#[tokio::test]
+async fn sweep_keeps_schema_sidecar_for_unopenable_root() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    let root = dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni");
+    fs::create_dir_all(&root).unwrap(); // exists, won't open
+    let sidecar = write_schema_apply_sidecar(dir.path(), "knowledge", "whatever", "01SROWX");
 
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics); // warning: cannot verify
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "cluster_recovery_pending")
-        );
-        assert!(sidecar.exists());
-    }
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics); // warning: cannot verify
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "cluster_recovery_pending")
+    );
+    assert!(sidecar.exists());
+}
 
-    /// Seed: converged knowledge subtree + a stale `old` graph subtree with a
-    /// real directory on disk.
-    async fn seed_deletable_state(config_dir: &Path) {
-        write_applyable_state(config_dir);
-        let state = read_state_json(config_dir);
-        let g = state["applied_revision"]["resources"]["graph.knowledge"]["digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let sc = state["applied_revision"]["resources"]["schema.knowledge"]["digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let old_streaming_digest = streaming_digest("old", false);
-        write_state_resources(
-            config_dir,
-            &[
-                ("graph.knowledge", g.as_str()),
-                ("schema.knowledge", sc.as_str()),
-                ("graph.old", "3333"),
-                ("schema.old", "4444"),
-                ("query.old.q", "5555"),
-                ("streaming.old", old_streaming_digest.as_str()),
-            ],
-        );
-        let mut state = read_state_json(config_dir);
-        let old_streaming = &mut state["applied_revision"]["resources"]["streaming.old"];
-        old_streaming["streaming_enabled"] = json!(false);
-        old_streaming["declaration_revision"] = json!(streaming_declaration_revision(
-            "old",
-            &old_streaming_digest
-        ));
-        old_streaming["profile_mode"] = json!("DISABLED");
-        old_streaming["profile_revision"] = json!(1);
-        state["resource_statuses"] = json!({
-            "streaming.old": {
-                "status": "applied",
-                "conditions": [],
-                "message": "stale streaming child"
-            }
-        });
-        fs::write(
-            config_dir.join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
+/// Seed: converged knowledge subtree + a stale `old` graph subtree with a
+/// real directory on disk.
+async fn seed_deletable_state(config_dir: &Path) {
+    write_applyable_state(config_dir);
+    let state = read_state_json(config_dir);
+    let g = state["applied_revision"]["resources"]["graph.knowledge"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sc = state["applied_revision"]["resources"]["schema.knowledge"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    write_state_resources(
+        config_dir,
+        &[
+            ("graph.knowledge", g.as_str()),
+            ("schema.knowledge", sc.as_str()),
+            ("graph.old", "3333"),
+            ("schema.old", "4444"),
+            ("query.old.q", "5555"),
+        ],
+    );
+    let mut state = read_state_json(config_dir);
+    state["resource_statuses"] = json!({
+        "query.old.q": {
+            "status": "applied",
+            "conditions": [],
+            "message": "stale query child"
+        }
+    });
+    fs::write(
+        config_dir.join(CLUSTER_STATE_FILE),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    let root = config_dir.join(CLUSTER_GRAPHS_DIR).join("old.omni");
+    fs::create_dir_all(root.parent().unwrap()).unwrap();
+    Omnigraph::init(root.to_string_lossy().as_ref(), SCHEMA)
+        .await
         .unwrap();
-        let root = config_dir.join(CLUSTER_GRAPHS_DIR).join("old.omni");
-        fs::create_dir_all(root.parent().unwrap()).unwrap();
-        Omnigraph::init(root.to_string_lossy().as_ref(), SCHEMA)
-            .await
-            .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apply_executes_approved_graph_delete() {
+    struct PausingExportWriter {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        release: Option<std::sync::mpsc::Receiver<()>>,
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn apply_executes_approved_graph_delete() {
-        struct PausingExportWriter {
-            started: Option<tokio::sync::oneshot::Sender<()>>,
-            release: Option<std::sync::mpsc::Receiver<()>>,
+    impl std::io::Write for PausingExportWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+                self.release
+                    .take()
+                    .expect("first export write must own its release receiver")
+                    .recv()
+                    .map_err(std::io::Error::other)?;
+            }
+            Ok(bytes.len())
         }
 
-        impl std::io::Write for PausingExportWriter {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if let Some(started) = self.started.take() {
-                    let _ = started.send(());
-                    self.release
-                        .take()
-                        .expect("first export write must own its release receiver")
-                        .recv()
-                        .map_err(std::io::Error::other)?;
-                }
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
+    }
 
-        let dir = fixture();
-        seed_deletable_state(dir.path()).await;
-        let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
-        assert!(approved.ok, "{:?}", approved.diagnostics);
-        let approval_id = approved.approval_id.clone().unwrap();
+    let dir = fixture();
+    seed_deletable_state(dir.path()).await;
+    let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
+    assert!(approved.ok, "{:?}", approved.diagnostics);
+    let approval_id = approved.approval_id.clone().unwrap();
 
-        let old_root = dir.path().join(CLUSTER_GRAPHS_DIR).join("old.omni");
-        let old_uri = derived_graph_uri(dir.path(), "old");
-        let export_db = Omnigraph::open(&old_uri).await.unwrap();
-        let mut seed_params = omnigraph_compiler::ir::ParamMap::new();
-        seed_params.insert(
-            "name".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("export-cut".to_string()),
-        );
-        export_db
-            .mutate(
-                "main",
-                r#"
+    let old_root = dir.path().join(CLUSTER_GRAPHS_DIR).join("old.omni");
+    let old_uri = derived_graph_uri(dir.path(), "old");
+    let export_db = Omnigraph::open(&old_uri).await.unwrap();
+    let mut seed_params = omnigraph_compiler::ir::ParamMap::new();
+    seed_params.insert(
+        "name".to_string(),
+        omnigraph_compiler::query::ast::Literal::String("export-cut".to_string()),
+    );
+    export_db
+        .mutate(
+            "main",
+            r#"
 query seed($name: String) {
   insert Person { name: $name }
 }
 "#,
-                "seed",
-                &seed_params,
-            )
+            "seed",
+            &seed_params,
+        )
+        .await
+        .unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let export_task = tokio::spawn(async move {
+        let mut writer = PausingExportWriter {
+            started: Some(started_tx),
+            release: Some(release_rx),
+        };
+        export_db
+            .export_jsonl_to_writer("main", &[], &[], &mut writer)
             .await
-            .unwrap();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let export_task = tokio::spawn(async move {
-            let mut writer = PausingExportWriter {
-                started: Some(started_tx),
-                release: Some(release_rx),
-            };
-            export_db
-                .export_jsonl_to_writer("main", &[], &[], &mut writer)
-                .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
-            .await
-            .expect("export did not reach its first write")
-            .expect("export exited before its first write");
-        let blocked = apply_config_dir(dir.path()).await;
-        release_tx.send(()).unwrap();
-        export_task.await.unwrap().unwrap();
-        assert!(!blocked.ok && !blocked.converged, "{blocked:?}");
-        assert!(blocked.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "graph_delete_export_in_progress"
-                && diagnostic.path == "graph.old"
-        }));
-        assert!(
-            old_root.exists(),
-            "a live immutable export cut must preserve the exact graph root"
-        );
-        let blocked_state = read_state_json(dir.path());
-        assert!(
-            blocked_state["applied_revision"]["resources"]
-                .get("graph.old")
-                .is_some(),
-            "the blocked delete must leave the graph subtree authoritative"
-        );
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.converged, "{out:?}");
-        let by_resource: BTreeMap<&str, &PlanChange> = out
-            .changes
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+        .await
+        .expect("export did not reach its first write")
+        .expect("export exited before its first write");
+    let blocked = apply_config_dir(dir.path()).await;
+    release_tx.send(()).unwrap();
+    export_task.await.unwrap().unwrap();
+    assert!(!blocked.ok && !blocked.converged, "{blocked:?}");
+    assert!(blocked.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "graph_delete_export_in_progress" && diagnostic.path == "graph.old"
+    }));
+    assert!(
+        old_root.exists(),
+        "a live immutable export cut must preserve the exact graph root"
+    );
+    let blocked_state = read_state_json(dir.path());
+    assert!(
+        blocked_state["applied_revision"]["resources"]
+            .get("graph.old")
+            .is_some(),
+        "the blocked delete must leave the graph subtree authoritative"
+    );
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.converged, "{out:?}");
+    let by_resource: BTreeMap<&str, &PlanChange> = out
+        .changes
+        .iter()
+        .map(|change| (change.resource.as_str(), change))
+        .collect();
+    assert_eq!(
+        by_resource["graph.old"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["schema.old"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["query.old.q"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    // The root is gone; the subtree is tombstoned out of the ledger.
+    assert!(!old_root.exists());
+    let state = read_state_json(dir.path());
+    let resources = state["applied_revision"]["resources"].as_object().unwrap();
+    assert!(!resources.contains_key("graph.old"));
+    assert!(!resources.contains_key("schema.old"));
+    assert!(!resources.contains_key("query.old.q"));
+    assert!(
+        !state["resource_statuses"]
+            .as_object()
+            .unwrap()
+            .contains_key("query.old.q")
+    );
+    assert_eq!(state["observations"]["graph.old"]["kind"], "tombstone");
+    assert_eq!(
+        state["observations"]["graph.old"]["approval_id"],
+        approval_id
+    );
+    // Approval consumed in BOTH stores: ledger summary + artifact file.
+    assert!(state["approval_records"][&approval_id]["consumed_at"].is_string());
+    let artifact: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(
+            dir.path()
+                .join(CLUSTER_APPROVALS_DIR)
+                .join(format!("{approval_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(artifact["consumed_at"].is_string(), "{artifact}");
+    // Sidecar retired.
+    assert!(
+        fs::read_dir(dir.path().join(CLUSTER_RECOVERIES_DIR))
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true)
+    );
+    // A consumed approval authorizes nothing further (idempotent re-apply).
+    let again = apply_config_dir(dir.path()).await;
+    assert!(
+        again.ok && again.converged && !again.state_written,
+        "{again:?}"
+    );
+}
+
+fn write_delete_sidecar(
+    config_dir: &Path,
+    graph_id: &str,
+    approval_id: Option<&str>,
+    operation_id: &str,
+) -> PathBuf {
+    let dir = config_dir.join(CLUSTER_RECOVERIES_DIR);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{operation_id}.json"));
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "operation_id": operation_id,
+            "started_at": "1970-01-01T00:00:00Z",
+            "kind": "graph_delete",
+            "graph_id": graph_id,
+            "graph_uri": derived_graph_uri(config_dir, graph_id),
+            "desired_schema_digest": "",
+            "approval_id": approval_id,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    path
+}
+
+#[tokio::test]
+async fn sweep_retires_delete_sidecar_when_tombstoned() {
+    let dir = fixture();
+    write_applyable_state(dir.path()); // no graph.old in state, no root
+    let sidecar = write_delete_sidecar(dir.path(), "old", None, "01DROW7");
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(!sidecar.exists());
+    let state = read_state_json(dir.path());
+    assert!(
+        state["recovery_records"]
+            .as_object()
+            .is_none_or(|records| records.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn sweep_rolls_forward_completed_delete() {
+    let dir = fixture();
+    seed_deletable_state(dir.path()).await;
+    // Approve, then simulate: root removed, state stale, sidecar present.
+    let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
+    let approval_id = approved.approval_id.unwrap();
+    fs::remove_dir_all(dir.path().join(CLUSTER_GRAPHS_DIR).join("old.omni")).unwrap();
+    let sidecar = write_delete_sidecar(dir.path(), "old", Some(&approval_id), "01DROW7B");
+
+    // Refresh runs the recovery sweep directly, without the ordinary
+    // planned-delete path independently removing child resources first.
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(
+        out.diagnostics
             .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        assert_eq!(by_resource["graph.old"].disposition, Some(ApplyDisposition::Applied));
-        assert_eq!(by_resource["schema.old"].disposition, Some(ApplyDisposition::Applied));
-        assert_eq!(by_resource["query.old.q"].disposition, Some(ApplyDisposition::Applied));
-        // The root is gone; the subtree is tombstoned out of the ledger.
-        assert!(!old_root.exists());
-        let state = read_state_json(dir.path());
-        let resources = state["applied_revision"]["resources"].as_object().unwrap();
-        assert!(!resources.contains_key("graph.old"));
-        assert!(!resources.contains_key("schema.old"));
-        assert!(!resources.contains_key("query.old.q"));
-        assert!(!resources.contains_key("streaming.old"));
-        assert!(
-            !state["resource_statuses"]
-                .as_object()
-                .unwrap()
-                .contains_key("streaming.old")
-        );
-        assert_eq!(state["observations"]["graph.old"]["kind"], "tombstone");
-        assert_eq!(state["observations"]["graph.old"]["approval_id"], approval_id);
-        // Approval consumed in BOTH stores: ledger summary + artifact file.
-        assert!(state["approval_records"][&approval_id]["consumed_at"].is_string());
-        let artifact: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(
-                dir.path()
-                    .join(CLUSTER_APPROVALS_DIR)
-                    .join(format!("{approval_id}.json")),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert!(artifact["consumed_at"].is_string(), "{artifact}");
-        // Sidecar retired.
-        assert!(
-            fs::read_dir(dir.path().join(CLUSTER_RECOVERIES_DIR))
-                .map(|mut entries| entries.next().is_none())
-                .unwrap_or(true)
-        );
-        // A consumed approval authorizes nothing further (idempotent re-apply).
-        let again = apply_config_dir(dir.path()).await;
-        assert!(again.ok && again.converged && !again.state_written, "{again:?}");
-    }
-
-    fn write_delete_sidecar(
-        config_dir: &Path,
-        graph_id: &str,
-        approval_id: Option<&str>,
-        operation_id: &str,
-    ) -> PathBuf {
-        let dir = config_dir.join(CLUSTER_RECOVERIES_DIR);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{operation_id}.json"));
-        fs::write(
-            &path,
-            serde_json::to_string_pretty(&json!({
-                "schema_version": 1,
-                "operation_id": operation_id,
-                "started_at": "1970-01-01T00:00:00Z",
-                "kind": "graph_delete",
-                "graph_id": graph_id,
-                "graph_uri": derived_graph_uri(config_dir, graph_id),
-                "desired_schema_digest": "",
-                "approval_id": approval_id,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        path
-    }
-
-    #[tokio::test]
-    async fn sweep_retires_delete_sidecar_when_tombstoned() {
-        let dir = fixture();
-        write_applyable_state(dir.path()); // no graph.old in state, no root
-        let sidecar = write_delete_sidecar(dir.path(), "old", None, "01DROW7");
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(!sidecar.exists());
-        let state = read_state_json(dir.path());
-        assert!(
-            state["recovery_records"]
-                .as_object()
-                .is_none_or(|records| records.is_empty())
-        );
-    }
-
-    #[tokio::test]
-    async fn sweep_rolls_forward_completed_delete() {
-        let dir = fixture();
-        seed_deletable_state(dir.path()).await;
-        // Approve, then simulate: root removed, state stale, sidecar present.
-        let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
-        let approval_id = approved.approval_id.unwrap();
-        fs::remove_dir_all(dir.path().join(CLUSTER_GRAPHS_DIR).join("old.omni")).unwrap();
-        let sidecar = write_delete_sidecar(dir.path(), "old", Some(&approval_id), "01DROW7B");
-
-        // Refresh runs the recovery sweep directly, without the ordinary
-        // planned-delete path independently removing child resources first.
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "cluster_recovery_rolled_forward")
-        );
-        assert!(!sidecar.exists());
-        let state = read_state_json(dir.path());
-        assert!(
-            !state["applied_revision"]["resources"]
-                .as_object()
-                .unwrap()
-                .contains_key("graph.old")
-        );
-        assert!(
-            !state["applied_revision"]["resources"]
-                .as_object()
-                .unwrap()
-                .contains_key("streaming.old")
-        );
-        assert!(
-            !state["resource_statuses"]
-                .as_object()
-                .unwrap()
-                .contains_key("streaming.old")
-        );
-        assert_eq!(state["observations"]["graph.old"]["kind"], "tombstone");
-        assert!(state["approval_records"][&approval_id]["consumed_at"].is_string());
-        assert!(
+            .any(|diagnostic| diagnostic.code == "cluster_recovery_rolled_forward")
+    );
+    assert!(!sidecar.exists());
+    let state = read_state_json(dir.path());
+    assert!(
+        !state["applied_revision"]["resources"]
+            .as_object()
+            .unwrap()
+            .contains_key("graph.old")
+    );
+    assert!(
+        !state["applied_revision"]["resources"]
+            .as_object()
+            .unwrap()
+            .contains_key("query.old.q")
+    );
+    assert!(
+        !state["resource_statuses"]
+            .as_object()
+            .unwrap()
+            .contains_key("query.old.q")
+    );
+    assert_eq!(state["observations"]["graph.old"]["kind"], "tombstone");
+    assert!(state["approval_records"][&approval_id]["consumed_at"].is_string());
+    assert!(
             state["recovery_records"]
                 .as_object()
                 .unwrap()
@@ -3138,74 +3293,84 @@ query seed($name: String) {
                 .any(|record| record["kind"] == "graph_delete"
                     && record["outcome"] == "rolled_forward")
         );
-        // The artifact file is marked consumed post-CAS.
-        let artifact: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(
-                dir.path()
-                    .join(CLUSTER_APPROVALS_DIR)
-                    .join(format!("{approval_id}.json")),
-            )
-            .unwrap(),
+    // The artifact file is marked consumed post-CAS.
+    let artifact: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(
+            dir.path()
+                .join(CLUSTER_APPROVALS_DIR)
+                .join(format!("{approval_id}.json")),
         )
-        .unwrap();
-        assert!(artifact["consumed_at"].is_string());
-    }
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(artifact["consumed_at"].is_string());
+}
 
-    #[tokio::test]
-    async fn sweep_reproposes_incomplete_delete() {
-        let dir = fixture();
-        seed_deletable_state(dir.path()).await; // root present
-        let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
-        assert!(approved.ok);
-        let sidecar = write_delete_sidecar(dir.path(), "old", approved.approval_id.as_deref(), "01DROW8");
+#[tokio::test]
+async fn sweep_reproposes_incomplete_delete() {
+    let dir = fixture();
+    seed_deletable_state(dir.path()).await; // root present
+    let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
+    assert!(approved.ok);
+    let sidecar = write_delete_sidecar(
+        dir.path(),
+        "old",
+        approved.approval_id.as_deref(),
+        "01DROW8",
+    );
 
-        // Row 8: the stale intent is retired with a warning, and the same run
-        // re-executes the still-approved delete to completion.
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "graph_delete_incomplete")
-        );
-        assert!(!sidecar.exists());
-        assert!(!dir.path().join(CLUSTER_GRAPHS_DIR).join("old.omni").exists());
-        assert!(out.converged, "{out:?}");
-    }
+    // Row 8: the stale intent is retired with a warning, and the same run
+    // re-executes the still-approved delete to completion.
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "graph_delete_incomplete")
+    );
+    assert!(!sidecar.exists());
+    assert!(
+        !dir.path()
+            .join(CLUSTER_GRAPHS_DIR)
+            .join("old.omni")
+            .exists()
+    );
+    assert!(out.converged, "{out:?}");
+}
 
-    // ---- policy bindings in the applied revision (5A) ----
+// ---- policy bindings in the applied revision (5A) ----
 
-    #[tokio::test]
-    async fn apply_records_policy_bindings() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
+#[tokio::test]
+async fn apply_records_policy_bindings() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
 
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok && out.converged, "{:?}", out.diagnostics);
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["policy.base"]["applies_to"],
-            serde_json::json!(["graph.knowledge"]),
-            "{state}"
-        );
-        // Non-policy entries carry no bindings field at all.
-        assert!(
-            state["applied_revision"]["resources"]["query.knowledge.find_person"]
-                .get("applies_to")
-                .is_none()
-        );
-    }
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok && out.converged, "{:?}", out.diagnostics);
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["applied_revision"]["resources"]["policy.base"]["applies_to"],
+        serde_json::json!(["graph.knowledge"]),
+        "{state}"
+    );
+    // Non-policy entries carry no bindings field at all.
+    assert!(
+        state["applied_revision"]["resources"]["query.knowledge.find_person"]
+            .get("applies_to")
+            .is_none()
+    );
+}
 
-    #[tokio::test]
-    async fn binding_change_is_a_visible_plan_change() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-        let converge = apply_config_dir(dir.path()).await;
-        assert!(converge.converged, "{converge:?}");
-        // Edit ONLY applies_to: the policy file digest is unchanged.
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
+#[tokio::test]
+async fn binding_change_is_a_visible_plan_change() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    let converge = apply_config_dir(dir.path()).await;
+    assert!(converge.converged, "{converge:?}");
+    // Edit ONLY applies_to: the policy file digest is unchanged.
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
 version: 1
 metadata:
   name: test
@@ -3221,312 +3386,319 @@ graphs:
 policies:
   base:
     file: ./base.policy.yaml
-    applies_to: [cluster, knowledge]
+    applies_to: [cluster]
 "#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
-        let plan = plan_config_dir(dir.path()).await;
-        let change = plan
-            .changes
+    let plan = plan_config_dir(dir.path()).await;
+    let change = plan
+        .changes
+        .iter()
+        .find(|change| change.resource == "policy.base")
+        .expect("binding change must be visible in plan");
+    assert!(change.binding_change);
+    assert_eq!(
+        change.metadata_change,
+        Some(PlanMetadataChange::PolicyBindings)
+    );
+    assert_eq!(change.operation, PlanOperation::Update);
+    assert_eq!(change.before_digest, change.after_digest);
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok && out.converged, "{out:?}");
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["applied_revision"]["resources"]["policy.base"]["applies_to"],
+        serde_json::json!(["cluster"])
+    );
+    // Idempotent: a second run sees no changes.
+    let again = apply_config_dir(dir.path()).await;
+    assert!(
+        again.changes.is_empty() && !again.state_written,
+        "{again:?}"
+    );
+}
+
+#[tokio::test]
+async fn pre_5a_state_backfills_bindings() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    let converge = apply_config_dir(dir.path()).await;
+    assert!(converge.converged, "{converge:?}");
+    // Strip the bindings from the state entry (a pre-5A ledger).
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap())
+            .unwrap();
+    state["applied_revision"]["resources"]["policy.base"]
+        .as_object_mut()
+        .unwrap()
+        .remove("applies_to");
+    fs::write(
+        dir.path().join(CLUSTER_STATE_FILE),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+
+    let plan = plan_config_dir(dir.path()).await;
+    assert!(
+        plan.changes
             .iter()
-            .find(|change| change.resource == "policy.base")
-            .expect("binding change must be visible in plan");
-        assert!(change.binding_change);
-        assert_eq!(
-            change.metadata_change,
-            Some(PlanMetadataChange::PolicyBindings)
-        );
-        assert_eq!(change.operation, PlanOperation::Update);
-        assert_eq!(change.before_digest, change.after_digest);
-
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok && out.converged, "{out:?}");
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["policy.base"]["applies_to"],
-            serde_json::json!(["cluster", "graph.knowledge"])
-        );
-        // Idempotent: a second run sees no changes.
-        let again = apply_config_dir(dir.path()).await;
-        assert!(again.changes.is_empty() && !again.state_written, "{again:?}");
-    }
-
-    #[tokio::test]
-    async fn pre_5a_state_backfills_bindings() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-        let converge = apply_config_dir(dir.path()).await;
-        assert!(converge.converged, "{converge:?}");
-        // Strip the bindings from the state entry (a pre-5A ledger).
-        let mut state: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
-        )
-        .unwrap();
-        state["applied_revision"]["resources"]["policy.base"]
-            .as_object_mut()
-            .unwrap()
-            .remove("applies_to");
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
-
-        let plan = plan_config_dir(dir.path()).await;
-        assert!(
-            plan.changes.iter().any(|change| change.resource == "policy.base"
+            .any(|change| change.resource == "policy.base"
                 && change.binding_change
                 && change.metadata_change == Some(PlanMetadataChange::PolicyBindings)),
-            "{plan:?}"
-        );
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok && out.converged, "{out:?}");
-        let healed = read_state_json(dir.path());
-        assert_eq!(
-            healed["applied_revision"]["resources"]["policy.base"]["applies_to"],
-            serde_json::json!(["graph.knowledge"])
-        );
-    }
+        "{plan:?}"
+    );
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok && out.converged, "{out:?}");
+    let healed = read_state_json(dir.path());
+    assert_eq!(
+        healed["applied_revision"]["resources"]["policy.base"]["applies_to"],
+        serde_json::json!(["graph.knowledge"])
+    );
+}
 
-    #[tokio::test]
-    async fn pre_5a_state_backfills_embedding_profile() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_mock_embedding_cluster(dir.path(), "recorded-x");
-        write_applyable_state(dir.path());
-        let converge = apply_config_dir(dir.path()).await;
-        assert!(converge.converged, "{converge:?}");
+#[tokio::test]
+async fn pre_5a_state_backfills_embedding_profile() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_mock_embedding_cluster(dir.path(), "recorded-x");
+    write_applyable_state(dir.path());
+    let converge = apply_config_dir(dir.path()).await;
+    assert!(converge.converged, "{converge:?}");
 
-        let mut state = read_state_json(dir.path());
-        state["applied_revision"]["resources"]["provider.embedding.default"]
-            .as_object_mut()
-            .unwrap()
-            .remove("embedding_profile");
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
+    let mut state = read_state_json(dir.path());
+    state["applied_revision"]["resources"]["provider.embedding.default"]
+        .as_object_mut()
+        .unwrap()
+        .remove("embedding_profile");
+    fs::write(
+        dir.path().join(CLUSTER_STATE_FILE),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
 
-        let plan = plan_config_dir(dir.path()).await;
-        let change = plan
-            .changes
+    let plan = plan_config_dir(dir.path()).await;
+    let change = plan
+        .changes
+        .iter()
+        .find(|change| change.resource == "provider.embedding.default")
+        .expect("embedding profile backfill must be visible in plan");
+    assert_eq!(change.operation, PlanOperation::Update);
+    assert_eq!(change.before_digest, change.after_digest);
+    assert_eq!(
+        change.metadata_change,
+        Some(PlanMetadataChange::EmbeddingProfile)
+    );
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok && out.converged, "{out:?}");
+    let healed = read_state_json(dir.path());
+    assert_eq!(
+        healed["applied_revision"]["resources"]["provider.embedding.default"]["embedding_profile"]
+            ["model"],
+        serde_json::json!("recorded-x")
+    );
+    let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
+    let profile = snapshot.graphs[0].embedding.as_ref().unwrap();
+    assert_eq!(profile.model.as_deref(), Some("recorded-x"));
+}
+
+#[tokio::test]
+async fn bindings_survive_refresh() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path());
+    let converge = apply_config_dir(dir.path()).await;
+    assert!(converge.converged, "{converge:?}");
+
+    let refresh = refresh_config_dir(dir.path()).await;
+    assert!(refresh.ok, "{:?}", refresh.diagnostics);
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["applied_revision"]["resources"]["policy.base"]["applies_to"],
+        serde_json::json!(["graph.knowledge"])
+    );
+}
+
+// ---- serving snapshot (5B read-only loader) ----
+
+// ---- storage: root (RFC-006) ----
+
+#[tokio::test]
+async fn storage_root_defaults_to_config_dir_layout() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path());
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.converged, "{out:?}");
+    // No storage: key — the original on-disk layout, byte-compatible.
+    assert!(dir.path().join(CLUSTER_STATE_FILE).exists());
+    assert!(dir.path().join(CLUSTER_RESOURCES_DIR).exists());
+    assert!(dir.path().join("graphs/knowledge.omni").exists());
+}
+
+#[tokio::test]
+async fn storage_root_file_uri_relocates_the_cluster() {
+    let dir = fixture();
+    let storage = tempfile::tempdir().unwrap();
+    let storage_path = storage.path().to_string_lossy().to_string();
+    let mut config = fs::read_to_string(dir.path().join("cluster.yaml")).unwrap();
+    config = config.replace(
+        "version: 1\n",
+        &format!("version: 1\nstorage: {storage_path}\n"),
+    );
+    fs::write(dir.path().join("cluster.yaml"), config).unwrap();
+
+    let import = import_config_dir(dir.path()).await;
+    assert!(import.ok, "{:?}", import.diagnostics);
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok && out.converged, "{:?}", out.diagnostics);
+
+    // Everything lives under the declared root; nothing under config dir.
+    assert!(storage.path().join("__cluster/state.json").exists());
+    assert!(storage.path().join("graphs/knowledge.omni").exists());
+    assert!(storage.path().join(CLUSTER_RESOURCES_DIR).exists());
+    assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
+    assert!(!dir.path().join("graphs").exists());
+
+    // The serving snapshot follows the root.
+    let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
+    assert!(
+        snapshot.graphs[0].root.starts_with(storage.path()),
+        "{:?}",
+        snapshot.graphs[0].root
+    );
+}
+
+#[test]
+fn storage_root_invalid_uri_fails_validation() {
+    let dir = fixture();
+    let mut config = fs::read_to_string(dir.path().join("cluster.yaml")).unwrap();
+    config = config.replace("version: 1\n", "version: 1\nstorage: \"s3://\"\n");
+    fs::write(dir.path().join("cluster.yaml"), config).unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
             .iter()
-            .find(|change| change.resource == "provider.embedding.default")
-            .expect("embedding profile backfill must be visible in plan");
-        assert_eq!(change.operation, PlanOperation::Update);
-        assert_eq!(change.before_digest, change.after_digest);
-        assert_eq!(
-            change.metadata_change,
-            Some(PlanMetadataChange::EmbeddingProfile)
-        );
+            .any(|diagnostic| diagnostic.code == "invalid_storage_root"),
+        "{:?}",
+        out.diagnostics
+    );
+}
 
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok && out.converged, "{out:?}");
-        let healed = read_state_json(dir.path());
-        assert_eq!(
-            healed["applied_revision"]["resources"]["provider.embedding.default"]
-                ["embedding_profile"]["model"],
-            serde_json::json!("recorded-x")
-        );
-        let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
-        let profile = snapshot.graphs[0].embedding.as_ref().unwrap();
-        assert_eq!(profile.model.as_deref(), Some("recorded-x"));
-    }
+#[tokio::test]
+async fn serving_snapshot_reads_converged_cluster() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path());
+    let converge = apply_config_dir(dir.path()).await;
+    assert!(converge.converged, "{converge:?}");
 
-    #[tokio::test]
-    async fn bindings_survive_refresh() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_applyable_state(dir.path());
-        let converge = apply_config_dir(dir.path()).await;
-        assert!(converge.converged, "{converge:?}");
+    let snapshot = read_serving_snapshot(dir.path())
+        .await
+        .expect("converged cluster must serve");
+    assert_eq!(snapshot.graphs.len(), 1);
+    assert_eq!(snapshot.graphs[0].graph_id, "knowledge");
+    assert!(snapshot.graphs[0].root.ends_with("graphs/knowledge.omni"));
+    assert_eq!(snapshot.queries.len(), 1);
+    assert_eq!(snapshot.queries[0].name, "find_person");
+    assert!(snapshot.queries[0].source.contains("query find_person"));
+    assert_eq!(snapshot.policies.len(), 1);
+    assert_eq!(snapshot.policies[0].applies_to, vec!["graph.knowledge"]);
+    // Content, not a path: the catalog may live on object storage.
+    // The fixture bundle has no rules — assert the verified text.
+    assert!(snapshot.policies[0].source.contains("rules:"));
+}
 
-        let refresh = refresh_config_dir(dir.path()).await;
-        assert!(refresh.ok, "{:?}", refresh.diagnostics);
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["policy.base"]["applies_to"],
-            serde_json::json!(["graph.knowledge"])
-        );
-    }
+#[tokio::test]
+async fn serving_snapshot_uses_applied_embedding_provider_profile() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_mock_embedding_cluster(dir.path(), "recorded-x");
+    write_applyable_state(dir.path());
+    let converge = apply_config_dir(dir.path()).await;
+    assert!(converge.converged, "{converge:?}");
 
-    // ---- serving snapshot (5B read-only loader) ----
+    let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
+    let profile = snapshot.graphs[0].embedding.as_ref().unwrap();
+    assert_eq!(profile.kind.as_deref(), Some("mock"));
+    assert_eq!(profile.model.as_deref(), Some("recorded-x"));
+}
 
-    // ---- storage: root (RFC-006) ----
+#[tokio::test]
+async fn serving_snapshot_refuses_missing_embedding_provider_metadata() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_mock_embedding_cluster(dir.path(), "recorded-x");
+    write_applyable_state(dir.path());
+    let converge = apply_config_dir(dir.path()).await;
+    assert!(converge.converged, "{converge:?}");
 
-    #[tokio::test]
-    async fn storage_root_defaults_to_config_dir_layout() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_applyable_state(dir.path());
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.converged, "{out:?}");
-        // No storage: key — the original on-disk layout, byte-compatible.
-        assert!(dir.path().join(CLUSTER_STATE_FILE).exists());
-        assert!(dir.path().join(CLUSTER_RESOURCES_DIR).exists());
-        assert!(dir.path().join("graphs/knowledge.omni").exists());
-    }
+    let mut state = read_state_json(dir.path());
+    state["applied_revision"]["resources"]["provider.embedding.default"]
+        .as_object_mut()
+        .unwrap()
+        .remove("embedding_profile");
+    fs::write(
+        dir.path().join(CLUSTER_STATE_FILE),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
 
-    #[tokio::test]
-    async fn storage_root_file_uri_relocates_the_cluster() {
-        let dir = fixture();
-        let storage = tempfile::tempdir().unwrap();
-        let storage_path = storage.path().to_string_lossy().to_string();
-        let mut config = fs::read_to_string(dir.path().join("cluster.yaml")).unwrap();
-        config = config.replace("version: 1\n", &format!("version: 1\nstorage: {storage_path}\n"));
-        fs::write(dir.path().join("cluster.yaml"), config).unwrap();
+    let err = read_serving_snapshot(dir.path()).await.unwrap_err();
+    assert!(
+        err.iter()
+            .any(|diagnostic| diagnostic.code == "embedding_provider_profile_missing"),
+        "{err:?}"
+    );
+    assert!(
+        err.iter()
+            .any(|diagnostic| diagnostic.code == "embedding_provider_missing"),
+        "{err:?}"
+    );
+}
 
-        let import = import_config_dir(dir.path()).await;
-        assert!(import.ok, "{:?}", import.diagnostics);
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok && out.converged, "{:?}", out.diagnostics);
+#[tokio::test]
+async fn serving_snapshot_refuses_missing_state() {
+    let dir = fixture();
+    let err = read_serving_snapshot(dir.path()).await.unwrap_err();
+    assert!(
+        err.iter()
+            .any(|diagnostic| diagnostic.code == "cluster_state_missing"),
+        "{err:?}"
+    );
+}
 
-        // Everything lives under the declared root; nothing under config dir.
-        assert!(storage.path().join("__cluster/state.json").exists());
-        assert!(storage.path().join("graphs/knowledge.omni").exists());
-        assert!(storage.path().join(CLUSTER_RESOURCES_DIR).exists());
-        assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
-        assert!(!dir.path().join("graphs").exists());
+#[tokio::test]
+async fn serving_snapshot_refuses_pending_recovery() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path());
+    apply_config_dir(dir.path()).await;
+    write_schema_apply_sidecar(dir.path(), "knowledge", "whatever", "01SERVE");
 
-        // The serving snapshot follows the root.
-        let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
-        assert!(
-            snapshot.graphs[0]
-                .root
-                .starts_with(storage.path()),
-            "{:?}",
-            snapshot.graphs[0].root
-        );
-    }
+    let err = read_serving_snapshot(dir.path()).await.unwrap_err();
+    assert!(
+        err.iter()
+            .any(|diagnostic| diagnostic.code == "cluster_no_healthy_graphs"),
+        "{err:?}"
+    );
+    assert!(
+        err.iter().any(|diagnostic| {
+            diagnostic.code == "cluster_recovery_pending" && diagnostic.path == "graph.knowledge"
+        }),
+        "{err:?}"
+    );
+}
 
-    #[test]
-    fn storage_root_invalid_uri_fails_validation() {
-        let dir = fixture();
-        let mut config = fs::read_to_string(dir.path().join("cluster.yaml")).unwrap();
-        config = config.replace("version: 1\n", "version: 1\nstorage: \"s3://\"\n");
-        fs::write(dir.path().join("cluster.yaml"), config).unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "invalid_storage_root"),
-            "{:?}",
-            out.diagnostics
-        );
-    }
-
-    #[tokio::test]
-    async fn serving_snapshot_reads_converged_cluster() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_applyable_state(dir.path());
-        let converge = apply_config_dir(dir.path()).await;
-        assert!(converge.converged, "{converge:?}");
-
-        let snapshot = read_serving_snapshot(dir.path()).await.expect("converged cluster must serve");
-        assert_eq!(snapshot.graphs.len(), 1);
-        assert_eq!(snapshot.graphs[0].graph_id, "knowledge");
-        assert!(snapshot.graphs[0].root.ends_with("graphs/knowledge.omni"));
-        assert_eq!(snapshot.queries.len(), 1);
-        assert_eq!(snapshot.queries[0].name, "find_person");
-        assert!(snapshot.queries[0].source.contains("query find_person"));
-        assert_eq!(snapshot.policies.len(), 1);
-        assert_eq!(snapshot.policies[0].applies_to, vec!["graph.knowledge"]);
-        // Content, not a path: the catalog may live on object storage.
-        // The fixture bundle is `rules: []` — assert the verified text.
-        assert!(snapshot.policies[0].source.contains("rules:"));
-    }
-
-    #[tokio::test]
-    async fn serving_snapshot_uses_applied_embedding_provider_profile() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_mock_embedding_cluster(dir.path(), "recorded-x");
-        write_applyable_state(dir.path());
-        let converge = apply_config_dir(dir.path()).await;
-        assert!(converge.converged, "{converge:?}");
-
-        let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
-        let profile = snapshot.graphs[0].embedding.as_ref().unwrap();
-        assert_eq!(profile.kind.as_deref(), Some("mock"));
-        assert_eq!(profile.model.as_deref(), Some("recorded-x"));
-    }
-
-    #[tokio::test]
-    async fn serving_snapshot_refuses_missing_embedding_provider_metadata() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_mock_embedding_cluster(dir.path(), "recorded-x");
-        write_applyable_state(dir.path());
-        let converge = apply_config_dir(dir.path()).await;
-        assert!(converge.converged, "{converge:?}");
-
-        let mut state = read_state_json(dir.path());
-        state["applied_revision"]["resources"]["provider.embedding.default"]
-            .as_object_mut()
-            .unwrap()
-            .remove("embedding_profile");
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
-
-        let err = read_serving_snapshot(dir.path()).await.unwrap_err();
-        assert!(
-            err.iter()
-                .any(|diagnostic| diagnostic.code == "embedding_provider_profile_missing"),
-            "{err:?}"
-        );
-        assert!(
-            err.iter()
-                .any(|diagnostic| diagnostic.code == "embedding_provider_missing"),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn serving_snapshot_refuses_missing_state() {
-        let dir = fixture();
-        let err = read_serving_snapshot(dir.path()).await.unwrap_err();
-        assert!(
-            err.iter().any(|diagnostic| diagnostic.code == "cluster_state_missing"),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn serving_snapshot_refuses_pending_recovery() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_applyable_state(dir.path());
-        apply_config_dir(dir.path()).await;
-        write_schema_apply_sidecar(dir.path(), "knowledge", "whatever", "01SERVE");
-
-        let err = read_serving_snapshot(dir.path()).await.unwrap_err();
-        assert!(
-            err.iter()
-                .any(|diagnostic| diagnostic.code == "cluster_no_healthy_graphs"),
-            "{err:?}"
-        );
-        assert!(
-            err.iter().any(|diagnostic| {
-                diagnostic.code == "cluster_recovery_pending"
-                    && diagnostic.path == "graph.knowledge"
-            }),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn serving_snapshot_quarantines_one_graph_with_pending_recovery() {
-        let dir = fixture();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
+#[tokio::test]
+async fn serving_snapshot_quarantines_one_graph_with_pending_recovery() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
 version: 1
 metadata:
   name: test
@@ -3539,2245 +3711,385 @@ graphs:
   archive:
     schema: ./people.pg
 "#,
-        )
-        .unwrap();
-        let graph_dir = dir.path().join(CLUSTER_GRAPHS_DIR);
-        fs::create_dir_all(&graph_dir).unwrap();
-        Omnigraph::init(
-            graph_dir.join("knowledge.omni").to_string_lossy().as_ref(),
-            SCHEMA,
-        )
-        .await
-        .unwrap();
-        Omnigraph::init(
-            graph_dir.join("archive.omni").to_string_lossy().as_ref(),
-            SCHEMA,
-        )
-        .await
-        .unwrap();
-        let desired = validate_config_dir(dir.path());
-        assert!(desired.ok, "{:?}", desired.diagnostics);
-        let schema_digest = desired.resource_digests["schema.knowledge"].clone();
-        let empty_queries = BTreeMap::new();
-        let knowledge_digest = graph_digest(
-            "knowledge",
-            Some(&schema_digest),
-            Some(&empty_queries),
-            None,
-            None,
-        );
-        let archive_digest = graph_digest(
-            "archive",
-            Some(&schema_digest),
-            Some(&empty_queries),
-            None,
-            None,
-        );
-        write_state_resources(
-            dir.path(),
-            &[
-                ("graph.knowledge", knowledge_digest.as_str()),
-                ("schema.knowledge", schema_digest.as_str()),
-                ("graph.archive", archive_digest.as_str()),
-                ("schema.archive", schema_digest.as_str()),
-            ],
-        );
-        write_schema_apply_sidecar(dir.path(), "knowledge", "whatever", "01SERVE2");
+    )
+    .unwrap();
+    let graph_dir = dir.path().join(CLUSTER_GRAPHS_DIR);
+    fs::create_dir_all(&graph_dir).unwrap();
+    Omnigraph::init(
+        graph_dir.join("knowledge.omni").to_string_lossy().as_ref(),
+        SCHEMA,
+    )
+    .await
+    .unwrap();
+    Omnigraph::init(
+        graph_dir.join("archive.omni").to_string_lossy().as_ref(),
+        SCHEMA,
+    )
+    .await
+    .unwrap();
+    let desired = validate_config_dir(dir.path());
+    assert!(desired.ok, "{:?}", desired.diagnostics);
+    let schema_digest = desired.resource_digests["schema.knowledge"].clone();
+    let empty_queries = BTreeMap::new();
+    let knowledge_digest = graph_digest(
+        "knowledge",
+        Some(&schema_digest),
+        Some(&empty_queries),
+        None,
+        None,
+    );
+    let archive_digest = graph_digest(
+        "archive",
+        Some(&schema_digest),
+        Some(&empty_queries),
+        None,
+        None,
+    );
+    write_state_resources(
+        dir.path(),
+        &[
+            ("graph.knowledge", knowledge_digest.as_str()),
+            ("schema.knowledge", schema_digest.as_str()),
+            ("graph.archive", archive_digest.as_str()),
+            ("schema.archive", schema_digest.as_str()),
+        ],
+    );
+    write_schema_apply_sidecar(dir.path(), "knowledge", "whatever", "01SERVE2");
 
-        let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
-        assert_eq!(snapshot.graphs.len(), 1);
-        assert_eq!(snapshot.graphs[0].graph_id, "archive");
-        assert!(snapshot.queries.is_empty());
-        assert!(snapshot.policies.is_empty());
-        assert!(snapshot.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "cluster_recovery_pending"
-                && diagnostic.path == "graph.knowledge"
-                && diagnostic.severity == DiagnosticSeverity::Warning
-        }));
-    }
+    let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
+    assert_eq!(snapshot.graphs.len(), 1);
+    assert_eq!(snapshot.graphs[0].graph_id, "archive");
+    assert!(snapshot.queries.is_empty());
+    assert!(snapshot.policies.is_empty());
+    assert!(snapshot.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "cluster_recovery_pending"
+            && diagnostic.path == "graph.knowledge"
+            && diagnostic.severity == DiagnosticSeverity::Warning
+    }));
+}
 
-    #[tokio::test]
-    async fn serving_snapshot_refuses_tampered_blob_and_stripped_bindings() {
-        let dir = fixture();
-        init_derived_graph(dir.path()).await;
-        write_applyable_state(dir.path());
-        apply_config_dir(dir.path()).await;
-        // Tamper with the query blob...
-        let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
-        let desired = validate_config_dir(dir.path());
-        let query_digest = &desired.resource_digests["query.knowledge.find_person"];
-        let blob = dir
-            .path()
-            .join(CLUSTER_RESOURCES_DIR)
-            .join("query/knowledge/find_person")
-            .join(format!("{query_digest}.gq"));
-        fs::write(&blob, "tampered").unwrap();
-        // ...and strip the policy bindings (pre-5A ledger).
-        let mut state: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
-        )
-        .unwrap();
-        state["applied_revision"]["resources"]["policy.base"]
-            .as_object_mut()
-            .unwrap()
-            .remove("applies_to");
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
+#[tokio::test]
+async fn serving_snapshot_refuses_tampered_blob_and_stripped_bindings() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path());
+    apply_config_dir(dir.path()).await;
+    // Tamper with the query blob...
+    let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
+    let desired = validate_config_dir(dir.path());
+    let query_digest = &desired.resource_digests["query.knowledge.find_person"];
+    let blob = dir
+        .path()
+        .join(CLUSTER_RESOURCES_DIR)
+        .join("query/knowledge/find_person")
+        .join(format!("{query_digest}.gq"));
+    fs::write(&blob, "tampered").unwrap();
+    // ...and strip the policy bindings (pre-5A ledger).
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap())
+            .unwrap();
+    state["applied_revision"]["resources"]["policy.base"]
+        .as_object_mut()
+        .unwrap()
+        .remove("applies_to");
+    fs::write(
+        dir.path().join(CLUSTER_STATE_FILE),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
 
-        let err = read_serving_snapshot(dir.path()).await.unwrap_err();
-        assert!(
-            err.iter()
-                .any(|diagnostic| diagnostic.code == "catalog_payload_digest_mismatch"),
-            "{err:?}"
-        );
-        assert!(
-            err.iter().any(|diagnostic| diagnostic.code == "policy_bindings_missing"),
-            "{err:?}"
-        );
-        let _ = snapshot; // the pre-tamper read succeeded
-    }
+    let err = read_serving_snapshot(dir.path()).await.unwrap_err();
+    assert!(
+        err.iter()
+            .any(|diagnostic| diagnostic.code == "catalog_payload_digest_mismatch"),
+        "{err:?}"
+    );
+    assert!(
+        err.iter()
+            .any(|diagnostic| diagnostic.code == "policy_bindings_missing"),
+        "{err:?}"
+    );
+    let _ = snapshot; // the pre-tamper read succeeded
+}
 
-    #[tokio::test]
-    async fn serving_snapshot_refuses_empty_cluster() {
-        let dir = fixture();
-        write_state_resources(dir.path(), &[]); // state exists, no graphs
+#[tokio::test]
+async fn serving_snapshot_refuses_empty_cluster() {
+    let dir = fixture();
+    write_state_resources(dir.path(), &[]); // state exists, no graphs
 
-        let err = read_serving_snapshot(dir.path()).await.unwrap_err();
-        assert!(
-            err.iter().any(|diagnostic| diagnostic.code == "cluster_empty"),
-            "{err:?}"
-        );
-    }
+    let err = read_serving_snapshot(dir.path()).await.unwrap_err();
+    assert!(
+        err.iter()
+            .any(|diagnostic| diagnostic.code == "cluster_empty"),
+        "{err:?}"
+    );
+}
 
-    // ---- query discovery (Terraform-style declaration) ----
+// ---- query discovery (Terraform-style declaration) ----
 
-    #[test]
-    fn queries_directory_discovers_every_declaration() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("people.pg"), "\nnode Person {\n  name: String @key\n}\n").unwrap();
-        fs::create_dir(dir.path().join("queries")).unwrap();
-        fs::write(
+#[test]
+fn queries_directory_discovers_every_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n}\n",
+    )
+    .unwrap();
+    fs::create_dir(dir.path().join("queries")).unwrap();
+    fs::write(
             dir.path().join("queries/people.gq"),
             "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n\nquery all_people() {\n  match { $p: Person }\n  return { $p.name }\n}\n",
         )
         .unwrap();
-        fs::write(
-            dir.path().join("queries/extra.gq"),
-            "\nquery count_people() {\n  match { $p: Person }\n  return { count($p) }\n}\n",
-        )
-        .unwrap();
-        fs::write(dir.path().join("queries/notes.txt"), "ignored").unwrap();
-        fs::write(
-            dir.path().join("cluster.yaml"),
-            "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: ./queries/\n",
-        )
-        .unwrap();
+    fs::write(
+        dir.path().join("queries/extra.gq"),
+        "\nquery count_people() {\n  match { $p: Person }\n  return { count($p) }\n}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("queries/notes.txt"), "ignored").unwrap();
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: ./queries/\n",
+    )
+    .unwrap();
 
-        let out = validate_config_dir(dir.path());
-        assert!(out.ok, "{:?}", out.diagnostics);
-        let names: Vec<&str> = out
-            .resource_digests
-            .keys()
-            .filter_map(|address| address.strip_prefix("query.knowledge."))
-            .collect();
-        assert_eq!(names, vec!["all_people", "count_people", "find_person"]);
-    }
+    let out = validate_config_dir(dir.path());
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let names: Vec<&str> = out
+        .resource_digests
+        .keys()
+        .filter_map(|address| address.strip_prefix("query.knowledge."))
+        .collect();
+    assert_eq!(names, vec!["all_people", "count_people", "find_person"]);
+}
 
-    #[test]
-    fn queries_list_and_single_file_forms_discover() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("people.pg"), "\nnode Person {\n  name: String @key\n}\n").unwrap();
-        fs::write(
+#[test]
+fn queries_list_and_single_file_forms_discover() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n}\n",
+    )
+    .unwrap();
+    fs::write(
             dir.path().join("a.gq"),
             "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
         )
         .unwrap();
-        fs::write(
-            dir.path().join("b.gq"),
-            "\nquery all_people() {\n  match { $p: Person }\n  return { $p.name }\n}\n",
-        )
-        .unwrap();
-        fs::write(
+    fs::write(
+        dir.path().join("b.gq"),
+        "\nquery all_people() {\n  match { $p: Person }\n  return { $p.name }\n}\n",
+    )
+    .unwrap();
+    fs::write(
             dir.path().join("cluster.yaml"),
             "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: [./a.gq, ./b.gq]\n",
         )
         .unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.resource_digests.contains_key("query.knowledge.find_person"));
-        assert!(out.resource_digests.contains_key("query.knowledge.all_people"));
+    let out = validate_config_dir(dir.path());
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(
+        out.resource_digests
+            .contains_key("query.knowledge.find_person")
+    );
+    assert!(
+        out.resource_digests
+            .contains_key("query.knowledge.all_people")
+    );
 
-        // Single-file string form
-        fs::write(
-            dir.path().join("cluster.yaml"),
-            "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: ./a.gq\n",
-        )
-        .unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.resource_digests.contains_key("query.knowledge.find_person"));
-        assert!(!out.resource_digests.contains_key("query.knowledge.all_people"));
-    }
+    // Single-file string form
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: ./a.gq\n",
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(
+        out.resource_digests
+            .contains_key("query.knowledge.find_person")
+    );
+    assert!(
+        !out.resource_digests
+            .contains_key("query.knowledge.all_people")
+    );
+}
 
-    #[test]
-    fn query_discovery_rejects_duplicates_and_parse_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("people.pg"), "\nnode Person {\n  name: String @key\n}\n").unwrap();
-        let decl = "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n";
-        fs::write(dir.path().join("a.gq"), decl).unwrap();
-        fs::write(dir.path().join("b.gq"), decl).unwrap();
-        fs::write(
+#[test]
+fn query_discovery_rejects_duplicates_and_parse_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n}\n",
+    )
+    .unwrap();
+    let decl = "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n";
+    fs::write(dir.path().join("a.gq"), decl).unwrap();
+    fs::write(dir.path().join("b.gq"), decl).unwrap();
+    fs::write(
             dir.path().join("cluster.yaml"),
             "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: [./a.gq, ./b.gq]\n",
         )
         .unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "duplicate_query_name"),
-            "{:?}",
-            out.diagnostics
-        );
-
-        fs::write(dir.path().join("broken.gq"), "query {{{ nope").unwrap();
-        fs::write(
-            dir.path().join("cluster.yaml"),
-            "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: ./broken.gq\n",
-        )
-        .unwrap();
-        let out = validate_config_dir(dir.path());
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "query_parse_error"),
-            "{:?}",
-            out.diagnostics
-        );
-    }
-
-    #[tokio::test]
-    async fn status_warns_on_pending_recovery_sidecar() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-        write_create_sidecar(dir.path(), "knowledge", "irrelevant", "01STATUS");
-
-        let out = status_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "cluster_recovery_pending"
-                    && diagnostic.severity == DiagnosticSeverity::Warning)
-        );
-    }
-
-    #[tokio::test]
-    async fn read_only_commands_ignore_missing_recovery_sidecar_dir() {
-        let dir = fixture();
-        write_applyable_state(dir.path());
-        assert!(!dir.path().join(CLUSTER_RECOVERIES_DIR).exists());
-
-        let status = status_config_dir(dir.path()).await;
-        assert!(status.ok, "{:?}", status.diagnostics);
-        assert!(
-            !status.diagnostics.iter().any(|diagnostic| matches!(
-                diagnostic.code.as_str(),
-                "recovery_sidecar_read_error" | "cluster_recovery_pending"
-            )),
-            "{:?}",
-            status.diagnostics
-        );
-
-        let plan = plan_config_dir(dir.path()).await;
-        assert!(plan.ok, "{:?}", plan.diagnostics);
-        assert!(
-            !plan.diagnostics.iter().any(|diagnostic| matches!(
-                diagnostic.code.as_str(),
-                "recovery_sidecar_read_error" | "cluster_recovery_pending"
-            )),
-            "{:?}",
-            plan.diagnostics
-        );
-    }
-
-    #[tokio::test]
-    async fn read_only_commands_warn_on_pending_recovery_sidecar_in_storage_root() {
-        let dir = fixture();
-        let storage = tempfile::tempdir().unwrap();
-        let storage_path = storage.path().to_string_lossy().to_string();
-        let mut config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
-        config = config.replace(
-            "version: 1\n",
-            &format!("version: 1\nstorage: {storage_path}\n"),
-        );
-        fs::write(dir.path().join(CLUSTER_CONFIG_FILE), config).unwrap();
-
-        let desired = validate_config_dir(dir.path());
-        assert!(desired.ok, "{:?}", desired.diagnostics);
-        let schema_digest = desired
-            .resource_digests
-            .get("schema.knowledge")
-            .unwrap()
-            .clone();
-        let graph_composite = graph_digest(
-            "knowledge",
-            Some(&schema_digest),
-            Some(&BTreeMap::new()),
-            None,
-            None,
-        );
-        write_state_resources(
-            storage.path(),
-            &[
-                ("graph.knowledge", graph_composite.as_str()),
-                ("schema.knowledge", schema_digest.as_str()),
-            ],
-        );
-        write_create_sidecar(storage.path(), "knowledge", "irrelevant", "01STORAGE");
-
-        let status = status_config_dir(dir.path()).await;
-        assert!(status.ok, "{:?}", status.diagnostics);
-        assert!(
-            status
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "cluster_recovery_pending"
-                    && diagnostic.path.contains("01STORAGE.json")),
-            "{:?}",
-            status.diagnostics
-        );
-
-        let plan = plan_config_dir(dir.path()).await;
-        assert!(plan.ok, "{:?}", plan.diagnostics);
-        assert!(
-            plan.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "cluster_recovery_pending"
-                    && diagnostic.path.contains("01STORAGE.json")),
-            "{:?}",
-            plan.diagnostics
-        );
-
-        assert!(!dir.path().join(CLUSTER_RECOVERIES_DIR).exists());
-    }
-
-    #[tokio::test]
-    async fn plan_annotates_apply_dispositions() {
-        let dir = fixture();
-        let out = plan_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        let by_resource: BTreeMap<&str, &PlanChange> = out
-            .changes
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
             .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        // Stage 4A: graph/schema creates are executable, and dependents ride
-        // the same run — plan previews exactly that.
-        assert_eq!(
-            by_resource["graph.knowledge"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        assert_eq!(
-            by_resource["schema.knowledge"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        assert_eq!(
-            by_resource["query.knowledge.find_person"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        assert_eq!(
-            by_resource["policy.base"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-    }
+            .any(|diagnostic| diagnostic.code == "duplicate_query_name"),
+        "{:?}",
+        out.diagnostics
+    );
 
-    // ---- RFC-026 §4.7 P1: streaming enablement (slice 1) ----
+    fs::write(dir.path().join("broken.gq"), "query {{{ nope").unwrap();
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: ./broken.gq\n",
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "query_parse_error"),
+        "{:?}",
+        out.diagnostics
+    );
+}
 
-    fn write_streaming_cluster(config_dir: &Path, streaming: Option<bool>) {
-        fs::write(
-            config_dir.join("base.policy.yaml"),
-            r#"
-version: 1
-groups:
-  stream_operators: [stream-operator]
-rules:
-  - id: stream-operators-manage
-    allow:
-      actors: { group: stream_operators }
-      actions: [stream_manage]
-"#,
-        )
-        .unwrap();
-        let streaming_line = match streaming {
-            Some(enabled) => format!("    streaming: {enabled}\n"),
-            None => String::new(),
-        };
-        fs::write(
-            config_dir.join(CLUSTER_CONFIG_FILE),
-            format!(
-                r#"
-version: 1
-metadata:
-  name: test
-state:
-  backend: cluster
-  lock: true
-graphs:
-  knowledge:
-    schema: ./people.pg
-{streaming_line}    queries:
-      find_person:
-        file: ./people.gq
-policies:
-  base:
-    file: ./base.policy.yaml
-    applies_to: [knowledge]
-"#
-            ),
-        )
-        .unwrap();
-    }
+#[tokio::test]
+async fn status_warns_on_pending_recovery_sidecar() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    write_create_sidecar(dir.path(), "knowledge", "irrelevant", "01STATUS");
 
-    async fn confirmed_streaming_apply(config_dir: &Path) -> ApplyOutput {
-        apply_config_dir_with_options(
-            config_dir,
-            ApplyOptions {
-                actor: Some("stream-operator".to_string()),
-                confirm_stream_offline: true,
-            },
-        )
-        .await
-    }
+    let out = status_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "cluster_recovery_pending"
+                && diagnostic.severity == DiagnosticSeverity::Warning)
+    );
+}
 
-    async fn live_streaming_enabled(config_dir: &Path) -> bool {
-        let graph_uri = format!("{}/graphs/knowledge.omni", config_dir.display());
-        let db = Omnigraph::open_read_only(&graph_uri).await.unwrap();
-        db.snapshot_of(omnigraph::db::ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .streaming_status()
-            .enabled
-    }
+#[tokio::test]
+async fn read_only_commands_ignore_missing_recovery_sidecar_dir() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    assert!(!dir.path().join(CLUSTER_RECOVERIES_DIR).exists());
 
-    #[test]
-    fn unreadable_pre_schema_stream_probe_is_unknown_not_safe() {
-        assert_eq!(
-            classify_pre_schema_stream_probe(Err::<&str, ()>(())),
-            PreSchemaStreamProbe::Unknown
-        );
-        assert_eq!(
-            classify_pre_schema_stream_probe(Ok::<&str, ()>("DISABLING")),
-            PreSchemaStreamProbe::Disabling
-        );
-        assert_eq!(
-            classify_pre_schema_stream_probe(Ok::<&str, ()>("ENABLED")),
-            PreSchemaStreamProbe::Other
-        );
-    }
+    let status = status_config_dir(dir.path()).await;
+    assert!(status.ok, "{:?}", status.diagnostics);
+    assert!(
+        !status.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic.code.as_str(),
+            "recovery_sidecar_read_error" | "cluster_recovery_pending"
+        )),
+        "{:?}",
+        status.diagnostics
+    );
 
-    #[test]
-    fn streaming_config_accepts_bool_and_rejects_non_bool() {
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        let out = validate_config_dir(dir.path());
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(
-            out.resource_digests.contains_key("streaming.knowledge"),
-            "declared streaming must emit its first-class resource: {:?}",
-            out.resource_digests
-        );
+    let plan = plan_config_dir(dir.path()).await;
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert!(
+        !plan.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic.code.as_str(),
+            "recovery_sidecar_read_error" | "cluster_recovery_pending"
+        )),
+        "{:?}",
+        plan.diagnostics
+    );
+}
 
-        // Absent = unmanaged: no resource, and (load-bearing for approvals)
-        // the config digest must be byte-identical to a pre-streaming config.
-        write_streaming_cluster(dir.path(), None);
-        let unmanaged = validate_config_dir(dir.path());
-        assert!(unmanaged.ok);
-        assert!(!unmanaged.resource_digests.contains_key("streaming.knowledge"));
+#[tokio::test]
+async fn read_only_commands_warn_on_pending_recovery_sidecar_in_storage_root() {
+    let dir = fixture();
+    let storage = tempfile::tempdir().unwrap();
+    let storage_path = storage.path().to_string_lossy().to_string();
+    let mut config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    config = config.replace(
+        "version: 1\n",
+        &format!("version: 1\nstorage: {storage_path}\n"),
+    );
+    fs::write(dir.path().join(CLUSTER_CONFIG_FILE), config).unwrap();
 
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
-version: 1
-graphs:
-  knowledge:
-    schema: ./people.pg
-    streaming: "yes"
-"#,
-        )
-        .unwrap();
-        let rejected = validate_config_dir(dir.path());
-        assert!(
-            !rejected.ok,
-            "a non-boolean streaming declaration must be a validation error"
-        );
-    }
+    let desired = validate_config_dir(dir.path());
+    assert!(desired.ok, "{:?}", desired.diagnostics);
+    let schema_digest = desired
+        .resource_digests
+        .get("schema.knowledge")
+        .unwrap()
+        .clone();
+    let graph_composite = graph_digest(
+        "knowledge",
+        Some(&schema_digest),
+        Some(&BTreeMap::new()),
+        None,
+        None,
+    );
+    write_state_resources(
+        storage.path(),
+        &[
+            ("graph.knowledge", graph_composite.as_str()),
+            ("schema.knowledge", schema_digest.as_str()),
+        ],
+    );
+    write_create_sidecar(storage.path(), "knowledge", "irrelevant", "01STORAGE");
 
-    #[test]
-    fn streaming_classifies_first_class_and_drain_pending_blocks() {
-        // The dedicated resource kind parses, and a drain-pending graph
-        // blocks the flip with the §4.7 P1 disposition — the shape later
-        // slices populate from live observation. Delete stays Applied
-        // (unmanage = ledger-row removal, never an engine call).
-        assert_eq!(
-            resource_kind("streaming.knowledge"),
-            ResourceKind::Streaming("knowledge".to_string())
-        );
-        let mut changes = vec![
-            PlanChange {
-                resource: "streaming.knowledge".to_string(),
-                operation: PlanOperation::Update,
-                before_digest: Some("a".to_string()),
-                after_digest: Some("b".to_string()),
-                disposition: None,
-                reason: None,
-                binding_change: false,
-                metadata_change: None,
-                migration: None,
-            },
-            PlanChange {
-                resource: "streaming.other".to_string(),
-                operation: PlanOperation::Delete,
-                before_digest: Some("a".to_string()),
-                after_digest: None,
-                disposition: None,
-                reason: None,
-                binding_change: false,
-                metadata_change: None,
-                migration: None,
-            },
-        ];
-        let drain_pending = BTreeSet::from(["knowledge".to_string(), "other".to_string()]);
-        classify_changes(
-            &mut changes,
-            &[],
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            &drain_pending,
-        );
-        assert_eq!(changes[0].disposition, Some(ApplyDisposition::Blocked));
-        assert_eq!(changes[0].reason.as_deref(), Some("streaming_drain_pending"));
-        assert_eq!(changes[1].disposition, Some(ApplyDisposition::Applied));
-        assert_eq!(changes[1].reason, None);
-    }
-
-    #[tokio::test]
-    async fn streaming_apply_requires_lock_confirmation_and_actor_before_graph_effects() {
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        write_state_resources(dir.path(), &[]);
-
-        let unconfirmed = apply_config_dir(dir.path()).await;
-        assert!(!unconfirmed.ok, "{unconfirmed:?}");
-        assert!(unconfirmed.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "streaming_offline_confirmation_required"
-        }));
-        assert!(unconfirmed
+    let status = status_config_dir(dir.path()).await;
+    assert!(status.ok, "{:?}", status.diagnostics);
+    assert!(
+        status
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "streaming_apply_actor_required"));
-        assert!(
-            !dir.path().join("graphs/knowledge.omni").exists(),
-            "profile-authority refusal must precede graph effects"
-        );
+            .any(|diagnostic| diagnostic.code == "cluster_recovery_pending"
+                && diagnostic.path.contains("01STORAGE.json")),
+        "{:?}",
+        status.diagnostics
+    );
 
-        let config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            config.replace("  lock: true", "  lock: false"),
-        )
-        .unwrap();
-        let unlocked = confirmed_streaming_apply(dir.path()).await;
-        assert!(!unlocked.ok, "{unlocked:?}");
-        assert!(unlocked
-            .diagnostics
+    let plan = plan_config_dir(dir.path()).await;
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert!(
+        plan.diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "streaming_requires_state_lock"));
-        assert!(
-            !dir.path().join("graphs/knowledge.omni").exists(),
-            "missing-lock refusal must precede graph effects"
-        );
-    }
+            .any(|diagnostic| diagnostic.code == "cluster_recovery_pending"
+                && diagnostic.path.contains("01STORAGE.json")),
+        "{:?}",
+        plan.diagnostics
+    );
 
-    #[test]
-    fn streaming_profile_operation_identity_is_stable_and_target_bound() {
-        let state_cas = format!("sha256:{}", "a".repeat(64));
-        let first = stream_profile_operation_id(
-            &state_cas,
-            "config-revision",
-            "declaration-digest",
-            "knowledge",
-            "/cluster/graphs/knowledge.omni",
-            true,
-        );
-        assert_eq!(
-            first,
-            stream_profile_operation_id(
-                &state_cas,
-                "config-revision",
-                "declaration-digest",
-                "knowledge",
-                "/cluster/graphs/knowledge.omni",
-                true,
-            )
-        );
-        assert_ne!(
-            first,
-            stream_profile_operation_id(
-                &state_cas,
-                "config-revision",
-                "declaration-digest",
-                "knowledge",
-                "/cluster/graphs/knowledge.omni",
-                false,
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_propagates_streaming_flag_and_disable() {
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        write_state_resources(dir.path(), &[]);
-
-        // First apply creates the real graph and must land the flag in the
-        // graph's __manifest — the engine-obeyed authority — not just the
-        // ledger. The change classifies Applied, never Derived (the
-        // fake-convergence trap this resource kind exists to avoid).
-        let out = confirmed_streaming_apply(dir.path()).await;
-        assert!(out.ok && out.converged, "{out:?}");
-        let streaming_change = out
-            .changes
-            .iter()
-            .find(|change| change.resource == "streaming.knowledge")
-            .expect("streaming change visible in apply");
-        assert_eq!(streaming_change.disposition, Some(ApplyDisposition::Applied));
-        assert!(live_streaming_enabled(dir.path()).await);
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["streaming.knowledge"]["streaming_enabled"],
-            serde_json::json!(true)
-        );
-        assert_eq!(
-            state["applied_revision"]["resources"]["streaming.knowledge"]["profile_revision"],
-            serde_json::json!(2)
-        );
-        assert_eq!(
-            state["applied_revision"]["resources"]["streaming.knowledge"]["profile_mode"],
-            serde_json::json!("ENABLED")
-        );
-        let declaration_digest = streaming_digest("knowledge", true);
-        let declaration_revision =
-            streaming_declaration_revision("knowledge", &declaration_digest);
-        assert_eq!(
-            state["applied_revision"]["resources"]["streaming.knowledge"]
-                ["declaration_revision"],
-            serde_json::json!(declaration_revision.clone())
-        );
-        let original_config_digest = state["applied_revision"]["config_digest"].clone();
-        let serving = read_serving_snapshot(dir.path()).await.unwrap();
-        let binding = serving.graphs[0]
-            .stream_runtime_authority
-            .as_ref()
-            .expect("enabled served graph carries validated binding evidence");
-        assert!(serving.graphs[0].stream_served_export_authority.is_none());
-        assert_eq!(binding.graph_id(), "knowledge");
-        assert_eq!(binding.profile_revision(), 2);
-        assert_eq!(binding.declaration_revision(), declaration_revision);
-
-        // Idempotent: a second run sees no changes and calls no engine.
-        let again = confirmed_streaming_apply(dir.path()).await;
-        assert!(again.changes.is_empty() && !again.state_written, "{again:?}");
-
-        // An unrelated cluster resource may advance the global applied config
-        // without invalidating this graph's unchanged fold delegation.
-        let policy_path = dir.path().join("base.policy.yaml");
-        let current_policy = fs::read_to_string(&policy_path).unwrap();
-        fs::write(
-            policy_path,
-            format!("{current_policy}\n# unrelated policy revision\n"),
-        )
-        .unwrap();
-        let unrelated = confirmed_streaming_apply(dir.path()).await;
-        assert!(unrelated.ok && unrelated.converged, "{unrelated:?}");
-        let state = read_state_json(dir.path());
-        assert_ne!(
-            state["applied_revision"]["config_digest"],
-            original_config_digest
-        );
-        assert_eq!(
-            state["applied_revision"]["resources"]["streaming.knowledge"]
-                ["declaration_revision"],
-            serde_json::json!(declaration_revision.clone())
-        );
-        let serving = read_serving_snapshot(dir.path()).await.unwrap();
-        let binding = serving.graphs[0]
-            .stream_runtime_authority
-            .as_ref()
-            .expect("unrelated apply preserves the enabled runtime binding");
-        assert!(serving.graphs[0].stream_served_export_authority.is_none());
-        assert_eq!(binding.declaration_revision(), declaration_revision);
-        assert_eq!(binding.profile_revision(), 2);
-
-        // A stale cluster row must converge from the engine's no-op result,
-        // including the discriminated mode and declaration binding.
-        let mut state = read_state_json(dir.path());
-        let stale_digest = streaming_digest("knowledge", false);
-        let stale = &mut state["applied_revision"]["resources"]["streaming.knowledge"];
-        stale["digest"] = serde_json::json!(stale_digest.clone());
-        stale["declaration_revision"] = serde_json::json!(
-            streaming_declaration_revision("knowledge", &stale_digest)
-        );
-        stale["streaming_enabled"] = serde_json::json!(false);
-        stale["profile_mode"] = serde_json::json!("DISABLED");
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
-        let reconciled_noop = confirmed_streaming_apply(dir.path()).await;
-        assert!(
-            reconciled_noop.ok && reconciled_noop.converged,
-            "{reconciled_noop:?}"
-        );
-        let state = read_state_json(dir.path());
-        let row = &state["applied_revision"]["resources"]["streaming.knowledge"];
-        assert_eq!(row["streaming_enabled"], serde_json::json!(true));
-        assert_eq!(row["profile_mode"], serde_json::json!("ENABLED"));
-        assert_eq!(
-            row["declaration_revision"],
-            serde_json::json!(declaration_revision.clone())
-        );
-        assert_eq!(row["profile_revision"], serde_json::json!(2));
-
-        // Explicit `streaming: false` disables (clean graph → converges now).
-        write_streaming_cluster(dir.path(), Some(false));
-        let out = confirmed_streaming_apply(dir.path()).await;
-        assert!(out.ok && out.converged, "{out:?}");
-        assert!(!live_streaming_enabled(dir.path()).await);
-        let serving = read_serving_snapshot(dir.path()).await.unwrap();
-        assert!(serving.graphs[0].stream_runtime_authority.is_none());
-        let terminal = serving.graphs[0]
-            .stream_served_export_authority
-            .as_ref()
-            .expect("disabled served graph carries checked export binding evidence");
-        assert_eq!(terminal.graph_id(), "knowledge");
-        assert_eq!(
-            terminal.managed_profile().map(|(mode, _)| mode),
-            Some("DISABLED")
-        );
-
-        // Removing an active declaration cannot bypass the durable disable.
-        write_streaming_cluster(dir.path(), Some(true));
-        let out = confirmed_streaming_apply(dir.path()).await;
-        assert!(out.ok && out.converged, "{out:?}");
-        assert!(live_streaming_enabled(dir.path()).await);
-        write_streaming_cluster(dir.path(), None);
-        let blocked = confirmed_streaming_apply(dir.path()).await;
-        let change = blocked
-            .changes
-            .iter()
-            .find(|change| change.resource == "streaming.knowledge")
-            .unwrap();
-        assert_eq!(change.disposition, Some(ApplyDisposition::Blocked));
-        assert_eq!(
-            change.reason.as_deref(),
-            Some("streaming_profile_must_disable_first")
-        );
-        assert!(!blocked.converged);
-        assert!(live_streaming_enabled(dir.path()).await);
-
-        // Explicit false reaches terminal DISABLED; only then may a second
-        // apply remove the declaration as configuration-only unmanagement.
-        write_streaming_cluster(dir.path(), Some(false));
-        let disabled = confirmed_streaming_apply(dir.path()).await;
-        assert!(disabled.ok && disabled.converged, "{disabled:?}");
-        let serving = read_serving_snapshot(dir.path()).await.unwrap();
-        assert!(serving.graphs[0].stream_runtime_authority.is_none());
-        assert_eq!(
-            serving.graphs[0]
-                .stream_served_export_authority
-                .as_ref()
-                .expect("terminal managed graph keeps served export evidence")
-                .managed_profile()
-                .map(|(mode, _)| mode),
-            Some("DISABLED")
-        );
-        write_streaming_cluster(dir.path(), None);
-        let out = confirmed_streaming_apply(dir.path()).await;
-        assert!(out.ok && out.converged, "{out:?}");
-        let state = read_state_json(dir.path());
-        assert!(
-            state["applied_revision"]["resources"]
-                .get("streaming.knowledge")
-                .is_none(),
-            "unmanaged flag must drop its ledger row"
-        );
-        assert!(
-            !live_streaming_enabled(dir.path()).await,
-            "unmanaging after explicit disable must preserve DISABLED"
-        );
-        let serving = read_serving_snapshot(dir.path()).await.unwrap();
-        assert!(serving.graphs[0].stream_runtime_authority.is_none());
-        assert!(
-            serving.graphs[0]
-                .stream_served_export_authority
-                .as_ref()
-                .is_some_and(|binding| binding.is_unmanaged_terminal()),
-            "an unmanaged graph keeps exact graph/state evidence so server startup can bind it only for RETIRED or enrolled DISABLED"
-        );
-    }
-
-    #[cfg(feature = "failpoints")]
-    #[test]
-    #[serial_test::serial]
-    fn blocked_disable_persists_exact_disabling_correction_authority() {
-        on_big_stack(blocked_disable_persists_exact_disabling_correction_authority_body);
-    }
-
-    #[cfg(feature = "failpoints")]
-    async fn prepare_blocked_disable_data_block(dir: &Path) -> std::path::PathBuf {
-        fs::write(
-            dir.join("people.pg"),
-            r#"
-node Person {
-  name: String @key
-  age: I32
-  @unique(age)
+    assert!(!dir.path().join(CLUSTER_RECOVERIES_DIR).exists());
 }
-"#,
-        )
-        .unwrap();
-        write_streaming_cluster(dir, Some(false));
-        write_state_resources(dir, &[]);
-        let created = confirmed_streaming_apply(dir).await;
-        assert!(created.ok && created.converged, "{created:?}");
 
-        let graph_root = dir.join("graphs/knowledge.omni");
-        let db = Arc::new(Omnigraph::open(graph_root.to_str().unwrap()).await.unwrap());
-        let mut params = ParamMap::new();
-        params.insert("name".to_string(), Literal::String("base".to_string()));
-        params.insert("age".to_string(), Literal::Integer(7));
-        db.mutate(
-            "main",
-            r#"
-query seed($name: String, $age: I32) {
-  insert Person { name: $name, age: $age }
+#[tokio::test]
+async fn plan_annotates_apply_dispositions() {
+    let dir = fixture();
+    let out = plan_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let by_resource: BTreeMap<&str, &PlanChange> = out
+        .changes
+        .iter()
+        .map(|change| (change.resource.as_str(), change))
+        .collect();
+    // Stage 4A: graph/schema creates are executable, and dependents ride
+    // the same run — plan previews exactly that.
+    assert_eq!(
+        by_resource["graph.knowledge"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["schema.knowledge"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["query.knowledge.find_person"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["policy.base"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
 }
-"#,
-            "seed",
-            &params,
-        )
-        .await
-        .unwrap();
-        db.failpoint_enroll_stream_table_for_test("node:Person")
-            .await
-            .unwrap();
-        drop(db);
-
-        write_streaming_cluster(dir, Some(true));
-        let enabled = confirmed_streaming_apply(dir).await;
-        assert!(enabled.ok && enabled.converged, "{enabled:?}");
-        let serving = read_serving_snapshot(dir).await.unwrap();
-        let binding = serving.graphs[0]
-            .stream_runtime_authority
-            .clone()
-            .expect("enabled graph carries runtime authority");
-        let runtime_guard = mint_runtime_guard(
-            binding,
-            "cluster-blocked-disable-fixture",
-            "stream-operator",
-        )
-        .await
-        .unwrap();
-        let db = Arc::new(
-            Omnigraph::open(graph_root.to_str().unwrap())
-                .await
-                .unwrap()
-                .with_checked_cluster_stream_runtime(runtime_guard)
-                .await
-                .unwrap(),
-        );
-        let incarnation = db
-            .failpoint_stream_incarnation_for_test("node:Person")
-            .await
-            .unwrap();
-        let row = serde_json::to_vec(&serde_json::json!({
-            "$stream": {
-                "stream_incarnation_id": incarnation,
-                "write_id": "b1b1b1b1-b1b1-41b1-81b1-b1b1b1b1b1b1",
-                "predecessor_token": null,
-            },
-            "id": "stream-conflict",
-            "name": "stream-conflict",
-            "age": 7,
-        }))
-        .unwrap();
-        db.failpoint_stream_ingest_one_as_for_test(
-            "node:Person",
-            &row,
-            0,
-            "stream-operator",
-        )
-        .await
-        .expect("the conflicting row remains durable until the disable fold validates it");
-        db.shutdown_stream_fold_driver()
-            .await
-            .expect("runtime shutdown must fence and settle detached stream producers");
-        drop(db);
-
-        graph_root
-    }
-
-    #[cfg(feature = "failpoints")]
-    async fn blocked_disable_persists_exact_disabling_correction_authority_body() {
-        let _scenario = fail::FailScenario::setup();
-        let dir = fixture();
-        // Heap-bound the setup future: inlining its state into this already-large
-        // test future exceeds rustc's default layout-query recursion limit on Linux.
-        let graph_root = Box::pin(prepare_blocked_disable_data_block(dir.path())).await;
-        let _dead_letter_object_overflow = omnigraph::failpoints::ScopedFailPoint::new(
-            omnigraph::failpoints::names::STREAM_DEAD_LETTER_FORCE_OBJECT_LIMIT,
-            "1*return",
-        );
-
-        write_streaming_cluster(dir.path(), Some(false));
-        let blocked = confirmed_streaming_apply(dir.path()).await;
-        assert!(blocked.ok && !blocked.converged, "{blocked:?}");
-        let change = blocked
-            .changes
-            .iter()
-            .find(|change| change.resource == "streaming.knowledge")
-            .unwrap();
-        assert_eq!(change.disposition, Some(ApplyDisposition::Blocked));
-        assert_eq!(change.reason.as_deref(), Some("streaming_data_blocked"));
-        assert!(blocked.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "streaming_data_blocked"
-                && diagnostic.message.contains("inspect and correct")
-        }));
-
-        let observed_digest = observed_streaming_digest("knowledge", "DISABLING");
-        let state = read_state_json(dir.path());
-        let streaming = &state["applied_revision"]["resources"]["streaming.knowledge"];
-        assert_eq!(streaming["digest"], serde_json::json!(observed_digest));
-        assert_eq!(streaming["streaming_enabled"], serde_json::json!(false));
-        assert_eq!(streaming["profile_mode"], serde_json::json!("DISABLING"));
-        assert_eq!(streaming["profile_revision"], serde_json::json!(3));
-        assert_eq!(
-            streaming["declaration_revision"],
-            serde_json::json!(streaming_declaration_revision(
-                "knowledge",
-                streaming["digest"].as_str().unwrap()
-            ))
-        );
-        assert_ne!(
-            streaming["digest"],
-            serde_json::json!(streaming_digest("knowledge", false))
-        );
-
-        let live = Omnigraph::open_read_only(graph_root.to_str().unwrap())
-            .await
-            .unwrap()
-            .stream_status()
-            .await
-            .unwrap();
-        let block_token = live.tables[0]
-            .strict_block_token
-            .as_deref()
-            .expect("disable must retain the strict block");
-        let shown = show_stream_data_block_config_dir(
-            dir.path(),
-            "knowledge",
-            block_token,
-            None,
-            StreamBlockControlOptions {
-                actor: Some("stream-operator".to_string()),
-                confirm_stream_offline: true,
-            },
-        )
-        .await;
-        assert!(shown.ok && shown.page.is_some(), "{shown:?}");
-
-        // A desired schema edit must not run ahead of the parked disable.
-        // The pre-schema attempt resumes the exact continuation, then the
-        // ordinary streaming phase still owns the blocked observation and
-        // persists the same DISABLING revision for correction authority.
-        fs::write(
-            dir.path().join("people.pg"),
-            r#"
-node Person {
-  name: String @key
-  age: I32
-  nickname: String?
-  @unique(age)
-}
-"#,
-        )
-        .unwrap();
-        let schema_parked = confirmed_streaming_apply(dir.path()).await;
-        assert!(schema_parked.ok && !schema_parked.converged, "{schema_parked:?}");
-        let schema_change = schema_parked
-            .changes
-            .iter()
-            .find(|change| change.resource == "schema.knowledge")
-            .expect("desired schema edit remains planned");
-        assert_eq!(
-            schema_change.disposition,
-            Some(ApplyDisposition::Blocked)
-        );
-        assert_eq!(
-            schema_change.reason.as_deref(),
-            Some("streaming_disable_continuation_pending")
-        );
-        let streaming_change = schema_parked
-            .changes
-            .iter()
-            .find(|change| change.resource == "streaming.knowledge")
-            .expect("desired false remains unresolved beside DISABLING");
-        assert_eq!(
-            streaming_change.disposition,
-            Some(ApplyDisposition::Blocked)
-        );
-        assert_eq!(
-            streaming_change.reason.as_deref(),
-            Some("streaming_data_blocked")
-        );
-
-        let state_after_schema_attempt = read_state_json(dir.path());
-        assert_eq!(
-            state_after_schema_attempt["applied_revision"]["resources"]
-                ["streaming.knowledge"],
-            state["applied_revision"]["resources"]["streaming.knowledge"]
-        );
-        let live_after_schema_attempt =
-            Omnigraph::open_read_only(graph_root.to_str().unwrap())
-                .await
-                .unwrap();
-        assert!(
-            !live_after_schema_attempt.schema_source().contains("nickname"),
-            "schema movement must wait until the disable continuation reaches DISABLED"
-        );
-
-        let shown_page = shown.page.expect("the graph-level block page is present");
-        let correction = omnigraph::db::StreamDataCorrectionRequest {
-            protocol_version: 1,
-            block_token: shown_page.block_token.clone(),
-            correction_id: "abababab-abab-4bab-8bab-abababababab".to_string(),
-            expected_lifecycle_revision: shown_page.lifecycle_revision,
-            actions: shown_page
-                .entries
-                .iter()
-                .map(|entry| omnigraph::db::StreamDataCorrectionAction::Withdraw {
-                    ordinal: entry.ordinal,
-                    logical_key: entry.logical_key.clone(),
-                    current_blocked_winner_stream_token: entry
-                        .current_blocked_winner_stream_token
-                        .clone(),
-                })
-                .collect(),
-            expected_plan_digest: None,
-        };
-        let options = StreamBlockControlOptions {
-            actor: Some("stream-operator".to_string()),
-            confirm_stream_offline: true,
-        };
-        let corrected = correct_stream_data_block_config_dir(
-            dir.path(),
-            "knowledge",
-            correction.clone(),
-            options.clone(),
-        )
-        .await;
-        assert!(corrected.ok, "{corrected:?}");
-        assert!(corrected.result.as_ref().is_some_and(|result| result.changed));
-
-        // The exact retry has no current block or caller-supplied table alias
-        // to resolve. It must discover the receipt across enrolled immutable
-        // identities before inspecting current lifecycle authority.
-        let replayed = correct_stream_data_block_config_dir(
-            dir.path(),
-            "knowledge",
-            correction,
-            options,
-        )
-        .await;
-        assert!(replayed.ok, "{replayed:?}");
-        assert!(replayed
-            .result
-            .as_ref()
-            .is_some_and(|result| !result.changed));
-        assert_eq!(
-            corrected.result.as_ref().map(|result| &result.plan_digest),
-            replayed.result.as_ref().map(|result| &result.plan_digest)
-        );
-    }
-
-    #[tokio::test]
-    async fn streaming_apply_enforces_bound_graph_policy() {
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        write_state_resources(dir.path(), &[]);
-        fs::write(
-            dir.path().join("base.policy.yaml"),
-            r#"
-version: 1
-groups:
-  observers: [stream-operator]
-rules:
-  - id: observers-read-only
-    allow:
-      actors: { group: observers }
-      actions: [read]
-"#,
-        )
-        .unwrap();
-
-        let denied = confirmed_streaming_apply(dir.path()).await;
-        let change = denied
-            .changes
-            .iter()
-            .find(|change| change.resource == "streaming.knowledge")
-            .expect("streaming change remains visible");
-        assert_eq!(change.disposition, Some(ApplyDisposition::Blocked));
-        assert_eq!(change.reason.as_deref(), Some("streaming_apply_failed"));
-        assert!(
-            denied.diagnostics.iter().any(|diagnostic| {
-                diagnostic.code == "streaming_apply_failed"
-                    && diagnostic.message.contains("policy denied")
-            }),
-            "{:?}",
-            denied.diagnostics
-        );
-        assert!(
-            !live_streaming_enabled(dir.path()).await,
-            "Cedar refusal must precede the profile receipt and manifest effect"
-        );
-    }
-
-    #[tokio::test]
-    async fn blocked_stream_profile_preserves_policy_authority_for_retry() {
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        write_state_resources(dir.path(), &[]);
-        let enabled = confirmed_streaming_apply(dir.path()).await;
-        assert!(enabled.ok && enabled.converged, "{enabled:?}");
-        let allowing_policy_digest = read_state_json(dir.path())["applied_revision"]["resources"]
-            ["policy.base"]["digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        write_streaming_cluster(dir.path(), Some(false));
-        fs::write(
-            dir.path().join("base.policy.yaml"),
-            r#"
-version: 1
-groups:
-  observers: [stream-operator]
-rules:
-  - id: observers-read-only
-    allow:
-      actors: { group: observers }
-      actions: [read]
-"#,
-        )
-        .unwrap();
-
-        let denied = confirmed_streaming_apply(dir.path()).await;
-        let by_resource: BTreeMap<&str, &PlanChange> = denied
-            .changes
-            .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        assert_eq!(
-            by_resource["streaming.knowledge"].reason.as_deref(),
-            Some("streaming_apply_failed")
-        );
-        assert_eq!(
-            by_resource["policy.base"].disposition,
-            Some(ApplyDisposition::Blocked)
-        );
-        assert_eq!(
-            by_resource["policy.base"].reason.as_deref(),
-            Some("streaming_profile_not_applied")
-        );
-        assert!(
-            live_streaming_enabled(dir.path()).await,
-            "denied disable must leave the live profile enabled"
-        );
-        assert_eq!(
-            read_state_json(dir.path())["applied_revision"]["resources"]["policy.base"]["digest"],
-            json!(allowing_policy_digest),
-            "the state CAS must retain the policy that can authorize a retry"
-        );
-
-        // Restoring the prior desired policy must now make the very next apply
-        // able to finish the pending disable. If the denying policy had landed
-        // in state, old+new conjunction would deny this retry again.
-        write_streaming_cluster(dir.path(), Some(false));
-        let retried = confirmed_streaming_apply(dir.path()).await;
-        assert!(retried.ok && retried.converged, "{retried:?}");
-        assert!(!live_streaming_enabled(dir.path()).await);
-    }
-
-    #[tokio::test]
-    async fn live_profile_blocks_unmanage_when_cluster_state_is_stale_or_missing() {
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        write_state_resources(dir.path(), &[]);
-        let enabled = confirmed_streaming_apply(dir.path()).await;
-        assert!(enabled.ok && enabled.converged, "{enabled:?}");
-
-        // Model the engine-commit/state-CAS crash window: the manifest is
-        // ENABLED, while the persisted cluster row still claims DISABLED.
-        let mut state = read_state_json(dir.path());
-        let disabled_digest = streaming_digest("knowledge", false);
-        let streaming = &mut state["applied_revision"]["resources"]["streaming.knowledge"];
-        streaming["digest"] = json!(disabled_digest.clone());
-        streaming["streaming_enabled"] = json!(false);
-        streaming["declaration_revision"] = json!(streaming_declaration_revision(
-            "knowledge",
-            &disabled_digest
-        ));
-        streaming["profile_mode"] = json!("DISABLED");
-        streaming["profile_revision"] = json!(1);
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
-        write_streaming_cluster(dir.path(), None);
-
-        let blocked = confirmed_streaming_apply(dir.path()).await;
-        let change = blocked
-            .changes
-            .iter()
-            .find(|change| change.resource == "streaming.knowledge")
-            .expect("live manifest must preserve a blocked control-plane row");
-        assert_eq!(change.disposition, Some(ApplyDisposition::Blocked));
-        assert_eq!(
-            change.reason.as_deref(),
-            Some("streaming_profile_must_disable_first")
-        );
-        assert!(!blocked.converged, "{blocked:?}");
-        assert!(live_streaming_enabled(dir.path()).await);
-        let state = read_state_json(dir.path());
-        let streaming = &state["applied_revision"]["resources"]["streaming.knowledge"];
-        assert_eq!(streaming["profile_mode"], json!("ENABLED"));
-        assert_eq!(streaming["streaming_enabled"], json!(true));
-        assert_eq!(streaming["profile_revision"], json!(2));
-
-        // Losing the row entirely is equally unsafe. Apply must rediscover
-        // the active profile rather than treating the absent digest as proof
-        // that there is nothing left to manage.
-        let mut state = state;
-        state["applied_revision"]["resources"]
-            .as_object_mut()
-            .unwrap()
-            .remove("streaming.knowledge");
-        state["resource_statuses"]
-            .as_object_mut()
-            .unwrap()
-            .remove("streaming.knowledge");
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
-
-        let blocked = confirmed_streaming_apply(dir.path()).await;
-        assert!(
-            blocked.changes.iter().any(|change| {
-                change.resource == "streaming.knowledge"
-                    && change.disposition == Some(ApplyDisposition::Blocked)
-            }),
-            "{blocked:?}"
-        );
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["streaming.knowledge"]["profile_mode"],
-            json!("ENABLED")
-        );
-    }
-
-    #[tokio::test]
-    async fn live_profile_blocks_approved_graph_delete_when_streaming_row_is_missing() {
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        write_state_resources(dir.path(), &[]);
-        let enabled = confirmed_streaming_apply(dir.path()).await;
-        assert!(enabled.ok && enabled.converged, "{enabled:?}");
-
-        let mut state = read_state_json(dir.path());
-        state["applied_revision"]["resources"]
-            .as_object_mut()
-            .unwrap()
-            .remove("streaming.knowledge");
-        state["resource_statuses"]
-            .as_object_mut()
-            .unwrap()
-            .remove("streaming.knowledge");
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join(CLUSTER_CONFIG_FILE),
-            r#"
-version: 1
-metadata:
-  name: test
-state:
-  backend: cluster
-  lock: true
-graphs: {}
-policies: {}
-"#,
-        )
-        .unwrap();
-
-        let approved = approve_config_dir(dir.path(), "graph.knowledge", "andrew").await;
-        assert!(approved.ok, "{approved:?}");
-        let blocked = apply_config_dir(dir.path()).await;
-        let by_resource: BTreeMap<&str, &PlanChange> = blocked
-            .changes
-            .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        assert_eq!(
-            by_resource["graph.knowledge"].disposition,
-            Some(ApplyDisposition::Blocked)
-        );
-        assert_eq!(
-            by_resource["graph.knowledge"].reason.as_deref(),
-            Some("streaming_profile_must_disable_first")
-        );
-        assert!(
-            dir.path()
-                .join(CLUSTER_GRAPHS_DIR)
-                .join("knowledge.omni")
-                .exists(),
-            "an approval based on stale cluster state must not erase a live active profile"
-        );
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["streaming.knowledge"]["profile_mode"],
-            json!("ENABLED")
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_recreates_unmanaged_active_profile_metadata_and_surfaces_drift() {
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        write_state_resources(dir.path(), &[]);
-        let enabled = confirmed_streaming_apply(dir.path()).await;
-        assert!(enabled.ok && enabled.converged, "{enabled:?}");
-
-        let mut state = read_state_json(dir.path());
-        state["applied_revision"]["resources"]
-            .as_object_mut()
-            .unwrap()
-            .remove("streaming.knowledge");
-        state["resource_statuses"]
-            .as_object_mut()
-            .unwrap()
-            .remove("streaming.knowledge");
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
-        write_streaming_cluster(dir.path(), None);
-
-        let refreshed = refresh_config_dir(dir.path()).await;
-        assert!(refreshed.ok, "{refreshed:?}");
-        assert_eq!(
-            refreshed.resource_statuses["streaming.knowledge"].status,
-            ResourceLifecycleStatus::Drifted
-        );
-        assert!(
-            refreshed.resource_statuses["streaming.knowledge"]
-                .conditions
-                .contains(&"streaming_profile_must_disable_first".to_string())
-        );
-        let state = read_state_json(dir.path());
-        let streaming = &state["applied_revision"]["resources"]["streaming.knowledge"];
-        assert_eq!(streaming["profile_mode"], json!("ENABLED"));
-        assert_eq!(streaming["streaming_enabled"], json!(true));
-        assert_eq!(streaming["profile_revision"], json!(2));
-    }
-
-    #[tokio::test]
-    async fn streaming_survives_refresh_and_converges_to_engine_truth() {
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        write_state_resources(dir.path(), &[]);
-        let out = confirmed_streaming_apply(dir.path()).await;
-        assert!(out.ok && out.converged, "{out:?}");
-
-        // Wipe the streaming row (a crashed apply / pre-streaming ledger).
-        let mut state = read_state_json(dir.path());
-        state["applied_revision"]["resources"]
-            .as_object_mut()
-            .unwrap()
-            .remove("streaming.knowledge");
-        state["resource_statuses"]["streaming.knowledge"] = serde_json::json!({
-            "status": "blocked",
-            "conditions": ["stale_streaming_status"],
-            "message": "stale streaming status",
-        });
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
-
-        // Refresh reads the live graph and regains the row from ENGINE truth.
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(out.ok, "{out:?}");
-        assert_eq!(
-            out.resource_statuses["streaming.knowledge"].status,
-            ResourceLifecycleStatus::Applied
-        );
-        assert!(
-            out.resource_statuses["streaming.knowledge"]
-                .conditions
-                .is_empty(),
-            "refresh must clear stale streaming conditions after observing a match"
-        );
-        assert!(
-            out.resource_statuses["streaming.knowledge"]
-                .message
-                .is_none(),
-            "refresh must clear the stale streaming status message"
-        );
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["streaming.knowledge"]["streaming_enabled"],
-            serde_json::json!(true)
-        );
-        assert_eq!(
-            state["applied_revision"]["resources"]["streaming.knowledge"]["profile_revision"],
-            serde_json::json!(2)
-        );
-        assert_eq!(
-            state["applied_revision"]["resources"]["streaming.knowledge"]["profile_mode"],
-            serde_json::json!("ENABLED")
-        );
-        let enabled_digest = streaming_digest("knowledge", true);
-        assert_eq!(
-            state["applied_revision"]["resources"]["streaming.knowledge"]
-                ["declaration_revision"],
-            serde_json::json!(streaming_declaration_revision(
-                "knowledge",
-                &enabled_digest
-            ))
-        );
-
-        // Model a stale ledger around a supported offline disable: move
-        // engine truth through cluster apply, then restore a stale enabled
-        // ledger row. Refresh must rederive false from the manifest.
-        write_streaming_cluster(dir.path(), Some(false));
-        let disabled = confirmed_streaming_apply(dir.path()).await;
-        assert!(disabled.ok && disabled.converged, "{disabled:?}");
-        let mut state = read_state_json(dir.path());
-        state["applied_revision"]["resources"]["streaming.knowledge"]["streaming_enabled"] =
-            serde_json::json!(true);
-        state["applied_revision"]["resources"]["streaming.knowledge"]["digest"] =
-            serde_json::json!(streaming_digest("knowledge", true));
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
-        write_streaming_cluster(dir.path(), Some(true));
-        let out = refresh_config_dir(dir.path()).await;
-        assert!(out.ok, "{out:?}");
-        let streaming_status = &out.resource_statuses["streaming.knowledge"];
-        assert_eq!(
-            streaming_status.status,
-            ResourceLifecycleStatus::Drifted
-        );
-        assert!(
-            streaming_status
-                .conditions
-                .contains(&"streaming_mismatch".to_string())
-        );
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["streaming.knowledge"]["streaming_enabled"],
-            serde_json::json!(false)
-        );
-        let plan = plan_config_dir(dir.path()).await;
-        let drift = plan
-            .changes
-            .iter()
-            .find(|change| change.resource == "streaming.knowledge")
-            .expect("observed/declared streaming drift must be a visible plan change");
-        assert_eq!(drift.operation, PlanOperation::Update);
-
-        // And apply re-converges to the declaration.
-        let out = confirmed_streaming_apply(dir.path()).await;
-        assert!(out.ok && out.converged, "{out:?}");
-        assert!(live_streaming_enabled(dir.path()).await);
-    }
-
-    #[tokio::test]
-    async fn enabled_streaming_without_exact_profile_revision_is_quarantined() {
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        write_state_resources(dir.path(), &[]);
-        let out = confirmed_streaming_apply(dir.path()).await;
-        assert!(out.ok && out.converged, "{out:?}");
-
-        let mut state = read_state_json(dir.path());
-        state["applied_revision"]["resources"]["streaming.knowledge"]
-            .as_object_mut()
-            .unwrap()
-            .remove("profile_revision");
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
-
-        let diagnostics = read_serving_snapshot(dir.path()).await.unwrap_err();
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "stream_runtime_profile_revision_missing"
-                && diagnostic.severity == DiagnosticSeverity::Warning
-        }));
-        assert!(diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "cluster_no_healthy_graphs"));
-
-        state["applied_revision"]["resources"]["streaming.knowledge"]["profile_revision"] =
-            serde_json::json!(2);
-        state["applied_revision"]["resources"]["streaming.knowledge"]
-            .as_object_mut()
-            .unwrap()
-            .remove("declaration_revision");
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
-        let diagnostics = read_serving_snapshot(dir.path()).await.unwrap_err();
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "stream_runtime_declaration_revision_missing"
-                && diagnostic.severity == DiagnosticSeverity::Warning
-        }));
-    }
-
-    #[tokio::test]
-    async fn disabling_profile_stays_plannable_and_refuses_normal_server_boot() {
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        write_state_resources(dir.path(), &[]);
-        let out = confirmed_streaming_apply(dir.path()).await;
-        assert!(out.ok && out.converged, "{out:?}");
-
-        let mut state = read_state_json(dir.path());
-        let row = &mut state["applied_revision"]["resources"]["streaming.knowledge"];
-        row["streaming_enabled"] = serde_json::json!(false);
-        row["profile_mode"] = serde_json::json!("DISABLING");
-        row["profile_revision"] = serde_json::json!(3);
-        row["digest"] = serde_json::json!("durable-disabling-plan");
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&state).unwrap(),
-        )
-        .unwrap();
-        write_streaming_cluster(dir.path(), Some(false));
-
-        let plan = plan_config_dir(dir.path()).await;
-        let continuation = plan
-            .changes
-            .iter()
-            .find(|change| change.resource == "streaming.knowledge")
-            .expect("DISABLING must remain a visible continuation");
-        assert_eq!(continuation.operation, PlanOperation::Update);
-        assert_eq!(continuation.disposition, Some(ApplyDisposition::Applied));
-
-        let diagnostics = read_serving_snapshot(dir.path()).await.unwrap_err();
-        assert!(diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "stream_profile_disabling"));
-        assert_ne!(
-            observed_streaming_digest("knowledge", "DISABLING"),
-            streaming_digest("knowledge", false)
-        );
-        assert!(!streaming_mode_matches_desired("DISABLING", false));
-    }
-
-    #[tokio::test]
-    async fn streaming_applies_over_an_imported_preexisting_graph() {
-        // The CLI lifecycle shape: a graph exists BEFORE the cluster manages
-        // it; import records observed truth (disabled), apply must flip it.
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        let graphs_dir = dir.path().join("graphs");
-        fs::create_dir_all(&graphs_dir).unwrap();
-        let graph_uri = graphs_dir.join("knowledge.omni");
-        Omnigraph::init(graph_uri.to_str().unwrap(), SCHEMA)
-            .await
-            .unwrap();
-
-        let import = import_config_dir(dir.path()).await;
-        assert!(import.ok, "{import:?}");
-        let out = confirmed_streaming_apply(dir.path()).await;
-        assert!(out.ok && out.converged, "{out:?}");
-        assert!(
-            live_streaming_enabled(dir.path()).await,
-            "import→apply must flip the pre-existing graph: {out:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn authority_retirement_preflight_requires_actor_confirmation_and_declared_graph() {
-        let dir = fixture();
-        let missing_authority = plan_stream_authority_retirement_config_dir(
-            dir.path(),
-            "knowledge",
-            StreamAuthorityRetirementOptions::default(),
-        )
-        .await;
-        assert!(!missing_authority.ok);
-        assert!(missing_authority.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "stream_authority_retirement_actor_required"
-        }));
-        assert!(missing_authority.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "streaming_offline_confirmation_required"
-        }));
-        assert!(
-            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
-            "preflight refusal must happen before lock acquisition"
-        );
-
-        let unknown_graph = plan_stream_authority_retirement_config_dir(
-            dir.path(),
-            "other",
-            StreamAuthorityRetirementOptions {
-                actor: Some("stream-operator".to_string()),
-                confirm_stream_offline: true,
-            },
-        )
-        .await;
-        assert!(!unknown_graph.ok);
-        assert!(unknown_graph.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "stream_authority_retirement_graph_not_declared"
-                && diagnostic.path == "graphs.other"
-        }));
-        assert!(
-            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
-            "unknown graph refusal must happen before lock acquisition"
-        );
-
-        // Once config/state/actor/offline authority are valid, the command
-        // must reach the engine under the dedicated lock. A fresh disabled,
-        // unenrolled graph is intentionally not retireable, so the exact
-        // engine precondition gives this test a harmless terminal outcome.
-        write_streaming_cluster(dir.path(), Some(false));
-        init_derived_graph(dir.path()).await;
-        let import = import_config_dir(dir.path()).await;
-        assert!(import.ok, "{import:?}");
-        let engine_refusal = plan_stream_authority_retirement_config_dir(
-            dir.path(),
-            "knowledge",
-            StreamAuthorityRetirementOptions {
-                actor: Some("stream-operator".to_string()),
-                confirm_stream_offline: true,
-            },
-        )
-        .await;
-        assert!(!engine_refusal.ok);
-        assert!(engine_refusal.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "stream_authority_retirement_plan_failed"
-                && diagnostic
-                    .message
-                    .contains("at least one current WITHDRAWN or DEAD_LETTERED token")
-        }));
-        assert!(
-            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
-            "engine refusal must release the dedicated retirement lock"
-        );
-    }
-
-    #[cfg(feature = "failpoints")]
-    #[test]
-    #[serial_test::serial]
-    fn authority_retirement_confirm_converges_applied_state_to_retired() {
-        on_big_stack(|| async {
-        let _scenario = fail::FailScenario::setup();
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(false));
-        write_state_resources(dir.path(), &[]);
-        let created = confirmed_streaming_apply(dir.path()).await;
-        assert!(created.ok && created.converged, "{created:?}");
-
-        let graph_root = dir.path().join("graphs/knowledge.omni");
-        let db = Arc::new(Omnigraph::open(graph_root.to_str().unwrap()).await.unwrap());
-        db.failpoint_enroll_stream_table_for_test("node:Person")
-            .await
-            .unwrap();
-        drop(db);
-
-        write_streaming_cluster(dir.path(), Some(true));
-        let enabled = confirmed_streaming_apply(dir.path()).await;
-        assert!(enabled.ok && enabled.converged, "{enabled:?}");
-        let serving = read_serving_snapshot(dir.path()).await.unwrap();
-        let runtime_binding = serving.graphs[0]
-            .stream_runtime_authority
-            .clone()
-            .expect("enabled graph carries checked runtime authority");
-        let runtime_guard = mint_runtime_guard(
-            runtime_binding,
-            "cluster-retirement-state-fixture",
-            "stream-operator",
-        )
-        .await
-        .unwrap();
-        let db = Arc::new(
-            Omnigraph::open(graph_root.to_str().unwrap())
-                .await
-                .unwrap()
-                .with_checked_cluster_stream_runtime(runtime_guard)
-                .await
-                .unwrap(),
-        );
-        let incarnation = db
-            .failpoint_stream_incarnation_for_test("node:Person")
-            .await
-            .unwrap();
-        let row = serde_json::to_vec(&serde_json::json!({
-            "$stream": {
-                "stream_incarnation_id": incarnation,
-                "write_id": "71717171-7171-4171-8171-717171717171",
-                "predecessor_token": null,
-            },
-            "id": "retire-state-row",
-            "name": "retire-state-row",
-            "age": 42,
-        }))
-        .unwrap();
-        db.failpoint_stream_ingest_one_as_for_test(
-            "node:Person",
-            &row,
-            0,
-            "stream-operator",
-        )
-        .await
-        .unwrap();
-        db.shutdown_stream_fold_driver().await.unwrap();
-        drop(db);
-
-        write_streaming_cluster(dir.path(), Some(false));
-        let disabled = confirmed_streaming_apply(dir.path()).await;
-        assert!(disabled.ok && disabled.converged, "{disabled:?}");
-        let before = read_state_json(dir.path());
-        let before_state_revision = before["state_revision"].as_u64().unwrap();
-        let before_streaming =
-            &before["applied_revision"]["resources"]["streaming.knowledge"];
-        assert_eq!(before_streaming["profile_mode"], json!("DISABLED"));
-        let declaration_digest = before_streaming["digest"].clone();
-        let declaration_revision = before_streaming["declaration_revision"].clone();
-
-        let db = Omnigraph::open(graph_root.to_str().unwrap()).await.unwrap();
-        db.failpoint_withdraw_stream_token_for_retirement_test(
-            "node:Person",
-            "retire-state-row",
-            "72727272-7272-4272-8272-727272727272",
-        )
-        .await
-        .unwrap();
-        drop(db);
-
-        let options = StreamAuthorityRetirementOptions {
-            actor: Some("stream-operator".to_string()),
-            confirm_stream_offline: true,
-        };
-        let plan = plan_stream_authority_retirement_config_dir(
-            dir.path(),
-            "knowledge",
-            options.clone(),
-        )
-        .await;
-        assert!(plan.ok, "{plan:?}");
-        let plan = plan.plan.expect("successful retirement plan");
-        let retirement_id = "73737373-7373-4373-8373-737373737373";
-        let raced_state_revision = before_state_revision + 50;
-        let race_path = dir.path().join(CLUSTER_STATE_FILE);
-        let state_race = omnigraph::failpoints::ScopedFailPoint::with_callback(
-            crate::failpoints::names::CLUSTER_STREAM_RETIREMENT_BEFORE_STATE_WRITE,
-            move || {
-                let mut concurrent: serde_json::Value = serde_json::from_str(
-                    &fs::read_to_string(&race_path).unwrap(),
-                )
-                .unwrap();
-                concurrent["state_revision"] = json!(raced_state_revision);
-                concurrent["applied_revision"]["resources"]["streaming.knowledge"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("declaration_revision");
-                fs::write(
-                    &race_path,
-                    serde_json::to_string_pretty(&concurrent).unwrap(),
-                )
-                .unwrap();
-            },
-        );
-        let raced = confirm_stream_authority_retirement_config_dir(
-            dir.path(),
-            "knowledge",
-            retirement_id,
-            &plan.plan_digest,
-            options.clone(),
-        )
-        .await;
-        drop(state_race);
-        assert!(!raced.ok, "the stale cluster-state CAS must fail closed");
-        assert!(raced.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "state_cas_mismatch"
-        }));
-        let raced_result = raced
-            .result
-            .as_ref()
-            .expect("the manifest retirement effect remains explicit");
-        assert!(raced_result.changed);
-        let raced_profile_revision = raced_result.profile_revision;
-        let raced_state = read_state_json(dir.path());
-        assert_eq!(raced_state["state_revision"], json!(raced_state_revision));
-        assert!(
-            raced_state["applied_revision"]["resources"]["streaming.knowledge"]
-                .get("declaration_revision")
-                .is_none(),
-            "the concurrent malformed row makes the retry prove deterministic backfill"
-        );
-        assert_eq!(
-            raced_state["applied_revision"]["resources"]["streaming.knowledge"]
-                ["profile_mode"],
-            json!("DISABLED")
-        );
-        assert_eq!(
-            Omnigraph::open(graph_root.to_str().unwrap())
-                .await
-                .unwrap()
-                .stream_status()
-                .await
-                .unwrap()
-                .profile_mode,
-            "RETIRED"
-        );
-
-        let confirmed = confirm_stream_authority_retirement_config_dir(
-            dir.path(),
-            "knowledge",
-            retirement_id,
-            &plan.plan_digest,
-            options,
-        )
-        .await;
-        assert!(confirmed.ok, "{confirmed:?}");
-        let result = confirmed.result.expect("successful retirement result");
-        assert!(!result.changed, "retry must replay the exact durable receipt");
-        assert_eq!(result.profile_revision, raced_profile_revision);
-
-        let after = read_state_json(dir.path());
-        let after_streaming =
-            &after["applied_revision"]["resources"]["streaming.knowledge"];
-        assert_eq!(after["state_revision"], json!(raced_state_revision + 1));
-        assert_eq!(after_streaming["digest"], declaration_digest);
-        assert_eq!(
-            after_streaming["declaration_revision"],
-            declaration_revision
-        );
-        assert_eq!(after_streaming["streaming_enabled"], json!(false));
-        assert_eq!(after_streaming["profile_mode"], json!("RETIRED"));
-        assert_eq!(
-            after_streaming["profile_revision"],
-            json!(result.profile_revision)
-        );
-        assert_eq!(
-            confirmed.state_observations.state_revision,
-            raced_state_revision + 1
-        );
-        let serving = read_serving_snapshot(dir.path()).await.unwrap();
-        assert!(serving.graphs[0].stream_runtime_authority.is_none());
-        assert_eq!(
-            serving.graphs[0]
-                .stream_served_export_authority
-                .as_ref()
-                .and_then(|binding| binding.managed_profile()),
-            Some(("RETIRED", result.profile_revision))
-        );
-
-        assert!(streaming_mode_matches_desired("RETIRED", false));
-        let refreshed = refresh_config_dir(dir.path()).await;
-        assert!(refreshed.ok, "{refreshed:?}");
-        assert_eq!(
-            refreshed.resource_statuses["streaming.knowledge"].status,
-            ResourceLifecycleStatus::Applied
-        );
-        let refreshed_state = read_state_json(dir.path());
-        let refreshed_streaming =
-            &refreshed_state["applied_revision"]["resources"]["streaming.knowledge"];
-        assert_eq!(refreshed_streaming["digest"], declaration_digest);
-        assert_eq!(
-            refreshed_streaming["declaration_revision"],
-            declaration_revision
-        );
-        assert_eq!(refreshed_streaming["profile_mode"], json!("RETIRED"));
-        assert_eq!(
-            refreshed_streaming["profile_revision"],
-            json!(result.profile_revision)
-        );
-        assert_eq!(
-            refreshed_state["observations"]["graph.knowledge"]
-                ["streaming_matches_desired"],
-            json!(true)
-        );
-        let next_plan = plan_config_dir(dir.path()).await;
-        assert!(
-            next_plan
-                .changes
-                .iter()
-                .all(|change| change.resource != "streaming.knowledge"),
-            "RETIRED must remain converged with desired streaming:false: {next_plan:?}"
-        );
-        });
-    }
-
-    #[tokio::test]
-    async fn stream_block_preflight_requires_actor_confirmation_and_declared_graph() {
-        let dir = fixture();
-        let missing_authority = show_stream_data_block_config_dir(
-            dir.path(),
-            "knowledge",
-            "block-1",
-            None,
-            StreamBlockControlOptions::default(),
-        )
-        .await;
-        assert!(!missing_authority.ok);
-        assert!(missing_authority
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "stream_block_actor_required"));
-        assert!(missing_authority.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "streaming_offline_confirmation_required"
-        }));
-        assert!(
-            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
-            "preflight refusal must happen before lock acquisition"
-        );
-
-        let unknown_graph = show_stream_data_block_config_dir(
-            dir.path(),
-            "other",
-            "block-1",
-            None,
-            StreamBlockControlOptions {
-                actor: Some("stream-operator".to_string()),
-                confirm_stream_offline: true,
-            },
-        )
-        .await;
-        assert!(!unknown_graph.ok);
-        assert!(unknown_graph.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "stream_block_graph_not_declared"
-                && diagnostic.path == "graphs.other"
-        }));
-        assert!(
-            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
-            "unknown graph refusal must happen before lock acquisition"
-        );
-
-        init_derived_graph(dir.path()).await;
-        let import = import_config_dir(dir.path()).await;
-        assert!(import.ok, "{import:?}");
-        let unapplied_profile = show_stream_data_block_config_dir(
-            dir.path(),
-            "knowledge",
-            "block-1",
-            None,
-            StreamBlockControlOptions {
-                actor: Some("stream-operator".to_string()),
-                confirm_stream_offline: true,
-            },
-        )
-        .await;
-        assert!(!unapplied_profile.ok);
-        assert!(unapplied_profile.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "stream_block_profile_not_applied"
-                && diagnostic.path == "streaming.knowledge"
-        }));
-        assert!(
-            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
-            "applied-profile refusal must release the state lock"
-        );
-    }
-
-    #[tokio::test]
-    async fn stream_dead_letter_preflight_requires_actor_confirmation_and_declared_graph() {
-        let dir = fixture();
-        let missing_authority = list_stream_dead_letters_config_dir(
-            dir.path(),
-            "knowledge",
-            None,
-            StreamDeadLetterControlOptions::default(),
-        )
-        .await;
-        assert!(!missing_authority.ok);
-        assert!(
-            missing_authority
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "stream_dead_letter_actor_required")
-        );
-        assert!(missing_authority.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "streaming_offline_confirmation_required"
-        }));
-        assert!(
-            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
-            "dead-letter preflight refusal must happen before lock acquisition"
-        );
-
-        let unknown_graph = list_stream_dead_letters_config_dir(
-            dir.path(),
-            "other",
-            None,
-            StreamDeadLetterControlOptions {
-                actor: Some("stream-operator".to_string()),
-                confirm_stream_offline: true,
-            },
-        )
-        .await;
-        assert!(!unknown_graph.ok);
-        assert!(unknown_graph.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "stream_dead_letter_graph_not_declared"
-                && diagnostic.path == "graphs.other"
-        }));
-        assert!(
-            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
-            "unknown dead-letter graph refusal must happen before lock acquisition"
-        );
-
-        write_streaming_cluster(dir.path(), Some(true));
-        write_state_resources(dir.path(), &[]);
-        let applied = confirmed_streaming_apply(dir.path()).await;
-        assert!(applied.ok && applied.converged, "{applied:?}");
-        let mut stale_state = read_state_json(dir.path());
-        let recorded_revision = stale_state["applied_revision"]["resources"]
-            ["streaming.knowledge"]["profile_revision"]
-            .as_u64()
-            .unwrap();
-        stale_state["applied_revision"]["resources"]["streaming.knowledge"]
-            ["profile_revision"] = json!(recorded_revision + 1);
-        fs::write(
-            dir.path().join(CLUSTER_STATE_FILE),
-            serde_json::to_string_pretty(&stale_state).unwrap(),
-        )
-        .unwrap();
-        let stale_options = StreamDeadLetterControlOptions {
-            actor: Some("stream-operator".to_string()),
-            confirm_stream_offline: true,
-        };
-        let stale_list = list_stream_dead_letters_config_dir(
-            dir.path(),
-            "knowledge",
-            None,
-            stale_options.clone(),
-        )
-        .await;
-        assert!(!stale_list.ok);
-        assert!(stale_list.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "stream_dead_letter_list_failed"
-                && diagnostic
-                    .message
-                    .contains("offline graph streaming authority is unavailable or changed")
-        }));
-        let stale_export = export_stream_dead_letters_config_dir(
-            dir.path(),
-            "knowledge",
-            None,
-            stale_options,
-        )
-        .await;
-        assert!(!stale_export.ok);
-        assert!(stale_export.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "stream_dead_letter_export_failed"
-                && diagnostic
-                    .message
-                    .contains("offline graph streaming authority is unavailable or changed")
-        }));
-    }
-
-    #[cfg(feature = "failpoints")]
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn stream_block_authority_and_shape_refusals_precede_recovery() {
-        let _scenario = fail::FailScenario::setup();
-
-        fn graph_tree(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
-            fn visit(
-                root: &Path,
-                current: &Path,
-                files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
-            ) {
-                let mut entries = fs::read_dir(current)
-                    .unwrap()
-                    .map(|entry| entry.unwrap().path())
-                    .collect::<Vec<_>>();
-                entries.sort();
-                for path in entries {
-                    if path.is_dir() {
-                        visit(root, &path, files);
-                    } else {
-                        files.insert(
-                            path.strip_prefix(root).unwrap().to_path_buf(),
-                            fs::read(path).unwrap(),
-                        );
-                    }
-                }
-            }
-
-            let mut files = std::collections::BTreeMap::new();
-            visit(root, root, &mut files);
-            files
-        }
-
-        let dir = fixture();
-        write_streaming_cluster(dir.path(), Some(true));
-        write_state_resources(dir.path(), &[]);
-        let applied = confirmed_streaming_apply(dir.path()).await;
-        assert!(applied.ok && applied.converged, "{applied:?}");
-        let serving = read_serving_snapshot(dir.path()).await.unwrap();
-        let runtime_binding = serving.graphs[0]
-            .stream_runtime_authority
-            .clone()
-            .expect("enabled graph carries a validated runtime binding");
-        let graph_root = dir.path().join("graphs/knowledge.omni");
-        let runtime_guard = mint_runtime_guard(
-            runtime_binding.clone(),
-            "stream-block-recovery-fixture",
-            "stream-operator",
-        )
-        .await
-        .unwrap();
-        let db = Omnigraph::open(graph_root.to_str().unwrap())
-            .await
-            .unwrap()
-            .with_checked_cluster_stream_runtime(runtime_guard)
-            .await
-            .unwrap();
-        db.branch_create("recovery-fixture").await.unwrap();
-        let mut params = ParamMap::new();
-        params.insert(
-            "name".to_string(),
-            Literal::String("pending-recovery".to_string()),
-        );
-        params.insert("age".to_string(), Literal::Integer(42));
-        let mutation_error = {
-            let _failpoint = omnigraph::failpoints::ScopedFailPoint::new(
-                omnigraph::failpoints::names::MUTATION_POST_SIDECAR_PRE_FORK,
-                "return",
-            );
-            db.mutate(
-                "recovery-fixture",
-                r#"
-query arm_recovery($name: String, $age: I32) {
-  insert Person { name: $name, age: $age }
-}
-"#,
-                "arm_recovery",
-                &params,
-            )
-            .await
-            .expect_err("the fixture must retain one arm-only graph recovery sidecar")
-        };
-        assert!(
-            matches!(
-                mutation_error,
-                omnigraph::error::OmniError::RecoveryRequired { .. }
-            ),
-            "{mutation_error:?}"
-        );
-        drop(db);
-        let recovery_dir = graph_root.join("__recovery");
-        assert_eq!(fs::read_dir(&recovery_dir).unwrap().count(), 1);
-        let before_graph = graph_tree(&graph_root);
-        let runtime_guard = mint_runtime_guard(
-            runtime_binding.clone(),
-            "stream-block-runtime-owner",
-            "operator:runtime-owner",
-        )
-        .await
-        .unwrap();
-
-        let request = omnigraph::db::StreamDataCorrectionRequest {
-            protocol_version: 1,
-            block_token: format!("sha256:{}", "a".repeat(64)),
-            correction_id: "abababab-abab-4bab-8bab-abababababab".to_string(),
-            expected_lifecycle_revision: 1,
-            actions: Vec::new(),
-            expected_plan_digest: None,
-        };
-        let refused = correct_stream_data_block_config_dir(
-            dir.path(),
-            "knowledge",
-            request.clone(),
-            StreamBlockControlOptions {
-                actor: Some("stream-operator".to_string()),
-                confirm_stream_offline: true,
-            },
-        )
-        .await;
-        assert!(!refused.ok, "{refused:?}");
-        assert!(refused.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "stream_block_correct_failed"
-                && diagnostic.message.contains("live runtime")
-        }));
-        assert_eq!(
-            graph_tree(&graph_root),
-            before_graph,
-            "runtime exclusion must reject before RW open can resolve the sidecar or move any graph physical/manifest file"
-        );
-        assert_eq!(fs::read_dir(&recovery_dir).unwrap().count(), 1);
-        assert!(
-            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
-            "runtime refusal must release the cluster state lock"
-        );
-
-        drop(runtime_guard);
-        let malformed = correct_stream_data_block_config_dir(
-            dir.path(),
-            "knowledge",
-            request,
-            StreamBlockControlOptions {
-                actor: Some("stream-operator".to_string()),
-                confirm_stream_offline: true,
-            },
-        )
-        .await;
-        assert!(!malformed.ok, "{malformed:?}");
-        assert!(malformed.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "stream_block_correct_failed"
-                && diagnostic.message.contains("request is invalid")
-        }));
-        assert_eq!(
-            graph_tree(&graph_root),
-            before_graph,
-            "request-shape refusal must happen before pending graph recovery can move any physical or manifest file"
-        );
-        assert_eq!(fs::read_dir(&recovery_dir).unwrap().count(), 1);
-        assert!(
-            !dir.path().join(CLUSTER_LOCK_FILE).exists(),
-            "shape refusal must release the cluster state lock"
-        );
-    }
