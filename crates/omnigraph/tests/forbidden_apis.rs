@@ -340,6 +340,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
+        "resolve_commit_range",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
         "head_commit_id",
     ),
     (

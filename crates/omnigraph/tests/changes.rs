@@ -130,8 +130,13 @@ node Anchor { name: String @key }
     let reincarnation_diff = diff_since_branch(&db, "main", after_rename, &ChangeFilter::default())
         .await
         .unwrap();
+    let reincarnation_changes = reincarnation_diff
+        .changes
+        .iter()
+        .map(|change| (change.table_key.clone(), change.id.clone(), change.op))
+        .collect::<Vec<_>>();
     assert_eq!(
-        change_tuples(&reincarnation_diff),
+        reincarnation_changes,
         vec![
             (
                 "node:Human".to_string(),
@@ -144,7 +149,7 @@ node Anchor { name: String @key }
                 ChangeOp::Insert,
             ),
         ],
-        "drop/re-add under one alias must report the old lifetime's deletes and the new lifetime's inserts"
+        "drop/re-add under one alias must visit the old identity before the newly allocated identity"
     );
     assert_eq!(reincarnation_diff.stats.deletes, 1);
     assert_eq!(reincarnation_diff.stats.inserts, 1);
@@ -242,6 +247,15 @@ async fn diff_detects_node_delete_with_cascade() {
     let cs = diff_since_branch(&db, "main", v_before, &ChangeFilter::default())
         .await
         .unwrap();
+    let table_keys = cs
+        .changes
+        .iter()
+        .map(|change| change.table_key.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        table_keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "multi-table changes must follow graph-visible table-key order: {table_keys:?}"
+    );
 
     // Should have node:Person delete
     let person_deletes: Vec<_> = cs
