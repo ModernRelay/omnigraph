@@ -99,6 +99,7 @@ or object-store environment variables.
 | Topic | URL |
 |---|---|
 | Object-store guide | https://lance.org/guide/object_store/ |
+| Observability (logical object-store operations, bytes, failures, retries) | https://lance.org/guide/observability/ |
 
 ### Data types
 
@@ -118,6 +119,7 @@ Optimizing scans, fragment counts, cache behavior, memory pool sizing.
 | Topic | URL |
 |---|---|
 | Performance guide | https://lance.org/guide/performance/ |
+| Observability (request duration, bytes, in-flight work, retry/throttle counters) | https://lance.org/guide/observability/ |
 
 ### Compaction & cleanup
 
