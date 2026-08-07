@@ -240,7 +240,7 @@ applied revision is not safely servable. Each refusal names its remedy:
 | `catalog_payload_missing` / `…_digest_mismatch` | catalog blob lost or tampered | `cluster refresh`, then `apply`, restart |
 | `policy_bindings_missing` | ledger predates binding metadata | re-run `cluster apply` (backfills), restart |
 | `cluster_empty` | applied revision has no graphs | apply a cluster with ≥1 graph |
-| multiple bundles bind one scope | serving holds one policy bundle per graph + one server-level | split or merge bundles |
+| multiple bundles bind one scope | legacy/tampered state violates the one-bundle-per-scope contract now enforced before apply | merge the rules into one bundle and re-run `cluster apply` |
 
 A held *state lock* is deliberately **not** a boot error — the server reads
 the atomically-replaced ledger without locking, so serving never contends

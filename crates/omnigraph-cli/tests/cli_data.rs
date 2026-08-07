@@ -1033,49 +1033,6 @@ fn policy_validate_accepts_cluster_bundle() {
 }
 
 #[test]
-fn policy_validate_fails_for_invalid_cluster_bundle() {
-    // The cluster does not validate a policy bundle's internal rules, so an
-    // applied-but-malformed bundle reaches `policy validate`, which compiles it
-    // and surfaces the error (here: a duplicate rule id).
-    let cluster = converged_loaded_cluster(
-        "knowledge",
-        Some(
-            r#"
-version: 1
-groups:
-  team: [act-andrew]
-rules:
-  - id: duplicate
-    allow:
-      actors: { group: team }
-      actions: [read]
-      branch_scope: any
-  - id: duplicate
-    allow:
-      actors: { group: team }
-      actions: [export]
-      branch_scope: any
-"#,
-        ),
-    );
-
-    let output = output_failure(
-        cli()
-            .arg("policy")
-            .arg("validate")
-            .arg("--cluster")
-            .arg(cluster.path())
-            .arg("--graph")
-            .arg("knowledge"),
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("duplicate policy rule id"),
-        "expected a duplicate-rule error; got: {stderr}"
-    );
-}
-
-#[test]
 fn policy_test_runs_declarative_cases_against_cluster_bundle() {
     let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
     let tests = cluster.path().join("policy.tests.yaml");

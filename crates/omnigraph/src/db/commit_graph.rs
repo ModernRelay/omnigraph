@@ -14,10 +14,9 @@ pub struct GraphCommit {
 }
 
 impl GraphCommit {
-    /// The one total order on graph lineage. Every ordered view of commits —
-    /// the projection's sorted listing, head selection, and any future keyset
-    /// pagination cursor — derives from this key; no other comparator may
-    /// define commit order.
+    /// The one total order for deterministic lineage listing, head selection,
+    /// and any future commit-list keyset cursor. Ancestry and CDC traversal use
+    /// persisted first-parent links instead; this key never defines feed order.
     pub fn lineage_key(&self) -> (u64, i64, &str) {
         (
             self.manifest_version,
@@ -25,6 +24,18 @@ impl GraphCommit {
             &self.graph_commit_id,
         )
     }
+}
+
+/// One observable graph transition on a branch's first-parent lineage.
+///
+/// CDC compares exactly these two immutable graph commits. A merge commit is
+/// compared with the branch state it landed on (`parent`); its
+/// `merged_parent_commit_id` remains provenance and is never traversed as a
+/// second feed path.
+#[derive(Debug, Clone)]
+pub(crate) struct FirstParentEdge {
+    pub(crate) parent: GraphCommit,
+    pub(crate) child: GraphCommit,
 }
 
 /// A pure projection of the graph lineage that lives in `__manifest`

@@ -25,7 +25,7 @@ use omnigraph_compiler::{
     plan_schema_migration,
 };
 
-use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot};
+use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot, ResolvedCommitRange};
 use crate::error::{OmniError, Result};
 use crate::runtime_cache::RuntimeCache;
 use crate::storage::{
@@ -2129,10 +2129,19 @@ impl Omnigraph {
         filter: &crate::changes::ChangeFilter,
     ) -> Result<crate::changes::ChangeSet> {
         let coord = self.coordinator.read().await;
-        let from_commit = coord
-            .resolve_commit(&SnapshotId::new(from_commit_id))
+        let range = coord
+            .resolve_commit_range(
+                &SnapshotId::new(from_commit_id),
+                &SnapshotId::new(to_commit_id),
+            )
             .await?;
-        let to_commit = coord.resolve_commit(&SnapshotId::new(to_commit_id)).await?;
+        // Classify direct adjacency from the child's persisted first-parent
+        // pointer without changing this API's net-current result shape. The
+        // future feed can reuse that relationship without an ancestry index.
+        let (from_commit, to_commit) = match range {
+            ResolvedCommitRange::FirstParent(edge) => (edge.parent, edge.child),
+            ResolvedCommitRange::Arbitrary { from, to } => (from, to),
+        };
         let from_snap = coord
             .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
                 from_commit.graph_commit_id.clone(),

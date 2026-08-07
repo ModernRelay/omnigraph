@@ -26,6 +26,115 @@ fn cluster_validate_config_success() {
 }
 
 #[test]
+fn cluster_validate_rejects_semantically_invalid_policy() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    fs::write(
+        temp.path().join("base.policy.yaml"),
+        r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: invalid-invoke-scope
+    allow:
+      actors: { group: team }
+      actions: [invoke_query]
+      branch_scope: any
+"#,
+    )
+    .unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(temp.path()),
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("ERROR policy_invalid policies.base.file"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("branch_scope") && stdout.contains("invoke_query"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn cluster_validate_rejects_policy_binding_kind_mismatch() {
+    for (applies_to, action, scope, expected_kind) in [
+        ("knowledge", "graph_list", "", "server-scoped"),
+        ("cluster", "read", "      branch_scope: any\n", "per-graph"),
+    ] {
+        let temp = tempdir().unwrap();
+        write_cluster_config_fixture(temp.path());
+        let config_path = temp.path().join("cluster.yaml");
+        let config = fs::read_to_string(&config_path).unwrap().replace(
+            "applies_to: [knowledge]",
+            &format!("applies_to: [{applies_to}]"),
+        );
+        fs::write(config_path, config).unwrap();
+        fs::write(
+            temp.path().join("base.policy.yaml"),
+            format!(
+                r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: wrong-kind
+    allow:
+      actors: {{ group: team }}
+      actions: [{action}]
+{scope}"#
+            ),
+        )
+        .unwrap();
+
+        let output = output_failure(
+            cli()
+                .arg("cluster")
+                .arg("validate")
+                .arg("--config")
+                .arg(temp.path()),
+        );
+        let stdout = stdout_string(&output);
+        assert!(
+            stdout.contains("ERROR policy_invalid policies.base.file"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(expected_kind) && stdout.contains(action),
+            "{stdout}"
+        );
+    }
+
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let config_path = temp.path().join("cluster.yaml");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "applies_to: [knowledge]",
+        "applies_to: [cluster, knowledge]",
+    );
+    fs::write(config_path, config).unwrap();
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(temp.path()),
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("ERROR policy_mixed_binding_kinds policies.base.applies_to"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn cluster_validate_json_is_stable() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
@@ -981,7 +1090,7 @@ fn applied_two_graph_cluster() -> tempfile::TempDir {
         "node Person {\n  name: String @key\n  age: I32?\n}\n",
     )
     .unwrap();
-    fs::write(root.join("base.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(root.join("base.policy.yaml"), "version: 1\nrules: []\n").unwrap();
     fs::write(
         root.join("cluster.yaml"),
         r#"

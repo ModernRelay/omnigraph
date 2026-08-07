@@ -7,7 +7,7 @@ use crate::error::{OmniError, Result};
 use crate::failpoints;
 use crate::storage::{StorageAdapter, normalize_root_uri};
 
-use super::commit_graph::{CommitGraph, GraphCommit};
+use super::commit_graph::{CommitGraph, FirstParentEdge, GraphCommit};
 use super::is_internal_system_branch;
 use super::manifest::{
     CapturedManifestProbe, ExpectedTableVersions, LineageIntent, ManifestChange,
@@ -81,6 +81,25 @@ pub struct ResolvedTarget {
     pub branch: Option<String>,
     pub snapshot_id: SnapshotId,
     pub snapshot: Snapshot,
+}
+
+/// Internal lineage classification for an existing two-commit diff request.
+/// Arbitrary ranges retain net-current semantics; direct adjacency is derived
+/// only from the child's persisted first-parent pointer.
+pub(crate) enum ResolvedCommitRange {
+    FirstParent(FirstParentEdge),
+    Arbitrary { from: GraphCommit, to: GraphCommit },
+}
+
+fn classify_commit_range(from: GraphCommit, to: GraphCommit) -> ResolvedCommitRange {
+    if to.parent_commit_id.as_deref() == Some(from.graph_commit_id.as_str()) {
+        ResolvedCommitRange::FirstParent(FirstParentEdge {
+            parent: from,
+            child: to,
+        })
+    } else {
+        ResolvedCommitRange::Arbitrary { from, to }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -426,6 +445,22 @@ impl GraphCoordinator {
         )))
     }
 
+    /// Resolve both endpoints and classify direct first-parent adjacency from
+    /// the child's persisted parent pointer.
+    ///
+    /// This is deliberately O(1) after the two commits are resolved: it adds
+    /// no ancestry index or history walk. Arbitrary ranges retain the existing
+    /// net-current diff semantics.
+    pub(crate) async fn resolve_commit_range(
+        &self,
+        from_id: &SnapshotId,
+        to_id: &SnapshotId,
+    ) -> Result<ResolvedCommitRange> {
+        let from = self.resolve_commit(from_id).await?;
+        let to = self.resolve_commit(to_id).await?;
+        Ok(classify_commit_range(from, to))
+    }
+
     pub(crate) async fn head_commit_id(&self) -> Result<Option<SnapshotId>> {
         self.commit_graph
             .head_commit_id()
@@ -589,4 +624,66 @@ fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     Ok(Some(branch.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn commit(
+        id: &str,
+        parent_commit_id: Option<&str>,
+        merged_parent_commit_id: Option<&str>,
+    ) -> GraphCommit {
+        GraphCommit {
+            graph_commit_id: id.to_string(),
+            manifest_branch: None,
+            manifest_version: 1,
+            parent_commit_id: parent_commit_id.map(str::to_string),
+            merged_parent_commit_id: merged_parent_commit_id.map(str::to_string),
+            actor_id: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn commit_range_classification_uses_only_the_child_first_parent_pointer() {
+        let root = commit("root", None, None);
+        let child = commit("child", Some("root"), None);
+        match classify_commit_range(root.clone(), child.clone()) {
+            ResolvedCommitRange::FirstParent(edge) => {
+                assert_eq!(edge.parent.graph_commit_id, "root");
+                assert_eq!(edge.child.graph_commit_id, "child");
+            }
+            ResolvedCommitRange::Arbitrary { .. } => {
+                panic!("a direct child must classify as a first-parent edge")
+            }
+        }
+        assert!(matches!(
+            classify_commit_range(child.clone(), root.clone()),
+            ResolvedCommitRange::Arbitrary { .. }
+        ));
+        assert!(matches!(
+            classify_commit_range(root, commit("grandchild", Some("child"), None)),
+            ResolvedCommitRange::Arbitrary { .. }
+        ));
+
+        let left = commit("left", Some("root"), None);
+        let right = commit("right", Some("root"), None);
+        let merge = commit("merge", Some("left"), Some("right"));
+        match classify_commit_range(left, merge.clone()) {
+            ResolvedCommitRange::FirstParent(edge) => {
+                assert_eq!(edge.parent.graph_commit_id, "left");
+                assert_eq!(edge.child.graph_commit_id, "merge");
+                assert_eq!(edge.child.merged_parent_commit_id.as_deref(), Some("right"));
+            }
+            ResolvedCommitRange::Arbitrary { .. } => {
+                panic!("a merge must be adjacent only to its persisted first parent")
+            }
+        }
+        assert!(matches!(
+            classify_commit_range(right, merge),
+            ResolvedCommitRange::Arbitrary { .. }
+        ));
+    }
 }

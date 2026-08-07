@@ -691,8 +691,12 @@ query find_service($name: String) {
 "#,
     )
     .unwrap();
-    fs::write(root.join("cluster_wide.policy.yaml"), "rules: []\n").unwrap();
-    fs::write(root.join("shared.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(
+        root.join("cluster_wide.policy.yaml"),
+        "version: 1\nrules: []\n",
+    )
+    .unwrap();
+    fs::write(root.join("shared.policy.yaml"), "version: 1\nrules: []\n").unwrap();
     fs::write(
         root.join("cluster.yaml"),
         r#"
