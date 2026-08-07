@@ -561,7 +561,6 @@ async fn cluster_boot_quarantines_graph_open_failures() {
     let server_policy = omnigraph_server::PolicySource::Inline(
         r#"
 version: 1
-kind: server
 groups:
   admins: [act-admin]
 rules:
@@ -864,10 +863,16 @@ async fn cluster_boot_wires_policy_bindings_into_cedar_slots() {
         .unwrap();
         fs::write(
             temp.path().join("cluster.policy.yaml"),
-            permit_all_policy_yaml(&["default"]).replace(
-                "protected_branches: [main]\n",
-                "protected_branches: [main]\nkind: server\n",
-            ),
+            r#"
+version: 1
+groups:
+  permitted: [default]
+rules:
+  - id: permit-graph-list
+    allow:
+      actors: { group: permitted }
+      actions: [graph_list]
+"#,
         )
         .unwrap();
         fs::write(
@@ -914,7 +919,7 @@ graphs:
     else {
         panic!("cluster-mode server policy must be inline content");
     };
-    assert!(server_policy.contains("kind: server"), "{server_policy:?}");
+    assert!(server_policy.contains("graph_list"), "{server_policy:?}");
 }
 
 #[tokio::test]
