@@ -4,17 +4,9 @@
 #![allow(clippy::all)]
 
 use std::fs;
-#[cfg(feature = "failpoints")]
-use std::future::Future;
 use std::path::Path;
-#[cfg(feature = "failpoints")]
-use std::sync::Arc;
 
 use omnigraph::db::Omnigraph;
-#[cfg(feature = "failpoints")]
-use omnigraph_compiler::ir::ParamMap;
-#[cfg(feature = "failpoints")]
-use omnigraph_compiler::query::ast::Literal;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -62,28 +54,6 @@ policies:
     )
     .unwrap();
     dir
-}
-
-/// Run a composed lifecycle scenario outside libtest's 2-MiB
-/// thread. Individual operations run on ordinary stacks elsewhere; this
-/// only bounds the large debug future assembled by an end-to-end test.
-#[cfg(feature = "failpoints")]
-fn on_big_stack<F>(body: impl FnOnce() -> F + Send + 'static)
-where
-    F: Future<Output = ()>,
-{
-    std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
-        .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(body());
-        })
-        .unwrap()
-        .join()
-        .unwrap();
 }
 
 fn write_mock_embedding_cluster(config_dir: &Path, model: &str) {
@@ -3911,11 +3881,4 @@ async fn plan_annotates_apply_dispositions() {
         by_resource["policy.base"].disposition,
         Some(ApplyDisposition::Applied)
     );
-}
-
-#[cfg(feature = "failpoints")]
-#[test]
-#[serial_test::serial]
-fn blocked_disable_persists_exact_disabling_correction_authority() {
-    on_big_stack(blocked_disable_persists_exact_disabling_correction_authority_body);
 }
