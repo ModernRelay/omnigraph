@@ -206,6 +206,39 @@ fn parity_load() {
         "--json",
     ]);
     assert_parity("load", &l, &r);
+
+    // Canonical load is strict graph-batch syntax, but Overwrite uses Lance's
+    // replacement transaction rather than RFC-023's keyed Append/Merge adapter.
+    // Keep this one row above that adapter's ceiling so local and served CLI
+    // routing cannot accidentally impose the keyed limit on bulk replacement.
+    const KEYED_LIMIT: usize = 8192;
+    let mut overwrite = String::with_capacity((KEYED_LIMIT + 1) * 64);
+    for (name, age) in [("Alice", 30), ("Bob", 25), ("Charlie", 35), ("Diana", 28)] {
+        overwrite.push_str(&format!(
+            "{{\"type\":\"Person\",\"data\":{{\"name\":\"{name}\",\"age\":{age}}}}}\n"
+        ));
+    }
+    for row in 0..(KEYED_LIMIT - 3) {
+        overwrite.push_str(&format!(
+            "{{\"type\":\"Person\",\"data\":{{\"name\":\"Bulk {row}\",\"age\":1}}}}\n"
+        ));
+    }
+    std::fs::write(&data, overwrite).unwrap();
+    let (l, r) = p.run(&[
+        "load",
+        "--mode",
+        "overwrite",
+        "--data",
+        data.to_str().unwrap(),
+        "--yes",
+        "--json",
+    ]);
+    assert!(l.status.success(), "bulk Overwrite local arm failed: {l:?}");
+    assert!(
+        r.status.success(),
+        "bulk Overwrite remote arm failed: {r:?}"
+    );
+    assert_parity("load --mode overwrite above keyed limit", &l, &r);
 }
 
 #[test]

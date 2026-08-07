@@ -459,11 +459,19 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let mut edge_rows: HashMap<String, Vec<(String, String, JsonValue)>> = HashMap::new();
     let mut strict_rows = StrictGraphRows::default();
     let mut keyed_input_budget: HashMap<String, (usize, u64)> = HashMap::new();
-    let bounded_keyed_input = input_shape == LoadInputShape::StrictGraphBatch
-        || matches!(mode, LoadMode::Append | LoadMode::Merge);
+    // Strict syntax is independent of the keyed-write transaction ceiling.
+    // Append/Merge route through the bounded keyed adapter; Overwrite stages a
+    // Lance replacement transaction and must retain the bulk-replacement
+    // contract. Strict normalization still preflights its Arrow allocation.
+    let bounded_keyed_input = matches!(mode, LoadMode::Append | LoadMode::Merge);
 
     if input_shape == LoadInputShape::StrictGraphBatch {
-        strict_rows = parse_strict_graph_rows(reader, &catalog, &mut keyed_input_budget)?;
+        strict_rows = parse_strict_graph_rows(
+            reader,
+            &catalog,
+            bounded_keyed_input,
+            &mut keyed_input_budget,
+        )?;
     } else {
         // Parse a stream of JSON values. Accepts both compact JSONL (one object
         // per line) and pretty-printed JSON where a single object spans multiple
@@ -1018,6 +1026,7 @@ impl<'de> Visitor<'de> for UniqueJsonVisitor {
 fn parse_strict_graph_rows<R: BufRead>(
     mut reader: R,
     catalog: &Catalog,
+    bounded_keyed_input: bool,
     keyed_input_budget: &mut HashMap<String, (usize, u64)>,
 ) -> Result<StrictGraphRows> {
     let mut rows = StrictGraphRows::default();
@@ -1065,7 +1074,9 @@ fn parse_strict_graph_rows<R: BufRead>(
                 }
                 let table_key = format!("node:{type_name}");
                 let row = JsonValue::Object(data);
-                account_keyed_json_row(&table_key, &row, 0, keyed_input_budget)?;
+                if bounded_keyed_input {
+                    account_keyed_json_row(&table_key, &row, 0, keyed_input_budget)?;
+                }
                 rows.nodes.entry(type_name).or_default().push(row);
             }
             (false, true) => {
@@ -1092,12 +1103,14 @@ fn parse_strict_graph_rows<R: BufRead>(
                 })?;
                 let canonical = edge_type.name.clone();
                 let table_key = format!("edge:{canonical}");
-                account_keyed_json_row(
-                    &table_key,
-                    &JsonValue::Object(data.clone()),
-                    from.len().saturating_add(to.len()),
-                    keyed_input_budget,
-                )?;
+                if bounded_keyed_input {
+                    account_keyed_json_row(
+                        &table_key,
+                        &JsonValue::Object(data.clone()),
+                        from.len().saturating_add(to.len()),
+                        keyed_input_budget,
+                    )?;
+                }
                 data.insert("src".to_string(), JsonValue::String(from));
                 data.insert("dst".to_string(), JsonValue::String(to));
                 rows.edges
