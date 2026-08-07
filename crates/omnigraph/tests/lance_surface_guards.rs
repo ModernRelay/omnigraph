@@ -23,10 +23,14 @@
 //! Functions decorated `#[tokio::test]` actually run; they construct real
 //! values and assert field shapes / types.
 
+mod helpers;
+
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
@@ -55,6 +59,8 @@ use lance_io::object_store::ObjectStoreRegistry;
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
 use omnigraph_compiler::schema::parser::parse_schema;
+
+use helpers::{init_and_load, open_dataset_head, snapshot_main};
 
 #[test]
 fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
@@ -1439,6 +1445,251 @@ async fn _compile_scalar_index_coverage_surface() -> lance::Result<()> {
         let _covered: Option<bool> = index.fragment_bitmap.as_ref().map(|b| b.contains(0u32));
     }
     Ok(())
+}
+
+// --- CDC C0 guards: exact-end deltas and production row-version shape -------
+//
+// Lance's explicit delta range controls the version-column predicate, but the
+// row images are scanned from the `Dataset` handle used to build the delta. A
+// historical interval therefore needs a handle checked out at its exact end:
+// asking a later HEAD for the same interval can lose a row that changed again.
+// Keep this regression beside the other Lance surface probes so a dependency
+// bump cannot silently invalidate RFC-030's candidate-pruning contract.
+
+#[tokio::test]
+async fn dataset_delta_historical_images_require_the_exact_end_handle() {
+    async fn commit_alice_value(dataset: Dataset, value: i32) -> Dataset {
+        let batch = pk_full_row(&dataset, "alice", value);
+        let staged = stage_pk_merge(
+            Arc::new(dataset.clone()),
+            batch,
+            "id",
+            WhenMatched::UpdateAll,
+            WhenNotMatched::InsertAll,
+            Some(false),
+        )
+        .await;
+        CommitBuilder::new(Arc::new(dataset))
+            .with_skip_auto_cleanup(true)
+            .execute(staged.transaction)
+            .await
+            .expect("the guard update must commit")
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("cdc-exact-end-delta.lance");
+    let initial = fresh_pk_dataset(uri.to_str().unwrap()).await;
+    let begin_version = initial.version().version;
+
+    let exact_end = commit_alice_value(initial, 20).await;
+    let end_version = exact_end.version().version;
+    assert_eq!(
+        end_version,
+        begin_version + 1,
+        "the exact-end fixture needs one adjacent update"
+    );
+
+    let current_head = commit_alice_value(exact_end.clone(), 30).await;
+    assert_eq!(
+        current_head.version().version,
+        end_version + 1,
+        "the negative control needs the same row updated after the selected end"
+    );
+
+    let exact_delta = exact_end
+        .delta()
+        .with_begin_version(begin_version)
+        .with_end_version(end_version)
+        .build()
+        .unwrap();
+    let exact_batches: Vec<RecordBatch> = exact_delta
+        .get_updated_rows()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let exact_rows = exact_batches
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    assert_eq!(
+        exact_rows, 1,
+        "the exact-end delta must retain the one row changed in the interval"
+    );
+    let exact_batch = exact_batches
+        .iter()
+        .find(|batch| batch.num_rows() == 1)
+        .expect("the one changed row must be materialized");
+    let exact_ids = exact_batch["id"]
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let exact_values = exact_batch["value"]
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let exact_updated_versions = exact_batch[ROW_LAST_UPDATED_AT_VERSION]
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(exact_ids.value(0), "alice");
+    assert_eq!(
+        exact_values.value(0),
+        20,
+        "the delta must return the image at the selected end, not a later image"
+    );
+    assert_eq!(exact_updated_versions.value(0), end_version);
+
+    let stale_interval_on_head = current_head
+        .delta()
+        .with_begin_version(begin_version)
+        .with_end_version(end_version)
+        .build()
+        .unwrap();
+    let head_batches: Vec<RecordBatch> = stale_interval_on_head
+        .get_updated_rows()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        head_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        0,
+        "pinned Lance scans row images from the builder's handle: a later HEAD is \
+         not a valid source for an older interval whose row changed again; RFC-030 \
+         must check out the exact end version before constructing DatasetDelta"
+    );
+}
+
+#[tokio::test]
+async fn omnigraph_graph_tables_enable_stable_row_ids_and_version_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let snapshot = snapshot_main(&db).await.unwrap();
+    let entries = snapshot
+        .entries()
+        .map(|entry| {
+            (
+                entry.table_key.clone(),
+                entry.table_path.clone(),
+                entry.table_version,
+                entry.table_branch.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries.len(),
+        4,
+        "the shared fixture must exercise every declared node and edge table"
+    );
+
+    for (table_key, table_path, table_version, table_branch) in entries {
+        let table_uri = dir.path().join(table_path);
+        let head = open_dataset_head(table_uri.to_str().unwrap(), table_branch.as_deref()).await;
+        let table = if head.version().version == table_version {
+            head
+        } else {
+            head.checkout_version(table_version).await.unwrap()
+        };
+
+        assert!(
+            table.manifest().uses_stable_row_ids(),
+            "OmniGraph-created graph table {table_key} must keep Lance stable row IDs enabled"
+        );
+
+        let selected_version = table.version().version;
+        let mut scanner = table.scan();
+        scanner
+            .project(&[
+                "id",
+                ROW_ID,
+                ROW_CREATED_AT_VERSION,
+                ROW_LAST_UPDATED_AT_VERSION,
+            ])
+            .expect("stable row-id and row-version columns must be projectable");
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert_ne!(
+            row_count, 0,
+            "the shared loaded fixture must contain rows in {table_key}"
+        );
+
+        let mut row_ids = HashSet::new();
+        for batch in &batches {
+            let ids = batch[ROW_ID]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("_rowid must retain Lance's UInt64 surface");
+            let created = batch[ROW_CREATED_AT_VERSION]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("_row_created_at_version must retain Lance's UInt64 surface");
+            let updated = batch[ROW_LAST_UPDATED_AT_VERSION]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("_row_last_updated_at_version must retain Lance's UInt64 surface");
+            assert_eq!(
+                ids.null_count(),
+                0,
+                "live {table_key} rows need concrete stable row IDs"
+            );
+            assert_eq!(
+                created.null_count(),
+                0,
+                "live {table_key} rows need a creation version"
+            );
+            assert_eq!(
+                updated.null_count(),
+                0,
+                "live {table_key} rows need an update version"
+            );
+            for row in 0..batch.num_rows() {
+                assert!(
+                    row_ids.insert(ids.value(row)),
+                    "stable row IDs must be unique within {table_key}"
+                );
+                assert!(created.value(row) <= updated.value(row));
+                assert!(updated.value(row) <= selected_version);
+            }
+        }
+
+        let version_predicate = format!(
+            "{ROW_CREATED_AT_VERSION} <= {ROW_LAST_UPDATED_AT_VERSION} AND \
+             {ROW_LAST_UPDATED_AT_VERSION} <= {selected_version}"
+        );
+        let mut predicate_probe = table.scan();
+        predicate_probe
+            .project(&["id"])
+            .expect("the predicate probe must project a logical column");
+        predicate_probe
+            .filter(&version_predicate)
+            .expect("row-version columns must be usable in a scan predicate");
+        let filtered_rows = predicate_probe
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_fold(
+                0usize,
+                |rows, batch| async move { Ok(rows + batch.num_rows()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered_rows, row_count,
+            "the row-version predicate must retain every validated live row in {table_key}"
+        );
+    }
 }
 
 // --- Guard 12: can a scalar BTREE be built on a system version column? --------

@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use arrow_cast::display::array_value_to_string;
 use lance::dataset::scanner::ColumnOrdering;
 
 use crate::db::SubTableEntry;
-use crate::db::manifest::Snapshot;
+use crate::db::manifest::{Snapshot, TableIdentity};
 use crate::error::Result;
 use crate::storage_layer::{SnapshotHandle, TableStorage};
 use crate::table_store::TableStore;
@@ -104,6 +104,62 @@ impl ChangeFilter {
 
 // ─── Core diff ──────────────────────────────────────────────────────────────
 
+/// One immutable table lifetime whose physical state differs between two
+/// graph snapshots.
+///
+/// Identity, not alias, pairs the endpoints. A rename therefore stays one
+/// interval (and is elided when its physical state did not move), while a
+/// drop/re-add under the same public name remains two distinct lifetimes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TableChangeInterval<'a> {
+    pub(crate) identity: TableIdentity,
+    pub(crate) from: Option<&'a SubTableEntry>,
+    pub(crate) to: Option<&'a SubTableEntry>,
+}
+
+impl<'a> TableChangeInterval<'a> {
+    fn table_key(&self) -> &'a str {
+        &self
+            .to
+            .or(self.from)
+            .expect("a changed interval has at least one endpoint")
+            .table_key
+    }
+}
+
+/// Derive changed table lifetimes in stable graph-visible order: destination
+/// alias (or source alias for a removal), then immutable identity.
+///
+/// This is the graph-commit CDC pruning layer: later row enumeration only
+/// needs to inspect these exact endpoint pairs. It persists no parallel change
+/// log and does not infer identity from an alias, path, or Lance version.
+pub(crate) fn changed_table_intervals<'a>(
+    from: &'a Snapshot,
+    to: &'a Snapshot,
+) -> Vec<TableChangeInterval<'a>> {
+    let mut by_identity =
+        BTreeMap::<TableIdentity, (Option<&'a SubTableEntry>, Option<&'a SubTableEntry>)>::new();
+    for entry in from.entries() {
+        by_identity.entry(entry.identity).or_default().0 = Some(entry);
+    }
+    for entry in to.entries() {
+        by_identity.entry(entry.identity).or_default().1 = Some(entry);
+    }
+
+    let mut intervals = by_identity
+        .into_iter()
+        .filter_map(|(identity, (from, to))| {
+            (!same_state(from, to)).then_some(TableChangeInterval { identity, from, to })
+        })
+        .collect::<Vec<_>>();
+    intervals.sort_by(|left, right| {
+        left.table_key()
+            .cmp(right.table_key())
+            .then_with(|| left.identity.cmp(&right.identity))
+    });
+    intervals
+}
+
 /// Net-current diff between two snapshots.
 ///
 /// Uses a three-level algorithm:
@@ -117,37 +173,25 @@ pub(crate) async fn diff_snapshots(
     filter: &ChangeFilter,
     branch: Option<String>,
 ) -> Result<ChangeSet> {
-    let from_by_identity = from
-        .entries()
-        .map(|entry| (entry.identity, entry))
-        .collect::<HashMap<_, _>>();
-    let to_by_identity = to
-        .entries()
-        .map(|entry| (entry.identity, entry))
-        .collect::<HashMap<_, _>>();
-    let all_identities = from_by_identity
-        .keys()
-        .chain(to_by_identity.keys())
-        .copied()
-        .collect::<HashSet<_>>();
-
     let mut changes = Vec::new();
 
-    for identity in all_identities {
-        let from_entry = from_by_identity.get(&identity).copied();
-        let to_entry = to_by_identity.get(&identity).copied();
+    for interval in changed_table_intervals(from, to) {
+        let from_entry = interval.from;
+        let to_entry = interval.to;
         // Prefer the destination alias for a rename; a removed table has only
         // its source alias. Logical pairing never depends on either name.
         let table_key = &to_entry
             .or(from_entry)
             .expect("identity came from one snapshot")
             .table_key;
+        debug_assert!(
+            from_entry
+                .into_iter()
+                .chain(to_entry)
+                .all(|entry| entry.identity == interval.identity),
+            "table interval endpoints must retain their immutable identity"
+        );
         if !filter.matches_table(table_key) {
-            continue;
-        }
-
-        // Skip if both snapshots have identical state for this table
-        if same_state(from_entry, to_entry) {
             continue;
         }
 
