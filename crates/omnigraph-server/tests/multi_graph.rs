@@ -561,7 +561,6 @@ async fn cluster_boot_quarantines_graph_open_failures() {
     let server_policy = omnigraph_server::PolicySource::Inline(
         r#"
 version: 1
-kind: server
 groups:
   admins: [act-admin]
 rules:

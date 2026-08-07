@@ -272,10 +272,38 @@ rules:
             "unexpected diagnostic: {diagnostic:?}"
         );
     }
+
+    let dir = fixture();
+    fs::write(
+        dir.path().join("base.policy.yaml"),
+        r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: typo-must-not-widen-access
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scpoe: protected
+"#,
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    let diagnostic = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "policy_invalid")
+        .unwrap_or_else(|| panic!("missing policy_invalid diagnostic: {:?}", out.diagnostics));
+    assert_eq!(diagnostic.path, "policies.base.file");
+    assert!(
+        diagnostic.message.contains("branch_scpoe"),
+        "unexpected diagnostic: {diagnostic:?}"
+    );
 }
 
 #[test]
-fn policy_binding_kind_mismatch_fails_validation() {
+fn policy_binding_contract_fails_validation() {
     for (applies_to, action, scope, expected_kind) in [
         ("knowledge", "graph_list", "", "server-scoped"),
         ("cluster", "read", "      branch_scope: any\n", "per-graph"),
@@ -314,6 +342,70 @@ rules:
         assert_eq!(diagnostic.path, "policies.base.file");
         assert!(
             diagnostic.message.contains(expected_kind) && diagnostic.message.contains(action),
+            "unexpected diagnostic: {diagnostic:?}"
+        );
+    }
+
+    let dir = fixture();
+    let config_path = dir.path().join(CLUSTER_CONFIG_FILE);
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "applies_to: [knowledge]",
+        "applies_to: [cluster, knowledge]",
+    );
+    fs::write(config_path, config).unwrap();
+    let out = validate_config_dir(dir.path());
+    let diagnostic = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "policy_mixed_binding_kinds")
+        .unwrap_or_else(|| {
+            panic!(
+                "missing policy_mixed_binding_kinds diagnostic: {:?}",
+                out.diagnostics
+            )
+        });
+    assert_eq!(diagnostic.path, "policies.base.applies_to");
+    assert!(
+        !out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "policy_invalid"),
+        "an empty, structurally valid policy must not acquire a spurious kind error: {:?}",
+        out.diagnostics
+    );
+
+    for target in ["knowledge", "cluster"] {
+        let dir = fixture();
+        fs::write(dir.path().join("second.policy.yaml"), POLICY).unwrap();
+        let config_path = dir.path().join(CLUSTER_CONFIG_FILE);
+        let mut config = fs::read_to_string(&config_path).unwrap();
+        if target == "cluster" {
+            config = config.replace("applies_to: [knowledge]", "applies_to: [cluster]");
+        }
+        config.push_str(&format!(
+            "  second:\n    file: ./second.policy.yaml\n    applies_to: [{target}]\n"
+        ));
+        fs::write(config_path, config).unwrap();
+
+        let out = validate_config_dir(dir.path());
+        let diagnostic = out
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "duplicate_policy_binding")
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing duplicate_policy_binding diagnostic for {target}: {:?}",
+                    out.diagnostics
+                )
+            });
+        assert_eq!(diagnostic.path, "policies.second.applies_to");
+        assert!(
+            diagnostic.message.contains("`base`")
+                && diagnostic.message.contains("`second`")
+                && diagnostic.message.contains(if target == "cluster" {
+                    "`cluster`"
+                } else {
+                    "`graph.knowledge`"
+                }),
             "unexpected diagnostic: {diagnostic:?}"
         );
     }
@@ -3324,7 +3416,7 @@ graphs:
 policies:
   base:
     file: ./base.policy.yaml
-    applies_to: [cluster, knowledge]
+    applies_to: [cluster]
 "#,
     )
     .unwrap();
@@ -3348,7 +3440,7 @@ policies:
     let state = read_state_json(dir.path());
     assert_eq!(
         state["applied_revision"]["resources"]["policy.base"]["applies_to"],
-        serde_json::json!(["cluster", "graph.knowledge"])
+        serde_json::json!(["cluster"])
     );
     // Idempotent: a second run sees no changes.
     let again = apply_config_dir(dir.path()).await;

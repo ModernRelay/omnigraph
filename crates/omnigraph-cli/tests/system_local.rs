@@ -2123,7 +2123,6 @@ rules:
         dir.join("server.policy.yaml"),
         r#"
 version: 1
-kind: server
 groups:
   admins: ["act-admin"]
 rules:

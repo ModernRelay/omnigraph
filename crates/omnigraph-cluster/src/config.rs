@@ -748,6 +748,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
     }
 
     let mut policy_bindings: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut policy_binding_owners: BTreeMap<String, String> = BTreeMap::new();
     for (policy_name, policy) in &raw.policies {
         validate_id(
             "policy name",
@@ -802,6 +803,32 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         normalized_bindings.sort();
         normalized_bindings.dedup();
 
+        let mixes_binding_kinds = binds_cluster && graph_binding.is_some();
+        if mixes_binding_kinds {
+            diagnostics.push(Diagnostic::error(
+                "policy_mixed_binding_kinds",
+                format!("policies.{policy_name}.applies_to"),
+                "one policy bundle cannot bind both `cluster` and graph scopes; split server and graph rules into separate bundles",
+            ));
+        }
+        for binding in &normalized_bindings {
+            match policy_binding_owners.entry(binding.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(policy_name.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    diagnostics.push(Diagnostic::error(
+                        "duplicate_policy_binding",
+                        format!("policies.{policy_name}.applies_to"),
+                        format!(
+                            "policy bundles `{}` and `{policy_name}` both bind `{binding}`; merge them or leave exactly one bundle for that scope",
+                            entry.get()
+                        ),
+                    ));
+                }
+            }
+        }
+
         let policy_path = resolve_config_path(&config_dir, &policy.file);
         match fs::read_to_string(&policy_path) {
             Ok(source) => {
@@ -814,23 +841,23 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                         path: Some(display_path(&policy_path)),
                     },
                 );
-                let validation = omnigraph_policy::PolicyConfig::from_source(&source)
-                    .and_then(|_| {
-                        if binds_cluster {
-                            omnigraph_policy::PolicyEngine::load_server_from_source(&source)
+                let validation =
+                    omnigraph_policy::PolicyConfig::from_source(&source).and_then(|_| {
+                        match (binds_cluster, graph_binding.as_deref()) {
+                            (true, None) => {
+                                omnigraph_policy::PolicyEngine::load_server_from_source(&source)
+                                    .map(|_| ())
+                            }
+                            (false, Some(graph_id)) => {
+                                omnigraph_policy::PolicyEngine::load_graph_from_source(
+                                    &source, graph_id,
+                                )
                                 .map(|_| ())
-                        } else {
-                            Ok(())
-                        }
-                    })
-                    .and_then(|_| {
-                        if let Some(graph_id) = graph_binding.as_deref() {
-                            omnigraph_policy::PolicyEngine::load_graph_from_source(
-                                &source, graph_id,
-                            )
-                            .map(|_| ())
-                        } else {
-                            Ok(())
+                            }
+                            // Binding diagnostics above own the mixed/empty cases. Still parse the
+                            // source strictly, but do not pretend one policy can have both runtime
+                            // kinds or choose an arbitrary kind for an unbound bundle.
+                            _ => Ok(()),
                         }
                     });
                 if let Err(err) = validation {

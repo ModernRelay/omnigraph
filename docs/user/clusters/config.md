@@ -151,9 +151,10 @@ operation is active.
 - schema parsing and catalog construction
 - stored-query parsing and query-name matching
 - stored-query type-checking against the desired schema
-- policy YAML parsing and semantic rule validation (groups, actions, scopes,
-  and graph/server binding compatibility)
-- policy `applies_to` graph references
+- strict policy YAML parsing and semantic rule validation (unknown fields,
+  groups, actions, and scopes)
+- policy `applies_to` graph references, one runtime kind per bundle, and one
+  bundle per served graph or cluster scope
 - embedding provider profiles and graph `embedding_provider` references
 
 Fields reserved for later phases, such as `pipelines`, top-level
@@ -413,9 +414,9 @@ Boot is fail-fast for cluster-global readiness failures: missing or
 unreadable state, invalid/unattributable recovery sidecars,
 missing/tampered shared catalog blobs, policy entries without binding
 metadata (pre-binding ledgers — re-run `cluster apply`), an empty graph set,
-more than one policy bundle binding a single scope (split or merge bundles;
-stacked scopes are a later stage), cluster policy problems, or zero healthy
-graphs. Valid graph-attributed recovery sidecars, unopenable graph roots, and
+legacy or tampered state with more than one policy bundle binding a single
+scope (current validation refuses this before apply), cluster policy problems,
+or zero healthy graphs. Valid graph-attributed recovery sidecars, unopenable graph roots, and
 stored queries that no longer type-check quarantine that graph instead; the
 server logs startup diagnostics, skips the graph's queries and graph-only
 policy bindings, and serves any remaining healthy graphs. A held state lock

@@ -111,6 +111,27 @@ rules:
             "{stdout}"
         );
     }
+
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let config_path = temp.path().join("cluster.yaml");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "applies_to: [knowledge]",
+        "applies_to: [cluster, knowledge]",
+    );
+    fs::write(config_path, config).unwrap();
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(temp.path()),
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("ERROR policy_mixed_binding_kinds policies.base.applies_to"),
+        "{stdout}"
+    );
 }
 
 #[test]
