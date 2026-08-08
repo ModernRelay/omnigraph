@@ -324,9 +324,7 @@ query reach($name: String) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-    load_jsonl(&mut db, DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, DATA, LoadMode::Overwrite).await.unwrap();
 
     let got = both_modes(&mut db, QUERY, "reach", &params(&[("$name", "alice")])).await;
     assert_eq!(
@@ -363,9 +361,7 @@ async fn variable_hops_terminate_and_dedup_on_cycle() {
 {"edge":"Knows","from":"b","to":"c"}
 {"edge":"Knows","from":"c","to":"a"}"#;
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let got = both_modes(&mut db, REACH_5, "reach", &params(&[("$name", "a")])).await;
     // From a: b (1 hop), c (2 hops); the c->a back-edge hits the seeded source
@@ -384,9 +380,7 @@ async fn variable_hops_handle_self_loop() {
 {"edge":"Knows","from":"a","to":"a"}
 {"edge":"Knows","from":"a","to":"b"}"#;
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let got = both_modes(&mut db, REACH_5, "reach", &params(&[("$name", "a")])).await;
     // a->a hits the seeded source (pruned); only b is reached.

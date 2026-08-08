@@ -80,10 +80,10 @@ async fn snapshot_returns_stale_data_after_write() {
 async fn load_append_rejects_existing_id_without_update() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
         LoadMode::Overwrite,
     )
@@ -98,7 +98,7 @@ async fn load_append_rejects_existing_id_without_update() {
         .table_version;
 
     let err = load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"Alice","age":99}}"#,
         LoadMode::Append,
     )
@@ -169,16 +169,16 @@ async fn load_keyed_write_row_cap_excludes_strict_overwrite() {
     };
 
     let exact_dir = tempfile::tempdir().unwrap();
-    let mut exact = Omnigraph::init(exact_dir.path().to_str().unwrap(), SCHEMA)
+    let exact = Omnigraph::init(exact_dir.path().to_str().unwrap(), SCHEMA)
         .await
         .unwrap();
-    load_jsonl(&mut exact, &jsonl(LIMIT), LoadMode::Append)
+    load_jsonl(&exact, &jsonl(LIMIT), LoadMode::Append)
         .await
         .expect("the exact keyed row limit is inclusive");
     assert_eq!(count_rows(&exact, "node:Thing").await, LIMIT);
 
     let over_dir = tempfile::tempdir().unwrap();
-    let mut over = Omnigraph::init(over_dir.path().to_str().unwrap(), SCHEMA)
+    let over = Omnigraph::init(over_dir.path().to_str().unwrap(), SCHEMA)
         .await
         .unwrap();
     let before = snapshot_main(&over).await.unwrap();
@@ -191,7 +191,7 @@ async fn load_keyed_write_row_cap_excludes_strict_overwrite() {
         entry.table_path.trim_start_matches('/')
     );
     let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
-    let error = load_jsonl(&mut over, &jsonl(LIMIT + 1), LoadMode::Append)
+    let error = load_jsonl(&over, &jsonl(LIMIT + 1), LoadMode::Append)
         .await
         .unwrap_err();
     assert!(
@@ -243,7 +243,7 @@ node Thing {
 "#;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+    let db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
         .await
         .unwrap();
     let before = snapshot_main(&db).await.unwrap();
@@ -260,9 +260,7 @@ node Thing {
     let wide = "x".repeat(LIMIT as usize + 1024);
     let input =
         format!("{{\"type\":\"Thing\",\"data\":{{\"key\":\"wide\",\"payload\":\"{wide}\"}}}}");
-    let error = load_jsonl(&mut db, &input, LoadMode::Append)
-        .await
-        .unwrap_err();
+    let error = load_jsonl(&db, &input, LoadMode::Append).await.unwrap_err();
     assert!(
         matches!(
             error,
@@ -476,13 +474,13 @@ node Thing {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let start = Arc::new(Barrier::new(SAME_KEY_WRITERS));
-    let same_results = join_all(writers.into_iter().enumerate().map(|(writer, mut db)| {
+    let same_results = join_all(writers.into_iter().enumerate().map(|(writer, db)| {
         let start = Arc::clone(&start);
         async move {
             start.wait().await;
             let row =
                 format!(r#"{{"type":"Thing","data":{{"key":"SAME","value":"writer-{writer}"}}}}"#);
-            (writer, load_jsonl(&mut db, &row, LoadMode::Append).await)
+            (writer, load_jsonl(&db, &row, LoadMode::Append).await)
         }
     }))
     .await;
@@ -525,16 +523,16 @@ node Thing {
         "the persisted row must belong to the sole successful writer"
     );
 
-    let mut left = Omnigraph::open(uri).await.unwrap();
-    let mut right = Omnigraph::open(uri).await.unwrap();
+    let left = Omnigraph::open(uri).await.unwrap();
+    let right = Omnigraph::open(uri).await.unwrap();
     let (left, right) = tokio::join!(
         load_jsonl(
-            &mut left,
+            &left,
             r#"{"type":"Thing","data":{"key":"LEFT","value":"l"}}"#,
             LoadMode::Append,
         ),
         load_jsonl(
-            &mut right,
+            &right,
             r#"{"type":"Thing","data":{"key":"RIGHT","value":"r"}}"#,
             LoadMode::Append,
         ),
@@ -555,23 +553,19 @@ node Thing {
 async fn load_merge_upserts_existing_and_inserts_new() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     // Load Alice(30) and Bob(25) via Overwrite
     let initial = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Person", "data": {"name": "Bob", "age": 25}}"#;
-    load_jsonl(&mut db, initial, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, initial, LoadMode::Overwrite).await.unwrap();
 
     assert_eq!(count_rows(&db, "node:Person").await, 2);
 
     // Merge: Alice updated to age=31, Charlie is new
     let merge_data = r#"{"type": "Person", "data": {"name": "Alice", "age": 31}}
 {"type": "Person", "data": {"name": "Charlie", "age": 35}}"#;
-    load_jsonl(&mut db, merge_data, LoadMode::Merge)
-        .await
-        .unwrap();
+    load_jsonl(&db, merge_data, LoadMode::Merge).await.unwrap();
 
     // Should have 3 persons total (not 4)
     assert_eq!(count_rows(&db, "node:Person").await, 3);
@@ -627,7 +621,7 @@ node Thing {
     optional_val: String?
 }
 "#;
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     // Seed with 50 fully-populated rows (id + required + optional).
     let mut seed = String::new();
@@ -637,9 +631,7 @@ node Thing {
 "#,
         ));
     }
-    load_jsonl(&mut db, &seed, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, &seed, LoadMode::Overwrite).await.unwrap();
 
     // Partial-schema delta — mirrors the bug report exactly: omits
     // `optional_val`. 25 existing keys + 5 new keys, one row per key.
@@ -651,12 +643,12 @@ node Thing {
         ));
     }
 
-    load_jsonl(&mut db, &delta, LoadMode::Merge)
+    load_jsonl(&db, &delta, LoadMode::Merge)
         .await
         .expect("first merge must succeed");
     assert_eq!(count_rows(&db, "node:Thing").await, 55);
 
-    load_jsonl(&mut db, &delta, LoadMode::Merge)
+    load_jsonl(&db, &delta, LoadMode::Merge)
         .await
         .expect("second merge against same keys must succeed");
     assert_eq!(count_rows(&db, "node:Thing").await, 55);
@@ -691,14 +683,14 @@ node Thing {
     value: String
 }
 "#;
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     let dupes = r#"{"type":"Thing","data":{"key":"DUP","value":"first"}}
 {"type":"Thing","data":{"key":"DUP","value":"second"}}
 "#;
 
     for mode in [LoadMode::Overwrite, LoadMode::Append, LoadMode::Merge] {
-        let err = load_jsonl(&mut db, dupes, mode).await.unwrap_err();
+        let err = load_jsonl(&db, dupes, mode).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("@unique violation") && msg.contains("DUP"),
@@ -826,14 +818,14 @@ node ExternalID {
     @unique(source, external_id)
 }
 "#;
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     // Same `source`, different `external_id` → unique on the composite key.
     // This is the exact repro from MR-983 and must be accepted.
     let composite_ok = r#"{"type":"ExternalID","data":{"slug":"a","source":"whatsapp","external_id":"+E.164"}}
 {"type":"ExternalID","data":{"slug":"b","source":"whatsapp","external_id":"pn:12345"}}
 "#;
-    load_jsonl(&mut db, composite_ok, LoadMode::Overwrite)
+    load_jsonl(&db, composite_ok, LoadMode::Overwrite)
         .await
         .expect("rows unique on the composite (source, external_id) must be accepted");
     assert_eq!(count_rows(&db, "node:ExternalID").await, 2);
@@ -843,7 +835,7 @@ node ExternalID {
     let composite_dupe = r#"{"type":"ExternalID","data":{"slug":"c","source":"whatsapp","external_id":"dup"}}
 {"type":"ExternalID","data":{"slug":"d","source":"whatsapp","external_id":"dup"}}
 "#;
-    let err = load_jsonl(&mut db, composite_dupe, LoadMode::Overwrite)
+    let err = load_jsonl(&db, composite_dupe, LoadMode::Overwrite)
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -949,7 +941,7 @@ node Thing {
     optional_val: String?
 }
 "#;
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     let mut seed = String::new();
     for i in 1..=50 {
@@ -958,9 +950,7 @@ node Thing {
 "#,
         ));
     }
-    load_jsonl(&mut db, &seed, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, &seed, LoadMode::Overwrite).await.unwrap();
 
     // Explicit ensure_indices between seed and the merges — the Window
     // 2 trigger. The eager-build behavior (MR-583) means the BTREE on
@@ -980,11 +970,11 @@ node Thing {
     // Both merges must succeed under the FirstSeen workaround.
     // `processed_row_ids` re-processes the same target row_id under
     // the default `SourceDedupeBehavior::Fail`; FirstSeen tolerates it.
-    load_jsonl(&mut db, &delta, LoadMode::Merge)
+    load_jsonl(&db, &delta, LoadMode::Merge)
         .await
         .expect("first merge after ensure_indices must succeed");
     db.ensure_indices().await.unwrap();
-    load_jsonl(&mut db, &delta, LoadMode::Merge).await.expect(
+    load_jsonl(&db, &delta, LoadMode::Merge).await.expect(
         "second merge after ensure_indices must succeed \
              (Window 2 canary: drop the FirstSeen setter in table_store.rs \
              only when this stays green WITHOUT it)",
@@ -1016,9 +1006,7 @@ query company($name: String) {
 "#;
 
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let result = query_main(&mut db, query, "company", &params(&[("$name", "Alice")]))
         .await
@@ -1128,9 +1116,7 @@ async fn null_values_in_filter_and_projection() {
     let data = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Person", "data": {"name": "Bob"}}
 {"type": "Person", "data": {"name": "Charlie", "age": 35}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     // Filter: age > 30 should exclude Bob (null) and Alice (30), keep Charlie (35)
     let queries = r#"
@@ -1358,9 +1344,7 @@ node Item {
         ));
     }
     let data = lines.join("\n");
-    load_jsonl(&mut db, &data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
 
     assert_eq!(count_rows(&db, "node:Item").await, 500);
 

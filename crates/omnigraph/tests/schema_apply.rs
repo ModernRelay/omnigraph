@@ -513,7 +513,7 @@ async fn plan_schema_rejects_when_schema_contract_has_drifted() {
 async fn apply_schema_noop_returns_not_applied() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     let result = db.apply_schema(TEST_SCHEMA).await.unwrap();
     assert!(result.supported);
@@ -526,7 +526,7 @@ async fn apply_schema_noop_returns_not_applied() {
 async fn apply_schema_rejects_when_non_main_branch_exists() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     db.branch_create("feature").await.unwrap();
 
     let desired = TEST_SCHEMA.replace(
@@ -545,7 +545,7 @@ async fn apply_schema_rejects_when_non_main_branch_exists() {
 async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -583,7 +583,7 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let people_before = count_rows(&db, "node:Person").await;
     let before_version = db
@@ -690,7 +690,7 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_drops_node_and_referencing_edge_softly() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -804,7 +804,7 @@ edge Knows: Person -> Person {
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_drops_an_edge_type_softly() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -862,7 +862,7 @@ async fn apply_schema_drops_an_edge_type_softly() {
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_rejects_adding_a_required_property_without_backfill() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -898,8 +898,8 @@ async fn plan_schema_for_property_type_narrowing_is_not_supported() {
     let uri = dir.path().to_str().unwrap();
 
     let initial = TEST_SCHEMA.replace("age: I32?", "age: I64?");
-    let mut db = Omnigraph::init(uri, &initial).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, &initial).await.unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -919,7 +919,7 @@ async fn plan_schema_for_property_type_narrowing_is_not_supported() {
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_pure_type_rename_preserves_identity_path_and_version() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     db.ensure_indices().await.unwrap();
     let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let before_version = before_snapshot.version();
@@ -1059,7 +1059,7 @@ async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
     // "supported" half of the destructive-vs-supported boundary that the
     // rejections above cover.
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let before = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -1231,7 +1231,7 @@ query put_pair($aaaa: String, $zzzz: String, $label: String) {
 async fn apply_schema_drop_then_same_name_readd_mints_new_identity_and_path() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(
+    let db = Omnigraph::init(
         uri,
         r#"
 node Person { name: String @key }
@@ -1295,7 +1295,7 @@ node Anchor { name: String @key }
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
 
@@ -1362,7 +1362,7 @@ async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -1415,7 +1415,7 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_hard_drops_node_and_edge_with_flag_succeeds() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -1519,7 +1519,7 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
         body: String?\n    \
         embedding: Vector(8) @index\n\
         }\n";
-    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    let db = Omnigraph::init(uri, v1).await.unwrap();
 
     // Add an unrelated scalar @index on `body`. Schema apply must record both
     // declarations without trying to build either one or train the empty vector.
@@ -1537,7 +1537,7 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
     // The deferred declarations are not dropped: after data arrives, the
     // explicit reconciler materializes every buildable index without error.
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Doc","data":{"slug":"d1","body":"hello","embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}"#,
         LoadMode::Merge,
     )
@@ -1560,9 +1560,9 @@ async fn index_only_constraint_apply_touches_no_table_data() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let v1 = "node Doc {\n    slug: String @key\n    n: I64\n}\n";
-    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    let db = Omnigraph::init(uri, v1).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Doc","data":{"slug":"d1","n":1}}"#,
         LoadMode::Merge,
     )
@@ -1615,9 +1615,9 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let v1 = "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done)\n}\n";
-    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    let db = Omnigraph::init(uri, v1).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Ticket","data":{"slug":"t1","status":"todo"}}"#,
         LoadMode::Merge,
     )
@@ -1659,7 +1659,7 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
 
     // The NEW variant is accepted on the write path...
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Ticket","data":{"slug":"t2","status":"blocked"}}"#,
         LoadMode::Merge,
     )
@@ -1667,7 +1667,7 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     .expect("new variant must be accepted after widening");
     // ...an original variant still is...
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Ticket","data":{"slug":"t3","status":"done"}}"#,
         LoadMode::Merge,
     )
@@ -1676,7 +1676,7 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     // ...and an out-of-set value is still rejected (the fence didn't widen to
     // free text).
     let err = load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Ticket","data":{"slug":"t4","status":"bogus"}}"#,
         LoadMode::Merge,
     )
@@ -1690,7 +1690,7 @@ async fn enum_narrowing_apply_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let v1 = "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done)\n}\n";
-    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    let db = Omnigraph::init(uri, v1).await.unwrap();
 
     let narrowed = "node Ticket {\n    slug: String @key\n    status: enum(todo, done)\n}\n";
     let err = db.apply_schema(narrowed).await;
@@ -1703,7 +1703,7 @@ async fn enum_narrowing_apply_is_refused() {
 
     // The graph stays healthy and writable on the original schema.
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Ticket","data":{"slug":"t1","status":"doing"}}"#,
         LoadMode::Merge,
     )

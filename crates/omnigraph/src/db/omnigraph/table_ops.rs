@@ -738,15 +738,15 @@ async fn plan_index_work_node(
                     }
                 }
             }
-            Some(NodePropIndexKind::Btree) => {
-                if !db.storage().has_btree_index(ds, prop_name).await? {
-                    work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
-                        column: prop_name.clone(),
-                        name: None,
-                    });
-                }
+            Some(NodePropIndexKind::Btree)
+                if !db.storage().has_btree_index(ds, prop_name).await? =>
+            {
+                work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
+                    column: prop_name.clone(),
+                    name: None,
+                });
             }
-            None => {}
+            Some(NodePropIndexKind::Btree) | None => {}
         }
     }
     Ok(work)
@@ -779,7 +779,7 @@ async fn plan_index_work_edge_on_dataset(
     db: &Omnigraph,
     ds: &SnapshotHandle,
 ) -> Result<PlannedIndexWork> {
-    if db.storage().count_rows(&ds, None).await? == 0 {
+    if db.storage().count_rows(ds, None).await? == 0 {
         return Ok(PlannedIndexWork::default());
     }
     let mut work = PlannedIndexWork::default();

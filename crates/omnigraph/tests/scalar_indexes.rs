@@ -42,10 +42,8 @@ const DATA: &str = r#"{"type":"Item","data":{"slug":"a","status":"active","publi
 async fn node_scalar_and_enum_index_columns_get_btree() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-    load_jsonl(&mut db, DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    load_jsonl(&db, DATA, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();

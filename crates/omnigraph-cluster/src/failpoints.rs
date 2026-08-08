@@ -16,11 +16,11 @@ pub(crate) fn maybe_fail(_name: &str) -> Result<(), Diagnostic> {
     {
         let name = _name;
         fail::fail_point!(name, |_| {
-            return Err(Diagnostic::error(
+            Err(Diagnostic::error(
                 "injected_failpoint",
                 name,
                 format!("injected failpoint triggered: {name}"),
-            ));
+            ))
         });
     }
     Ok(())

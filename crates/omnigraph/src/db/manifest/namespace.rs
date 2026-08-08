@@ -262,9 +262,9 @@ impl LanceNamespace for BranchManifestNamespace {
             .collect();
 
         if request.descending.unwrap_or(false) {
-            versions.sort_by(|a, b| b.version.cmp(&a.version));
+            versions.sort_by_key(|v| std::cmp::Reverse(v.version));
         } else {
-            versions.sort_by(|a, b| a.version.cmp(&b.version));
+            versions.sort_by_key(|v| v.version);
         }
         if let Some(limit) = request.limit {
             versions.truncate(limit as usize);
@@ -412,9 +412,9 @@ impl LanceNamespace for StagedTableNamespace {
             );
         }
         if request.descending.unwrap_or(false) {
-            versions.sort_by(|a, b| b.version.cmp(&a.version));
+            versions.sort_by_key(|v| std::cmp::Reverse(v.version));
         } else {
-            versions.sort_by(|a, b| a.version.cmp(&b.version));
+            versions.sort_by_key(|v| v.version);
         }
         if let Some(limit) = request.limit {
             versions.truncate(limit as usize);
@@ -466,7 +466,7 @@ impl LanceNamespace for StagedTableNamespace {
             _ => ManifestNamingScheme::V2,
         };
         let control_session = crate::lance_access::control_session();
-        let (object_store, base_path, _) = DatasetBuilder::from_uri(&self.table_uri())
+        let (object_store, base_path, _) = DatasetBuilder::from_uri(self.table_uri())
             .with_session(control_session)
             .build_object_store()
             .await

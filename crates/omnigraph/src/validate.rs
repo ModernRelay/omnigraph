@@ -756,6 +756,10 @@ where
     Ok(violation_count)
 }
 
+/// One entry of the coalesced `final_by_id` image: `(id, (key column strings,
+/// typed key values))`.
+type FinalKeyByIdEntry = (String, (Vec<String>, Vec<ScalarValue>));
+
 /// Uniqueness for one `@unique`/`@key` group on `table_key`, evaluated against
 /// the delta's FINAL coalesced image (last-wins per id) — the same image commit
 /// persists. Three checks:
@@ -829,8 +833,7 @@ where
     }
 
     // Deterministic order — no HashMap iteration in violation ordering.
-    let mut entries: Vec<(String, (Vec<String>, Vec<ScalarValue>))> =
-        final_by_id.into_iter().collect();
+    let mut entries: Vec<FinalKeyByIdEntry> = final_by_id.into_iter().collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Pass 2: two DISTINCT ids holding the same final key.

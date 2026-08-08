@@ -116,10 +116,8 @@ node Flagged {
 "#;
     let data = r#"{"type":"Flagged","data":{"slug":"alpha","active":true,"rating":42}}"#;
 
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let entity = db
         .entity_at_target(ReadTarget::branch("main"), "node:Flagged", "alpha")
@@ -144,10 +142,8 @@ node Doc {
     let data = r#"{"type":"Doc","data":{"slug":"a"}}
 {"type":"Doc","data":{"slug":"b","embedding":[1.0,2.0]}}"#;
 
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let missing = db
         .entity_at_target(ReadTarget::branch("main"), "node:Doc", "a")
@@ -226,10 +222,10 @@ async fn edge_ids_are_unique_strings() {
 async fn overwrite_replaces_data() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     // Load full data
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -242,9 +238,7 @@ async fn overwrite_replaces_data() {
     let small = r#"{"type": "Person", "data": {"name": "Zara", "age": 40}}
 {"edge": "Knows", "from": "Zara", "to": "Zara"}
 {"edge": "WorksAt", "from": "Zara", "to": "Acme"}"#;
-    load_jsonl(&mut db, small, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, small, LoadMode::Overwrite).await.unwrap();
 
     let batches = read_table(&db, "node:Person").await;
     let batch = &batches[0];
@@ -262,15 +256,13 @@ async fn overwrite_replaces_data() {
 async fn append_adds_rows() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     let batch1 = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#;
     let batch2 = r#"{"type": "Person", "data": {"name": "Bob", "age": 25}}"#;
 
-    load_jsonl(&mut db, batch1, LoadMode::Overwrite)
-        .await
-        .unwrap();
-    load_jsonl(&mut db, batch2, LoadMode::Append).await.unwrap();
+    load_jsonl(&db, batch1, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&db, batch2, LoadMode::Append).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Person").await.unwrap();
@@ -283,10 +275,10 @@ async fn append_adds_rows() {
 async fn load_from_file_works() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     let fixture_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.jsonl");
-    load_jsonl_file(&mut db, fixture_path, LoadMode::Overwrite)
+    load_jsonl_file(&db, fixture_path, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -304,10 +296,8 @@ async fn signals_fixture_loads_correctly() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
 
@@ -554,9 +544,7 @@ query unemployed() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let result = query_main(&mut db, queries, "unemployed", &ParamMap::new())
         .await
@@ -958,15 +946,13 @@ async fn blob_schema_parses_and_init_succeeds() {
 async fn blob_load_base64_inline() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
     // "Hello World" = "SGVsbG8gV29ybGQ="
     let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}
 {"type": "Document", "data": {"title": "empty"}}
 "#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Document").await.unwrap();
@@ -980,9 +966,7 @@ async fn blob_query_returns_metadata() {
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
     let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     // Both filter spellings must survive a blob-bearing scan: inline props and
     // the standalone clause (hoisted onto the scan) ride the same filter path,
@@ -1018,9 +1002,7 @@ async fn blob_null_returns_null_in_query() {
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
     let data = r#"{"type": "Document", "data": {"title": "empty"}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let result = query_main(
         &mut db,
@@ -1122,13 +1104,11 @@ async fn blob_update_mutation() {
 async fn blob_read_returns_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
     // "Hello World" = base64 "SGVsbG8gV29ybGQ="
     let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let blob = db.read_blob("Document", "readme", "content").await.unwrap();
     assert_eq!(blob.size(), 11); // "Hello World" = 11 bytes
@@ -1141,12 +1121,10 @@ async fn blob_read_returns_bytes() {
 async fn blob_read_not_found_errors() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
     let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8="}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     // Non-existent ID
     let err = db.read_blob("Document", "nonexistent", "content").await;
@@ -1193,12 +1171,10 @@ async fn blob_scan_with_descriptions_on_nonempty_dataset() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
     let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     // Open the dataset directly and try BlobsDescriptions
     let snap = snapshot_main(&db).await.unwrap();
@@ -1235,11 +1211,11 @@ node Person {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     // age = 300 exceeds max of 200
     let data = r#"{"type": "Person", "data": {"name": "Old", "age": 300}}"#;
-    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    let result = load_jsonl(&db, data, LoadMode::Overwrite).await;
     assert!(result.is_err(), "expected range violation");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("@range violation"), "error: {}", err);
@@ -1256,12 +1232,10 @@ node Person {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     let data = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Person").await.unwrap();
@@ -1279,10 +1253,10 @@ node Measurement {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     let data = r#"{"type": "Measurement", "data": {"name": "hot", "temperature": 150.5}}"#;
-    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    let result = load_jsonl(&db, data, LoadMode::Overwrite).await;
     assert!(result.is_err(), "expected range violation for float");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("@range violation"), "error: {}", err);
@@ -1299,12 +1273,10 @@ node Measurement {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     let data = r#"{"type": "Measurement", "data": {"name": "warm", "temperature": 37.5}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Measurement").await.unwrap();
@@ -1322,17 +1294,15 @@ node Measurement {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     // Within bounds — should succeed
     let data = r#"{"type": "Measurement", "data": {"name": "cold", "temperature": -20.0}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     // Below minimum — should fail
     let data = r#"{"type": "Measurement", "data": {"name": "arctic", "temperature": -50.0}}"#;
-    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    let result = load_jsonl(&db, data, LoadMode::Overwrite).await;
     assert!(result.is_err(), "expected range violation for -50.0");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("@range violation"), "error: {}", err);
@@ -1348,10 +1318,10 @@ node Order {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     let data = r#"{"type": "Order", "data": {"code": "invalid"}}"#;
-    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    let result = load_jsonl(&db, data, LoadMode::Overwrite).await;
     assert!(result.is_err(), "expected check violation");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("@check violation"), "error: {}", err);
@@ -1367,12 +1337,10 @@ node Order {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     let data = r#"{"type": "Order", "data": {"code": "ABC-123"}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Order").await.unwrap();
@@ -1433,7 +1401,7 @@ query set_age($name: String, $age: I32) {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#,
         LoadMode::Overwrite,
     )
@@ -1507,7 +1475,7 @@ query set_label($code: String, $label: String) {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type": "Order", "data": {"code": "ABC-123", "label": "VALID"}}"#,
         LoadMode::Overwrite,
     )
@@ -1541,7 +1509,7 @@ edge WorksAt: Person -> Company @card(0..1)
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     // Alice works at two companies — violates @card(0..1)
     let data = r#"{"type": "Person", "data": {"name": "Alice"}}
@@ -1550,7 +1518,7 @@ edge WorksAt: Person -> Company @card(0..1)
 {"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 {"edge": "WorksAt", "from": "Alice", "to": "Globex"}
 "#;
-    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    let result = load_jsonl(&db, data, LoadMode::Overwrite).await;
     assert!(result.is_err(), "expected cardinality violation");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("@card violation"), "error: {}", err);
@@ -1565,15 +1533,13 @@ edge WorksAt: Person -> Company @card(0..1)
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     let data = r#"{"type": "Person", "data": {"name": "Alice"}}
 {"type": "Company", "data": {"name": "Acme"}}
 {"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 "#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("edge:WorksAt").await.unwrap();
@@ -1660,9 +1626,7 @@ async fn blob_update_null_to_non_null() {
 
     // Load a row with blob = null (no blob data in dataset)
     let data = r#"{"type": "Document", "data": {"title": "kid-a"}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     // Update: null → non-null blob. Previously panicked with assertion
     // `left: 0, right: 1` in lance-table stream.rs.
@@ -1697,16 +1661,14 @@ async fn blob_load_external_file_uri() {
     std::fs::write(&blob_path, b"Hello from file").unwrap();
     let file_uri = format!("file://{}", blob_path.display());
 
-    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
     let data = format!(
         r#"{{"type": "Document", "data": {{"title": "from-file", "content": "{}"}}}}"#,
         file_uri
     );
 
     // Load with external URI
-    load_jsonl(&mut db, &data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
 
     // Verify the blob is accessible
     let blob = db
@@ -1772,10 +1734,10 @@ query filter_date($d: String) {
 #[tokio::test]
 async fn append_mode_manifest_row_count_is_total() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await; // Overwrite: 4 persons
+    let db = init_and_load(&dir).await; // Overwrite: 4 persons
 
     let extra = r#"{"type": "Person", "data": {"name": "Eve", "age": 22}}"#;
-    load_jsonl(&mut db, extra, LoadMode::Append).await.unwrap();
+    load_jsonl(&db, extra, LoadMode::Append).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let entry = snap.entry("node:Person").unwrap();
@@ -1798,7 +1760,7 @@ edge WorksAt: Person -> Company @card(0..1)
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     // Alice works at two companies — violates @card(0..1) (at most 1)
     let data = r#"
@@ -1810,7 +1772,7 @@ edge WorksAt: Person -> Company @card(0..1)
 "#;
 
     let v_before = version_main(&db).await.unwrap();
-    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    let result = load_jsonl(&db, data, LoadMode::Overwrite).await;
     assert!(result.is_err(), "cardinality violation should be rejected");
     assert!(
         result.unwrap_err().to_string().contains("@card violation"),
@@ -1827,14 +1789,14 @@ edge WorksAt: Person -> Company @card(0..1)
 async fn dangling_edge_dst_rejected_on_load() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     let data = r#"
 {"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Company", "data": {"name": "Acme"}}
 {"edge": "Knows", "from": "Alice", "to": "NonExistent"}
 "#;
-    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    let result = load_jsonl(&db, data, LoadMode::Overwrite).await;
     assert!(result.is_err(), "dangling edge dst should be rejected");
     let err = result.unwrap_err().to_string();
     assert!(
@@ -1848,14 +1810,14 @@ async fn dangling_edge_dst_rejected_on_load() {
 async fn dangling_edge_src_rejected_on_load() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     let data = r#"
 {"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Company", "data": {"name": "Acme"}}
 {"edge": "WorksAt", "from": "Ghost", "to": "Acme"}
 "#;
-    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    let result = load_jsonl(&db, data, LoadMode::Overwrite).await;
     assert!(result.is_err(), "dangling edge src should be rejected");
     let err = result.unwrap_err().to_string();
     assert!(
@@ -1870,7 +1832,7 @@ async fn dangling_edge_src_rejected_on_load() {
 #[tokio::test]
 async fn ensure_indices_does_not_error_on_repeated_call() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let version_after_load = version_main(&db).await.unwrap();
 
     // load commits now enforce required indices; repeated ensure_indices calls
@@ -1919,9 +1881,7 @@ node Doc {
     let mut db = Omnigraph::init(dir.path().to_str().unwrap(), schema)
         .await
         .unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let queries = r#"
 query docs_with_tag($tag: String) {

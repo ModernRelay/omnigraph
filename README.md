@@ -19,7 +19,6 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-1b1b1f?style=flat-square&labelColor=1b1b1f"></a>
-  <a href="https://crates.io/crates/omnigraph-cli"><img alt="crates.io" src="https://img.shields.io/crates/v/omnigraph-cli?style=flat-square&color=d71921&labelColor=1b1b1f"></a>
   <a href="rust-toolchain.toml"><img alt="Rust" src="https://img.shields.io/badge/rust-stable-1b1b1f?style=flat-square&labelColor=1b1b1f"></a>
 </p>
 

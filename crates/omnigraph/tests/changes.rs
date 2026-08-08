@@ -494,7 +494,7 @@ async fn diff_after_merge_reports_actual_changes() {
 
     // Bob's update should be detected
     assert!(
-        !person_updates.is_empty() || person_inserts.len() > 0,
+        !person_updates.is_empty() || !person_inserts.is_empty(),
         "Should detect Bob's age update or Eve's insert"
     );
 }
@@ -503,7 +503,7 @@ async fn diff_after_merge_reports_actual_changes() {
 async fn diff_commits_resolves_feature_commit_from_main_handle() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -550,7 +550,7 @@ async fn diff_commits_resolves_feature_commit_from_main_handle() {
 async fn cross_branch_diff_honors_insert_only_filter() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -601,7 +601,7 @@ async fn cross_branch_diff_honors_insert_only_filter() {
 async fn diff_commits_resolves_commits_across_branches_from_any_handle() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     let base_commit = head_commit_id(uri, None).await;
 
     main.branch_create("feature").await.unwrap();
@@ -636,7 +636,7 @@ async fn diff_commits_resolves_commits_across_branches_from_any_handle() {
 async fn cross_lineage_diff_honors_delete_only_filter() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
     let mut feature = Omnigraph::open(uri).await.unwrap();
     let before = snapshot_id(&feature, "feature").await.unwrap();
@@ -684,7 +684,7 @@ async fn cross_lineage_diff_honors_delete_only_filter() {
 async fn same_branch_diff_across_first_lazy_fork_detects_update() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
     let mut feature = Omnigraph::open(uri).await.unwrap();
     let before = snapshot_id(&feature, "feature").await.unwrap();
@@ -711,7 +711,7 @@ async fn same_branch_diff_across_first_lazy_fork_detects_update() {
 async fn diff_commits_cross_branch_reports_property_only_updates() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     let base_commit = head_commit_id(uri, None).await;
 
     main.branch_create("feature").await.unwrap();

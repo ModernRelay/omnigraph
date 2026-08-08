@@ -83,7 +83,7 @@ impl TableVersionMetadata {
             manifest_path: full_manifest_object_store_path(
                 root_uri,
                 table_path,
-                &dataset.manifest_location().path.to_string(),
+                dataset.manifest_location().path.as_ref(),
             )?,
             manifest_size: dataset.manifest_location().size,
             e_tag: dataset.manifest_location().e_tag.clone(),

@@ -560,10 +560,8 @@ fn find_outer_var(clauses: &[Clause], outer_bound: &HashSet<String>) -> Option<S
                     return Some(v);
                 }
             }
-            Clause::Binding(b) => {
-                if outer_bound.contains(&b.variable) {
-                    return Some(b.variable.clone());
-                }
+            Clause::Binding(b) if outer_bound.contains(&b.variable) => {
+                return Some(b.variable.clone());
             }
             _ => {}
         }

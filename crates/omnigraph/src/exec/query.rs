@@ -1549,7 +1549,7 @@ async fn execute_expand_bound(
             edge_def
                 .arrow_schema
                 .field_with_name(name)
-                .map(Clone::clone)
+                .cloned()
                 .map_err(|e| OmniError::manifest(e.to_string()))
         })
         .collect::<Result<_>>()?;
@@ -2901,7 +2901,7 @@ fn cross_join_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordB
         return Ok(RecordBatch::new_empty(Arc::new(Schema::new(fields))));
     }
     let left_indices: Vec<u32> = (0..n as u32)
-        .flat_map(|i| std::iter::repeat(i).take(m))
+        .flat_map(|i| std::iter::repeat_n(i, m))
         .collect();
     let right_indices: Vec<u32> = (0..n).flat_map(|_| 0..m as u32).collect();
     let left_expanded = take_batch(left, &UInt32Array::from(left_indices))?;

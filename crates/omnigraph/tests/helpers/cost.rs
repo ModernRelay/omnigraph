@@ -672,10 +672,10 @@ pub async fn local_graph(dir: &tempfile::TempDir) -> Omnigraph {
 pub async fn s3_graph(name: &str) -> Option<Omnigraph> {
     let bucket = std::env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
     let uri = format!("s3://{bucket}/cost-tests/{name}-{}", std::process::id());
-    let mut db = Omnigraph::init(&uri, TEST_SCHEMA)
+    let db = Omnigraph::init(&uri, TEST_SCHEMA)
         .await
         .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 graph init failed");
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 seed load failed");
     Some(db)

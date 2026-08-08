@@ -282,9 +282,9 @@ fn validate_evolution_identity(accepted: &SchemaIR, desired: &SchemaIR) -> Resul
             .into());
         }
         if let Some(incarnation) = incarnation
-            && !accepted_types
+            && accepted_types
                 .get(&type_id)
-                .is_some_and(|(_, previous)| *previous == Some(incarnation))
+                .is_none_or(|(_, previous)| *previous != Some(incarnation))
             && incarnation.get() < accepted.next_identity_id
         {
             return Err(SchemaIdentityError::Resolution(format!(

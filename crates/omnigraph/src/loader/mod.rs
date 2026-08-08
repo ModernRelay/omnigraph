@@ -918,7 +918,7 @@ fn validate_graph_batch_json_structure(raw_json: &[u8]) -> Result<()> {
             continue;
         }
         if matches!(byte, b'{' | b'}' | b'[' | b']' | b',' | b':') {
-            slots = slots.checked_add(1).unwrap_or(u64::MAX);
+            slots = slots.saturating_add(1);
             if slots > GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS {
                 return Err(OmniError::resource_limit(
                     "graph_batch_json_structural_slots",
@@ -1770,7 +1770,10 @@ fn validate_required_row_string<'a>(
     }
 }
 
+// Single-row test shim over `preflight_strict_row_arrow_bytes_with_limit`,
+// kept next to the strict-row staged-write preflight helpers.
 #[cfg(test)]
+#[allow(dead_code)]
 fn preflight_strict_row_arrow_bytes(
     schema: &arrow_schema::Schema,
     object: &serde_json::Map<String, JsonValue>,
@@ -1787,9 +1790,8 @@ fn preflight_strict_row_arrow_bytes_with_limit(
     let mut projected = 0_u64;
     for field in schema.fields() {
         let value = object.get(field.name()).unwrap_or(&JsonValue::Null);
-        projected = projected
-            .checked_add(projected_strict_column_bytes(field.data_type(), value)?)
-            .unwrap_or(u64::MAX);
+        projected =
+            projected.saturating_add(projected_strict_column_bytes(field.data_type(), value)?);
         if projected > limit {
             return Err(OmniError::resource_limit(
                 "strict_input_arrow_bytes",
@@ -1816,7 +1818,7 @@ fn preflight_strict_rows_arrow_bytes(
             } else {
                 projected_strict_column_bytes(field.data_type(), value)?
             };
-            projected = projected.checked_add(field_bytes).unwrap_or(u64::MAX);
+            projected = projected.saturating_add(field_bytes);
             if projected > limit {
                 return Err(OmniError::resource_limit(
                     "strict_input_arrow_bytes",
@@ -1849,8 +1851,7 @@ fn projected_strict_column_bytes(data_type: &DataType, value: &JsonValue) -> Res
             if let Some(items) = value.as_array() {
                 for item in items {
                     bytes = bytes
-                        .checked_add(projected_strict_list_item_bytes(child.data_type(), item)?)
-                        .unwrap_or(u64::MAX);
+                        .saturating_add(projected_strict_list_item_bytes(child.data_type(), item)?);
                 }
             }
             bytes
@@ -1862,9 +1863,7 @@ fn projected_strict_column_bytes(data_type: &DataType, value: &JsonValue) -> Res
                 ))
             })?;
             let child_width = projected_strict_fixed_width(child.data_type())?;
-            ARRAY_BUFFER_OVERHEAD
-                .checked_add(dimension.checked_mul(child_width + 1).unwrap_or(u64::MAX))
-                .unwrap_or(u64::MAX)
+            ARRAY_BUFFER_OVERHEAD.saturating_add(dimension.saturating_mul(child_width + 1))
         }
         other => {
             return Err(OmniError::manifest(format!(
@@ -3403,9 +3402,9 @@ node Doc {
     async fn test_load_creates_data() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
-        let result = load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        let result = load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
 
@@ -3419,8 +3418,8 @@ node Doc {
     async fn test_load_data_readable_via_lance() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
 
@@ -3457,8 +3456,8 @@ node Doc {
     async fn test_load_edges_reference_node_keys() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
 
@@ -3496,10 +3495,10 @@ node Doc {
     async fn test_load_manifest_version_advances() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
         let v1 = db.version().await;
 
-        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
 
@@ -3510,15 +3509,13 @@ node Doc {
     async fn test_load_append_adds_rows() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
         let batch1 = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#;
         let batch2 = r#"{"type": "Person", "data": {"name": "Bob", "age": 25}}"#;
 
-        load_jsonl(&mut db, batch1, LoadMode::Overwrite)
-            .await
-            .unwrap();
-        load_jsonl(&mut db, batch2, LoadMode::Append).await.unwrap();
+        load_jsonl(&db, batch1, LoadMode::Overwrite).await.unwrap();
+        load_jsonl(&db, batch2, LoadMode::Append).await.unwrap();
 
         let snap = db.snapshot().await;
         let person_ds = snap.open("node:Person").await.unwrap();
@@ -3529,10 +3526,10 @@ node Doc {
     async fn test_load_unknown_type_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
         let bad = r#"{"type": "FakeType", "data": {"name": "x"}}"#;
-        let result = load_jsonl(&mut db, bad, LoadMode::Overwrite).await;
+        let result = load_jsonl(&db, bad, LoadMode::Overwrite).await;
         assert!(result.is_err());
     }
 
@@ -3586,8 +3583,8 @@ node Doc {
     async fn test_ingest_existing_branch_ignores_from_and_merges_data() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
         db.branch_create_from(crate::db::ReadTarget::branch("main"), "feature")

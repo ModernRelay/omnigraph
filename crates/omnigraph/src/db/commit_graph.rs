@@ -243,7 +243,7 @@ impl CommitGraph {
         let source_distances = ancestor_distances(source_commit_id, &commits);
         let target_distances = ancestor_distances(target_commit_id, &commits);
 
-        let best = source_distances
+        source_distances
             .iter()
             .filter_map(|(id, source_distance)| {
                 target_distances.get(id).and_then(|target_distance| {
@@ -259,9 +259,7 @@ impl CommitGraph {
                 })
             })
             .min_by_key(|(score, _)| *score)
-            .map(|(_, commit)| commit);
-
-        best
+            .map(|(_, commit)| commit)
     }
 }
 

@@ -285,15 +285,14 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     // node/edge types) — the internal system tables below must still be compacted.
     let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
 
-    let preparations: Vec<Result<OptimizePreparation>> =
-        futures::stream::iter(table_tasks.into_iter())
-            .map(|task| {
-                let catalog = std::sync::Arc::clone(&catalog);
-                async move { prepare_optimize_table(db, catalog.as_ref(), task).await }
-            })
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
+    let preparations: Vec<Result<OptimizePreparation>> = futures::stream::iter(table_tasks)
+        .map(|task| {
+            let catalog = std::sync::Arc::clone(&catalog);
+            async move { prepare_optimize_table(db, catalog.as_ref(), task).await }
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
 
     let mut prepared = Vec::new();
     let mut stats = Vec::new();
@@ -332,15 +331,14 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
         // siblings: after the shared sidecar is armed, recovery needs the most
         // knowable completed effect set possible.
         let effect_concurrency = maint_concurrency().min(prepared.len()).max(1);
-        let effect_results: Vec<Result<OptimizeEffectOutcome>> =
-            futures::stream::iter(prepared.into_iter())
-                .map(|work| {
-                    let catalog = std::sync::Arc::clone(&catalog);
-                    async move { apply_optimize_table_effects(db, catalog.as_ref(), work).await }
-                })
-                .buffer_unordered(effect_concurrency)
-                .collect()
-                .await;
+        let effect_results: Vec<Result<OptimizeEffectOutcome>> = futures::stream::iter(prepared)
+            .map(|work| {
+                let catalog = std::sync::Arc::clone(&catalog);
+                async move { apply_optimize_table_effects(db, catalog.as_ref(), work).await }
+            })
+            .buffer_unordered(effect_concurrency)
+            .collect()
+            .await;
 
         let mut outcomes = Vec::new();
         let mut first_error = None;
@@ -1184,7 +1182,7 @@ pub async fn cleanup_all_tables(
     // stats row (`error: Some`) and logged, never aborting the healthy tables.
     // cleanup is the convergence backstop, so it must do as much as it can and
     // converge on re-run rather than fail wholesale (invariant 13).
-    let results: Vec<TableCleanupStats> = futures::stream::iter(table_tasks.into_iter())
+    let results: Vec<TableCleanupStats> = futures::stream::iter(table_tasks)
         .map(|(table_key, full_path, live_main_floor)| async move {
             let outcome: Result<RemovalStats> = async {
                 crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_TABLE_GC)?;
@@ -1548,9 +1546,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let schema = "node Person { name: String @key }\nnode Company { name: String @key }\n";
-        let mut db = Omnigraph::init(uri, schema).await.unwrap();
+        let db = Omnigraph::init(uri, schema).await.unwrap();
         load_jsonl(
-            &mut db,
+            &db,
             "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\"}}\n\
              {\"type\":\"Company\",\"data\":{\"name\":\"Acme\"}}",
             LoadMode::Merge,

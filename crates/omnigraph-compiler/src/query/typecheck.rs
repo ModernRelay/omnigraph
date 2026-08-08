@@ -579,22 +579,19 @@ fn typecheck_clauses(
                 let mut has_outer = false;
                 for clause in inner {
                     match clause {
-                        Clause::Traversal(t) => {
-                            if outer_vars.contains(&t.src) || outer_vars.contains(&t.dst) {
-                                has_outer = true;
-                            }
+                        Clause::Traversal(t)
+                            if outer_vars.contains(&t.src) || outer_vars.contains(&t.dst) =>
+                        {
+                            has_outer = true;
                         }
-                        Clause::Filter(f) => {
+                        Clause::Filter(f)
                             if expr_references_any(&f.left, &outer_vars)
-                                || expr_references_any(&f.right, &outer_vars)
-                            {
-                                has_outer = true;
-                            }
+                                || expr_references_any(&f.right, &outer_vars) =>
+                        {
+                            has_outer = true;
                         }
-                        Clause::Binding(b) => {
-                            if outer_vars.contains(&b.variable) {
-                                has_outer = true;
-                            }
+                        Clause::Binding(b) if outer_vars.contains(&b.variable) => {
+                            has_outer = true;
                         }
                         _ => {}
                     }
@@ -1676,15 +1673,13 @@ fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Re
     if expected.is_enum() {
         let allowed = expected.enum_values.as_ref().cloned().unwrap_or_default();
         match lit {
-            Literal::String(v) => {
-                if !allowed.contains(v) {
-                    return Err(CompilerError::Type(format!(
-                        "T3: property `{}` expects one of [{}], got '{}'",
-                        prop_name,
-                        allowed.join(", "),
-                        v
-                    )));
-                }
+            Literal::String(v) if !allowed.contains(v) => {
+                return Err(CompilerError::Type(format!(
+                    "T3: property `{}` expects one of [{}], got '{}'",
+                    prop_name,
+                    allowed.join(", "),
+                    v
+                )));
             }
             Literal::List(items) if expected.list => {
                 for item in items {

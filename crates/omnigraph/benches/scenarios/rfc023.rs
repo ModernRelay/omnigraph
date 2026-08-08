@@ -1252,7 +1252,7 @@ async fn verify_id_content(
         canonical.update(format!("prefix={prefix};seed={seed}\n").as_bytes());
         for ordinal in 0..rows_per_prefix {
             canonical_id.clear();
-            write!(&mut canonical_id, "{prefix}-{ordinal:010}\n")
+            writeln!(&mut canonical_id, "{prefix}-{ordinal:010}")
                 .expect("format canonical verified ID");
             canonical.update(canonical_id.as_bytes());
         }
@@ -1473,8 +1473,7 @@ fn general_merge_batch_rows(dims: usize) -> usize {
         .saturating_div(per_row);
     usize::try_from(by_bytes)
         .unwrap_or(rfc023_limits::KEYED_WRITE_MAX_ROWS)
-        .min(rfc023_limits::KEYED_WRITE_MAX_ROWS)
-        .max(1)
+        .clamp(1, rfc023_limits::KEYED_WRITE_MAX_ROWS)
 }
 
 fn general_merge_fixture_root(args: &Args) -> &std::path::Path {

@@ -366,6 +366,9 @@ impl ExactCommitOutcome {
 /// pay a clone cost per element. `StagedWrite::clone` is cheap because
 /// `Transaction`, commit metadata, and `Vec<Fragment>` are shallow-clone
 /// friendly.
+// Staged-write helper retained alongside the sealed storage surface (it
+// adapts `StagedHandle`s for `stage_append`'s `prior_stages`).
+#[allow(dead_code)]
 pub(crate) fn staged_handles_as_writes(handles: &[StagedHandle]) -> Vec<StagedWrite> {
     handles.iter().map(|h| h.inner.clone()).collect()
 }
@@ -398,6 +401,10 @@ pub enum ForkOutcome<D> {
 /// `TableStore` is the only `impl`. The trait is sealed; the inline
 /// Lance APIs are not reachable through trait dispatch. New writers that
 /// might advance Lance HEAD MUST add a staged-shape method here.
+// Sealed storage surface: the trait defines the full staged-write
+// vocabulary, so not every method has a caller. Pinned by name in
+// tests/forbidden_apis.rs — deleting one shrinks the audited gateway.
+#[allow(dead_code)]
 #[async_trait]
 pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     // ── Snapshot opens (no HEAD advance) ────────────────────────────────

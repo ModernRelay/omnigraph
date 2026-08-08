@@ -84,6 +84,13 @@ cedar-policy = "4.9"
 sha2 = "0.10"
 subtle = "2"
 
+[workspace.lints.clippy]
+# Nested guards often read clearer than one merged condition (Polars allows this too).
+collapsible_if = "allow"
+# Streaming/recovery internals thread identity + authority + payload explicitly;
+# a params-struct refactor is not earned yet.
+too_many_arguments = "allow"
+
 [profile.dev]
 debug = 0
 

@@ -606,6 +606,9 @@ pub struct CountingStorageAdapter {
 
 impl CountingStorageAdapter {
     /// Wrap `inner`, returning the adapter and a shared handle to its counts.
+    // Returns the erased `Arc<dyn StorageAdapter>` the engine consumes plus the
+    // counts handle; a bare `Self` would leave the caller unable to read them.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(
         inner: Arc<dyn StorageAdapter>,
     ) -> (Arc<dyn StorageAdapter>, Arc<StorageReadCounts>) {

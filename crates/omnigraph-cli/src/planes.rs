@@ -339,6 +339,7 @@ fn accepts_graph_selector(cmd: &Command) -> bool {
 /// - `--server` → served-graph scopes (`any`/`served`);
 /// - `--cluster` → cluster-scoped direct/control verbs;
 /// - `--graph` → any multi-graph scope: a served scope *or* a cluster one.
+///
 /// RFC-010 Slice 1, generalized for RFC-011 cluster addressing.
 pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     if let Command::Alias { .. } = &cli.command {
@@ -413,7 +414,6 @@ mod tests {
     use clap::Parser;
 
     use super::*;
-    use crate::cli::PolicyCommand;
 
     #[test]
     fn scope_flag_matrix_matches_capabilities() {

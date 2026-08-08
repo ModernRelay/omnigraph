@@ -40,6 +40,9 @@ impl TypeIndex {
         self.dense_to_id.get(dense as usize).map(|s| s.as_str())
     }
 
+    // The size of the dense id space, consumed as a CSR row width; emptiness is
+    // not a meaningful question for it.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.dense_to_id.len()
     }

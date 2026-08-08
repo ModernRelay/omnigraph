@@ -202,9 +202,7 @@ async fn inline_global_count_empty() {
     // Load only nodes, no edges
     let data = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Company", "data": {"name": "Acme"}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     // Global count — should return 1 row with count=1
     let queries = r#"
