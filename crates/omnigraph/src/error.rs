@@ -149,12 +149,12 @@ pub enum OmniError {
     AlreadyInitialized { uri: String },
 }
 
-impl From<omnigraph_storage::StorageError> for OmniError {
-    fn from(error: omnigraph_storage::StorageError) -> Self {
+impl From<crate::storage_backend::StorageError> for OmniError {
+    fn from(error: crate::storage_backend::StorageError) -> Self {
         match error {
-            omnigraph_storage::StorageError::Internal(message) => Self::manifest_internal(message),
-            omnigraph_storage::StorageError::Io(error) => Self::Io(error),
-            omnigraph_storage::StorageError::ResourceLimit {
+            crate::storage_backend::StorageError::Internal(message) => Self::manifest_internal(message),
+            crate::storage_backend::StorageError::Io(error) => Self::Io(error),
+            crate::storage_backend::StorageError::ResourceLimit {
                 resource,
                 limit,
                 actual,

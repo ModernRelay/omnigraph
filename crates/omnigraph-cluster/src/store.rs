@@ -12,7 +12,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use omnigraph_storage::{
+use omnigraph::storage_backend::{
     StorageAdapter, StorageHandle, StorageKind, storage_for_uri, storage_handle_for_uri,
     storage_kind_for_uri,
 };

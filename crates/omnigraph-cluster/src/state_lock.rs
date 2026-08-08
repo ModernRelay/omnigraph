@@ -7,7 +7,7 @@
 use std::process;
 use std::sync::Arc;
 
-use omnigraph_storage::{
+use omnigraph::storage_backend::{
     StorageAdapter, StorageError, StorageHandle, StorageKind, normalize_root_uri,
 };
 use serde::{Deserialize, Serialize};
@@ -184,7 +184,7 @@ fn cluster_root_from_lock_uri(lock_uri: &str) -> Result<String, StateLockError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omnigraph_storage::storage_handle_for_uri;
+    use omnigraph::storage_backend::storage_handle_for_uri;
 
     #[test]
     fn lock_wire_is_strict_and_versioned() {

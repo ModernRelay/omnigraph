@@ -506,11 +506,11 @@ gateway_surfaces! {
         "write_text", "write_text_if_absent", "rename_text", "delete",
         "write_text_if_match", "delete_prefix",
     ],
-    "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
+    "storage_backend.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
         "read_text", "read_text_if_exists", "read_text_if_exists_bounded", "exists",
         "list_dir", "list_dir_bounded", "read_text_versioned",
     ],
-    "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::Durable(WriteProtocol::Composed("shared object storage primitive")) => [
+    "storage_backend.rs" => "StorageAdapter" => GatewayDisposition::Durable(WriteProtocol::Composed("shared object storage primitive")) => [
         "write_text", "write_text_if_absent", "rename_text", "delete",
         "write_text_if_match", "delete_prefix",
     ],
@@ -633,10 +633,10 @@ durable_calls! {
     ("storage.rs", ".rename_text(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("storage.rs", ".delete(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("storage.rs", ".delete_prefix(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
-    ("omnigraph-storage/lib.rs", ".delete(", 2, WriteProtocol::Composed("storage adapter primitive")),
-    ("omnigraph-storage/lib.rs", ".put(", 2, WriteProtocol::Composed("object storage put primitive")),
-    ("omnigraph-storage/lib.rs", ".put_opts(", 2, WriteProtocol::Composed("object storage conditional put primitive")),
-    ("omnigraph-storage/lib.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
+    ("storage_backend.rs", ".delete(", 2, WriteProtocol::Composed("storage adapter primitive")),
+    ("storage_backend.rs", ".put(", 2, WriteProtocol::Composed("object storage put primitive")),
+    ("storage_backend.rs", ".put_opts(", 2, WriteProtocol::Composed("object storage conditional put primitive")),
+    ("storage_backend.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
     ("storage_layer.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".force_delete_branch(", 1, WriteProtocol::NativeRefControl),
     ("storage_layer.rs", ".commit_staged_create_exact(", 1, WriteProtocol::Exact("sealed TableStorage create forwarding")),
@@ -831,15 +831,6 @@ const DURABLE_PRIMITIVES: &[&str] = &[
 fn engine_src_root() -> PathBuf {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     PathBuf::from(manifest_dir).join("src")
-}
-
-fn sibling_crate_src(engine_src: &Path, crate_name: &str) -> PathBuf {
-    engine_src
-        .parent()
-        .and_then(Path::parent)
-        .expect("engine crate lives below the workspace crates directory")
-        .join(crate_name)
-        .join("src")
 }
 
 fn is_allow_listed(src: &Path, path: &Path) -> bool {
@@ -1304,13 +1295,6 @@ fn durable_protocol_scan_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
         .into_iter()
         .map(|path| (relative_to_src(engine_src, &path), path))
         .collect::<Vec<_>>();
-    let storage_src = sibling_crate_src(engine_src, "omnigraph-storage");
-    files.extend(walk_rust_files(&storage_src).into_iter().map(|path| {
-        (
-            format!("omnigraph-storage/{}", relative_to_src(&storage_src, &path)),
-            path,
-        )
-    }));
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
 }
@@ -1531,17 +1515,10 @@ fn is_gateway_owner(relative: &str, owner: &str) -> bool {
 
 fn callable_gateway_surfaces(src: &Path) -> BTreeSet<(String, String, String)> {
     let mut surfaces = BTreeSet::new();
-    let mut files = walk_rust_files(src)
+    let files = walk_rust_files(src)
         .into_iter()
         .map(|path| (relative_to_src(src, &path), path))
         .collect::<Vec<_>>();
-    let storage_src = sibling_crate_src(src, "omnigraph-storage");
-    files.extend(walk_rust_files(&storage_src).into_iter().map(|path| {
-        (
-            format!("omnigraph-storage/{}", relative_to_src(&storage_src, &path)),
-            path,
-        )
-    }));
     for (relative, file) in files {
         let contents = std::fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));

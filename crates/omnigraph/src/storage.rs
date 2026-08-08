@@ -1,9 +1,10 @@
 //! Compatibility facade over the shared storage implementation.
 //!
-//! `omnigraph-storage` owns the only local/S3 implementation so lower
-//! control-plane crates do not depend back on the engine. This module keeps
-//! the v10 engine API intact: the public trait and constructors still return
-//! [`crate::error::Result`] / [`crate::error::OmniError`].
+//! [`crate::storage_backend`] owns the only local/S3 implementation; every
+//! consumer (engine and cluster control plane alike) reaches it through this
+//! crate. This module keeps the v10 engine API intact: the public trait and
+//! constructors still return [`crate::error::Result`] /
+//! [`crate::error::OmniError`].
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
-pub use omnigraph_storage::{ListDirBounds, StorageKind, join_uri};
+pub use crate::storage_backend::{ListDirBounds, StorageKind, join_uri};
 
 #[async_trait]
 pub trait StorageAdapter: Debug + Send + Sync {
@@ -101,7 +102,7 @@ pub trait StorageAdapter: Debug + Send + Sync {
 /// Engine-facing wrapper over the one lower storage implementation.
 #[derive(Debug)]
 pub struct ObjectStorageAdapter {
-    inner: omnigraph_storage::ObjectStorageAdapter,
+    inner: crate::storage_backend::ObjectStorageAdapter,
 }
 
 impl ObjectStorageAdapter {
@@ -110,7 +111,7 @@ impl ObjectStorageAdapter {
     /// current working directory.
     pub fn local() -> Self {
         Self {
-            inner: omnigraph_storage::ObjectStorageAdapter::local(),
+            inner: crate::storage_backend::ObjectStorageAdapter::local(),
         }
     }
 
@@ -119,7 +120,7 @@ impl ObjectStorageAdapter {
     /// same ones Lance reads for its dataset stores).
     pub fn s3_from_root_uri(root_uri: &str) -> Result<Self> {
         Ok(Self {
-            inner: omnigraph_storage::ObjectStorageAdapter::s3_from_root_uri(root_uri)?,
+            inner: crate::storage_backend::ObjectStorageAdapter::s3_from_root_uri(root_uri)?,
         })
     }
 
@@ -127,7 +128,7 @@ impl ObjectStorageAdapter {
     /// full contract including true conditional updates.
     pub fn in_memory() -> Self {
         Self {
-            inner: omnigraph_storage::ObjectStorageAdapter::in_memory(),
+            inner: crate::storage_backend::ObjectStorageAdapter::in_memory(),
         }
     }
 }
@@ -135,11 +136,11 @@ impl ObjectStorageAdapter {
 #[async_trait]
 impl StorageAdapter for ObjectStorageAdapter {
     async fn read_text(&self, uri: &str) -> Result<String> {
-        Ok(omnigraph_storage::StorageAdapter::read_text(&self.inner, uri).await?)
+        Ok(crate::storage_backend::StorageAdapter::read_text(&self.inner, uri).await?)
     }
 
     async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>> {
-        Ok(omnigraph_storage::StorageAdapter::read_text_if_exists(&self.inner, uri).await?)
+        Ok(crate::storage_backend::StorageAdapter::read_text_if_exists(&self.inner, uri).await?)
     }
 
     async fn read_text_if_exists_bounded(
@@ -148,7 +149,7 @@ impl StorageAdapter for ObjectStorageAdapter {
         max_bytes: u64,
     ) -> Result<Option<String>> {
         Ok(
-            omnigraph_storage::StorageAdapter::read_text_if_exists_bounded(
+            crate::storage_backend::StorageAdapter::read_text_if_exists_bounded(
                 &self.inner,
                 uri,
                 max_bytes,
@@ -158,30 +159,30 @@ impl StorageAdapter for ObjectStorageAdapter {
     }
 
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
-        Ok(omnigraph_storage::StorageAdapter::write_text(&self.inner, uri, contents).await?)
+        Ok(crate::storage_backend::StorageAdapter::write_text(&self.inner, uri, contents).await?)
     }
 
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
         Ok(
-            omnigraph_storage::StorageAdapter::write_text_if_absent(&self.inner, uri, contents)
+            crate::storage_backend::StorageAdapter::write_text_if_absent(&self.inner, uri, contents)
                 .await?,
         )
     }
 
     async fn exists(&self, uri: &str) -> Result<bool> {
-        Ok(omnigraph_storage::StorageAdapter::exists(&self.inner, uri).await?)
+        Ok(crate::storage_backend::StorageAdapter::exists(&self.inner, uri).await?)
     }
 
     async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
-        Ok(omnigraph_storage::StorageAdapter::rename_text(&self.inner, from_uri, to_uri).await?)
+        Ok(crate::storage_backend::StorageAdapter::rename_text(&self.inner, from_uri, to_uri).await?)
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
-        Ok(omnigraph_storage::StorageAdapter::delete(&self.inner, uri).await?)
+        Ok(crate::storage_backend::StorageAdapter::delete(&self.inner, uri).await?)
     }
 
     async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
-        Ok(omnigraph_storage::StorageAdapter::list_dir(&self.inner, dir_uri).await?)
+        Ok(crate::storage_backend::StorageAdapter::list_dir(&self.inner, dir_uri).await?)
     }
 
     async fn list_dir_bounded(
@@ -190,7 +191,7 @@ impl StorageAdapter for ObjectStorageAdapter {
         matching_suffix: &str,
         bounds: ListDirBounds,
     ) -> Result<Vec<String>> {
-        Ok(omnigraph_storage::StorageAdapter::list_dir_bounded(
+        Ok(crate::storage_backend::StorageAdapter::list_dir_bounded(
             &self.inner,
             dir_uri,
             matching_suffix,
@@ -200,7 +201,7 @@ impl StorageAdapter for ObjectStorageAdapter {
     }
 
     async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
-        Ok(omnigraph_storage::StorageAdapter::read_text_versioned(&self.inner, uri).await?)
+        Ok(crate::storage_backend::StorageAdapter::read_text_versioned(&self.inner, uri).await?)
     }
 
     async fn write_text_if_match(
@@ -209,7 +210,7 @@ impl StorageAdapter for ObjectStorageAdapter {
         contents: &str,
         expected_version: &str,
     ) -> Result<Option<String>> {
-        Ok(omnigraph_storage::StorageAdapter::write_text_if_match(
+        Ok(crate::storage_backend::StorageAdapter::write_text_if_match(
             &self.inner,
             uri,
             contents,
@@ -219,12 +220,12 @@ impl StorageAdapter for ObjectStorageAdapter {
     }
 
     async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
-        Ok(omnigraph_storage::StorageAdapter::delete_prefix(&self.inner, prefix_uri).await?)
+        Ok(crate::storage_backend::StorageAdapter::delete_prefix(&self.inner, prefix_uri).await?)
     }
 }
 
 pub fn storage_kind_for_uri(uri: &str) -> StorageKind {
-    omnigraph_storage::storage_kind_for_uri(uri)
+    crate::storage_backend::storage_kind_for_uri(uri)
 }
 
 pub fn storage_for_uri(uri: &str) -> Result<Arc<dyn StorageAdapter>> {
@@ -235,11 +236,11 @@ pub fn storage_for_uri(uri: &str) -> Result<Arc<dyn StorageAdapter>> {
 }
 
 pub fn normalize_root_uri(uri: &str) -> Result<String> {
-    Ok(omnigraph_storage::normalize_root_uri(uri)?)
+    Ok(crate::storage_backend::normalize_root_uri(uri)?)
 }
 
 pub(crate) fn write_queue_root_identity(normalized_root: &str) -> Result<String> {
-    Ok(omnigraph_storage::write_queue_root_identity(
+    Ok(crate::storage_backend::write_queue_root_identity(
         normalized_root,
     )?)
 }

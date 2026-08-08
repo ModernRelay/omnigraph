@@ -21,6 +21,7 @@ pub mod loader;
 pub mod policy;
 pub(crate) mod runtime_cache;
 pub mod storage;
+pub mod storage_backend;
 pub(crate) mod storage_layer;
 pub(crate) mod table_store;
 pub(crate) mod validate;
