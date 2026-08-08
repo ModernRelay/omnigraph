@@ -113,9 +113,22 @@ pub(crate) mod sealed {
 /// outside this storage contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexBuildSpec {
-    BTree { column: String },
-    FullText { column: String },
-    Vector { column: String },
+    /// `name: None` keeps Lance's default index name (`{column}_idx`).
+    /// An explicit name is REQUIRED whenever the column already carries an
+    /// index of another kind under the default name: Lance's `replace(true)`
+    /// removes existing indexes BY NAME, so an unnamed second build would
+    /// silently replace the first index instead of coexisting with it
+    /// (pinned by `lance_surface_guards::second_index_on_column_requires_explicit_distinct_name`).
+    BTree {
+        column: String,
+        name: Option<String>,
+    },
+    FullText {
+        column: String,
+    },
+    Vector {
+        column: String,
+    },
 }
 
 /// Logical semantics for an RFC-023 keyed write.

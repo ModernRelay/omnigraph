@@ -10416,6 +10416,7 @@ mod tests {
                 &after_data,
                 &[IndexBuildSpec::BTree {
                     column: "id".to_string(),
+                    name: None,
                 }],
             )
             .await
@@ -10447,6 +10448,7 @@ mod tests {
                 &after_one_index,
                 &[IndexBuildSpec::BTree {
                     column: "age".to_string(),
+                    name: None,
                 }],
             )
             .await
