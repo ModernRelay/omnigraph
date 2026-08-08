@@ -261,8 +261,8 @@ impl Omnigraph {
         // for "load into a fresh branch", so the layered check is
         // correct, not redundant.
         self.enforce(
-            omnigraph_policy::PolicyAction::Change,
-            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            crate::policy::PolicyAction::Change,
+            &crate::policy::ResourceScope::Branch(branch.to_string()),
             actor_id,
         )?;
         let (requested, base_branch) = Self::normalize_load_scope(branch, base)?;

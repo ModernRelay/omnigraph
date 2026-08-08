@@ -842,14 +842,14 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                     },
                 );
                 let validation =
-                    omnigraph_policy::PolicyConfig::from_source(&source).and_then(|_| {
+                    omnigraph::policy::PolicyConfig::from_source(&source).and_then(|_| {
                         match (binds_cluster, graph_binding.as_deref()) {
                             (true, None) => {
-                                omnigraph_policy::PolicyEngine::load_server_from_source(&source)
+                                omnigraph::policy::PolicyEngine::load_server_from_source(&source)
                                     .map(|_| ())
                             }
                             (false, Some(graph_id)) => {
-                                omnigraph_policy::PolicyEngine::load_graph_from_source(
+                                omnigraph::policy::PolicyEngine::load_graph_from_source(
                                     &source, graph_id,
                                 )
                                 .map(|_| ())

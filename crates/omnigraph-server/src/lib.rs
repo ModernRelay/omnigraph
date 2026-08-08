@@ -508,7 +508,7 @@ impl AppState {
         // requests fail before their write bodies are interpreted; the engine
         // repeats the authoritative actor-aware decision at the write boundary.
         let db = if let Some(policy) = policy_engine.as_ref() {
-            let checker = Arc::clone(policy) as Arc<dyn omnigraph_policy::PolicyChecker>;
+            let checker = Arc::clone(policy) as Arc<dyn omnigraph::policy::PolicyChecker>;
             db.with_policy(checker)
         } else {
             db
@@ -1396,7 +1396,7 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<OpenedGraph> {
         Some(source) => {
             let policy = load_graph_policy(source, graph_id.as_str())?;
             let policy_arc: Arc<PolicyEngine> = Arc::new(policy);
-            let checker = Arc::clone(&policy_arc) as Arc<dyn omnigraph_policy::PolicyChecker>;
+            let checker = Arc::clone(&policy_arc) as Arc<dyn omnigraph::policy::PolicyChecker>;
             (Some(policy_arc), db.with_policy(checker))
         }
         None => (None, db),

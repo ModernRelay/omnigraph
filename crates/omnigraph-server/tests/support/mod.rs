@@ -14,7 +14,7 @@ use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_policy::{PolicyChecker, PolicyEngine};
+use omnigraph::policy::{PolicyChecker, PolicyEngine};
 use omnigraph_server::api::{BranchCreateRequest, BranchMergeRequest, ChangeRequest, ReadRequest};
 use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
 use omnigraph_server::{AppState, build_app};

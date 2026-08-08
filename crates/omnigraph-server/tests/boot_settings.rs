@@ -458,7 +458,7 @@ mod multi_graph_startup {
     /// operator-authorized — here.
     #[tokio::test(flavor = "multi_thread")]
     async fn get_graphs_with_server_policy_authorizes_per_cedar() {
-        use omnigraph_policy::PolicyEngine;
+        use omnigraph::policy::PolicyEngine;
         use omnigraph_server::{GraphHandle, GraphId, GraphKey};
 
         let dir = tempfile::tempdir().unwrap();

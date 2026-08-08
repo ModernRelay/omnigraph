@@ -245,7 +245,7 @@ pub struct Omnigraph {
     /// mutating method calls `self.enforce(action, scope, actor)` at
     /// entry; denial returns `OmniError::Policy`.
     ///
-    /// Per chassis design (see `omnigraph_policy::PolicyChecker`), the
+    /// Per chassis design (see `crate::policy::PolicyChecker`), the
     /// trait surface is deliberately coarse — action × scope × actor.
     /// Per-row / per-type / per-column scope lives at the query layer
     /// (MR-725), which extends the same trait with a different method.
@@ -254,7 +254,7 @@ pub struct Omnigraph {
     /// Set via `with_policy(checker)` after construction. Today only
     /// `apply_schema_as` consults this field (PR #2 proof-of-concept);
     /// PR #3 fans the `enforce()` call out to the remaining writers.
-    policy: Option<Arc<dyn omnigraph_policy::PolicyChecker>>,
+    policy: Option<Arc<dyn crate::policy::PolicyChecker>>,
     /// Lazily-built, reused-across-queries embedding client. Built on the first
     /// `nearest($v, "string")` that needs server-side embedding (so a graph that
     /// never embeds needs no provider key), then shared by every later query —
@@ -671,7 +671,7 @@ impl Omnigraph {
     /// Embedded callers that don't care about authorization should
     /// just not call this. Server / CLI callers that have loaded a
     /// `PolicyEngine` from `policy.yaml` pass it here.
-    pub fn with_policy(mut self, checker: Arc<dyn omnigraph_policy::PolicyChecker>) -> Self {
+    pub fn with_policy(mut self, checker: Arc<dyn crate::policy::PolicyChecker>) -> Self {
         self.policy = Some(checker);
         self
     }
@@ -712,8 +712,8 @@ impl Omnigraph {
     ///   internal failure to `OmniError::Policy(...)`.
     pub(crate) fn enforce(
         &self,
-        action: omnigraph_policy::PolicyAction,
-        scope: &omnigraph_policy::ResourceScope,
+        action: crate::policy::PolicyAction,
+        scope: &crate::policy::ResourceScope,
         actor: Option<&str>,
     ) -> Result<()> {
         let Some(checker) = self.policy.as_ref() else {
@@ -2588,8 +2588,8 @@ impl Omnigraph {
     /// `main` from a non-privileged actor.
     pub async fn branch_create_as(&self, name: &str, actor: Option<&str>) -> Result<()> {
         self.enforce(
-            omnigraph_policy::PolicyAction::BranchCreate,
-            &omnigraph_policy::ResourceScope::TargetBranch(name.to_string()),
+            crate::policy::PolicyAction::BranchCreate,
+            &crate::policy::ResourceScope::TargetBranch(name.to_string()),
             actor,
         )?;
         ensure_public_branch_ref(name, "branch_create")?;
@@ -2662,8 +2662,8 @@ impl Omnigraph {
             _ => "<snapshot>".to_string(),
         };
         self.enforce(
-            omnigraph_policy::PolicyAction::BranchCreate,
-            &omnigraph_policy::ResourceScope::BranchTransition {
+            crate::policy::PolicyAction::BranchCreate,
+            &crate::policy::ResourceScope::BranchTransition {
                 source: source_branch,
                 target: name.to_string(),
             },
@@ -2762,8 +2762,8 @@ impl Omnigraph {
     /// `main`).
     pub async fn branch_delete_as(&self, name: &str, actor: Option<&str>) -> Result<()> {
         self.enforce(
-            omnigraph_policy::PolicyAction::BranchDelete,
-            &omnigraph_policy::ResourceScope::TargetBranch(name.to_string()),
+            crate::policy::PolicyAction::BranchDelete,
+            &crate::policy::ResourceScope::TargetBranch(name.to_string()),
             actor,
         )?;
         ensure_public_branch_ref(name, "branch_delete")?;

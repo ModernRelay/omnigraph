@@ -2977,8 +2977,8 @@ impl Omnigraph {
         // merges INTO protected branches without forbidding the
         // (symmetric) source-side reference.
         self.enforce(
-            omnigraph_policy::PolicyAction::BranchMerge,
-            &omnigraph_policy::ResourceScope::BranchTransition {
+            crate::policy::PolicyAction::BranchMerge,
+            &crate::policy::ResourceScope::BranchTransition {
                 source: source.to_string(),
                 target: target.to_string(),
             },

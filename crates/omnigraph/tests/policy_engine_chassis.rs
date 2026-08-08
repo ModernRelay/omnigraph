@@ -25,7 +25,7 @@ use std::sync::Arc;
 use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
 use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
-use omnigraph_policy::{PolicyChecker, PolicyEngine};
+use omnigraph::policy::{PolicyChecker, PolicyEngine};
 
 use helpers::*;
 

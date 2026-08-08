@@ -667,8 +667,8 @@ impl Omnigraph {
         // PolicyChecker is installed this is a no-op; with policy installed
         // and actor=None this fails hard (forget-the-actor footgun guard).
         self.enforce(
-            omnigraph_policy::PolicyAction::Change,
-            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            crate::policy::PolicyAction::Change,
+            &crate::policy::ResourceScope::Branch(branch.to_string()),
             actor_id,
         )?;
         self.mutate_with_current_actor(branch, query_source, query_name, params, actor_id)

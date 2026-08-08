@@ -208,10 +208,10 @@ where
     // gate schema applies, so the engine-layer call has to set the
     // target_branch shape that activates that predicate. Wrong scope
     // here = silent policy mismatch with HTTP. See
-    // `omnigraph_policy::ResourceScope::to_branch_pair` for the mapping.
+    // `crate::policy::ResourceScope::to_branch_pair` for the mapping.
     db.enforce(
-        omnigraph_policy::PolicyAction::SchemaApply,
-        &omnigraph_policy::ResourceScope::TargetBranch("main".to_string()),
+        crate::policy::PolicyAction::SchemaApply,
+        &crate::policy::ResourceScope::TargetBranch("main".to_string()),
         actor,
     )?;
 

@@ -18,6 +18,7 @@ pub mod graph_index;
 pub mod instrumentation;
 pub(crate) mod lance_access;
 pub mod loader;
+pub mod policy;
 pub(crate) mod runtime_cache;
 pub mod storage;
 pub(crate) mod storage_layer;
