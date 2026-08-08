@@ -53,6 +53,15 @@ pub enum StorageError {
         actual: u64,
         uri: String,
     },
+    /// The local backend publishes create-if-absent writes with
+    /// `hard_link(2)`, and the filesystem behind `dir` refuses hard links
+    /// (Android app storage, FAT/exFAT, some network mounts). Distinct from
+    /// `Internal` so callers can report the filesystem requirement instead
+    /// of the misleading upstream "Unable to rename file" wording.
+    #[error(
+        "the filesystem at '{dir}' does not support hard links, which the local storage backend requires for atomic create-if-absent writes (seen on Android app storage, FAT/exFAT, and some network mounts); move the graph to a filesystem with hard-link support or use an S3-compatible backend: {source}"
+    )]
+    CreateIfAbsentUnsupported { dir: String, source: std::io::Error },
 }
 
 impl StorageError {
@@ -324,6 +333,50 @@ impl ObjectStorageAdapter {
             }),
         }
     }
+
+    /// Map a non-already-exists `PutMode::Create` failure. The local backend
+    /// publishes create-if-absent via `std::fs::hard_link` (omnigraph#453),
+    /// so probing the destination directory distinguishes "this filesystem
+    /// cannot do create-if-absent" from a generic backend failure.
+    fn create_if_absent_error(&self, uri: &str, err: object_store::Error) -> StorageError {
+        if matches!(self.codec, UriCodec::Local)
+            && let Ok(path) = local_path_from_uri(uri)
+            && let Ok(path) = absolutize_lexically(path)
+            && let Some(dir) = path.parent()
+            && let Some(link_error) = hard_link_refusal_in(dir)
+        {
+            return StorageError::CreateIfAbsentUnsupported {
+                dir: dir.display().to_string(),
+                source: link_error,
+            };
+        }
+        storage_backend_error("write_if_absent", uri, err)
+    }
+}
+
+/// Probe whether `dir` accepts new files but refuses `hard_link(2)` — the
+/// signature of a filesystem without hard-link support. Returns the link
+/// error only in that case; setup failures and "name taken" outcomes are
+/// `None`, and callers keep their original error. Cleanup is best-effort;
+/// leftover probe files fall under `list_dir`'s foreign-residue tolerance.
+fn hard_link_refusal_in(dir: &Path) -> Option<std::io::Error> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let src = dir.join(format!("__hardlink_probe_{pid}_{seq}_src"));
+    let dst = dir.join(format!("__hardlink_probe_{pid}_{seq}_dst"));
+    if std::fs::write(&src, b"").is_err() {
+        return None;
+    }
+    let outcome = std::fs::hard_link(&src, &dst);
+    let _ = std::fs::remove_file(&dst);
+    let _ = std::fs::remove_file(&src);
+    match outcome {
+        Ok(()) => None,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => None,
+        Err(err) => Some(err),
+    }
 }
 
 #[async_trait]
@@ -431,7 +484,7 @@ impl StorageAdapter for ObjectStorageAdapter {
             Ok(_) => Ok(true),
             Err(object_store::Error::AlreadyExists { .. })
             | Err(object_store::Error::Precondition { .. }) => Ok(false),
-            Err(err) => Err(storage_backend_error("write_if_absent", uri, err)),
+            Err(err) => Err(self.create_if_absent_error(uri, err)),
         }
     }
 
@@ -1600,5 +1653,46 @@ mod tests {
         let location = parse_s3_uri("s3://bucket/graph/_schema.pg").unwrap();
         assert_eq!(location.bucket, "bucket");
         assert_eq!(location.key, "graph/_schema.pg");
+    }
+
+    /// Where hard links work the probe is negative and cleans up after
+    /// itself. (The positive branch needs a filesystem that refuses
+    /// `hard_link(2)`, e.g. FAT32, which this suite cannot assume.)
+    #[test]
+    fn hard_link_probe_negative_where_links_work_and_leaves_no_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(hard_link_refusal_in(dir.path()).is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// A missing directory is an inconclusive probe, not a capability
+    /// verdict: callers keep their original error.
+    #[test]
+    fn hard_link_probe_inconclusive_on_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent");
+        assert!(hard_link_refusal_in(&missing).is_none());
+    }
+
+    /// A generic create-if-absent failure on a link-capable filesystem keeps
+    /// the original backend error: the enriched diagnostic fires only when
+    /// the probe proves hard links are refused.
+    #[tokio::test]
+    async fn create_if_absent_failure_keeps_backend_error_where_links_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ObjectStorageAdapter::local();
+        // A destination whose parent is a regular FILE makes PutMode::Create
+        // fail at staging, before any hard link. The probe on the parent is
+        // inconclusive (unwritable dir), so the original error survives.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let uri = format!("{}/child.txt", blocker.display());
+        let err = StorageAdapter::write_text_if_absent(&adapter, &uri, "x")
+            .await
+            .expect_err("staging under a regular file must fail");
+        assert!(
+            matches!(err, StorageError::Internal(ref message) if message.contains("write_if_absent")),
+            "got: {err}"
+        );
     }
 }

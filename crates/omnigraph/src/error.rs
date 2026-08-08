@@ -164,6 +164,11 @@ impl From<omnigraph_storage::StorageError> for OmniError {
                 limit,
                 actual,
             },
+            // The display already carries the full diagnosis; engine
+            // consumers surface the message rather than match the variant.
+            err @ omnigraph_storage::StorageError::CreateIfAbsentUnsupported { .. } => {
+                Self::manifest_internal(err.to_string())
+            }
         }
     }
 }
