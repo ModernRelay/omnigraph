@@ -366,7 +366,14 @@ fn hard_link_refusal_in(dir: &Path) -> Option<std::io::Error> {
     let pid = std::process::id();
     let src = dir.join(format!("__hardlink_probe_{pid}_{seq}_src"));
     let dst = dir.join(format!("__hardlink_probe_{pid}_{seq}_dst"));
-    if std::fs::write(&src, b"").is_err() {
+    // O_EXCL creation: never follows a pre-placed entry at the predictable
+    // path (symlink attack), which instead lands in the inconclusive arm.
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&src)
+        .is_err()
+    {
         return None;
     }
     let outcome = std::fs::hard_link(&src, &dst);
