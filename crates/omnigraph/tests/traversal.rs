@@ -5,7 +5,7 @@ use arrow_schema::DataType;
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_compiler::ir::ParamMap;
+use omnigraph::compiler::ir::ParamMap;
 
 use helpers::*;
 
@@ -254,7 +254,7 @@ query slow() {
     return { $p.name }
 }
 "#;
-    let names = |result: omnigraph_compiler::result::QueryResult| {
+    let names = |result: omnigraph::compiler::result::QueryResult| {
         let batch = result.concat_batches().unwrap();
         let col = batch
             .column(0)

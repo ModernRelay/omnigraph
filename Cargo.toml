@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/omnigraph-compiler",
     "crates/omnigraph",
     "crates/omnigraph-cli",
     "crates/omnigraph-api-types",

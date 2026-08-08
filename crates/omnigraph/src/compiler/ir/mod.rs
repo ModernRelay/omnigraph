@@ -2,8 +2,8 @@ pub(crate) mod lower;
 
 use std::collections::HashMap;
 
-use crate::query::ast::{AggFunc, CompOp, Literal, Param};
-use crate::types::Direction;
+use crate::compiler::query::ast::{AggFunc, CompOp, Literal, Param};
+use crate::compiler::types::Direction;
 
 #[derive(Debug, Clone)]
 pub struct QueryIR {

@@ -614,7 +614,7 @@ fn dedup_delete_filter(base: &str, prior: &[String]) -> String {
 /// two-commit ordering in the hot mutation path — complexity this boundary
 /// deliberately avoids.
 fn enforce_no_mixed_destructive_constructive(
-    ir: &omnigraph_compiler::ir::MutationIR,
+    ir: &crate::compiler::ir::MutationIR,
 ) -> Result<()> {
     let mut has_constructive = false;
     let mut has_delete = false;
@@ -908,11 +908,11 @@ impl Omnigraph {
     /// is unchanged.
     fn lower_named_mutation(
         &self,
-        catalog: &omnigraph_compiler::catalog::Catalog,
+        catalog: &crate::compiler::catalog::Catalog,
         query_source: &str,
         query_name: &str,
-    ) -> Result<omnigraph_compiler::ir::MutationIR> {
-        let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
+    ) -> Result<crate::compiler::ir::MutationIR> {
+        let query_decl = crate::compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
 
         let checked = typecheck_query_decl(catalog, &query_decl)?;
@@ -933,7 +933,7 @@ impl Omnigraph {
 
     async fn execute_named_mutation(
         &self,
-        ir: &omnigraph_compiler::ir::MutationIR,
+        ir: &crate::compiler::ir::MutationIR,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,

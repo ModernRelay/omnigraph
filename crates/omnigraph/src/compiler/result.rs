@@ -5,8 +5,8 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use serde::de::DeserializeOwned;
 
-use crate::error::{CompilerError, Result};
-use crate::json_output::{record_batches_to_json_rows, record_batches_to_rust_json_rows};
+use crate::compiler::error::{CompilerError, Result};
+use crate::compiler::json_output::{record_batches_to_json_rows, record_batches_to_rust_json_rows};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MutationExecResult {

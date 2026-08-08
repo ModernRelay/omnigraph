@@ -1,6 +1,6 @@
 use super::*;
-use crate::build_catalog;
-use crate::schema::parser::parse_schema;
+use crate::compiler::build_catalog;
+use crate::compiler::schema::parser::parse_schema;
 
 fn catalog(schema: &str) -> Catalog {
     let schema = parse_schema(schema).unwrap();

@@ -47,10 +47,10 @@ use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
 use omnigraph::storage::normalize_root_uri;
-use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::json_params_to_param_map;
-use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::{JsonParamMode, ParamMap};
+use omnigraph::compiler::catalog::Catalog;
+use omnigraph::compiler::json_params_to_param_map;
+use omnigraph::compiler::query::parser::parse_query;
+use omnigraph::compiler::{JsonParamMode, ParamMap};
 pub use policy::{
     PolicyAction, PolicyCompiler, PolicyConfig, PolicyDecision, PolicyEngine, PolicyExpectation,
     PolicyRequest, PolicyResourceKind, PolicyTestConfig,

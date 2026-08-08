@@ -16,11 +16,14 @@ default = []
 failpoints = ["dep:fail", "fail/failpoints"]
 
 [dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.9.0" }
 serde_yaml = { workspace = true }
 color-eyre = { workspace = true }
 clap = { workspace = true }
 cedar-policy = { workspace = true }
+pest = { workspace = true }
+pest_derive = { workspace = true }
+arrow-ipc = { workspace = true }
+ahash = { workspace = true }
 lance = { workspace = true }
 lance-core = { workspace = true }
 lance-select = { workspace = true }
@@ -57,7 +60,6 @@ chrono = { workspace = true }
 arc-swap = { workspace = true }
 
 [dev-dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.9.0" }
 tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
 # test-util gates IoStats.requests + assert_io_eq! (failure diagnostics only); dev-dep,

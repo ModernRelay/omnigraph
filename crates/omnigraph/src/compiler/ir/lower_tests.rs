@@ -1,8 +1,8 @@
 use super::*;
-use crate::catalog::build_catalog;
-use crate::query::parser::parse_query;
-use crate::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
-use crate::schema::parser::parse_schema;
+use crate::compiler::catalog::build_catalog;
+use crate::compiler::query::parser::parse_query;
+use crate::compiler::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
+use crate::compiler::schema::parser::parse_schema;
 
 fn setup() -> Catalog {
     let schema = parse_schema(

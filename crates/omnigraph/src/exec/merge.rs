@@ -1679,7 +1679,7 @@ async fn build_merge_changeset(
 /// constraint reads them, and keeping them out of the change-set keeps validation
 /// memory bounded regardless of embedding width.
 fn validation_projection(catalog: &Catalog, table_key: &str) -> Vec<String> {
-    use omnigraph_compiler::types::{PropType, ScalarType};
+    use crate::compiler::types::{PropType, ScalarType};
     let is_heavy = |ty: &PropType| matches!(ty.scalar, ScalarType::Vector(_) | ScalarType::Blob);
     let mut cols = vec!["id".to_string()];
     if let Some(name) = table_key.strip_prefix("node:") {

@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_compiler::ir::ParamMap;
+use omnigraph::compiler::ir::ParamMap;
 
 const SCHEMA: &str = r#"
 node Person {
@@ -243,7 +243,7 @@ query sel($name: String) {
         let mut params = ParamMap::new();
         params.insert(
             "name".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("p0".to_string()),
+            omnigraph::compiler::query::ast::Literal::String("p0".to_string()),
         );
 
         let mut rows_by_mode: Vec<(&str, usize)> = Vec::new();

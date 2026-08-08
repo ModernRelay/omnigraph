@@ -16,10 +16,10 @@ use lance::dataset::scanner::ColumnOrdering;
 use lance::datatypes::{
     BlobKind, LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
 };
-use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
-use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::types::{PropType, ScalarType};
-use omnigraph_compiler::{
+use crate::compiler::catalog::{Catalog, EdgeType, NodeType};
+use crate::compiler::schema::parser::parse_schema;
+use crate::compiler::types::{PropType, ScalarType};
+use crate::compiler::{
     DropMode, SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep,
     SchemaShape, SchemaTypeKind, build_catalog_from_ir, compile_schema_shape, initialize_schema_ir,
     plan_schema_migration,
@@ -371,7 +371,7 @@ impl Omnigraph {
             );
         }
         let schema_ir = resolution.schema_ir;
-        let accepted_schema_ir_hash = omnigraph_compiler::schema_ir_hash(&schema_ir)
+        let accepted_schema_ir_hash = crate::compiler::schema_ir_hash(&schema_ir)
             .map_err(|error| OmniError::manifest(error.to_string()))?;
         let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
@@ -633,14 +633,14 @@ impl Omnigraph {
         schema_source: String,
         accepted_ir: &SchemaIR,
     ) -> Result<()> {
-        let schema_ir_hash = omnigraph_compiler::schema_ir_hash(accepted_ir)
+        let schema_ir_hash = crate::compiler::schema_ir_hash(accepted_ir)
             .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
         let catalog_ir = catalog.bound_schema_ir().ok_or_else(|| {
             OmniError::manifest_internal(
                 "cannot publish an identity-unbound runtime catalog".to_string(),
             )
         })?;
-        let catalog_ir_hash = omnigraph_compiler::schema_ir_hash(catalog_ir)
+        let catalog_ir_hash = crate::compiler::schema_ir_hash(catalog_ir)
             .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
         if catalog_ir_hash != schema_ir_hash {
             return Err(OmniError::manifest_internal(

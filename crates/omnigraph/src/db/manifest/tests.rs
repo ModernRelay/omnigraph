@@ -19,8 +19,8 @@ use super::publisher::{
 };
 use super::state::read_publish_scan;
 use super::*;
-use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::{
+use crate::compiler::schema::parser::parse_schema;
+use crate::compiler::{
     SchemaIdentityDomain, build_catalog_from_ir, compile_schema_shape, initialize_schema_ir,
 };
 

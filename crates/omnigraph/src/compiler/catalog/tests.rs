@@ -1,7 +1,7 @@
 use super::*;
-use crate::schema::ast::{EdgeDecl, NodeDecl};
-use crate::schema::parser::parse_schema;
-use crate::types::PropType;
+use crate::compiler::schema::ast::{EdgeDecl, NodeDecl};
+use crate::compiler::schema::parser::parse_schema;
+use crate::compiler::types::PropType;
 
 fn test_schema() -> &'static str {
     r#"
@@ -163,7 +163,7 @@ fn test_edge_lookup_handles_non_ascii_leading_character() {
                 name: "Person".to_string(),
                 annotations: vec![],
                 implements: vec![],
-                properties: vec![crate::schema::ast::PropDecl {
+                properties: vec![crate::compiler::schema::ast::PropDecl {
                     name: "name".to_string(),
                     prop_type: PropType::scalar(ScalarType::String, false),
                     annotations: vec![],

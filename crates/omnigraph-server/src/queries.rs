@@ -15,11 +15,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::query::ast::QueryDecl;
-use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::query::typecheck::typecheck_query_decl;
-use omnigraph_compiler::types::{PropType, ScalarType};
+use omnigraph::compiler::catalog::Catalog;
+use omnigraph::compiler::query::ast::QueryDecl;
+use omnigraph::compiler::query::parser::parse_query;
+use omnigraph::compiler::query::typecheck::typecheck_query_decl;
+use omnigraph::compiler::types::{PropType, ScalarType};
 
 /// One loaded stored query. `source` is the full `.gq` file text — the
 /// invocation handler hands it to `run_query` / `run_mutate` verbatim,
@@ -462,8 +462,8 @@ mod tests {
 
     // --- check(registry, catalog) ---
 
-    use omnigraph_compiler::catalog::build_catalog;
-    use omnigraph_compiler::schema::parser::parse_schema;
+    use omnigraph::compiler::catalog::build_catalog;
+    use omnigraph::compiler::schema::parser::parse_schema;
 
     fn test_catalog() -> Catalog {
         let schema = parse_schema(

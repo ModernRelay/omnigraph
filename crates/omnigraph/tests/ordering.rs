@@ -15,8 +15,8 @@ use arrow_array::{Array, StringArray};
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::result::QueryResult;
+use omnigraph::compiler::ir::ParamMap;
+use omnigraph::compiler::result::QueryResult;
 
 use helpers::*;
 

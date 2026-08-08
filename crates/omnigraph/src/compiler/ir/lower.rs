@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::catalog::Catalog;
-use crate::error::Result;
-use crate::query::ast::*;
-use crate::query::typecheck::TypeContext;
-use crate::types::Direction;
+use crate::compiler::catalog::Catalog;
+use crate::compiler::error::Result;
+use crate::compiler::query::ast::*;
+use crate::compiler::query::typecheck::TypeContext;
+use crate::compiler::types::Direction;
 
 use super::*;
 
@@ -14,7 +14,7 @@ pub fn lower_query(
     type_ctx: &TypeContext,
 ) -> Result<QueryIR> {
     if !query.mutations.is_empty() {
-        return Err(crate::error::CompilerError::Plan(
+        return Err(crate::compiler::error::CompilerError::Plan(
             "cannot lower mutation query with read-query lowerer".to_string(),
         ));
     }
@@ -62,7 +62,7 @@ pub fn lower_query(
 
 pub fn lower_mutation_query(query: &QueryDecl) -> Result<MutationIR> {
     if query.mutations.is_empty() {
-        return Err(crate::error::CompilerError::Plan(
+        return Err(crate::compiler::error::CompilerError::Plan(
             "query does not contain a mutation body".to_string(),
         ));
     }
@@ -261,7 +261,7 @@ fn lower_clauses(
             let edge = catalog
                 .lookup_edge_by_name(&traversal.edge_name)
                 .ok_or_else(|| {
-                    crate::error::CompilerError::Plan(format!(
+                    crate::compiler::error::CompilerError::Plan(format!(
                         "lowering traversal referenced missing edge '{}' after typecheck",
                         traversal.edge_name
                     ))
@@ -423,7 +423,7 @@ fn lower_clauses(
 /// Build IR filters from a binding's inline property matches.
 fn build_binding_filters(
     binding: &Binding,
-    node_type: &crate::catalog::NodeType,
+    node_type: &crate::compiler::catalog::NodeType,
     param_names: &HashSet<String>,
 ) -> Vec<IRFilter> {
     let mut filters = Vec::new();

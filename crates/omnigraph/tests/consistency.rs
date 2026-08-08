@@ -10,8 +10,8 @@ use tokio::sync::Barrier;
 use omnigraph::db::Omnigraph;
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph::compiler::ir::ParamMap;
+use omnigraph::compiler::query::ast::Literal;
 
 use helpers::*;
 

@@ -9,6 +9,7 @@
 
 mod branch_control;
 pub mod changes;
+pub mod compiler;
 pub mod db;
 pub mod embedding;
 pub mod error;

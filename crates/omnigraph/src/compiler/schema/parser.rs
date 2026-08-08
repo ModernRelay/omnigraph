@@ -4,15 +4,15 @@ use pest::Parser;
 use pest::error::InputLocation;
 use pest_derive::Parser;
 
-use crate::error::{
+use crate::compiler::error::{
     CompilerError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
 };
-use crate::types::{PropType, ScalarType};
+use crate::compiler::types::{PropType, ScalarType};
 
 use super::ast::*;
 
 #[derive(Parser)]
-#[grammar = "schema/schema.pest"]
+#[grammar = "compiler/schema/schema.pest"]
 struct SchemaParser;
 
 pub fn parse_schema(input: &str) -> Result<SchemaFile> {

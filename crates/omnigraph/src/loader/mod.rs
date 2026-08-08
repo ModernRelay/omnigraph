@@ -15,8 +15,8 @@ use arrow_array::{
 use arrow_schema::DataType;
 use base64::Engine;
 use lance::blob::BlobArrayBuilder;
-use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
-use omnigraph_compiler::types::PropType;
+use crate::compiler::catalog::{Catalog, EdgeType, NodeType};
+use crate::compiler::types::PropType;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
@@ -1431,7 +1431,7 @@ fn build_node_batch(
 }
 
 fn build_edge_batch(
-    edge_type: &omnigraph_compiler::catalog::EdgeType,
+    edge_type: &crate::compiler::catalog::EdgeType,
     rows: &[(String, String, JsonValue)],
     node_id_remap: &TypedNodeIdRemap,
 ) -> Result<RecordBatch> {
@@ -2634,7 +2634,7 @@ pub(crate) fn parse_date64_literal(value: &str) -> Result<i64> {
 
 pub(crate) fn validate_value_constraints(
     batch: &RecordBatch,
-    node_type: &omnigraph_compiler::catalog::NodeType,
+    node_type: &crate::compiler::catalog::NodeType,
 ) -> Result<()> {
     use arrow_array::Array;
 
@@ -2716,7 +2716,7 @@ pub(crate) fn validate_value_constraints(
 /// checked element-by-element across the underlying string values.
 pub(crate) fn validate_enum_constraints(
     batch: &RecordBatch,
-    properties: &HashMap<String, omnigraph_compiler::types::PropType>,
+    properties: &HashMap<String, crate::compiler::types::PropType>,
     type_name: &str,
 ) -> Result<()> {
     use arrow_array::{Array, ListArray};
@@ -3043,8 +3043,8 @@ fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
     None
 }
 
-fn literal_value_to_f64(v: &omnigraph_compiler::catalog::LiteralValue) -> f64 {
-    use omnigraph_compiler::catalog::LiteralValue;
+fn literal_value_to_f64(v: &crate::compiler::catalog::LiteralValue) -> f64 {
+    use crate::compiler::catalog::LiteralValue;
     match v {
         LiteralValue::Integer(n) => *n as f64,
         LiteralValue::Float(f) => *f,
@@ -3754,7 +3754,7 @@ node Doc {
     #[test]
     fn test_range_constraint_rejects_nan() {
         use arrow_array::{Float64Array, RecordBatch, StringArray};
-        use omnigraph_compiler::catalog::{LiteralValue, NodeType, RangeConstraint};
+        use crate::compiler::catalog::{LiteralValue, NodeType, RangeConstraint};
         use std::sync::Arc;
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![

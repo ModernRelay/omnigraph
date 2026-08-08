@@ -14,8 +14,8 @@ mod helpers;
 use arrow_array::{Array, Int64Array};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::result::QueryResult;
+use omnigraph::compiler::ir::ParamMap;
+use omnigraph::compiler::result::QueryResult;
 
 use helpers::{
     MUTATION_QUERIES, count_rows, count_rows_branch, mixed_params, mutate_branch, mutate_main,

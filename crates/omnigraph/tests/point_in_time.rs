@@ -4,7 +4,7 @@ use arrow_array::{Array, Int32Array};
 use helpers::*;
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::LoadMode;
-use omnigraph_compiler::ir::ParamMap;
+use omnigraph::compiler::ir::ParamMap;
 
 // ─── Inline queries for point-in-time tests ─────────────────────────────────
 

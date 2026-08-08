@@ -1044,14 +1044,14 @@ pub async fn sdk_change_decision(graph: &Path, policy_path: &Path, actor: &str) 
         .await
         .unwrap()
         .with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>);
-    let mut params: omnigraph_compiler::ParamMap = Default::default();
+    let mut params: omnigraph::compiler::ParamMap = Default::default();
     // Parameter keys are bare names (no `$` prefix); the runtime resolves
     // `$name` references in the query body to `params["name"]`.
     params.insert(
         "name".to_string(),
-        omnigraph_compiler::Literal::String("ParityCharlie".to_string()),
+        omnigraph::compiler::Literal::String("ParityCharlie".to_string()),
     );
-    params.insert("age".to_string(), omnigraph_compiler::Literal::Integer(30));
+    params.insert("age".to_string(), omnigraph::compiler::Literal::Integer(30));
     let result = db
         .mutate_as(
             "main",

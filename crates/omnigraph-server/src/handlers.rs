@@ -772,7 +772,7 @@ pub(crate) async fn run_query(
     branch: Option<String>,
     snapshot: Option<String>,
     reject_mutations: bool,
-) -> std::result::Result<(String, ReadTarget, omnigraph_compiler::result::QueryResult), ApiError> {
+) -> std::result::Result<(String, ReadTarget, omnigraph::compiler::result::QueryResult), ApiError> {
     if branch.is_some() && snapshot.is_some() {
         return Err(ApiError::bad_request(
             "request may specify branch or snapshot, not both",
@@ -1983,7 +1983,7 @@ pub(crate) fn read_target_from_request(
 pub(crate) fn select_named_query_decl(
     query_source: &str,
     requested_name: Option<&str>,
-) -> Result<omnigraph_compiler::query::ast::QueryDecl> {
+) -> Result<omnigraph::compiler::query::ast::QueryDecl> {
     let parsed = parse_query(query_source)?;
     let query = if let Some(name) = requested_name {
         parsed
@@ -2002,13 +2002,13 @@ pub(crate) fn select_named_query_decl(
 pub(crate) fn select_named_query(
     query_source: &str,
     requested_name: Option<&str>,
-) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
+) -> Result<(String, Vec<omnigraph::compiler::query::ast::Param>)> {
     let query = select_named_query_decl(query_source, requested_name)?;
     Ok((query.name, query.params))
 }
 
 pub(crate) fn query_params_from_json(
-    query_params: &[omnigraph_compiler::query::ast::Param],
+    query_params: &[omnigraph::compiler::query::ast::Param],
     params_json: Option<&Value>,
 ) -> Result<ParamMap> {
     json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)

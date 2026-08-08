@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use crate::catalog::Catalog;
-use crate::query::ast::{Mutation, QueryDecl};
-use crate::query::parser::parse_query;
-use crate::query::typecheck::typecheck_query_decl;
+use crate::compiler::catalog::Catalog;
+use crate::compiler::query::ast::{Mutation, QueryDecl};
+use crate::compiler::query::parser::parse_query;
+use crate::compiler::query::typecheck::typecheck_query_decl;
 
 const PARSE_ERROR_CODE: &str = "Q000";
 const L201_CODE: &str = "L201";

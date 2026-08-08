@@ -8,8 +8,8 @@ use serial_test::serial;
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_compiler::query::ast::Literal;
-use omnigraph_compiler::result::QueryResult;
+use omnigraph::compiler::query::ast::Literal;
+use omnigraph::compiler::result::QueryResult;
 
 use helpers::*;
 

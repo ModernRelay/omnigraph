@@ -12,9 +12,9 @@ use omnigraph::changes::{ChangeFilter, ChangeSet};
 use omnigraph::db::{Omnigraph, ReadTarget, Snapshot, SnapshotId};
 use omnigraph::error::Result;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
-use omnigraph_compiler::result::{MutationResult, QueryResult};
+use omnigraph::compiler::ir::ParamMap;
+use omnigraph::compiler::query::ast::Literal;
+use omnigraph::compiler::result::{MutationResult, QueryResult};
 
 pub const TEST_SCHEMA: &str = include_str!("../fixtures/test.pg");
 pub const TEST_DATA: &str = include_str!("../fixtures/test.jsonl");

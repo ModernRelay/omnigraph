@@ -25,8 +25,8 @@ use proptest::test_runner::{Config, TestRunner};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::instrumentation::with_traversal_mode;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph::compiler::ir::ParamMap;
+use omnigraph::compiler::query::ast::Literal;
 
 use helpers::*;
 

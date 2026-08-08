@@ -34,7 +34,7 @@ use omnigraph_api_types::{
     SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output, ingest_output, read_output,
     schema_apply_output, snapshot_payload,
 };
-use omnigraph_compiler::catalog::Catalog;
+use omnigraph::compiler::catalog::Catalog;
 use reqwest::Method;
 use serde_json::Value;
 

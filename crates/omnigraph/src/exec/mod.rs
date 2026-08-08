@@ -18,18 +18,18 @@ use futures::TryStreamExt;
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
-use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{
+use crate::compiler::catalog::Catalog;
+use crate::compiler::ir::{
     IRAssignment, IRExpr, IRFilter, IRMutationPredicate, IROp, IROrdering, IRProjection,
     MutationOpIR, ParamMap, QueryIR,
 };
-use omnigraph_compiler::lower_mutation_query;
-use omnigraph_compiler::lower_query;
-use omnigraph_compiler::query::ast::{AggFunc, CompOp, Literal, NOW_PARAM_NAME};
-use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
-use omnigraph_compiler::result::{MutationResult, QueryResult};
-use omnigraph_compiler::types::Direction;
-use omnigraph_compiler::types::ScalarType;
+use crate::compiler::lower_mutation_query;
+use crate::compiler::lower_query;
+use crate::compiler::query::ast::{AggFunc, CompOp, Literal, NOW_PARAM_NAME};
+use crate::compiler::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
+use crate::compiler::result::{MutationResult, QueryResult};
+use crate::compiler::types::Direction;
+use crate::compiler::types::ScalarType;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 

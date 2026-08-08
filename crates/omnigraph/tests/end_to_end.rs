@@ -5,7 +5,7 @@ use futures::TryStreamExt;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl, load_jsonl_file};
-use omnigraph_compiler::ir::ParamMap;
+use omnigraph::compiler::ir::ParamMap;
 
 use helpers::*;
 
@@ -1398,14 +1398,14 @@ query insert_person($name: String, $age: I32) {
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
 
     let result = mutate_main(&mut db, queries, "insert_person", &{
-        let mut p = omnigraph_compiler::ir::ParamMap::new();
+        let mut p = omnigraph::compiler::ir::ParamMap::new();
         p.insert(
             "name".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("Old".to_string()),
+            omnigraph::compiler::query::ast::Literal::String("Old".to_string()),
         );
         p.insert(
             "age".to_string(),
-            omnigraph_compiler::query::ast::Literal::Integer(300),
+            omnigraph::compiler::query::ast::Literal::Integer(300),
         );
         p
     })
@@ -1441,14 +1441,14 @@ query set_age($name: String, $age: I32) {
     .unwrap();
 
     let result = mutate_main(&mut db, queries, "set_age", &{
-        let mut p = omnigraph_compiler::ir::ParamMap::new();
+        let mut p = omnigraph::compiler::ir::ParamMap::new();
         p.insert(
             "name".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("Alice".to_string()),
+            omnigraph::compiler::query::ast::Literal::String("Alice".to_string()),
         );
         p.insert(
             "age".to_string(),
-            omnigraph_compiler::query::ast::Literal::Integer(300),
+            omnigraph::compiler::query::ast::Literal::Integer(300),
         );
         p
     })
@@ -1476,10 +1476,10 @@ query insert_order($code: String) {
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
 
     let result = mutate_main(&mut db, queries, "insert_order", &{
-        let mut p = omnigraph_compiler::ir::ParamMap::new();
+        let mut p = omnigraph::compiler::ir::ParamMap::new();
         p.insert(
             "code".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("invalid".to_string()),
+            omnigraph::compiler::query::ast::Literal::String("invalid".to_string()),
         );
         p
     })
@@ -1515,14 +1515,14 @@ query set_label($code: String, $label: String) {
     .unwrap();
 
     let result = mutate_main(&mut db, queries, "set_label", &{
-        let mut p = omnigraph_compiler::ir::ParamMap::new();
+        let mut p = omnigraph::compiler::ir::ParamMap::new();
         p.insert(
             "code".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("ABC-123".to_string()),
+            omnigraph::compiler::query::ast::Literal::String("ABC-123".to_string()),
         );
         p.insert(
             "label".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("invalid".to_string()),
+            omnigraph::compiler::query::ast::Literal::String("invalid".to_string()),
         );
         p
     })

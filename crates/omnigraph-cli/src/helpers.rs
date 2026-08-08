@@ -707,7 +707,7 @@ pub(crate) fn load_params_json(params: &ParamsArgs) -> Result<Option<Value>> {
 pub(crate) fn select_named_query(
     query_source: &str,
     requested_name: Option<&str>,
-) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
+) -> Result<(String, Vec<omnigraph::compiler::query::ast::Param>)> {
     let parsed = parse_query(query_source)?;
     let query = if let Some(name) = requested_name {
         parsed
@@ -725,7 +725,7 @@ pub(crate) fn select_named_query(
 }
 
 pub(crate) fn query_params_from_json(
-    query_params: &[omnigraph_compiler::query::ast::Param],
+    query_params: &[omnigraph::compiler::query::ast::Param],
     params_json: Option<&Value>,
 ) -> Result<ParamMap> {
     json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)

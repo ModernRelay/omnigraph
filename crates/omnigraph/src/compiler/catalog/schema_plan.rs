@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
-use crate::schema::ast::{Annotation, Constraint};
-use crate::types::PropType;
+use crate::compiler::error::Result;
+use crate::compiler::schema::ast::{Annotation, Constraint};
+use crate::compiler::types::PropType;
 
 use super::schema_ir::{
     ConstraintIR, EdgeIR, EmbedSourceIR, InterfaceIR, NodeIR, PropertyIR, PropertyRefIR, SchemaIR,
@@ -33,7 +33,7 @@ pub enum SchemaTypeKind {
 ///
 /// The planner emits `Soft` by default; `--allow-data-loss` on the apply
 /// CLI promotes drops to `Hard`. This is the dimension orthogonal to
-/// `SafetyTier` from the schema-lint chassis (`crate::lint`): tier
+/// `SafetyTier` from the schema-lint chassis (`crate::compiler::lint`): tier
 /// describes the rule's class; mode describes the operator's intent for
 /// data treatment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,7 +138,7 @@ pub enum SchemaMigrationStep {
         reason: String,
         /// Stable schema-lint code (`OG-XXX-NNN`) for this rejection,
         /// or `None` if the path predates the chassis catalog. See
-        /// [`crate::lint::codes`] for the registry. Renderers should
+        /// [`crate::compiler::lint::codes`] for the registry. Renderers should
         /// prefix the message with `[code]` when present so operators
         /// can suppress, look up docs, or filter on stable identifiers
         /// rather than free-text prose.
@@ -174,9 +174,9 @@ impl SchemaMigrationStep {
     /// Returns `None` for steps that carry no code (the 12 of 17
     /// `UnsupportedChange` paths still untagged in v0, plus every
     /// non-`UnsupportedChange` variant).
-    pub fn diagnostic(&self) -> Option<&'static crate::lint::DiagnosticCode> {
+    pub fn diagnostic(&self) -> Option<&'static crate::compiler::lint::DiagnosticCode> {
         match self {
-            Self::UnsupportedChange { code: Some(c), .. } => crate::lint::lookup(c),
+            Self::UnsupportedChange { code: Some(c), .. } => crate::compiler::lint::lookup(c),
             _ => None,
         }
     }
@@ -189,7 +189,7 @@ pub fn plan_schema_migration(
     validate_schema_ir(accepted)?;
     validate_schema_ir(desired)?;
     if accepted.schema_identity_domain != desired.schema_identity_domain {
-        return Err(crate::error::SchemaIdentityError::Resolution(
+        return Err(crate::compiler::error::SchemaIdentityError::Resolution(
             "migration planning requires accepted and desired IR in the same identity domain"
                 .to_string(),
         )
@@ -218,7 +218,7 @@ pub fn plan_schema_migration(
 }
 
 fn validate_evolution_identity(accepted: &SchemaIR, desired: &SchemaIR) -> Result<()> {
-    use crate::error::SchemaIdentityError;
+    use crate::compiler::error::SchemaIdentityError;
 
     if desired.next_identity_id < accepted.next_identity_id {
         return Err(SchemaIdentityError::Resolution(format!(
@@ -620,7 +620,7 @@ fn plan_properties(
                         "adding required property '{}.{}' requires a backfill and is not supported in schema migration v1",
                         type_name, property.name
                     ),
-                    code: Some(crate::lint::codes::OG_MF_103.code.to_string()),
+                    code: Some(crate::compiler::lint::codes::OG_MF_103.code.to_string()),
                 });
             }
             continue;
@@ -655,7 +655,7 @@ fn plan_properties(
                     "changing property type for '{}.{}' is not supported in schema migration v1",
                     type_name, property.name
                 ),
-                code: Some(crate::lint::codes::OG_MF_106.code.to_string()),
+                code: Some(crate::compiler::lint::codes::OG_MF_106.code.to_string()),
             });
         }
 
@@ -1095,11 +1095,11 @@ fn schema_type_kind_key(kind: SchemaTypeKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::catalog::schema_ir::{
+    use crate::compiler::catalog::schema_ir::{
         SchemaIdentityDomain, initialize_schema_ir, resolve_schema_ir,
     };
-    use crate::catalog::schema_shape::compile_schema_shape;
-    use crate::schema::parser::parse_schema;
+    use crate::compiler::catalog::schema_shape::compile_schema_shape;
+    use crate::compiler::schema::parser::parse_schema;
 
     use super::SchemaMigrationStep::{
         AddConstraint, AddProperty, RenameProperty, RenameType, UnsupportedChange,
@@ -1107,7 +1107,7 @@ mod tests {
     };
     use super::*;
 
-    fn ir(source: &str) -> crate::catalog::schema_ir::SchemaIR {
+    fn ir(source: &str) -> crate::compiler::catalog::schema_ir::SchemaIR {
         let shape = compile_schema_shape(&parse_schema(source).unwrap()).unwrap();
         initialize_schema_ir(
             SchemaIdentityDomain::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
@@ -1118,9 +1118,9 @@ mod tests {
     }
 
     fn evolve(
-        accepted: &crate::catalog::schema_ir::SchemaIR,
+        accepted: &crate::compiler::catalog::schema_ir::SchemaIR,
         source: &str,
-    ) -> crate::catalog::schema_ir::SchemaIR {
+    ) -> crate::compiler::catalog::schema_ir::SchemaIR {
         let shape = compile_schema_shape(&parse_schema(source).unwrap()).unwrap();
         resolve_schema_ir(accepted, &shape).unwrap().schema_ir
     }
@@ -1234,7 +1234,7 @@ node Ticket {
             assert!(
                 plan.steps.iter().any(|s| matches!(
                     s,
-                    UnsupportedChange { code: Some(c), .. } if c == crate::lint::codes::OG_MF_106.code
+                    UnsupportedChange { code: Some(c), .. } if c == crate::compiler::lint::codes::OG_MF_106.code
                 )),
                 "expected OG-MF-106: {plan:?}"
             );
@@ -1295,7 +1295,7 @@ node Person {
             type_kind: SchemaTypeKind::Node,
             type_name: "Person".to_string(),
             property_name: "nickname".to_string(),
-            property_type: PropType::scalar(crate::types::ScalarType::String, true),
+            property_type: PropType::scalar(crate::compiler::types::ScalarType::String, true),
         }));
         assert!(plan.steps.contains(&AddConstraint {
             type_kind: SchemaTypeKind::Node,
@@ -1481,7 +1481,7 @@ node Person {
             step,
             UnsupportedChange { entity, code, .. }
                 if entity.contains("Person.age")
-                    && code.as_deref() == Some(crate::lint::codes::OG_MF_103.code)
+                    && code.as_deref() == Some(crate::compiler::lint::codes::OG_MF_103.code)
         )));
     }
 

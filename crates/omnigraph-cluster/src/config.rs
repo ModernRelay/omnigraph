@@ -924,7 +924,7 @@ pub(crate) fn validate_query_source(
     graph_id: &str,
     query_name: &str,
     source: &str,
-    catalog: Option<&omnigraph_compiler::catalog::Catalog>,
+    catalog: Option<&omnigraph::compiler::catalog::Catalog>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let path = format!("graphs.{graph_id}.queries.{query_name}");

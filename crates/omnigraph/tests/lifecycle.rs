@@ -3,15 +3,15 @@ mod helpers;
 use std::fs;
 
 use omnigraph::db::{InitOptions, Omnigraph, ReadTarget};
-use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::{
+use omnigraph::compiler::schema::parser::parse_schema;
+use omnigraph::compiler::{
     SchemaIR, SchemaIdentityDomain, compile_schema_shape, resolve_schema_ir, schema_ir_hash,
     schema_ir_pretty_json, schema_shape_hash, schema_shape_hash_from_ir,
 };
 
 use helpers::*;
 
-fn compile_shape(source: &str) -> omnigraph_compiler::SchemaShape {
+fn compile_shape(source: &str) -> omnigraph::compiler::SchemaShape {
     compile_schema_shape(&parse_schema(source).unwrap()).unwrap()
 }
 

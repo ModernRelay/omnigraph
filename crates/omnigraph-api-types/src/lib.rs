@@ -6,10 +6,10 @@
 use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot};
 use omnigraph::error::{MergeConflict, MergeConflictKind};
 use omnigraph::loader::{LoadMode, LoadResult};
-use omnigraph_compiler::SchemaMigrationStep;
-use omnigraph_compiler::query::ast::Param;
-use omnigraph_compiler::result::QueryResult;
-use omnigraph_compiler::types::{PropType, ScalarType};
+use omnigraph::compiler::SchemaMigrationStep;
+use omnigraph::compiler::query::ast::Param;
+use omnigraph::compiler::result::QueryResult;
+use omnigraph::compiler::types::{PropType, ScalarType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::{IntoParams, ToSchema};

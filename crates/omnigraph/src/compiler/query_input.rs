@@ -3,11 +3,11 @@ use std::fmt;
 
 use serde_json::Value;
 
-use crate::error::CompilerError;
-use crate::ir::ParamMap;
-use crate::json_output::{JS_MAX_SAFE_INTEGER_U64, is_js_safe_integer_i64};
-use crate::query::ast::{Literal, Param, QueryDecl};
-use crate::query::parser::parse_query;
+use crate::compiler::error::CompilerError;
+use crate::compiler::ir::ParamMap;
+use crate::compiler::json_output::{JS_MAX_SAFE_INTEGER_U64, is_js_safe_integer_i64};
+use crate::compiler::query::ast::{Literal, Param, QueryDecl};
+use crate::compiler::query::parser::parse_query;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonParamMode {
@@ -54,71 +54,71 @@ impl From<CompilerError> for RunInputError {
 pub type RunInputResult<T> = std::result::Result<T, RunInputError>;
 
 pub trait ToParam {
-    fn to_param(self) -> crate::error::Result<Literal>;
+    fn to_param(self) -> crate::compiler::error::Result<Literal>;
 }
 
 impl ToParam for Literal {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         Ok(self)
     }
 }
 
 impl ToParam for &Literal {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         Ok(self.clone())
     }
 }
 
 impl ToParam for String {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         Ok(Literal::String(self))
     }
 }
 
 impl ToParam for &String {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         Ok(Literal::String(self.clone()))
     }
 }
 
 impl ToParam for &str {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         Ok(Literal::String(self.to_string()))
     }
 }
 
 impl ToParam for bool {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         Ok(Literal::Bool(self))
     }
 }
 
 impl ToParam for i8 {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         Ok(Literal::Integer(i64::from(self)))
     }
 }
 
 impl ToParam for i16 {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         Ok(Literal::Integer(i64::from(self)))
     }
 }
 
 impl ToParam for i32 {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         Ok(Literal::Integer(i64::from(self)))
     }
 }
 
 impl ToParam for i64 {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         Ok(Literal::Integer(self))
     }
 }
 
 impl ToParam for isize {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         let value = i64::try_from(self).map_err(|_| {
             CompilerError::Execution(format!(
                 "param value {} exceeds current engine range for numeric literals (max {})",
@@ -131,25 +131,25 @@ impl ToParam for isize {
 }
 
 impl ToParam for u8 {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         Ok(Literal::Integer(i64::from(self)))
     }
 }
 
 impl ToParam for u16 {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         Ok(Literal::Integer(i64::from(self)))
     }
 }
 
 impl ToParam for u32 {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         Ok(Literal::Integer(i64::from(self)))
     }
 }
 
 impl ToParam for u64 {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         let value = i64::try_from(self).map_err(|_| {
             CompilerError::Execution(format!(
                 "param value {} exceeds current engine range for numeric literals (max {})",
@@ -162,7 +162,7 @@ impl ToParam for u64 {
 }
 
 impl ToParam for usize {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         let value = i64::try_from(self).map_err(|_| {
             CompilerError::Execution(format!(
                 "param value {} exceeds current engine range for numeric literals (max {})",
@@ -175,7 +175,7 @@ impl ToParam for usize {
 }
 
 impl ToParam for f32 {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         if !self.is_finite() {
             return Err(CompilerError::Execution(format!(
                 "invalid float parameter {}",
@@ -187,7 +187,7 @@ impl ToParam for f32 {
 }
 
 impl ToParam for f64 {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         if !self.is_finite() {
             return Err(CompilerError::Execution(format!(
                 "invalid float parameter {}",
@@ -202,7 +202,7 @@ impl<T> ToParam for Vec<T>
 where
     T: ToParam,
 {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         let mut out = Vec::with_capacity(self.len());
         for value in self {
             out.push(value.to_param()?);
@@ -215,7 +215,7 @@ impl<T> ToParam for &[T]
 where
     T: Clone + ToParam,
 {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         let mut out = Vec::with_capacity(self.len());
         for value in self {
             out.push(value.clone().to_param()?);
@@ -228,7 +228,7 @@ impl<T, const N: usize> ToParam for [T; N]
 where
     T: ToParam,
 {
-    fn to_param(self) -> crate::error::Result<Literal> {
+    fn to_param(self) -> crate::compiler::error::Result<Literal> {
         let mut out = Vec::with_capacity(N);
         for value in self {
             out.push(value.to_param()?);
@@ -240,13 +240,13 @@ where
 #[macro_export]
 macro_rules! params {
     () => {
-        ::std::result::Result::Ok($crate::ParamMap::new())
+        ::std::result::Result::Ok($crate::compiler::ParamMap::new())
     };
     ($($key:expr => $value:expr),+ $(,)?) => {{
-        (|| -> $crate::error::Result<$crate::ParamMap> {
-            let mut map = $crate::ParamMap::new();
+        (|| -> $crate::compiler::error::Result<$crate::compiler::ParamMap> {
+            let mut map = $crate::compiler::ParamMap::new();
             $(
-                map.insert(::std::convert::Into::<String>::into($key), $crate::ToParam::to_param($value)?);
+                map.insert(::std::convert::Into::<String>::into($key), $crate::compiler::ToParam::to_param($value)?);
             )+
             Ok(map)
         })()
@@ -765,7 +765,7 @@ mod tests {
     use serde_json::json;
 
     use super::{JsonParamMode, ToParam, find_named_query, json_params_to_param_map};
-    use crate::query::ast::Literal;
+    use crate::compiler::query::ast::Literal;
 
     #[test]
     fn js_mode_rejects_unsafe_integer_numbers() {

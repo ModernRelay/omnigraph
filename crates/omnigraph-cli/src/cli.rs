@@ -304,7 +304,7 @@ pub(crate) enum Command {
     },
     /// Validate queries against a schema (offline) or repo (repo-backed).
     ///
-    /// Canonical name is `lint` (matches the `omnigraph_compiler::lint`
+    /// Canonical name is `lint` (matches the `omnigraph::compiler::lint`
     /// module and the `OG-XXX-NNN` lint-code vocabulary). Replaces the
     /// deprecated `omnigraph query lint` / `omnigraph query check` /
     /// `omnigraph check` invocations — each is kept as an argv-level

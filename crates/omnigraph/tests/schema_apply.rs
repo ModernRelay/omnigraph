@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
+use omnigraph::compiler::{SchemaMigrationStep, SchemaTypeKind};
 
 use helpers::*;
 
@@ -609,7 +609,7 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
                 type_kind: SchemaTypeKind::Node,
                 type_name,
                 property_name,
-                mode: omnigraph_compiler::DropMode::Soft,
+                mode: omnigraph::compiler::DropMode::Soft,
                 ..
             } if type_name == "Person" && property_name == "age"
         )),
@@ -722,7 +722,7 @@ edge Knows: Person -> Person {
             SchemaMigrationStep::DropType {
                 type_kind: SchemaTypeKind::Node,
                 name,
-                mode: omnigraph_compiler::DropMode::Soft,
+                mode: omnigraph::compiler::DropMode::Soft,
             } if name == "Company"
         )),
         "expected DropType {{ Node, Company, Soft }} in plan: {plan:?}",
@@ -733,7 +733,7 @@ edge Knows: Person -> Person {
             SchemaMigrationStep::DropType {
                 type_kind: SchemaTypeKind::Edge,
                 name,
-                mode: omnigraph_compiler::DropMode::Soft,
+                mode: omnigraph::compiler::DropMode::Soft,
             } if name == "WorksAt"
         )),
         "expected DropType {{ Edge, WorksAt, Soft }} in plan: {plan:?}",
@@ -825,7 +825,7 @@ async fn apply_schema_drops_an_edge_type_softly() {
             SchemaMigrationStep::DropType {
                 type_kind: SchemaTypeKind::Edge,
                 name,
-                mode: omnigraph_compiler::DropMode::Soft,
+                mode: omnigraph::compiler::DropMode::Soft,
             } if name == "WorksAt"
         )),
         "expected DropType {{ Edge, WorksAt, Soft }} in plan: {plan:?}",
@@ -1029,7 +1029,7 @@ edge WorksAt: Human -> Company
         step,
         SchemaMigrationStep::DropProperty {
             type_name,
-            mode: omnigraph_compiler::DropMode::Hard,
+            mode: omnigraph::compiler::DropMode::Hard,
             ..
         } if type_name == "Human"
     )));
@@ -1304,7 +1304,7 @@ async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
     assert!(plan_soft.steps.iter().any(|step| matches!(
         step,
         SchemaMigrationStep::DropProperty {
-            mode: omnigraph_compiler::DropMode::Soft,
+            mode: omnigraph::compiler::DropMode::Soft,
             ..
         }
     )));
@@ -1324,7 +1324,7 @@ async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
         plan_hard.steps.iter().any(|step| matches!(
             step,
             SchemaMigrationStep::DropProperty {
-                mode: omnigraph_compiler::DropMode::Hard,
+                mode: omnigraph::compiler::DropMode::Hard,
                 ..
             }
         )),
@@ -1335,10 +1335,10 @@ async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
         !plan_hard.steps.iter().any(|step| matches!(
             step,
             SchemaMigrationStep::DropProperty {
-                mode: omnigraph_compiler::DropMode::Soft,
+                mode: omnigraph::compiler::DropMode::Soft,
                 ..
             } | SchemaMigrationStep::DropType {
-                mode: omnigraph_compiler::DropMode::Soft,
+                mode: omnigraph::compiler::DropMode::Soft,
                 ..
             }
         )),
@@ -1448,7 +1448,7 @@ edge Knows: Person -> Person {
             step,
             SchemaMigrationStep::DropType {
                 type_kind: SchemaTypeKind::Node,
-                mode: omnigraph_compiler::DropMode::Hard,
+                mode: omnigraph::compiler::DropMode::Hard,
                 ..
             }
         )),
@@ -1459,7 +1459,7 @@ edge Knows: Person -> Person {
             step,
             SchemaMigrationStep::DropType {
                 type_kind: SchemaTypeKind::Edge,
-                mode: omnigraph_compiler::DropMode::Hard,
+                mode: omnigraph::compiler::DropMode::Hard,
                 ..
             }
         )),

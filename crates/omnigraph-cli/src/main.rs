@@ -14,9 +14,9 @@ use omnigraph_cluster::{
     approve_config_dir, force_unlock_config_dir, import_config_dir, plan_config_dir,
     refresh_config_dir, status_config_dir, validate_config_dir,
 };
-use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::{
+use omnigraph::compiler::query::parser::parse_query;
+use omnigraph::compiler::schema::parser::parse_schema;
+use omnigraph::compiler::{
     JsonParamMode, ParamMap, QueryLintOutput, QueryLintQueryKind, QueryLintSchemaSource,
     QueryLintSeverity, QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, build_catalog,
     json_params_to_param_map, lint_query_file,

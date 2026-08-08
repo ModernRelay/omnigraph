@@ -30,7 +30,7 @@ use datafusion::prelude::{Expr, col, lit};
 use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
 use lance::Dataset;
-use omnigraph_compiler::catalog::{Catalog, EdgeType};
+use crate::compiler::catalog::{Catalog, EdgeType};
 
 use crate::db::{Omnigraph, Snapshot};
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
@@ -1179,8 +1179,8 @@ mod tests {
 
     use arrow_array::StringArray;
     use arrow_schema::{DataType, Field, Schema};
-    use omnigraph_compiler::catalog::build_catalog;
-    use omnigraph_compiler::schema::parser::parse_schema;
+    use crate::compiler::catalog::build_catalog;
+    use crate::compiler::schema::parser::parse_schema;
 
     const DOC_SCHEMA: &str =
         "node Doc {\n  slug: String @key\n  status: enum(draft, published)\n}\n";

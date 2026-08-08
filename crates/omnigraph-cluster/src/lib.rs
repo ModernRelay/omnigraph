@@ -8,11 +8,11 @@ use std::fs::{self};
 use std::path::{Path, PathBuf};
 
 use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
-use omnigraph_compiler::SchemaMigrationPlan;
-use omnigraph_compiler::build_catalog;
-use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::query::typecheck::typecheck_query_decl;
-use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph::compiler::SchemaMigrationPlan;
+use omnigraph::compiler::build_catalog;
+use omnigraph::compiler::query::parser::parse_query;
+use omnigraph::compiler::query::typecheck::typecheck_query_decl;
+use omnigraph::compiler::schema::parser::parse_schema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};

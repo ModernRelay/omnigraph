@@ -15,10 +15,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
-use crate::error::{CompilerError, Result, SchemaIdentityError};
-use crate::schema::ast::{Annotation, Cardinality, Constraint, ConstraintBound};
-use crate::schema::is_reserved_storage_system_column;
-use crate::types::PropType;
+use crate::compiler::error::{CompilerError, Result, SchemaIdentityError};
+use crate::compiler::schema::ast::{Annotation, Cardinality, Constraint, ConstraintBound};
+use crate::compiler::schema::is_reserved_storage_system_column;
+use crate::compiler::types::PropType;
 
 use super::schema_shape::{
     EdgeShape, EmbedSourceShape, InterfaceShape, NodeShape, PropertyConstraintShape, PropertyShape,
@@ -1472,9 +1472,9 @@ fn invalid_ir<T>(message: String) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema_shape::compile_schema_shape;
-    use crate::catalog::{build_catalog, build_catalog_from_ir};
-    use crate::schema::parser::parse_schema;
+    use crate::compiler::catalog::schema_shape::compile_schema_shape;
+    use crate::compiler::catalog::{build_catalog, build_catalog_from_ir};
+    use crate::compiler::schema::parser::parse_schema;
 
     fn domain() -> SchemaIdentityDomain {
         SchemaIdentityDomain::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap()

@@ -641,30 +641,30 @@ pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
     }
 }
 
-pub(crate) fn schema_type_kind_label(kind: omnigraph_compiler::SchemaTypeKind) -> &'static str {
+pub(crate) fn schema_type_kind_label(kind: omnigraph::compiler::SchemaTypeKind) -> &'static str {
     match kind {
-        omnigraph_compiler::SchemaTypeKind::Interface => "interface",
-        omnigraph_compiler::SchemaTypeKind::Node => "node",
-        omnigraph_compiler::SchemaTypeKind::Edge => "edge",
+        omnigraph::compiler::SchemaTypeKind::Interface => "interface",
+        omnigraph::compiler::SchemaTypeKind::Node => "node",
+        omnigraph::compiler::SchemaTypeKind::Edge => "edge",
     }
 }
 
-pub(crate) fn schema_lint_tier_label(tier: omnigraph_compiler::SafetyTier) -> &'static str {
+pub(crate) fn schema_lint_tier_label(tier: omnigraph::compiler::SafetyTier) -> &'static str {
     match tier {
-        omnigraph_compiler::SafetyTier::Safe => "safe",
-        omnigraph_compiler::SafetyTier::Validated => "validated",
-        omnigraph_compiler::SafetyTier::Destructive => "destructive",
+        omnigraph::compiler::SafetyTier::Safe => "safe",
+        omnigraph::compiler::SafetyTier::Validated => "validated",
+        omnigraph::compiler::SafetyTier::Destructive => "destructive",
     }
 }
 
-pub(crate) fn drop_mode_label(mode: omnigraph_compiler::DropMode) -> &'static str {
+pub(crate) fn drop_mode_label(mode: omnigraph::compiler::DropMode) -> &'static str {
     match mode {
-        omnigraph_compiler::DropMode::Soft => "soft",
-        omnigraph_compiler::DropMode::Hard => "hard",
+        omnigraph::compiler::DropMode::Soft => "soft",
+        omnigraph::compiler::DropMode::Hard => "hard",
     }
 }
 
-pub(crate) fn render_prop_type(prop_type: &omnigraph_compiler::PropType) -> String {
+pub(crate) fn render_prop_type(prop_type: &omnigraph::compiler::PropType) -> String {
     let base = if let Some(values) = &prop_type.enum_values {
         format!("Enum({})", values.join("|"))
     } else {
@@ -683,29 +683,29 @@ pub(crate) fn render_prop_type(prop_type: &omnigraph_compiler::PropType) -> Stri
 }
 
 pub(crate) fn render_constraint(
-    constraint: &omnigraph_compiler::schema::ast::Constraint,
+    constraint: &omnigraph::compiler::schema::ast::Constraint,
 ) -> String {
     match constraint {
-        omnigraph_compiler::schema::ast::Constraint::Key(columns) => {
+        omnigraph::compiler::schema::ast::Constraint::Key(columns) => {
             format!("@key({})", columns.join(", "))
         }
-        omnigraph_compiler::schema::ast::Constraint::Unique(columns) => {
+        omnigraph::compiler::schema::ast::Constraint::Unique(columns) => {
             format!("@unique({})", columns.join(", "))
         }
-        omnigraph_compiler::schema::ast::Constraint::Index(columns) => {
+        omnigraph::compiler::schema::ast::Constraint::Index(columns) => {
             format!("@index({})", columns.join(", "))
         }
-        omnigraph_compiler::schema::ast::Constraint::Range { property, min, max } => {
+        omnigraph::compiler::schema::ast::Constraint::Range { property, min, max } => {
             format!("@range({}, {:?}, {:?})", property, min, max)
         }
-        omnigraph_compiler::schema::ast::Constraint::Check { property, pattern } => {
+        omnigraph::compiler::schema::ast::Constraint::Check { property, pattern } => {
             format!("@check({}, {:?})", property, pattern)
         }
     }
 }
 
 pub(crate) fn render_annotations(
-    annotations: &[omnigraph_compiler::schema::ast::Annotation],
+    annotations: &[omnigraph::compiler::schema::ast::Annotation],
 ) -> String {
     annotations
         .iter()
@@ -1015,8 +1015,8 @@ pub(crate) fn resolve_table_render_options() -> ReadRenderOptions {
 
 #[cfg(test)]
 mod tests {
-    use omnigraph_compiler::schema::ast::Annotation;
-    use omnigraph_compiler::schema::parser::parse_schema;
+    use omnigraph::compiler::schema::ast::Annotation;
+    use omnigraph::compiler::schema::parser::parse_schema;
     use std::collections::BTreeMap;
 
     use super::render_annotations;

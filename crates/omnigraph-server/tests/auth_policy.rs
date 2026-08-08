@@ -832,12 +832,12 @@ async fn engine_layer_policy_fires_via_direct_arc_omnigraph_from_new_single() {
     };
     let engine = Arc::clone(&handle.engine);
 
-    let mut params: omnigraph_compiler::ParamMap = Default::default();
+    let mut params: omnigraph::compiler::ParamMap = Default::default();
     params.insert(
         "name".to_string(),
-        omnigraph_compiler::Literal::String("EngineLayerBlocked".to_string()),
+        omnigraph::compiler::Literal::String("EngineLayerBlocked".to_string()),
     );
-    params.insert("age".to_string(), omnigraph_compiler::Literal::Integer(30));
+    params.insert("age".to_string(), omnigraph::compiler::Literal::Integer(30));
     let result = engine
         .mutate_as(
             "main",

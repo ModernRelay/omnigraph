@@ -3085,10 +3085,10 @@ async fn apply_executes_approved_graph_delete() {
     let old_root = dir.path().join(CLUSTER_GRAPHS_DIR).join("old.omni");
     let old_uri = derived_graph_uri(dir.path(), "old");
     let export_db = Omnigraph::open(&old_uri).await.unwrap();
-    let mut seed_params = omnigraph_compiler::ir::ParamMap::new();
+    let mut seed_params = omnigraph::compiler::ir::ParamMap::new();
     seed_params.insert(
         "name".to_string(),
-        omnigraph_compiler::query::ast::Literal::String("export-cut".to_string()),
+        omnigraph::compiler::query::ast::Literal::String("export-cut".to_string()),
     );
     export_db
         .mutate(

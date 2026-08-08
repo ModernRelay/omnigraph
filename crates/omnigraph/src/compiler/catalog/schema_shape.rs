@@ -11,12 +11,12 @@ use std::collections::{BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::error::{CompilerError, Result};
-use crate::schema::ast::{
+use crate::compiler::error::{CompilerError, Result};
+use crate::compiler::schema::ast::{
     Annotation, Cardinality, Constraint, InterfacePropertyOrigin, PropDecl, SchemaDecl, SchemaFile,
     rename_from_annotation,
 };
-use crate::types::PropType;
+use crate::compiler::types::PropType;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaShape {
@@ -277,7 +277,7 @@ fn canonical_interface_property<'a>(
     node_name: &str,
     property_name: &str,
     contributions: &[InterfacePropertyOrigin],
-    interfaces: &HashMap<&str, &'a crate::schema::ast::InterfaceDecl>,
+    interfaces: &HashMap<&str, &'a crate::compiler::schema::ast::InterfaceDecl>,
 ) -> Result<&'a PropDecl> {
     let mut candidates = Vec::with_capacity(contributions.len());
     for contribution in contributions {
@@ -516,7 +516,7 @@ fn validate_shape(shape: &SchemaShape) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::parser::parse_schema;
+    use crate::compiler::schema::parser::parse_schema;
 
     #[test]
     fn shape_hash_ignores_source_order_comments_and_rename_hints() {

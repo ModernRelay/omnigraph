@@ -5012,7 +5012,6 @@ dependencies = [
 name = "omnigraph-api-types"
 version = "0.9.0"
 dependencies = [
- "omnigraph-compiler",
  "omnigraph-engine",
  "serde",
  "serde_json",
@@ -5031,7 +5030,6 @@ dependencies = [
  "lance-index",
  "omnigraph-api-types",
  "omnigraph-cluster",
- "omnigraph-compiler",
  "omnigraph-engine",
  "omnigraph-server",
  "predicates",
@@ -5048,7 +5046,6 @@ name = "omnigraph-cluster"
 version = "0.9.0"
 dependencies = [
  "fail",
- "omnigraph-compiler",
  "omnigraph-engine",
  "serde",
  "serde_json",
@@ -5063,32 +5060,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "omnigraph-compiler"
-version = "0.9.0"
-dependencies = [
- "ahash",
- "arrow-array",
- "arrow-cast",
- "arrow-ipc",
- "arrow-ord",
- "arrow-schema",
- "arrow-select",
- "pest",
- "pest_derive",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror",
- "ulid",
-]
-
-[[package]]
 name = "omnigraph-engine"
 version = "0.9.0"
 dependencies = [
+ "ahash",
  "arc-swap",
  "arrow-array",
  "arrow-cast",
+ "arrow-ipc",
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
@@ -5114,7 +5093,8 @@ dependencies = [
  "lance-table",
  "libc",
  "object_store",
- "omnigraph-compiler",
+ "pest",
+ "pest_derive",
  "proptest",
  "regex",
  "reqwest 0.12.28",
@@ -5150,7 +5130,6 @@ dependencies = [
  "lance-index",
  "omnigraph-api-types",
  "omnigraph-cluster",
- "omnigraph-compiler",
  "omnigraph-engine",
  "regex",
  "serde",

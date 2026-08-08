@@ -2,14 +2,14 @@ use pest::Parser;
 use pest::error::InputLocation;
 use pest_derive::Parser;
 
-use crate::error::{
+use crate::compiler::error::{
     CompilerError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
 };
 
 use super::ast::*;
 
 #[derive(Parser)]
-#[grammar = "query/query.pest"]
+#[grammar = "compiler/query/query.pest"]
 struct QueryParser;
 
 pub fn parse_query(input: &str) -> Result<QueryFile> {

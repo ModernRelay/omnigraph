@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::{
+use crate::compiler::schema::parser::parse_schema;
+use crate::compiler::{
     SchemaIR, SchemaIdentityDomain, SchemaShape, compile_schema_shape, schema_ir_hash,
     schema_ir_pretty_json, schema_shape_hash, schema_shape_hash_from_ir, validate_schema_ir,
 };

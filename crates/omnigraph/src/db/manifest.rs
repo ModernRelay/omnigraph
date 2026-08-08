@@ -9,7 +9,7 @@ use lance::datatypes::{BlobHandling, Schema as LanceSchema};
 use lance::index::DatasetIndexExt;
 use lance_namespace::models::CreateTableVersionRequest;
 use lance_table::format::IndexMetadata;
-use omnigraph_compiler::catalog::Catalog;
+use crate::compiler::catalog::Catalog;
 
 #[path = "manifest/graph.rs"]
 mod graph;

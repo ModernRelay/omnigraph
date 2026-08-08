@@ -83,7 +83,7 @@ pub enum MergeConflictKind {
 #[derive(Debug, Error)]
 pub enum OmniError {
     #[error("{0}")]
-    Compiler(#[from] omnigraph_compiler::error::CompilerError),
+    Compiler(#[from] crate::compiler::error::CompilerError),
     #[error("storage: {0}")]
     Lance(String),
     /// Lance rejected a stale transaction as semantically retryable. Kept

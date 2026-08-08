@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
-use crate::error::{CompilerError, Result};
-use crate::schema::ast::{Cardinality, Constraint, ConstraintBound, SchemaDecl, SchemaFile};
-use crate::types::{PropType, ScalarType};
+use crate::compiler::error::{CompilerError, Result};
+use crate::compiler::schema::ast::{Cardinality, Constraint, ConstraintBound, SchemaDecl, SchemaFile};
+use crate::compiler::types::{PropType, ScalarType};
 
 #[derive(Debug, Clone)]
 pub struct Catalog {

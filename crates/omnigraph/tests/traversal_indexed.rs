@@ -13,7 +13,7 @@ use omnigraph::IndexCoverage;
 use omnigraph::db::Omnigraph;
 use omnigraph::instrumentation::with_traversal_mode;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_compiler::ir::ParamMap;
+use omnigraph::compiler::ir::ParamMap;
 
 use helpers::*;
 

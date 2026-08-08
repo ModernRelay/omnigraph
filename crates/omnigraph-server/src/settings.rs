@@ -492,8 +492,8 @@ mod tests {
     #[test]
     fn validate_and_attach_gates_on_schema_and_collapses_empty() {
         use crate::queries::{QueryRegistry, RegistrySpec};
-        use omnigraph_compiler::catalog::build_catalog;
-        use omnigraph_compiler::schema::parser::parse_schema;
+        use omnigraph::compiler::catalog::build_catalog;
+        use omnigraph::compiler::schema::parser::parse_schema;
 
         let schema = parse_schema("node User {\nname: String\n}\n").unwrap();
         let catalog = build_catalog(&schema).unwrap();

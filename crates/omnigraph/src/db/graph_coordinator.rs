@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use omnigraph_compiler::catalog::Catalog;
+use crate::compiler::catalog::Catalog;
 
 use crate::error::{OmniError, Result};
 use crate::failpoints;

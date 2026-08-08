@@ -48,7 +48,7 @@ fn resolve_desired_schema_ir(
     desired_schema_source: &str,
 ) -> Result<SchemaIR> {
     let desired_shape = read_schema_shape_from_source(desired_schema_source)?;
-    let resolution = omnigraph_compiler::resolve_schema_ir(accepted_ir, &desired_shape)
+    let resolution = crate::compiler::resolve_schema_ir(accepted_ir, &desired_shape)
         .map_err(|error| OmniError::manifest(error.to_string()))?;
     for diagnostic in &resolution.diagnostics {
         tracing::warn!(
@@ -783,7 +783,7 @@ where
     // roll back a pre-staging crash or roll forward a post-staging crash.
     // `branch=None` because schema_apply publishes against main — the
     // `__schema_apply_lock__` branch is purely a serialization sentinel.
-    let target_schema_ir_hash = omnigraph_compiler::schema_ir_hash(&desired_ir)
+    let target_schema_ir_hash = crate::compiler::schema_ir_hash(&desired_ir)
         .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
     let recovery_authority = crate::db::manifest::RecoveryAuthorityToken {
         branch_identifier: base_branch_identifier.clone(),

@@ -58,7 +58,7 @@ use lance_index::scalar::ScalarIndexParams;
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
-use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph::compiler::schema::parser::parse_schema;
 
 use helpers::{init_and_load, open_dataset_head, snapshot_main};
 

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use crate::error::{CompilerError, Result};
-use crate::types::PropType;
+use crate::compiler::error::{CompilerError, Result};
+use crate::compiler::types::PropType;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

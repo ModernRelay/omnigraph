@@ -41,7 +41,7 @@ impl Omnigraph {
         // the applying handle could pair that new snapshot with the old catalog.
         let (resolved, catalog) = self.capture_read_view(target).await?;
 
-        let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
+        let query_decl = crate::compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
         let type_ctx = typecheck_query(&catalog, &query_decl)?;
         let ir = lower_query(&catalog, &query_decl, &type_ctx)?;
@@ -91,7 +91,7 @@ impl Omnigraph {
         // live-target query.
         let (snapshot, catalog) = self.capture_historical_read_view(version).await?;
 
-        let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
+        let query_decl = crate::compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
         let type_ctx = typecheck_query(&catalog, &query_decl)?;
         let ir = lower_query(&catalog, &query_decl, &type_ctx)?;
@@ -2523,7 +2523,7 @@ async fn execute_node_scan(
 /// Uses column_by_name (not positional) so it's order-independent.
 fn add_null_blob_columns(
     batch: &RecordBatch,
-    node_type: &omnigraph_compiler::catalog::NodeType,
+    node_type: &crate::compiler::catalog::NodeType,
 ) -> Result<RecordBatch> {
     let num_rows = batch.num_rows();
     let mut fields = Vec::with_capacity(node_type.arrow_schema.fields().len());
@@ -3125,7 +3125,7 @@ mod referenced_edge_types_tests {
                     variable: "p".into(),
                     property: "name".into(),
                 },
-                op: omnigraph_compiler::query::ast::CompOp::Eq,
+                op: crate::compiler::query::ast::CompOp::Eq,
                 right: IRExpr::Literal(Literal::String("a".into())),
             }),
             expand("identifiesPerson"),

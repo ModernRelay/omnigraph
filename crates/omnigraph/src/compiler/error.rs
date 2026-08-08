@@ -189,8 +189,8 @@ mod tests {
         let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
-            .expect("compiler crate should live under crates/");
-        let allowed_file = workspace_root.join("crates/omnigraph-compiler/src/error.rs");
+            .expect("engine crate should live under crates/");
+        let allowed_file = workspace_root.join("crates/omnigraph/src/compiler/error.rs");
         let mut offenders = Vec::new();
 
         visit_rs_files(workspace_root, &mut |path| {

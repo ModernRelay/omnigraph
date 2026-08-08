@@ -1,7 +1,7 @@
 use super::*;
-use crate::catalog::build_catalog;
-use crate::query::parser::parse_query;
-use crate::schema::parser::parse_schema;
+use crate::compiler::catalog::build_catalog;
+use crate::compiler::query::parser::parse_query;
+use crate::compiler::schema::parser::parse_schema;
 
 fn setup() -> Catalog {
     let schema = parse_schema(

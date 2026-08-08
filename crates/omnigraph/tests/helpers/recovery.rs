@@ -6,7 +6,7 @@ use lance::Dataset;
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{GraphCommit, Omnigraph, ReadTarget, SubTableEntry};
 use omnigraph::error::{OmniError, Result};
-use omnigraph_compiler::ir::ParamMap;
+use omnigraph::compiler::ir::ParamMap;
 use serde::Deserialize;
 
 const RECOVERY_ACTOR: &str = "omnigraph:recovery";

@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
-use crate::catalog::Catalog;
-use crate::error::{CompilerError, Result};
-use crate::types::{Direction, PropType, ScalarType};
+use crate::compiler::catalog::Catalog;
+use crate::compiler::error::{CompilerError, Result};
+use crate::compiler::types::{Direction, PropType, ScalarType};
 
 use super::ast::*;
 
@@ -450,7 +450,7 @@ fn ensure_no_duplicate_assignment_names(assignments: &[MutationAssignment]) -> R
 fn typecheck_mutation_predicate(
     type_name: &str,
     predicate: &MutationPredicate,
-    node_type: &crate::catalog::NodeType,
+    node_type: &crate::compiler::catalog::NodeType,
     param_types: &HashMap<String, PropType>,
 ) -> Result<()> {
     let prop_type = node_type
@@ -480,7 +480,7 @@ fn typecheck_mutation_predicate(
 fn typecheck_edge_mutation_predicate(
     type_name: &str,
     predicate: &MutationPredicate,
-    edge_type: &crate::catalog::EdgeType,
+    edge_type: &crate::compiler::catalog::EdgeType,
     param_types: &HashMap<String, PropType>,
 ) -> Result<()> {
     if predicate.property == "from" || predicate.property == "to" {
@@ -903,7 +903,7 @@ fn bind_traversal_endpoint(
     ctx: &mut TypeContext,
     var: &str,
     expected_type: &str,
-    edge: &crate::catalog::EdgeType,
+    edge: &crate::compiler::catalog::EdgeType,
 ) -> Result<()> {
     if var == "_" {
         return Ok(()); // anonymous variable

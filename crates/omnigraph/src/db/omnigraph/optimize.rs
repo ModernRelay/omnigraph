@@ -436,7 +436,7 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
 /// any Lance HEAD. The caller holds schema -> main -> all table gates.
 async fn prepare_optimize_table(
     db: &Omnigraph,
-    catalog: &omnigraph_compiler::catalog::Catalog,
+    catalog: &crate::compiler::catalog::Catalog,
     task: OptimizeTableTask,
 ) -> Result<OptimizePreparation> {
     let snapshot = db
@@ -503,7 +503,7 @@ async fn prepare_optimize_table(
 /// `optimize_all_tables`.
 async fn apply_optimize_table_effects(
     db: &Omnigraph,
-    catalog: &omnigraph_compiler::catalog::Catalog,
+    catalog: &crate::compiler::catalog::Catalog,
     work: PreparedOptimizeTable,
 ) -> Result<OptimizeEffectOutcome> {
     let identity = work.identity;
@@ -1310,7 +1310,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
 
 async fn reconcile_orphaned_branches_with_catalog(
     db: &Omnigraph,
-    catalog: &omnigraph_compiler::catalog::Catalog,
+    catalog: &crate::compiler::catalog::Catalog,
 ) -> Result<BranchReconcileStats> {
     use std::collections::{HashMap, HashSet};
 
@@ -1488,7 +1488,7 @@ async fn reconcile_orphaned_branches_with_catalog(
     Ok(stats)
 }
 
-pub(super) fn all_table_keys(catalog: &omnigraph_compiler::catalog::Catalog) -> Vec<String> {
+pub(super) fn all_table_keys(catalog: &crate::compiler::catalog::Catalog) -> Vec<String> {
     let mut keys: Vec<String> = catalog
         .node_types
         .keys()

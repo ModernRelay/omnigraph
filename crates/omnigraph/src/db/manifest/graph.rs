@@ -7,7 +7,7 @@ use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use lance_file::version::LanceFileVersion;
-use omnigraph_compiler::catalog::Catalog;
+use crate::compiler::catalog::Catalog;
 
 use crate::error::{OmniError, Result};
 

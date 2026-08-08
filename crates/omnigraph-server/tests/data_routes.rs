@@ -471,12 +471,12 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
         "main",
         MUTATION_QUERIES,
         "set_age",
-        &omnigraph_compiler::json_params_to_param_map(
+        &omnigraph::compiler::json_params_to_param_map(
             Some(&json!({"name": "Alice", "age": 31 })),
-            &omnigraph_compiler::find_named_query(MUTATION_QUERIES, "set_age")
+            &omnigraph::compiler::find_named_query(MUTATION_QUERIES, "set_age")
                 .unwrap()
                 .params,
-            omnigraph_compiler::JsonParamMode::Standard,
+            omnigraph::compiler::JsonParamMode::Standard,
         )
         .unwrap(),
     )
@@ -486,12 +486,12 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
         "feature",
         MUTATION_QUERIES,
         "set_age",
-        &omnigraph_compiler::json_params_to_param_map(
+        &omnigraph::compiler::json_params_to_param_map(
             Some(&json!({"name": "Alice", "age": 32 })),
-            &omnigraph_compiler::find_named_query(MUTATION_QUERIES, "set_age")
+            &omnigraph::compiler::find_named_query(MUTATION_QUERIES, "set_age")
                 .unwrap()
                 .params,
-            omnigraph_compiler::JsonParamMode::Standard,
+            omnigraph::compiler::JsonParamMode::Standard,
         )
         .unwrap(),
     )
@@ -1567,12 +1567,12 @@ async fn change_long_lived_handle_refreshes_before_preparing_write() {
             "main",
             MUTATION_QUERIES,
             "set_age",
-            &omnigraph_compiler::json_params_to_param_map(
+            &omnigraph::compiler::json_params_to_param_map(
                 Some(&json!({"name": "Alice", "age": 31 })),
-                &omnigraph_compiler::find_named_query(MUTATION_QUERIES, "set_age")
+                &omnigraph::compiler::find_named_query(MUTATION_QUERIES, "set_age")
                     .unwrap()
                     .params,
-                omnigraph_compiler::JsonParamMode::Standard,
+                omnigraph::compiler::JsonParamMode::Standard,
             )
             .unwrap(),
         )
