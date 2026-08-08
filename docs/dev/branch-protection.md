@@ -77,6 +77,6 @@ The branch-protection policy is the foundation. Future hardening adds:
 - **Required signed commits** (`required_signatures: true`) — once maintainers enroll GPG/SSH signing.
 - **Tag protection** for `v*` tags via `repos/.../tags/protection`.
 - **Required reviewers from specific teams** for high-leverage paths (e.g., `docs/dev/invariants.md`) via a GitHub ruleset's path-scoped required-review rule, if a review gate is ever reintroduced.
-- **More required CI checks**: `cargo deny`, `cargo audit`, `cargo fmt --check`, `cargo clippy -D warnings`, CodeQL, secret scanning, schema-lint (MR-946).
+- **More required CI checks**: `cargo deny`, `cargo audit`, CodeQL, secret scanning, schema-lint (MR-946). The `cargo fmt --check` and `cargo clippy -D warnings` jobs exist as PR-time checks (`Format (rustfmt)`, `Lint (clippy)`); requiring them is a one-line addition to `.github/branch-protection.json` once a green run exists.
 
 See the hardening playbook for the full plan.

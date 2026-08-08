@@ -1,3 +1,7 @@
 [toolchain]
-channel = "stable"
+# Pinned: a floating `stable` changes what the CI lint gate enforces with zero
+# commits. Bump deliberately, e.g. when a Lance upgrade raises the required
+# toolchain. Components make a fresh checkout gate-ready.
+channel = "1.97.1"
 profile = "minimal"
+components = ["clippy", "rustfmt"]
