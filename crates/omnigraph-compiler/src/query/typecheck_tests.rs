@@ -3,6 +3,28 @@ use crate::catalog::build_catalog;
 use crate::query::parser::parse_query;
 use crate::schema::parser::parse_schema;
 
+/// Node type name of a binding, panicking if it is an edge binding — the two
+/// namespaces can share a type name (see `setup_same_named_node_and_edge`).
+/// Indexing `ctx.bindings` covers the unbound case with its own panic.
+fn node_type_of(binding: &BoundVariable) -> &str {
+    match binding {
+        BoundVariable::Node { type_name } => type_name,
+        BoundVariable::Edge { type_name } => {
+            panic!("expected a node binding, found edge type `{type_name}`")
+        }
+    }
+}
+
+/// Edge type name of a binding — the dual of `node_type_of`.
+fn edge_type_of(binding: &BoundVariable) -> &str {
+    match binding {
+        BoundVariable::Edge { type_name } => type_name,
+        BoundVariable::Node { type_name } => {
+            panic!("expected an edge binding, found node type `{type_name}`")
+        }
+    }
+}
+
 fn setup() -> Catalog {
     let schema = parse_schema(
         r#"
@@ -760,7 +782,7 @@ return { $f.name }
     .unwrap();
     let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
     assert_eq!(ctx.traversals[0].direction, Direction::Both);
-    assert_eq!(ctx.bindings["f"].type_name, "Person");
+    assert_eq!(node_type_of(&ctx.bindings["f"]), "Person");
 }
 
 #[test]
@@ -801,7 +823,7 @@ return { $f.name }
     .unwrap();
     let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
     assert_eq!(ctx.traversals[0].direction, Direction::Out);
-    assert_eq!(ctx.bindings["f"].type_name, "Person");
+    assert_eq!(node_type_of(&ctx.bindings["f"]), "Person");
 }
 
 #[test]
@@ -1231,9 +1253,7 @@ return { $f.name, $w.since }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let w = &ctx.bindings["w"];
-    assert!(matches!(w.kind, BindingKind::Edge));
-    assert_eq!(w.type_name, "Knows");
+    assert_eq!(edge_type_of(&ctx.bindings["w"]), "Knows");
     assert_eq!(
         ctx.traversals[0].edge_binding.as_deref(),
         Some("w"),
@@ -1449,7 +1469,7 @@ return { $f.name, count($w.since) }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    assert!(matches!(ctx.bindings["w"].kind, BindingKind::Edge));
+    assert!(matches!(&ctx.bindings["w"], BoundVariable::Edge { .. }));
 }
 
 #[test]
