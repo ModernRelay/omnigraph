@@ -32,7 +32,7 @@ use crate::error::{OmniError, Result};
 #[cfg(test)]
 use super::SubTableUpdate;
 use super::layout::{
-    open_manifest_dataset, table_object_id, tombstone_object_id, version_object_id,
+    open_manifest_dataset_with_session, table_object_id, tombstone_object_id, version_object_id,
 };
 use super::metadata::{TableVersionMetadata, parse_namespace_version_request};
 use super::migrations::{read_stamp, refuse_if_stamp_unsupported};
@@ -173,6 +173,7 @@ pub(super) trait ManifestBatchPublisher: Send + Sync {
 pub(super) struct GraphNamespacePublisher {
     root_uri: String,
     branch: Option<String>,
+    control_session: Arc<lance::session::Session>,
 }
 
 #[derive(Debug)]
@@ -203,17 +204,32 @@ struct LoadedPublishState {
 }
 
 impl GraphNamespacePublisher {
+    #[cfg(test)]
     pub(super) fn new(root_uri: &str, branch: Option<&str>) -> Self {
+        Self::new_with_session(root_uri, branch, crate::lance_access::control_session())
+    }
+
+    pub(super) fn new_with_session(
+        root_uri: &str,
+        branch: Option<&str>,
+        control_session: Arc<lance::session::Session>,
+    ) -> Self {
         Self {
             root_uri: root_uri.trim_end_matches('/').to_string(),
             branch: branch
                 .filter(|branch| *branch != "main")
                 .map(ToOwned::to_owned),
+            control_session,
         }
     }
 
     async fn dataset(&self) -> Result<Dataset> {
-        open_manifest_dataset(&self.root_uri, self.branch.as_deref()).await
+        open_manifest_dataset_with_session(
+            &self.root_uri,
+            self.branch.as_deref(),
+            &self.control_session,
+        )
+        .await
     }
 
     async fn load_publish_state(&self) -> Result<LoadedPublishState> {

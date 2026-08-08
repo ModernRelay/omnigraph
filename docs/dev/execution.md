@@ -44,13 +44,14 @@ sequenceDiagram
 
 **Code paths:**
 
-- Entry: `Omnigraph::query` at `crates/omnigraph/src/exec/query.rs:7`
-- Search-mode extraction: `extract_search_mode` at `crates/omnigraph/src/exec/query.rs:110`
-- Pipeline runner: `execute_query` at `crates/omnigraph/src/exec/query.rs:347`
-- RRF fan-out: `execute_rrf_query` at `crates/omnigraph/src/exec/query.rs:393`
-- Per-source-row BFS: `execute_expand` at `crates/omnigraph/src/exec/query.rs:675`
-- Lance scan + pushdown: `execute_node_scan` at `crates/omnigraph/src/exec/query.rs:1027`
-- Filter → SQL pushdown: `build_lance_filter` at `crates/omnigraph/src/exec/query.rs:1158`
+- Entry: `Omnigraph::query` at `crates/omnigraph/src/exec/query.rs:31`
+- Search-mode extraction: `extract_search_mode` at `crates/omnigraph/src/exec/query.rs:149`
+- Pipeline runner: `execute_query` at `crates/omnigraph/src/exec/query.rs:419`
+- RRF fan-out: `execute_rrf_query` at `crates/omnigraph/src/exec/query.rs:478`
+- Per-source-row BFS: `execute_expand` at `crates/omnigraph/src/exec/query.rs:1297`
+- Filter hoist pre-pass: `execute_pipeline` at `crates/omnigraph/src/exec/query.rs:749` — search filters and single-binding pushable scalar filters move onto the introducing `NodeScan` (arming `prefilter(true)` for any search on the same scanner) or into the introducing `Expand`'s `dst_filters`; multi-binding and non-pushable filters stay in-memory at their lowered position
+- Lance scan + pushdown: `execute_node_scan` at `crates/omnigraph/src/exec/query.rs:2328`
+- Filter → Expr pushdown: `build_lance_filter_expr` at `crates/omnigraph/src/exec/query.rs:2594`
 
 ### Multi-modal search modes (`SearchMode`)
 
@@ -65,6 +66,7 @@ Hybrid example: `order { rrf(nearest($d.embedding, $q), bm25($d.body, $q_text)) 
 ### Joins / set operations
 
 - Joins are implicit: MATCH bindings + traversals are implemented as scans + CSR/CSC lookups.
+- A traversal with an edge binding (`$p $w:knows $f`) bypasses both unbound expand modes: it always scans the edge dataset (`execute_expand_bound` — CSR holds topology only, not edge properties), emits one row per matching edge row, and never triggers the lazy `GraphIndex` build on its own. It preserves the incoming wide-row order (including ANN/BM25 rank) and carries the physical edge ID as a hidden ordering tie-break so parallel rows remain deterministic.
 - `not { … }` lowers to an `AntiJoin` over the inner pipeline.
 
 ### Scoped reads
@@ -187,7 +189,7 @@ sequenceDiagram
 - End-of-query Lance operations: `TableStore::stage_keyed_write`, `stage_overwrite`, `stage_delete`, and `commit_staged` at `crates/omnigraph/src/table_store.rs`. BranchMerge separately feeds actual new/changed chunks capped at 8,192 rows / 32 MiB through a pre-minted keyed chain of at most 1,024 logical data transactions per table; exact recovery scans at most 1,026 versions to reserve one index tail and one restore. When every link in a complete insertion-only source interval carries and structurally satisfies v1, its opaque `ProvenInsertChunk` route uses `stage_proven_strict_insert`: no target-ID preflight or target merge join. Public Lance `InsertBuilder` stages only fragment files; its uncommitted Append descriptor is replaced by another filtered, certified `Update`, so no Append is committed and a second branch generation remains provable. Source and existing-target native incarnations are revalidated under the final gates. A first-touch lazy target keeps the ref-only fork path; missing/unfamiliar history falls back to the ordered diff. Generic Append/merge-insert helpers are test-only.
 - Manifest commit primitive: `commit_updates_on_branch_with_expected` at `crates/omnigraph/src/db/omnigraph/table_ops.rs` (exact native-branch/head precondition plus expected table versions)
 
-Atomicity guarantee for multi-statement mutations: a mid-query failure leaves Lance HEAD untouched because no effect occurs during statement execution or staging. The RFC-023 adapter fixes the join key to physical `id`, forces the beta.21 v2 route, and verifies that the emitted transaction filter covers exactly that field. Mutation/Load keeps one keyed transaction per touched table and rejects accumulated strict-insert or upsert input above 8,192 rows or 32 MiB before sidecar arm with typed `ResourceLimitExceeded`. Update predicate results stream into the remaining table budget after pending-key shadowing; blob sizes are checked before payload reads. Strict insertion first probes the pinned target: an existing ID is typed `KeyConflict`. A retryable commit conflict may be treated as effect-free only when every participant still has no owned Lance effect; the intent is then finalized and a fresh manifest-visible probe must find one of the attempted IDs before strict insert returns terminal `KeyConflict`. Without that exact match, the broad substrate conflict becomes internal `ReadSetChanged` and the strict operation fully reprepares without changing mode, never reporting a false duplicate. Upsert likewise discards the entire attempt for bounded reprepare and revalidation. An unrelated pre-effect authority movement may also cause a retryable writer to reprepare—including load `Append`—but its semantics remain `StrictInsert`; a detected key conflict is never retried or changed to upsert. If any earlier participant advanced, or absence is ambiguous, the fixed sidecar remains and the result is `RecoveryRequired`. See [docs/dev/invariants.md](invariants.md) and [docs/dev/writes.md](writes.md).
+Atomicity guarantee for multi-statement mutations: a mid-query failure leaves Lance HEAD untouched because no effect occurs during statement execution or staging. The RFC-023 adapter fixes the join key to physical `id`, forces pinned Lance's v2 route, and verifies that the emitted transaction filter covers exactly that field. Mutation/Load keeps one keyed transaction per touched table and rejects accumulated strict-insert or upsert input above 8,192 rows or 32 MiB before sidecar arm with typed `ResourceLimitExceeded`. Update predicate results stream into the remaining table budget after pending-key shadowing; blob sizes are checked before payload reads. Strict insertion first probes the pinned target: an existing ID is typed `KeyConflict`. A retryable commit conflict may be treated as effect-free only when every participant still has no owned Lance effect; the intent is then finalized and a fresh manifest-visible probe must find one of the attempted IDs before strict insert returns terminal `KeyConflict`. Without that exact match, the broad substrate conflict becomes internal `ReadSetChanged` and the strict operation fully reprepares without changing mode, never reporting a false duplicate. Upsert likewise discards the entire attempt for bounded reprepare and revalidation. An unrelated pre-effect authority movement may also cause a retryable writer to reprepare—including load `Append`—but its semantics remain `StrictInsert`; a detected key conflict is never retried or changed to upsert. If any earlier participant advanced, or absence is ambiguous, the fixed sidecar remains and the result is `RecoveryRequired`. See [docs/dev/invariants.md](invariants.md) and [docs/dev/writes.md](writes.md).
 
 ## Bulk loader (`loader/mod.rs`)
 
@@ -225,17 +227,20 @@ same pre-arm resource error above 32 MiB without reading payload bytes.
 Overwrite does accept `WriteParams` and preserves the external reference.
 
 `Append` is a user-facing mode name, not the selected Lance operation. On the
-v6 format it means strict insert and routes through filtered merge-insert with
+current v6 format it follows the strict-insert contract and routes through
+filtered merge-insert with
 `WhenMatched::Fail`; bare Lance `Append` is unreachable from production graph
 writes. Use `Merge` when an existing `id` should be updated. This distinction is
 part of the public mutation contract, not an optimization choice.
 
-## `load` and the deprecated `ingest` shims
+## Load entry points and deprecated ingest compatibility
 
-- `load_as(branch, base, data, mode, actor)` — the unified entry (single publisher commit per call). `base: Some(b)` forks a missing `branch` from `b` first (via `branch_create_from_as`, which enforces `BranchCreate`); `base: None` requires the branch to exist — staging fails on an unknown branch, so a typo'd name can never create one.
-- `load(branch, data, mode)` — convenience wrapper with `base: None` and no actor.
-- Returns `LoadResult { branch, base_branch, branch_created, nodes_loaded, edges_loaded }`.
-- `ingest{,_as,_file,_file_as}` are `#[deprecated]` shims over `load_as` preserving the historical contract (`from: None` forks from `main`; returns `IngestResult`); they are slated for removal. The CLI `ingest` command is a deprecated alias of `load --from <base>`.
+- `load_graph_batch_as(branch, base, data, mode, actor)` is the canonical strict graph-batch boundary. Each nonblank line is exactly one logical node or edge envelope; recursive duplicate members, unknown or physical fields, compatibility coercions, and noncanonical supplied node IDs are rejected before effects. It still uses the ordinary Load transaction, validation, recovery, and single graph publication.
+- `load_graph_batch(branch, data, mode)` is its convenience wrapper with `base: None` and no actor.
+- `load_as(branch, base, data, mode, actor)` retains the loader-compatible parser for SDK and legacy-wire compatibility. It shares the same transaction machinery but is not the strict public graph-batch grammar.
+- `load(branch, data, mode)` is the loader-compatible convenience wrapper with `base: None` and no actor.
+- For either boundary, `base: Some(b)` forks a missing `branch` from `b` first (via `branch_create_from_as`, which enforces `BranchCreate`); `base: None` requires the branch to exist. The result is `LoadResult { branch, base_branch, branch_created, nodes_loaded, edges_loaded }`.
+- `ingest{,_as,_file,_file_as}` are `#[deprecated]` shims over loader-compatible `load_as`, preserving the historical contract (`from: None` forks from `main`; returns `IngestResult`). The CLI `ingest` command likewise retains that compatibility path; it is not an alias for strict CLI `load`.
 
 ## Embeddings during load
 

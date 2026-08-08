@@ -187,11 +187,13 @@ pub enum PolicyBranchScope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyActorSelector {
     pub group: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyAllowRule {
     pub actors: PolicyActorSelector,
     pub actions: Vec<PolicyAction>,
@@ -200,12 +202,14 @@ pub struct PolicyAllowRule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRule {
     pub id: String,
     pub allow: PolicyAllowRule,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     pub version: u32,
     #[serde(default)]
@@ -217,6 +221,7 @@ pub struct PolicyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyTestConfig {
     pub version: u32,
     #[serde(default)]
@@ -224,6 +229,7 @@ pub struct PolicyTestConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyTestCase {
     pub id: String,
     pub actor: String,
@@ -1044,7 +1050,6 @@ rules:
 
         let server_yaml = r#"
 version: 1
-kind: server
 groups:
   admins: ["act-a"]
 rules:
@@ -1057,6 +1062,37 @@ rules:
         // Kind misalignment stays loud through the from-source path.
         assert!(PolicyEngine::load_graph_from_source(server_yaml, "g1").is_err());
         assert!(PolicyEngine::load_server_from_source(yaml).is_err());
+
+        for (unknown_field, invalid_yaml) in [
+            (
+                "kind",
+                r#"
+version: 1
+kind: server
+rules: []
+"#,
+            ),
+            (
+                "branch_scpoe",
+                r#"
+version: 1
+groups:
+  readers: ["act-r"]
+rules:
+  - id: typo-must-not-widen-access
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scpoe: protected
+"#,
+            ),
+        ] {
+            let error = PolicyConfig::from_source(invalid_yaml).unwrap_err();
+            assert!(
+                error.to_string().contains(unknown_field),
+                "unexpected error for {unknown_field}: {error}"
+            );
+        }
     }
     use super::{
         PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine, PolicyExpectation, PolicyRequest,

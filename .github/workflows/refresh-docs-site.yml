@@ -1,0 +1,18 @@
+# When the user docs change on main, ping the omnigraph.dev Vercel deploy hook
+# so the site rebuilds and re-syncs the latest docs (see the site repo's
+# scripts/sync-docs.mjs). Also runnable manually.
+name: Refresh omnigraph.dev docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+  workflow_dispatch: {}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger omnigraph.dev redeploy
+        run: curl -fsS -X POST "${{ secrets.OMNIGRAPH_SITE_DEPLOY_HOOK }}"

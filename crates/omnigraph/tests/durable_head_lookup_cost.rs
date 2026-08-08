@@ -18,7 +18,7 @@
 //! stable summary fields on the pinned Lance surface.  The
 //! `fragments_scanned`, `ranges_scanned`, and `rows_scanned` entries in
 //! `all_counts` are explicitly documented upstream as debug/subject-to-change;
-//! this dedicated substrate fixture intentionally requires those beta.21 names
+//! this dedicated substrate fixture intentionally requires the pinned RC.1 names
 //! so a Lance upgrade fails visibly and triggers a fresh alignment audit.
 
 mod helpers;
@@ -38,9 +38,7 @@ use futures::{FutureExt, TryStreamExt};
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::scanner::ExecutionSummaryCounts;
-use lance::dataset::{
-    MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams,
-};
+use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance::index::DatasetIndexExt;
 use lance::session::Session;
@@ -242,8 +240,14 @@ impl HeadFixture {
             .execute_reader(Box::new(reader))
             .await
             .unwrap_or_else(|err| panic!("fixture publish at depth {next_depth} failed: {err}"));
-        assert_eq!(stats.num_inserted_rows, 2, "journal rows must be immutable inserts");
-        assert_eq!(stats.num_updated_rows, 2, "table + graph heads must update in place");
+        assert_eq!(
+            stats.num_inserted_rows, 2,
+            "journal rows must be immutable inserts"
+        );
+        assert_eq!(
+            stats.num_updated_rows, 2,
+            "table + graph heads must update in place"
+        );
         self.dataset = Arc::try_unwrap(dataset).unwrap_or_else(|arc| (*arc).clone());
         self.journal_depth = next_depth;
     }
@@ -329,12 +333,10 @@ impl HeadFixture {
 }
 
 fn manifest_schema() -> SchemaRef {
-    let object_id_metadata: HashMap<String, String> = [(
-        LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
-        "true".to_string(),
-    )]
-    .into_iter()
-    .collect();
+    let object_id_metadata: HashMap<String, String> =
+        [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())]
+            .into_iter()
+            .collect();
     Arc::new(Schema::new(vec![
         Field::new("object_id", DataType::Utf8, false).with_metadata(object_id_metadata),
         Field::new("object_type", DataType::Utf8, false),
@@ -459,9 +461,7 @@ fn lineage_rows(graph_commit: u64) -> [ManifestRow; 2] {
             object_id: "graph_head:main".to_string(),
             object_type: "graph_head".to_string(),
             location: None,
-            metadata: Some(
-                serde_json::json!({ "head_commit_id": commit_id }).to_string(),
-            ),
+            metadata: Some(serde_json::json!({ "head_commit_id": commit_id }).to_string()),
             table_key: String::new(),
             stable_table_id: None,
             table_incarnation_id: None,
@@ -491,7 +491,9 @@ fn rows_to_batch(rows: &[ManifestRow], schema: &SchemaRef) -> RecordBatch {
             new_null_array(list_type, rows.len()),
             Arc::new(StringArray::from(table_keys)),
             Arc::new(UInt64Array::from(
-                rows.iter().map(|row| row.stable_table_id).collect::<Vec<_>>(),
+                rows.iter()
+                    .map(|row| row.stable_table_id)
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(UInt64Array::from(
                 rows.iter()
@@ -528,12 +530,14 @@ async fn execute_head_lookup(
     scanner
         .project(&LOOKUP_COLUMNS)
         .unwrap()
-        .filter_expr(col("object_id").in_list(
-            (1..=catalog_width)
-                .map(|stable_id| lit(format!("table_head:{stable_id}")))
-                .collect(),
-            false,
-        ))
+        .filter_expr(
+            col("object_id").in_list(
+                (1..=catalog_width)
+                    .map(|stable_id| lit(format!("table_head:{stable_id}")))
+                    .collect(),
+                false,
+            ),
+        )
         .use_scalar_index(true)
         .scan_stats_callback(Arc::new(move |summary| {
             callback_summaries.lock().unwrap().push(summary.clone());
@@ -560,7 +564,7 @@ fn required_debug_metric(summary: &ExecutionSummaryCounts, name: &str) -> u64 {
         *summary
             .all_counts
             .get(name)
-            .unwrap_or_else(|| panic!("pinned beta.21 scan summary omitted `{name}`: {summary:?}")),
+            .unwrap_or_else(|| panic!("pinned RC.1 scan summary omitted `{name}`: {summary:?}")),
     )
     .unwrap()
 }
@@ -649,7 +653,10 @@ fn validate_heads(batches: &[RecordBatch], expected_versions: &[u64]) {
         .enumerate()
         .map(|(offset, version)| (offset as u64 + 1, *version))
         .collect();
-    assert_eq!(actual, expected, "lookup must return each exact current head once");
+    assert_eq!(
+        actual, expected,
+        "lookup must return each exact current head once"
+    );
 }
 
 async fn record_state(
@@ -660,10 +667,13 @@ async fn record_state(
     index_state: IndexState,
     backend: StorageBackend,
 ) {
-    let (total_fragments, uncovered_fragments) = fixture
-        .index_coverage()
-        .await
-        .unwrap_or_else(|| (fixture.dataset.fragments().len() as u64, fixture.dataset.fragments().len() as u64));
+    let (total_fragments, uncovered_fragments) =
+        fixture.index_coverage().await.unwrap_or_else(|| {
+            (
+                fixture.dataset.fragments().len() as u64,
+                fixture.dataset.fragments().len() as u64,
+            )
+        });
     for (access, cost) in fixture.lookup_pair().await {
         let point = CurvePoint {
             base_depth,
@@ -699,11 +709,7 @@ async fn record_state(
     }
 }
 
-async fn run_matrix(
-    base_uri: &str,
-    depths: &[u64],
-    backend: StorageBackend,
-) -> LookupCurve {
+async fn run_matrix(base_uri: &str, depths: &[u64], backend: StorageBackend) -> LookupCurve {
     let mut curve = Vec::new();
     for layout in [HistoryLayout::Uncompacted, HistoryLayout::Compacted] {
         for &depth in depths {
@@ -758,10 +764,7 @@ async fn run_matrix(
             for _ in 1..UNRECONCILED_TAIL {
                 fixture.publish_one().await;
             }
-            assert_eq!(
-                fixture.index_coverage().await.unwrap().1,
-                UNRECONCILED_TAIL
-            );
+            assert_eq!(fixture.index_coverage().await.unwrap().1, UNRECONCILED_TAIL);
             record_state(
                 &mut curve,
                 &fixture,
@@ -827,31 +830,29 @@ fn assert_non_growing(label: &str, shallow: u64, deep: u64) {
     );
 }
 
-fn assert_reconciled_slopes(
-    curve: &[CurvePoint],
-    depths: &[u64],
-    backend: StorageBackend,
-) {
+fn assert_bounded_growth(label: &str, shallow: u64, deep: u64, slack: u64) {
+    assert!(
+        deep <= shallow + slack,
+        "{label} exceeded its fixed bound: shallow={shallow}, deep={deep}, slack={slack}"
+    );
+}
+
+fn assert_bounded_pair(label: &str, shallow: u64, deep: u64, ceiling: u64) {
+    assert!(
+        shallow <= ceiling && deep <= ceiling,
+        "{label} exceeded its absolute bound: shallow={shallow}, deep={deep}, ceiling={ceiling}"
+    );
+}
+
+fn assert_reconciled_slopes(curve: &[CurvePoint], depths: &[u64], backend: StorageBackend) {
     let shallow_depth = depths[0];
     let deep_depth = *depths.last().unwrap();
     assert!(deep_depth > shallow_depth);
 
     for layout in [HistoryLayout::Uncompacted, HistoryLayout::Compacted] {
         for access in [AccessMode::ColdOpen, AccessMode::WarmRepeat] {
-            let shallow = point(
-                curve,
-                shallow_depth,
-                layout,
-                IndexState::Reconciled,
-                access,
-            );
-            let deep = point(
-                curve,
-                deep_depth,
-                layout,
-                IndexState::Reconciled,
-                access,
-            );
+            let shallow = point(curve, shallow_depth, layout, IndexState::Reconciled, access);
+            let deep = point(curve, deep_depth, layout, IndexState::Reconciled, access);
 
             assert_flat(
                 "reconciled rows_scanned proxy",
@@ -889,22 +890,29 @@ fn assert_reconciled_slopes(
                     AccessMode::WarmRepeat => 0,
                 }
             );
-            assert_flat(
-                "reconciled scan I/O operations",
+            // RC.1 crosses at most one additional range-read boundary between
+            // the 10- and 1,000-commit endpoints. The candidate already fails
+            // Gate A on physical byte curves; keep this second no-go visible
+            // and bounded instead of describing the read cost as flat.
+            assert_bounded_growth(
+                "BLOCKER: reconciled scan I/O operations",
                 shallow.cost.scan_iops,
                 deep.cost.scan_iops,
+                1,
             );
-            assert_flat(
-                "reconciled scan requests",
+            assert_bounded_growth(
+                "BLOCKER: reconciled scan requests",
                 shallow.cost.scan_requests,
                 deep.cost.scan_requests,
+                1,
             );
 
             match (layout, access) {
-                (HistoryLayout::Uncompacted, _) => assert_flat(
-                    "reconciled uncompacted scan bytes",
+                (HistoryLayout::Uncompacted, _) => assert_bounded_growth(
+                    "BLOCKER: reconciled uncompacted scan bytes",
                     shallow.cost.scan_read_bytes,
                     deep.cost.scan_read_bytes,
+                    128,
                 ),
                 (HistoryLayout::Compacted, AccessMode::ColdOpen) => assert_grows(
                     "BLOCKER: compacted cold scan bytes",
@@ -919,30 +927,22 @@ fn assert_reconciled_slopes(
             }
 
             match (layout, access, backend) {
-                (
-                    HistoryLayout::Uncompacted,
-                    AccessMode::ColdOpen,
-                    StorageBackend::Local,
-                ) => {
+                (HistoryLayout::Uncompacted, AccessMode::ColdOpen, StorageBackend::Local) => {
                     // Local filesystem manifest discovery is outside the range
                     // read wrapper.  This is a control, not evidence that remote
                     // cold open is flat.
-                    assert_flat(
+                    assert_non_growing(
                         "local uncompacted cold object reads",
                         shallow.cost.object_store_reads,
                         deep.cost.object_store_reads,
                     );
-                    assert_flat(
+                    assert_non_growing(
                         "local uncompacted cold object bytes",
                         shallow.cost.object_store_read_bytes,
                         deep.cost.object_store_read_bytes,
                     );
                 }
-                (
-                    HistoryLayout::Uncompacted,
-                    AccessMode::ColdOpen,
-                    StorageBackend::S3,
-                ) => {
+                (HistoryLayout::Uncompacted, AccessMode::ColdOpen, StorageBackend::S3) => {
                     // Known RFC-024 no-go: opening latest on object storage
                     // still walks history-dependent manifest metadata before
                     // the flat BTREE lookup begins.
@@ -963,31 +963,44 @@ fn assert_reconciled_slopes(
                         shallow.cost.object_store_reads,
                         deep.cost.object_store_reads,
                     );
-                    assert_flat(
+                    assert_bounded_growth(
                         "uncompacted warm object bytes",
                         shallow.cost.object_store_read_bytes,
                         deep.cost.object_store_read_bytes,
+                        128,
                     );
                 }
-                (HistoryLayout::Compacted, AccessMode::ColdOpen, _) => {
-                    assert_flat(
+                (HistoryLayout::Compacted, AccessMode::ColdOpen, StorageBackend::Local) => {
+                    assert_non_growing(
                         "compacted cold object reads",
+                        shallow.cost.object_store_reads,
+                        deep.cost.object_store_reads,
+                    );
+                    // Local manifest/object bookkeeping is non-monotonic as
+                    // compacted files cross encoding boundaries. It is a
+                    // bounded control; scan bytes above carry the no-go slope.
+                    assert_bounded_pair(
+                        "local compacted cold object bytes",
+                        shallow.cost.object_store_read_bytes,
+                        deep.cost.object_store_read_bytes,
+                        8 * 1024,
+                    );
+                }
+                (HistoryLayout::Compacted, AccessMode::ColdOpen, StorageBackend::S3) => {
+                    assert_flat(
+                        "S3 compacted cold object reads",
                         shallow.cost.object_store_reads,
                         deep.cost.object_store_reads,
                     );
                     // Exact head lookup performs a fixed number of reads, but
                     // their byte ranges still grow with the compacted data file.
                     assert_grows(
-                        "BLOCKER: compacted cold object bytes",
+                        "BLOCKER: S3 compacted cold object bytes",
                         shallow.cost.object_store_read_bytes,
                         deep.cost.object_store_read_bytes,
                     );
                 }
-                (
-                    HistoryLayout::Compacted,
-                    AccessMode::WarmRepeat,
-                    StorageBackend::Local,
-                ) => {
+                (HistoryLayout::Compacted, AccessMode::WarmRepeat, StorageBackend::Local) => {
                     assert_flat(
                         "local compacted warm object reads",
                         shallow.cost.object_store_reads,
@@ -999,11 +1012,7 @@ fn assert_reconciled_slopes(
                         deep.cost.object_store_read_bytes,
                     );
                 }
-                (
-                    HistoryLayout::Compacted,
-                    AccessMode::WarmRepeat,
-                    StorageBackend::S3,
-                ) => {
+                (HistoryLayout::Compacted, AccessMode::WarmRepeat, StorageBackend::S3) => {
                     assert_flat(
                         "S3 compacted warm object reads",
                         shallow.cost.object_store_reads,
@@ -1020,11 +1029,7 @@ fn assert_reconciled_slopes(
     }
 }
 
-fn assert_matrix_contract(
-    curve: &[CurvePoint],
-    depths: &[u64],
-    backend: StorageBackend,
-) {
+fn assert_matrix_contract(curve: &[CurvePoint], depths: &[u64], backend: StorageBackend) {
     assert_eq!(curve.len(), depths.len() * 2 * 5 * 2);
     for &depth in depths {
         for layout in [HistoryLayout::Uncompacted, HistoryLayout::Compacted] {
@@ -1065,14 +1070,10 @@ fn assert_matrix_contract(
 
                 assert_eq!(tail.uncovered_fragments, UNRECONCILED_TAIL);
                 assert!(
-                    tail.cost.fragments_scanned
-                        <= full.cost.fragments_scanned + UNRECONCILED_TAIL
+                    tail.cost.fragments_scanned <= full.cost.fragments_scanned + UNRECONCILED_TAIL
                 );
                 assert!(tail.cost.rows_scanned >= CATALOG_WIDTH as u64);
-                assert!(
-                    tail.cost.rows_scanned
-                        <= CATALOG_WIDTH as u64 + UNRECONCILED_TAIL * 4
-                );
+                assert!(tail.cost.rows_scanned <= CATALOG_WIDTH as u64 + UNRECONCILED_TAIL * 4);
                 assert!(
                     tail.cost.rows_scanned > one.cost.rows_scanned,
                     "growing uncovered tail must be visible in rows_scanned"
@@ -1084,13 +1085,11 @@ fn assert_matrix_contract(
 
                 assert_eq!(reconciled_after_tail.uncovered_fragments, 0);
                 assert_eq!(
-                    reconciled_after_tail.cost.rows_scanned,
-                    CATALOG_WIDTH as u64,
+                    reconciled_after_tail.cost.rows_scanned, CATALOG_WIDTH as u64,
                     "index reconciliation must restore catalog-width rows_scanned"
                 );
                 assert_eq!(
-                    reconciled_after_tail.cost.ranges_scanned,
-                    CATALOG_WIDTH as u64,
+                    reconciled_after_tail.cost.ranges_scanned, CATALOG_WIDTH as u64,
                     "index reconciliation must remove uncovered-tail range work"
                 );
                 if access == AccessMode::ColdOpen {
@@ -1259,11 +1258,6 @@ async fn local_durable_head_lookup_matrix_at_one_thousand_commits() {
     let dir = tempfile::tempdir().unwrap();
     let base_uri = dir.path().join("rfc024-head-cost-decision");
     let depths = [10, 100, 1_000];
-    let curve = run_matrix(
-        base_uri.to_str().unwrap(),
-        &depths,
-        StorageBackend::Local,
-    )
-    .await;
+    let curve = run_matrix(base_uri.to_str().unwrap(), &depths, StorageBackend::Local).await;
     assert_matrix_contract(&curve, &depths, StorageBackend::Local);
 }

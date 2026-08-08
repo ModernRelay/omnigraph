@@ -17,9 +17,9 @@ message that **names the release line that wrote it** and the exact commands —
 so you can fetch the right old binary without guessing:
 
 ```
-__manifest is stamped at internal schema v5, but this omnigraph reads only v6.
-This graph was created by omnigraph 0.9.x. Rebuild it: with an omnigraph
-0.9.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
+__manifest is stamped at internal schema v4, but this omnigraph reads only v6.
+This graph was created by omnigraph 0.8.x. Rebuild it: with an omnigraph
+0.8.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
 binary run `omnigraph init --schema <schema.pg> <new-graph>` and `omnigraph load
 --mode overwrite --data graph.jsonl <new-graph>`. (Data, vectors, and blobs are
 preserved; commit history and branches are not.) See docs/user/operations/upgrade.md.
@@ -36,8 +36,12 @@ from that line (the latest is safest):
 | internal schema v2 | omnigraph 0.4.1–0.6.1 | the latest 0.6.x (e.g. 0.6.1) |
 | internal schema v3 | omnigraph 0.6.2–0.7.2 | the latest 0.7.x (e.g. 0.7.2) |
 | internal schema v4 | omnigraph 0.8.x | the latest 0.8.x (e.g. 0.8.1) |
-| internal schema v5 | omnigraph 0.9.x | the latest 0.9.x |
-| internal schema v6 | omnigraph 0.10.x | — current format; no rebuild needed |
+| internal schema v5 | unreleased development builds | the exact source build that wrote the graph |
+| internal schema v6 | omnigraph 0.9.x | — current format; no rebuild needed |
+
+Internal schemas v7-v19 were unreleased development formats from the rejected
+MemWAL experiment. They are not an upgrade ladder and the current binary does
+not reinterpret them; see the [decision record](../../dev/wal-removal.md).
 
 You can also check versions before you hit a refusal:
 
@@ -183,7 +187,7 @@ The two CLI checks are listed in
 `omnigraph snapshot`). New in v0.8.0, the server's `GET /healthz` response also
 reports `internal_schema_version`.
 
-## Migrating to internal schema v5
+## Unreleased internal schema v5
 
 Internal schema v5 activates RFC-028 stable schema identity. Accepted type and
 property IDs are allocated inside one graph identity domain and survive
@@ -192,13 +196,15 @@ logical lifetime. The `__manifest` journal keys table registrations, versions,
 and tombstones by stable table ID plus incarnation, and initial table paths are
 derived from that pair rather than a mutable type name.
 
-This is why a v4 graph must be rebuilt instead of opened in place: v4 has only
+V5 was never released. It is documented here only so a maintainer can recognize
+an old development root. This is why a v4 graph must be rebuilt instead of
+opened in place: v4 has only
 name-derived SchemaIR IDs and name-keyed manifest history, so there is no safe,
 unambiguous identity to backfill after renames or drop/recreate events. Export
-with the latest v0.8.x binary, initialize a different root with the v5 binary,
-load the export, verify it, and then cut clients over. The new root deliberately
-mints a new identity domain; identity continuity across export/import is not
-claimed.
+with the latest v0.8.x binary, initialize a different root with the current v6
+binary, load the export, verify it, and then cut clients over. The new root
+deliberately mints a new identity domain; identity continuity across
+export/import is not claimed.
 
 Tooling that reads `__manifest` directly must treat `stable_table_id` and
 `table_incarnation_id` as the table coordinate. `table_key` remains the current
@@ -231,13 +237,14 @@ payload bytes after enforcing a 32 MiB aggregate pre-read ceiling. `overwrite`
 retains Lance's external-reference behavior. This is intentional: Lance's
 merge-insert builder has no `WriteParams` hook, while Overwrite does.
 
-This format cannot be obtained by adding metadata to a live v5 root. Lance's
-filtered/unfiltered conflict behavior is directional, so every table image and
-every writer must cross the boundary together. Quiesce writers, export with the
-latest 0.9.x binary, initialize a **different** root with the 0.10.x binary,
-load the export, verify the v6 stamp and data, then cut the whole fleet over.
-The 0.10.x binary refuses the v5 source root, and the 0.9.x binary refuses the
-new v6 root.
+This format cannot be obtained by adding metadata to a live v4 or development
+v5 root. Lance's filtered/unfiltered conflict behavior is directional, so every
+table image and every writer must cross the boundary together. For a released
+v4 graph, quiesce writers, export with the latest 0.8.x binary, initialize a
+**different** root with the current 0.9.x binary, load the export, verify the v6
+stamp and data, then cut the whole fleet over. A development v5 root must be
+exported with the exact source build that wrote it. The current binary refuses
+both older roots, and the old binary must never write the new v6 root.
 
 The v6 load checks the export for duplicate logical IDs before any table effect.
 Older bare-Append workloads could contain a committed collision; do not resolve

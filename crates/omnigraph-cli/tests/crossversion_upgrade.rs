@@ -39,7 +39,6 @@ fn old_bin() -> Option<PathBuf> {
     );
     Some(path)
 }
-
 fn previous_bin() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var_os("OMNIGRAPH_PREVIOUS_BIN")?);
     assert!(
@@ -474,8 +473,8 @@ fn current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6() {
     let refusal = output_failure(cli().arg("snapshot").arg(&v5_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(
-        stderr.contains("0.9.x"),
-        "v5 refusal must name the release line that wrote internal schema v5, got: {stderr}",
+        stderr.contains("unreleased final-v5") && stderr.contains("46b6d908"),
+        "v5 refusal must name the exact development source that wrote internal schema v5, got: {stderr}",
     );
     assert!(
         stderr.contains("export"),

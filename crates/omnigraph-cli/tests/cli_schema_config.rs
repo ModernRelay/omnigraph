@@ -11,7 +11,6 @@ mod support;
 
 use support::*;
 
-
 #[test]
 fn version_command_prints_current_cli_version() {
     let output = output_success(cli().arg("version"));
@@ -551,9 +550,73 @@ fn graphs_subcommand_help_lists_list_only() {
 }
 
 #[test]
-fn graphs_list_against_local_uri_errors_with_remote_only_message() {
-    // RFC-011: `graphs list` is served-only; a `--store` (local) address has no
-    // enumeration endpoint, so it fails loudly pointing at a server / cluster.
+fn init_with_store_flag_errors_instead_of_ignoring_it() {
+    // `init` takes its target as a required positional URI and never reads
+    // `--store`; passing both must be a loud guard error, not a silently
+    // ignored second address (PR #377 review follow-up).
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    let schema = fixture("test.pg");
+    let output = output_failure(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg("--store")
+            .arg("file:///elsewhere/graph.omni")
+            .arg(&graph),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("`init` is a direct (storage-native) command")
+            && stderr.contains("--store")
+            && stderr.contains("does not apply"),
+        "expected the addressing-guard store rejection on init; got:\n{stderr}"
+    );
+    assert!(
+        !graph.exists(),
+        "init must not run when the addressing is rejected"
+    );
+}
+
+#[test]
+fn init_with_profile_flag_errors_instead_of_ignoring_it() {
+    // `init` never resolves a scope, so an explicit `--profile` (which may
+    // carry a store binding) would be silently discarded — the same
+    // two-address ambiguity as `init --store` (PR #377 review follow-up).
+    // The ambient $OMNIGRAPH_PROFILE default remains ignored, matching the
+    // explicit-flag-vs-config-default rule on the registry path.
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    let schema = fixture("test.pg");
+    let output = output_failure(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg("--profile")
+            .arg("localdev")
+            .arg(&graph),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("`init` is a direct (storage-native) command")
+            && stderr.contains("--profile")
+            && stderr.contains("does not apply"),
+        "expected the addressing-guard profile rejection on init; got:\n{stderr}"
+    );
+    assert!(
+        !graph.exists(),
+        "init must not run when the addressing is rejected"
+    );
+}
+
+#[test]
+fn graphs_list_rejects_store_scope() {
+    // `graphs list` is a served-registry command: it enumerates a server's
+    // graphs, so a `--store` (local) address can never apply. The addressing
+    // guard rejects it up front instead of failing late in the client with an
+    // engine-limitation message.
     let output = output_failure(
         cli()
             .arg("graphs")
@@ -563,7 +626,127 @@ fn graphs_list_against_local_uri_errors_with_remote_only_message() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
-        stderr.contains("remote multi-graph server"),
-        "expected a remote-server rejection in stderr; got:\n{stderr}"
+        stderr.contains("`graphs list` is a served command")
+            && stderr
+                .contains("--store addresses a single graph's storage directly and does not apply")
+            && stderr.contains("Address the server with --server <name|url> or --profile <name>."),
+        "expected the addressing-guard store rejection in stderr; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn graphs_list_rejects_graph_selector() {
+    // `graphs list` IS the enumeration — selecting a graph is meaningless, and
+    // historically `--graph` corrupted the URL to `/graphs/<id>/graphs` (404).
+    // The guard rejects it before any network I/O.
+    let output = output_failure(
+        cli()
+            .arg("graphs")
+            .arg("list")
+            .arg("--server")
+            .arg("http://127.0.0.1:9")
+            .arg("--graph")
+            .arg("atlas"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("`graphs list` is a served command")
+            && stderr.contains(
+                "--graph selects a graph within a server or cluster scope and does not apply"
+            )
+            && stderr.contains("Address the server with --server <name|url> or --profile <name>."),
+        "expected the addressing-guard graph rejection in stderr; got:\n{stderr}"
+    );
+}
+
+/// Operator home for the graphs-list registry-resolution tests: a store-bound
+/// and a cluster-bound profile, neither of which can carry a served-registry
+/// command.
+fn registry_profile_home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.yaml"),
+        "servers:\n  prod:\n    url: https://graph.example.com\n\
+         clusters:\n  brain:\n    root: s3://acme/clusters/brain\n\
+         profiles:\n\
+         \x20 localdev:\n    store: file:///data/dev.omni\n\
+         \x20 brain-admin:\n    cluster: brain\n",
+    )
+    .unwrap();
+    home
+}
+
+#[test]
+fn graphs_list_without_scope_needs_server() {
+    // No addressing and no operator defaults: the served-registry resolver
+    // asks for a server scope — not the graph-shaped "no graph addressed"
+    // advice, which points at flags graphs list cannot consume.
+    let output = output_failure(cli().arg("graphs").arg("list"));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("`graphs list` needs a server scope")
+            && stderr.contains("--server <name|url> or --profile <name>"),
+        "expected the needs-a-server-scope error in stderr; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn graphs_list_rejects_store_bound_profile() {
+    // A store-bound profile resolves a single graph's storage; the registry
+    // is server-scoped, so resolution fails with scope-shaped advice instead
+    // of the late embedded-arm engine-limitation message.
+    let home = registry_profile_home();
+    let output = output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("graphs")
+            .arg("list")
+            .arg("--profile")
+            .arg("localdev"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("requires a server")
+            && stderr.contains("profile 'localdev' resolves a store scope"),
+        "expected the served store-scope rejection in stderr; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn graphs_list_rejects_cluster_bound_profile() {
+    // A cluster-bound profile is control-plane addressing; the rejection
+    // points at `cluster status` for cluster-graph enumeration instead of the
+    // misleading graph-data-command error.
+    let home = registry_profile_home();
+    let output = output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("graphs")
+            .arg("list")
+            .arg("--profile")
+            .arg("brain-admin"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("requires a server")
+            && stderr.contains("profile 'brain-admin' resolves a cluster scope")
+            && stderr.contains("cluster status"),
+        "expected the served cluster-scope rejection in stderr; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn graphs_list_rejects_as_actor() {
+    // The registry read carries no actor; `--as` is for direct-engine and
+    // actor-bound cluster operations. Rejected loudly instead of silently
+    // ignored.
+    let output = output_failure(cli().arg("graphs").arg("list").arg("--as").arg("act-op"));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("`graphs list` is a served command")
+            && stderr.contains(
+                "--as sets the actor for a direct-engine or actor-bound cluster operation and does not apply"
+            ),
+        "expected the addressing-guard --as rejection in stderr; got:\n{stderr}"
     );
 }

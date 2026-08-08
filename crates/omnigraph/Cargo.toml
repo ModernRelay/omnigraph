@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-engine"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
 description = "Runtime engine for the Omnigraph graph database."
 license = "MIT"
@@ -16,8 +16,9 @@ default = []
 failpoints = ["dep:fail", "fail/failpoints"]
 
 [dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.8.1" }
-omnigraph-policy = { path = "../omnigraph-policy", version = "0.8.1" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.9.0" }
+omnigraph-policy = { path = "../omnigraph-policy", version = "0.9.0" }
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.9.0" }
 lance = { workspace = true }
 lance-core = { workspace = true }
 lance-select = { workspace = true }
@@ -35,7 +36,7 @@ arrow-select = { workspace = true }
 arrow-cast = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 reqwest = { workspace = true }
 object_store = { workspace = true }
 ulid = { workspace = true }
@@ -54,16 +55,16 @@ chrono = { workspace = true }
 arc-swap = { workspace = true }
 
 [dev-dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.8.1" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.9.0" }
 tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
 # test-util gates IoStats.requests + assert_io_eq! (failure diagnostics only); dev-dep,
 # so production builds (which exclude dev-deps) never see it.
-lance-io = { git = "https://github.com/lance-format/lance", rev = "1aec14652dcbace23ac277fa8ced35000bea0c40", features = ["test-util"] }
+lance-io = { version = "9.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
 syn = { version = "2", features = ["full", "visit"] }
-# benches/scenarios.rs only: wait4/rusage peak-RSS + setrlimit memory caps.
+# benches/scenarios.rs: wait4/rusage peak-RSS and benchmark memory caps.
 libc = "0.2"
 
 [[bench]]

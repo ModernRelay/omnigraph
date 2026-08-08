@@ -18,42 +18,28 @@ pub(crate) struct LoadOutput {
     pub(crate) edge_types_loaded: usize,
 }
 
-pub(crate) fn load_output_from_tables(
+pub(crate) fn load_output_from_graph_batch(
     uri: &str,
-    branch: &str,
     mode: &'static str,
-    output: &IngestOutput,
+    output: &GraphBatchLoadOutput,
 ) -> LoadOutput {
-    let mut nodes_loaded = 0;
-    let mut edges_loaded = 0;
-    let mut node_types_loaded = 0;
-    let mut edge_types_loaded = 0;
-    for table in &output.tables {
-        if table.table_key.starts_with("node:") {
-            nodes_loaded += table.rows_loaded;
-            node_types_loaded += 1;
-        } else if table.table_key.starts_with("edge:") {
-            edges_loaded += table.rows_loaded;
-            edge_types_loaded += 1;
-        }
-    }
     LoadOutput {
         uri: uri.to_string(),
-        branch: branch.to_string(),
+        branch: output.branch.clone(),
         mode,
         base_branch: output.base_branch.clone(),
         branch_created: output.branch_created,
-        nodes_loaded,
-        edges_loaded,
-        node_types_loaded,
-        edge_types_loaded,
+        nodes_loaded: output.nodes.iter().map(|entry| entry.rows_loaded).sum(),
+        edges_loaded: output.edges.iter().map(|entry| entry.rows_loaded).sum(),
+        node_types_loaded: output.nodes.len(),
+        edge_types_loaded: output.edges.len(),
     }
 }
 
-/// The local arm's twin of `load_output_from_tables`: build the same
-/// `LoadOutput` from the engine `LoadResult` directly (the remote arm only
-/// has the wire `IngestOutput`'s table list; the local arm has the full
-/// result). Both load mappings live here, next to the struct — RFC-009
+/// The local arm's twin of `load_output_from_graph_batch`: build the same
+/// `LoadOutput` from the engine `LoadResult` directly (the remote arm has the
+/// logical graph-batch DTO; the local arm has the full result). Both load
+/// mappings live here, next to the struct — RFC-009
 /// Phase 2's "one place" for the `-> LoadOutput` mapping that used to fork
 /// between this file and main.rs's inline construction.
 pub(crate) fn load_output_from_result(
@@ -187,7 +173,11 @@ pub(crate) fn print_cluster_plan_human(output: &PlanOutput) {
             output.approvals_required.len()
         );
         for change in &output.changes {
-            let bindings = if change.binding_change { " [bindings]" } else { "" };
+            let bindings = if change.binding_change {
+                " [bindings]"
+            } else {
+                ""
+            };
             println!("  {:?} {}{bindings}", change.operation, change.resource);
             if let Some(migration) = &change.migration {
                 if !migration.supported {
@@ -228,14 +218,20 @@ pub(crate) fn print_cluster_apply_human(output: &ApplyOutput) {
             "  state: revision {}, converged: {}, written: {}",
             state.state_revision, output.converged, output.state_written
         );
-        println!("  note: cluster-booted servers (--cluster) serve this on their next restart; omnigraph.yaml deployments are unaffected");
+        println!(
+            "  note: cluster-booted servers (--cluster) serve this on their next restart; omnigraph.yaml deployments are unaffected"
+        );
     }
     print_cluster_diagnostics(&output.diagnostics);
 }
 
 pub(crate) fn print_cluster_apply_changes(changes: &[omnigraph_cluster::PlanChange]) {
     for change in changes {
-        let bindings = if change.binding_change { " [bindings]" } else { "" };
+        let bindings = if change.binding_change {
+            " [bindings]"
+        } else {
+            ""
+        };
         match (&change.disposition, change.reason.as_deref()) {
             (Some(disposition), Some(reason)) => println!(
                 "  {:?} {}{bindings} [{disposition:?}: {reason}]",
@@ -686,7 +682,9 @@ pub(crate) fn render_prop_type(prop_type: &omnigraph_compiler::PropType) -> Stri
     }
 }
 
-pub(crate) fn render_constraint(constraint: &omnigraph_compiler::schema::ast::Constraint) -> String {
+pub(crate) fn render_constraint(
+    constraint: &omnigraph_compiler::schema::ast::Constraint,
+) -> String {
     match constraint {
         omnigraph_compiler::schema::ast::Constraint::Key(columns) => {
             format!("@key({})", columns.join(", "))
@@ -706,7 +704,9 @@ pub(crate) fn render_constraint(constraint: &omnigraph_compiler::schema::ast::Co
     }
 }
 
-pub(crate) fn render_annotations(annotations: &[omnigraph_compiler::schema::ast::Annotation]) -> String {
+pub(crate) fn render_annotations(
+    annotations: &[omnigraph_compiler::schema::ast::Annotation],
+) -> String {
     annotations
         .iter()
         .map(|annotation| {
@@ -765,10 +765,7 @@ pub(crate) fn print_snapshot_human(
     }
 }
 
-pub(crate) fn print_read_output(
-    output: &ReadOutput,
-    format: ReadOutputFormat,
-) -> Result<()> {
+pub(crate) fn print_read_output(output: &ReadOutput, format: ReadOutputFormat) -> Result<()> {
     println!(
         "{}",
         render_read(output, format, &resolve_table_render_options())?
@@ -822,7 +819,11 @@ pub(crate) fn print_commit_human(commit: &CommitOutput) {
     println!("created_at: {}", commit.created_at);
 }
 
-pub(crate) fn print_policy_explain(decision: &PolicyDecision, actor_id: &str, request: &PolicyRequest) {
+pub(crate) fn print_policy_explain(
+    decision: &PolicyDecision,
+    actor_id: &str,
+    request: &PolicyRequest,
+) {
     println!(
         "decision: {}",
         if decision.allowed { "allow" } else { "deny" }

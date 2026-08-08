@@ -10,13 +10,31 @@ owner: OmniGraph maintainers
 
 # RFC-024: Durable table heads
 
+> **Current disposition (2026-08-06):** this proposal remains research-blocked
+> and no durable-head format ships. RFC-026 was rejected and its unreleased
+> internal formats v7-v19 were abandoned; the current binary serves manifest
+> v6 and still resolves current table state by folding the identity-bearing
+> manifest journal.
+
 **Status:** Research blocked — Gate A physical lookup rejected
 **Date:** 2026-07-10
 **Author track:** Maintainer design series
-**Surveyed:** omnigraph 0.8.1 (`main`); Lance 9.0.0-beta.21 at git rev
-`1aec14652dcbace23ac277fa8ced35000bea0c40`; full Lance table layout,
+**Surveyed:** omnigraph 0.8.1 (`main`); Lance 9.0.0-rc.1 at git rev
+`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance table layout,
 transaction, branching, indexing, compaction, cleanup, and object-store
 specifications
+**RC.1 evidence status (2026-07-17):** the public current-HEAD-witness and BTREE
+surfaces remain aligned. The local 10/100/1,000 decision instrument was rerun:
+exact indexed rows, ranges, result fragments, and pages remain flat; RC.1 adds
+one bounded range-read operation and at most 128 scan bytes at the deepest
+uncompacted endpoint, while compacted cold scan bytes still grow. The
+representative RustFS table in §7.4 remains explicitly historical beta.21
+evidence; its bucket-gated RC.1 cell was not available for this audit. The
+candidate remains rejected for the same physical-cost reason.
+**Historical development consequence (2026-07-19):** RFC-026 Phase A activated
+internal schema v7 and private Phase B1 subsequently activated v8; neither added
+table-head rows or lookup. The candidate remains rejected and v8 still resolves
+current table state by folding the identity-bearing manifest journal.
 **Relationship to RFC-022:** this RFC is the durable-heads decision split from
 the earlier monolithic RFC-022 draft. [RFC-022](0022-unified-write-path.md)
 defines the shared publisher/recovery protocol; this RFC owns the heads-format
@@ -60,8 +78,8 @@ The first Gate A instrument rejected the proposed in-manifest BTREE shape on
 2026-07-15. Exact indexed scan work is flat at fixed catalog width, but the
 complete required cost is not: latest-manifest discovery on uncompacted
 RustFS grows in object reads and bytes, and compacted reads still grow in bytes.
-No heads-format production code ships from this RFC; internal schema v6 and its
-journal-fold current-state path remain authoritative while research looks for a
+No heads-format production code ships from this RFC; current internal schema v6
+preserves the journal-fold current-state path while research looks for a
 different substrate/access shape.
 
 Normative decisions:
@@ -156,28 +174,39 @@ TableHeadMetadata {
     state: "live" | "tombstoned",
     stable_table_id: u64,
     incarnation_id: u64,
-    physical_ref_incarnation: String,
+    current_head_witness: CurrentHeadWitness,
     schema_ir_hash: String,
     head_graph_commit_id: Option<ULID>,
 }
+
+CurrentHeadWitness {
+    branch_identifier: BranchIdentifier,
+    table_version: u64,
+    transaction_uuid: UUID,
+    manifest_e_tag: String,
+}
 ```
 
-`physical_ref_incarnation` is the opaque encoding of one public Lance composite:
+`current_head_witness` is the encoding of one public Lance composite:
 
 ```text
-(BranchIdentifier, current Transaction.uuid, ManifestLocation.e_tag)
+(BranchIdentifier, current table version, current Transaction.uuid,
+ ManifestLocation.e_tag)
 ```
 
 Capture reads `BranchIdentifier` before and after the current transaction and
 manifest-location evidence and rejects movement during capture. A missing
 current transaction, an empty transaction UUID, or a missing backend-required
-e_tag fails closed. On beta.21, local `current_manifest_path` synthesizes the
+e_tag fails closed. On pinned Lance, local `current_manifest_path` synthesizes the
 e_tag from inode, mtime, and size; S3/RustFS returns the object e_tag. Main's
 `BranchIdentifier` is canonically empty, so its transaction UUID and e_tag are
 load-bearing; a named-ref recreation additionally changes `BranchIdentifier`.
-Logical `incarnation_id` cannot substitute for this composite because a
-physical owner or ref may be replaced while logical table identity is
-preserved.
+This is deliberately a **mutable current-HEAD witness**, not a stable physical
+or enrollment incarnation. An ordinary successful table commit changes the
+version, transaction UUID, and manifest e_tag, so the publisher must replace
+the witness with the exact achieved value in the same head-row update. Logical
+`incarnation_id` cannot substitute for the witness because a physical owner or
+ref may be replaced while logical table identity is preserved.
 
 The public-surface guards prove stable unchanged reopens and same-version
 delete/recreate detection for main and named refs on local FS and S3/RustFS,
@@ -223,8 +252,8 @@ transition then follows that accepted schema outcome; RFC-024 never invents it.
 
 The mutable head is not the only place that records identity. Every heads-format
 table-version, registration, rename, and tombstone journal event carries
-`stable_table_id`, `incarnation_id`, and the exact physical location/ref token
-for its table version; otherwise drop/recreate followed by a new physical
+`stable_table_id`, `incarnation_id`, and the exact `current_head_witness` for
+its table version; otherwise drop/recreate followed by a new physical
 dataset whose Lance versions restart cannot be replayed unambiguously or repair
 the full head token.
 
@@ -273,7 +302,7 @@ complete expected token:
 
 ```text
 (state, stable_table_id, incarnation_id, location, table_branch,
- physical_ref_incarnation, table_version, schema_ir_hash)
+ current_head_witness, table_version, schema_ir_hash)
 ```
 
 Any difference returns control to full RFC-022 revalidation before effects; a
@@ -303,7 +332,7 @@ A heads-format current-state read:
 4. includes only rows whose authoritative state is `live`;
 5. validates schema identity from the head payload;
 6. opens the exact pinned physical table/ref and validates
-   `physical_ref_incarnation` before exposing it;
+   `current_head_witness` before exposing it;
 7. returns one immutable `Snapshot` used for the operation's lifetime.
 
 Missing, duplicate, unknown-state, or schema-mismatched **live** heads fail
@@ -341,7 +370,7 @@ positive slope in:
 - manifest object-store reads;
 - bytes read;
 - fragments/pages scanned; and
-- beta.21 `rows_scanned` proxy
+- the pinned Lance `rows_scanned` debug proxy, re-audited on every bump
 
 as commit history grows.
 
@@ -387,7 +416,7 @@ eight-fragment uncovered tail, and reconciliation after that tail. Each state
 is measured as a cold tracked open and a warm repeat over the same `Dataset` and
 shared `Session`, on local FS and bucket-gated S3/RustFS.
 
-Representative reconciled RustFS curves from 20 to 80 publishes were:
+Historical beta.21 reconciled RustFS curves from 20 to 80 publishes were:
 
 | Shape | 20 publishes | 80 publishes | Disposition |
 |---|---:|---:|---|
@@ -540,8 +569,10 @@ No migration claimant, per-branch conversion ledger, old-format writer mode, or
   dataset restarts Lance version numbering;
 - rename preserves identity/incarnation and changes the public key only;
 - owner-branch handoff at an equal table version updates the head;
+- every ordinary table commit advances `current_head_witness` together with
+  `table_version` in the same manifest publish;
 - delete/recreate of a dataset or native ref at the same path, branch, and
-  numeric version changes `physical_ref_incarnation` and rejects a stale
+  numeric version changes `current_head_witness` and rejects a stale
   writer, on local FS and S3/RustFS; public token detection is proven, while
   publisher-level stale-writer rejection remains unimplemented;
 - a current read refuses that same replacement until an authoritative publish
@@ -560,7 +591,7 @@ No migration claimant, per-branch conversion ledger, old-format writer mode, or
 - rollback and roll-forward assertions include head payloads, not only table
   versions;
 - publisher retry compares the complete expected token and never reparents a
-  prepared effect across a physical-ref incarnation change;
+  prepared effect across a current-HEAD-witness change;
 - a stale sidecar converges exactly once with one audit record.
 
 ### 12.3 Format and rebuild
@@ -612,7 +643,7 @@ coverage and does run against RustFS in CI.
 
 - exact heads-format metadata schema and object IDs;
 - one head row per stable identity;
-- RFC-028 stable-ID/incarnation types plus `physical_ref_incarnation` in head
+- RFC-028 stable-ID/incarnation types plus `current_head_witness` in head
   and identity-bearing journal event schemas;
 - RFC-023 PK metadata on node and edge tables when the release combines them;
 - heads-format publisher source always pairs a journal/tombstone event with a head row.
@@ -632,8 +663,8 @@ coverage and does run against RustFS in CI.
 - Checkpoint retention is deferred.
 - The first in-manifest BTREE candidate is rejected: flat indexed scan work is
   insufficient while latest-manifest/object byte work grows with history.
-- Production remains on internal schema v6; no heads-format number or partial
-  implementation is assigned.
+- The current development format remains on internal schema v6 without table heads; no
+  heads-format number or partial implementation is assigned.
 
 ### Gate status
 

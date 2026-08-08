@@ -1,22 +1,23 @@
 //! The cluster's storage layer: every stored byte (state ledger, lock,
 //! recovery sidecars, approval artifacts, catalog payloads) goes through the
-//! engine's `StorageAdapter`, so `file://` and `s3://` are one code path
+//! shared `StorageAdapter`, so `file://` and `s3://` are one code path
 //! (RFC-006). Declared configuration — `cluster.yaml` and the schema/query/
 //! policy sources it references — deliberately does NOT live here: config is
 //! read from the operator's working tree (Terraform's config-local /
 //! state-remote split).
 //!
-//! Raw `fs::*` for cluster state outside this module is a deny-list entry.
+//! Raw `fs::*` for cluster state outside this module and the exact lock-release
+//! guard in `state_lock` is a deny-list entry.
 
 use std::path::Path;
-use std::process;
 use std::sync::Arc;
 
-use omnigraph::storage::{StorageAdapter, StorageKind, storage_for_uri, storage_kind_for_uri};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
-use ulid::Ulid;
+use omnigraph_storage::{
+    StorageAdapter, StorageHandle, StorageKind, storage_for_uri, storage_handle_for_uri,
+    storage_kind_for_uri,
+};
 
+use crate::state_lock::{StateLockAcquire, StateLockError, StateLockGuard, acquire_state_lock};
 use crate::{
     ApprovalArtifact, CLUSTER_APPROVALS_DIR, CLUSTER_LOCK_FILE, CLUSTER_RECOVERIES_DIR,
     CLUSTER_RESOURCES_DIR, CLUSTER_STATE_FILE, ClusterState, Diagnostic, RecoverySidecar,
@@ -26,6 +27,9 @@ use crate::{
 #[derive(Debug, Clone)]
 pub(crate) struct ClusterStore {
     adapter: Arc<dyn StorageAdapter>,
+    /// Concrete backend evidence used by lock/authority factories. Unlike the
+    /// public adapter trait, callers cannot implement this handle.
+    storage: StorageHandle,
     /// Normalized storage-root URI, no trailing slash: `file:///abs/dir`
     /// (the default config-dir layout) or `s3://bucket/prefix`.
     root: String,
@@ -42,68 +46,20 @@ pub(crate) struct StateSnapshot {
     pub(crate) state_cas: Option<String>,
 }
 
-#[derive(Debug)]
-pub(crate) struct StateLockGuard {
-    adapter: Arc<dyn StorageAdapter>,
-    uri: String,
-    kind: StorageKind,
-}
-
-impl Drop for StateLockGuard {
-    fn drop(&mut self) {
-        match self.kind {
-            // Deterministic release on the file backend (tests assert the
-            // lock is gone the moment a command returns).
-            StorageKind::Local => {
-                let path = self.uri.trim_start_matches("file://");
-                let _ = std::fs::remove_file(path);
-            }
-            // Object stores need an async delete, and it must COMPLETE
-            // before a short-lived CLI process exits — a spawned task dies
-            // with the runtime and leaks the lock (caught by the s3 smoke
-            // test: import's lock survived into the next command). On the
-            // multi-thread runtime (the CLI and the gated s3 tests),
-            // block_in_place waits for the delete; on a current-thread
-            // runtime that's not allowed, so fall back to a spawn —
-            // best-effort, with `force-unlock` as the documented recovery,
-            // same as a crash.
-            StorageKind::S3 => {
-                let adapter = Arc::clone(&self.adapter);
-                let uri = self.uri.clone();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                        tokio::task::block_in_place(move || {
-                            handle.block_on(async move {
-                                let _ = adapter.delete(&uri).await;
-                            });
-                        });
-                    } else {
-                        handle.spawn(async move {
-                            let _ = adapter.delete(&uri).await;
-                        });
-                    }
-                }
-            }
-        }
-    }
-}
-
 impl ClusterStore {
     /// The default layout: storage root = the config directory itself
     /// (`file://<abs config dir>`), byte-compatible with every pre-existing
     /// cluster on disk.
     pub(crate) fn for_config_dir(config_dir: &Path) -> Self {
-        let absolute =
-            std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
-        let display_root = absolute
-            .to_string_lossy()
-            .trim_end_matches('/')
-            .to_string();
+        let absolute = std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
+        let display_root = absolute.to_string_lossy().trim_end_matches('/').to_string();
         let root = format!("file://{display_root}");
-        let adapter = storage_for_uri(&root)
+        let storage = storage_handle_for_uri(&root)
             .expect("local storage adapter construction is infallible for file:// roots");
+        let adapter = storage.adapter();
         Self {
             adapter,
+            storage,
             root,
             display_root,
         }
@@ -118,7 +74,7 @@ impl ClusterStore {
             let path = trimmed.trim_start_matches("file://");
             return Ok(Self::for_config_dir(Path::new(path)));
         }
-        let adapter = storage_for_uri(trimmed).map_err(|err| {
+        let storage = storage_handle_for_uri(trimmed).map_err(|err| {
             Diagnostic::error(
                 "storage_root_invalid",
                 "storage",
@@ -126,7 +82,8 @@ impl ClusterStore {
             )
         })?;
         Ok(Self {
-            adapter,
+            adapter: storage.adapter(),
+            storage,
             root: trimmed.to_string(),
             display_root: trimmed.to_string(),
         })
@@ -257,7 +214,10 @@ impl ClusterStore {
     /// on the deletion (e.g. the pre-movement sidecar cleanup fast-path) can
     /// report it as a diagnostic instead of silently leaving stale state.
     pub(crate) async fn try_delete_object(&self, uri: &str) -> Result<(), String> {
-        self.adapter.delete(uri).await.map_err(|err| err.to_string())
+        self.adapter
+            .delete(uri)
+            .await
+            .map_err(|err| err.to_string())
     }
 
     /// Recursive prefix delete for graph roots (approved deletes). Idempotent;
@@ -434,16 +394,12 @@ impl ClusterStore {
             Ok(true) => {}
             Err(err) => return Err(err.to_string()),
         }
-        self.adapter
-            .read_text(&uri)
-            .await
-            .map(Some)
-            .map_err(|err| {
-                format!(
-                    "could not read catalog payload '{}': {err}",
-                    self.display(&relative)
-                )
-            })
+        self.adapter.read_text(&uri).await.map(Some).map_err(|err| {
+            format!(
+                "could not read catalog payload '{}': {err}",
+                self.display(&relative)
+            )
+        })
     }
 
     /// Idempotent content-addressed write: a payload already present at its
@@ -667,35 +623,13 @@ impl ClusterStore {
         observations: &mut StateObservations,
     ) -> Result<StateLockGuard, Diagnostic> {
         let lock_uri = self.uri(CLUSTER_LOCK_FILE);
-        let lock_id = Ulid::new().to_string();
-        let lock = StateLockFile {
-            version: 1,
-            lock_id: lock_id.clone(),
-            operation: operation.to_string(),
-            created_at: OffsetDateTime::now_utc()
-                .format(&Rfc3339)
-                .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
-            pid: process::id(),
-        };
-        let payload = serde_json::to_string_pretty(&lock).map_err(|err| {
-            Diagnostic::error(
-                "state_lock_error",
-                CLUSTER_LOCK_FILE,
-                format!("could not encode state lock: {err}"),
-            )
-        })?;
-
-        match self.adapter.write_text_if_absent(&lock_uri, &payload).await {
-            Ok(true) => {
+        match acquire_state_lock(&self.storage, &lock_uri, operation).await {
+            Ok(StateLockAcquire::Acquired(guard)) => {
                 observations.lock_acquired = true;
-                observations.acquired_lock_id = Some(lock_id);
-                Ok(StateLockGuard {
-                    adapter: Arc::clone(&self.adapter),
-                    uri: lock_uri,
-                    kind: self.kind(),
-                })
+                observations.acquired_lock_id = Some(guard.lock_id().to_string());
+                Ok(guard)
             }
-            Ok(false) => {
+            Ok(StateLockAcquire::Held) => {
                 self.observe_lock_metadata_lossy(observations).await;
                 Err(Diagnostic::error(
                     "state_lock_held",
@@ -703,6 +637,11 @@ impl ClusterStore {
                     state_lock_held_message(observations),
                 ))
             }
+            Err(StateLockError::LockEncode(err)) => Err(Diagnostic::error(
+                "state_lock_error",
+                CLUSTER_LOCK_FILE,
+                format!("could not encode state lock: {err}"),
+            )),
             Err(err) => Err(Diagnostic::error(
                 "state_lock_error",
                 CLUSTER_LOCK_FILE,
@@ -737,13 +676,13 @@ impl ClusterStore {
         let lock = parse_lock_file_for_unlock(&text)?;
         observations.observe_lock_metadata(&lock);
         observations.locked = true;
-        if lock.lock_id != lock_id {
+        if lock.lock_id() != lock_id {
             return Err(Diagnostic::error(
                 "state_lock_id_mismatch",
                 CLUSTER_LOCK_FILE,
                 format!(
                     "lock id mismatch: held lock is {}, refusing to remove (pass the exact id from `cluster status`)",
-                    lock.lock_id
+                    lock.lock_id()
                 ),
             ));
         }
@@ -767,12 +706,19 @@ impl ClusterStore {
         match self.read_versioned_opt(&lock_uri).await {
             Ok(Some((text, _))) => {
                 observations.locked = true;
-                match serde_json::from_str::<StateLockFile>(&text) {
-                    Ok(lock) if lock.version == 1 => observations.observe_lock_metadata(&lock),
-                    Ok(lock) => diagnostics.push(Diagnostic::warning(
-                        "unsupported_state_lock_version",
+                match StateLockFile::parse(&text) {
+                    Ok(lock) => observations.observe_lock_metadata(&lock),
+                    Err(StateLockError::LockVersion(version)) => {
+                        diagnostics.push(Diagnostic::warning(
+                            "unsupported_state_lock_version",
+                            CLUSTER_LOCK_FILE,
+                            format!("unsupported cluster state lock version {version}"),
+                        ))
+                    }
+                    Err(StateLockError::LockParse(err)) => diagnostics.push(Diagnostic::warning(
+                        "invalid_state_lock",
                         CLUSTER_LOCK_FILE,
-                        format!("unsupported cluster state lock version {}", lock.version),
+                        format!("could not parse state lock: {err}"),
                     )),
                     Err(err) => diagnostics.push(Diagnostic::warning(
                         "invalid_state_lock",
@@ -790,17 +736,12 @@ impl ClusterStore {
         }
     }
 
-    pub(crate) async fn observe_lock_metadata_lossy(
-        &self,
-        observations: &mut StateObservations,
-    ) {
+    pub(crate) async fn observe_lock_metadata_lossy(&self, observations: &mut StateObservations) {
         observations.locked = true;
         let lock_uri = self.uri(CLUSTER_LOCK_FILE);
         if let Ok(Some((text, _))) = self.read_versioned_opt(&lock_uri).await {
-            if let Ok(lock) = serde_json::from_str::<StateLockFile>(&text) {
-                if lock.version == 1 {
-                    observations.observe_lock_metadata(&lock);
-                }
+            if let Ok(lock) = StateLockFile::parse(&text) {
+                observations.observe_lock_metadata(&lock);
             }
         }
     }
@@ -815,21 +756,24 @@ fn state_cas_mismatch() -> Diagnostic {
 }
 
 pub(crate) fn parse_lock_file_for_unlock(text: &str) -> Result<StateLockFile, Diagnostic> {
-    let lock = serde_json::from_str::<StateLockFile>(text).map_err(|err| {
-        Diagnostic::error(
+    match StateLockFile::parse(text) {
+        Ok(lock) => Ok(lock),
+        Err(StateLockError::LockVersion(version)) => Err(Diagnostic::error(
+            "unsupported_state_lock_version",
+            CLUSTER_LOCK_FILE,
+            format!("unsupported cluster state lock version {version}"),
+        )),
+        Err(StateLockError::LockParse(err)) => Err(Diagnostic::error(
             "invalid_state_lock",
             CLUSTER_LOCK_FILE,
             format!("could not parse state lock: {err}"),
-        )
-    })?;
-    if lock.version != 1 {
-        return Err(Diagnostic::error(
-            "unsupported_state_lock_version",
+        )),
+        Err(err) => Err(Diagnostic::error(
+            "invalid_state_lock",
             CLUSTER_LOCK_FILE,
-            format!("unsupported cluster state lock version {}", lock.version),
-        ));
+            format!("could not parse state lock: {err}"),
+        )),
     }
-    Ok(lock)
 }
 
 pub(crate) fn state_lock_held_message(observations: &StateObservations) -> String {

@@ -1,5 +1,5 @@
 {
-  "_comment": "Branch protection policy for main. Applied via scripts/apply-branch-protection.sh. See docs/dev/branch-protection.md for rationale. CODEOWNERS was removed (2-person team where both maintainers own everything, so code-owner review added friction without value). Review is no longer code-owner-scoped and no approvals are required; the required CI status checks are the gate. Maintainers merge their own PRs once checks pass.",
+  "_comment": "Branch protection policy for main. Applied via scripts/apply-branch-protection.sh. See docs/dev/branch-protection.md for rationale. CODEOWNERS was removed (2-person team where both maintainers own everything, so code-owner review added friction without value). Review is no longer code-owner-scoped and no approvals are required; the reporting PR checks below are the gate. The full workspace, format-fence, and RustFS suites run post-merge; a red main branch is stop-the-line until fixed or reverted.",
   "required_status_checks": {
     "strict": true,
     "contexts": [

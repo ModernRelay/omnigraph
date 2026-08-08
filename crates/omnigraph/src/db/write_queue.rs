@@ -43,7 +43,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
+    RwLock as AsyncRwLock,
+};
 
 /// Queue key: `(table_key, branch_ref)`. `branch_ref = None` means main.
 ///
@@ -52,6 +55,25 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 /// writes to the same `table_key` on disjoint branches must NOT
 /// serialize at the queue.
 pub(crate) type TableQueueKey = (String, Option<String>);
+
+/// Non-cloneable ownership of the sole immutable export cut for one graph.
+///
+/// The root registry stores weak references, so retaining the manager here is
+/// part of the exclusion contract: a cut can outlive the `Omnigraph` handle
+/// that captured it without a reopened handle creating an independent gate.
+#[must_use = "dropping the permit releases the export cut"]
+pub(crate) struct ExportCutPermit {
+    _manager: Arc<WriteQueueManager>,
+    _permit: OwnedRwLockWriteGuard<()>,
+}
+
+/// Shared exclusion held by controls that can remove or reuse an export cut's
+/// exact path/version coordinates.
+#[must_use = "dropping the permit releases export destructive control"]
+pub(crate) struct ExportDestructivePermit {
+    _manager: Arc<WriteQueueManager>,
+    _permit: OwnedRwLockReadGuard<()>,
+}
 
 /// Per-`(table_key, branch)` writer queue manager.
 ///
@@ -75,6 +97,10 @@ pub(crate) struct WriteQueueManager {
     /// publication; explicit authority/physical exceptions follow their own
     /// registered ordering contracts.
     branch_queues: Mutex<HashMap<Option<String>, Arc<AsyncMutex<()>>>>,
+    /// One immutable export owns the write side through output. Cooperative
+    /// destructive controls share the read side, so they remain mutually
+    /// concurrent but cannot remove a path/version beneath a live cut.
+    export_gate: Arc<AsyncRwLock<()>>,
 }
 
 impl WriteQueueManager {
@@ -129,12 +155,32 @@ impl WriteQueueManager {
     /// RFC-022-enrolled callers MUST acquire this before any per-table queue.
     /// It is an in-process contention optimization only; publisher OCC and
     /// recovery remain the correctness authorities.
-    pub(crate) async fn acquire_branch(
-        &self,
-        branch: Option<&str>,
-    ) -> OwnedMutexGuard<()> {
+    pub(crate) async fn acquire_branch(&self, branch: Option<&str>) -> OwnedMutexGuard<()> {
         let key = branch.map(str::to_string);
         self.branch_slot(&key).lock_owned().await
+    }
+
+    /// Reserve the sole immutable export cut without waiting.
+    pub(crate) fn try_acquire_export_cut(self: &Arc<Self>) -> Option<ExportCutPermit> {
+        let permit = Arc::clone(&self.export_gate).try_write_owned().ok()?;
+        Some(ExportCutPermit {
+            _manager: Arc::clone(self),
+            _permit: permit,
+        })
+    }
+
+    /// Exclude a live export while destructive control is active.
+    ///
+    /// Destructive controls take the shared side so unrelated controls keep
+    /// their existing concurrency; they only serialize against an export cut.
+    pub(crate) fn try_acquire_export_destructive(
+        self: &Arc<Self>,
+    ) -> Option<ExportDestructivePermit> {
+        let permit = Arc::clone(&self.export_gate).try_read_owned().ok()?;
+        Some(ExportDestructivePermit {
+            _manager: Arc::clone(self),
+            _permit: permit,
+        })
     }
 
     /// Acquire several graph-branch control gates in one deterministic order.
@@ -239,6 +285,32 @@ mod tests {
         .await
         .expect("duplicate branch keys must not self-deadlock");
         assert_eq!(guards.len(), 2);
+    }
+
+    #[test]
+    fn export_cut_and_destructive_controls_share_one_root_gate() {
+        let root = format!("memory://export-gate/{}", ulid::Ulid::new());
+        let first = WriteQueueManager::for_root(&root);
+        let second = WriteQueueManager::for_root(&root);
+
+        let destructive_a = first
+            .try_acquire_export_destructive()
+            .expect("first destructive control must acquire");
+        let destructive_b = second
+            .try_acquire_export_destructive()
+            .expect("destructive controls must remain mutually concurrent");
+        assert!(second.try_acquire_export_cut().is_none());
+        drop(destructive_a);
+        drop(destructive_b);
+
+        let cut = first
+            .try_acquire_export_cut()
+            .expect("export must acquire after destructive controls release");
+        assert!(second.try_acquire_export_cut().is_none());
+        assert!(second.try_acquire_export_destructive().is_none());
+        drop(cut);
+
+        assert!(second.try_acquire_export_cut().is_some());
     }
 
     #[tokio::test]

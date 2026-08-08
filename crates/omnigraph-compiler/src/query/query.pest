@@ -54,7 +54,11 @@ match_value = { literal | variable | now_call }
 
 // Traversal: $p knows $f (directional) or $p <knows> $f (undirected —
 // matches the edge in either direction; same-endpoint-type edges only).
-traversal = { variable ~ (undirected_edge | edge_ident) ~ traversal_bounds? ~ variable }
+// An optional edge binding names the matched edge row: $p $w:knows $f.
+// A node binding also starts `variable ~ ":"`; the case of the next token
+// (lowercase edge_ident vs uppercase type_name) keeps the choice unambiguous.
+traversal = { variable ~ edge_binding? ~ (undirected_edge | edge_ident) ~ traversal_bounds? ~ variable }
+edge_binding = { variable ~ ":" }
 undirected_edge = { "<" ~ edge_ident ~ ">" }
 traversal_bounds = { "{" ~ integer ~ "," ~ integer? ~ "}" }
 

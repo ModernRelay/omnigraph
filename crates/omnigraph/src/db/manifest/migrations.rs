@@ -77,22 +77,25 @@ pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 6;
 /// module doc).
 pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_SCHEMA_VERSION;
 
-/// The omnigraph release line that wrote a given internal-schema stamp. The
+/// The omnigraph release or exact development build that wrote a given
+/// internal-schema stamp. The
 /// open-refusal uses it to tell an operator exactly which binary to use to
 /// export a sub-CURRENT graph (the export side of the strand-model upgrade —
 /// see `docs/user/operations/upgrade.md`). Ranges are the release tags that
 /// stamped each version (verify with
 /// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
-/// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5 0.9.x,
-/// v6 0.10.x.
+/// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5 was
+/// unreleased (final source commit pinned below), and v6 is 0.9.x.
 pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
     match stamp {
         1 => "0.3.1 or earlier",
         2 => "0.4.1 to 0.6.1",
         3 => "0.6.2 to 0.7.2",
         4 => "0.8.x",
-        5 => "0.9.x",
-        6 => "0.10.x",
+        5 => {
+            "built from unreleased final-v5 source commit 46b6d9084fb629b88d4ac9e8c546e0a30d213d19"
+        }
+        6 => "0.9.x",
         // Unreachable today (1–6 are mapped; > CURRENT is caught by the ceiling
         // guard before this is consulted). Worded to read naturally after
         // "created by omnigraph " if a future bump ever leaves a gap.
@@ -189,10 +192,13 @@ mod tests {
                 "a sub-floor stamp must be refused"
             );
         }
-        assert!(
-            refuse_if_stamp_unsupported(INTERNAL_MANIFEST_SCHEMA_VERSION + 1).is_err(),
-            "a future stamp must be refused"
-        );
+        let future_stamp = INTERNAL_MANIFEST_SCHEMA_VERSION + 1;
+        let future = refuse_if_stamp_unsupported(future_stamp)
+            .expect_err("the first abandoned post-v6 stamp must be refused")
+            .to_string();
+        assert!(future.contains("internal schema v7"), "got: {future}");
+        assert!(future.contains("expects v6"), "got: {future}");
+        assert!(future.contains("upgrade omnigraph"), "got: {future}");
     }
 
     /// The refusal names the release line that wrote each stamp so an operator
@@ -202,8 +208,9 @@ mod tests {
     fn release_names_the_writing_line_for_each_stamp() {
         assert_eq!(release_for_internal_schema_version(3), "0.6.2 to 0.7.2");
         assert_eq!(release_for_internal_schema_version(4), "0.8.x");
-        assert_eq!(release_for_internal_schema_version(5), "0.9.x");
-        assert_eq!(release_for_internal_schema_version(6), "0.10.x");
+        assert!(release_for_internal_schema_version(5).contains("unreleased final-v5"));
+        assert!(release_for_internal_schema_version(5).contains("46b6d908"));
+        assert_eq!(release_for_internal_schema_version(6), "0.9.x");
         assert_eq!(
             release_for_internal_schema_version(99),
             "an unrecognized older release"

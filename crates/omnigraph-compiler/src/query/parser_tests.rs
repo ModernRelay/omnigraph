@@ -1007,3 +1007,46 @@ return { $p.name
     let err = parse_query_diagnostic(input).unwrap_err();
     assert!(err.span.is_some());
 }
+
+#[test]
+fn test_parse_traversal_edge_binding() {
+    // `$p $w:knows $f` — the optional edge binding names the matched edge row
+    // so its properties become addressable (`$w.since`).
+    let input = r#"
+query rated_friends($name: String) {
+match {
+    $p: Person { name: $name }
+    $p $w:knows $f
+    $p $x:<knows> $g
+    $p knows $h
+}
+return { $f.name }
+}
+"#;
+    let qf = parse_query(input).unwrap();
+    let q = &qf.queries[0];
+    assert_eq!(q.match_clause.len(), 4);
+    match &q.match_clause[1] {
+        Clause::Traversal(t) => {
+            assert_eq!(t.src, "p");
+            assert_eq!(t.edge_name, "knows");
+            assert_eq!(t.dst, "f");
+            assert!(!t.undirected);
+            assert_eq!(t.edge_binding.as_deref(), Some("w"));
+        }
+        c => panic!("expected Traversal, got {c:?}"),
+    }
+    match &q.match_clause[2] {
+        Clause::Traversal(t) => {
+            assert!(t.undirected, "binding composes with undirected form");
+            assert_eq!(t.edge_binding.as_deref(), Some("x"));
+        }
+        c => panic!("expected Traversal, got {c:?}"),
+    }
+    match &q.match_clause[3] {
+        Clause::Traversal(t) => {
+            assert_eq!(t.edge_binding, None, "binding stays optional");
+        }
+        c => panic!("expected Traversal, got {c:?}"),
+    }
+}

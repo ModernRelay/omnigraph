@@ -11,10 +11,13 @@
 //! - **omnigraph `StorageAdapter`** — [`CountingStorageAdapter`], a decorator that
 //!   counts per-method calls (the schema-contract reads on the query path).
 //!
-//! Nothing here changes runtime behavior: the wrappers only observe, and the
-//! decorator delegates every call. `IOTracker` (the concrete counter) lives in
-//! tests via the `lance-io` dev-dependency; this module stays generic over the
-//! `lance::io`-re-exported trait, so it adds no production dependency.
+//! The probes themselves only observe, and the decorator delegates every call.
+//! The shared dataset opener also supplies the process control session when a
+//! caller has no graph-scoped data session, so detached opens still reuse the
+//! process object-store registry without caching mutable metadata. `IOTracker`
+//! (the concrete counter) lives in tests via the `lance-io` dev-dependency; this
+//! module stays generic over the `lance::io`-re-exported trait, so it adds no
+//! production dependency.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +29,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::io::{ObjectStoreParams, WrappingObjectStore};
 
 use crate::error::{OmniError, Result};
-use crate::storage::StorageAdapter;
+use crate::storage::{ListDirBounds, StorageAdapter};
 
 /// Per-query IO probes, installed for a query's task via [`with_query_io_probes`].
 ///
@@ -60,6 +63,10 @@ pub struct QueryIoProbes {
     /// Internal/system-table (`__manifest`) open CALLS — the complement of
     /// `data_open_count`, kept for symmetry and debugging.
     pub internal_open_count: Arc<AtomicU64>,
+    /// Full `__manifest` row-scan invocations. Counted at the shared state scan
+    /// and the dedicated lineage scan, so a coordinator that opens one handle
+    /// but scans state and lineage separately still reports two.
+    pub manifest_scan_count: Arc<AtomicU64>,
     /// Counts topology-index builds (the `RuntimeCache::graph_index` cache-miss
     /// path). A cost test asserts a fresh branch whose edge tables are unchanged
     /// from main reuses main's cached index (0 builds) rather than rebuilding it.
@@ -163,13 +170,21 @@ pub(crate) fn record_open(uri: &str) {
     });
 }
 
+/// Record one full `__manifest` row scan. No-op unless a cost probe is active.
+pub(crate) fn record_manifest_scan() {
+    let _ = current(|p| {
+        p.manifest_scan_count.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
 /// Record one topology-index build over `edges` edge tables (the
 /// `RuntimeCache::graph_index` cache-miss path). No-op when no probes are
 /// installed (production).
 pub(crate) fn record_graph_build(edges: usize) {
     let _ = current(|p| {
         p.graph_build_count.fetch_add(1, Ordering::Relaxed);
-        p.graph_edges_built.fetch_add(edges as u64, Ordering::Relaxed);
+        p.graph_edges_built
+            .fetch_add(edges as u64, Ordering::Relaxed);
     });
 }
 
@@ -506,12 +521,12 @@ pub(crate) enum VersionResolution {
 ///    `ObjectStoreParams` on the builder, so the open itself is counted
 ///    (`Dataset::with_object_store_wrappers` only wraps an already-open
 ///    store). No wrapper (production) adds nothing.
-/// 3. The shared per-graph `Session` (LanceDB's one-session-per-connection
-///    pattern; warms Lance's metadata/index caches across opens) is attached
-///    whenever the caller has one. `None` is for genuinely session-less
-///    contexts (a `Snapshot` detached from its graph's read caches) — owners
-///    that hold a session (`TableStore`, the handle cache) pass it
-///    unconditionally, so it cannot be silently dropped on one path.
+/// 3. A caller-provided graph data `Session` warms Lance's metadata/index
+///    caches across data-table opens. When absent (for example a detached
+///    historical snapshot or recovery helper), the process-wide zero-cache
+///    control session is attached instead. Every open therefore reuses the
+///    shared object-store registry/client pool without letting mutable control
+///    metadata become stale in a session cache.
 pub(crate) async fn open_dataset(
     uri: &str,
     version: VersionResolution,
@@ -523,9 +538,10 @@ pub(crate) async fn open_dataset(
     if let VersionResolution::At(version) = version {
         builder = builder.with_version(version);
     }
-    if let Some(session) = session {
-        builder = builder.with_session(session.clone());
-    }
+    let session = session
+        .cloned()
+        .unwrap_or_else(crate::lance_access::control_session);
+    builder = builder.with_session(session);
     if let Some(wrapper) = wrapper {
         builder = builder.with_store_params(ObjectStoreParams {
             object_store_wrapper: Some(wrapper),
@@ -538,7 +554,7 @@ pub(crate) async fn open_dataset(
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
-/// Per-method read counts for [`CountingStorageAdapter`].
+/// Per-method call counts for [`CountingStorageAdapter`].
 #[derive(Debug, Default)]
 pub struct StorageReadCounts {
     pub read_text: AtomicU64,
@@ -546,6 +562,7 @@ pub struct StorageReadCounts {
     pub exists: AtomicU64,
     pub read_text_versioned: AtomicU64,
     pub list_dir: AtomicU64,
+    pub mutation_calls: AtomicU64,
     pub write_text: AtomicU64,
     pub delete: AtomicU64,
 }
@@ -566,6 +583,9 @@ impl StorageReadCounts {
     pub fn list_dir(&self) -> u64 {
         self.list_dir.load(Ordering::Relaxed)
     }
+    pub fn mutation_calls(&self) -> u64 {
+        self.mutation_calls.load(Ordering::Relaxed)
+    }
     pub fn write_text(&self) -> u64 {
         self.write_text.load(Ordering::Relaxed)
     }
@@ -574,8 +594,8 @@ impl StorageReadCounts {
     }
 }
 
-/// Boundary decorator over a [`StorageAdapter`] that counts read-facing calls.
-/// Reads delegate after incrementing; writes delegate unchanged. Construct with
+/// Boundary decorator over a [`StorageAdapter`] that counts every method call.
+/// Calls delegate after incrementing. Construct with
 /// [`CountingStorageAdapter::new`] and open an engine via
 /// `Omnigraph::open_with_storage` to count its non-Lance storage IO.
 #[derive(Debug)]
@@ -586,7 +606,9 @@ pub struct CountingStorageAdapter {
 
 impl CountingStorageAdapter {
     /// Wrap `inner`, returning the adapter and a shared handle to its counts.
-    pub fn new(inner: Arc<dyn StorageAdapter>) -> (Arc<dyn StorageAdapter>, Arc<StorageReadCounts>) {
+    pub fn new(
+        inner: Arc<dyn StorageAdapter>,
+    ) -> (Arc<dyn StorageAdapter>, Arc<StorageReadCounts>) {
         let counts = Arc::new(StorageReadCounts::default());
         let adapter: Arc<dyn StorageAdapter> = Arc::new(Self {
             inner,
@@ -610,12 +632,25 @@ impl StorageAdapter for CountingStorageAdapter {
         self.inner.read_text_if_exists(uri).await
     }
 
+    async fn read_text_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<String>> {
+        self.counts
+            .read_text_if_exists
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.read_text_if_exists_bounded(uri, max_bytes).await
+    }
+
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.counts.write_text.fetch_add(1, Ordering::Relaxed);
         self.inner.write_text(uri, contents).await
     }
 
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.write_text_if_absent(uri, contents).await
     }
 
@@ -625,10 +660,12 @@ impl StorageAdapter for CountingStorageAdapter {
     }
 
     async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.rename_text(from_uri, to_uri).await
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.counts.delete.fetch_add(1, Ordering::Relaxed);
         self.inner.delete(uri).await
     }
@@ -638,8 +675,22 @@ impl StorageAdapter for CountingStorageAdapter {
         self.inner.list_dir(dir_uri).await
     }
 
+    async fn list_dir_bounded(
+        &self,
+        dir_uri: &str,
+        matching_suffix: &str,
+        bounds: ListDirBounds,
+    ) -> Result<Vec<String>> {
+        self.counts.list_dir.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .list_dir_bounded(dir_uri, matching_suffix, bounds)
+            .await
+    }
+
     async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
-        self.counts.read_text_versioned.fetch_add(1, Ordering::Relaxed);
+        self.counts
+            .read_text_versioned
+            .fetch_add(1, Ordering::Relaxed);
         self.inner.read_text_versioned(uri).await
     }
 
@@ -649,12 +700,14 @@ impl StorageAdapter for CountingStorageAdapter {
         contents: &str,
         expected_version: &str,
     ) -> Result<Option<String>> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner
             .write_text_if_match(uri, contents, expected_version)
             .await
     }
 
     async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.delete_prefix(prefix_uri).await
     }
 }

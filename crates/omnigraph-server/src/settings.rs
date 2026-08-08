@@ -217,7 +217,7 @@ pub async fn load_server_settings(
             "omnigraph-server boots from a cluster: pass --cluster <dir|s3://…> \
              (the cluster's applied revision is the deployment artifact). The legacy \
              single-graph boot (positional <URI>, --target, --config omnigraph.yaml) \
-             was removed in RFC-011."
+             has been removed."
         );
     };
     load_cluster_settings(

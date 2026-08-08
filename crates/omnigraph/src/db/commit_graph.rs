@@ -13,6 +13,31 @@ pub struct GraphCommit {
     pub created_at: i64,
 }
 
+impl GraphCommit {
+    /// The one total order for deterministic lineage listing, head selection,
+    /// and any future commit-list keyset cursor. Ancestry and CDC traversal use
+    /// persisted first-parent links instead; this key never defines feed order.
+    pub fn lineage_key(&self) -> (u64, i64, &str) {
+        (
+            self.manifest_version,
+            self.created_at,
+            &self.graph_commit_id,
+        )
+    }
+}
+
+/// One observable graph transition on a branch's first-parent lineage.
+///
+/// CDC compares exactly these two immutable graph commits. A merge commit is
+/// compared with the branch state it landed on (`parent`); its
+/// `merged_parent_commit_id` remains provenance and is never traversed as a
+/// second feed path.
+#[derive(Debug, Clone)]
+pub(crate) struct FirstParentEdge {
+    pub(crate) parent: GraphCommit,
+    pub(crate) child: GraphCommit,
+}
+
 /// A pure projection of the graph lineage that lives in `__manifest`
 /// (`graph_commit` + `graph_head` rows, RFC-013 Phase 7). It opens NO Lance
 /// dataset (Phase B retired `_graph_commits.lance` / `_graph_commit_actors.lance`):
@@ -42,6 +67,33 @@ impl CommitGraph {
             commit_by_id,
             head_commit,
         })
+    }
+
+    /// Build the lineage projection from rows decoded alongside one coherent
+    /// manifest-state scan.
+    pub(crate) fn from_manifest_rows(
+        root_uri: &str,
+        active_branch: Option<&str>,
+        rows: Vec<crate::db::manifest::GraphLineageRow>,
+    ) -> Self {
+        let (commit_by_id, head_commit) = build_commit_cache(rows);
+        Self {
+            root_uri: root_uri.trim_end_matches('/').to_string(),
+            active_branch: active_branch.map(str::to_string),
+            commit_by_id,
+            head_commit,
+        }
+    }
+
+    /// Replace this derived cache from rows captured with the coordinator's
+    /// newly-refreshed manifest state.
+    pub(crate) fn replace_from_manifest_rows(
+        &mut self,
+        rows: Vec<crate::db::manifest::GraphLineageRow>,
+    ) {
+        let (commit_by_id, head_commit) = build_commit_cache(rows);
+        self.commit_by_id = commit_by_id;
+        self.head_commit = head_commit;
     }
 
     /// Insert a just-published commit into the in-memory cache (RFC-013 Phase 7).
@@ -76,8 +128,7 @@ impl CommitGraph {
         let root = root_uri.trim_end_matches('/');
         // `load_commit_cache_for_branch` opens the branch's `__manifest` (the
         // authoritative table), so a truly absent branch fails loudly here.
-        let (commit_by_id, head_commit) =
-            load_commit_cache_for_branch(root, Some(branch)).await?;
+        let (commit_by_id, head_commit) = load_commit_cache_for_branch(root, Some(branch)).await?;
         Ok(Self {
             root_uri: root.to_string(),
             active_branch: Some(branch.to_string()),
@@ -104,13 +155,23 @@ impl CommitGraph {
 
     pub async fn load_commits(&self) -> Result<Vec<GraphCommit>> {
         let mut commits = self.commit_by_id.values().cloned().collect::<Vec<_>>();
-        commits.sort_by(|a, b| {
-            a.manifest_version
-                .cmp(&b.manifest_version)
-                .then_with(|| a.created_at.cmp(&b.created_at))
-                .then_with(|| a.graph_commit_id.cmp(&b.graph_commit_id))
-        });
+        commits.sort_by(|a, b| a.lineage_key().cmp(&b.lineage_key()));
         Ok(commits)
+    }
+
+    /// The maximal commit (by [`GraphCommit::lineage_key`]) satisfying `pred`.
+    /// Callers wanting "the latest X" use this instead of consuming
+    /// `load_commits` positionally, so no caller couples to iteration
+    /// direction.
+    pub(crate) fn latest_commit_matching(
+        &self,
+        pred: impl Fn(&GraphCommit) -> bool,
+    ) -> Option<GraphCommit> {
+        self.commit_by_id
+            .values()
+            .filter(|commit| pred(commit))
+            .max_by(|a, b| a.lineage_key().cmp(&b.lineage_key()))
+            .cloned()
     }
 
     pub fn get_commit(&self, commit_id: &str) -> Option<GraphCommit> {
@@ -218,13 +279,20 @@ async fn load_commit_cache_for_branch(
 /// Build the in-memory commit cache from the `__manifest` graph-lineage
 /// projection (RFC-013 step 4). The lineage rows carry the actor inline, so no
 /// separate actor-table read is needed. Head selection (`should_replace_head`)
-/// matches the order `load_commits` reports.
+/// is the [`GraphCommit::lineage_key`] maximum — the same total order every
+/// ordered lineage view derives from.
 async fn load_commit_cache_from_manifest(
     root_uri: &str,
     branch: Option<&str>,
 ) -> Result<(HashMap<String, GraphCommit>, Option<GraphCommit>)> {
     let (rows, _) =
         crate::db::manifest::ManifestCoordinator::read_graph_lineage_at(root_uri, branch).await?;
+    Ok(build_commit_cache(rows))
+}
+
+fn build_commit_cache(
+    rows: Vec<crate::db::manifest::GraphLineageRow>,
+) -> (HashMap<String, GraphCommit>, Option<GraphCommit>) {
     let mut commit_by_id = HashMap::with_capacity(rows.len());
     let mut head_commit = None;
     for row in rows {
@@ -242,18 +310,11 @@ async fn load_commit_cache_from_manifest(
         }
         commit_by_id.insert(commit.graph_commit_id.clone(), commit);
     }
-    Ok((commit_by_id, head_commit))
+    (commit_by_id, head_commit)
 }
 
 fn should_replace_head(current: Option<&GraphCommit>, candidate: &GraphCommit) -> bool {
-    current.is_none_or(|existing| {
-        candidate
-            .manifest_version
-            .cmp(&existing.manifest_version)
-            .then_with(|| candidate.created_at.cmp(&existing.created_at))
-            .then_with(|| candidate.graph_commit_id.cmp(&existing.graph_commit_id))
-            .is_gt()
-    })
+    current.is_none_or(|existing| candidate.lineage_key() > existing.lineage_key())
 }
 
 fn ancestor_distances(

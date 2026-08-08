@@ -149,6 +149,25 @@ pub enum OmniError {
     AlreadyInitialized { uri: String },
 }
 
+impl From<omnigraph_storage::StorageError> for OmniError {
+    fn from(error: omnigraph_storage::StorageError) -> Self {
+        match error {
+            omnigraph_storage::StorageError::Internal(message) => Self::manifest_internal(message),
+            omnigraph_storage::StorageError::Io(error) => Self::Io(error),
+            omnigraph_storage::StorageError::ResourceLimit {
+                resource,
+                limit,
+                actual,
+                ..
+            } => Self::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            },
+        }
+    }
+}
+
 impl OmniError {
     pub fn key_conflict(table_key: impl Into<String>, key: impl Into<String>) -> Self {
         Self::KeyConflict {
@@ -246,10 +265,7 @@ impl OmniError {
         )
     }
 
-    pub fn recovery_required(
-        operation_id: impl Into<String>,
-        reason: impl Into<String>,
-    ) -> Self {
+    pub fn recovery_required(operation_id: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::RecoveryRequired {
             operation_id: operation_id.into(),
             reason: reason.into(),

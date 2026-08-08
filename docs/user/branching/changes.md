@@ -22,3 +22,11 @@ EntityChange { table_key, kind, type_name, id, op, manifest_version, endpoints?:
 ChangeFilter { kinds?, type_names?, ops? }
 ChangeSet { from_version, to_version, branch?, changes[], stats }
 ```
+
+## Ordering
+
+Changed table lifetimes are grouped in ascending graph-visible `table_key`
+order, with immutable table identity as the hidden tie-breaker when one alias
+names multiple lifetimes across the compared snapshots. Entity order within one
+table is not a public guarantee; callers that need their own total order must
+sort the returned changes explicitly.

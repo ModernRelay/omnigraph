@@ -115,11 +115,16 @@ pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Option<String> {
 ///
 /// `cluster` is a config directory or a storage-root URI (`s3://…`, config-free),
 /// mirroring the server's `--cluster` dispatch.
-pub async fn resolve_graph_storage_uri(cluster: &str, graph_id: &str) -> Result<String, Diagnostic> {
+pub async fn resolve_graph_storage_uri(
+    cluster: &str,
+    graph_id: &str,
+) -> Result<String, Diagnostic> {
     let backend = open_cluster_backend(cluster)?;
     let mut observations = backend.observations();
     let snapshot = backend.read_state(&mut observations).await?;
-    let state = snapshot.state.ok_or_else(|| missing_state_diagnostic(cluster))?;
+    let state = snapshot
+        .state
+        .ok_or_else(|| missing_state_diagnostic(cluster))?;
     let address = format!("graph.{graph_id}");
     if !state.applied_revision.resources.contains_key(&address) {
         let applied = applied_graph_ids(&state);
@@ -144,7 +149,9 @@ pub async fn cluster_graph_ids(cluster: &str) -> Result<Vec<String>, Diagnostic>
     let backend = open_cluster_backend(cluster)?;
     let mut observations = backend.observations();
     let snapshot = backend.read_state(&mut observations).await?;
-    let state = snapshot.state.ok_or_else(|| missing_state_diagnostic(cluster))?;
+    let state = snapshot
+        .state
+        .ok_or_else(|| missing_state_diagnostic(cluster))?;
     Ok(applied_graph_ids(&state))
 }
 
@@ -293,7 +300,7 @@ async fn read_snapshot_with_store(
             ));
             continue;
         }
-        embedding_profiles.insert(address.clone(), profile);
+        embedding_profiles.insert(address.to_owned(), profile);
     }
 
     let mut graphs = Vec::new();
@@ -337,8 +344,9 @@ async fn read_snapshot_with_store(
                     },
                     None => None,
                 };
+                let graph_root = backend.graph_root(&graph_id);
                 graphs.push(ServingGraph {
-                    root: PathBuf::from(backend.graph_root(&graph_id)),
+                    root: PathBuf::from(graph_root),
                     graph_id,
                     embedding,
                 });
@@ -408,7 +416,7 @@ async fn read_snapshot_with_store(
             diagnostics.push(Diagnostic::error(
                 "cluster_no_healthy_graphs",
                 CLUSTER_RECOVERIES_DIR,
-                "all applied graphs are quarantined by pending recovery sidecars; run any state-mutating cluster command (e.g. `cluster apply`) to sweep, then retry",
+                "all applied graphs are quarantined by startup safety checks; resolve the graph-specific diagnostics, then retry",
             ));
         } else {
             diagnostics.push(Diagnostic::error(

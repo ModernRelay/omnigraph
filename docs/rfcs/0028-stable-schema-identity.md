@@ -13,10 +13,16 @@ owner: OmniGraph maintainers
 **Status:** Implemented (2026-07-15)
 **Date:** 2026-07-14
 **Author track:** Maintainer design series
+
+> **RFC-026 disposition:** stable schema identity remains implemented in v5/v6,
+> but RFC-026 was later rejected and removed. Its lifecycle, WAL, and v7+
+> passages below are historical consumers of the identity model, not current
+> format behavior. See [the removal decision](../dev/wal-removal.md).
+
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s accepted-schema capture,
 SchemaApply recovery, and strict publication boundary
-**Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-beta.21 at git rev
-`1aec14652dcbace23ac277fa8ced35000bea0c40`; full Lance table-schema,
+**Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-rc.1 at git rev
+`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance table-schema,
 schema-evolution, transaction, and versioning specifications
 **Audience:** compiler, schema, engine, migration, and release maintainers
 **Architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
@@ -464,10 +470,37 @@ logical identity and retain their own exact physical tokens.
 SchemaIR v2, the identity domain/allocator, and identity-bearing manifest rows
 are one internal storage-format capability. RFC-028 landed as internal manifest
 schema v5; that release kept `MIN_SUPPORTED == CURRENT == 5` and added the
-identity version to the release/stamp history. The currently served v6 format
-preserves this contract and adds RFC-023 key fencing; it does not reinterpret or
-backfill v5 in place. A v5 graph was never served with a partial combination
-such as identity-bearing IR over name-keyed manifest rows.
+identity version to the release/stamp history. V6 preserved this contract and
+added RFC-023 key fencing; v7 preserved both and added RFC-026 identity-keyed
+stream-lifecycle authority. Historical v8 preserved those contracts and added
+RFC-026 stream-config v2 plus recovery-v11 for the private B1 row/fold core.
+V9 preserves those worker mechanics and activates stream-config v3, lifecycle
+state v2, trusted hidden attribution, the manifest-selected token participant,
+and recovery-v12's exact base-plus-token fold. V10 adds the required
+disabled-from-genesis profile singleton and the now-frozen explicit-null
+dead-letter compatibility placeholder. V11
+replaces the profile boolean with protocol-v2 checked authority and adds
+recovery-v13 `StreamProfileChange`. The v12 format replaces
+inline lifecycle history with lifecycle-v3 ledger heads and recovery-v14
+hidden enrollment, claim, ordinary/drain-fold, and terminal receipt authority.
+V13/recovery-v15 adds private resume and guarded drain-abort.
+V14/recovery-v16 adds the checked-runtime `SEALED` EnsureIndices bridge;
+v15/recovery-v17 adds the distinct checked-runtime `SEALED` Optimize bridge.
+Neither maintenance owner adds a token receipt or caller operation ID.
+V16/recovery-v18 adds the separate private physical-rebind owner for an exact
+`SEALED` lane. V17/recovery-v19 adds the narrow stopped/offline, cluster-only
+authority-retirement and receipt-bearing export exit. Current
+v18/recovery-v20 adds exact stopped/offline `DataBlock` correction through the
+cluster-only `stream block show|correct` commands. Graph-native served ingress
+is active; explicit enrollment, per-declaration lifecycle control, authority
+repair, and rebind remain inactive. Graph-wide checked resume and sealed
+EnsureIndices/Optimize are the only served lifecycle/maintenance controls;
+they expose no type/table selector and reuse recovery-v15/v16/v17 unchanged.
+Retirement and DataBlock control remain narrow cluster-control CLI exceptions.
+None of the later formats reinterprets or
+backfills v5 in place. A v5
+graph was never served with a
+partial combination such as identity-bearing IR over name-keyed manifest rows.
 
 There is no v1→v2 IR backfill and no new-binary in-place conversion of an old
 graph. Activation follows the documented strand:

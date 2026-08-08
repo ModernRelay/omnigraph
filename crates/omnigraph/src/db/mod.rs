@@ -10,14 +10,39 @@ pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{Snapshot, SnapshotScanner, SnapshotTable, SubTableEntry, SubTableUpdate};
 pub(crate) use omnigraph::ensure_public_branch_ref;
-pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
 pub use omnigraph::{
-    CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, PendingIndex,
-    RepairAction, RepairClassification, RepairOptions, RepairStats, SchemaApplyOptions,
-    SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats, TableRepairStats,
+    CleanupPolicyOptions, EXPORT_CHUNK_MAX_BYTES, ExportCut, InitOptions, MergeOutcome, Omnigraph,
+    OpenMode, PendingIndex, RepairAction, RepairClassification, RepairOptions, RepairStats,
+    SchemaApplyOptions, SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats,
+    TableRepairStats,
 };
+pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
 
 use crate::error::{OmniError, Result};
+
+/// Process-local exclusion shared by immutable export cuts and cooperative
+/// whole-root destructive control. It grants no storage or graph authority.
+#[doc(hidden)]
+#[must_use = "dropping the guard releases destructive root control"]
+pub struct ExportRootExclusion {
+    _permit: write_queue::ExportDestructivePermit,
+}
+
+/// Nonwaitingly reserve one graph root against a live immutable export cut.
+#[doc(hidden)]
+pub fn reserve_export_root_exclusion(graph_uri: &str) -> Result<ExportRootExclusion> {
+    let normalized = crate::storage::normalize_root_uri(graph_uri)?;
+    let identity = crate::storage::write_queue_root_identity(&normalized)?;
+    let manager = write_queue::WriteQueueManager::for_root(&identity);
+    let permit = manager.try_acquire_export_destructive().ok_or_else(|| {
+        OmniError::ResourceLimitExceeded {
+            resource: "stream_export_slots".to_string(),
+            limit: 1,
+            actual: 2,
+        }
+    })?;
+    Ok(ExportRootExclusion { _permit: permit })
+}
 
 pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
 

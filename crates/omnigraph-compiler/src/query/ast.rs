@@ -63,6 +63,9 @@ pub struct Traversal {
     /// `$a <edge> $b` — match the edge in either direction (set semantics;
     /// same-endpoint-type edges only, enforced at typecheck).
     pub undirected: bool,
+    /// Optional name for the matched edge row (`$p $w:knows $f`), making the
+    /// edge's own properties addressable as `$w.<prop>`.
+    pub edge_binding: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -10,7 +10,7 @@
 //! `delete_where` was the final data-write residual until MR-A: Lance 7.0's
 //! `DeleteBuilder::execute_uncommitted` (#6658) made delete a staged write
 //! (`TableStorage::stage_delete` → `commit_staged`), so delete no longer
-//! advances Lance HEAD inline. Lance beta.21's public full-table index
+//! advances Lance HEAD inline. Pinned Lance's public full-table index
 //! `execute_uncommitted` shape now does the same for BTREE, FTS, and vector
 //! index builds. There is no separate inline-commit storage surface left.
 //!
@@ -352,10 +352,6 @@ impl ExactCommitOutcome {
 
     pub fn committed_version(&self) -> u64 {
         self.snapshot.version()
-    }
-
-    pub fn snapshot(&self) -> &SnapshotHandle {
-        &self.snapshot
     }
 
     pub fn into_snapshot(self) -> SnapshotHandle {
@@ -747,9 +743,11 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         with_row_id: bool,
     ) -> Result<DatasetRecordBatchStream>;
 
-    /// Streaming sibling with explicit per-batch row and decoded-byte limits.
-    /// This is the read-side primitive for operations that retain batches under
-    /// a fixed resource budget instead of inheriting Lance's process defaults.
+    /// Streaming sibling with an explicit initial row estimate and approximate
+    /// decoded-byte target. Lance's byte target overrides the row setting;
+    /// neither setting is a hard limit, and Lance may emit a larger batch.
+    /// Callers with a retained
+    /// resource budget must charge the actual emitted batch before keeping it.
     async fn scan_stream_bounded(
         &self,
         snapshot: &SnapshotHandle,

@@ -30,7 +30,7 @@ fn lance_error(error: lance::Error) -> OmniError {
     OmniError::Lance(error.to_string())
 }
 
-/// Lance beta.21 treats an already-absent target tree as success. OmniGraph
+/// Pinned Lance treats an already-absent target tree as success. OmniGraph
 /// still normalizes `RefNotFound` / `NotFound` around the whole call because
 /// Lance's branch-contents existence check and delete are separate operations,
 /// so a concurrent cleanup can win between them. The live path-descendant

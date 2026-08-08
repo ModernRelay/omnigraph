@@ -23,12 +23,17 @@
 //! Functions decorated `#[tokio::test]` actually run; they construct real
 //! values and assert field shapes / types.
 
+mod helpers;
+
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::refs::BranchIdentifier;
 use lance::dataset::transaction::{Operation, Transaction};
@@ -42,12 +47,39 @@ use lance::dataset::{
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance::index::DatasetIndexExt;
 use lance::session::Session;
+use lance_core::{
+    ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, ROW_OFFSET,
+    is_system_column,
+};
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
+use lance_io::object_store::ObjectStoreRegistry;
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
+use omnigraph_compiler::schema::parser::parse_schema;
+
+use helpers::{init_and_load, open_dataset_head, snapshot_main};
+
+#[test]
+fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
+    let names = [
+        ROW_ID,
+        ROW_ADDR,
+        ROW_OFFSET,
+        ROW_CREATED_AT_VERSION,
+        ROW_LAST_UPDATED_AT_VERSION,
+    ];
+    for name in names {
+        assert!(is_system_column(name), "Lance no longer reserves {name}");
+        let error = parse_schema(&format!("node N {{ {name}: String }}"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reserved"), "unexpected error: {error}");
+        assert!(error.contains(name), "unexpected error: {error}");
+    }
+}
 
 /// Helper: build a small fresh dataset in a tempdir. Pinned at V2_2 to match
 /// production write paths (blob v2 requires V2_2; see `docs/dev/lance.md`).
@@ -74,13 +106,41 @@ async fn fresh_dataset(uri: &str) -> Dataset {
     Dataset::write(reader, uri, Some(params)).await.unwrap()
 }
 
+/// Append one uniquely keyed row while preserving the V2_2/stable-row-id shape
+/// used by the production tables. Tag/cleanup guards use this to create exact,
+/// distinguishable versions without introducing a graph-level writer.
+async fn append_guard_row(dataset: &mut Dataset, id: &str, value: i32) {
+    let schema = Arc::new(Schema::from(dataset.schema()));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![id])),
+            Arc::new(Int32Array::from(vec![value])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    dataset
+        .append(
+            reader,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+}
+
 /// RFC-024 Gate A candidate built exclusively from public Lance surfaces.
 ///
 /// `BranchIdentifier` distinguishes named-ref lifetimes, the current
 /// transaction UUID distinguishes main-dataset replacement where main's
 /// identifier is necessarily empty, and the manifest e_tag gives object stores
 /// an independent physical-object witness. The e_tag remains optional at the
-/// type level for backends that omit it; beta.21's local filesystem backend
+/// type level for backends that omit it; the pinned Lance local filesystem backend
 /// resolves a metadata-derived e_tag, and the local guards below require it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PublicPhysicalRefIncarnation {
@@ -263,7 +323,7 @@ fn staged_inserted_rows_filter(staged: &UncommittedMergeInsert) -> Option<&KeyEx
 
 fn assert_bloom_empty(filter: &KeyExistenceFilter, expected_empty: bool, case: &str) {
     let FilterType::Bloom { bitmap, .. } = &filter.filter else {
-        panic!("{case}: beta.21 merge_insert should emit a Bloom key filter")
+        panic!("{case}: pinned Lance should emit a Bloom key filter")
     };
     assert_eq!(
         bitmap.iter().all(|byte| *byte == 0),
@@ -402,6 +462,88 @@ async fn manifest_location_field_shape() {
     assert!(!format!("{:?}", loc.naming_scheme).is_empty());
 }
 
+// --- Guard 2a: shared client pool with cache-isolated Sessions ---------------
+//
+// OmniGraph uses a cached data Session and a zero-cache control Session. They
+// must reuse the same object-store client pool without turning mutable-tip
+// control metadata into a second shared cache. This exercises the public Lance
+// construction with real Dataset opens: the second Session hits the first
+// Session's live object store, while its own zero-sized metadata cache remains
+// empty.
+
+#[tokio::test]
+async fn cached_and_zero_cache_sessions_share_store_registry_not_metadata_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared-registry-isolated-caches.lance");
+    let uri = path.to_str().unwrap();
+    drop(fresh_dataset(uri).await);
+
+    let registry = Arc::new(ObjectStoreRegistry::default());
+    let cached_session = Arc::new(Session::new(
+        16 * 1024 * 1024,
+        16 * 1024 * 1024,
+        Arc::clone(&registry),
+    ));
+    let control_session = Arc::new(Session::new(0, 0, Arc::clone(&registry)));
+
+    let before = registry.stats();
+    let cached = DatasetBuilder::from_uri(uri)
+        .with_session(Arc::clone(&cached_session))
+        .load()
+        .await
+        .expect("the cached data Session must open the dataset");
+    let after_cached = registry.stats();
+    assert!(
+        after_cached.misses > before.misses,
+        "the first Session open must create an object-store client"
+    );
+    let cached_metadata_items = cached_session
+        .metadata_cache_keys()
+        .await
+        .expect("the default Lance cache backend must expose key inventory")
+        .count();
+    assert!(
+        cached_metadata_items > 0,
+        "a real data-Session open must populate its metadata cache"
+    );
+    assert_eq!(
+        control_session
+            .metadata_cache_keys()
+            .await
+            .expect("the zero-cache Session backend must expose key inventory")
+            .count(),
+        0,
+        "the control Session must not observe the data Session's metadata entries"
+    );
+
+    // Keep `cached` alive so the registry's weak entry still has a live store
+    // for the control Session to reuse.
+    let control = DatasetBuilder::from_uri(uri)
+        .with_session(Arc::clone(&control_session))
+        .load()
+        .await
+        .expect("the zero-cache control Session must open the dataset");
+    let after_control = registry.stats();
+    assert!(
+        after_control.hits > after_cached.hits,
+        "the control Session must reuse the data Session's live object-store client"
+    );
+    assert_eq!(
+        after_control.misses, after_cached.misses,
+        "the second Session must not build a duplicate client for identical store parameters"
+    );
+    assert_eq!(
+        control_session
+            .metadata_cache_keys()
+            .await
+            .expect("the zero-cache Session backend must expose key inventory")
+            .count(),
+        0,
+        "a control-plane open must leave the zero-sized metadata cache empty"
+    );
+    assert_eq!(cached.version().version, control.version().version);
+}
+
 // --- Guard 2b: RFC-024 public physical-ref incarnation surfaces -----------
 //
 // RFC-024 may activate durable table heads only if a public, backend-portable
@@ -464,14 +606,13 @@ async fn public_physical_ref_token_rejects_local_same_version_aba() {
     let first_etag = first_token
         .manifest_e_tag
         .as_deref()
-        .expect("beta.21 must expose the first local main manifest's metadata-derived e_tag");
-    let second_etag = second_token
-        .manifest_e_tag
-        .as_deref()
-        .expect("beta.21 must expose the recreated local main manifest's metadata-derived e_tag");
+        .expect("pinned Lance must expose the first local main manifest's metadata-derived e_tag");
+    let second_etag = second_token.manifest_e_tag.as_deref().expect(
+        "pinned Lance must expose the recreated local main manifest's metadata-derived e_tag",
+    );
     assert_ne!(
         first_etag, second_etag,
-        "beta.21's local e_tag must distinguish the recreated main manifest object"
+        "pinned Lance's local e_tag must distinguish the recreated main manifest object"
     );
     assert_ne!(
         first_token, second_token,
@@ -481,11 +622,14 @@ async fn public_physical_ref_token_rejects_local_same_version_aba() {
     recreate_named_branch_and_assert_token_changes(&mut second, true).await;
 }
 
-/// Exercise the production-shaped shared-Session case. Once the
-/// canonical first incarnation is cached, deleting and recreating main at the
-/// same URI/version must still resolve the second incarnation rather than reuse
-/// the cached transaction UUID. A fresh public DatasetBuilder open is the
-/// cache-bypass fallback and must agree with the shared-Session result.
+/// Exercise the production-shaped shared-Session case. "Stable" here means
+/// stable across an unchanged reopen: an ordinary commit must rotate the
+/// current transaction/e_tag witness while preserving the branch identifier.
+/// Once the canonical first incarnation is cached, deleting and recreating
+/// main at the same URI/version must still resolve the second incarnation
+/// rather than reuse the cached transaction UUID. A fresh public DatasetBuilder
+/// open is the cache-bypass fallback and must agree with the shared-Session
+/// result.
 #[tokio::test]
 async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
     let dir = tempfile::tempdir().unwrap();
@@ -497,12 +641,12 @@ async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
     let first_committed_token = public_physical_ref_incarnation(&first_committed).await;
     assert!(
         first_committed_token.manifest_e_tag.is_some(),
-        "beta.21's public Dataset result must expose the local manifest's metadata-derived e_tag"
+        "pinned Lance's public Dataset result must expose the local manifest's metadata-derived e_tag"
     );
     drop(first_committed);
 
     let shared_session = Arc::new(Session::default());
-    let first = DatasetBuilder::from_uri(uri)
+    let mut first = DatasetBuilder::from_uri(uri)
         .with_session(shared_session.clone())
         .load()
         .await
@@ -524,6 +668,25 @@ async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
         "a canonical token must be stable across unchanged shared-Session reopens"
     );
     drop(first_again);
+
+    append_guard_row(&mut first, "ordinary-head-advance", 3).await;
+    let advanced_token = public_physical_ref_incarnation(&first).await;
+    assert_eq!(
+        advanced_token.branch_identifier, first_token.branch_identifier,
+        "an ordinary main commit must preserve the native branch identifier"
+    );
+    assert_ne!(
+        advanced_token.transaction_uuid, first_token.transaction_uuid,
+        "the public composite is a current-HEAD witness: an ordinary commit must rotate its transaction UUID"
+    );
+    assert_ne!(
+        advanced_token.manifest_e_tag, first_token.manifest_e_tag,
+        "the public composite is a current-HEAD witness: an ordinary commit must rotate its manifest e_tag"
+    );
+    assert_ne!(
+        advanced_token, first_token,
+        "the current-HEAD witness must not be mistaken for an immutable dataset-incarnation token"
+    );
     drop(first);
 
     std::fs::remove_dir_all(&path).expect("the first local dataset must be deleted completely");
@@ -548,11 +711,11 @@ async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
     let first_etag = first_token
         .manifest_e_tag
         .as_deref()
-        .expect("beta.21 must retain the first local manifest's metadata-derived e_tag");
+        .expect("pinned Lance must retain the first local manifest's metadata-derived e_tag");
     let second_etag = second_token
         .manifest_e_tag
         .as_deref()
-        .expect("beta.21 must expose the recreated local manifest's metadata-derived e_tag");
+        .expect("pinned Lance must expose the recreated local manifest's metadata-derived e_tag");
     assert_ne!(
         first_etag, second_etag,
         "the shared Session must resolve the recreated local manifest's distinct e_tag"
@@ -577,8 +740,8 @@ async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
 async fn public_physical_ref_token_rejects_s3_same_version_aba() {
     let Ok(bucket) = std::env::var("OMNIGRAPH_S3_TEST_BUCKET") else {
         eprintln!(
-            "skipping RFC-024 S3 physical-ref token guard: \
-             OMNIGRAPH_S3_TEST_BUCKET is not set"
+            "SKIP public_physical_ref_token_rejects_s3_same_version_aba: \
+             OMNIGRAPH_S3_TEST_BUCKET unset"
         );
         return;
     };
@@ -838,7 +1001,7 @@ async fn _compile_uncommitted_delete_field_shape() -> lance::Result<()> {
 //
 // EnsureIndices batches BTREE, FTS, and the current one-segment full-table
 // vector shape into one exact `Operation::CreateIndex`. This requires the
-// beta.21 builder to return complete public `IndexMetadata` without committing
+// pinned Lance builder to return complete public `IndexMetadata` without committing
 // HEAD. Compile-only: a Lance bump that removes or narrows the surface must
 // turn the compatibility smoke test red.
 #[allow(
@@ -884,8 +1047,12 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
     use lance_select::mask::RowAddrTreeMap;
     let ds: Arc<Dataset> = unimplemented!();
     let source: Box<dyn arrow_array::RecordBatchReader + Send> = unimplemented!();
-    let job = MergeInsertBuilder::try_new(ds, vec!["x".to_string()])?.try_build()?;
+    let builder = MergeInsertBuilder::try_new(ds, vec!["x".to_string()])?;
+    let job = builder.try_build()?;
     let staged = job.execute_uncommitted(source).await?;
+    let Operation::Update { .. } = &staged.transaction.operation else {
+        unreachable!()
+    };
     let _txn: lance::dataset::transaction::Transaction = staged.transaction;
     let _affected: Option<RowAddrTreeMap> = staged.affected_rows;
     let _stats = staged.stats;
@@ -898,7 +1065,7 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 // The branch-delete reconciler (`db/omnigraph/optimize.rs::reconcile_orphaned_branches`)
 // and the eager best-effort reclaim in `cleanup_deleted_branch_tables` call
 // `force_delete_branch` to drop orphaned branch refs. The single-authority
-// design relies on five facts pinned here:
+// design relies on six facts pinned here:
 //   1. plain `delete_branch` errors on a missing ref (so the design uses the
 //      force variant instead);
 //   2. `force_delete_branch` removes an existing (forked) branch — the orphan
@@ -913,6 +1080,9 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 //   5. a live slash-name path-child makes force delete remove an ancestor's
 //      BranchContents but intentionally retain its dataset files. OmniGraph's
 //      prefix-disjoint live-name invariant prevents this false-success shape.
+//   6. a tag targeting a named branch does not retain `tree/{branch}`. RFC-025
+//      must therefore refuse graph-branch deletion while checkpoint authority
+//      names that branch; the Lance tag alone is not a deletion fence.
 
 #[tokio::test]
 async fn force_delete_branch_semantics() {
@@ -930,12 +1100,39 @@ async fn force_delete_branch_semantics() {
 
     // (2) force_delete_branch removes an existing (forked) branch.
     let base = ds.version().version;
-    ds.create_branch("feature", base, None).await.unwrap();
+    let feature = ds.create_branch("feature", base, None).await.unwrap();
+    let feature_version = feature.version().version;
+    let branch_delete_tag = concat!(
+        "ogcp_v1_01J00000000000000000000000_t_",
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    );
+    ds.tags()
+        .create(branch_delete_tag, ("feature", feature_version))
+        .await
+        .expect("the RFC-025 deterministic internal spelling must be a valid Lance tag");
     ds.force_delete_branch("feature").await.unwrap();
     assert!(
         !ds.list_branches().await.unwrap().contains_key("feature"),
         "force_delete_branch should remove an existing branch ref"
     );
+    assert!(
+        !std::path::Path::new(uri)
+            .join("tree")
+            .join("feature")
+            .exists(),
+        "a tag targeting a named branch must not retain its physical branch tree"
+    );
+    assert_eq!(
+        ds.tags().get(branch_delete_tag).await.unwrap().version,
+        feature_version,
+        "branch deletion must not be mistaken for tag deletion"
+    );
+    assert!(
+        ds.checkout_version(branch_delete_tag).await.is_err(),
+        "the surviving tag must not make a deleted branch version readable; \
+         OmniGraph's checkpoint-aware branch-delete guard is load-bearing"
+    );
+    ds.tags().delete(branch_delete_tag).await.unwrap();
 
     // (3) Force delete is idempotent even when both the ref and tree are absent.
     ds.force_delete_branch("never").await.unwrap();
@@ -988,6 +1185,129 @@ async fn force_delete_branch_semantics() {
             .join("_versions")
             .exists(),
         "Lance must retain ancestor dataset files while a physical path-child is live"
+    );
+}
+
+// --- Guard 9b: RFC-025 tag targets and sparse cleanup protection -----------
+//
+// This is deliberately a substrate-only activation gate: it writes no
+// OmniGraph checkpoint rows and changes no graph format. It pins the Lance
+// facts RFC-025 would consume:
+//   * the proposed deterministic `ogcp_v1_...` spellings are valid tag names;
+//   * exact main and named-branch targets remain distinct even at overlapping
+//     numeric versions;
+//   * a sparse tagged old version survives cleanup while adjacent eligible
+//     versions are reclaimed; and
+//   * deleting the tag makes that last old version reclaimable.
+#[tokio::test]
+async fn native_tags_pin_exact_main_and_named_branch_versions_through_cleanup() {
+    const MAIN_TAG: &str = concat!(
+        "ogcp_v1_01J00000000000000000000000_m_",
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    );
+    const TABLE_TAG: &str = concat!(
+        "ogcp_v1_01J00000000000000000000000_t_",
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard9b.lance");
+    let uri = uri.to_str().unwrap();
+    let mut main = fresh_dataset(uri).await;
+
+    let main_v1 = main.version().version;
+    append_guard_row(&mut main, "main-only", 10).await;
+    let main_v2 = main.version().version;
+    assert_eq!(
+        main_v2,
+        main_v1 + 1,
+        "the main fixture must have two versions"
+    );
+
+    // Fork from main v1 after main has advanced. The branch deliberately
+    // reuses numeric v1 so the tag's branch component is load-bearing.
+    let mut feature = main
+        .create_branch("checkpoint-feature", main_v1, None)
+        .await
+        .unwrap();
+    let feature_v1 = feature.version().version;
+    assert_eq!(feature_v1, main_v1);
+    append_guard_row(&mut feature, "feature-v2", 20).await;
+    let feature_v2 = feature.version().version;
+    append_guard_row(&mut feature, "feature-v3", 30).await;
+    let feature_v3 = feature.version().version;
+    append_guard_row(&mut feature, "feature-v4", 40).await;
+    let feature_v4 = feature.version().version;
+    assert_eq!((feature_v2, feature_v3, feature_v4), (2, 3, 4));
+
+    let main_head_before_tags = main.version().version;
+    let feature_head_before_tags = feature.version().version;
+    main.tags()
+        .create(MAIN_TAG, (None::<&str>, Some(main_v1)))
+        .await
+        .expect("RFC-025's deterministic manifest-tag spelling must be accepted");
+    main.tags()
+        .create(TABLE_TAG, ("checkpoint-feature", feature_v2))
+        .await
+        .expect("RFC-025's deterministic table-tag spelling must be accepted");
+
+    let main_contents = main.tags().get(MAIN_TAG).await.unwrap();
+    assert_eq!(main_contents.branch, None);
+    assert_eq!(main_contents.version, main_v1);
+    let table_contents = main.tags().get(TABLE_TAG).await.unwrap();
+    assert_eq!(table_contents.branch.as_deref(), Some("checkpoint-feature"));
+    assert_eq!(table_contents.version, feature_v2);
+    assert_eq!(
+        main.version().version,
+        main_head_before_tags,
+        "tag creation is auxiliary metadata and must not advance main"
+    );
+    assert_eq!(
+        feature.version().version,
+        feature_head_before_tags,
+        "tag creation is auxiliary metadata and must not advance the named branch"
+    );
+
+    let tagged_main = main.checkout_version(MAIN_TAG).await.unwrap();
+    assert_eq!(tagged_main.version().version, main_v1);
+    assert_eq!(tagged_main.count_rows(None).await.unwrap(), 2);
+    let tagged_feature = main.checkout_version(TABLE_TAG).await.unwrap();
+    assert_eq!(tagged_feature.version().version, feature_v2);
+    assert_eq!(tagged_feature.count_rows(None).await.unwrap(), 3);
+
+    let cleanup_policy = CleanupPolicy {
+        before_version: Some(feature_v4),
+        error_if_tagged_old_versions: false,
+        ..Default::default()
+    };
+    let removed = cleanup_old_versions(&feature, cleanup_policy.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        removed.old_versions, 2,
+        "branch v1 and v3 are eligible and untagged; sparse tagged v2 must survive"
+    );
+    assert!(feature.checkout_version(feature_v1).await.is_err());
+    assert!(feature.checkout_version(feature_v3).await.is_err());
+    assert!(feature.checkout_version(feature_v2).await.is_ok());
+    assert!(feature.checkout_version(feature_v4).await.is_ok());
+    assert!(
+        main.checkout_version(MAIN_TAG).await.is_ok(),
+        "branch cleanup must not confuse an overlapping main-version tag with a branch tag"
+    );
+
+    main.tags().delete(TABLE_TAG).await.unwrap();
+    let removed = cleanup_old_versions(&feature, cleanup_policy)
+        .await
+        .unwrap();
+    assert_eq!(
+        removed.old_versions, 1,
+        "deleting the tag must make the formerly pinned branch v2 reclaimable"
+    );
+    assert!(feature.checkout_version(feature_v2).await.is_err());
+    assert!(
+        main.checkout_version(MAIN_TAG).await.is_ok(),
+        "deleting one deterministic tag must not disturb a different checkpoint target"
     );
 }
 
@@ -1125,6 +1445,251 @@ async fn _compile_scalar_index_coverage_surface() -> lance::Result<()> {
         let _covered: Option<bool> = index.fragment_bitmap.as_ref().map(|b| b.contains(0u32));
     }
     Ok(())
+}
+
+// --- CDC C0 guards: exact-end deltas and production row-version shape -------
+//
+// Lance's explicit delta range controls the version-column predicate, but the
+// row images are scanned from the `Dataset` handle used to build the delta. A
+// historical interval therefore needs a handle checked out at its exact end:
+// asking a later HEAD for the same interval can lose a row that changed again.
+// Keep this regression beside the other Lance surface probes so a dependency
+// bump cannot silently invalidate RFC-030's candidate-pruning contract.
+
+#[tokio::test]
+async fn dataset_delta_historical_images_require_the_exact_end_handle() {
+    async fn commit_alice_value(dataset: Dataset, value: i32) -> Dataset {
+        let batch = pk_full_row(&dataset, "alice", value);
+        let staged = stage_pk_merge(
+            Arc::new(dataset.clone()),
+            batch,
+            "id",
+            WhenMatched::UpdateAll,
+            WhenNotMatched::InsertAll,
+            Some(false),
+        )
+        .await;
+        CommitBuilder::new(Arc::new(dataset))
+            .with_skip_auto_cleanup(true)
+            .execute(staged.transaction)
+            .await
+            .expect("the guard update must commit")
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("cdc-exact-end-delta.lance");
+    let initial = fresh_pk_dataset(uri.to_str().unwrap()).await;
+    let begin_version = initial.version().version;
+
+    let exact_end = commit_alice_value(initial, 20).await;
+    let end_version = exact_end.version().version;
+    assert_eq!(
+        end_version,
+        begin_version + 1,
+        "the exact-end fixture needs one adjacent update"
+    );
+
+    let current_head = commit_alice_value(exact_end.clone(), 30).await;
+    assert_eq!(
+        current_head.version().version,
+        end_version + 1,
+        "the negative control needs the same row updated after the selected end"
+    );
+
+    let exact_delta = exact_end
+        .delta()
+        .with_begin_version(begin_version)
+        .with_end_version(end_version)
+        .build()
+        .unwrap();
+    let exact_batches: Vec<RecordBatch> = exact_delta
+        .get_updated_rows()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let exact_rows = exact_batches
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    assert_eq!(
+        exact_rows, 1,
+        "the exact-end delta must retain the one row changed in the interval"
+    );
+    let exact_batch = exact_batches
+        .iter()
+        .find(|batch| batch.num_rows() == 1)
+        .expect("the one changed row must be materialized");
+    let exact_ids = exact_batch["id"]
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let exact_values = exact_batch["value"]
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let exact_updated_versions = exact_batch[ROW_LAST_UPDATED_AT_VERSION]
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(exact_ids.value(0), "alice");
+    assert_eq!(
+        exact_values.value(0),
+        20,
+        "the delta must return the image at the selected end, not a later image"
+    );
+    assert_eq!(exact_updated_versions.value(0), end_version);
+
+    let stale_interval_on_head = current_head
+        .delta()
+        .with_begin_version(begin_version)
+        .with_end_version(end_version)
+        .build()
+        .unwrap();
+    let head_batches: Vec<RecordBatch> = stale_interval_on_head
+        .get_updated_rows()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        head_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        0,
+        "pinned Lance scans row images from the builder's handle: a later HEAD is \
+         not a valid source for an older interval whose row changed again; RFC-030 \
+         must check out the exact end version before constructing DatasetDelta"
+    );
+}
+
+#[tokio::test]
+async fn omnigraph_graph_tables_enable_stable_row_ids_and_version_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let snapshot = snapshot_main(&db).await.unwrap();
+    let entries = snapshot
+        .entries()
+        .map(|entry| {
+            (
+                entry.table_key.clone(),
+                entry.table_path.clone(),
+                entry.table_version,
+                entry.table_branch.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries.len(),
+        4,
+        "the shared fixture must exercise every declared node and edge table"
+    );
+
+    for (table_key, table_path, table_version, table_branch) in entries {
+        let table_uri = dir.path().join(table_path);
+        let head = open_dataset_head(table_uri.to_str().unwrap(), table_branch.as_deref()).await;
+        let table = if head.version().version == table_version {
+            head
+        } else {
+            head.checkout_version(table_version).await.unwrap()
+        };
+
+        assert!(
+            table.manifest().uses_stable_row_ids(),
+            "OmniGraph-created graph table {table_key} must keep Lance stable row IDs enabled"
+        );
+
+        let selected_version = table.version().version;
+        let mut scanner = table.scan();
+        scanner
+            .project(&[
+                "id",
+                ROW_ID,
+                ROW_CREATED_AT_VERSION,
+                ROW_LAST_UPDATED_AT_VERSION,
+            ])
+            .expect("stable row-id and row-version columns must be projectable");
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert_ne!(
+            row_count, 0,
+            "the shared loaded fixture must contain rows in {table_key}"
+        );
+
+        let mut row_ids = HashSet::new();
+        for batch in &batches {
+            let ids = batch[ROW_ID]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("_rowid must retain Lance's UInt64 surface");
+            let created = batch[ROW_CREATED_AT_VERSION]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("_row_created_at_version must retain Lance's UInt64 surface");
+            let updated = batch[ROW_LAST_UPDATED_AT_VERSION]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("_row_last_updated_at_version must retain Lance's UInt64 surface");
+            assert_eq!(
+                ids.null_count(),
+                0,
+                "live {table_key} rows need concrete stable row IDs"
+            );
+            assert_eq!(
+                created.null_count(),
+                0,
+                "live {table_key} rows need a creation version"
+            );
+            assert_eq!(
+                updated.null_count(),
+                0,
+                "live {table_key} rows need an update version"
+            );
+            for row in 0..batch.num_rows() {
+                assert!(
+                    row_ids.insert(ids.value(row)),
+                    "stable row IDs must be unique within {table_key}"
+                );
+                assert!(created.value(row) <= updated.value(row));
+                assert!(updated.value(row) <= selected_version);
+            }
+        }
+
+        let version_predicate = format!(
+            "{ROW_CREATED_AT_VERSION} <= {ROW_LAST_UPDATED_AT_VERSION} AND \
+             {ROW_LAST_UPDATED_AT_VERSION} <= {selected_version}"
+        );
+        let mut predicate_probe = table.scan();
+        predicate_probe
+            .project(&["id"])
+            .expect("the predicate probe must project a logical column");
+        predicate_probe
+            .filter(&version_predicate)
+            .expect("row-version columns must be usable in a scan predicate");
+        let filtered_rows = predicate_probe
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_fold(
+                0usize,
+                |rows, batch| async move { Ok(rows + batch.num_rows()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered_rows, row_count,
+            "the row-version predicate must retain every validated live row in {table_key}"
+        );
+    }
 }
 
 // --- Guard 12: can a scalar BTREE be built on a system version column? --------
@@ -1681,17 +2246,18 @@ async fn unenforced_primary_key_is_immutable_once_set() {
     );
 }
 
-// --- Guard 19b: beta.21 merge_insert PK-filter shape -----------------------
+// --- Guard 19b: pinned Lance merge_insert PK-filter shape ------------------
 //
 // RFC-023 can rely on Lance's key-conflict fencing only when every keyed
-// insert produces an `Operation::Update.inserted_rows_filter`. In beta.21 that
+// insert produces an `Operation::Update.inserted_rows_filter`. On the pinned
+// Lance revision that
 // is a route-dependent contract: the v2 plan emits a filter when the ordered
 // ON field ids exactly match the unenforced PK, while the scalar-index v1 path
 // and non-PK ON shapes emit `None`. A matched-only v2 update still emits
 // `Some(empty Bloom)`, which is important because `Some` selects the strict
 // conflict-resolver branch even though this attempt inserted no key.
 #[tokio::test]
-async fn unenforced_pk_filter_shape_is_route_dependent_on_beta21() {
+async fn unenforced_pk_filter_shape_is_route_dependent() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("rfc023_filter_v2.lance");
     let dataset = Arc::new(fresh_pk_dataset(uri.to_str().unwrap()).await);
@@ -1749,7 +2315,7 @@ async fn unenforced_pk_filter_shape_is_route_dependent_on_beta21() {
     );
 
     // Matched-only partial-schema v2 update: no Insert action touches the
-    // filter builder, but beta.21 deliberately retains `Some(empty Bloom)`.
+    // filter builder, but pinned Lance deliberately retains `Some(empty Bloom)`.
     let partial_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("value", DataType::Int32, false),
@@ -1779,7 +2345,7 @@ async fn unenforced_pk_filter_shape_is_route_dependent_on_beta21() {
     assert_bloom_empty(filter, true, "matched-only partial-schema PK update");
 
     // With a scalar index on every ON column and the default `use_index=true`,
-    // beta.21 selects v1. That route hardcodes `inserted_rows_filter=None`.
+    // pinned Lance selects v1. That route hardcodes `inserted_rows_filter=None`.
     let indexed_uri = dir.path().join("rfc023_filter_indexed_v1.lance");
     let mut indexed = fresh_pk_dataset(indexed_uri.to_str().unwrap()).await;
     indexed
@@ -1799,19 +2365,19 @@ async fn unenforced_pk_filter_shape_is_route_dependent_on_beta21() {
     .await;
     assert!(
         staged_inserted_rows_filter(&indexed_route).is_none(),
-        "the beta.21 all-keys-indexed v1 route must remain visibly unfenced"
+        "the pinned Lance all-keys-indexed v1 route must remain visibly unfenced"
     );
 }
 
-// --- Guard 19c: beta.21 key-filter conflict checks are directional ---------
+// --- Guard 19c: pinned Lance key-filter conflicts are directional ----------
 //
 // Lance evaluates compatibility from the transaction currently being rebased
-// against the transaction already committed. beta.21 is deliberately strict
+// against the transaction already committed. Pinned Lance is deliberately strict
 // for `filtered current / unfiltered committed`, but the reverse order is
 // accepted. RFC-023 must not assume a symmetric conflict matrix until the
 // upstream resolver actually supplies one.
 #[tokio::test]
-async fn unenforced_pk_conflict_matrix_is_directional_on_beta21() {
+async fn unenforced_pk_conflict_matrix_is_directional() {
     struct Case {
         name: &'static str,
         committed: ConflictMatrixTxn,
@@ -1940,7 +2506,7 @@ async fn unenforced_pk_conflict_matrix_is_directional_on_beta21() {
         if case.current_succeeds {
             assert!(
                 current_result.is_ok(),
-                "{}: beta.21 should accept this direction, got {current_result:?}",
+                "{}: pinned Lance should accept this direction, got {current_result:?}",
                 case.name
             );
         } else {
@@ -1949,7 +2515,7 @@ async fn unenforced_pk_conflict_matrix_is_directional_on_beta21() {
                     &current_result,
                     Err(lance::Error::RetryableCommitConflict { .. })
                 ),
-                "{}: expected beta.21 RetryableCommitConflict, got {current_result:?}",
+                "{}: expected pinned Lance RetryableCommitConflict, got {current_result:?}",
                 case.name
             );
         }

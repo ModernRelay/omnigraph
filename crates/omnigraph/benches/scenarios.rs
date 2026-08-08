@@ -80,6 +80,16 @@ struct Args {
     selectivity: f64,
     /// ANN k (the query's `limit`) for nearest-prefilter.
     k: usize,
+    /// How many already-committed rows the source branch MODIFIES, for
+    /// `general-merge-updates`. This is the branch delta; `--rows` is the
+    /// target size. Holding this small while `--rows` grows is the whole
+    /// point of that scenario: it separates delta cost from target cost.
+    delta_rows: usize,
+    /// `general-merge-updates` source shape: "update" rewrites committed rows,
+    /// "insert" adds brand-new rows. Both run against a target that advanced
+    /// after the fork, which is what distinguishes this from the adopt
+    /// scenario's untouched target.
+    source_mode: String,
     memory_cap_mb: Option<u64>,
     /// Results-log override; see `results_path`.
     out: Option<String>,
@@ -110,6 +120,8 @@ impl Args {
             runs: 1,
             selectivity: 0.05,
             k: 10,
+            delta_rows: 50,
+            source_mode: "update".to_string(),
             memory_cap_mb: None,
             out: None,
             baseline: false,
@@ -133,6 +145,10 @@ impl Args {
                     args.selectivity = take("--selectivity").parse().expect("--selectivity")
                 }
                 "--k" => args.k = take("--k").parse().expect("--k"),
+                "--delta-rows" => {
+                    args.delta_rows = take("--delta-rows").parse().expect("--delta-rows")
+                }
+                "--source-mode" => args.source_mode = take("--source-mode"),
                 "--out" => args.out = Some(take("--out")),
                 "--memory-cap-mb" => {
                     args.memory_cap_mb = Some(take("--memory-cap-mb").parse().expect("cap"))
@@ -163,6 +179,10 @@ impl Args {
             self.selectivity.to_string(),
             "--k".into(),
             self.k.to_string(),
+            "--delta-rows".into(),
+            self.delta_rows.to_string(),
+            "--source-mode".into(),
+            self.source_mode.clone(),
             "--child".into(),
         ];
         if self.baseline {
@@ -199,8 +219,9 @@ fn main() {
     if args.scenario.is_empty() {
         eprintln!(
             "usage: --scenario <merge-all-changed|nearest-prefilter|fenced-small-upsert|\
-             fenced-adopt-all-new> [--rows N] [--dims D] \
-             [--seed S] [--runs K] [--selectivity F] [--k K] [--memory-cap-mb M]"
+             fenced-adopt-all-new|general-merge-updates> [--rows N] [--dims D] \
+             [--seed S] [--runs K] [--selectivity F] [--k K] [--delta-rows N] \
+             [--source-mode update|insert] [--memory-cap-mb M]"
         );
         // `cargo bench` with no args must exit 0 so the target stays inert in
         // any blanket `cargo bench` invocation.
@@ -216,7 +237,10 @@ fn main() {
     }
     let mut aggregate_exit_status = 0_i64;
     for run in 0..args.runs {
-        let record = if args.scenario == "fenced-adopt-all-new" {
+        let record = if matches!(
+            args.scenario.as_str(),
+            "fenced-adopt-all-new" | "general-merge-updates"
+        ) {
             run_phased_adopt_once(&args, run)
         } else {
             run_once(&args, run)
@@ -579,6 +603,8 @@ fn run_phased_adopt_once(args: &Args, run: usize) -> serde_json::Value {
             "seed": args.seed,
             "selectivity": args.selectivity,
             "k": args.k,
+            "delta_rows": args.delta_rows,
+            "source_mode": args.source_mode,
             "memory_cap_mb": args.memory_cap_mb,
             "baseline": args.baseline,
         },
@@ -701,6 +727,15 @@ fn run_child(args: &Args) {
             }
             ("fenced-adopt-all-new", Some("verify")) => {
                 rfc023_scenarios::fenced_adopt_verify(args).await
+            }
+            ("general-merge-updates", Some("setup")) => {
+                rfc023_scenarios::general_merge_setup(args).await
+            }
+            ("general-merge-updates", Some("operation")) => {
+                rfc023_scenarios::general_merge_operation(args).await
+            }
+            ("general-merge-updates", Some("verify")) => {
+                rfc023_scenarios::general_merge_verify(args).await
             }
             ("merge-all-changed", None) => merge_all_changed(args).await,
             ("nearest-prefilter", None) => nearest_prefilter(args).await,
@@ -856,7 +891,11 @@ fn seeded_vector(seed: u64, slug: &str, dims: usize, pole: f32) -> Vec<f32> {
         // Dominate the direction with the pole while keeping per-row jitter.
         v[0] = pole * 10.0;
     }
-    let norm = v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt() as f32;
+    let norm = v
+        .iter()
+        .map(|x| (*x as f64) * (*x as f64))
+        .sum::<f64>()
+        .sqrt() as f32;
     if norm > f32::EPSILON {
         for x in &mut v {
             *x /= norm;
@@ -912,11 +951,21 @@ async fn merge_all_changed(args: &Args) -> serde_json::Value {
     {
         let mut jsonl = String::new();
         let slug = "doc-main-diverge";
-        let _ = write!(jsonl, r#"{{"type":"Doc","data":{{"slug":"{slug}","embedding":"#);
-        push_vector_json(&mut jsonl, &seeded_vector(args.seed ^ 0x5eed, slug, args.dims, 0.0));
-        jsonl.push_str("}}
-");
-        db.load("main", &jsonl, LoadMode::Merge).await.expect("diverge main");
+        let _ = write!(
+            jsonl,
+            r#"{{"type":"Doc","data":{{"slug":"{slug}","embedding":"#
+        );
+        push_vector_json(
+            &mut jsonl,
+            &seeded_vector(args.seed ^ 0x5eed, slug, args.dims, 0.0),
+        );
+        jsonl.push_str(
+            "}}
+",
+        );
+        db.load("main", &jsonl, LoadMode::Merge)
+            .await
+            .expect("diverge main");
     }
 
     // Rewrite every row's vector on the branch (same keys, new seed).
@@ -935,7 +984,10 @@ async fn merge_all_changed(args: &Args) -> serde_json::Value {
 
     // The measured window: the merge alone.
     let merge_start = Instant::now();
-    let outcome = db.branch_merge("bench", "main").await.expect("branch_merge");
+    let outcome = db
+        .branch_merge("bench", "main")
+        .await
+        .expect("branch_merge");
     let merge_ms = merge_start.elapsed().as_millis() as u64;
 
     serde_json::json!({
@@ -962,11 +1014,16 @@ async fn load_vector_rows(
         let mut jsonl = String::with_capacity(batch_rows * (args.dims * 12 + 64));
         for i in row..end {
             let slug = format!("doc-{i:08}");
-            let _ = write!(jsonl, r#"{{"type":"Doc","data":{{"slug":"{slug}","embedding":"#);
+            let _ = write!(
+                jsonl,
+                r#"{{"type":"Doc","data":{{"slug":"{slug}","embedding":"#
+            );
             push_vector_json(&mut jsonl, &seeded_vector(seed, &slug, args.dims, pole));
             jsonl.push_str("}}\n");
         }
-        db.load(branch, &jsonl, LoadMode::Merge).await.expect("load batch");
+        db.load(branch, &jsonl, LoadMode::Merge)
+            .await
+            .expect("load batch");
         row = end;
     }
 }
@@ -1014,10 +1071,15 @@ async fn nearest_prefilter(args: &Args) -> serde_json::Value {
                 jsonl,
                 r#"{{"type":"Doc","data":{{"slug":"{slug}","status":"{status}","embedding":"#
             );
-            push_vector_json(&mut jsonl, &seeded_vector(args.seed, &slug, args.dims, pole));
+            push_vector_json(
+                &mut jsonl,
+                &seeded_vector(args.seed, &slug, args.dims, pole),
+            );
             jsonl.push_str("}}\n");
         }
-        db.load("main", &jsonl, LoadMode::Merge).await.expect("load batch");
+        db.load("main", &jsonl, LoadMode::Merge)
+            .await
+            .expect("load batch");
         row = end;
     }
     let seed_ms = seed_start.elapsed().as_millis() as u64;
@@ -1054,7 +1116,12 @@ async fn nearest_prefilter(args: &Args) -> serde_json::Value {
     for i in 0..QUERY_ITERS {
         let q_start = Instant::now();
         let result = db
-            .query(ReadTarget::branch("main"), &query_src, "filtered_nearest", &params)
+            .query(
+                ReadTarget::branch("main"),
+                &query_src,
+                "filtered_nearest",
+                &params,
+            )
             .await
             .expect("filtered nearest query");
         total_ms += q_start.elapsed().as_millis() as u64;

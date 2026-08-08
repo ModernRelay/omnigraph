@@ -166,7 +166,9 @@ async fn non_numeric_vector_element_rejected_on_jsonl_load() {
 
     // A valid row still loads.
     let good = r#"{"type":"Doc","data":{"slug":"d4","embedding":[0.1,0.2,0.3]}}"#;
-    load_jsonl(&mut db, good, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, good, LoadMode::Overwrite)
+        .await
+        .unwrap();
 }
 
 // ─── Enum validation ─────────────────────────────────────────────────────────
@@ -353,7 +355,11 @@ edge Knows: Person -> Person
 "#;
 
 /// Cross-version uniqueness is now enforced on the bulk-load path too: a second
-/// Append load duplicating a committed `@unique` value is rejected.
+/// Append load duplicating a committed `@unique` value is rejected. The second
+/// load carries a MULTI-ROW batch (one colliding row + one clean row) so it
+/// exercises the batched committed probe (one scan for the whole key set, the
+/// colliding key found in the returned map) and load atomicity (the clean row
+/// must not survive the rejected load).
 #[tokio::test]
 async fn cross_version_unique_rejected_on_append_load() {
     let (_dir, mut db) = init_with(UNIQUE_SCHEMA, "").await;
@@ -366,7 +372,8 @@ async fn cross_version_unique_rejected_on_append_load() {
     .unwrap();
     let err = load_jsonl(
         &mut db,
-        r#"{"type":"User","data":{"name":"Carol","email":"dup@example.com"}}"#,
+        r#"{"type":"User","data":{"name":"Carol","email":"dup@example.com"}}
+{"type":"User","data":{"name":"Dave","email":"dave@example.com"}}"#,
         LoadMode::Append,
     )
     .await
@@ -375,6 +382,12 @@ async fn cross_version_unique_rejected_on_append_load() {
         err.to_string().contains("@unique violation on User.email"),
         "got: {}",
         err
+    );
+    // Atomicity: the clean sibling row was rejected with the batch.
+    assert_eq!(
+        count_rows(&db, "node:User").await,
+        1,
+        "rejected load must not commit its clean sibling row"
     );
 }
 
@@ -602,7 +615,9 @@ query reassign() {
 "#;
     mutate_main(&mut db, Q, "reassign", &params(&[]))
         .await
-        .expect("Alice ends at 'final' and Carol takes the freed 'temp' — final image has no collision");
+        .expect(
+            "Alice ends at 'final' and Carol takes the freed 'temp' — final image has no collision",
+        );
 }
 
 // ─── Edge cardinality ────────────────────────────────────────────────────────

@@ -20,31 +20,33 @@ Server-scoped action (v0.6.0+; binds to `Omnigraph::Server::"root"`):
 
 10. `graph_list` — `GET /graphs` registry enumeration (multi-graph mode)
 
-Server-scoped actions cannot use `branch_scope` or `target_branch_scope` — they operate on the registry, not on a graph's branches. A rule cannot mix server-scoped and per-graph actions; split into separate rules. (Runtime `graph_create` / `graph_delete` over HTTP are reserved but not shipped; operators add/remove graphs by editing the cluster's `cluster.yaml`, running `omnigraph cluster apply`, and restarting the server.)
+Server-scoped actions cannot use `branch_scope` or `target_branch_scope` — they operate on the registry, not on a graph's branches. A policy bundle cannot mix server-scoped and per-graph actions; split them into separate files and cluster policy entries. (Runtime `graph_create` / `graph_delete` over HTTP are reserved but not shipped; operators add/remove graphs by editing the cluster's `cluster.yaml`, running `omnigraph cluster apply`, and restarting the server.)
 
 ## Scope kinds
 
 - `branch_scope` — applied to source branch (`read`, `export`, `change`)
 - `target_branch_scope` — applied to destination (`schema_apply`, branch ops, run ops)
 - `protected_branches` — named list with special rules; rule scopes are `any | protected | unprotected`
+- Graph-scoped per-graph actions (`admin`, `invoke_query`) take **neither** scope; a rule that sets one is rejected at validation.
 
 ## Per-graph vs. server-level policy
 
 A server boots from a cluster (`--cluster <dir>`), and the cluster's
 `cluster.yaml` declares its policy bundles in a `policies:` section. Each bundle
-names the scopes it `applies_to`: a graph id (per-graph rules — `read`, `change`,
-`branch_*`, `schema_apply`) or the literal `cluster` (server-level rules —
-`graph_list`).
+has exactly one runtime kind: it applies either to one or more graph ids
+(per-graph rules — `read`, `change`, `branch_*`, `schema_apply`) or to the
+literal `cluster` (server-level rules — `graph_list`), never both. One scope may
+have only one bundle; combine rules that govern the same scope into that file.
 
 ```yaml
 # cluster.yaml
 policies:
-  base:
-    file: base.policy.yaml
-    applies_to: [cluster, knowledge]   # cluster-level + the `knowledge` graph
-  alpha:
-    file: policies/alpha.yaml
-    applies_to: [alpha]                # per-graph: alpha only
+  server:
+    file: server.policy.yaml
+    applies_to: [cluster]              # server-level rules only
+  graphs:
+    file: graph.policy.yaml
+    applies_to: [knowledge, alpha]     # one graph policy shared by two graphs
 ```
 
 A graph with no bundle bound to it has no engine-layer Cedar enforcement. Each

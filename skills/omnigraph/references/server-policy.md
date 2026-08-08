@@ -114,13 +114,15 @@ Per-graph actions (evaluated against the graph being addressed):
 | `branch_delete` | branch deletion |
 | `branch_merge` | merges (especially into protected branches) |
 
-`admin` exists but is reserved (no call site yet — don't write rules for it). A server-scoped `graph_list` action gates `GET /graphs`; declare it in a `[cluster]`-scoped bundle.
+`admin` exists but is reserved (no call site yet — don't write rules for it).
+A server-scoped `graph_list` action gates `GET /graphs`; declare it in a
+`[cluster]`-scoped bundle.
 
 For any shared repo, gate at least `schema_apply` and `branch_merge`.
 
 ### Where policy is declared
 
-Cedar bundles are declared in `cluster.yaml` and attach via `applies_to`: `[cluster]` is the server-level engine (gates `graph_list` / `GET /graphs`); `[<graph-id>]` is that graph's engine (gates `invoke_query`, `read`, `change`, `branch_*`, `schema_apply`). `cluster apply` publishes them and the `--cluster` server enforces the applied revision. The `policy.yaml` rule format (below) is the bundle content.
+Cedar bundles are declared in `cluster.yaml` and attach via `applies_to`: `[cluster]` is the server-level engine (gates `graph_list` / `GET /graphs`); `[<graph-id>]` is that graph's engine (gates `invoke_query`, `read`, `change`, `branch_*`, and `schema_apply`). `cluster apply` publishes them and the `--cluster` server enforces the applied revision. The `policy.yaml` rule format (below) is the bundle content.
 
 ### `policy.yaml` shape
 

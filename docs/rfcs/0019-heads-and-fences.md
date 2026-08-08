@@ -17,6 +17,11 @@ owner: OmniGraph maintainers
 **Companion docs:** RFC-018 (streaming-ingest WAL), PR #318's plan doc (`unlimited-history-latency-plan.md`, whose §9 "U2" this RFC promotes from follow-up to prerequisite)
 **Audience:** OmniGraph maintainers
 
+> **Later disposition:** RFC-018 and its successor RFC-026 were rejected. All
+> MemWAL and streaming-ingest discussion below is retained historical context,
+> not an active dependency or roadmap. See
+> [the removal decision](../dev/wal-removal.md).
+
 > **Supersession note (2026-07-10):** key-conflict fencing and durable table
 > heads are separate irreversible decisions with different substrate gates and
 > rollout requirements. RFC-023 and RFC-024 review them independently under

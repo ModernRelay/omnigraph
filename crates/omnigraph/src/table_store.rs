@@ -391,7 +391,7 @@ impl TableStore {
 
     /// Idempotently drop `branch` from the dataset at `dataset_uri`.
     ///
-    /// This tolerates an already-absent branch — beta.21's native
+    /// This tolerates an already-absent branch — pinned Lance's native
     /// `force_delete_branch` treats both a missing contents ref and a missing
     /// `tree/{branch}/` directory as success, while OmniGraph also normalizes a
     /// raced `RefNotFound` / `NotFound` around the non-atomic contents delete.
@@ -893,10 +893,12 @@ impl TableStore {
         Self::scan_stream_with(ds, projection, filter, order_by, with_row_id, |_| Ok(())).await
     }
 
-    /// Streaming scan with explicit row and decoded-byte ceilings per emitted
-    /// batch. Callers that retain or transform batches as part of a bounded
-    /// write plan must use this instead of inheriting Lance's environment-
-    /// controlled defaults.
+    /// Streaming scan with an explicit initial row estimate and approximate
+    /// decoded-byte target. Lance's byte target overrides the row setting;
+    /// neither setting is a hard limit, and Lance may emit a larger batch.
+    /// Callers that retain or
+    /// transform batches must charge the actual batch against their own hard
+    /// budget instead of treating these scanner settings as admission.
     pub async fn scan_stream_bounded(
         ds: &Dataset,
         projection: Option<&[&str]>,
@@ -908,7 +910,7 @@ impl TableStore {
     ) -> Result<DatasetRecordBatchStream> {
         if batch_rows == 0 || batch_bytes == 0 {
             return Err(OmniError::manifest_internal(
-                "bounded scan requires non-zero row and byte ceilings",
+                "bounded scan requires non-zero row estimate and byte target",
             ));
         }
         Self::scan_stream_with(ds, projection, filter, order_by, with_row_id, |scanner| {
@@ -1010,17 +1012,34 @@ impl TableStore {
         opposite_col: &str,
         keys: &[String],
     ) -> Result<Vec<RecordBatch>> {
+        Self::scan_edges_by_endpoint_projected(ds, key_col, opposite_col, &[], keys).await
+    }
+
+    /// `scan_edges_by_endpoint` with extra projected columns beyond the two
+    /// endpoints. Consumed by the bound-edge expand, which carries the edge's
+    /// physical id and declared property columns alongside each matched row.
+    pub async fn scan_edges_by_endpoint_projected(
+        ds: &Dataset,
+        key_col: &str,
+        opposite_col: &str,
+        extra_cols: &[&str],
+        keys: &[String],
+    ) -> Result<Vec<RecordBatch>> {
         use datafusion::prelude::{col, lit};
 
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        let mut projection: Vec<&str> = Vec::with_capacity(2 + extra_cols.len());
+        projection.push(key_col);
+        projection.push(opposite_col);
+        projection.extend_from_slice(extra_cols);
         let key_list: Vec<datafusion::prelude::Expr> =
             keys.iter().map(|k| lit(k.clone())).collect();
         let filter_expr = col(key_col).in_list(key_list, false);
         Self::scan_stream_with(
             ds,
-            Some(&[key_col, opposite_col]),
+            Some(projection.as_slice()),
             None,
             None,
             false,
@@ -1203,6 +1222,7 @@ impl TableStore {
                 Ok(ds)
             }
             None => {
+                let control_session = crate::lance_access::control_session();
                 let params = WriteParams {
                     mode: WriteMode::Create,
                     enable_stable_row_ids: true,
@@ -1210,6 +1230,7 @@ impl TableStore {
                     allow_external_blob_outside_bases: true,
                     auto_cleanup: None,
                     skip_auto_cleanup: true,
+                    session: Some(control_session),
                     ..Default::default()
                 };
                 Dataset::write(reader, dataset_uri, Some(params))
@@ -1549,7 +1570,7 @@ impl TableStore {
     /// that parent, so this adapter does not repeat the exact target probe. It
     /// uses Lance's public insert writer for immutable data fragments and
     /// replaces only its uncommitted `Append` operation with the same
-    /// filter-bearing, insert-only `Update` shape emitted by beta.21
+    /// filter-bearing, insert-only `Update` shape emitted by pinned Lance
     /// merge-insert. The resulting transaction inherits the certificate, so
     /// the proof composes across later branch generations without creating a
     /// graph-visible Append side door.
@@ -2351,7 +2372,6 @@ impl TableStore {
     /// `stage_append`).
     ///
     /// MR-793 Phase 2: introduces this for the schema_apply rewrite path.
-    /// Lance API verified in `.context/mr-793-design.md` Appendix A.1.
     pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
         // `enable_stable_row_ids: true` is defensive — empirically Lance 6.0.1
         // preserves the source dataset's flag through `Operation::Overwrite`
@@ -2432,7 +2452,7 @@ impl TableStore {
     /// Stage a batch of full-table index builds as one Lance transaction.
     ///
     /// Each builder writes its immutable index artifact and returns complete
-    /// `IndexMetadata` through beta.21's public `execute_uncommitted` surface.
+    /// `IndexMetadata` through pinned Lance's public `execute_uncommitted` surface.
     /// All metadata is based on the same pinned dataset version and is wrapped
     /// in one `Operation::CreateIndex`, so committing any number of requested
     /// BTREE, FTS, and vector indexes advances the table exactly once. HEAD does
@@ -2566,22 +2586,21 @@ impl TableStore {
     /// surface twice — once via the original committed fragment, once via
     /// the rewrite in `new_fragments`.
     ///
-    /// **Filter contract is incomplete on staged fragments.** When `filter`
-    /// is `Some(...)`, Lance pushes the predicate to per-fragment scans
-    /// with stats-based pruning. Uncommitted fragments produced by
-    /// `write_fragments_internal` lack the per-column statistics that
-    /// committed fragments carry; Lance's optimizer drops them from the
-    /// filtered scan even when their data would match. Staged-fragment
-    /// rows are silently absent from the result. `scanner.use_stats(false)`
-    /// does not fix this in lance 6.0.1. Callers needing correct filtered
-    /// reads against staged data should use a different strategy — the
-    /// engine's `MutationStaging` accumulator unions in-memory pending
-    /// batches with the committed scan via DataFusion `MemTable` (see
-    /// `scan_with_pending`).
+    /// **Filtered staged reads were incomplete before Lance 9.0.0.** Through
+    /// 9.0.0-rc.1, a `Some(filter)` scan pushed the predicate to per-fragment
+    /// scans with stats-based pruning, and uncommitted fragments produced by
+    /// `write_fragments_internal` lack the per-column statistics committed
+    /// fragments carry — so Lance's optimizer dropped them from the filtered
+    /// scan even when their data matched, and `scanner.use_stats(false)` did
+    /// not bypass it. Lance 9.0.0 closed that gap: matching staged rows are
+    /// now returned. `staged_tests::scan_with_staged_with_filter_returns_
+    /// matching_staged_rows` pins the current behavior.
     ///
-    /// This method remains on the surface for primitive-level testing
-    /// (basic stage + scan correctness without filters works) and for
-    /// callers that don't need filter pushdown.
+    /// Production never depended on either side of this. The engine's
+    /// `MutationStaging` accumulator unions in-memory pending batches with
+    /// the committed scan via DataFusion `MemTable` for read-your-writes
+    /// (see `scan_with_pending`), and no production caller passes a filter
+    /// here. This method remains on the surface for primitive-level testing.
     pub async fn scan_with_staged(
         &self,
         ds: &Dataset,
@@ -2936,10 +2955,7 @@ impl TableStore {
         Ok(count as usize)
     }
 
-    async fn user_indices_for_column(
-        ds: &Dataset,
-        column: &str,
-    ) -> Result<Vec<IndexMetadata>> {
+    async fn user_indices_for_column(ds: &Dataset, column: &str) -> Result<Vec<IndexMetadata>> {
         let field_id = ds
             .schema()
             .field(column)
@@ -3028,6 +3044,7 @@ impl TableStore {
 
     pub async fn write_dataset(dataset_uri: &str, batch: RecordBatch) -> Result<Dataset> {
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let control_session = crate::lance_access::control_session();
         let params = WriteParams {
             mode: WriteMode::Create,
             enable_stable_row_ids: true,
@@ -3035,6 +3052,7 @@ impl TableStore {
             allow_external_blob_outside_bases: true,
             auto_cleanup: None,
             skip_auto_cleanup: true,
+            session: Some(control_session),
             ..Default::default()
         };
         Dataset::write(reader, dataset_uri, Some(params))
@@ -3781,7 +3799,7 @@ fn validate_keyed_write_batch_ids(
     Ok(source_ids)
 }
 
-/// Assert the exact RFC-023 substrate proof carried by beta.21's v2
+/// Assert the exact RFC-023 substrate proof carried by pinned Lance's v2
 /// merge-insert route.  Checking both public copies makes a future Lance
 /// refactor that drops the transaction-level conflict filter fail closed.
 fn validate_exact_id_filter(
@@ -4413,8 +4431,7 @@ fn check_batch_unique_by_keys(
         if !seen.insert(v) {
             return Err(OmniError::manifest(format!(
                 "{}: duplicate source row for key '{}' (column '{}'); \
-                 callers must hand in a batch unique by `key_columns` \
-                 — see MR-957",
+                 callers must hand in a batch unique by `key_columns`",
                 context, v, key_col_name
             )));
         }
@@ -4450,8 +4467,8 @@ mod tests {
             "unexpected error: {msg}"
         );
         assert!(
-            msg.contains("MR-957"),
-            "error should reference MR-957: {msg}"
+            msg.contains("unique by `key_columns`"),
+            "error should state the unique-batch precondition: {msg}"
         );
     }
 

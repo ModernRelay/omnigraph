@@ -143,6 +143,39 @@ pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestSta
     let version = dataset.version().version;
     // The table-state hot path never needs lineage, so don't pay its JSON decode.
     let scan = read_manifest_scan(dataset, false).await?;
+    manifest_state_from_scan(version, scan)
+}
+
+/// Read the visible table state and complete graph-lineage projection from one
+/// coherent `__manifest` scan.
+///
+/// `GraphCoordinator` needs both projections. Keeping them in one pass avoids a
+/// second dataset open/full scan and guarantees its table snapshot and lineage
+/// cache describe the exact same manifest version.
+pub(super) async fn read_manifest_state_and_lineage(
+    dataset: &Dataset,
+) -> Result<(ManifestState, Vec<GraphLineageRow>)> {
+    let version = dataset.version().version;
+    let ManifestScan {
+        table_registrations,
+        version_entries,
+        tombstones,
+        lineage_rows,
+        graph_heads,
+    } = read_manifest_scan(dataset, true).await?;
+    let state = assemble_manifest_state(
+        version,
+        table_registrations,
+        version_entries,
+        tombstones
+            .into_iter()
+            .map(|t| (t.identity, t.tombstone_version)),
+        graph_heads,
+    )?;
+    Ok((state, lineage_rows))
+}
+
+fn manifest_state_from_scan(version: u64, scan: ManifestScan) -> Result<ManifestState> {
     assemble_manifest_state(
         version,
         scan.table_registrations,
@@ -358,6 +391,7 @@ fn decode_graph_head_row(
 }
 
 async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<ManifestScan> {
+    crate::instrumentation::record_manifest_scan();
     // Project only the columns the assembly below reads (RFC-013 PR2 #1c). The
     // `object_id` is needed for the bounded graph-head authority decode on every
     // path; `base_objects` remains reserved/unused. Mirrors Lance's own
@@ -588,6 +622,7 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
 pub(crate) async fn read_graph_lineage(
     dataset: &Dataset,
 ) -> Result<(Vec<GraphLineageRow>, HashMap<String, String>)> {
+    crate::instrumentation::record_manifest_scan();
     let batches: Vec<RecordBatch> = dataset
         .scan()
         .try_into_stream()

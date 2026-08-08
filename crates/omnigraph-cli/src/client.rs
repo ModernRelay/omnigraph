@@ -29,10 +29,10 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
-    ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest,
-    InvokeStoredQueryRequest, ReadOutput,
-    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
-    ingest_output, read_output, schema_apply_output, snapshot_payload,
+    ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphListResponse, IngestOutput,
+    IngestRequest, InvokeStoredQueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
+    SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output, ingest_output, read_output,
+    schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::Method;
@@ -41,21 +41,17 @@ use serde_json::Value;
 use crate::cli::CliLoadMode;
 use crate::helpers::{
     apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
-    legacy_change_request_body, query_params_from_json,
-    remote_json, remote_url, resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token,
-    resolve_server_flag, select_named_query,
+    legacy_change_request_body, query_params_from_json, remote_json, remote_url, resolve_cli_actor,
+    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
-use crate::output::{LoadOutput, load_output_from_result, load_output_from_tables};
+use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_result};
 
 pub(crate) enum GraphClient {
     /// Local engine at `uri`. Reads (`resolve()`) leave `actor` empty;
     /// writes (`resolve_with_policy()`) attribute the resolved actor.
     /// Direct-store access carries no Cedar policy (RFC-011: policy lives
     /// in the cluster/server, not in per-operator addressing).
-    Embedded {
-        uri: String,
-        actor: Option<String>,
-    },
+    Embedded { uri: String, actor: Option<String> },
     /// Remote HTTP server. The actor is resolved server-side from the
     /// token; the client never sets identity.
     Remote {
@@ -72,21 +68,11 @@ pub(crate) enum GraphClient {
 /// a policy-gated `/graphs`, or an unreachable server all proceed — the bare URL
 /// is then correct, or the real request surfaces the failure. Only fires on the
 /// no-graph path, so a `--graph`/`default_graph` happy path does no extra I/O.
-async fn require_graph_for_multi_graph_server(
-    scope: &crate::scope::ResolvedScope,
-) -> Result<()> {
+async fn require_graph_for_multi_graph_server(scope: &crate::scope::ResolvedScope) -> Result<()> {
     let (Some(server), None) = (scope.server.as_deref(), scope.graph.as_deref()) else {
         return Ok(());
     };
-    let Some(base) = resolve_server_flag(Some(server), None)? else {
-        return Ok(());
-    };
-    let token = resolve_remote_bearer_token(Some(&base))?;
-    let probe = GraphClient::Remote {
-        http: build_http_client()?,
-        base_url: base,
-        token,
-    };
+    let probe = GraphClient::registry_client(server)?;
     if let Ok(resp) = probe.list_graphs().await {
         if !resp.graphs.is_empty() {
             let ids: Vec<&str> = resp.graphs.iter().map(|g| g.graph_id.as_str()).collect();
@@ -116,6 +102,60 @@ fn reject_positional_remote(via_server: bool, uri: &str) -> Result<()> {
 }
 
 impl GraphClient {
+    /// The single owner of registry (`GET /graphs`) addressing: the bare base
+    /// URL of `server` (a config name or literal URL) — never `/graphs/<id>`
+    /// — with the keyed bearer-token chain. Synchronous: pure config
+    /// resolution, no I/O. Used by the RFC-011 D7 multi-graph probe and the
+    /// `graphs list` registry factory.
+    fn registry_client(server: &str) -> Result<Self> {
+        let base = resolve_server_flag(Some(server), None)?.expect("server name is present");
+        let token = resolve_remote_bearer_token(Some(&base))?;
+        Ok(GraphClient::Remote {
+            http: build_http_client()?,
+            base_url: base,
+            token,
+        })
+    }
+
+    /// Served-REGISTRY factory (RFC-011): resolve a server scope (`--server`
+    /// / `--profile` / `defaults.server`) to the bare server base URL for
+    /// `graphs list`. Synchronous by design: the RFC-011 D7 multi-graph probe
+    /// (`require_graph_for_multi_graph_server`) is async, so it structurally
+    /// cannot run on this path — `graphs list` IS the enumeration the probe
+    /// performs. There is no graph selection and no `/graphs/<id>` append; a
+    /// scope's `default_graph` is deliberately ignored (rejecting a config
+    /// default would make `graphs list` unusable in any profile that sets
+    /// one, and the registry is server-scoped either way). An explicit
+    /// `--graph` never reaches here — the addressing guard rejects it.
+    pub(crate) fn resolve_registry(server: Option<&str>, profile: Option<&str>) -> Result<Self> {
+        let scope = crate::scope::resolve_scope(
+            &crate::operator::load_operator_config()?,
+            crate::planes::Capability::Served,
+            crate::scope::ScopeFlags {
+                profile,
+                store: None,
+                server,
+                cluster: None,
+                graph: None,
+                uri: None,
+            },
+        )?;
+        let Some(server) = scope.server.as_deref() else {
+            bail!(
+                "`graphs list` needs a server scope — pass --server <name|url> or \
+                 --profile <name>, or set `defaults.server` in ~/.omnigraph/config.yaml"
+            );
+        };
+        let client = Self::registry_client(server)?;
+        if !is_remote_uri(client.uri()) {
+            bail!(
+                "a server scope resolves to an http(s):// URL; `{}` is not one",
+                client.uri()
+            );
+        }
+        Ok(client)
+    }
+
     /// Resolve the addressing (positional URI / `--target` / `--server`)
     /// and credential once, then pick the variant by URI scheme — the
     /// single branch point that replaces every per-command `is_remote`
@@ -123,6 +163,7 @@ impl GraphClient {
     /// path, not the policy-bearing `resolve_cli_graph`). Used by reads
     /// and `query` (which opens without policy, like the reads).
     pub(crate) async fn resolve(
+        capability: crate::planes::Capability,
         server: Option<&str>,
         graph: Option<&str>,
         uri: Option<String>,
@@ -131,18 +172,25 @@ impl GraphClient {
     ) -> Result<Self> {
         // RFC-011: a scope (profile / --store / operator defaults) may stand in
         // for omitted addressing. The explicit branch passes server/graph/uri
-        // straight through, so existing invocations are unchanged.
+        // straight through, so existing invocations are unchanged. The caller
+        // threads its verb's declared capability (planes::command_capability)
+        // so scope resolution and the addressing guard share one
+        // classification; every current caller is a data-plane (`Any`) verb —
+        // registry-scoped `graphs list` uses `resolve_registry` instead.
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
-            crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
+            capability,
+            crate::scope::ScopeFlags {
+                profile,
+                store,
+                server,
+                cluster: None,
+                graph,
+                uri,
+            },
         )?;
         require_graph_for_multi_graph_server(&scope).await?;
-        let (server, graph, uri) = (
-            scope.server.as_deref(),
-            scope.graph.as_deref(),
-            scope.uri,
-        );
+        let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
         let via_server = server.is_some();
         let uri = apply_server_flag(server, graph, uri)?;
         let token = resolve_remote_bearer_token(uri.as_deref())?;
@@ -166,6 +214,7 @@ impl GraphClient {
     /// resolution order matches the write arms exactly: server flag →
     /// bearer token → graph.
     pub(crate) async fn resolve_with_policy(
+        capability: crate::planes::Capability,
         server: Option<&str>,
         graph: Option<&str>,
         uri: Option<String>,
@@ -174,18 +223,29 @@ impl GraphClient {
         store: Option<&str>,
     ) -> Result<Self> {
         // RFC-011 scope translation (see `resolve`); explicit addressing passes
-        // through unchanged.
+        // through unchanged, and the caller threads its verb's declared
+        // capability.
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
-            crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
+            capability,
+            crate::scope::ScopeFlags {
+                profile,
+                store,
+                server,
+                cluster: None,
+                graph,
+                uri,
+            },
         )?;
+        Self::resolve_with_policy_scope(scope, cli_as).await
+    }
+
+    async fn resolve_with_policy_scope(
+        scope: crate::scope::ResolvedScope,
+        cli_as: Option<&str>,
+    ) -> Result<Self> {
         require_graph_for_multi_graph_server(&scope).await?;
-        let (server, graph, uri) = (
-            scope.server.as_deref(),
-            scope.graph.as_deref(),
-            scope.uri,
-        );
+        let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
         let via_server = server.is_some();
         let uri = apply_server_flag(server, graph, uri)?;
         let token = resolve_remote_bearer_token(uri.as_deref())?;
@@ -362,8 +422,8 @@ impl GraphClient {
 
     /// `load` — bulk-load `data` (a file path) onto `branch`, forking from
     /// `from` if missing. Returns the CLI `LoadOutput`; each arm keeps its
-    /// own mapping (remote sums the wire `IngestOutput.tables`, embedded
-    /// reads the richer `LoadResult` directly) — preserved exactly.
+    /// own mapping (remote uses the logical graph-batch result, embedded reads
+    /// the engine `LoadResult` directly).
     pub(crate) async fn load(
         &self,
         branch: &str,
@@ -378,39 +438,51 @@ impl GraphClient {
                 token,
             } => {
                 let data = std::fs::read_to_string(data)?;
-                // RFC-009 Phase 5: the canonical `load` verb targets the
-                // canonical `/load` route (the deprecated `ingest` verb below
-                // still rides `/ingest`).
-                let output = remote_json::<IngestOutput>(
-                    http,
-                    Method::POST,
-                    remote_url(base_url, &["load"], &[])?,
-                    Some(serde_json::to_value(IngestRequest {
-                        branch: Some(branch.to_string()),
-                        from: from.map(ToOwned::to_owned),
-                        mode: Some(mode.into()),
-                        data,
-                    })?),
+                let mut query = vec![("branch", branch), ("mode", mode.as_str())];
+                if let Some(from) = from {
+                    query.push(("from", from));
+                }
+                let request = apply_bearer_token(
+                    http.request(
+                        Method::POST,
+                        remote_url(base_url, &["load", "ndjson"], &query)?,
+                    ),
                     token.as_deref(),
                 )
-                .await?;
-                Ok(load_output_from_tables(base_url, branch, mode.as_str(), &output))
+                .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+                .body(data);
+                let response = request.send().await?;
+                let status = response.status();
+                let text = response.text().await?;
+                if !status.is_success() {
+                    if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
+                        bail!(error.error);
+                    }
+                    bail!("server returned {}: {}", status, text);
+                }
+                let output: GraphBatchLoadOutput = serde_json::from_str(&text)?;
+                Ok(load_output_from_graph_batch(
+                    base_url,
+                    mode.as_str(),
+                    &output,
+                ))
             }
             GraphClient::Embedded { uri, actor } => {
                 let db = Self::open_embedded(uri).await?;
+                let data = std::fs::read_to_string(data)?;
                 let result = db
-                    .load_file_as(branch, from, data, mode.into(), actor.as_deref())
+                    .load_graph_batch_as(branch, from, &data, mode.into(), actor.as_deref())
                     .await?;
                 Ok(load_output_from_result(uri, branch, mode.as_str(), &result))
             }
         }
     }
 
-    /// `ingest` — the deprecated alias of `load`. Same operation, but the
-    /// surfaced shape is the wire `IngestOutput` (printed by
-    /// `print_ingest_human`), so it is its own method. The embedded arm
-    /// echoes `actor_id: None` in the output exactly as the legacy arm did
-    /// (the actor is still attributed on the commit via `load_file_as`).
+    /// `ingest` — the deprecated loader-compatible path. Unlike canonical
+    /// `load`, it retains the historical permissive parser and JSON `/ingest`
+    /// wire shape. The embedded arm echoes `actor_id: None` in the output
+    /// exactly as the legacy arm did (the actor is still attributed on the
+    /// commit via `load_file_as`).
     pub(crate) async fn ingest(
         &self,
         branch: &str,
@@ -813,11 +885,11 @@ impl GraphClient {
         }
     }
 
-    /// `graphs list` — enumerate the graphs a remote multi-graph server
-    /// serves (`GET /graphs`). Remote-only by design: there is no local
-    /// enumeration endpoint, so the Embedded arm fails loudly. Routing it
-    /// through the enum still buys the shared `resolve()` addressing/token
-    /// preamble.
+    /// `graphs list` — enumerate the graphs a multi-graph server serves
+    /// (`GET /graphs`). Reached only through registry-addressed clients
+    /// (`resolve_registry` / the D7 probe's `registry_client`), which always
+    /// build the Remote variant — the Embedded arm is unreachable by
+    /// construction and kept as a defensive internal-invariant bail.
     pub(crate) async fn list_graphs(&self) -> Result<GraphListResponse> {
         match self {
             GraphClient::Remote {
@@ -835,10 +907,28 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { .. } => bail!(
-                "`omnigraph graphs list` requires a remote multi-graph server \
-                 (--server <url>). To enumerate the graphs in a cluster, run \
-                 `omnigraph cluster status --config <dir>`."
+                "internal error: `graphs list` reached an embedded client — registry \
+                 addressing always resolves a server"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_registry_is_sync_and_yields_the_bare_base_url() {
+        // Structural proof the RFC-011 D7 multi-graph probe cannot fire on the
+        // graphs-list path: resolve_registry is synchronous (called here with
+        // no tokio runtime), while the probe is async and performs GET
+        // /graphs. Also pins the URL-corruption fix: the bare base URL with
+        // the trailing slash trimmed and no `/graphs/<id>` segment. A literal
+        // `://` --server value bypasses the operator server registry, so a
+        // developer's real config cannot change the outcome.
+        let client = GraphClient::resolve_registry(Some("http://server.invalid:9/"), None).unwrap();
+        assert_eq!(client.uri(), "http://server.invalid:9");
+        assert!(client.is_remote());
     }
 }

@@ -177,6 +177,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/schema",
     "/graphs/{graph_id}/schema/apply",
     "/graphs/{graph_id}/load",
+    "/graphs/{graph_id}/load/ndjson",
     "/graphs/{graph_id}/ingest",
     "/graphs/{graph_id}/branches",
     "/graphs/{graph_id}/branches/{branch}",
@@ -233,6 +234,23 @@ fn openapi_read_is_post() {
 fn openapi_export_is_post() {
     let doc = openapi_json();
     assert!(doc["paths"]["/graphs/{graph_id}/export"]["post"].is_object());
+}
+
+#[test]
+fn export_documents_pre_header_failures() {
+    let doc = openapi_json();
+    let responses = &doc["paths"]["/graphs/{graph_id}/export"]["post"]["responses"];
+    for status in ["400", "401", "403", "404", "409", "413", "503"] {
+        assert!(
+            responses[status].is_object(),
+            "export must document {status}"
+        );
+        assert_eq!(
+            responses[status]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ErrorOutput",
+            "export {status} must use ErrorOutput"
+        );
+    }
 }
 
 #[test]
@@ -318,6 +336,34 @@ fn openapi_load_is_not_deprecated() {
         !deprecated,
         "/load is the canonical load endpoint and must not be deprecated"
     );
+}
+
+#[test]
+fn openapi_raw_graph_batch_has_ndjson_body_and_logical_result() {
+    let doc = openapi_json();
+    let operation = &doc["paths"]["/graphs/{graph_id}/load/ndjson"]["post"];
+    assert!(operation.is_object());
+    assert!(operation["requestBody"]["content"]["application/x-ndjson"].is_object());
+    assert_eq!(
+        operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/GraphBatchLoadOutput"
+    );
+    let parameters = operation["parameters"].as_array().unwrap();
+    for name in ["branch", "from", "mode"] {
+        assert!(
+            parameters.iter().any(|parameter| parameter["name"] == name),
+            "raw graph-batch endpoint must document query parameter {name}"
+        );
+    }
+
+    let props = doc["components"]["schemas"]["GraphBatchLoadOutput"]["properties"]
+        .as_object()
+        .unwrap();
+    for field in ["branch", "nodes", "edges", "total_rows"] {
+        assert!(props.contains_key(field));
+    }
+    assert!(!props.contains_key("tables"));
+    assert!(!props.contains_key("table_key"));
 }
 
 #[test]
@@ -793,6 +839,7 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/graphs/{graph_id}/queries", "get"),
         ("/graphs/{graph_id}/queries/{name}", "post"),
         ("/graphs/{graph_id}/load", "post"),
+        ("/graphs/{graph_id}/load/ndjson", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
         ("/graphs/{graph_id}/export", "post"),
         ("/graphs/{graph_id}/snapshot", "get"),
@@ -981,6 +1028,7 @@ fn recovery_barrier_write_endpoints_document_recovery_required() {
         ("/graphs/{graph_id}/mutate", "post"),
         ("/graphs/{graph_id}/queries/{name}", "post"),
         ("/graphs/{graph_id}/load", "post"),
+        ("/graphs/{graph_id}/load/ndjson", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
         ("/graphs/{graph_id}/branches", "post"),
         ("/graphs/{graph_id}/branches/{branch}", "delete"),
@@ -1007,6 +1055,7 @@ fn bounded_keyed_write_endpoints_document_resource_limit() {
         ("/graphs/{graph_id}/mutate", "post"),
         ("/graphs/{graph_id}/queries/{name}", "post"),
         ("/graphs/{graph_id}/load", "post"),
+        ("/graphs/{graph_id}/load/ndjson", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
         ("/graphs/{graph_id}/branches/merge", "post"),
     ] {
@@ -1248,6 +1297,8 @@ const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/change",
     "/graphs/{graph_id}/schema",
     "/graphs/{graph_id}/schema/apply",
+    "/graphs/{graph_id}/load",
+    "/graphs/{graph_id}/load/ndjson",
     "/graphs/{graph_id}/ingest",
     "/graphs/{graph_id}/branches",
     "/graphs/{graph_id}/branches/{branch}",
@@ -1322,6 +1373,8 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
         "/change",
         "/schema",
         "/schema/apply",
+        "/load",
+        "/load/ndjson",
         "/ingest",
         "/branches",
         "/branches/{branch}",
@@ -1522,6 +1575,7 @@ async fn served_spec_always_nests_under_cluster_prefix() {
         "/schema",
         "/schema/apply",
         "/load",
+        "/load/ndjson",
         "/ingest",
         "/branches",
         "/branches/{branch}",

@@ -16,7 +16,7 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
 URI): query, mutate, load, branch, snapshot, export, commit, schema show/apply.\n  \
-served — require a server: graphs.\n  \
+served — require a server: graphs (registry scope).\n  \
 direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
 schema plan, lint).\n  \
 control — manage or inspect a cluster (cluster via --config; policy & queries via \
@@ -24,9 +24,10 @@ control — manage or inspect a cluster (cluster via --config; policy & queries 
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
 See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
-    /// Actor id for direct-engine writes; overrides `cli.actor`. No effect on
-    /// remote writes (the server resolves the actor from the bearer token).
-    /// With a policy configured but no actor set, the write is denied — see
+    /// Actor id for direct-engine writes and actor-bound cluster operations;
+    /// overrides `operator.actor`. No effect on remote writes (the server
+    /// resolves the actor from the bearer token). With a policy configured
+    /// but no actor set, the operation is denied — see
     /// docs/user/operations/policy.md.
     #[arg(long = "as", global = true, value_name = "ACTOR")]
     pub(crate) as_actor: Option<String>,
@@ -38,13 +39,13 @@ pub(crate) struct Cli {
     pub(crate) server: Option<String>,
 
     /// Select a graph within a multi-graph scope: on a `--server` it appends
-    /// `/graphs/<id>` to the server url; on a `--cluster` it picks which
-    /// cluster graph to maintain. Rejected on a single-graph address (a
-    /// positional URI / `--store`).
+    /// `/graphs/<id>` to the server url; on `--cluster` it picks which cluster
+    /// graph to maintain. Rejected on a single-graph address (a positional URI /
+    /// `--store`).
     #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
 
-    /// Select a named scope bundle (RFC-011) from `profiles:` in
+    /// Select a named scope bundle from `profiles:` in
     /// ~/.omnigraph/config.yaml: fills in this command's omitted addressing
     /// (server/cluster/store + default graph). Falls back to
     /// $OMNIGRAPH_PROFILE. Config data, not state — every command resolves
@@ -52,13 +53,13 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     pub(crate) profile: Option<String>,
 
-    /// Address a single graph's storage directly (RFC-011): a `file://` /
+    /// Address a single graph's storage directly: a `file://` /
     /// `s3://` store URI. Explicit, ad-hoc direct access — bypasses any
     /// server. Exclusive with a positional URI / `--server`.
     #[arg(long, global = true, value_name = "URI")]
     pub(crate) store: Option<String>,
 
-    /// Address a cluster-managed graph's storage for maintenance (RFC-011):
+    /// Address a cluster-managed graph's storage for maintenance:
     /// a cluster directory or storage-root URI — named via `clusters:` in
     /// ~/.omnigraph/config.yaml, or a literal `file://`/`s3://` root. Pair
     /// with `--graph <id>` to select the graph. Used by optimize / repair /
@@ -67,14 +68,14 @@ pub(crate) struct Cli {
     pub(crate) cluster: Option<String>,
 
     /// Skip the confirmation prompt for a destructive write (`cleanup`,
-    /// overwrite `load`, `branch delete`) against a non-local scope (RFC-011
-    /// Decision 9). Without it, a non-local destructive write prompts on a TTY
+    /// overwrite `load`, `branch delete`) against a non-local scope.
+    /// Without it, a non-local destructive write prompts on a TTY
     /// and refuses (errors) when there is no TTY or `--json` is set.
     #[arg(long, global = true)]
     pub(crate) yes: bool,
 
     /// Suppress the one-line resolved-write-target diagnostic that write
-    /// commands echo to stderr (RFC-011 Decision 9).
+    /// commands echo to stderr.
     #[arg(long, global = true)]
     pub(crate) quiet: bool,
 
@@ -100,7 +101,12 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
         /// Inline ad-hoc GQ source — alternative to `--query <path>`.
-        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
+        #[arg(
+            short = 'e',
+            long = "query-string",
+            value_name = "GQ",
+            conflicts_with = "query"
+        )]
         query_string: Option<String>,
         #[command(flatten)]
         params: ParamsArgs,
@@ -128,7 +134,12 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
         /// Inline ad-hoc GQ source — alternative to `--query <path>`.
-        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
+        #[arg(
+            short = 'e',
+            long = "query-string",
+            value_name = "GQ",
+            conflicts_with = "query"
+        )]
         query_string: Option<String>,
         #[command(flatten)]
         params: ParamsArgs,
@@ -137,7 +148,7 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Invoke an operator alias (RFC-011 Decision 4).
+    /// Invoke an operator alias.
     ///
     /// An alias is a personal binding under `aliases:` in
     /// ~/.omnigraph/config.yaml — name → (server, graph, stored-query name,
@@ -177,7 +188,7 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Deprecated alias of `load --from <base>` (defaults: --mode merge, --from main)
+    /// Deprecated loader-compatible ingestion command (defaults: --mode merge, --from main)
     #[command(hide = true)]
     Ingest {
         /// Graph URI
@@ -230,7 +241,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: SchemaCommand,
     },
-    /// Manage graphs on a multi-graph server (MR-668)
+    /// Manage graphs on a multi-graph server
     Graphs {
         #[command(subcommand)]
         command: GraphsCommand,
@@ -246,7 +257,7 @@ pub(crate) enum Command {
         /// Overwrite existing schema artifacts at the URI. Without
         /// this flag, init refuses to touch a URI that already holds
         /// `_schema.pg`, `_schema.ir.json`, or `__schema_state.json`
-        /// — closes the re-init footgun (MR-668 follow-up). With the
+        /// — closes the re-init footgun. With the
         /// flag, the operator opts in to destructive semantics.
         #[arg(long)]
         force: bool,
@@ -300,8 +311,7 @@ pub(crate) enum Command {
     /// shim that prints a one-line stderr warning and rewrites to
     /// `omnigraph lint`. Aliases are deliberately *not* exposed via
     /// clap's `visible_alias` because that would advertise two
-    /// equivalent canonical names, which agents emit interchangeably
-    /// (see MR-981).
+    /// equivalent canonical names, which agents emit interchangeably.
     Lint {
         /// Graph URI
         uri: Option<String>,
@@ -463,17 +473,15 @@ pub(crate) enum ClusterCommand {
 
 /// Operations on the graph registry of a multi-graph server (MR-668).
 ///
-/// All operations target a remote multi-graph server URL (http:// or
-/// https://). Local-URI invocations return a clear error. To add or
-/// remove graphs, operators edit `omnigraph.yaml` directly and restart
-/// the server — runtime mutation is not exposed in v0.6.0.
+/// Registry scope (RFC-011): these address the server itself, not a graph
+/// within it — `--server <name|url>` / `--profile <name>` apply, while
+/// `--graph`, `--store`, and `--as` are rejected by the addressing guard.
+/// To add or remove graphs, operators run `cluster apply` and restart the
+/// server — runtime mutation is not exposed.
 #[derive(Debug, Subcommand)]
 pub(crate) enum GraphsCommand {
     /// List every graph registered with the multi-graph server.
     List {
-        /// Remote server URL (e.g. `https://server.example.com`).
-        #[arg(long)]
-        uri: Option<String>,
         #[arg(long)]
         json: bool,
     },

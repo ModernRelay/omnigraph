@@ -370,13 +370,14 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
         .await
         .unwrap();
 
-    // An id BTREE makes beta.21's default merge route select v1, which emits
+    // An id BTREE makes pinned Lance's default merge route select v1, which emits
     // no key filter.  The keyed adapter must override that routing choice.
     let staged_index = store
         .stage_create_indices(
             &ds,
             &[IndexBuildSpec::BTree {
                 column: "id".to_string(),
+                name: None,
             }],
         )
         .await
@@ -594,6 +595,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
             &ds,
             &[IndexBuildSpec::BTree {
                 column: "id".to_string(),
+                name: None,
             }],
         )
         .await
@@ -1794,21 +1796,23 @@ async fn exact_overwrite_rejects_foreign_append_without_altering_the_winner() {
     );
 }
 
-/// **Documented limitation** (see `scan_with_staged` doc): when a filter
-/// is supplied, Lance's stats-based pruning drops the staged fragment from
-/// the filtered scan because uncommitted fragments produced by
-/// `write_fragments_internal` lack per-column statistics. The result
-/// contains only matching committed rows; matching staged rows are
-/// silently absent. `scanner.use_stats(false)` does not bypass this in
-/// lance 6.0.1.
+/// **Limitation closed at the Lance 9.0.0 bump.** Through 9.0.0-rc.1, a
+/// filtered `scan_with_staged` silently dropped matching staged rows:
+/// Lance's stats-based pruning discarded the staged fragment because
+/// uncommitted fragments produced by `write_fragments_internal` lack
+/// per-column statistics, and `scanner.use_stats(false)` did not bypass
+/// it. This test pinned that behavior with an explicit instruction to
+/// rewrite it if Lance ever scanned uncommitted fragments without
+/// stats-based pruning.
 ///
-/// This test pins the actual behavior so a future change either
-/// preserves it (and updates the doc) or fixes it (and rewrites this
-/// test). The engine's `MutationStaging` accumulator unions in-memory
-/// pending batches with the committed scan via DataFusion `MemTable`
-/// for read-your-writes instead, so production code is unaffected.
+/// Lance 9.0.0 does exactly that, so the assertion is now the correct
+/// semantics: a filtered staged scan returns matching committed *and*
+/// staged rows. Production was never affected either way — the engine's
+/// `MutationStaging` accumulator unions in-memory pending batches with
+/// the committed scan via DataFusion `MemTable` for read-your-writes, and
+/// no production caller uses `scan_with_staged` with a filter.
 #[tokio::test]
-async fn scan_with_staged_with_filter_silently_drops_staged_rows() {
+async fn scan_with_staged_with_filter_returns_matching_staged_rows() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
@@ -1831,21 +1835,20 @@ async fn scan_with_staged_with_filter_silently_drops_staged_rows() {
         .await
         .unwrap();
 
-    // Filter: age >= 30. Correct semantics would return alice, carol, dave.
-    // Actual: dave (staged, age=35) is dropped — only the committed matches
-    // come back.
+    // Filter: age >= 30 must return every match, committed or staged —
+    // alice and carol from the committed image plus the staged dave.
     let batches = store
         .scan_with_staged(&ds, std::slice::from_ref(&staged), None, Some("age >= 30"))
         .await
         .unwrap();
     assert_eq!(
         collect_ids(&batches),
-        vec!["alice", "carol"],
-        "documented limitation: filter pushdown drops staged fragments. \
-         If you're here because this assertion failed: either (a) Lance \
-         exposed a way to scan uncommitted fragments without stats-based \
-         pruning (good — update to assert == [alice, carol, dave]), or \
-         (b) something changed in our scan_with_staged path."
+        vec!["alice", "carol", "dave"],
+        "a filtered staged scan must return matching staged rows. Through \
+         9.0.0-rc.1 stats-based pruning dropped the staged fragment and this \
+         asserted [alice, carol]; Lance 9.0.0 closed that gap. A regression \
+         here means either Lance reintroduced the pruning or our \
+         scan_with_staged path changed."
     );
 
     // Without filter, staged data IS visible — confirms the issue is

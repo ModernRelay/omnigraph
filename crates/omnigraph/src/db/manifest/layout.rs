@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use lance::Dataset;
 use lance_namespace::Error as LanceNamespaceError;
 
@@ -12,12 +14,22 @@ pub(crate) fn manifest_uri(root: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), MANIFEST_DIR)
 }
 
+#[cfg(test)]
 pub(super) async fn open_manifest_dataset(root_uri: &str, branch: Option<&str>) -> Result<Dataset> {
+    let control_session = crate::lance_access::control_session();
+    open_manifest_dataset_with_session(root_uri, branch, &control_session).await
+}
+
+pub(super) async fn open_manifest_dataset_with_session(
+    root_uri: &str,
+    branch: Option<&str>,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<Dataset> {
     let uri = manifest_uri(root_uri.trim_end_matches('/'));
     let dataset = crate::instrumentation::open_dataset(
         &uri,
         crate::instrumentation::VersionResolution::Latest,
-        None,
+        Some(control_session),
         crate::instrumentation::manifest_wrapper(),
     )
     .await?;

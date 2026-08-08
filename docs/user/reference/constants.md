@@ -11,8 +11,10 @@
 | Schema apply lock | `__schema_apply_lock__` | schema apply |
 | Manifest publisher retry budget | `PUBLISHER_RETRY_BUDGET = 5` | manifest publish |
 | Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 6` | strict RFC-023 fencing strand; preserves v5's SchemaIR-v2 identity-bearing manifest/recovery ownership |
-| Keyed-write row ceiling | `KEYED_WRITE_MAX_ROWS = 8192` | one Mutation/Load keyed table or one BranchMerge chunk; inclusive |
+| Keyed-write row ceiling | `KEYED_WRITE_MAX_ROWS = 8192` | one Mutation/Load keyed table (`mutate`, `load --mode append`/`merge`) or one BranchMerge chunk; inclusive. `load --mode overwrite` stages a whole-table replacement transaction and is not subject to the keyed ceiling |
 | Keyed-write Arrow-memory ceiling | `KEYED_WRITE_MAX_BYTES = 33,554,432` (32 MiB) | accumulated Mutation/Load keyed input (including pending state plus a streamed mutation-update match set) or one BranchMerge row/upsert/delete-filter chunk; a single larger row is refused before sidecar arm. Stored update Blobs and keyed external-URI ranges/object sizes are charged before payload reads. The complete retained BranchMerge delete plan and the operation-wide projected scalar validation delta are separately capped at the same value; ordered merge and validation scans explicitly apply it as Lance's per-batch decoded-byte ceiling. Overwrite retains external-reference semantics |
+| Served export scan targets and chunk ceiling | initial `8,192`-row estimate and approximate `33,554,432` decoded-Arrow-byte target; emitted chunks: hard `65,536`-byte maximum | `POST /graphs/{id}/export` incrementally scans exact pinned Lance versions without whole-table collection. Lance's byte target overrides the row setting; neither scanner setting is a hard limit. Blob descriptor batches are sliced to one logical row before that row's complete Blob-property set is materialized. One row remains indivisible scratch before its encoded JSONL is split into bounded transport chunks |
+| Served export transport budget | `2` queued chunks; `262,144` bytes reserved per response queue envelope; `2,097,152` bytes process-wide; `250 ms` reservation deadline; `1` nonwaiting immutable cut per graph root | each reservation covers two queued chunks, one producer chunk awaiting admission, and one consumer-current chunk. At most eight reservations coexist. Saturation or an occupied graph cut returns typed HTTP 413 before success headers; response and producer ownership retain the permit and cut until completion or disconnect unwinds both |
 | Maintenance concurrency | `OMNIGRAPH_MAINTENANCE_CONCURRENCY=8` | optimize/cleanup |
 | Graph index cache size | `8` (LRU) | runtime cache |
 | Expand indexed-path frontier ceiling | `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER=1024` | traversal |
@@ -20,7 +22,9 @@
 | Expand CSR-build cost factor | `CSR_BUILD_FACTOR = 1.5` | traversal |
 | Expand mode override | `OMNIGRAPH_TRAVERSAL_MODE` (`indexed`\|`csr`; unset = cost-based auto) | traversal |
 | Default body limit | `1 MB` | HTTP server |
-| Load (bulk-write) body limit | `32 MB` | HTTP server (`/load`; shared by the deprecated `/ingest` alias) |
+| Load (bulk-write) body limit | `32 MiB` | HTTP server (`/load`, `/load/ndjson`, and the deprecated `/ingest` alias) |
+| Strict graph-batch line limit | `GRAPH_BATCH_MAX_LINE_BYTES = 33,554,432` (32 MiB) | each nonblank logical node/edge envelope read by `load_graph_batch{,_as}`; an oversized tail is discarded through its newline without retaining it |
+| Strict graph-batch structural limit | `GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS = 131,072` (64 MiB modeled DOM budget at 512 bytes/slot) | pre-DOM guard over JSON object/array delimiters, commas, and colons; excess fails as typed `graph_batch_json_structural_slots` |
 | Default embed provider/model | `openai-compatible` / `openai/text-embedding-3-large` | engine embedding |
 | OpenAI-direct embed model | `text-embedding-3-large` | engine embedding |
 | Gemini-direct embed model | `gemini-embedding-2` | engine embedding |

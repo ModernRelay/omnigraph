@@ -189,12 +189,14 @@ async fn create_recoveries_dataset(root_uri: &str) -> Result<Dataset> {
     let uri = recoveries_uri(root_uri);
     let batch = RecordBatch::new_empty(recoveries_schema());
     let reader = RecordBatchIterator::new(vec![Ok(batch)], recoveries_schema());
+    let control_session = crate::lance_access::control_session();
     let params = WriteParams {
         mode: WriteMode::Create,
         enable_stable_row_ids: true,
         data_storage_version: Some(LanceFileVersion::V2_2),
         auto_cleanup: None,
         skip_auto_cleanup: true,
+        session: Some(control_session),
         ..Default::default()
     };
     match Dataset::write(reader, &uri as &str, Some(params)).await {

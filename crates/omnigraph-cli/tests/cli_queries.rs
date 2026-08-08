@@ -1,13 +1,11 @@
 //! Stored-query commands and alias resolution.
 //! Moved verbatim from tests/cli.rs in the modularization.
 
-
 use tempfile::tempdir;
 
 mod support;
 
 use support::*;
-
 
 #[test]
 fn query_check_alias_matches_lint_output() {
@@ -115,6 +113,49 @@ fn alias_rejects_global_scope_flags_that_the_binding_owns() {
 }
 
 #[test]
+fn queries_list_with_store_flag_errors() {
+    // `queries list` reads a cluster's applied state; a single-graph `--store`
+    // address can never apply. Rejected loudly at the addressing guard (was:
+    // silently ignored, then failed later asking for a cluster).
+    let output = output_failure(
+        cli()
+            .arg("--store")
+            .arg("file:///tmp/graph.omni")
+            .arg("queries")
+            .arg("list"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`queries list` is a cluster control command")
+            && stderr
+                .contains("--store addresses a single graph's storage directly and does not apply"),
+        "expected the addressing-guard store rejection; got: {stderr}"
+    );
+}
+
+#[test]
+fn queries_list_with_as_flag_errors() {
+    // Read-only control verbs (`queries`, `policy`, `cluster status`, …) never
+    // read the actor; only `cluster apply`/`cluster approve` do. `--as` on a
+    // non-attributing control verb must be a loud guard error, not a silently
+    // dropped identity (PR #377 review follow-up).
+    let output = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-alice")
+            .arg("queries")
+            .arg("list"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`queries list` is a cluster control command")
+            && stderr.contains("--as")
+            && stderr.contains("does not apply"),
+        "expected the addressing-guard --as rejection; got: {stderr}"
+    );
+}
+
+#[test]
 fn queries_and_policy_wrong_server_scope_points_at_cluster_scope() {
     let output = output_failure(cli().arg("--server").arg("prod").arg("queries").arg("list"));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -142,7 +183,11 @@ fn queries_and_policy_wrong_server_scope_points_at_cluster_scope() {
 
 /// Build a converged single-graph cluster (id `knowledge`) with one stored
 /// query. `query_block` is the YAML under the graph's `queries:` key.
-fn converged_cluster_with_query(query_file: &str, query_src: &str, query_block: &str) -> tempfile::TempDir {
+fn converged_cluster_with_query(
+    query_file: &str,
+    query_src: &str,
+    query_block: &str,
+) -> tempfile::TempDir {
     let temp = tempdir().unwrap();
     let dir = temp.path();
     std::fs::copy(fixture("test.pg"), dir.join("graph.pg")).unwrap();
@@ -248,7 +293,11 @@ fn queries_list_surfaces_description_and_instruction() {
 
     // Human output.
     let output = output_success(
-        cli().arg("queries").arg("list").arg("--cluster").arg(cluster.path()),
+        cli()
+            .arg("queries")
+            .arg("list")
+            .arg("--cluster")
+            .arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
     assert!(
@@ -296,7 +345,11 @@ fn queries_list_indents_multiline_annotation_continuation() {
         "      multi:\n        file: ./multi.gq\n",
     );
     let output = output_success(
-        cli().arg("queries").arg("list").arg("--cluster").arg(cluster.path()),
+        cli()
+            .arg("queries")
+            .arg("list")
+            .arg("--cluster")
+            .arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
     // "    description: " is 17 chars wide; the continuation aligns under it.
@@ -319,7 +372,11 @@ fn queries_list_omits_annotations_when_absent() {
 
     // Human output: the query is listed, but no annotation lines.
     let output = output_success(
-        cli().arg("queries").arg("list").arg("--cluster").arg(cluster.path()),
+        cli()
+            .arg("queries")
+            .arg("list")
+            .arg("--cluster")
+            .arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
     assert!(stdout.contains("bare()"), "stdout:\n{stdout}");

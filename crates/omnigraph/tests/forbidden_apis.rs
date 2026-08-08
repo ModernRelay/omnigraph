@@ -51,7 +51,7 @@
 //!
 //! After the exact EnsureIndices adapter, `db.storage()` (`&dyn TableStorage`)
 //! exposes only staged primitives + reads and there is no separate inline
-//! residual surface. Vector index creation uses beta.21's full-table
+//! residual surface. Vector index creation uses pinned Lance's full-table
 //! `execute_uncommitted` path inside `stage_create_indices`; `delete` likewise
 //! migrated to `stage_delete` in MR-A (Lance 7.0 #6658).
 //! The dead legacy methods
@@ -222,8 +222,8 @@ write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options"],
     "db/omnigraph.rs" => WriteProtocol::RecoveryExecutor => ["open", "open_with_storage", "refresh"],
     "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_as"],
-    "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_file"],
-    "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v9") => ["load_as", "load_file_as"],
+    "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_file", "load_graph_batch"],
+    "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v9") => ["load_as", "load_file_as", "load_graph_batch_as"],
     "loader/mod.rs" => WriteProtocol::Composed("branch create when absent, then Load v9 alias") => ["ingest", "ingest_as", "ingest_file", "ingest_file_as"],
     "db/omnigraph.rs" => WriteProtocol::Composed("SchemaApply v9 + sentinel ref + optional hard-drop GC") => ["apply_schema", "apply_schema_with_options", "apply_schema_as", "apply_schema_as_with_catalog_check"],
     "exec/merge.rs" => MERGE_V9 => ["branch_merge", "branch_merge_as"],
@@ -242,6 +242,7 @@ write_surfaces! {
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
+    ("db/omnigraph/export.rs", "capture_served_export_cut"),
     ("db/omnigraph.rs", "plan_schema"),
     ("db/omnigraph.rs", "plan_schema_with_options"),
     ("db/omnigraph.rs", "preview_schema_apply_with_options"),
@@ -273,7 +274,17 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
 // manifest publisher without changing the durable gateway count.
 const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     ("db/graph_coordinator.rs", "GraphCoordinator", "open"),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "open_with_session",
+    ),
     ("db/graph_coordinator.rs", "GraphCoordinator", "open_branch"),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "open_branch_with_session",
+    ),
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
@@ -329,6 +340,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
+        "resolve_commit_range",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
         "head_commit_id",
     ),
     (
@@ -337,18 +353,25 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "list_commits",
     ),
     ("db/manifest.rs", "ManifestCoordinator", "open"),
+    ("db/manifest.rs", "ManifestCoordinator", "open_with_session"),
     ("db/manifest.rs", "ManifestCoordinator", "open_at_branch"),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "open_at_branch_with_session",
+    ),
+    ("db/manifest.rs", "ManifestCoordinator", "open_with_lineage"),
     ("db/manifest.rs", "ManifestCoordinator", "snapshot_at"),
     ("db/manifest.rs", "ManifestCoordinator", "refresh"),
     (
         "db/manifest.rs",
         "ManifestCoordinator",
-        "read_graph_lineage_at",
+        "refresh_with_lineage",
     ),
     (
         "db/manifest.rs",
         "ManifestCoordinator",
-        "probe_latest_version",
+        "read_graph_lineage_at",
     ),
     ("db/manifest.rs", "ManifestCoordinator", "branch_identifier"),
     (
@@ -368,7 +391,7 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
-        "init",
+        "init_with_session",
         WriteProtocol::Bootstrap,
     ),
     (
@@ -386,6 +409,12 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
+        "branch_delete_captured",
+        WriteProtocol::NativeRefControl,
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
         "commit_updates_with_actor_with_expected",
         WriteProtocol::Exact("shared publisher gateway"),
     ),
@@ -398,7 +427,7 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/manifest.rs",
         "ManifestCoordinator",
-        "init",
+        "init_with_lineage",
         WriteProtocol::Bootstrap,
     ),
     (
@@ -417,6 +446,12 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
         "db/manifest.rs",
         "ManifestCoordinator",
         "delete_branch",
+        WriteProtocol::NativeRefControl,
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "delete_branch_with_expected",
         WriteProtocol::NativeRefControl,
     ),
 ];
@@ -464,9 +499,18 @@ macro_rules! gateway_surfaces {
 // or an entirely new primitive name before a crate-internal caller can use it.
 gateway_surfaces! {
     "storage.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
-        "read_text", "read_text_if_exists", "exists", "list_dir", "read_text_versioned",
+        "read_text", "read_text_if_exists", "read_text_if_exists_bounded", "exists",
+        "list_dir", "list_dir_bounded", "read_text_versioned",
     ],
     "storage.rs" => "StorageAdapter" => GatewayDisposition::Durable(WriteProtocol::Composed("object storage primitive")) => [
+        "write_text", "write_text_if_absent", "rename_text", "delete",
+        "write_text_if_match", "delete_prefix",
+    ],
+    "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
+        "read_text", "read_text_if_exists", "read_text_if_exists_bounded", "exists",
+        "list_dir", "list_dir_bounded", "read_text_versioned",
+    ],
+    "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::Durable(WriteProtocol::Composed("shared object storage primitive")) => [
         "write_text", "write_text_if_absent", "rename_text", "delete",
         "write_text_if_match", "delete_prefix",
     ],
@@ -509,6 +553,7 @@ gateway_surfaces! {
         "scan_proven_insert_delta_bounded",
         "materialize_blob_batch", "scan_stream", "scan_stream_bounded",
         "scan_stream_with", "scan", "scan_with", "scan_edges_by_endpoint",
+        "scan_edges_by_endpoint_projected",
         "key_column_index_coverage", "has_unindexed_fragments", "count_rows",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
         "scan_with_pending_materialized_blobs", "count_rows_with_staged",
@@ -543,7 +588,7 @@ gateway_surfaces! {
         "publish", "publish_with_precondition",
     ],
     "db/manifest/publisher.rs" => "GraphNamespacePublisher" => GatewayDisposition::ReadOrPure => [
-        "new",
+        "new_with_session",
     ],
 }
 
@@ -582,10 +627,16 @@ durable_calls! {
     ("instrumentation.rs", ".rename_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".delete(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".delete_prefix(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
-    ("storage.rs", ".delete(", 2, WriteProtocol::Composed("storage adapter primitive")),
-    ("storage.rs", ".put(", 2, WriteProtocol::Composed("object storage put primitive")),
-    ("storage.rs", ".put_opts(", 2, WriteProtocol::Composed("object storage conditional put primitive")),
-    ("storage.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
+    ("storage.rs", ".write_text(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
+    ("storage.rs", ".write_text_if_absent(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
+    ("storage.rs", ".write_text_if_match(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
+    ("storage.rs", ".rename_text(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
+    ("storage.rs", ".delete(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
+    ("storage.rs", ".delete_prefix(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
+    ("omnigraph-storage/lib.rs", ".delete(", 2, WriteProtocol::Composed("storage adapter primitive")),
+    ("omnigraph-storage/lib.rs", ".put(", 2, WriteProtocol::Composed("object storage put primitive")),
+    ("omnigraph-storage/lib.rs", ".put_opts(", 2, WriteProtocol::Composed("object storage conditional put primitive")),
+    ("omnigraph-storage/lib.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
     ("storage_layer.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".force_delete_branch(", 1, WriteProtocol::NativeRefControl),
     ("storage_layer.rs", ".commit_staged_create_exact(", 1, WriteProtocol::Exact("sealed TableStorage create forwarding")),
@@ -647,7 +698,7 @@ durable_calls! {
     ("db/schema_state.rs", ".rename_text(", 1, WriteProtocol::Composed("schema staging promotion")),
     ("db/manifest/recovery.rs", ".delete(", 2, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".delete_prefix(", 2, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph.rs", "GraphCoordinator::init(", 1, WriteProtocol::Bootstrap),
+    ("db/omnigraph.rs", "GraphCoordinator::init_with_session(", 1, WriteProtocol::Bootstrap),
     ("db/omnigraph.rs", "recover_manifest_drift(", 1, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph.rs", "heal_pending_sidecars_roll_forward(", 2, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph.rs", "recover_schema_state_files(", 2, WriteProtocol::RecoveryExecutor),
@@ -660,11 +711,12 @@ durable_calls! {
     ("db/omnigraph/schema_apply.rs", "write_schema_contract_staging(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply.rs", "promote_exact_schema_staging(", 1, SCHEMA_V9),
     ("db/omnigraph.rs", ".branch_create(", 2, WriteProtocol::NativeRefControl),
-    ("db/omnigraph.rs", ".branch_delete(", 1, WriteProtocol::NativeRefControl),
+    ("db/omnigraph.rs", ".branch_delete_captured(", 1, WriteProtocol::NativeRefControl),
     ("db/omnigraph/schema_apply.rs", ".branch_create(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply.rs", ".branch_delete(", 1, SCHEMA_V9),
     ("db/graph_coordinator.rs", ".create_branch(", 1, WriteProtocol::NativeRefControl),
     ("db/graph_coordinator.rs", ".delete_branch(", 1, WriteProtocol::NativeRefControl),
+    ("db/graph_coordinator.rs", ".delete_branch_with_expected(", 1, WriteProtocol::NativeRefControl),
     ("branch_control.rs", ".create_branch(", 1, WriteProtocol::Composed("graph/data native refs")),
     ("branch_control.rs", ".delete_branch(", 1, WriteProtocol::Composed("graph/data native refs")),
     ("branch_control.rs", ".force_delete_branch(", 1, WriteProtocol::Composed("graph/data native refs")),
@@ -726,7 +778,7 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".put_opts(",
     ".rename(",
     ".rename_text(",
-    "GraphCoordinator::init(",
+    "GraphCoordinator::init_with_session(",
     "recover_manifest_drift(",
     "heal_pending_sidecars_roll_forward(",
     "recover_schema_state_files(",
@@ -741,8 +793,10 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "discard_exact_schema_staging(",
     ".branch_create(",
     ".branch_delete(",
+    ".branch_delete_captured(",
     ".create_branch(",
     ".delete_branch(",
+    ".delete_branch_with_expected(",
     ".force_delete_branch(",
     "TableStore::create_empty_dataset(",
     "TableStore::append_or_create_batch(",
@@ -777,6 +831,15 @@ const DURABLE_PRIMITIVES: &[&str] = &[
 fn engine_src_root() -> PathBuf {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     PathBuf::from(manifest_dir).join("src")
+}
+
+fn sibling_crate_src(engine_src: &Path, crate_name: &str) -> PathBuf {
+    engine_src
+        .parent()
+        .and_then(Path::parent)
+        .expect("engine crate lives below the workspace crates directory")
+        .join(crate_name)
+        .join("src")
 }
 
 fn is_allow_listed(src: &Path, path: &Path) -> bool {
@@ -852,6 +915,22 @@ fn cfg_requires_test(attributes: &[Attribute]) -> bool {
             return false;
         };
         cfg.path.is_ident("cfg") && nested_meta(cfg).iter().any(meta_requires_test)
+    })
+}
+
+fn has_doc_hidden(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        if !attribute.path().is_ident("doc") || !matches!(&attribute.meta, Meta::List(_)) {
+            return false;
+        }
+        let mut hidden = false;
+        attribute
+            .parse_nested_meta(|meta| {
+                hidden |= meta.path.is_ident("hidden");
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("failed to parse doc attribute: {error}"));
+        hidden
     })
 }
 
@@ -1220,6 +1299,22 @@ fn protocol_scan_files(src: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn durable_protocol_scan_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
+    let mut files = protocol_scan_files(engine_src)
+        .into_iter()
+        .map(|path| (relative_to_src(engine_src, &path), path))
+        .collect::<Vec<_>>();
+    let storage_src = sibling_crate_src(engine_src, "omnigraph-storage");
+    files.extend(walk_rust_files(&storage_src).into_iter().map(|path| {
+        (
+            format!("omnigraph-storage/{}", relative_to_src(&storage_src, &path)),
+            path,
+        )
+    }));
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
 fn is_omnigraph_type(ty: &Type) -> bool {
     is_named_type(ty, "Omnigraph")
 }
@@ -1297,6 +1392,99 @@ fn public_graph_surfaces(src: &Path) -> BTreeSet<(String, String)> {
     surfaces
 }
 
+#[test]
+fn export_cut_is_hidden_move_only_and_non_forgeable() {
+    let path = engine_src_root().join("db/omnigraph/export.rs");
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let ast = parse_rust_source(&contents, "db/omnigraph/export.rs");
+    let mut cut_structs = 0;
+    let mut capture_methods = 0;
+    let mut cut_methods = BTreeSet::new();
+
+    for item in &ast.items {
+        match item {
+            Item::Struct(item) if item.ident == "ExportCut" => {
+                cut_structs += 1;
+                assert!(matches!(item.vis, Visibility::Public(_)));
+                assert!(has_doc_hidden(&item.attrs));
+                assert!(
+                    item.fields
+                        .iter()
+                        .all(|field| matches!(field.vis, Visibility::Inherited)),
+                    "every ExportCut field must remain private"
+                );
+                let mut derives_clone = false;
+                for attribute in &item.attrs {
+                    if attribute.path().is_ident("derive") {
+                        attribute
+                            .parse_nested_meta(|meta| {
+                                derives_clone |= meta.path.is_ident("Clone");
+                                Ok(())
+                            })
+                            .unwrap_or_else(|error| panic!("failed to parse cut derive: {error}"));
+                    }
+                }
+                assert!(!derives_clone, "ExportCut must remain move-only");
+            }
+            Item::Impl(item)
+                if item.trait_.is_none()
+                    && type_final_ident(&item.self_ty)
+                        .is_some_and(|ident| ident == "ExportCut") =>
+            {
+                for member in &item.items {
+                    let syn::ImplItem::Fn(function) = member else {
+                        continue;
+                    };
+                    if !matches!(function.vis, Visibility::Public(_)) {
+                        continue;
+                    }
+                    assert!(function.sig.asyncness.is_some());
+                    assert!(matches!(
+                        function.sig.inputs.first(),
+                        Some(syn::FnArg::Receiver(receiver)) if receiver.reference.is_none()
+                    ));
+                    cut_methods.insert(function.sig.ident.to_string());
+                }
+            }
+            Item::Impl(item) if item.trait_.is_none() && is_omnigraph_type(&item.self_ty) => {
+                for member in &item.items {
+                    let syn::ImplItem::Fn(function) = member else {
+                        continue;
+                    };
+                    if function.sig.ident != "capture_served_export_cut" {
+                        continue;
+                    }
+                    capture_methods += 1;
+                    assert!(matches!(function.vis, Visibility::Public(_)));
+                    assert!(function.sig.asyncness.is_some());
+                    assert!(has_doc_hidden(&function.attrs));
+                    assert!(return_type_contains_identifier(
+                        &function.sig.output,
+                        "ExportCut"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(cut_structs, 1, "exactly one export-cut type is allowed");
+    assert_eq!(
+        capture_methods, 1,
+        "exactly one export-cut capture is allowed"
+    );
+    assert_eq!(
+        cut_methods,
+        BTreeSet::from([
+            "into_jsonl".to_string(),
+            "write_chunks".to_string(),
+            "write_to".to_string(),
+        ])
+    );
+    assert!(!contents.contains("impl Clone for ExportCut"));
+}
+
 fn low_level_async_surfaces(src: &Path, owner: &str) -> BTreeSet<(String, String, String)> {
     let mut surfaces = BTreeSet::new();
     for file in walk_rust_files(src) {
@@ -1343,8 +1531,18 @@ fn is_gateway_owner(relative: &str, owner: &str) -> bool {
 
 fn callable_gateway_surfaces(src: &Path) -> BTreeSet<(String, String, String)> {
     let mut surfaces = BTreeSet::new();
-    for file in walk_rust_files(src) {
-        let relative = relative_to_src(src, &file);
+    let mut files = walk_rust_files(src)
+        .into_iter()
+        .map(|path| (relative_to_src(src, &path), path))
+        .collect::<Vec<_>>();
+    let storage_src = sibling_crate_src(src, "omnigraph-storage");
+    files.extend(walk_rust_files(&storage_src).into_iter().map(|path| {
+        (
+            format!("omnigraph-storage/{}", relative_to_src(&storage_src, &path)),
+            path,
+        )
+    }));
+    for (relative, file) in files {
         let contents = std::fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
         let ast = parse_rust_source(&contents, &relative);
@@ -1553,8 +1751,7 @@ fn callable_storage_and_manifest_gateway_surfaces_are_registered() {
 fn graph_visible_keyed_writes_cannot_reach_unfenced_append() {
     let src = engine_src_root();
     let mut violations = Vec::new();
-    for file in protocol_scan_files(&src) {
-        let relative = relative_to_src(&src, &file);
+    for (relative, file) in durable_protocol_scan_files(&src) {
         // This is the one sealed forwarding boundary. TableStore's inherent
         // implementation and its cfg(test) primitive coverage contain no
         // graph-facing call site.
@@ -1637,8 +1834,7 @@ fn graph_visible_write_chokepoints_are_registered() {
     }
 
     let mut observed = BTreeMap::new();
-    for file in protocol_scan_files(&src) {
-        let relative = relative_to_src(&src, &file);
+    for (relative, file) in durable_protocol_scan_files(&src) {
         let contents = std::fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
         let ast = parse_rust_source(&contents, &relative);
@@ -2013,7 +2209,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
     }
 
     let methods = [
-        ("db/manifest.rs", "init"),
+        ("db/manifest.rs", "init_with_lineage"),
         ("db/manifest.rs", "commit"),
         ("db/manifest.rs", "commit_with_expected"),
         ("db/manifest.rs", "commit_changes"),
@@ -2025,9 +2221,11 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
         ),
         ("db/manifest.rs", "create_branch"),
         ("db/manifest.rs", "delete_branch"),
-        ("db/graph_coordinator.rs", "init"),
+        ("db/manifest.rs", "delete_branch_with_expected"),
+        ("db/graph_coordinator.rs", "init_with_session"),
         ("db/graph_coordinator.rs", "branch_create"),
         ("db/graph_coordinator.rs", "branch_delete"),
+        ("db/graph_coordinator.rs", "branch_delete_captured"),
         ("db/graph_coordinator.rs", "commit_updates_with_actor"),
         (
             "db/graph_coordinator.rs",
@@ -2069,6 +2267,104 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
             "{relative}::{method} is a graph-writer escape hatch; it must remain crate-private"
         );
     }
+}
+
+fn method_call_count(block: &syn::Block, method_name: &str) -> usize {
+    struct Counter<'a> {
+        method_name: &'a str,
+        count: usize,
+    }
+
+    impl<'ast> Visit<'ast> for Counter<'_> {
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            if node.method == self.method_name {
+                self.count += 1;
+            }
+            visit::visit_expr_method_call(self, node);
+        }
+    }
+
+    let mut counter = Counter {
+        method_name,
+        count: 0,
+    };
+    counter.visit_block(block);
+    counter.count
+}
+
+#[test]
+fn native_branch_controls_use_post_gate_captures_not_handle_refreshes() {
+    let relative = "db/omnigraph.rs";
+    let file = engine_src_root().join(relative);
+    let contents = std::fs::read_to_string(&file)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+    let ast = parse_rust_source(&contents, relative);
+
+    let mut functions = BTreeMap::new();
+    for item in &ast.items {
+        let Item::Impl(implementation) = item else {
+            continue;
+        };
+        if !is_omnigraph_type(&implementation.self_ty) {
+            continue;
+        }
+        for item in &implementation.items {
+            let syn::ImplItem::Fn(function) = item else {
+                continue;
+            };
+            functions.insert(function.sig.ident.to_string(), function);
+        }
+    }
+
+    for function_name in [
+        "branch_create_as",
+        "branch_create_from_impl",
+        "branch_delete_as",
+        "delete_captured_branch_storage",
+    ] {
+        let function = functions
+            .get(function_name)
+            .unwrap_or_else(|| panic!("missing Omnigraph::{function_name}"));
+        assert_eq!(
+            method_call_count(&function.block, "refresh_coordinator_only"),
+            0,
+            "Omnigraph::{function_name} must not refresh the handle-local coordinator as native-ref authority"
+        );
+    }
+
+    for function_name in [
+        "branch_create_as",
+        "branch_create_from_impl",
+        "branch_delete_as",
+    ] {
+        let function = functions
+            .get(function_name)
+            .unwrap_or_else(|| panic!("missing Omnigraph::{function_name}"));
+        assert_eq!(
+            method_call_count(&function.block, "open_coordinator_for_branch"),
+            1,
+            "Omnigraph::{function_name} must take exactly one post-gate operation-local control capture"
+        );
+    }
+
+    for function_name in ["branch_create_as", "branch_create_from_impl"] {
+        let function = functions
+            .get(function_name)
+            .unwrap_or_else(|| panic!("missing Omnigraph::{function_name}"));
+        assert_eq!(
+            method_call_count(&function.block, "invalidate_read_caches"),
+            1,
+            "Omnigraph::{function_name} must invalidate derived caches after successful ref creation"
+        );
+    }
+    let delete_helper = functions
+        .get("delete_captured_branch_storage")
+        .expect("missing Omnigraph::delete_captured_branch_storage");
+    assert_eq!(
+        method_call_count(&delete_helper.block, "invalidate_read_caches"),
+        1,
+        "captured branch deletion must invalidate derived caches after successful ref removal"
+    );
 }
 
 #[test]

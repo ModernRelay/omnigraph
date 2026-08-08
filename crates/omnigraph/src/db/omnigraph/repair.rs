@@ -135,6 +135,11 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     db.ensure_schema_apply_idle("repair").await?;
     ensure_no_pending_recovery_sidecars(db, "repair").await?;
 
+    // Repair may adopt physical HEADs into graph authority. Bind the entire
+    // attempt to one accepted view and revalidate after schema -> main -> table
+    // gates so concurrent graph movement refuses before publication.
+    let authority_txn = db.open_write_txn(None).await?;
+
     // Repair publishes manifest authority, so it joins the canonical writer
     // envelope. The accepted catalog, identity/path pairs, raw Lance reads, and
     // final publish all remain under schema -> main -> sorted-table gates. This
@@ -157,7 +162,7 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     let _table_guards = db.write_queue().acquire_many(&queue_keys).await;
     ensure_no_pending_recovery_sidecars(db, "repair").await?;
 
-    let snapshot = db.fresh_snapshot_for_branch(None).await?;
+    let snapshot = db.revalidate_write_txn(&authority_txn).await?;
     let table_tasks = table_keys
         .into_iter()
         .filter_map(|table_key| {

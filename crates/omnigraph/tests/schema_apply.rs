@@ -49,6 +49,12 @@ async fn plan_schema_reports_supported_additive_change() {
             ..
         } if type_name == "Person" && property_name == "nickname"
     )));
+
+    let preview = db
+        .preview_schema_apply_with_options(&desired, omnigraph::db::SchemaApplyOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(preview.catalog.node_types.len(), 2);
 }
 
 #[tokio::test]
@@ -149,6 +155,8 @@ async fn long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token() {
         )
     );
     schema_owner.apply_schema(&desired).await.unwrap();
+    let reopened_after_apply = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(reopened_after_apply.catalog().node_types.len(), 3);
     // The same apply exercises both physical schema shapes: Person is rebuilt
     // through a staged overwrite for the added property, while Project is a
     // newly created table incarnation. Neither may drop the immutable v6 PK.

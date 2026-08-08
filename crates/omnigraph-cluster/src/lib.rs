@@ -1,3 +1,8 @@
+// The failpoint-only cluster state-machine tests compose several large async
+// futures. Linux rustc needs the wider layout-query budget while building the
+// lib-test harness; production and ordinary test builds keep the default.
+#![cfg_attr(all(test, feature = "failpoints"), recursion_limit = "256")]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self};
 use std::path::{Path, PathBuf};
@@ -20,11 +25,14 @@ pub mod failpoints;
 mod config;
 mod diff;
 mod serve;
+mod state_lock;
 mod store;
 mod sweep;
 mod types;
 use config::{
-    QueriesDecl, graph_address, initial_import_state, load_desired, observe_declared_graphs, parse_cluster_config, preview_schema_migration, schema_address, state_resource_digests, validate_cluster_header,
+    QueriesDecl, graph_address, initial_import_state, load_desired, observe_declared_graphs,
+    parse_cluster_config, preview_schema_migration, schema_address, state_resource_digests,
+    validate_cluster_header,
 };
 use diff::{
     FailedGraphOrigin, ResourceKind, append_embedding_profile_changes,
@@ -412,7 +420,6 @@ pub async fn apply_config_dir_with_options(
         &sweep.pending_graphs,
         &approved,
     );
-
     // Defensive invariant: nothing the approval gate covers may be executable
     // WITHOUT a matching approval. Gated changes with a valid artifact are the
     // sanctioned exception (stage 4C).
@@ -503,7 +510,9 @@ pub async fn apply_config_dir_with_options(
                 continue;
             }
         };
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_CREATE) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_CREATE)
+        {
             // Simulated crash before the init: the sidecar stays for the
             // sweep (row 1: root absent -> intent removed next run).
             diagnostics.push(diagnostic);
@@ -580,7 +589,9 @@ pub async fn apply_config_dir_with_options(
         // Crash point: the graph exists, the cluster state does not record it
         // yet. A failure here must acknowledge nothing; the next run's sweep
         // rolls the ledger forward (row 4).
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_CREATE) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_CREATE)
+        {
             diagnostics.push(diagnostic);
             return early_return(
                 display_path(&desired.config_dir),
@@ -720,7 +731,9 @@ pub async fn apply_config_dir_with_options(
                 continue;
             }
         };
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_SCHEMA_APPLY) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_SCHEMA_APPLY)
+        {
             // Simulated crash before the engine call: the sidecar stays; the
             // sweep retires it next run (ledger still consistent with live).
             diagnostics.push(diagnostic);
@@ -780,7 +793,9 @@ pub async fn apply_config_dir_with_options(
         }
         // Crash point: the manifest moved, the ledger does not record it yet.
         // A failure here acknowledges nothing; the sweep rolls forward.
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_SCHEMA_APPLY) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_SCHEMA_APPLY)
+        {
             diagnostics.push(diagnostic);
             return early_return(
                 display_path(&desired.config_dir),
@@ -865,7 +880,9 @@ pub async fn apply_config_dir_with_options(
     // Crash point: payloads are on disk, state has not moved. A failure here
     // must leave state.json byte-identical and acknowledge nothing; re-running
     // apply repairs via the skip-if-exists blob reuse.
-    if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_PAYLOAD_PHASE) {
+    if let Err(diagnostic) =
+        failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_PAYLOAD_PHASE)
+    {
         diagnostics.push(diagnostic);
         return early_return(
             display_path(&desired.config_dir),
@@ -912,6 +929,21 @@ pub async fn apply_config_dir_with_options(
             })
             .map(|artifact| artifact.approval_id.clone());
         let graph_uri = backend.graph_root(graph_id);
+        let _export_exclusion = match omnigraph::db::reserve_export_root_exclusion(&graph_uri) {
+            Ok(guard) => guard,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                        "graph_delete_export_in_progress",
+                        graph_addr.clone(),
+                        format!(
+                            "cannot remove graph root '{graph_uri}' while an immutable export owns it: {error}"
+                        ),
+                    ));
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
+                graph_moving_aborted = true;
+                continue;
+            }
+        };
         let observed_manifest_version = match Omnigraph::open_read_only(&graph_uri).await {
             Ok(db) => match db.snapshot_of(ReadTarget::branch("main")).await {
                 Ok(snapshot) => Some(snapshot.version()),
@@ -942,7 +974,9 @@ pub async fn apply_config_dir_with_options(
                 continue;
             }
         };
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_DELETE) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_DELETE)
+        {
             // Simulated crash before removal: row 8 retires the intent and
             // the still-valid approval lets a later run retry.
             diagnostics.push(diagnostic);
@@ -967,7 +1001,9 @@ pub async fn apply_config_dir_with_options(
         }
         // Crash point: the root is gone, the ledger does not record it yet.
         // The sweep rolls forward (row 7b) and consumes the approval.
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_DELETE) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_DELETE)
+        {
             diagnostics.push(diagnostic);
             return early_return(
                 display_path(&desired.config_dir),
@@ -1073,7 +1109,9 @@ pub async fn apply_config_dir_with_options(
         // persisted-statuses revert contract below is exercised; a cfg_callback
         // on this point can mutate state.json to simulate a concurrent writer,
         // making write_state's CAS check fail organically.
-        let write_result = match failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_STATE_WRITE) {
+        let write_result = match failpoints::maybe_fail(
+            crate::failpoints::names::CLUSTER_APPLY_BEFORE_STATE_WRITE,
+        ) {
             Ok(()) => {
                 backend
                     .write_state(&new_state, expected_cas.as_deref(), &mut observations)

@@ -3,103 +3,87 @@
 **Audience:** engine / storage / release maintainers
 **Status:** living document
 
-Omnigraph has four independent version axes. They have different compatibility
-contracts because they fail in different ways and at different costs. Conflating
-them (for example, treating a storage-format change like a wire change) is how you
-either ship an unsafe silent-misread or carry migration code you do not need.
+OmniGraph has four independent version axes. They have different compatibility
+contracts and must not be conflated.
 
 | Axis | Policy | Mechanism |
 |---|---|---|
-| **Release (semver)** | All published crates move in lockstep. | Maintenance-contract rule 4 in [AGENTS.md](../../AGENTS.md): a release bump updates every crate manifest, `Cargo.lock`, `openapi.json`, and the surveyed version line together. |
-| **CLI ↔ server wire** | Additive and rolling-safe; **no version gate**. New fields are optional; old clients ignore unknown fields and omit new ones. | Additive JSON DTOs in `omnigraph-api-types`; the OpenAPI-drift test (`crates/omnigraph-server/tests/openapi.rs`) catches an unintended wire change. |
-| **Storage (internal manifest schema)** | **Strict single version**; upgrade is a cutover via export/import, never an in-place migration. | A stamp (`omnigraph:internal_schema_version`) in `__manifest`'s schema metadata + `refuse_if_stamp_unsupported`, with `MIN_SUPPORTED == CURRENT`. |
-| **Lance on-disk format** | Pinned to one Lance version; bumped deliberately with the engine. | `data_storage_version: V2_2` at every write site + the surface guards in [lance.md](lance.md), re-run on every Lance bump. |
+| **Release (semver)** | All published crates move in lockstep. | A release bump updates every crate manifest, `Cargo.lock`, generated API metadata, and the surveyed version in [AGENTS.md](../../AGENTS.md). |
+| **CLI ↔ server wire** | Additive and rolling-safe; no version gate. | Optional JSON DTO fields plus the OpenAPI drift test. |
+| **Storage (internal manifest schema)** | Strict single version; upgrade by export/init/load, never in-place migration. | `omnigraph:internal_schema_version` metadata plus `refuse_if_stamp_unsupported`, with `MIN_SUPPORTED == CURRENT`. |
+| **Lance on-disk format** | Pinned to one Lance version and bumped deliberately. | `data_storage_version: V2_2` at write sites plus the checks in [lance.md](lance.md). |
 
-## Why storage is strict-single-version (the strand model)
+## Current storage contract
 
-The internal-schema stamp gates the on-disk shape of `__manifest`. The contract is:
-**this binary reads exactly one internal-schema version.** `Omnigraph::open` (both
-read-write and read-only) reads main's stamp before any data and refuses anything
-it cannot serve:
+The current binary reads and writes exactly **internal manifest schema v6**.
 
-- a stamp **below** CURRENT → refused with a rebuild-via-export/import message (see
-  [the upgrade guide](../user/operations/upgrade.md));
-- a stamp **above** CURRENT → refused with "upgrade omnigraph", so an old binary
-  cannot silently misread a newer format.
+- **v4** is the last released format, shipped by OmniGraph v0.8.x.
+- **v5** is an unreleased development format that introduced SchemaIR v2,
+  immutable stable-table/incarnation identity, identity-keyed manifest rows,
+  and identity-derived table paths.
+- **v6** is the current format. It preserves v5 and makes every graph table's
+  exact non-null physical `id` field Lance's unenforced primary key; supported
+  strict insert/upsert writers use the exact-`id`, filter-bearing adapter.
+- **v7-v19** were unreleased development formats belonging to the rejected
+  RFC-026 MemWAL experiment. They are abandoned and are not compatibility
+  obligations. The v6 binary refuses them as future formats before recovery or
+  table decoding.
 
-The below-CURRENT refusal names the release line that wrote the stamp
-(`release_for_internal_schema_version` in `db/manifest/migrations.rs`) and prints
-the exact `export` / `init` / `load` commands, so the upgrade is fail-closed **and**
-self-service — the operator can fetch the right old binary without guessing.
+The exact v6 meaning is the one established immediately before RFC-026. A fresh
+v6 root has no `_stream_tokens.lance`, `_mem_wal`, stream manifest rows,
+stream profile, hidden stream metadata column, fold attribution, or stream
+recovery protocol.
 
-Internal schema v5 was the RFC-028 identity boundary: SchemaIR v2, its graph
-identity domain and allocator, and the identity-keyed manifest journal activate
-together. A v4 graph cannot be backfilled safely because its logical IDs,
-registration keys, paths, versions, and tombstones are all name-derived; the
-normal strand rebuild mints a fresh domain and table incarnations instead.
+Recovery sidecars use a separate version space. The ordinary graph writers emit
+**recovery sidecar schema v9** for identity-aware Mutation/Load, BranchMerge,
+SchemaApply, EnsureIndices, and Optimize recovery. Do not lower that number to
+6 merely because the manifest schema is v6.
 
-Internal schema **v6 is the currently served format** and maps to OmniGraph
-**0.10.x**. It preserves the v5 identity contract and activates RFC-023 key
-fencing: every graph node/edge dataset declares exactly non-null physical `id`
-as Lance's unenforced primary key from creation, and production strict
-insert/upsert routes use the exact-`id` filter-bearing adapter. A v5/0.9.x graph
-is not annotated or migrated in place; export it with the v5 binary, initialize
-a different v6 root, and load through the v6 writer. Because
-`MIN_SUPPORTED == CURRENT == 6`, v6 refuses v5 and a v5 binary refuses v6.
+The rationale and historical links are in
+[Streaming ingestion after RFC-026](wal-removal.md).
 
-There is no in-place migration dispatcher. The single source file
-`db/manifest/migrations.rs` holds only the version constant, the stamp read/write,
-and `refuse_if_stamp_unsupported`.
+## Why storage is strict-single-version
 
-This is a liability decision, not a limitation we have not gotten around to. In-place
-migration code is permanent surface: every future format change has to write,
-test, and keep working a `vN → vN+1` step, plus the legacy readers and crash-recovery
-paths each step needs, for a storage format that is still pre-release and changing.
-The strand model trades that ongoing cost for a one-time operator action (export +
-import) when a format changes. Per "engineering is programming integrated over time"
-(see [AGENTS.md](../../AGENTS.md)), the lower-liability option is to **not** carry
-the machinery until a concrete graph demands it.
+`Omnigraph::open` reads main's manifest stamp before decoding graph or recovery
+state:
 
-The stamp + `refuse_if_stamp_unsupported` floor is exactly the seam a future in-place
-migration would re-introduce: re-add a dispatcher and lower `MIN_SUPPORTED` below
-CURRENT for the versions it can actually walk forward. Until then that machinery is
-deliberately absent.
+- a stamp below v6 is refused with rebuild guidance;
+- a stamp above v6 is refused with an upgrade-binary message.
 
-### Gating altitude
+There is no in-place migration dispatcher. A released v4 graph is exported with
+its v0.8.x binary, initialized as a fresh v6 graph, and loaded through the
+current writer. That rebuild preserves logical rows, vectors, blobs, and schema
+shape while intentionally starting fresh physical histories and identities.
 
-The stamp is validated at the **graph (main) level**: `Omnigraph::open` checks main
-once, and branch reads trust it. The stamp is a graph-wide storage-format property
-(the upgrade path is a whole-graph export/import), so with one binary version every
-branch is always CURRENT — init stamps main, `create_branch` forks the stamp, and the
-publisher writes rows without re-stamping. A branch stamped out of range while main
-stays in range is only reachable with concurrent multi-version writers, an
-unsupported topology; the residual is recorded as a known gap in
-[invariants.md](invariants.md).
+This is a liability decision. A migration framework permanently multiplies
+legacy readers, crash paths, and version-pair tests. The stamp guard is the seam
+for a future converter if a concrete deployment justifies that cost.
 
-## Why the wire is additive-rolling-safe instead
+## Gating altitude
 
-The CLI↔server boundary is the opposite case: clients and servers are deployed
-independently and a hard gate there would force lockstep redeploys for every field
-addition. So that axis is additive — old and new coexist — and the OpenAPI-drift test
-is the guard that a change stayed additive rather than breaking the shape.
-RFC-023 follows that rule: `ErrorOutput.key_conflict` is optional, and its
-`key` member remains optional on the wire for additive compatibility. The v6
-engine returns `KeyConflict` only after a fresh exact-ID probe identifies an
-attempted key; Lance's broader retryable conflict class is not serialized as a
-key conflict without that evidence. `ErrorOutput.resource_limit` is likewise
-optional and additive; v6 servers use it with HTTP 413 for pre-arm keyed-write
-ceilings.
+The stamp is a graph-wide property and is checked on main. Branches inherit the
+format when created. A branch with a different stamp is reachable only through
+unsupported concurrent multi-version writers.
 
-## When you change each axis
+Format refusal must happen before recovery-sidecar or table decoding. In
+particular, the current binary never tries to interpret abandoned v7-v19 state
+as v6 and never cleans it opportunistically.
 
-- **Storage format**: bump `INTERNAL_MANIFEST_SCHEMA_VERSION`, keep
-  `MIN_SUPPORTED == CURRENT` (unless you are re-introducing migration), update the
-  stamp history on the constant's doc-comment, and add a release note pointing at
-  the upgrade guide. The change is breaking by construction — pre-bump graphs are
-  refused.
-- **Wire**: keep it additive; regenerate `openapi.json`
-  (`OMNIGRAPH_UPDATE_OPENAPI=1`); do not add a version gate.
-- **Lance**: follow the Lance-bump checklist in [lance.md](lance.md) — re-run the
-  surface guards first, then `cargo test --workspace` (a clean build is not a clean
-  alignment).
-- **Release**: lockstep per the maintenance contract.
+## Why the wire is additive
+
+CLI and server versions roll independently, so their JSON boundary remains
+additive. New fields are optional, old clients ignore unknown fields, and the
+OpenAPI drift test guards unintended breaking changes. Storage strictness does
+not justify a wire-version gate.
+
+## When changing an axis
+
+- **Storage format:** bump the manifest version, keep
+  `MIN_SUPPORTED == CURRENT` unless a real migration is introduced, update the
+  format history and release notes, and add genuine-binary refusal/rebuild
+  evidence for a released boundary.
+- **Recovery grammar:** bump the recovery-sidecar ceiling only when persisted
+  recovery meaning changes. Never derive it from the manifest version.
+- **Wire:** keep changes additive and regenerate `openapi.json`.
+- **Lance:** follow the complete Lance-bump checklist in [lance.md](lance.md).
+- **Release:** update all published crates and generated metadata in lockstep.

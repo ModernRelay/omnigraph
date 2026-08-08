@@ -1,33 +1,148 @@
 # Architecture review: RFC-022 through RFC-028
 
-**Status:** RFC-022, RFC-023, and RFC-028 implemented; RFC-024 and RFC-027
-research-blocked; RFC-025 and RFC-026 remain under review
+> **Historical disposition ledger.** RFC-026 is now rejected and its MemWAL
+> implementation has been removed. The remaining review findings are retained
+> as historical evidence; see [the current decision](wal-removal.md).
+
+**Historical status at archival time:** RFC-022, RFC-023, and RFC-028 implemented; RFC-024, RFC-025, and
+RFC-027 research-blocked; RFC-026 Phase A implemented, private B1's legal
+near-cap closure repaired and green, private B2a unbounded retain-all gate
+implemented, the private common-B2 compare-and-chain/token-fold core
+implemented, B2b optional, activation P1 plus the Cedar vocabulary and embedded
+manifest-only status plus bounded v11/profile-v2 and recovery-v13
+profile-authority implemented, hidden v12/lifecycle-v3/recovery-v14
+enrollment/claim/fold/quiesce, v13/recovery-v15 resume/abort-drain,
+v14/recovery-v16 `SEALED` EnsureIndices, v15/recovery-v17 `SEALED` Optimize,
+v16/recovery-v18 checked offline physical rebind, v17/recovery-v19 terminal
+authority retirement/export, v18/recovery-v20 stopped/offline DataBlock
+correction, and v19/recovery-v21 terminal dead-letter folding plus
+three-disposition retirement implemented; F7a graph-native served row ingress
+and F7b graph-redacted checked status transport active; public lane enrollment,
+general lifecycle/rebind control, direct SDK status, and lifecycle/maintenance
+transport remain inactive
 **Date:** 2026-07-11
+**Last updated:** 2026-08-04
 **Audience:** RFC authors, engine/storage maintainers, and release reviewers
 **Reviewed against:** OmniGraph 0.8.1; Lance 9.0.0-beta.15 at
 `f24e42c11a742581365e1cbe17c906ea2dac1bc6`; full Lance transaction,
 branch/tag, MemWAL, row-lineage, read/write, compaction, and cleanup
 specifications; pinned Rust implementation where the public specification is
 not precise enough
-**RFC-022 close-out revalidated against:** Lance 9.0.0-beta.21 at
+**Current Lance revalidation:** all RFC-022–028 substrate contracts were
+re-audited on 2026-07-17 against Lance 9.0.0-rc.1 at
+`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; see the
+[RC.1 alignment audit](lance.md#last-alignment-audit-2026-07-17-lance-900-rc1-git-rev-cec0b7df).
+Stable V2_2, native branch/tag/cleanup semantics, exact full-table index
+staging, and RFC-023's route-dependent/directional key-filter behavior remain
+aligned. Data Overlay is opt-in and unused. MemWAL now inherits store/session
+configuration but still lacks RFC-026's exact enrollment receipt and reversible
+admission seal. RFC-026 therefore keeps the general multi-process profile
+closed. A production-neutral bounded Gate E0 tested the existing public
+surface, and its 2026-07-18 redesign is green: exact
+`N`/`N + 1` immediate-successor probes replace latest resolution, complete
+attempt tracking is flat at versions 8/80 with zero lists, and configured
+RustFS runs the strict positive/negative matrix non-vacuously. Phase A then
+activated internal schema v7 with exact empty-enrollment recovery,
+identity-keyed lifecycle authority, process-local admission/exclusion,
+partial-format refusal, and strict v6↔v7 rebuild. Private Phase B1 subsequently
+activated schema v8/config-v2, one root-singleflight no-roll generation,
+watcher success plus a same-writer post-durability epoch check, conservative
+replay/fold-only reopen, and a recovery-v11 exact graph-atomic fold. Genuine
+v7↔v8 rebuild/refusal, the prior 24 graph-level race/crash cells, and qualified
+cost/RSS evidence remain green. Gate R0 then found a legal high-entropy
+near-cap generation that acknowledged and materialized but could not fold
+within the original closure implementation. B1 now charges the scanner's
+logical slices against the same 32-MiB generation cap and copies every scanner
+emission into dense owned arrays before retaining it. The 8,192-row near-cap
+cell folds and publishes successfully; the reference subprocess run measured a
+286,441,472-byte (about 273 MiB) isolated fold RSS delta, below the 384-MiB
+remeasurement tripwire. No production or public caller reaches the row seam.
+
+Gate R0's 2026-07-20 **historical** no-go applies to a finite or otherwise
+bounded retain-all claim on stock RC.1. Random generation roots have no
+MemWAL-persisted/enforced durable cross-open materialization-attempt
+cap/receipt; RC.1 exposes no admission-grade reserve-first complete
+physical-output envelope; and current LIST cannot prove all provider-retained
+or billed bytes. The implemented private B2a gate deliberately makes none of
+those finite-storage claims: retain every canonical durable `_mem_wal` object,
+perform no raw WAL GC, impose no retained-byte, object-count, file-count, or
+history quota, and surface provider exhaustion loudly. Lance may remove only a
+losing manifest-CAS temporary staging object. Complete and partial orphan output
+remains non-authoritative and untouched below its root through retry/reopen;
+parent shard discovery may observe its prefix. Local/configured-RustFS provider
+cells and a 1/8/32/128 retained-history instrument pin that boundary. Warm-ack
+operation shape stays flat while serialized authority and combined history work
+grow; LIST bytes, timings, and RSS remain advisory. The missing materialization-attempt receipt and
+complete envelope therefore do not block B2a. No test-only attempt ledger or
+`GraphHistoryBudget` is on its immediate path. B2b remains optional future
+Lance-owned managed reclamation. The private common-B2 core subsequently
+activated internal schema v9, stream-config v3, lifecycle state-v2, trusted
+hidden row attribution, canonical payload/token digests, the
+manifest-selected graph-global `_stream_tokens.lance` authority, and
+recovery-v12 exact base-plus-token fold publication. Genuine v8↔v9
+refusal/rebuild evidence is green. V10 added graph-profile enablement. The
+bounded v11/profile-v2 tranche now adds checked stopped/offline and runtime
+ownership, resumable `DISABLING`, fail-closed `RETIRED`, and exact
+recovery-v13 `StreamProfileChange`. V12/lifecycle-v3/recovery-v14 adds
+immutable enrollment/binding receipts, recovery-covered claims, exact
+ordinary/drain folds, and restartable hidden empty/non-empty quiescence.
+V13/recovery-v15 adds private resume and guarded drain-abort.
+V14/recovery-v16 adds the narrow checked `SEALED` EnsureIndices bridge;
+v15/recovery-v17 adds the distinct checked `SEALED` Optimize bridge;
+v16/recovery-v18 adds the private physical-rebind owner for an exact `SEALED`
+lane; v17/recovery-v19 adds the cluster-only stopped/offline terminal
+authority-retirement and receipt-bearing export exit; v18/recovery-v20 adds
+exact stopped/offline DataBlock correction while retaining `DRAINING`; current
+v19/token-schema-v3/recovery-v21 adds deterministic terminal diversion and
+three-disposition retirement. Checked offline disable is the sole supported
+production quiescence owner; public/production rebind remains inactive.
+Historical recovery-v12 fold keeps its wire meaning and is refused rather than
+reinterpreted. Production/public enrollment, general resume/abort, direct SDK
+status, and lifecycle/maintenance parity remain specified, required, and
+inactive. F7b exposes a graph-redacted HTTP/OpenAPI/remote-CLI projection of
+F6b6's checked read-only operational core. Its
+complete pending-sidecar view is bounded to 256 matching direct `.json`
+sidecars, 256 irrelevant direct-or-nested objects encountered below the prefix,
+4 MiB of cumulative input-anchored URI bytes across all encountered objects,
+32 MiB per sidecar body, and 32 MiB of cumulative bodies; exceeding any bound
+is a typed whole-status refusal, never a partial inventory. Two RC.1 surface
+guards prove generic cleanup
+non-ownership and the stale-writer hazard created by deleting the successor's
+empty WAL fence sentinel; neither is an implementation of reclamation.
+The local RFC-024/025 decision instruments were rerun: both remain
+research-blocked, with the current RC-specific counters recorded in the Lance
+audit and RFC-025.
+**Prior RFC-022 close-out revalidation:** Lance 9.0.0-beta.21 at
 `1aec14652dcbace23ac277fa8ced35000bea0c40`; see the
-[2026-07-12 alignment audit](lance.md#last-alignment-audit-2026-07-12-lance-900-beta21-upstream-omnigraph-pinned-at-900-beta21-via-git-rev).
+[2026-07-12 alignment audit](lance.md#prior-alignment-audit-2026-07-12-lance-900-beta21-upstream-omnigraph-pinned-at-900-beta21-via-git-rev).
 **RFC-023 substrate evidence revalidated against:** the same beta.21 revision;
 filter-shape and conflict-order probes are recorded in RFC-023 §2. Internal
-schema v6 now consumes that evidence through exact-`id` fenced production
-routing. Its final insertion-absence certificate/no-target-preflight route and
+schema v6 introduced that evidence through exact-`id` fenced production
+routing, and current v19 preserves it. Its final insertion-absence certificate/no-target-preflight route and
 predeclared 10K/100K production series now satisfy the remaining implementation
 and acceptance gates.
-**RFC-026 substrate contract revalidated against:** the same beta.21 revision;
+**RFC-026 substrate contract revalidated against:** RC.1 at the current revision;
 the full MemWAL table and system-index specifications, including the
 durability/fencing behavior carried forward from beta.17, are reflected in the
-RFC's survey and acceptance guards.
-**RFC-024/025/027 substrate claims revalidated against:** the same beta.21
+RFC's survey and acceptance guards. Gate E0 passed at the explicit bounded
+process/topology profile and Phase A consumed it as described above; RFC-026
+remains draft, and F7a now activates only graph-native served row streaming.
+Public lane management remains inactive. Gate R0's historical
+finite-retention no-go, the selected unbounded B2a disposition, the optional
+B2b route, and the common contract inventory are recorded in RFC-026 §0.2,
+§4.1–§4.6, and BLOCKER-14 below.
+**RFC-024/025/027 substrate claims revalidated against:** the current RC.1
 revision and the full matching table/index/branch/tag/cleanup, transaction, and
-row-lineage specification sections; their survey headers now record beta.21.
+row-lineage specification sections; their survey headers now record RC.1.
 RFC-024 Gate A was subsequently measured on 2026-07-15: its exact BTREE scan
 work is flat, but the required RustFS latest-manifest/object-byte curves grow,
 so the candidate and format are research-blocked rather than accepted.
+RFC-025 Gate 0 was measured on 2026-07-17: Lance tag semantics pass, but the
+current in-manifest checkpoint-registry BTREE shape has history-sensitive
+compacted scan bytes and crosses another scan-operation boundary at 1,000
+commits. RFC-025 is therefore also research-blocked; current internal schema v19
+still contains no retention state. The bucket-gated S3/RustFS cost cell is checked in but was
+not run for that decision.
 
 This is a review ledger, not a competing specification. The RFCs remain the
 normative design records: RFC-022/RFC-028 document implemented contracts;
@@ -383,20 +498,22 @@ identity, at least:
 
 ```text
 (state, stable_table_id, incarnation_id, table_path,
- table_branch, physical_ref_incarnation, table_version, schema_ir_hash)
+ table_branch, current_head_witness, table_version, schema_ir_hash)
 ```
 
 The publisher may encode that token differently, but retry/revalidation must
-not reduce it to `table_version`. `physical_ref_incarnation` is the public
-`BranchIdentifier` + current `Transaction.uuid` + `ManifestLocation.e_tag`
-composite. Capture brackets transaction/e_tag collection with branch-identifier
-reads and rejects movement; missing/empty transaction identity fails closed.
-This is distinct from the logical `incarnation_id`, which RFC-028 deliberately
-preserves across an owner handoff. Add stale-writer races for both logical
-drop/recreate and physical ref recreation at the same numeric version.
+not reduce it to `table_version`. `current_head_witness` is the public
+`BranchIdentifier` + current table version + current `Transaction.uuid` +
+`ManifestLocation.e_tag` composite. Capture brackets transaction/e_tag
+collection with branch-identifier reads and rejects movement; missing/empty
+transaction identity fails closed. It is intentionally mutable: every ordinary
+table commit advances it. This is distinct from the logical `incarnation_id`,
+which RFC-028 deliberately preserves across an owner handoff. Add stale-writer
+races for both logical drop/recreate and physical ref recreation at the same
+numeric version.
 
-**Disposition:** RFC-024 §3.2 now persists the separate physical-ref token and
-refuses activation on a backend without a proven source. Beta.21 local manifest
+**Disposition:** RFC-024 §3.2 now persists the separate current-HEAD witness and
+refuses activation on a backend without a proven source. Pinned-Lance local manifest
 resolution supplies an inode-mtime-size e_tag; S3/RustFS supplies the object
 e_tag. Public-surface guards pass main and named-ref same-version ABA on both,
 unchanged reopen stability on S3, and original-shared-`Session` local
@@ -416,10 +533,44 @@ integration.
 [§9](../rfcs/0026-memwal-streaming-ingest.md#9-fresh-read-cuts),
 and [§11–13](../rfcs/0026-memwal-streaming-ingest.md#11-format-activation-and-rebuild)
 
-**Status:** Open. The format/refusal portion is specified, but beta.21 lacks the
-public exact enrollment and reversible shard-admission surface needed by the
-recovery/quiescence adapter. RFC-026 cannot be accepted or activated until that
-API gate and its crash evidence close.
+**Status:** Format separation is specified. Gate R0's legal near-cap closure
+failure was repaired on 2026-07-21 with logical-slice accounting and dense
+scanner-output copies; the closure and RSS cells are green. The selected B2a
+profile's private gate is implemented as unbounded retain-all with no canonical
+durable `_mem_wal` deletion and no retained-byte, object-count, file-count, or
+history quota. Structural guards, typed local/configured-RustFS provider
+failures, complete/partial inert orphan evidence, and the 1/8/32/128 advisory
+history instrument pin that boundary. Lance losing manifest-CAS temp staging is
+not retained authority. Gate R0's historical no-go applies
+only to claiming a finite storage bound on stock RC.1. The private common-B2
+compare-and-chain/token-fold core is implemented in schema v9. Public
+activation remains closed on the explicit enrollment, lifecycle-control,
+authorization, and product contracts below, not on the missing
+materialization-attempt receipt or physical-output envelope. RC.1 also lacks the ideal caller-owned
+enrollment receipt and cross-process shard-admission seal, but those remain
+broader-topology gates rather than dependencies of the implemented private
+single-live-writer-process profile. Gate E0's exact-classification and ABA
+cells passed using known-version probes and strict object-store classification.
+Phase A then activated a main-only, unsharded, single-live-writer-process empty
+enrollment foundation in internal schema v7. Private B1 activated the bounded
+data-bearing schema-v8/config-v2 core. The private common-B2 slice activated
+schema v9/config-v3/state-v2 and recovery-v12 for exact base-plus-token fold
+publication. The bounded v11/profile-v2 + recovery-v13 profile-authority
+tranche adds opaque checked control/runtime ownership and restart-stable
+`DISABLING`. V12/lifecycle-v3 + recovery-v14 adds the hidden enrollment, claim,
+ordinary/drain fold, and terminal-quiesce path. V13/recovery-v15 adds the
+private resume/guarded drain-abort path. V14/recovery-v16 adds the checked
+`SEALED` EnsureIndices bridge; v15/recovery-v17 adds the distinct checked
+`SEALED` Optimize bridge. Neither maintenance owner adds a token receipt or
+caller operation ID. V16/recovery-v18 adds the separate private physical-rebind
+owner; v17/recovery-v19 adds terminal stopped/offline authority retirement and
+receipt-bearing export; v18/recovery-v20 adds stopped/offline exact DataBlock
+correction; current v19/token-schema-v3/recovery-v21 adds deterministic
+mixed/all-diverted terminal folding and three-disposition retirement while
+leaving public/production rebind inactive. RFC-026 remains draft; F7a exposes
+one graph-native served row route and F7b exposes graph-redacted checked status,
+while lane enrollment/control, rebind, maintenance transport, and direct SDK
+status remain inactive.
 
 Enrollment creates persistent MemWAL metadata and `stream_state` changes the
 correctness preconditions for schema, branch, maintenance, and data operations.
@@ -427,9 +578,11 @@ An older binary that understands key fencing but not stream lifecycle can ignore
 `OPEN | DRAINING | SEALED`, mutate the base table, or perform a schema/branch
 operation without draining acknowledged rows.
 
-**Format disposition:** RFC-026 §11 makes streaming a graph-format capability present
-at new-root initialization, never a feature stamp added by first enrollment.
-It defines:
+**Format disposition:** RFC-026 §11 makes the stream foundation a graph-format
+capability present at new-root initialization, never a feature stamp added by
+first enrollment. Phase A implemented schema v7, recovery-v10
+`StreamEnrollment`, lifecycle CAS, compatible-open validation, partial-format
+refusal, and genuine v6↔v7 rebuild. The contract includes:
 
 - a graph capability/internal-format stamp written only after every enrolled
   table and lifecycle authority is valid;
@@ -438,29 +591,136 @@ It defines:
 - preservation rules for later heads/retention formats;
 - genuine cross-version tests, not a stamp-rewind simulation.
 
-RFC-026 §12 carries those tests and §13 places them in Phase A before the public
-stream path. RFC-026 §3/§8 also make a rematerialized table a separate physical
+B1 is a second format activation, not an in-place reinterpretation of the v7
+empty-enrollment contract: implemented v8 is the first data-bearing stream
+format, uses stream-config v2 and recovery schema v11, refuses v7/config-v1,
+and carries genuine v7↔v8 rebuild/refusal evidence.
+
+B2 is a third strict strand, not an in-place reinterpretation of v8. Private
+B2a adds no schema change; it closes the stock-v8 storage/correctness gate for
+the selected retain-all profile. The implemented private common-B2 core assigns
+internal schema v9, stream-config v3, stream-state protocol v2, and
+recovery-v12 to trusted hidden row metadata, canonical payload/token digests,
+the manifest-selected current-token participant, and exact base-plus-token fold
+publication. Genuine v8↔v9 refusal/rebuild evidence is green. F7a's graph-native
+served row bridge and F7b's graph-redacted checked status transport are active;
+explicit public lane enrollment/general lifecycle control, direct-SDK status,
+and remaining product parity stay inactive. F6b6's richer physical cut remains
+internal, and checked offline disable is the supported quiescence owner. Internal
+schema v11/profile-v2 and recovery-v13 own checked profile
+changes and their exact receipt. V12/lifecycle-v3 and recovery-v14 own
+the hidden enrollment, claim, ordinary/drain fold, and terminal management
+receipt families. V13/recovery-v15 owns private resume and guarded drain-abort.
+V14/recovery-v16 owns checked `SEALED` EnsureIndices; v15/recovery-v17 owns the
+distinct checked `SEALED` Optimize shape; v16/recovery-v18 owns exact offline
+physical rebind into a fresh empty `SEALED` scope; v17/recovery-v19 owns
+terminal root-wide authority retirement and receipt-bearing export;
+v18/recovery-v20 owns stopped/offline exact DataBlock correction; and current
+v19/token-schema-v3/recovery-v21 owns terminal dead-letter folding and
+three-disposition retirement. The older
+v14 resume/maintenance/retirement/rebind scaffolds and correction variant remain
+fail-closed. The selected unbounded
+B2a profile adds no storage watermark or `GraphHistoryBudget`; those mechanisms
+would belong only to a separately justified future bounded/managed profile.
+
+RFC-026 §12 records those tests and §13 places the completed Phase A before the
+public stream path. RFC-026 §3/§8 also make a rematerialized table a separate physical
 enrollment boundary: SchemaApply leaves the preserved logical identity
 `SEALED`, and only an exact sidecar-covered rebind with a fresh enrollment and
 shard namespace may publish `OPEN`. Recovery never infers adoption from the
 logical pair, name, path, or a compatible-looking index.
 
-**Remaining required disposition:** in beta.21,
+**Remaining required disposition:** in RC.1,
 `InitializeMemWalBuilder::execute` internally commits the `CreateIndex`
 transaction and returns only `Result<()>`; `mem_wal_writer` separately creates
 or claims shard-manifest objects. That cannot satisfy a sidecar that pre-arms
-one exact combined effect. RFC-026 §3 now rejects private-module/object-store
-emulation and requires a public caller-controlled transaction plus idempotent
-shard provision/classify/seal/reopen/reclaim APIs, or one recoverable enrollment
-receipt covering both effects. §5/§8 require the physical admission seal that
-closes the final lifecycle-check-to-put race. The same-path/ref ABA, multi-
-effect crash, and paused-claimant tests remain red acceptance gates.
+one caller-minted combined effect, so the public receipt plus seal/reopen API
+remains the preferred simplification and the gate for overlapping processes.
+RFC-026 still rejects private-module/object-store emulation. That missing
+combined receipt gates broader topology, not private B1 inside the implemented
+process boundary. At the row boundary, `put_no_wait` supplies an optional
+status-only durability watcher. RC.1's watcher watermark is writer-wide while
+`WriteResult.batch_positions` reset with the active MemTable, so a later
+generation can falsely resolve from an earlier watermark. `put_no_wait` can
+also mutate before returning a flush-scheduling error. B1 therefore cannot
+interpret an error after invocation as effect-free or use one writer across
+rollover. RC.1 replay also rebuilds a fresh BatchStore without advancing its
+per-MemTable WAL-flush watermark, so a later put or plain reseal re-appends and
+re-indexes the replayed prefix; repeated pre-manifest crashes can multiply it.
+And a late `wait_for_flush_drain` can observe an empty watcher queue after a
+failed handler removed the watcher. Both are explicit B1 compatibility gates,
+not inferred success.
 
-Replica scope must also match RFC-023's recovery support boundary. Multiple
-replicas may route acknowledgement traffic to one shard owner, but enrollment,
-fold, and sidecar recovery remain single-writer-process operations until
-foreign-process sidecar ownership is fenced. Do not advertise general replica
-failover for those operations merely because MemWAL has a shard epoch.
+The implemented private design is a root-scoped singleflight worker and one
+nominally bounded generation per writer: internal schema v8/config-v2, no automatic
+rollover, at most 8,192 rows/32 MiB for the complete generation, explicit
+admission from before epoch claim, conservative fold-only replay/unmerged-state
+routing, the pinned public BatchStore watermark bridge before replay reseal,
+drain proof from empty frozen refs plus the authoritative generation/cursor,
+immediate writer retirement, one recovery-v11 keyed fold, and higher-epoch
+reopen only after publication. `AckUnknown` preserves possible residue through
+replay but remains permanently caller-ambiguous. Fold now charges each scanner
+logical slice against the generation cap and takes each emission into dense
+owned arrays before retaining it; the legal 8,192-row high-entropy near-cap
+cell folds and publishes successfully. The current private B2 core adds durable
+trusted contributor attribution, compare-and-chain tokens, a manifest-selected
+current-token participant, and exact joint recovery/publication of the base and
+token effects. Public strict activation remains a later B2 gate. The remaining
+common B2 inventory specifies explicit production enrollment, bounded
+`REPLACE`/`WITHDRAW` correction, persistent
+revisioned status/quiesce/resume/abort-drain/rebuild with bounded management
+receipts, authorization, and SDK/CLI/HTTP/OpenAPI product parity. B2a selects
+unbounded retain-all and loud provider exhaustion with no raw WAL deletion or
+storage/history quota. B2b managed reclamation is an optional future
+Lance-owned route, not an activation dependency for B2a. The common
+private token/attribution/fold implementation and its crash and cross-version
+evidence are present; enrollment/control, authorization, and product evidence
+remain gates. A `SEALED` B2 stream permits export/rebuild; in-place
+maintenance still waits for Phase D.
+
+The private single-live-writer-process candidate makes that support restriction
+load-bearing. It
+grants an `OPEN` stream exclusive authority to advance that base-table HEAD;
+every other writer/maintenance/control path touching the table must refuse
+pre-effect or drain. Stable enrollment identity is kept separate from the
+mutable `CurrentHeadWitness` (`BranchIdentifier`, current table version,
+transaction UUID, manifest e_tag), which advances atomically with every
+allowed table-pointer publish. A root-scoped admission lease closes the final
+claim-to-check and check-to-put races only inside the one live writer process;
+the shared lease begins before `mem_wal_writer` can advance the shard epoch.
+
+Gate E0 must classify exact no effect, the sole `N -> N + 1` singleton MemWAL
+`CreateIndex` carrying the namespaced enrollment/config-version marker, and
+that successor plus the pre-minted empty shard; wrong config, intervening HEAD,
+foreign shard, data-bearing WAL/generation state, or ambiguity must yield
+`RecoveryRequired` without deletion. It also proves unchanged-reopen
+witness stability, ordinary-commit movement, local/S3 same-coordinate ABA, and
+history-depth cost. The first cost attempt observed a flat tracked GET count but
+missed local filesystem `read_dir` work outside `IOTracker` and was discarded.
+The accepted replacement freshly ABA-verifies exact `N`, uses the public but
+guide-hidden `Dataset::has_successor_version` to probe only `N + 1`, then uses
+the exact `N + 1` handle to reject a buried `N + 2`. Exclusive HEAD and
+cleanup/version-GC exclusion remain held through decision/publish; only
+`Ok(false)` means absence, while errors, overflow, and detached boundaries fail
+closed.
+
+The final local run has 14 substantive cells plus one explicit S3 skip. Its
+attempt-counting wrapper includes failed/`NotFound` HEADs and records the same
+six-attempt, zero-list shape at baseline versions 8 and 80; a Unix permissions
+tripwire proves exact probes succeed when latest enumeration fails and that an
+unreadable exact HEAD errors. The configured RustFS cell passes non-vacuously
+with the same shape plus the declared positive and listing-dependent negative
+matrix. Surface guards pin the doc-hidden successor, flush/drain,
+merged-generation, and S3 ABA shapes; CI rejects skipped E0/ABA cells. This was
+green evidence for the bounded process/topology profile; Phase A subsequently
+consumed it, but
+it did not authorize a row acknowledgement.
+
+Replica scope must match RFC-023's recovery support boundary. This
+process/topology profile does not permit overlapping replicas: a crash
+successor proceeds only
+after external exclusivity, recovery, and a higher shard epoch. Do not
+advertise general replica failover merely because MemWAL has a shard epoch.
 
 ### BLOCKER-07 — stable identity ownership contradicts sibling dependencies
 
@@ -473,7 +733,7 @@ and [RFC-026 §8](../rfcs/0026-memwal-streaming-ingest.md#8-epoch-fenced-quiesce
 with the shared contract in [RFC-028](../rfcs/0028-stable-schema-identity.md)
 
 **Status:** Closed in implementation on 2026-07-15. RFC-028 was activated by
-SchemaIR v2 and internal manifest schema v5 and remains intact in v6, every
+SchemaIR v2 and internal manifest schema v5 and remains intact in v6, v7, and v8, every
 writer/recovery envelope, and identity-derived table path. Identity-consuming
 siblings may rely on that contract while retaining their independent activation
 gates.
@@ -499,9 +759,13 @@ adopted by implication, and drop/re-add cannot claim a predecessor's rows.
 The same correction keeps logical identity separate from physical ABA proof.
 RFC-025 now owns a heads-independent exact manifest/table version token,
 backend refusal, recovery/reconciler checks, and local/S3 same-coordinate ABA
-tests. RFC-026 owns a binding-stable physical-ref incarnation token and remains
-blocked under BLOCKER-06 until its backend/API guards pass. Neither silently
-imports RFC-024's head storage merely to obtain those proofs.
+tests. RFC-026 owns a stable enrollment identity plus a separately mutable
+`CurrentHeadWitness`; it does not pretend one token can be both stable across
+fold commits and sensitive to current-HEAD movement. Phase A closed
+BLOCKER-06's format-foundation requirement and private B1 closed its bounded row
+correctness/evidence gate; RFC-026 remains draft because B2 public/operational
+gates are still open. Neither
+silently imports RFC-024's head storage merely to obtain those proofs.
 
 > 💬 **Concur; supersedes a 2026-07-11 correction (2026-07-11):** the earlier
 > pass placed identity ownership *inside* RFC-024 §3.1, which created exactly
@@ -554,8 +818,8 @@ metadata selects its lifecycle:
 
 RFC-022 through RFC-028 now identify the maintainer design-series track and an
 owner. RFC-022 and RFC-028 are `implemented` at their documented support
-boundaries, RFC-023 is `implemented`, RFC-024 and RFC-027 are
-`research-blocked`, and RFC-025/RFC-026 remain `draft`.
+boundaries, RFC-023 is `implemented`, RFC-024, RFC-025, and RFC-027 are
+`research-blocked`, and RFC-026 remains `draft`.
 All formal RFC filenames in the central directory are normalized to four
 digits. Legacy `docs/dev/rfc-00N-*` files remain in place with their existing
 lifecycle; they are internal design and implementation records, not members of
@@ -710,10 +974,11 @@ revalidation without RFC-024.
 [RFC-026 §11](../rfcs/0026-memwal-streaming-ingest.md#11-format-activation-and-rebuild),
 and [RFC-028 §8](../rfcs/0028-stable-schema-identity.md#8-format-activation-and-upgrade)
 
-**Status:** Closed in specification on 2026-07-14. RFC-023 assigns and
-implements internal schema v6; its genuine v5↔v6 rebuild and bidirectional
-refusal run passed on 2026-07-15. Each later format still requires its own
-implementation and genuine evidence.
+**Status:** Closed in specification on 2026-07-14. RFC-023 assigned and
+implemented internal schema v6; its genuine v5↔v6 rebuild and bidirectional
+refusal run passed on 2026-07-15. RFC-026 Phase A subsequently assigned v7 and
+passed its genuine v6↔v7 rebuild/refusal evidence. Every future format still
+requires its own implementation and genuine evidence.
 
 The reviewed RFC-023 and RFC-024 drafts designed all-branch, in-place conversion
 protocols even though OmniGraph's strict-single-version strand intentionally has
@@ -730,6 +995,152 @@ Capabilities may co-release to reduce cutovers only after independent
 acceptance and a combined initialization/recovery matrix. The rebuild's loss of
 unselected branches and history is explicit rather than hidden behind the word
 “migration.”
+
+### BLOCKER-13 — checkpoint authority lookup is not physically history-flat
+
+**Affected:** [RFC-025 §0.1](../rfcs/0025-checkpoint-retention.md#01-pre-activation-gate-0),
+[§9](../rfcs/0025-checkpoint-retention.md#9-observability-and-bounds), and
+[§11](../rfcs/0025-checkpoint-retention.md#11-phasing)
+
+**Status:** Research-blocking no-go recorded on 2026-07-17. Current production
+schema v8 still activates no retention format or checkpoint API.
+
+The production-neutral `checkpoint_retention_cost.rs` fixture holds three live
+checkpoints and catalog width ten fixed while unrelated journal history grows.
+It measures complete list, exact show, and cleanup-root reads from cold open and
+warm repeat across compacted/uncompacted layouts and absent, reconciled, and
+eight-fragment uncovered-tail index states.
+
+The local 10→100→1,000 decision run separates a real access-shape win from the
+required history-slope claim:
+
+- reconciled uncompacted list is flat at 3 rows / 3 ranges / 1 fragment / 1
+  index page and 24 scan operations / 13,752 bytes; exact show is flat at
+  12 / 2 / 2 / 3 and 34 operations / 22,952 bytes; cleanup returns 44 rows with
+  list-like cost, and the bounded tail remains exact and history-flat;
+- after compaction, list/cleanup cold scan bytes grow 17,012→38,000 and warm
+  bytes 12,336→15,064; exact-show cold bytes grow 29,348→53,064 and warm bytes
+  24,672→30,128. At depth 1,000 the one-scan paths cross 24→25 scan operations
+  and show crosses 34→35.
+
+The default 20/80 test passes its no-go-preservation assertions. That is a
+successful instrument reproducing a failed design gate, not acceptance. The
+S3/RustFS cost cell exists and remains bucket-gated; it was skipped locally and
+is not credited as evidence. One required local compacted cell already fails,
+so the missing S3 run cannot turn this result green.
+
+The substrate itself is not the blocker. All 23 RC.1 Lance surface guards pass; the
+RFC-025 cells prove exact main/named-branch tag targets, sparse cleanup pin and
+unpin, and that tags do not protect a named branch tree. This supports the
+checkpoint-row/Lance-tag architecture and keeps the branch-deletion guard
+load-bearing. It does not make the surviving registry authority read
+history-flat.
+
+**Required disposition:** retain `__manifest` as the only checkpoint authority
+and find a history-flat current-authority lookup shape, or revise the
+operational contract with measured evidence and explicit user-visible cost.
+Do not weaken the physical-I/O gate, infer success from flat row/range counters,
+or add a second authority dataset whose rows cannot share the main-manifest
+CAS.
+
+### BLOCKER-14 — stock RC.1 cannot safely reclaim MemWAL state (B2b)
+
+**Affected:** [RFC-026 §4.5.2](../rfcs/0026-memwal-streaming-ingest.md#452-b2b-managed-reclamation-own-the-missing-lance-primitive),
+[§6](../rfcs/0026-memwal-streaming-ingest.md#6-fold-protocol), and
+[§12.6](../rfcs/0026-memwal-streaming-ingest.md#126-common-public-and-b2b-managed-reclamation-activation-gates)
+
+**Status:** Design-dispositioned on 2026-07-19 as the optional B2b
+managed-reclamation route; implementation-blocking only if that profile is
+pursued. Gate R0's 2026-07-20 result remains a historical no-go for a finite or
+otherwise bounded retain-all claim on stock RC.1. It does not reject the
+selected unbounded B2a profile, whose legal near-cap B1 closure was repaired on
+2026-07-21 and whose private no-delete/provider-failure/history-cost gate is now
+implemented. Neither result reopens the MemWAL substrate choice or activates a
+public surface.
+
+Two production-neutral guards pin the current RC.1 boundary:
+
+- `cleanup_old_versions_does_not_reclaim_mem_wal_objects` proves Lance's
+  generic version cleanup can remove ordinary table history while leaving the
+  present `_mem_wal` fixture unchanged; it does not classify orphans; and
+- `mem_wal_deleted_fence_slot_allows_stale_writer_success_on_pinned_lance`
+  proves that decoding and deleting the successor's empty epoch-2 WAL fence
+  sentinel can let the stale writer complete a later WAL PUT and receive
+  watcher success even though an explicit epoch check returns
+  `PeerClaimedEpoch`. RC.1 does not perform that check after success.
+
+Those are negative ownership findings. They forbid an OmniGraph raw-path
+collector; they do not prove a safe cleanup implementation. WAL positions also
+have no per-generation durable range in RC.1, so prefix deletion is limited to
+a quiescent whole cut rather than inferred from mutable cursor hints.
+
+Gate R0 deliberately tested whether **finite-lifetime, bounded** retain-all
+could avoid this reclamation dependency. Its revision-pinned source audit and
+evidence harness returned **no-go for that bounded claim**. A flush chooses a
+fresh random generation subtree and can leave partial output before the
+shard-manifest CAS. Reopen can retry materialization at another root, while
+durable shard state has no attempt ID/counter/reservation/receipt persisted and
+enforced across cold opens. RC.1 exposes no admission-grade reserve-first
+estimator or complete receipt for the
+data/deletion/bloom/PK/blob/transaction/manifest/local-staging/multipart
+output. The retained one/four/eight-fold current-object census and
+referenced-cut retry prove useful invariants but cannot establish provider
+versions, incomplete multipart, or billed bytes.
+
+The implemented private B2a profile accepts that limitation explicitly. It
+retains every canonical durable `_mem_wal` object, performs no OmniGraph WAL deletion, sets no retained-byte,
+object-count, file-count, or history quota, and treats provider exhaustion as a
+loud failure that may stop admission, fold, or recovery progress without
+weakening acknowledgement durability or manifest-only visibility. Because it
+makes no finite-storage claim, B2a does not need a test-only materialization
+attempt ledger, a complete reserve-first physical-output envelope, or a
+`GraphHistoryBudget`. Any later production state still binds to the existing
+manifest/recovery authority. Complete and partial unreferenced generation output
+remains non-authoritative and untouched below its root through retry/reopen;
+parent discovery may observe the prefix, and Lance may remove only a losing
+manifest-CAS temporary staging object. The checked-in provider matrix and
+1/8/32/128 advisory instrument pin that exact boundary.
+
+**Optional future B2b disposition:** if managed reclamation is pursued, author
+the capability inside Lance as an opaque inspect/plan/execute operation with
+durable attempt/receipt recovery. Its plan
+binds exact shard-manifest history, whole-cut cursor predicates, base
+merge/index state, writer epoch, graph-approved generation, and object/byte
+budgets. Execution revalidates those witnesses, advances both shard-manifest
+version and epoch before deleting only approved objects, retains unknown/gapped
+state, and returns an idempotently classifiable receipt. The patch also needs a
+bounded authoritative checkpoint for shard, ordinary-claim, and reclaim
+history. All epoch claims must be attempt-owned, successor-sentinel-first, and
+manifest-named; ordinary open/quiesce/resume/checkpoint claims preserve the
+replay cursor, while only a proved whole-cut reclaim may advance it. Enrollment
+creates the genesis bootstrap before a new MemWAL details kind that stock RC.1
+rejects. Exact accounting requires strong HEAD/GET/LIST visibility after
+PUT/DELETE plus multipart accounting/abort or durable complete accounting, a
+source-derived enforced physical-growth reservation with bounded
+materialization attempts and control headroom, and an epoch recheck after every
+successful WAL atomic PUT. One bootstrap-selected reserve-first ledger owns
+that budget per physical binding and settles only from exact inventory;
+versioned/soft-delete/Object-Lock stores are refused unless every retained byte
+is accounted and eligible versions are permanently removed. This is
+Lance-owned future work, not an OmniGraph raw-path collector and not an
+immediate B2a dependency.
+
+That managed-reclamation profile remains closed until the positive
+local/RustFS stale-plan,
+prune-CAS, partial-delete, lost-result/receipt,
+authoritative-checkpoint-plus-successor-chain orphan,
+unknown-state, genesis/first-publication, claim/reclaim receipt-expiry,
+history-checkpoint, inventory-consistency, and post-success-fence matrices pass.
+The source-derived reservation must be enforced before admission; a separate
+physical-expansion instrument validates it but cannot create a hard bound.
+Runtime never releases budget merely because a fold completed.
+
+The earlier bounded-profile sketch paired that per-binding ledger with a
+manifest-authoritative graph-global `GraphHistoryBudget`, because reclaiming
+`_mem_wal` alone would not bound base, token, and shared-manifest histories.
+That sketch remains design history for a possible B2b amendment. It is not part
+of the selected unbounded B2a profile, is not a common public-stream contract,
+and is not on the immediate implementation path.
 
 ### TIGHTENING-01 — symmetric Lance conflicts are not obviously an activation gate
 
@@ -772,8 +1183,9 @@ protected by symmetry in either case.
 > favor of a possible demotion. It does **not** close activation: the
 > scalar-indexed/default-v1 path still emits `None`, keyed Append remains
 > reachable in today's engine, and beta.21 still permits unfiltered Update or
-> Append to land second after a filtered Update. Internal schema v6 now closes
-> that routing condition: every production insertion-bearing graph path uses
+> Append to land second after a filtered Update. Internal schema v6 introduced
+> the routing closure, and current v19 preserves it: every production
+> insertion-bearing graph path uses
 > the exact-`id`, forced-v2 keyed adapter, generic Append is test-only, and the
 > adapter verifies the emitted field-ID filter. Upstream symmetry is therefore
 > defense in depth rather than an activation prerequisite.
@@ -783,10 +1195,13 @@ protected by symmetry in either case.
 These are smaller than the blockers above, but should be resolved before the
 affected RFC is accepted or implemented:
 
-1. **Checkpoint-name normalization:** define allowed bytes, Unicode
-   normalization, case sensitivity, maximum encoded length, reserved prefixes,
-   and normalization-version compatibility. Test collisions and reuse across
-   versions.
+1. **Checkpoint-name normalization (closed in specification and reference test
+   on 2026-07-17):** RFC-025 defines V1 as an ASCII-only, case-sensitive,
+   identity transform over 1..=128 bytes with slash-separated nonempty
+   `[A-Za-z0-9._-]+` segments, explicit path-like refusals, reserved `__` and
+   `ogcp_` prefixes, a versioned reservation key, and no trim, Unicode
+   normalization, or case folding. Future versions must use bounded exact
+   cross-version collision checks and may not reinterpret V1 reservations.
 2. **RFC lifecycle values (closed 2026-07-13):**
    [`docs/rfcs/README.md`](../rfcs/README.md) now uses one four-digit filename
    namespace and distinguishes the public contribution lifecycle from the
@@ -895,12 +1310,45 @@ The review does not require all RFCs to land together. A safe order is:
 4. RFC-024's independent physical lookup evaluation completed on 2026-07-15:
    the exact BTREE's scan work is flat, but uncompacted RustFS cold object
    reads/bytes and compacted byte terms grow, so the format is research-blocked
-   and production remains on internal schema v6;
-5. accept RFC-025 after physical protection of both checkpoints and live graph
-   branches plus strict-rebuild implementation evidence;
-6. accept RFC-026 only after Lance exposes the public exact-enrollment and
-   admission-seal surface, then its capability/refusal/rebuild, multi-effect
-   recovery, and writer-ownership evidence match the specified scope;
+   and the current development format remains on internal schema v19 without table heads;
+5. keep RFC-025 research-blocked after its 2026-07-17 Gate 0 no-go; reconsider
+   only after a history-flat current-authority lookup shape or revised
+   evidence-backed operational contract passes the full physical-I/O boundary,
+   then require physical protection of checkpoints/live graph branches and
+   strict-rebuild implementation evidence;
+6. retain RFC-026 Gate E0's green exact-version evidence and Phase A's
+   implemented bounded enrollment foundation. Preserve private B1's
+   schema-v8/config-v2 put/watcher/post-fence/replay/recovery-v11 evidence and
+   its repaired legal near-cap closure: logical-slice accounting plus dense
+   scanner-output copies now fold and publish the 8,192-row high-entropy cell,
+   with the isolated fold RSS delta below the remeasurement tripwire. Preserve
+   the implemented private B2a unbounded retain-all gate: never delete a
+   canonical durable `_mem_wal` object, keep complete/partial orphan subtrees
+   inert through retry/reopen, impose no retained-byte/object/file/history
+   quota, surface provider exhaustion loudly, and retain the local/RustFS
+   provider plus 1/8/32/128 advisory evidence. Do not add a materialization-attempt
+   ledger, reserve-first complete physical-output envelope, storage watermark,
+   or `GraphHistoryBudget` to that immediate path. Preserve the implemented
+   private schema-v9/config-v3/state-v2/recovery-v12 compare-and-chain/token-fold
+   core, including hidden trusted attribution, the manifest-selected
+   `_stream_tokens.lance` participant, exact joint publication, and genuine
+   v8↔v9 refusal/rebuild evidence. Preserve the bounded
+   v11/profile-v2/recovery-v13 profile-authority tranche: opaque checked
+   stopped/offline and runtime owners, resumable `DISABLING`, fail-closed
+   `RETIRED`, exact `ProfileManagementReceipt`, and unchanged recovery-v12
+   historical fold meaning. Preserve the implemented v12/lifecycle-v3/
+   recovery-v14 hidden enrollment, claim, ordinary/drain fold, and terminal
+   receipt path; the distinct recovery-v15/v16/v17/v18 resume, maintenance, and
+   rebind owners; and v17/recovery-v19 terminal retirement/export. Keep every
+   v14 scaffold frozen and give correction a new finalized strand. Before
+   exposing production lifecycle control, add the simplified F5 terminal path: one
+   bounded recovery-owned object, current `DEAD_LETTERED` authority, ordinary
+   correction, and extension of same-format retirement to `DEAD_LETTERED`, with emergency repair surfaces
+   cluster/offline-only. Then prove primary SDK/CLI/HTTP/OpenAPI parity before
+   exposing B2. Keep B2b
+   Lance-owned managed reclamation as an optional future route with its own
+   evidence and format amendment. Retain the public exact enrollment receipt
+   and cross-process admission seal as the gate for broader topology;
 7. keep RFC-027 in research until deletion-delta discovery passes its stated
    correctness and flat-cost gates.
 

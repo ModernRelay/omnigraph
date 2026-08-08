@@ -9,7 +9,6 @@ mod support;
 
 use support::*;
 
-
 #[test]
 fn cluster_validate_config_success() {
     let temp = tempdir().unwrap();
@@ -24,6 +23,115 @@ fn cluster_validate_config_success() {
     );
     let stdout = stdout_string(&output);
     assert!(stdout.contains("cluster config valid"), "{stdout}");
+}
+
+#[test]
+fn cluster_validate_rejects_semantically_invalid_policy() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    fs::write(
+        temp.path().join("base.policy.yaml"),
+        r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: invalid-invoke-scope
+    allow:
+      actors: { group: team }
+      actions: [invoke_query]
+      branch_scope: any
+"#,
+    )
+    .unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(temp.path()),
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("ERROR policy_invalid policies.base.file"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("branch_scope") && stdout.contains("invoke_query"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn cluster_validate_rejects_policy_binding_kind_mismatch() {
+    for (applies_to, action, scope, expected_kind) in [
+        ("knowledge", "graph_list", "", "server-scoped"),
+        ("cluster", "read", "      branch_scope: any\n", "per-graph"),
+    ] {
+        let temp = tempdir().unwrap();
+        write_cluster_config_fixture(temp.path());
+        let config_path = temp.path().join("cluster.yaml");
+        let config = fs::read_to_string(&config_path).unwrap().replace(
+            "applies_to: [knowledge]",
+            &format!("applies_to: [{applies_to}]"),
+        );
+        fs::write(config_path, config).unwrap();
+        fs::write(
+            temp.path().join("base.policy.yaml"),
+            format!(
+                r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: wrong-kind
+    allow:
+      actors: {{ group: team }}
+      actions: [{action}]
+{scope}"#
+            ),
+        )
+        .unwrap();
+
+        let output = output_failure(
+            cli()
+                .arg("cluster")
+                .arg("validate")
+                .arg("--config")
+                .arg(temp.path()),
+        );
+        let stdout = stdout_string(&output);
+        assert!(
+            stdout.contains("ERROR policy_invalid policies.base.file"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(expected_kind) && stdout.contains(action),
+            "{stdout}"
+        );
+    }
+
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let config_path = temp.path().join("cluster.yaml");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "applies_to: [knowledge]",
+        "applies_to: [cluster, knowledge]",
+    );
+    fs::write(config_path, config).unwrap();
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(temp.path()),
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("ERROR policy_mixed_binding_kinds policies.base.applies_to"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -723,8 +831,13 @@ fn cluster_apply_uses_operator_actor_from_omnigraph_home() {
             .arg("--json")
             .output()
             .unwrap();
-        let json: serde_json::Value =
-            serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        assert!(
+            output.status.success(),
+            "cluster apply failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json = parse_stdout_json(&output);
         json["actor"].clone()
     };
 
@@ -749,17 +862,17 @@ fn cluster_approve_uses_operator_actor_fallback() {
     )
     .unwrap();
     // Converge, then remove the graph so a gated delete is pending.
-    for command in ["import", "apply"] {
-        let output = cli()
+    for subcommand in ["import", "apply"] {
+        let mut command = cli();
+        command
             .current_dir(temp.path())
             .env("OMNIGRAPH_HOME", operator_home.path())
             .arg("cluster")
-            .arg(command)
+            .arg(subcommand)
             .arg("--config")
-            .arg(temp.path())
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "cluster {command} failed");
+            .arg(temp.path());
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "cluster {subcommand} failed");
     }
     fs::write(temp.path().join("cluster.yaml"), "version: 1\ngraphs: {}\n").unwrap();
 
@@ -884,12 +997,17 @@ graphs:
     let (a, b) = (validate(baseline.path()), validate(with_config.path()));
     // Compare the path-free invariants (paths embed each tempdir).
     for key in ["ok", "diagnostics", "resource_digests", "dependencies"] {
-        assert_eq!(a[key], b[key], "conflicting omnigraph.yaml leaked into cluster validate ({key})");
+        assert_eq!(
+            a[key], b[key],
+            "conflicting omnigraph.yaml leaked into cluster validate ({key})"
+        );
     }
     let leaked = b.to_string();
-    assert!(!leaked.contains("phantom") && !leaked.contains("9999"), "{leaked}");
+    assert!(
+        !leaked.contains("phantom") && !leaked.contains("9999"),
+        "{leaked}"
+    );
 }
-
 
 // ── RFC-010 Slice 3: cluster-managed maintenance addressing + init signpost ──
 
@@ -972,7 +1090,7 @@ fn applied_two_graph_cluster() -> tempfile::TempDir {
         "node Person {\n  name: String @key\n  age: I32?\n}\n",
     )
     .unwrap();
-    fs::write(root.join("base.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(root.join("base.policy.yaml"), "version: 1\nrules: []\n").unwrap();
     fs::write(
         root.join("cluster.yaml"),
         r#"

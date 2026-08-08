@@ -86,6 +86,13 @@ async fn init_creates_graph() {
     );
 
     let snap = snapshot_main(&db).await.unwrap();
+    assert_eq!(
+        db.internal_schema_version_of(ReadTarget::branch("main"))
+            .await
+            .unwrap(),
+        6,
+        "fresh graphs must use the restored pre-WAL v6 manifest format"
+    );
     assert!(snap.entry("node:Person").is_some());
     assert!(snap.entry("node:Company").is_some());
     assert!(snap.entry("edge:Knows").is_some());
@@ -103,6 +110,30 @@ async fn init_creates_graph() {
             ["id"],
             "fresh graph table {table_key} must be created with exactly `id` as its Lance unenforced primary key"
         );
+        assert!(
+            dataset.schema().field("__omnigraph_stream_v1$").is_none(),
+            "fresh v6 table {table_key} must not carry abandoned stream metadata"
+        );
+    }
+
+    assert!(
+        !dir.path().join("_stream_tokens.lance").exists(),
+        "fresh v6 roots must not create the abandoned token-authority dataset"
+    );
+    let mut pending = vec![dir.path().to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            assert_ne!(
+                entry.file_name().to_string_lossy(),
+                "_mem_wal",
+                "fresh v6 roots must not create MemWAL storage"
+            );
+            if path.is_dir() {
+                pending.push(path);
+            }
+        }
     }
 
     assert_eq!(db.catalog().node_types.len(), 2);

@@ -1,4 +1,5 @@
 pub mod api;
+mod export_transport;
 mod handlers;
 mod settings;
 use handlers::*;
@@ -20,32 +21,29 @@ use crate::queries::{QueryRegistry, check, format_check_breakages};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
-    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
-    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
-    SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output,
-    snapshot_payload,
+    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
+    GraphBatchLoadQuery, GraphInfo, GraphListResponse, HealthOutput, IngestOutput, IngestRequest,
+    InvokeStoredQueryRequest, InvokeStoredQueryResponse, QueriesCatalogOutput, QueryRequest,
+    ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery,
+    graph_batch_load_output, ingest_output, schema_apply_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
 use axum::http::StatusCode;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
-use futures::stream;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
 use omnigraph::storage::normalize_root_uri;
@@ -60,9 +58,9 @@ pub use policy::{
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::io::{self, Write};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -72,6 +70,11 @@ use utoipa::openapi::schema::{Object, Type};
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 
 type BearerTokenHash = [u8; 32];
+
+/// Machine-readable stdout record emitted after the HTTP listener owns its
+/// requested address. In particular, this exposes the OS-selected port for a
+/// `--bind 127.0.0.1:0` process without a reserve-and-rebind race.
+pub const LISTEN_ADDR_PREFIX: &str = "OMNIGRAPH_LISTEN_ADDR=";
 
 fn hash_bearer_token(token: &str) -> BearerTokenHash {
     let digest = Sha256::digest(token.as_bytes());
@@ -102,6 +105,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_schema_apply,
         handlers::server_schema_get,
         handlers::server_load,
+        handlers::server_load_ndjson,
         // deprecated; the #[deprecated] attribute on the handler surfaces as
         // `deprecated: true` on the OpenAPI operation.
         #[allow(deprecated)] handlers::server_ingest,
@@ -264,23 +268,13 @@ pub struct AppState {
     /// resource. Loaded from the cluster-scoped policy binding when
     /// configured. Per-graph policies live on each `GraphHandle.policy`.
     server_policy: Option<Arc<PolicyEngine>>,
+    /// Bounded process-wide ownership for queued served-export bytes. The
+    /// response body and detached producer jointly retain each reservation.
+    export_transport: export_transport::ExportTransport,
 }
 
-struct ExportStreamWriter {
-    sender: mpsc::UnboundedSender<std::result::Result<Bytes, io::Error>>,
-}
-
-impl Write for ExportStreamWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.sender
-            .send(Ok(Bytes::copy_from_slice(buf)))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "export stream closed"))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+struct OpenedGraph {
+    handle: Arc<GraphHandle>,
 }
 
 #[derive(Debug)]
@@ -510,8 +504,9 @@ impl AppState {
     ) -> Self {
         // Engine-layer policy gate (MR-722). With a per-graph policy
         // installed, every `_as` writer on `Omnigraph` calls into the
-        // PolicyChecker. HTTP-layer `authorize_request` is the first
-        // gate; engine-layer is the redundant-but-correct backstop.
+        // PolicyChecker. Handlers retain an HTTP-layer first gate so served
+        // requests fail before their write bodies are interpreted; the engine
+        // repeats the authoritative actor-aware decision at the write boundary.
         let db = if let Some(policy) = policy_engine.as_ref() {
             let checker = Arc::clone(policy) as Arc<dyn omnigraph_policy::PolicyChecker>;
             db.with_policy(checker)
@@ -543,6 +538,7 @@ impl AppState {
             workload,
             bearer_tokens,
             server_policy: None,
+            export_transport: export_transport::ExportTransport::with_defaults(),
         }
     }
 
@@ -569,6 +565,7 @@ impl AppState {
             workload: Arc::new(workload),
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
+            export_transport: export_transport::ExportTransport::with_defaults(),
         })
     }
 
@@ -695,6 +692,20 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
+            message: message.into(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            recovery_required: None,
+        }
+    }
+
+    fn unsupported_media_type(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            code: Some(ErrorCode::BadRequest),
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
@@ -908,12 +919,10 @@ impl ApiError {
                 Self::conflict(format!("retryable storage commit conflict: {message}"))
             }
             OmniError::Io(err) => Self::internal(format!("io: {err}")),
-            // Engine-layer policy enforcement (MR-722). All denials and
-            // evaluation failures surface here as 403. The HTTP-layer
-            // `authorize_request` already distinguishes 401 (missing
-            // bearer) from 403 (policy denial), so by the time the
-            // engine gate fires, the bearer is valid — any failure from
-            // the engine is a policy outcome, not an auth one.
+            // Engine-layer policy enforcement (MR-722). Authentication
+            // middleware has already distinguished a missing/invalid bearer
+            // (401); policy denials and evaluation failures surface as 403.
+            // Most handlers also perform an HTTP-layer policy check.
             OmniError::Policy(message) => Self::forbidden(message),
             // `Omnigraph::init` against an existing graph URI in strict
             // mode. Not currently HTTP-reachable (POST /graphs was
@@ -1141,6 +1150,7 @@ pub fn build_app(state: AppState) -> Router {
             "/load",
             post(server_load).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
         )
+        .route("/load/ndjson", post(server_load_ndjson))
         // /ingest is the deprecated alias of /load; its handler carries
         // #[deprecated] (OpenAPI operation flagged) and emits RFC 9745
         // Deprecation + RFC 8288 Link headers. Suppress the call-site warning.
@@ -1259,6 +1269,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     };
 
     let listener = TcpListener::bind(&bind).await?;
+    let listen_addr = listener.local_addr()?;
+    {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        writeln!(stdout, "{LISTEN_ADDR_PREFIX}{listen_addr}")?;
+        stdout.flush()?;
+    }
+
     axum::serve(listener, build_app(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -1317,7 +1335,9 @@ pub async fn open_multi_graph_state(
     let mut failed = 0usize;
     for result in results {
         match result {
-            Ok(handle) => handles.push(handle),
+            Ok(opened) => {
+                handles.push(opened.handle);
+            }
             Err((graph_id, err)) => {
                 failed += 1;
                 warn!(
@@ -1351,7 +1371,7 @@ pub async fn open_multi_graph_state(
 
 /// Open one graph and wrap it in a `GraphHandle`. Used at startup by
 /// `open_multi_graph_state`.
-async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> {
+async fn open_single_graph(cfg: GraphStartupConfig) -> Result<OpenedGraph> {
     let graph_id = GraphId::try_from(cfg.graph_id.clone())
         .map_err(|err| color_eyre::eyre::eyre!("graph id '{}': {err}", cfg.graph_id))?;
     let uri = normalize_root_uri(&cfg.uri)
@@ -1382,19 +1402,119 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
         None => (None, db),
     };
 
-    Ok(Arc::new(GraphHandle {
-        key: GraphKey::cluster(graph_id),
-        uri,
-        engine: Arc::new(db),
-        policy: policy_arc,
-        queries,
-    }))
+    Ok(OpenedGraph {
+        handle: Arc::new(GraphHandle {
+            key: GraphKey::cluster(graph_id),
+            uri,
+            engine: Arc::new(db),
+            policy: policy_arc,
+            queries,
+        }),
+    })
+}
+
+async fn wait_for_ctrl_c() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        error!(error = %err, "failed to install ctrl-c handler");
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal_with_terminate(mut terminate: tokio::signal::unix::Signal) {
+    tokio::select! {
+        () = wait_for_ctrl_c() => {},
+        received = terminate.recv() => {
+            if received.is_none() {
+                error!("SIGTERM handler closed before receiving a signal");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(terminate) => wait_for_shutdown_signal_with_terminate(terminate).await,
+        Err(err) => {
+            error!(error = %err, "failed to install SIGTERM handler; waiting for ctrl-c only");
+            wait_for_ctrl_c().await
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    wait_for_ctrl_c().await
 }
 
 async fn shutdown_signal() {
-    if let Err(err) = tokio::signal::ctrl_c().await {
-        error!(error = %err, "failed to install ctrl-c handler");
-        return;
-    }
+    wait_for_shutdown_signal().await;
     info!("shutdown signal received");
+}
+
+#[cfg(all(test, unix))]
+mod shutdown_signal_tests {
+    use std::process::Command;
+    use std::time::Duration;
+
+    use super::*;
+
+    const SIGTERM_CHILD_ENV: &str = "OMNIGRAPH_SERVER_SIGTERM_TEST_CHILD";
+    const SIGTERM_READY_PATH_ENV: &str = "OMNIGRAPH_SERVER_SIGTERM_TEST_READY_PATH";
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "subprocess helper; exercised by sigterm_reaches_the_shared_shutdown_path"]
+    async fn sigterm_child_waits_for_signal() {
+        if std::env::var_os(SIGTERM_CHILD_ENV).is_none() {
+            return;
+        }
+
+        let terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        let ready_path = std::env::var(SIGTERM_READY_PATH_ENV).unwrap();
+        std::fs::write(ready_path, b"ready").unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_shutdown_signal_with_terminate(terminate),
+        )
+        .await
+        .expect("SIGTERM was not observed before the child deadline");
+    }
+
+    #[test]
+    fn sigterm_reaches_the_shared_shutdown_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let ready_path = temp.path().join("signal-handler-ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("shutdown_signal_tests::sigterm_child_waits_for_signal")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(SIGTERM_CHILD_ENV, "1")
+            .env(SIGTERM_READY_PATH_ENV, &ready_path)
+            .spawn()
+            .unwrap();
+
+        for _ in 0..500 {
+            if ready_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready_path.exists(),
+            "SIGTERM helper did not install its handler before the deadline"
+        );
+
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill -TERM failed with {status}");
+
+        let status = child.wait().unwrap();
+        assert!(status.success(), "SIGTERM helper failed with {status}");
+    }
 }

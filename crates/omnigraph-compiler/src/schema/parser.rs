@@ -485,6 +485,13 @@ fn resolve_interfaces(node: &mut NodeDecl, interfaces: &[&InterfaceDecl]) -> Res
 fn parse_prop_decl(pair: pest::iterators::Pair<Rule>) -> Result<PropDecl> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
+    if super::is_reserved_storage_system_column(&name) {
+        return Err(CompilerError::Parse(format!(
+            "property name '{name}' is reserved for a virtual storage system column; \
+             a graph created with a pre-RC Lance binary must be exported with that binary, \
+             renamed, and rebuilt"
+        )));
+    }
     let type_ref = inner.next().unwrap();
     let prop_type = parse_type_ref(type_ref)?;
 

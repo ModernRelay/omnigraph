@@ -10,6 +10,20 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. **Cluster-only boot**: the server a
 omnigraph-server --cluster <dir | s3://…> --bind 0.0.0.0:8080
 ```
 
+Passing port `0` lets the operating system select an available port. After the
+listener binds, the server writes the actual address to stdout as one
+machine-readable line:
+
+```text
+OMNIGRAPH_LISTEN_ADDR=127.0.0.1:54321
+```
+
+Process supervisors and test harnesses can use this record instead of
+reserving and releasing a port before starting the server. When the bind host
+is a wildcard such as `0.0.0.0` or `[::]`, the record identifies the listener
+but is not itself a portable client endpoint; use the selected port with a
+host that is reachable from the client.
+
 `omnigraph-server --cluster <dir-or-uri>` boots from the cluster catalog's
 **applied revision**. The server resolves that revision into per-graph
 startup configs (id, URI, optional per-graph policy, stored-query
@@ -61,7 +75,8 @@ graph id from the cluster's applied revision:
 | POST | `/graphs/{id}/queries/{name}` | bearer + `invoke_query` (+ `change` for a stored mutation) | invoke a named query from the `queries:` registry; deny == 404 |
 | GET | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source |
 | POST | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | disabled for cluster-backed serving; returns 409 and points operators at `omnigraph cluster apply` + restart |
-| POST | `/graphs/{id}/load` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | bulk load (canonical); branch creation is opt-in via `from` — without it a missing `branch` is a 404, never an implicit fork (32 MB body limit) |
+| POST | `/graphs/{id}/load` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | JSON-envelope load (`data` contains NDJSON), retained for compatibility (32 MB body limit) |
+| POST | `/graphs/{id}/load/ndjson?branch=&from=&mode=` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | strict raw `application/x-ndjson` graph batch; one request publishes one graph commit before success (32 MB body limit) |
 | POST | `/graphs/{id}/ingest` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | **deprecated** alias of `/load` (carries `Deprecation: true` + `Link: <load>; rel="successor-version"`) (32 MB body limit) |
 | GET | `/graphs/{id}/branches` | bearer + `read` | list branches |
 | POST | `/graphs/{id}/branches` | bearer + `branch_create` | create |
@@ -156,14 +171,76 @@ channels:
 Migration is purely cosmetic on the client side — swap the URL path, leave
 the request body and response handling alone.
 
-## Streaming
+## Bounded graph-batch ingestion
 
-Only `/export` streams (`application/x-ndjson`, MPSC channel + `Body::from_stream`). Everything else is buffered JSON.
+`POST /graphs/{graph_id}/load/ndjson` accepts a raw
+`application/x-ndjson` body. Targeting stays at graph level: `branch`, optional
+`from`, and `mode=append|merge|overwrite` are query parameters; there is no
+table or dataset selector. One request may mix logical node and edge
+declarations:
+
+```http
+POST /graphs/knowledge/load/ndjson?branch=main&mode=merge
+Content-Type: application/x-ndjson
+
+{"type":"Person","data":{"name":"Ada"}}
+{"edge":"Knows","from":"Ada","to":"Grace","data":{}}
+```
+
+The server authenticates and completes Cedar `branch_create`/`change`
+authorization before polling the body. It then buffers at most 32 MiB, applies
+the ordinary admission limits, strictly validates the complete batch, and calls
+the actor-aware graph-batch loader. All touched declarations publish through
+the existing multi-dataset transaction. A successful response is terminal: the
+single graph commit is already visible. Its `nodes` and `edges` arrays contain
+only logical accepted-schema names and row counts; physical table and Lance
+identities are not exposed.
+
+`append` is strict insert, `merge` is upsert, and `overwrite` replaces each
+touched declaration's image. A malformed batch has no effect. Use multiple
+bounded requests for a larger feed; each successful request is one graph
+commit.
+
+The existing `POST /load` JSON envelope remains available: its `data` string
+contains the NDJSON and its other fields carry the same branch options. The
+canonical remote `omnigraph load` command uses the raw `/load/ndjson` route.
+
+The legacy JSON `POST /ingest` endpoint remains a deprecated alias of
+JSON `POST /load`.
+
+## Export streaming
+
+The `/export` route streams `application/x-ndjson`; other routes remain
+buffered JSON. Export authorization, recovery settlement, and branch/filter
+validation all finish before the server sends `200`.
+
+The engine incrementally scans exact pinned Lance versions using an initial
+8,192-row estimate and Lance's approximate 32-MiB decoded-byte target; these
+are scheduling targets, not hard scanner-memory ceilings. Blob descriptors are
+explicitly sliced to one logical row before its complete Blob-property set is
+materialized. One row's Blob values and encoded JSON are indivisible scratch
+outside the transport reservation. Encoded JSONL is split into independently
+owned chunks of at most 64 KiB.
+
+Each response uses a two-chunk bounded queue and reserves 256 KiB for the two
+queued chunks, one producer chunk awaiting admission, and one consumer-current
+chunk. This is a complete transport-queue envelope, not a cap on the whole
+response or process RSS. The production process holds a 2-MiB aggregate queue
+budget (eight reservations) and waits at most 250 ms for one. An occupied graph
+export cut or saturated transport returns the ordinary structured HTTP 413
+response before success headers. A stalled client backpressures production;
+the response body and producer jointly retain the queue lease, so disconnect
+closes the receiver immediately but does not recycle the permit until the
+producer has unwound. The immutable cut remains in the producer or a terminal
+frame queued after all data. A storage failure after `200` terminates the
+response body as a stream error; it cannot be rewritten into a JSON error after
+headers. Clients must discard a partial artifact whenever body consumption
+fails.
 
 ## Error model
 
 Uniform
-`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, read_set_conflict?, recovery_required? }`
+`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, read_set_conflict?, recovery_required?, resource_limit? }`
 with
 `code ∈ unauthorized | forbidden | bad_request | not_found | method_not_allowed | conflict | too_many_requests | internal`.
 Merge conflicts attach structured
@@ -191,7 +268,8 @@ structured field is additive and rolling-safe.
 Do not blindly resubmit the write: let a read-write open or the recovery sweep
 resolve that operation first, then retry from a fresh snapshot.
 
-HTTP status codes used: 200, 400, 401, 403, 404, 405, 409, 429, 500, 503.
+HTTP status codes used include 200, 400, 401, 403, 404, 405, 409, 412, 413,
+415, 429, 500, and 503.
 
 ## Per-actor admission control
 
@@ -223,15 +301,17 @@ denied requests don't consume admission slots.
 
 Today admission gates every mutating handler: `/mutate` (and its
 deprecated alias `/change`), `/load` (and its deprecated alias `/ingest`),
+`/load/ndjson`,
 `/branches/{create,delete,merge}`,
 and `/schema/apply`. Read-only endpoints (`/snapshot`, `/query`, `/read`,
 `/export`, `/branches` GET, `/commits`, `/schema` GET) are not
 admission-gated.
 
+
 ## Body limits
 
 - Default: 1 MB
-- `/load` (and its deprecated `/ingest` alias): 32 MB
+- `/load`, `/load/ndjson`, and the deprecated `/ingest` alias: 32 MB
 
 ## Auth model (`bearer + SHA-256`)
 
@@ -260,6 +340,7 @@ See [deployment.md](../deployment.md) for token-source operational details.
 - CORS — not configured; add `tower_http::cors` if needed.
 - Rate limiting — per-actor admission control gates `/mutate` (alias
   `/change`), `/load` (alias `/ingest`), `/branches/{create,delete,merge}`,
+  `/load/ndjson`,
   `/schema/apply` (see "Per-actor
   admission control" above). No global rate limiter is configured;
   add `tower_http::limit` if a graph-wide cap is needed.

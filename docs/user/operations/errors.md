@@ -25,7 +25,9 @@
   parses Lance error text. If this signal escapes an enrolled writer, HTTP maps
   it to a generic **409** conflict.
 - `ResourceLimitExceeded { resource, limit, actual }` — a keyed Mutation/Load
-  table exceeded its single-transaction ceiling of 8,192 rows or 32 MiB of
+  table (`mutate`, `load --mode append`/`merge`; Overwrite stages a whole-table
+  replacement transaction and is not subject to the keyed ceiling) exceeded its
+  single-transaction ceiling of 8,192 rows or 32 MiB of
   staged Arrow memory (with an earlier conservative parsed-value/base64 guard
   to bound the load spool, and a streamed remaining-budget guard on mutation
   update matches); keyed external-URI or stored-update blob payloads exceeded
@@ -35,7 +37,13 @@
   logical data chain would exceed 1,024 transactions. This is detected before
   recovery arm and has no durable effect.
   HTTP returns **413** with `resource_limit.{resource,limit,actual}`.
-  Reshape the input; it is not partial success.
+  Reshape the input; it is not partial success. Served streaming export also
+  uses this typed response before `200`: `stream_export_slots` means another
+  response owns the graph's immutable export cut, while
+  `stream_export_transport_bytes` means the process-wide bounded response
+  budget did not become available within 250 ms. Those export limits are
+  transient; finish or disconnect the earlier response and retry rather than
+  changing graph data.
 - `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id`. Resolve the sidecar through a read-write reopen/server restart before retrying; this is intentionally not an ordinary OCC retry.
 
 For RFC-023 Mutation/Load keyed writes, `KeyConflict` is returned only after

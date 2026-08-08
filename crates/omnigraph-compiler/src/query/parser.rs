@@ -427,7 +427,16 @@ fn parse_traversal(pair: pest::iterators::Pair<Rule>) -> Result<Traversal> {
     let mut inner = pair.into_inner();
     let src_var = inner.next().unwrap().as_str();
     let src = src_var.strip_prefix('$').unwrap_or(src_var).to_string();
-    let edge_pair = inner.next().unwrap();
+    let mut next = inner.next().unwrap();
+    let edge_binding = if let Rule::edge_binding = next.as_rule() {
+        let var = next.into_inner().next().unwrap().as_str();
+        let binding = var.strip_prefix('$').unwrap_or(var).to_string();
+        next = inner.next().unwrap();
+        Some(binding)
+    } else {
+        None
+    };
+    let edge_pair = next;
     let (edge_name, undirected) = match edge_pair.as_rule() {
         // `<edge>` — the inner edge_ident carries the name.
         Rule::undirected_edge => (
@@ -461,6 +470,7 @@ fn parse_traversal(pair: pest::iterators::Pair<Rule>) -> Result<Traversal> {
         min_hops,
         max_hops,
         undirected,
+        edge_binding,
     })
 }
 

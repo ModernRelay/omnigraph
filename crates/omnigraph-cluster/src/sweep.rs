@@ -362,8 +362,8 @@ pub(crate) async fn sweep_graph_delete_sidecar(
     outcome.completed_sidecars.push(path);
 }
 
-/// Remove a graph's subtree (graph, schema, queries) from the ledger and
-/// leave a tombstone observation. Idempotent.
+/// Remove a graph's subtree (graph, schema, queries) from the
+/// ledger and leave a tombstone observation. Idempotent.
 pub(crate) fn tombstone_graph_subtree(
     state: &mut ClusterState,
     graph_id: &str,

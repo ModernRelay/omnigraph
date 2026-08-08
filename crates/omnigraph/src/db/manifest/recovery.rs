@@ -183,7 +183,11 @@ async fn publish_recovery_commit(
             ));
         }
     };
-    let publisher = GraphNamespacePublisher::new(root_uri, sidecar.branch.as_deref());
+    let publisher = GraphNamespacePublisher::new_with_session(
+        root_uri,
+        sidecar.branch.as_deref(),
+        crate::lance_access::control_session(),
+    );
     let exact_authority = sidecar
         .protocol_v3
         .as_ref()
@@ -285,7 +289,8 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// alias inference or a serde default.
 pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 9;
 
-/// The only recovery generation emitted by the manifest-v5 write paths.
+/// The only recovery generation emitted by the identity-aware manifest-v5/v6
+/// write paths.
 pub(crate) const IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION: u32 = 9;
 
 /// Oldest loose-classification generation retained for test fixtures. No
@@ -3230,7 +3235,11 @@ async fn discard_orphaned_branch_sidecar(
             merged_parent_commit_id: None,
             created_at: crate::db::now_micros()?,
         };
-        let publisher = GraphNamespacePublisher::new(root_uri, None);
+        let publisher = GraphNamespacePublisher::new_with_session(
+            root_uri,
+            None,
+            crate::lance_access::control_session(),
+        );
         publisher
             .publish(&[], &HashMap::new(), Some(&intent))
             .await?;
@@ -6020,17 +6029,13 @@ async fn converge_or_defer_roll_forward(
         }
         None => crate::db::commit_graph::CommitGraph::open(root_uri).await?,
     };
-    let converged_commit_id = match cache
-        .load_commits()
-        .await?
-        .into_iter()
-        .rfind(|c| c.actor_id.as_deref() == Some(RECOVERY_ACTOR))
-    {
-        Some(recovery_commit) => recovery_commit.graph_commit_id,
-        // No recovery commit visible — unexpected on this path (the winner just
-        // published one); fall back to the head rather than an empty id.
-        None => cache.head_commit_id().await?.unwrap_or_default(),
-    };
+    let converged_commit_id =
+        match cache.latest_commit_matching(|c| c.actor_id.as_deref() == Some(RECOVERY_ACTOR)) {
+            Some(recovery_commit) => recovery_commit.graph_commit_id,
+            // No recovery commit visible — unexpected on this path (the winner just
+            // published one); fall back to the head rather than an empty id.
+            None => cache.head_commit_id().await?.unwrap_or_default(),
+        };
     record_audit(
         root_uri,
         sidecar,
@@ -7867,7 +7872,9 @@ async fn open_lance_head_if_present(
         // files but before committing version one. Preserve Lance's typed
         // DatasetNotFound distinction here; the shared instrumented opener
         // intentionally erases it into OmniError::Lance for ordinary callers.
+        let control_session = crate::lance_access::control_session();
         match lance::dataset::builder::DatasetBuilder::from_uri(table_path)
+            .with_session(control_session)
             .load()
             .await
         {
@@ -10409,6 +10416,7 @@ mod tests {
                 &after_data,
                 &[IndexBuildSpec::BTree {
                     column: "id".to_string(),
+                    name: None,
                 }],
             )
             .await
@@ -10440,6 +10448,7 @@ mod tests {
                 &after_one_index,
                 &[IndexBuildSpec::BTree {
                     column: "age".to_string(),
+                    name: None,
                 }],
             )
             .await

@@ -3,6 +3,7 @@
 //! verbatim from lib.rs in the modularization).
 
 use super::*;
+use futures::StreamExt;
 
 /// Liveness probe.
 ///
@@ -40,7 +41,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
     ),
     security(("bearer_token" = [])),
 )]
-/// List every graph currently registered with this server (MR-668).
+/// List every graph currently registered with this server.
 ///
 /// Multi-graph mode only. In single mode, the route returns 405 — there's
 /// no registry to enumerate. Cedar-gated by the server-level policy via
@@ -83,7 +84,9 @@ pub(crate) async fn server_graphs_list(
     Ok(Json(GraphListResponse { graphs }))
 }
 
-pub(crate) async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::OpenApi> {
+pub(crate) async fn server_openapi(
+    State(state): State<AppState>,
+) -> Json<utoipa::openapi::OpenApi> {
     // `served_openapi` is the single nesting source — the protected
     // routes always live under `/graphs/{graph_id}/...` (public/management
     // paths `/healthz`, `/graphs` stay flat). Building from it here means
@@ -292,7 +295,11 @@ pub(crate) async fn resolve_graph_handle(
     Ok(next.run(request).await)
 }
 
-pub(crate) fn log_policy_decision(actor_id: &str, request: &PolicyRequest, decision: &PolicyDecision) {
+pub(crate) fn log_policy_decision(
+    actor_id: &str,
+    request: &PolicyRequest,
+    decision: &PolicyDecision,
+) {
     info!(
         actor_id = actor_id,
         action = %request.action,
@@ -508,7 +515,9 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
     ),
     security(("bearer_token" = [])),
 )]
-#[deprecated(note = "use POST /query instead; /read is kept indefinitely for byte-stable back-compat")]
+#[deprecated(
+    note = "use POST /query instead; /read is kept indefinitely for byte-stable back-compat"
+)]
 /// **Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.
 ///
 /// Execute a GQ read query. Behavior is unchanged from prior releases; the
@@ -593,6 +602,10 @@ pub(crate) async fn server_query(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Export authority conflict", body = ErrorOutput),
+        (status = 413, description = "Export cut or transport capacity exhausted", body = ErrorOutput),
+        (status = 404, description = "Branch not found", body = ErrorOutput),
+        (status = 503, description = "Recovery required", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -603,6 +616,7 @@ pub(crate) async fn server_query(
 /// streams the entire branch. Suitable for large exports — the response is
 /// streamed, not buffered. Read-only.
 pub(crate) async fn server_export(
+    State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<ExportRequest>,
@@ -617,24 +631,56 @@ pub(crate) async fn server_export(
             target_branch: None,
         },
     )?;
-    let engine = Arc::clone(&handle.engine);
-    let type_names = request.type_names.clone();
-    let table_keys = request.table_keys.clone();
-    let (tx, rx) = mpsc::unbounded_channel::<std::result::Result<Bytes, io::Error>>();
+    // Reserve the bounded response transport before capturing the root cut so
+    // a saturated client population can never hold graph authority while it
+    // waits for process memory. Both operations finish before the 200 headers.
+    let queue_lease = state
+        .export_transport
+        .reserve()
+        .await
+        .map_err(ApiError::from_omni)?;
+    let cut = handle
+        .engine
+        .capture_served_export_cut(&branch, &request.type_names, &request.table_keys)
+        .await
+        .map_err(ApiError::from_omni)?;
+    let producer_queue_lease = Arc::clone(&queue_lease);
+    let (tx, body_stream) = export_transport::channel(queue_lease);
     tokio::spawn(async move {
-        let result = {
-            let mut writer = ExportStreamWriter { sender: tx.clone() };
-            engine
-                .export_jsonl_to_writer(&branch, &type_names, &table_keys, &mut writer)
-                .await
-        };
-        if let Err(err) = result {
-            let _ = tx.send(Err(io::Error::other(err.to_string())));
+        // The producer half prevents disconnect from recycling queue bytes
+        // until every pending send/scan future owned by this task is gone.
+        let _producer_queue_lease = producer_queue_lease;
+        let closed_tx = tx.clone();
+        let data_tx = tx.clone();
+        let export = cut.write_chunks(move |chunk| {
+            let data_tx = data_tx.clone();
+            async move {
+                data_tx
+                    .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
+                    .await
+                    .map_err(|_| {
+                        OmniError::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "served export response closed",
+                        ))
+                    })
+            }
+        });
+        tokio::pin!(export);
+        tokio::select! {
+            biased;
+            _ = closed_tx.closed() => {
+                // Cancelling the pinned export future drops its move-only cut.
+            }
+            (cut, result) = &mut export => {
+                let error = result.err().map(|error| std::io::Error::other(error.to_string()));
+                let _ = tx
+                    .send(export_transport::ExportFrame::Terminal { cut, error })
+                    .await;
+            }
         }
     });
-    let body = Body::from_stream(stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    }));
+    let body = Body::from_stream(body_stream);
     Ok((
         StatusCode::OK,
         [(CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
@@ -679,10 +725,8 @@ pub(crate) async fn run_mutate(
     // estimated bytes per actor. Cedar runs FIRST so denied requests
     // don't consume admission slots. Estimate uses the request body
     // size as a coarse proxy; engine memory pressure can run higher.
-    let est_bytes = query.len() as u64
-        + params_json
-            .map(|p| p.to_string().len() as u64)
-            .unwrap_or(0);
+    let est_bytes =
+        query.len() as u64 + params_json.map(|p| p.to_string().len() as u64).unwrap_or(0);
     let _admission = state
         .workload
         .try_admit(&actor_arc, est_bytes)
@@ -756,8 +800,8 @@ pub(crate) async fn run_query(
             target_branch: None,
         },
     )?;
-    let query_decl =
-        select_named_query_decl(query, name).map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let query_decl = select_named_query_decl(query, name)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
     if reject_mutations && !query_decl.mutations.is_empty() {
         return Err(ApiError::bad_request(format!(
             "query '{}' contains mutations (insert/update/delete); use POST /mutate for write queries",
@@ -1218,7 +1262,54 @@ pub(crate) async fn server_schema_apply(
     Ok(Json(schema_apply_output(handle.uri.as_str(), result)))
 }
 
-/// Shared body for `POST /load` (canonical) and `POST /ingest` (deprecated):
+/// Authorize one load target without touching request data.
+async fn authorize_load_scope(
+    handle: &GraphHandle,
+    actor: Option<&ResolvedActor>,
+    branch: &str,
+    from: Option<&str>,
+) -> std::result::Result<(), ApiError> {
+    let branch_exists = handle
+        .engine
+        .branch_list()
+        .await
+        .map_err(ApiError::from_omni)?
+        .into_iter()
+        .any(|name| name == branch);
+
+    if !branch_exists {
+        match from {
+            // Fork-if-missing is opt-in by presence of `from`; without it a
+            // typo'd branch name must surface as an error, not silently
+            // create a fork and land the data there.
+            None => {
+                return Err(ApiError::not_found(format!(
+                    "branch '{branch}' not found; pass `from` to create it"
+                )));
+            }
+            Some(from) => authorize_request(
+                actor,
+                handle.policy.as_deref(),
+                PolicyRequest {
+                    action: PolicyAction::BranchCreate,
+                    branch: Some(from.to_string()),
+                    target_branch: Some(branch.to_string()),
+                },
+            )?,
+        }
+    }
+    authorize_request(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Change,
+            branch: Some(branch.to_string()),
+            target_branch: None,
+        },
+    )
+}
+
+/// Shared body for JSON `POST /load` and `POST /ingest` (deprecated):
 /// branch-exists / fork-if-`from` check, Cedar authorization, admission, the
 /// bulk `load_as`, and the `IngestOutput` mapping.
 async fn run_ingest(
@@ -1235,45 +1326,7 @@ async fn run_ingest(
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor.map(|actor| actor.actor_id.as_ref());
 
-    let branch_exists = {
-        let db = &handle.engine;
-        db.branch_list()
-            .await
-            .map_err(ApiError::from_omni)?
-            .into_iter()
-            .any(|name| name == branch)
-    };
-
-    if !branch_exists {
-        match from.as_deref() {
-            // Fork-if-missing is opt-in by presence of `from`; without it a
-            // typo'd branch name must surface as an error, not silently
-            // create a fork and land the data there.
-            None => {
-                return Err(ApiError::not_found(format!(
-                    "branch '{branch}' not found; pass `from` to create it"
-                )));
-            }
-            Some(from) => authorize_request(
-                actor,
-                handle.policy.as_deref(),
-                PolicyRequest {
-                    action: PolicyAction::BranchCreate,
-                    branch: Some(from.to_string()),
-                    target_branch: Some(branch.clone()),
-                },
-            )?,
-        }
-    }
-    authorize_request(
-        actor,
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::Change,
-            branch: Some(branch.clone()),
-            target_branch: None,
-        },
-    )?;
+    authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
     let est_bytes = request.data.len() as u64;
     let _admission = state
         .workload
@@ -1313,7 +1366,7 @@ async fn run_ingest(
     ),
     security(("bearer_token" = [])),
 )]
-/// Bulk-load NDJSON data into a branch (canonical load endpoint).
+/// Compatibility-load NDJSON data through a JSON envelope.
 ///
 /// `data` is NDJSON with one record per line. `mode` controls behavior on
 /// existing rows: `merge` upserts by id (default), `append` strictly inserts
@@ -1340,6 +1393,133 @@ pub(crate) async fn server_load(
         )
         .await?,
     ))
+}
+
+async fn collect_graph_batch_body(body: Body) -> std::result::Result<Bytes, ApiError> {
+    let mut body = body.into_data_stream();
+    let mut data = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|err| {
+            ApiError::bad_request(format!("failed to read graph-batch request body: {err}"))
+        })?;
+        let actual = data.len().saturating_add(chunk.len());
+        if actual > INGEST_REQUEST_BODY_LIMIT_BYTES {
+            return Err(ApiError::resource_limit(
+                format!(
+                    "graph-batch request body exceeds {} bytes",
+                    INGEST_REQUEST_BODY_LIMIT_BYTES
+                ),
+                api::ResourceLimitOutput {
+                    resource: "graph_batch_request_bytes".to_string(),
+                    limit: INGEST_REQUEST_BODY_LIMIT_BYTES as u64,
+                    actual: actual as u64,
+                },
+            ));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(data))
+}
+
+#[utoipa::path(
+    post,
+    path = "/load/ndjson",
+    tag = "mutations",
+    operation_id = "loadNdjson",
+    params(GraphBatchLoadQuery),
+    request_body(
+        content = String,
+        content_type = "application/x-ndjson",
+        description = "Strict raw graph-level NDJSON. Each nonblank line is exactly one node envelope {\"type\":\"<Node>\",\"data\":{...}} or edge envelope {\"edge\":\"<Edge>\",\"from\":\"<src-id>\",\"to\":\"<dst-id>\",\"data\":{...}}. `data` defaults to {}; optional `data.id` follows ordinary ID semantics. Duplicate, unknown, reserved physical, and noncanonical supplied node-ID members are refused."
+    ),
+    responses(
+        (status = 200, description = "One committed graph-batch result", body = GraphBatchLoadOutput),
+        (status = 400, description = "Malformed query or graph batch", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Target branch missing without `from`", body = ErrorOutput),
+        (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
+        (status = 413, description = "Request or keyed load exceeds a bounded ceiling", body = ErrorOutput),
+        (status = 415, description = "Content-Type must be application/x-ndjson", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Load one strict, bounded graph-level NDJSON batch.
+///
+/// Bearer authentication runs in middleware. This handler completes both
+/// branch authorization checks before polling the raw body. A successful
+/// response describes logical schema declarations only and is returned after
+/// the ordinary graph commit is visible.
+pub(crate) async fn server_load_ndjson(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Query(query): Query<GraphBatchLoadQuery>,
+    request: Request,
+) -> std::result::Result<Json<GraphBatchLoadOutput>, ApiError> {
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    let branch = query.branch.unwrap_or_else(|| "main".to_string());
+    let from = query.from;
+    let mode = query.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
+
+    authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
+
+    let content_type = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !matches!(content_type, Some(value) if value.eq_ignore_ascii_case("application/x-ndjson")) {
+        return Err(ApiError::unsupported_media_type(
+            "graph-batch load requires Content-Type: application/x-ndjson",
+        ));
+    }
+
+    if let Some(actual) = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|actual| *actual > INGEST_REQUEST_BODY_LIMIT_BYTES as u64)
+    {
+        return Err(ApiError::resource_limit(
+            format!(
+                "graph-batch request body exceeds {} bytes",
+                INGEST_REQUEST_BODY_LIMIT_BYTES
+            ),
+            api::ResourceLimitOutput {
+                resource: "graph_batch_request_bytes".to_string(),
+                limit: INGEST_REQUEST_BODY_LIMIT_BYTES as u64,
+                actual,
+            },
+        ));
+    }
+
+    let data = collect_graph_batch_body(request.into_body()).await?;
+    let data = std::str::from_utf8(&data)
+        .map_err(|_| ApiError::bad_request("graph-batch request body must be valid UTF-8"))?;
+    let actor_arc = actor
+        .map(|actor| Arc::clone(&actor.actor_id))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
+    let actor_id = actor.map(|actor| actor.actor_id.as_ref());
+    let _admission = state
+        .workload
+        .try_admit(&actor_arc, data.len() as u64)
+        .map_err(ApiError::from_workload_reject)?;
+
+    let result = handle
+        .engine
+        .load_graph_batch_as(&branch, from.as_deref(), data, mode, actor_id)
+        .await
+        .map_err(ApiError::from_omni)?;
+    Ok(Json(graph_batch_load_output(
+        &result,
+        mode,
+        actor_id.map(str::to_string),
+    )))
 }
 
 #[utoipa::path(
@@ -1633,8 +1813,12 @@ pub(crate) async fn server_branch_merge(
             .map_err(ApiError::from_omni)?
     };
     let (branch_deleted, branch_delete_error) = if request.delete_branch {
-        match delete_merged_source_branch(&handle, actor.as_ref().map(|Extension(a)| a), &request.source)
-            .await
+        match delete_merged_source_branch(
+            &handle,
+            actor.as_ref().map(|Extension(a)| a),
+            &request.source,
+        )
+        .await
         {
             Ok(()) => (Some(true), None),
             Err(message) => (Some(false), Some(message)),
@@ -1696,27 +1880,36 @@ async fn delete_merged_source_branch(
     ),
     security(("bearer_token" = [])),
 )]
-/// List commits.
+/// List commits, most recent first.
 ///
-/// Filter by `branch` to get the commits on a single branch (most recent
-/// first); omit to list across all branches. Read-only.
+/// `branch` selects which history to list: a named branch returns the history
+/// reachable from that branch's head (the main commits inherited up to the
+/// fork plus the branch-authored commits); omitting it returns `main`'s
+/// history. There is no cross-branch listing. Ordering is part of the
+/// contract — newest first by (manifest version, created-at, commit id) — and
+/// a future `cursor`/`limit` pagination will be keyset-based on that same
+/// order. Read-only.
 pub(crate) async fn server_commit_list(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Query(query): Query<CommitListQuery>,
 ) -> std::result::Result<Json<CommitListOutput>, ApiError> {
+    // An omitted `branch` means main's history, so the policy gate must
+    // see `main` — not `has_branch == false`, which a branch-scoped read
+    // grant can never match.
+    let branch = query.branch.unwrap_or_else(|| "main".to_string());
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::Read,
-            branch: query.branch.clone(),
+            branch: Some(branch.clone()),
             target_branch: None,
         },
     )?;
     let commits = {
         let db = &handle.engine;
-        db.list_commits(query.branch.as_deref())
+        db.list_commits(Some(branch.as_str()))
             .await
             .map_err(ApiError::from_omni)?
     };
@@ -1776,7 +1969,10 @@ pub(crate) async fn server_commit_show(
     Ok(Json(api::commit_output(&commit)))
 }
 
-pub(crate) fn read_target_from_request(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
+pub(crate) fn read_target_from_request(
+    branch: Option<String>,
+    snapshot: Option<String>,
+) -> ReadTarget {
     if let Some(snapshot) = snapshot {
         ReadTarget::snapshot(omnigraph::db::SnapshotId::new(snapshot))
     } else {

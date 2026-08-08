@@ -241,6 +241,34 @@ pub struct IngestOutput {
     pub actor_id: Option<String>,
 }
 
+/// One logical declaration touched by a graph-batch load.
+///
+/// This deliberately carries the accepted-schema name, not the backing
+/// manifest table key, dataset path, or Lance identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct GraphBatchDeclarationOutput {
+    pub name: String,
+    pub rows_loaded: usize,
+}
+
+/// Terminal result for the raw graph-level NDJSON load surface.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GraphBatchLoadOutput {
+    pub branch: String,
+    /// Base branch a fork was requested from, even when the target already
+    /// existed. `null` when the request omitted `from`.
+    pub base_branch: Option<String>,
+    pub branch_created: bool,
+    #[schema(value_type = LoadModeSchema)]
+    pub mode: LoadMode,
+    /// Logical node declarations touched by this batch, sorted by name.
+    pub nodes: Vec<GraphBatchDeclarationOutput>,
+    /// Logical edge declarations touched by this batch, sorted by name.
+    pub edges: Vec<GraphBatchDeclarationOutput>,
+    pub total_rows: usize,
+    pub actor_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CommitOutput {
     pub graph_commit_id: String,
@@ -291,7 +319,9 @@ pub struct QueryRequest {
     /// with `name` when more than one is declared. Mutations
     /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its
     /// deprecated alias `POST /change`) instead.
-    #[schema(example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}")]
+    #[schema(
+        example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+    )]
     pub query: String,
     /// Name of the query to run when `query` declares multiple. Optional when
     /// only one query is declared.
@@ -344,7 +374,7 @@ pub struct InvokeStoredQueryRequest {
     /// mutation). Mutually exclusive with `branch`.
     #[serde(default)]
     pub snapshot: Option<String>,
-    /// The kind the caller expects (RFC-011 Decision 3): `Some(false)` for
+    /// The kind the caller expects: `Some(false)` for
     /// `omnigraph query <name>`, `Some(true)` for `omnigraph mutate <name>`.
     /// When set and it disagrees with the stored query's actual kind, the
     /// server rejects the call (400) so the verb asserts the kind. `None`
@@ -478,7 +508,6 @@ pub fn param_descriptor(param: &Param) -> ParamDescriptor {
     }
 }
 
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct SchemaApplyRequest {
     /// Project schema in `.pg` source form. The diff against the current
@@ -529,6 +558,18 @@ pub struct IngestRequest {
         example = "{\"type\": \"Person\", \"data\": {\"name\": \"Alice\", \"age\": 30}}\n{\"type\": \"Person\", \"data\": {\"name\": \"Bob\", \"age\": 25}}"
     )]
     pub data: String,
+}
+
+/// Query parameters for `POST /load/ndjson`.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct GraphBatchLoadQuery {
+    /// Target branch. Defaults to `main`. Without `from`, it must exist.
+    pub branch: Option<String>,
+    /// Parent branch used to create a missing target branch.
+    pub from: Option<String>,
+    /// How existing rows are handled. Defaults to `merge`.
+    #[param(value_type = Option<LoadModeSchema>)]
+    pub mode: Option<LoadMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -593,7 +634,7 @@ pub struct ManifestConflictOutput {
     pub actual: u64,
 }
 
-/// Structured authority mismatch for an RFC-022 prepared write. Values are
+/// Structured authority mismatch for a prepared write. Values are
 /// strings because members include optional graph commit ids and future
 /// authority tokens, not only numeric table versions.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -742,6 +783,48 @@ pub fn ingest_output(
                 rows_loaded: table.rows_loaded,
             })
             .collect(),
+        actor_id,
+    }
+}
+
+pub fn graph_batch_load_output(
+    result: &LoadResult,
+    mode: LoadMode,
+    actor_id: Option<String>,
+) -> GraphBatchLoadOutput {
+    let mut nodes = result
+        .nodes_loaded
+        .iter()
+        .map(|(name, rows_loaded)| GraphBatchDeclarationOutput {
+            name: name.clone(),
+            rows_loaded: *rows_loaded,
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut edges = result
+        .edges_loaded
+        .iter()
+        .map(|(name, rows_loaded)| GraphBatchDeclarationOutput {
+            name: name.clone(),
+            rows_loaded: *rows_loaded,
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let total_rows = nodes
+        .iter()
+        .chain(&edges)
+        .map(|declaration| declaration.rows_loaded)
+        .sum();
+    GraphBatchLoadOutput {
+        branch: result.branch.clone(),
+        base_branch: result.base_branch.clone(),
+        branch_created: result.branch_created,
+        mode,
+        nodes,
+        edges,
+        total_rows,
         actor_id,
     }
 }

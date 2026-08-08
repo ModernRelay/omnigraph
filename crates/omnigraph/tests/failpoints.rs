@@ -2,6 +2,7 @@
 
 mod helpers;
 
+use std::future::Future;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -30,6 +31,28 @@ use helpers::{
 const SCHEMA_V1: &str = "node Person { name: String @key }\n";
 const SCHEMA_V2_ADDED_TYPE: &str =
     "node Person { name: String @key }\nnode Company { name: String @key }\n";
+
+/// Run one composed debug-build recovery scenario outside libtest's 2-MiB
+/// thread. The production operations are independently exercised on ordinary
+/// Tokio stacks; this helper bounds only the large future assembled by a test
+/// that chains several complete recovery cycles in one body.
+fn on_big_stack<F>(body: impl FnOnce() -> F + Send + 'static)
+where
+    F: Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
 
 const RFC023_KEY_SCHEMA: &str = r#"
 node Person {
@@ -162,7 +185,7 @@ fn rfc023_external_writer_process() {
 /// an enrolled multi-table writer has committed table 1 and parked before
 /// table 2, where publishing a competing graph commit would be both unnecessary
 /// and semantically wrong for the recovery assertion. The source schema is
-/// restricted to the two-column `name @key` fixture used by that test.
+/// restricted to the `name @key` fixture used by that test.
 async fn commit_raw_fenced_name_row(table_uri: &str, id: &str) {
     let base = Arc::new(Dataset::open(table_uri).await.unwrap());
     let schema = Arc::new(Schema::from(base.schema()));
@@ -3513,9 +3536,13 @@ async fn recovery_rolls_forward_load_overwrite() {
     );
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
+fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
+    on_big_stack(recovery_rolls_forward_ensure_indices_on_feature_branch_inner);
+}
+
+async fn recovery_rolls_forward_ensure_indices_on_feature_branch_inner() {
     use lance::index::DatasetIndexExt;
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -7388,6 +7415,99 @@ async fn seed_optimize_late_sidecar_race(dir: &tempfile::TempDir) {
     // Leave real compaction work behind so a missing barrier advances Person
     // instead of accidentally passing because Optimize was a no-op.
     helpers::commit_many(&mut seed, 4).await;
+}
+
+/// Optimize captures a complete authority token before entering any writer
+/// gate, then revalidates it after schema -> main -> table (`optimize.rs`, the
+/// comment above `open_write_txn`). That revalidation is the only thing that
+/// stops a maintenance run from planning against a graph that moved while it
+/// waited — v6 had no such check, it used a bare fresh snapshot.
+///
+/// The token carried in `admission_txn` is the authority proof and the source
+/// of the recovery sidecar's `RecoveryAuthorityToken`. Removing it would
+/// silently downgrade optimize/cleanup/repair from
+/// reject-on-authority-drift to read-whatever-is-fresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    seed_optimize_late_sidecar_race(&dir).await;
+
+    let optimize_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let mut writer_db = Omnigraph::open(&uri).await.unwrap();
+    let person_uri = node_table_uri(optimize_db.as_ref(), "Person").await;
+    let graph_head_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
+
+    // Park Optimize with its authority token captured but no gate held.
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(
+        names::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
+    );
+    let optimize_task_db = std::sync::Arc::clone(&optimize_db);
+    let optimize = tokio::spawn(async move { optimize_task_db.optimize().await });
+    rendezvous.wait_until_reached().await;
+
+    // Advance the graph head underneath it with an ordinary committed write, so
+    // Optimize's captured token is now stale in `graph_head`.
+    mutate_main(
+        &mut writer_db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "authority-mover")], &[("$age", 41)]),
+    )
+    .await
+    .expect("the concurrent write must commit while Optimize waits");
+    let graph_head_after = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    assert_ne!(
+        graph_head_before, graph_head_after,
+        "the fixture must actually move the graph head, or this test is vacuous",
+    );
+    // Baseline taken AFTER the concurrent write: that write legitimately moves
+    // Person. What must not move it again is Optimize.
+    let person_head_after_write = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+
+    rendezvous.release();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
+        .await
+        .expect("Optimize task hung after releasing the authority-capture rendezvous")
+        .unwrap();
+    drop(rendezvous);
+
+    let error = outcome.expect_err(
+        "Optimize must refuse a token whose graph head moved before it acquired its gates",
+    );
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("read set")
+            || rendered.contains("graph_head")
+            || rendered.contains("changed"),
+        "expected an authority-drift refusal, got: {rendered}",
+    );
+
+    assert_eq!(
+        lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .version()
+            .version,
+        person_head_after_write,
+        "the refusal must land before any physical maintenance effect",
+    );
+    let recovery_dir = dir.path().join("__recovery");
+    let sidecars: Vec<_> = std::fs::read_dir(&recovery_dir)
+        .map(|entries| entries.filter_map(|entry| entry.ok()).collect())
+        .unwrap_or_default();
+    assert!(
+        sidecars.is_empty(),
+        "a pre-effect authority refusal must leave no Optimize sidecar: {sidecars:?}",
+    );
 }
 
 /// Optimize's entry recovery probe is only a fast path. A graph-global

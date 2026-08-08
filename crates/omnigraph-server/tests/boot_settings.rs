@@ -11,7 +11,6 @@ use omnigraph_server::{AppState, build_app};
 use serde_json::Value;
 use tower::ServiceExt;
 
-
 mod support;
 use support::*;
 
@@ -296,7 +295,6 @@ mod multi_graph_startup {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-
     #[tokio::test(flavor = "multi_thread")]
     async fn registry_rejects_duplicate_normalized_graph_uris() {
         let dir = tempfile::tempdir().unwrap();
@@ -395,7 +393,6 @@ mod multi_graph_startup {
              Body: {body_str}",
         );
     }
-
 
     /// `GET /graphs` requires bearer auth when tokens are configured.
     #[tokio::test(flavor = "multi_thread")]
@@ -558,5 +555,4 @@ rules:
             "viewer must be denied graph_list (Cedar gate)"
         );
     }
-
 }

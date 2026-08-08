@@ -215,6 +215,8 @@ where
         actor,
     )?;
 
+    let _export_exclusion = db.reserve_export_destructive_control()?;
+
     // Converge any pending recovery sidecar before planning: a table
     // rewrite over sidecar-covered drift would otherwise re-plan from
     // the manifest pin and orphan the drifted Phase-B commit (silently

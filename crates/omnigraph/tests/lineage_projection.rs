@@ -16,7 +16,7 @@
 mod helpers;
 
 use omnigraph::db::commit_graph::CommitGraph;
-use omnigraph::db::{GraphCommit, Omnigraph};
+use omnigraph::db::{GraphCommit, Omnigraph, ReadTarget};
 
 use helpers::*;
 
@@ -34,12 +34,7 @@ async fn projected_commits(root: &str, branch: Option<&str>) -> Vec<GraphCommit>
         None => CommitGraph::open(root).await.unwrap(),
     };
     let mut commits = graph.load_commits().await.unwrap();
-    commits.sort_by(|a, b| {
-        a.manifest_version
-            .cmp(&b.manifest_version)
-            .then_with(|| a.created_at.cmp(&b.created_at))
-            .then_with(|| a.graph_commit_id.cmp(&b.graph_commit_id))
-    });
+    commits.sort_by(|a, b| a.lineage_key().cmp(&b.lineage_key()));
     commits
 }
 
@@ -48,12 +43,7 @@ async fn head_id(root: &str, branch: Option<&str>) -> String {
         Some(branch) => CommitGraph::open_at_branch(root, branch).await.unwrap(),
         None => CommitGraph::open(root).await.unwrap(),
     };
-    graph
-        .head_commit()
-        .await
-        .unwrap()
-        .unwrap()
-        .graph_commit_id
+    graph.head_commit().await.unwrap().unwrap().graph_commit_id
 }
 
 #[tokio::test]
@@ -191,6 +181,20 @@ async fn graph_lineage_lives_only_in_manifest() {
         merge_commit.graph_commit_id,
         "the merge commit is the head of main"
     );
+    let resolved_main_head = main.resolve_snapshot("main").await.unwrap();
+    assert_eq!(
+        resolved_main_head.as_str(),
+        merge_commit.graph_commit_id,
+        "the production snapshot resolver and lineage projection must expose the same main head"
+    );
+    let resolved_main_snapshot = main.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let resolved_main_commit = main.get_commit(resolved_main_head.as_str()).await.unwrap();
+    assert_eq!(
+        resolved_main_commit.manifest_version,
+        resolved_main_snapshot.version(),
+        "without intervening physical-only maintenance, main's resolved snapshot and head \
+         lineage must come from one manifest version"
+    );
 
     // ── feature lineage projected from `__manifest` ──────────────────────────
     let feature_commits = projected_commits(&uri, Some("feature")).await;
@@ -205,15 +209,62 @@ async fn graph_lineage_lives_only_in_manifest() {
         Some("act-dave"),
         "feature head is Dave's authored commit"
     );
+    let resolved_feature_head = main.resolve_snapshot("feature").await.unwrap();
+    assert_eq!(
+        resolved_feature_head.as_str(),
+        feature_head,
+        "the production snapshot resolver and lineage projection must expose the same feature head"
+    );
+    let resolved_feature_snapshot = main
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap();
+    let resolved_feature_commit = main
+        .get_commit(resolved_feature_head.as_str())
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved_feature_commit.manifest_version,
+        resolved_feature_snapshot.version(),
+        "without intervening physical-only maintenance, feature's resolved snapshot and head \
+         lineage must come from one manifest version"
+    );
+
+    // ── public listing contract: newest-first, one total order ───────────────
+    // `Omnigraph::list_commits` is the single public door (embedded CLI, HTTP
+    // server, SDK all funnel through it); its contract is most-recent-first by
+    // `GraphCommit::lineage_key`. The internal projection (`load_commits`,
+    // asserted above) stays ascending — this block pins the public flip.
+    let listed_main = main.list_commits(None).await.unwrap();
+    assert_eq!(
+        listed_main.first().map(|c| c.graph_commit_id.as_str()),
+        Some(merge_commit.graph_commit_id.as_str()),
+        "public main listing must start at the branch head (newest first)"
+    );
+    assert!(
+        listed_main
+            .last()
+            .is_some_and(|c| c.parent_commit_id.is_none()),
+        "public main listing must end at the parentless genesis commit"
+    );
+    assert!(
+        listed_main
+            .windows(2)
+            .all(|pair| pair[0].lineage_key() > pair[1].lineage_key()),
+        "public listing must be strictly descending by lineage_key"
+    );
+    let listed_feature = main.list_commits(Some("feature")).await.unwrap();
+    assert_eq!(
+        listed_feature.first().map(|c| c.graph_commit_id.as_str()),
+        Some(feature_head.as_str()),
+        "public feature listing must start at the feature head (newest first)"
+    );
 
     // ── actors surface inline from the manifest metadata ─────────────────────
     // main's authored commits: Alice, Bob, Erin (direct) + the merge (act-merger)
     // = 4. Carol/Dave were authored on the feature branch, not main. Genesis has
     // no actor.
-    let authored = main_commits
-        .iter()
-        .filter(|c| c.actor_id.is_some())
-        .count();
+    let authored = main_commits.iter().filter(|c| c.actor_id.is_some()).count();
     assert!(
         authored >= 4,
         "expected the authored commits to surface their actor in the projection, saw {authored}"

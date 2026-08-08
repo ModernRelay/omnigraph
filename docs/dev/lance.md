@@ -34,7 +34,7 @@ Touching `db/manifest`, fragment lifecycle, dataset reconstruction, or anything 
 | Table schema metadata | https://lance.org/format/table/schema/ |
 | Table-level versioning | https://lance.org/format/table/versioning/ |
 | Transactions (commit semantics, conflict types) | https://lance.org/format/table/transaction/ |
-| MemWAL (durability story) | https://lance.org/format/table/mem_wal/ |
+| MemWAL (upstream reference; OmniGraph's RFC-026 path is rejected) | https://lance.org/format/table/mem_wal/ |
 | Row-ID lineage (stable row IDs) | https://lance.org/format/table/row_id_lineage/ |
 | Branches & tags (Lance native) | https://lance.org/format/table/branch_tag/ |
 
@@ -66,7 +66,7 @@ Adding/changing index types, fixing coverage, debugging FTS or vector recall, de
 | N-gram scalar index | https://lance.org/format/index/scalar/ngram/ |
 | Vector index | https://lance.org/format/index/vector/ |
 | Fragment-reuse system index | https://lance.org/format/index/system/frag_reuse/ |
-| MemWAL system index | https://lance.org/format/index/system/mem_wal/ |
+| MemWAL system index (upstream reference; no active OmniGraph consumer) | https://lance.org/format/index/system/mem_wal/ |
 | HNSW Rust example | https://lance.org/examples/rust/hnsw/ |
 | Distributed indexing | https://lance.org/guide/distributed_indexing/ |
 | Tokenizer (FTS, n-gram) | https://lance.org/guide/tokenizer/ |
@@ -92,11 +92,14 @@ Touching `apply_schema`, the migration planner, additive evolution.
 
 ### Object store / S3
 
-Touching `storage.rs`, S3-compatible backends (RustFS, MinIO), env vars.
+Touching `crates/omnigraph-storage/src/lib.rs`, the engine compatibility facade
+in `crates/omnigraph/src/storage.rs`, S3-compatible backends (RustFS, MinIO),
+or object-store environment variables.
 
 | Topic | URL |
 |---|---|
 | Object-store guide | https://lance.org/guide/object_store/ |
+| Observability (logical object-store operations, bytes, failures, retries) | https://lance.org/guide/observability/ |
 
 ### Data types
 
@@ -116,6 +119,7 @@ Optimizing scans, fragment counts, cache behavior, memory pool sizing.
 | Topic | URL |
 |---|---|
 | Performance guide | https://lance.org/guide/performance/ |
+| Observability (request duration, bytes, in-flight work, retry/throttle counters) | https://lance.org/guide/observability/ |
 
 ### Compaction & cleanup
 
@@ -156,7 +160,480 @@ If a future need pulls one of these into scope, add a row to the matching domain
 
 When Lance ships a major release that changes any of the above (file format bump, new index type, transaction semantics change, new branching primitive), refresh this index in the same change as the omnigraph upgrade. Stale Lance pointers are worse than no pointers.
 
-### Last alignment audit: 2026-07-12 (Lance 9.0.0-beta.21 upstream; omnigraph pinned at 9.0.0-beta.21 via git rev)
+> **Historical-audit boundary:** the dated audit stanzas below are retained as
+> evidence of what was inspected and tested at each dependency bump. Their
+> RFC-026, MemWAL, internal-schema-v7+ and stream-test statements describe the
+> now-rejected experiment at that date; they are not current OmniGraph product
+> contracts. Current ingestion reuses ordinary commit-visible graph Load and
+> current storage format is manifest v6. See [wal-removal.md](wal-removal.md).
+
+### Last alignment audit: 2026-07-25 (Lance 9.0.0 stable; crates.io)
+
+**The git-pin era is over.** Lance 9.0.0 was released on 2026-07-24 and every
+crate OmniGraph depends on is published to crates.io at that version, so the
+workspace moved from the `v9.0.0-rc.1` git rev (`cec0b7df`) to ordinary
+registry version pins. `Cargo.lock` now contains **zero** git sources. This
+restores ordinary publishability: the release gate recorded in
+[versioning.md](versioning.md) — "registry publication resumes when Lance 9.0.0
+ships stable" — is satisfied.
+
+The delta is 35 commits and unusually cheap. It is **not** a storage-format
+event: there is no file-format or minimum-reader-version movement, OmniGraph
+still writes explicit stable V2_2, and every MemWAL format-bearing file
+(`wal.rs`, `batch_store.rs`, `system_index/mem_wal.rs`, `protos/table.proto`,
+`mem_wal/util.rs`) is byte-identical to the rc.1 rev. Dependency floors are
+unchanged (Arrow 58, DataFusion 54, `object_store` 0.13.2, roaring 0.11.4,
+Rust 1.91+); this audit ran on Rust 1.95.
+
+Behavior-affecting findings:
+
+- **`ShardWriter::close` now propagates final flush failures** (#7769). This
+  was the pre-registered re-audit item parked at the rc.1 stanza below; the
+  contract sentence there is now rewritten. **No code change was required** —
+  OmniGraph never treats `close` as durability evidence, and the enrollment
+  adapter already maps its empty-shard close error. The matching lines in
+  [testing.md](testing.md) and RFC-026 were reworded in the same change.
+- **Filtered scans over staged fragments are fixed.** Through rc.1, a
+  `Some(filter)` `scan_with_staged` silently dropped matching *staged* rows
+  because stats-based pruning discarded uncommitted fragments that lack
+  per-column statistics. 9.0.0 returns them. This turned the
+  documented-limitation pin
+  `staged_tests::scan_with_staged_with_filter_silently_drops_staged_rows` red —
+  by design; that test carried an explicit instruction to rewrite it on this
+  exact event. It is now
+  `scan_with_staged_with_filter_returns_matching_staged_rows`, asserting the
+  correct semantics. Production was never affected: no production caller passes
+  a filter, and read-your-writes goes through `MutationStaging`'s in-memory
+  union instead.
+- **`read_transaction_by_version` no longer populates session caches**
+  (#7817), adding one ranged read per inline transaction on the RFC-023
+  certificate-chain path. The `write_cost` / `warm_read_cost` / `merge_cost`
+  budgets were re-run and all pass unchanged.
+- **BM25 corpus statistics changed** (#7699 drops zero-token documents), which
+  can legitimately move score ties. The pinned fused ordering in `search.rs`
+  still holds on this release.
+- **Neither RFC-026 upstream ask landed.** `InitializeMemWalBuilder::execute`
+  is still `-> Result<()>` with an internal commit and no enrollment receipt or
+  reversible shard-admission seal, and `WalAppender::append` still performs no
+  post-success writer epoch recheck. Both negative guards
+  (`mem_wal_deleted_fence_slot_allows_stale_writer_success_on_pinned_lance`,
+  `cleanup_old_versions_does_not_reclaim_mem_wal_objects`) therefore stay green,
+  and OmniGraph's adapter-side containment remains load-bearing.
+- **Gate R0's revision tripwire was rewritten, not retired.** It pinned the
+  exact git rev in `Cargo.lock`; it now pins the released version across the
+  whole Lance package family (with the two Arrow-versioned members carrying
+  their own surveyed version) and additionally refuses any return to a git
+  source. Its purpose is unchanged — the source audit must not silently outlive
+  the source it surveyed — and its underlying RC.1 no-go facts survive because
+  the MemWAL flush ordering and system-index files did not change.
+
+Evidence re-run for this bump: 26 Lance surface guards, `cargo test --workspace
+--locked` (75 suites), 141 failpoints, 35 `memwal_stream` cells, the
+`omnigraph-server --features aws` suite, and the local cost gates. The
+bucket-gated RustFS/S3 cells were not run locally and remain CI's
+responsibility.
+
+**Known gaps carried by choosing 9.0.0 over the v10 beta line** (both fixes
+exist only on v10, which is 96 commits ahead *and* 36 behind 9.0.0 after a
+9.1→10.0 renumber, ships two breaking changes, and renames the MemWAL
+vocabulary OmniGraph's recovery sidecars bind to):
+
+- **#7704** — stable-row-id `filter_deleted_ids` alignment. OmniGraph sets
+  `enable_stable_row_ids: true` everywhere, stages deletes, and calls
+  `optimize_indices`, so this is a live exposure.
+- **#7868** — flat-KNN ordering, which upstream itself labels Critical.
+- **#7965** — blob compaction misclassifying a valid empty blob as NULL, plus
+  a blob-v1 path where one empty blob can zero out neighbouring payloads.
+  `omnigraph optimize` compacts blob-bearing tables, so this is reachable.
+  Note OmniGraph's **own** blob descriptor decoder replicates the same
+  empty-vs-null misclassification independently of Lance; that is tracked as a
+  separate defect to fix on its own merits.
+
+### Prior alignment audit: 2026-07-17 (Lance 9.0.0-rc.1; git rev `cec0b7df`)
+
+The pin advanced from `v9.0.0-beta.21` (`1aec1465`) to
+`v9.0.0-rc.1` (`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`) after reviewing
+all 40 intervening commits, the cumulative RC release notes, and the complete
+matching format/guide pages listed above. Every Lance workspace dependency,
+including the engine's `lance-io` test dependency, uses the same exact rev.
+DataFusion advances 53→54; Arrow remains 58 and `object_store` remains 0.13.2.
+The lockfile adds Lance's new transitive `lance-index-core` crate. OmniGraph
+still writes explicit stable V2_2 files, so this dependency bump does not
+activate a new storage format or require a general OmniGraph format migration
+for schemas that avoid the newly reserved names documented below. RC.1 requires
+Rust 1.91 or newer; OmniGraph continues to track stable Rust and this audit ran
+on Rust 1.95.
+
+#### Post-audit implementation notes: 2026-07-18–21
+
+RFC-026 Gate E0 subsequently passed and Phase A activated OmniGraph internal
+schema v7. V7 adds only the bounded streaming foundation: exact recovery-v10
+enrollment, identity-keyed lifecycle authority, process-local admission and
+writer exclusion, current-HEAD witness validation, partial-format refusal, and
+strict v6↔v7 rebuild. The private adapter can establish one empty unsharded
+epoch-1 enrollment on main; no production caller can put or acknowledge a row,
+fold a generation, or operate drain/resume.
+
+On 2026-07-19, Phase B1 added the private data-bearing core and moved the
+then-current format to internal schema v8, stream-config v2, and recovery-v11
+`StreamFold`. One feature-gated, doc-hidden engine seam can admit one exact
+already-normalized physical batch, acknowledge only after that put's durability
+watcher succeeds, prevent rollover, and retire the writer before any
+successor-generation put. Empty reopen may admit; replayed active rows or one
+flushed-unmerged generation are fold-only. One strict fold consumes the exact
+generation, passes supplied physical vector columns through unchanged, performs
+no external embedding call or unspecified fold-derived-field materialization,
+and makes the achieved table pointer, lifecycle witness, and lineage
+graph-visible only at one `__manifest` CAS. This is private implementation and
+evidence machinery, not public activation: RFC-026 remains Draft, with no
+schema/SDK/HTTP/CLI/OpenAPI caller or operator drain/resume surface.
+
+On 2026-07-22, the private common-B2 slice moved the current format to internal
+schema v9, stream-config v3, lifecycle state v2, and recovery-v12. It adds the
+grammar-impossible `__omnigraph_stream_v1$` trusted base-row field and one
+manifest-selected `_stream_tokens.lance` participant, with compare-and-chain
+attribution and exact base-plus-token recovery. V8 crosses this boundary only
+through export/init/load; the pinned genuine-v8 cell also proves that a v8 user
+property named `__omnigraph_stream_v1` remains ordinary data. This still does
+not activate a production SDK/HTTP/CLI streaming surface.
+
+The Phase-B1 source audit also narrows the RC.1 row contract. `put_no_wait`
+returns a `WriteResult` plus an optional `BatchDurableWatcher`; the watcher's
+successful `Result<()>` is the only per-put durable-completion signal.
+`WriteResult.batch_positions` are active-MemTable/`BatchStore` positions that
+restart after `freeze_memtable`, while the durability watermark is shared for
+the writer lifetime. A generation-`N + 1` watcher can therefore resolve from
+generation `N`'s old watermark before `N + 1` reaches the WAL. In addition,
+`put_no_wait` inserts into the MemTable before a later flush-scheduling error,
+so its `Err` is not generally an effect-free result. Finally,
+`wal_stats.next_wal_entry_position` is mutable status, so neither is a durable
+row address or public receipt. Durable mode returning no watcher is treated as
+post-invocation `AckUnknown`, not effect-free configuration rejection.
+
+RC.1 replay has a second independent bookkeeping hazard. It inserts durable
+WAL batches into a fresh `BatchStore` and rebuilds indexes, but does not advance
+that store's per-MemTable WAL-flush watermark. A later put or plain seal starts
+its WAL range at batch zero, re-appending and re-indexing the replayed prefix.
+Repeated crashes after that duplicate WAL PUT but before the shard-manifest
+commit can multiply the replay tail until BatchStore capacity is exhausted.
+The public `BatchStore::set_max_flushed_batch_position` surface is therefore a
+pinned compatibility bridge: under the exclusive fold lease, B1 verifies that
+the active contiguous prefix came only from authoritative replay, marks it
+already WAL-durable, and then seals without another WAL/index write. Non-empty
+replay is fold-only; it never accepts a new put.
+
+Two flush details also constrain the proof. `wait_for_flush_drain` can return
+`Ok(())` after a fast failed handler has removed its watcher, so B1 separately
+requires empty frozen refs and the exact generation/cursor in the latest shard
+manifest. And RC.1 writes the randomized generation dataset and sidecars before
+that manifest CAS, so a crash may leave a complete or partial unreferenced
+`{hash}_gen_N/` subtree. B1 treats only that recognized subtree shape as
+retained derived orphan output. Private B2a proves complete and partial
+unreferenced output remains non-authoritative and is never descended into,
+read, mutated, adopted, or deleted through retry/reopen. Parent shard discovery
+may still observe the common prefix. The subtree remains in place under the
+selected unbounded retain-all profile. A later B2b
+managed profile would need a separately proved Lance-owned GC contract.
+Seal/drain/abort are background-owned
+with deadline-bounded caller waits: an error or stalled handler keeps the
+original task and abort completion retained, the registry retired, and
+admission closed. The caller never cancels `shutdown_all`, retries abort, or
+claims quiescence while the taken handler join may still be active.
+
+The implemented private B1 profile is deliberately bounded: one root-scoped
+serialized worker owns one generation whose complete input is capped at 8,192
+rows/32 MiB. Its explicit writer configuration prevents automatic rollover; it
+owns
+`put_no_wait` and the watcher, seals/drains, retires without writing into the
+replacement MemTable, folds one keyed transaction through recovery schema v11,
+then reopens at a higher epoch. The fold consumes already-normalized physical
+rows, including caller-supplied vector columns; it does not call an external
+embedding provider or invent unspecified fold-derived fields. Cold claim/replay
+and warm final-check/put hold the shared admission lease from before epoch claim
+until durability or quiesced retirement, preventing a claimant from crossing a
+drain's captured floor. Replay preserves possible residue but cannot resolve
+which caller attempt produced it. Configuration identity binds only
+correctness/topology/no-rollover fields; explicit runtime policy and injected
+Session/store capabilities remain separate. Private B1 activates graph schema
+v8 and stream-config v2 rather than adopting v7/config-v1 in place. The private
+B2a **unbounded retain-all** gate is implemented: OmniGraph deletes no canonical
+durable `_mem_wal` object, imposes no retained-byte/object/file/history quota,
+and accepts loud provider exhaustion. Lance may remove only its losing shard-
+manifest-CAS `.binpb.tmp.<uuid>` staging object, which never became authority.
+The provider matrix pins typed local/configured-RustFS failure and inert orphan
+behavior. The 1/8/32/128 local/RustFS instrument keeps warm acknowledgement,
+cold replay, fold, visibility, MemWAL, base-table, token-authority, other
+table-store, graph-manifest, adapter, advisory object, and RSS terms separate.
+The MemWAL warm-ack operation counts are flat while exact token/base authority
+and combined retained-history work are separately visible and may grow;
+aggregate table-store reads are not claimed flat. Timings, LIST totals, and RSS are
+diagnostics, not quotas or SLOs. Explicit enrollment, trusted attribution,
+compare-and-chain tokens, manifest-selected current-token authority, bounded
+correction, revisioned lifecycle/management receipts, authorization, and
+product parity remain common contracts. A graph-history budget is not one of
+them for this unbounded profile. Gate R0's legal high-entropy near-cap shape
+originally retained sparse scanner backing buffers and failed the fold charge;
+logical-slice accounting plus dense owned copies now make that exact shape
+acknowledge, materialize, fold, and publish. A reference isolated run measured
+a 286,441,472-byte fold RSS delta, below the 384-MiB CI remeasurement tripwire.
+The missing combined enrollment receipt and cross-process admission seal still
+gate broader topology, not the existing private single-live-writer-process
+seam or unbounded retention.
+
+The 2026-07-19 B2b reclamation audit adds a separate stock-RC.1 no-go. Generic
+`cleanup_old_versions` can reclaim ordinary dataset versions but does not walk
+or delete `_mem_wal`; the runtime guard
+`cleanup_old_versions_does_not_reclaim_mem_wal_objects` pins that ownership
+boundary. RC.1 also has no post-success epoch recheck after a WAL atomic PUT.
+`mem_wal_deleted_fence_slot_allows_stale_writer_success_on_pinned_lance`
+decodes and deletes the successor's empty epoch-2 WAL fence sentinel and proves
+the stale writer can still complete the put and receive watcher success even
+though an explicit check returns `PeerClaimedEpoch`. These guards forbid raw
+MemWAL deletion in OmniGraph; they do not implement reclamation.
+
+If bounded managed reclamation is later scheduled, RFC-026 §4.5.2 requires B2b
+to use a Lance-owned opaque
+inspect/plan/execute
+primitive with exact base/shard/history and whole-cut/cursor witnesses, durable
+attempt/receipt lost-result recovery, manifest-version plus epoch advancement
+before deletion, conservative orphan/unknown classification, bounded
+shard/reclaim-history checkpointing, and the post-success writer-epoch check.
+Every patched epoch claim first persists its attempt, writes an empty successor
+sentinel, and only then CASes the manifest that names it. Ordinary open,
+quiesce, resume, and checkpoint claims preserve the prior replay cursor and
+classify its complete tail; only a proved no-data-tail whole-cut reclaim may
+advance that cursor to its new sentinel. Pending attempts block another claim.
+Exact inventory also requires strong HEAD/GET/LIST visibility after PUT/DELETE
+plus incomplete-multipart accounting/abort, or Lance-owned durable complete
+accounting. Versioned/soft-delete/Object-Lock namespaces are refused unless
+every retained version/delete marker/locked byte is counted and eligible
+versions can be permanently removed. Its bounded bootstrap/checkpoint format
+creates a genesis body and pointer before a new details type URL or system-index
+kind that stock RC.1 must reject, not an ignored protobuf field or latest-
+version hint. One bootstrap-selected reserve-first ledger serializes generation
+and control reservations per physical binding before any WAL/upload effect,
+reconstructs cold, and settles only from exact inventory; cached checks cannot
+double-reserve across shards. Lance must source and enforce the maximum
+physical-growth reservation, durable materialization-attempt limit, bounded
+claim/reclaim/checkpoint history, and emergency control headroom before
+admission; local/RustFS measurement validates those bounds but does not create
+them. An upstream proposal remains useful for a future bounded profile, but it
+is not on the unbounded retain-all activation path. WAL-prefix reclamation is
+limited to a quiescent whole cut because RC.1 does not persist a per-generation
+WAL range.
+
+That optional Lance-owned ledger would bound only one physical `_mem_wal`
+binding; it would not bound the graph's base/token datasets or shared
+`__manifest` history. A future product that promises a finite whole-root bound
+would therefore need a separate RFC for a manifest-authoritative graph-global
+`GraphHistoryBudget`, including bootstrap, crash, refusal, every-writer, and
+local/RustFS physical-bound evidence. The selected retain-all profile makes no
+such promise and carries no such authority.
+
+#### Gate R0 source audit: 2026-07-20 bounded-retention result and 2026-07-21 disposition
+
+Gate R0 returned **no-go** for a B2a contract that promised finite retained
+storage on stock RC.1. The result is tied to exact revision
+`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; the checked-in decision test fails
+when the lockfile pin moves so the audit cannot silently outlive its source.
+On 2026-07-21 the RFC selected unbounded retain-all instead. The same source
+facts remain true, but they no longer block a profile with no storage ceiling,
+no raw-path deletion, and loud provider exhaustion.
+
+The materialization ordering is decisive. `MemTableFlusher::flush` checks the
+epoch, chooses a fresh eight-hex random generation directory, writes the Lance
+generation dataset, optional deletion state, Bloom filter, and mandatory PK
+sidecar, and only then calls the shard-manifest CAS
+(`mem_wal/memtable/flush.rs:223–280`; path construction is
+`mem_wal/util.rs:181–209`). Each `?` may leave a partial or complete
+unreferenced subtree. One background message invokes the flusher once and does
+not transparently retry the failed message (`mem_wal/write.rs:2658–2716`), but
+that is not a lifetime bound: reopen claims another epoch, reconstructs the
+MemTable at unchanged `manifest.current_generation`, replays WAL, and the next
+flush chooses another random path (`write.rs:1365–1403`, `1474–1517`). Durable
+`ShardManifest` state has no attempt ID, counter, reservation, inventory, or
+receipt (`lance-table/src/system_index/mem_wal.rs:177–205`).
+
+One clean unindexed B1 attempt includes generation data, a transaction,
+generation manifest, optional deletion vector, Bloom object, and the PK-BTree
+`page_data.lance` plus `page_lookup.lance`; Blob schemas may add packed or
+dedicated sidecars. Shard-manifest versions/hints, WAL entries, and one
+successor fence sentinel per reopen sit outside that randomized subtree.
+`FlushResult` returns generation/path/rows/covered WAL position, not a physical
+inventory or byte receipt. The data writer sets `max_rows_per_file =
+usize::MAX`; its byte target is soft and checked after a group is written.
+Uploads above 5 MiB may use multipart, whose abort-on-drop is best effort and
+cannot run after process death; local writes likewise use adjacent randomized
+temporary files. Provider and multipart retry settings are not represented in
+MemWAL authority.
+
+The production-neutral current-object census confirms success-path structure
+without overclaiming provider state. Locally, one/four/eight successful folds
+retain approximately 37.4 / 150.6 / 302.3 thousand currently listed immutable
+bytes and exactly the same number of referenced generation roots; every earlier
+listed path retains the same class and size. Generated metadata makes the exact
+byte totals vary slightly, so monotonic currently listed growth is the stable
+assertion.
+A retry after the referenced cut reuses that exact root. Before the closure
+repair, the deterministic high-entropy near-cap cell recorded 33,174,630 listed
+immutable bytes after acknowledgement and about 65.1 million after generation
+materialization, while sparse scanner arrays retained roughly 252.8 million
+bytes of backing allocation and tripped the 33,554,432-byte logical charge.
+Fold now charges the scanner's logical slices and densifies each emission before
+retaining it; the same 8,192-row shape folds and publishes. Ordinary LIST still
+cannot see incomplete multipart uploads, superseded provider versions, delete
+markers, local staging residue, or billed bytes. These measurements validate
+facts; they do not supply a finite storage envelope, and unbounded retain-all
+does not claim one.
+
+The selected profile does not add a test-only materialization-attempt ledger or
+a pre-attempt storage reservation: those would exist only to enforce a bound the
+profile deliberately does not promise. They become relevant again if a later
+RFC proposes bounded retention. No schema v9 or public surface is authorized by
+the source audit or closure repair alone.
+
+Private B2a closes the narrower stock-RC.1 storage/correctness gate. A shared
+fail-closed classifier validates canonical current MemWAL paths and decoded
+authority. Injected local and configured-RustFS failures prove effect-free claim
+errors, post-invocation acknowledgement ambiguity, complete post-cut orphan
+output, and partial post-data orphan output remain typed and recoverable without
+subtree adoption or deletion. The 1/8/32/128 local/RustFS sweep shows the warm-
+ack operation shape is flat but serialized authority bytes and combined
+retained-history work grow. Those observations are intentionally advisory;
+they neither revise the unbounded contract nor claim an isolated MemWAL slope.
+
+The no-roll profile uses fixed portable capacities (`8,193` rows/batches and
+1-GiB byte/unflushed thresholds), not architecture-dependent `usize::MAX`
+metadata. After reopen, the 32-MiB contract is validated from public
+`in_memory_memtable_refs().active.batch_store`: sum physical rows and exact
+stored post-tombstone Arrow batch memory, including replayed duplicate batches.
+An empty valid reopen may admit; a non-empty valid replay is routed fold-only.
+`MemTableStats::estimated_size` has different accounting and does not replace
+that contract. Retirement first stops the serialized worker and then uses
+public `ShardWriter::abort`. **Since 9.0.0, `close` propagates final flush,
+freeze, and task-shutdown failures** (upstream #7769, merged after the rc.1 pin
+and consumed by the 9.0.0 bump); through 9.0.0-rc.1 it discarded those results
+and returned a false `Ok(())`. OmniGraph's posture is unchanged under either
+contract — **close is never durability evidence**: the B1 worker retires via
+`abort`, and the enrollment adapter's two `close` calls are an error-path
+best-effort (result deliberately discarded) and a provably-empty-shard close
+after `check_fenced` whose error was already mapped, so the stricter contract
+can only surface more failures where OmniGraph already fails closed.
+
+Behavior-affecting findings in this audit:
+
+- **The RFC-022 write/recovery architecture remains aligned.** Native
+  branch/tag/cleanup behavior, shared `Session` construction, merge-insert
+  filter emission, the directional filtered/unfiltered conflict resolver, and
+  full-table `CreateIndexBuilder::execute_uncommitted` retain the shapes
+  OmniGraph consumes. All 23 Lance surface guards pass on RC.1, including the
+  exact tag/branch/ABA, blob-compaction, key-filter, shared-session, and vector
+  staging cells. Search, writes, schema apply, branching, maintenance,
+  row-version, ordinary recovery, and all 129 runnable failpoint tests also
+  pass. A graph initialized and populated by the cached beta.21 CLI was opened,
+  queried, merge-written, and queried again by the RC.1 CLI, proving the
+  supported ordinary-schema V2_2 forward-open/write path rather than relying
+  only on fresh RC fixtures. This proof intentionally does not cover the two
+  newly reserved row-version names; their explicit upgrade path is documented
+  below.
+- **Data Overlay is not an OmniGraph primitive.** RC.1 adds the experimental,
+  opt-in `Operation::DataOverlay` and table feature flag 64. OmniGraph neither
+  enables that flag nor emits the operation; its recovery classifiers keep
+  unknown foreign effects on the fail-closed path. The explicit V2_2 pin does
+  not silently opt a dataset into overlays.
+- **At RC.1 audit time, MemWAL's direction improved and RFC-026 owned a bounded
+  decision gate.**
+  Derived MemWAL datasets now inherit the base dataset's store parameters and
+  `Session`, which is compatible with OmniGraph's shared-session design and
+  remote credentials. The public initializer still commits internally and
+  shard claiming remains a separate effect: there is still no caller-owned
+  combined enrollment receipt plus reversible cross-process shard-admission
+  seal. Source inspection confirms that `execute()` builds one
+  `Operation::CreateIndex` from the current manifest, commits it through
+  `CommitBuilder`, mutates the handle, and returns `Result<()>`; the public
+  builder persists arbitrary namespaced writer defaults, and the public writer
+  path later accepts a caller-selected shard UUID and claims an observable
+  epoch. Gate E0 uses a pre-minted enrollment/config-version default as
+  read-back evidence independent of the replaceable index UUID. The public
+  branch/version/current-transaction/e_tag tuple
+  is a mutable current-HEAD witness—ordinary commits change it—not a stable
+  enrollment incarnation.
+
+  RC.1 persists writer defaults in the MemWAL index but does not apply them to
+  a caller-supplied `ShardWriterConfig`; any bounded adapter must reconstruct
+  the exact durable-write and buffer configuration rather than infer compatible
+  defaults.
+
+  MemWAL stays the strategic substrate and RFC-026 stays draft. Its
+  production-neutral Gate E0 passed for the bounded profile. The post-audit
+  note above records the subsequently implemented Phase A foundation and
+  private B1 boundary. The first
+  history-cost result was rejected: local
+  `checkout_latest` may discover the tip through filesystem `read_dir`, which
+  bypasses `IOTracker`, so the observed tracked GET count omitted part of the
+  lookup. RC.1's public but guide-hidden `Dataset::has_successor_version`
+  provides the accepted replacement: from a freshly ABA-verified exact `N`, it
+  tests only `N + 1` through `CommitHandler::version_exists`; the exact `N + 1`
+  handle can then reject a buried `N + 2` without latest resolution or listing.
+  `AttemptTracker` records before forwarding—including failed/`NotFound`
+  HEADs—and observes the identical complete shape at baseline versions 8 and
+  80: four successful manifest HEADs, one `NotFound` manifest HEAD, one
+  successful manifest GET, and zero lists. A Unix permissions tripwire proves
+  the exact probe works while latest enumeration fails and makes an unreadable
+  exact HEAD error.
+
+  Fourteen substantive local cells cover exact initializer readback,
+  lost-result reopening, the pre-minted empty shard, buried-effect refusal, and
+  broad fail-closed classification. The configured RustFS exact cell passes
+  non-vacuously with the same six-attempt/zero-list shape and covers the
+  positive sequence plus foreign shard, malformed/loose root, durable WAL,
+  persisted cursor, and corrupt-manifest negatives. Surface guards pin
+  `has_successor_version`, flush/drain, merged-generation state, and S3 ABA; CI
+  rejects skipped E0/ABA cells. Exclusive HEAD and cleanup/version-GC exclusion
+  remain load-bearing; only `Ok(false)` means absence, while errors, overflow,
+  or detached boundaries fail closed. The RC.1 audit itself introduced no
+  private API, raw object emulation, production schema, or stream
+  acknowledgement; the post-audit notes record the later Phase A and private
+  B1 format work.
+  The exact
+  upstream receipt/seal remains the preferred simplification and the gate for
+  broader topology.
+- **Maintenance and index defaults preserve current behavior.** Compaction
+  avoids a useless fragment-reuse-index optimization in a deferred-remap case;
+  OmniGraph uses `defer_index_remap=false`, and Lance still exposes no stable
+  caller-minted maintenance transaction. FTS posting blocks are now
+  configurable, but the default and legacy fallback remain 128; OmniGraph does
+  not opt into the experimental 256/v3 layout. The one-segment full-table
+  vector staging API remains public with the same relevant shape.
+- **Lance virtual system-column names now fail early in OmniGraph.** RC.1
+  rejects writes whose physical schema declares `_rowid`, `_rowaddr`,
+  `_rowoffset`, `_row_created_at_version`, or
+  `_row_last_updated_at_version`. The schema parser and accepted-SchemaIR
+  validator now reserve those five exact, case-sensitive property names before
+  init or SchemaApply can create durable state or arm recovery. A surface guard
+  pins the compiler-owned list to the five surveyed Lance public constants;
+  every Lance bump still audits upstream source for additions. At pin-audit
+  time internal schema v6 had not been released, so this was a validation
+  tightening rather than a format bump; Phase A's later v7 activation does not
+  change that conclusion. A development graph already using either newly
+  reserved row-version name must be exported with the beta.21 binary, renamed, and
+  rebuilt before opening on RC.1. The audit minted a genuine beta.21 v6 graph
+  with `_row_created_at_version`: beta.21 opened it successfully, while RC.1
+  refused it before any write with that exact recovery instruction.
+- **The research-blocked cost conclusions survive, with RC-specific numbers.**
+  RFC-025's local 10→1,000 compacted reconciled list/cleanup scan bytes are now
+  17,012→38,000 cold and 12,336→15,064 warm; exact show is 29,348→53,064
+  and 24,672→30,128. Cold scan operations still cross 24→25 (show 34→35).
+  These are modest improvements over beta.21, not a change in asymptotic
+  disposition: the proposed in-manifest checkpoint registry remains rejected.
+  RFC-024's ignored 10/100/1,000 instrument likewise keeps exact heads and
+  indexed row/range work flat, but RC.1 adds a bounded one-operation boundary
+  at the 1,000-commit endpoint on top of the already-rejected byte curves. The
+  local default and decision-scale instruments pass with these current no-go
+  facts asserted; S3/RustFS remains bucket-gated and was not available for this
+  audit.
+
+### Prior alignment audit: 2026-07-12 (Lance 9.0.0-beta.21 upstream; omnigraph pinned at 9.0.0-beta.21 via git rev)
 
 The pin advanced from `v9.0.0-beta.15` (`f24e42c1`) to
 `v9.0.0-beta.21` (`1aec1465`) after reviewing all 77 intervening commits and
@@ -170,6 +647,17 @@ requires one pinned Lance version across a deployment.
 
 Behavior-affecting findings in this audit:
 
+- **Session sharing has two separable layers.** Lance `Session::new` accepts an
+  `Arc<ObjectStoreRegistry>` independently of its metadata/index cache
+  capacities. OmniGraph therefore shares one process-wide registry to reuse
+  graph-dataset object-store clients, but does not use one process-global cached
+  Session. Data tables use a graph-handle-scoped cached Session; `__manifest`
+  and other mutable-tip control datasets use a zero-cache control Session.
+  Coordinator open/full-refresh reads decode manifest state and lineage from
+  one row scan.
+  This access shape reduces duplicate opens and cold client construction while
+  avoiding a mutable-tip cache authority. It does not make the append-only
+  manifest fold history-flat.
 - **The RFC-022 full-table vector-index stage is no longer substrate-blocked.**
   `CreateIndexBuilder::execute_uncommitted` builds the physical vector artifact
   and returns complete `IndexMetadata`; Lance's own `execute` wraps that value
@@ -199,16 +687,19 @@ Behavior-affecting findings in this audit:
   maintenance-transaction API and OmniGraph has distributed recovery fencing;
   the latter is independently required before destructive recovery is safe
   against a live foreign process.
-- **RFC-024 Gate A found a usable public ABA token but rejected the proposed
-  physical lookup shape.** The backend-portable candidate is the composite of
-  public `Dataset::branch_identifier()`, the current public
-  `Dataset::read_transaction()` UUID, and `Dataset::manifest_location().e_tag`.
+- **RFC-024 Gate A found a usable current-HEAD witness with ABA sensitivity but
+  rejected the proposed physical lookup shape.** The backend-portable candidate
+  combines the public table version, `Dataset::branch_identifier()`, the
+  current public `Dataset::read_transaction()` UUID, and
+  `Dataset::manifest_location().e_tag`.
   Capture brackets transaction/e_tag collection with two branch-identifier
   reads and fails if the ref moves; a missing transaction or empty UUID also
   fails. Beta.21's local `current_manifest_path` synthesizes an
   inode-mtime-size e_tag, while S3/RustFS returns the object e_tag. Guards prove
-  stable unchanged reopens and distinguish main and named-ref delete/recreate
-  at the same numeric version on local and S3/RustFS. The local guard reuses the
+  stability across unchanged reopens and distinguish main and named-ref
+  delete/recreate at the same numeric version on local and S3/RustFS. An
+  ordinary commit changes the witness; it is not a stable dataset/enrollment
+  incarnation. The local guard reuses the
   original shared `Session`; the S3 guard also pins unchanged-incarnation
   reopen stability. Main's canonical empty `BranchIdentifier` makes the UUID
   and e_tag load-bearing; named refs additionally mint a new branch identifier.
@@ -240,6 +731,41 @@ Behavior-affecting findings in this audit:
   `fragments_scanned`, `ranges_scanned`, and `rows_scanned` are beta.21
   `all_counts` debug names explicitly subject to change, so every Lance bump
   must re-audit them rather than silently treating them as stable API.
+- **RFC-025 Gate 0 validates Lance tags but rejects the current checkpoint-
+  registry access shape.** The pinned public tag surface targets an exact main
+  or named-branch version, creates/deletes auxiliary `_refs/tags/*.json`
+  metadata without advancing the dataset version, and exempts the tagged
+  version from cleanup. Deleting the tag makes the version reclaimable. A tag
+  on a named branch does **not** retain `tree/<branch>` after branch deletion,
+  so OmniGraph's proposed checkpoint-aware branch-delete refusal remains
+  load-bearing. `Tags::create` is an existence check followed by an
+  unconditional put on this revision, not a conditional create; RFC-025's
+  retention claim plus exact post-create verification therefore cannot be
+  replaced by the tag call itself. All 22 `lance_surface_guards` passed,
+  including `native_tags_pin_exact_main_and_named_branch_versions_through_cleanup`
+  and the extended `force_delete_branch_semantics` cell.
+
+  The separate production-neutral `checkpoint_retention_cost.rs` fixture holds
+  three checkpoints and catalog width ten constant while unrelated journal
+  history grows. At the local 10→1,000 decision endpoints, reconciled
+  uncompacted list stays at 3 rows / 3 ranges / 1 fragment / 1 page and 24 scan
+  operations / 13,752 bytes; exact show stays at 12 / 2 / 2 / 3 and 34 /
+  22,952; cleanup returns 44 rows with list-like cost. The eight-fragment tail
+  is exact and history-flat. Compaction rejects the candidate: list/cleanup
+  cold scan bytes grow 17,012→39,668 and warm bytes 12,336→16,736; exact-show
+  cold bytes grow 29,348→56,404 and warm bytes 24,672→33,472. At 1,000 commits
+  scan operations also cross 24→25 for the one-scan paths and 34→35 for show.
+  The default local 20/80 matrix passes its no-go-preservation assertions. The
+  bucket-gated S3/RustFS cost cell exists but was not run for this decision and
+  is not claimed.
+
+  This result blocks the in-manifest BTREE access shape, not checkpoint rows as
+  logical authority or Lance tags as physical pins. RFC-025 is
+  research-blocked and no retention format ships. Schema v6 was production
+  truth when the gate ran; current schema v19 likewise carries no retention
+  state. A successor needs a history-flat current-authority lookup
+  or revised evidence-backed operational contract without adding a second
+  authority dataset.
 - **RFC-023 key-filter behavior remains route-dependent and directional, and
   v6 closes production routing around that fact with two distinct adapters.**
   A 2026-07-14 probe on this beta.21 pin shows that an explicitly selected v2
@@ -368,6 +894,11 @@ Behavior-affecting findings in this audit:
   normalization because Lance still performs the branch-contents existence
   check and delete separately, leaving a concurrent-delete TOCTOU window around
   the otherwise-idempotent tree cleanup.
+  OmniGraph's access-shape follow-up performs one operation-local post-gate
+  control capture instead of refreshing the handle-local coordinator around
+  table-gate acquisition, then invalidates derived caches after a successful
+  ref transition. This changes neither `BranchContents` authority nor the
+  single-writer-process support boundary.
   The index-create source is unchanged; compaction changes are mechanical
   iterator cleanup; the transaction change only centralizes calculation of the
   next version. Branch checkout now reuses the session-cached manifest,
@@ -493,7 +1024,7 @@ Not a version bump — a single-fix vendored pin. `[patch.crates-io] lance-table
 
 Migration from Lance 6.0.1 → 7.0.0 landed in this cycle. **Arrow stayed 58, DataFusion stayed 53** (no change) — the only transitive bump is `object_store` 0.12.5 → 0.13.2. 141 upstream commits reviewed (6.0.1 → 7.0.0); no fixes lost (the 6.0.x release-branch backports are all forward-ported into 7.0.0). Behavior-affecting findings:
 
-- **object_store 0.13 moved convenience methods behind a new `ObjectStoreExt` trait** (`get`/`put`/`head`/`rename`/`delete`; `list`/`list_with_delimiter`/`put_opts` stay on the core `ObjectStore` trait). Fix = add `use object_store::ObjectStoreExt;` to `storage.rs` and `db/manifest/namespace.rs`; no call-site changes. Mirrors Lance's own migration in PR #6672. The local-FS `PutMode::Update` gap is unchanged (still unimplemented upstream), so `storage.rs::write_text_if_match`'s local content-token emulation stays.
+- **object_store 0.13 moved convenience methods behind a new `ObjectStoreExt` trait** (`get`/`put`/`head`/`rename`/`delete`; `list`/`list_with_delimiter`/`put_opts` stay on the core `ObjectStore` trait). Fix = add `use object_store::ObjectStoreExt;` to the implementation now at `crates/omnigraph-storage/src/lib.rs` and to `db/manifest/namespace.rs`; no call-site changes. Mirrors Lance's own migration in PR #6672. The local-FS `PutMode::Update` gap is unchanged (still unimplemented upstream), so `omnigraph-storage::ObjectStorageAdapter::write_text_if_match`'s local content-token emulation stays; `crates/omnigraph/src/storage.rs` is the engine compatibility facade.
 - **`roaring` must be pinned to 0.11.4** (`cargo update -p roaring --precise 0.11.4`). Lance 7.0.0's `UpdatedFragmentOffsets` newtype (PR #6650) derives `Eq` over `HashMap<u64, RoaringBitmap>`, which needs `RoaringBitmap: Eq` — added only in roaring 0.11.4 (roaring-rs PR #341). Lance's loose `roaring = "0.11"` constraint otherwise resolves the broken 0.11.3 and **lance itself fails to compile** (`RoaringBitmap: Eq is not satisfied`). roaring is transitive (no direct workspace dep); the pin lives only in `Cargo.lock`.
 - **`_row_created_at_version` for merge-insert INSERT rows now = the commit version** (PR #6774; was a fallback of 1 / dataset-creation version). Flipped `lance_version_columns.rs::lance_merge_insert_new_row_stamps_created_at_version` to assert `== v2`. Production change-detection keys on `_row_last_updated_at_version` + ID-set membership, so classification logic is unaffected (the `changes/mod.rs` rationale comment was corrected).
 - **BTREE range-query bound inclusiveness fixed** (PR #6796, issue #6792): `x <= hi AND x > lo` returned the wrong boundary row on 6.0.1. omnigraph today builds BTREE only on string `@key` columns (`id`/`src`/`dst`) and queries them by equality/IN, not range, so its *current* query patterns almost certainly never hit this bug — but the corrected boundary semantics are a contract we rely on the moment a BTREE-range path appears (BTREE-on-properties via the index-type tickets, or a range-on-key query). Pinned by `lance_surface_guards.rs::btree_range_query_boundary_is_correct` (reproduces #6792's 5-row + BTREE shape).

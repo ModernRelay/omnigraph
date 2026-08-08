@@ -3,7 +3,7 @@
 **Audience:** maintainers, contributors, and coding agents — internal
 **Type:** narrative reference ("the book"), read top-to-bottom
 **Status:** living document
-**Surveyed:** OmniGraph 0.8.1 development (`main`), with the v6/0.10.x format work present; Lance 9.0.0-beta.21 (git rev `1aec1465`); internal manifest schema v6
+**Surveyed:** OmniGraph 0.9.0 development (`main`); Lance 9.0.0; internal manifest schema v6
 
 ---
 
@@ -224,9 +224,10 @@ CLI (omnigraph)        HTTP Server (omnigraph-server: Axum + Cedar + admission)
 
 Workspace crates: `omnigraph-compiler`, `omnigraph` (package name
 `omnigraph-engine` — the directory and package names differ),
-`omnigraph-policy`, `omnigraph-api-types` (shared wire DTOs), `omnigraph-cluster`
-(control plane), `omnigraph-cli`, `omnigraph-server`. Full diagrams and code
-paths: [architecture.md](architecture.md).
+`omnigraph-storage` (shared control-object storage), `omnigraph-policy`,
+`omnigraph-api-types` (shared wire DTOs), `omnigraph-cluster` (control plane and
+persisted state-lock ownership), `omnigraph-cli`, `omnigraph-server`. Full
+diagrams and code paths: [architecture.md](architecture.md).
 
 Two structural boundaries deserve emphasis because everything else leans on
 them:
@@ -249,7 +250,7 @@ them:
 OmniGraph's relationship with Lance is a *contract*, managed like one:
 
 - **Pinned, audited versions.** The engine pins one Lance version
-  (currently 9.0.0-beta.21 via git rev, until 9.0.0 stable reaches crates.io).
+  (currently 9.0.0-rc.1 via git rev, until 9.0.0 stable reaches crates.io).
   Every bump gets a full alignment audit — all intervening upstream commits
   reviewed, findings recorded in [lance.md](lance.md)'s dated audit stanzas.
   History has justified the paranoia: audits have caught a default flip that
@@ -353,11 +354,18 @@ The path (details: [execution.md](execution.md)):
 
 **The cost model is a tested contract, not an aspiration.** The warm read path
 was once O(commit-history) per query — fresh coordinator per read, full
-manifest re-scans, no shared session. The query-latency work drove it to: one
-cheap freshness probe, one schema read, zero dataset opens on a warm repeat.
-This is *pinned* by IO-counted cost-budget tests (`warm_read_cost.rs`) that
-count object-store operations at commit-history depth — because cost-scaling
-bugs pass every correctness test and only bite in production. See
+manifest re-scans, and independently-created object-store clients. Lance
+graph-dataset access is now split deliberately: a process-wide
+`ObjectStoreRegistry` pools graph-dataset clients, graph data uses a
+graph-handle-scoped cached `Session`, and mutable-tip control state uses a
+zero-cache `Session`. A coordinator open or full refresh derives its manifest
+state and lineage projection together from one row scan. The warm query path
+remains one cheap freshness probe, one schema read, and zero dataset opens on a
+warm repeat. These are *pinned* by IO-counted cost-budget tests
+(`warm_read_cost.rs`) that count object-store operations at commit-history
+depth — because cost-scaling bugs pass every correctness test and only bite in
+production. A required full journal fold may still grow with uncompacted
+history; client/session reuse does not change that fact. See
 [testing.md](testing.md) "Cost-budget tests".
 
 ---
@@ -573,6 +581,12 @@ best-effort tree cleanup (absent ref ⇒ success). This is invariant 3's shape
 applied to metadata: when the logical target is fully derivable from one
 existing authority, a reconciler beats a sidecar — and it degrades to a no-op
 if Lance later closes the physical gap.
+
+After the complete schema → branch → table gate envelope is held, each control
+uses one operation-local manifest/namespace capture. It does not refresh the
+handle-local coordinator before and after table-gate acquisition. A successful
+ref transition explicitly invalidates derived read caches so a reused branch
+name cannot inherit stale handles or topology from its prior incarnation.
 
 ### Commits and time travel
 
@@ -857,8 +871,9 @@ on the proposer.)
   storage. See [design principle 6](#6-branches-are-the-transaction-model).
 - **A custom WAL / transaction manager / buffer pool.** Lance owns durability
   primitives. Our recovery sidecars are *intents over Lance commits*, not a
-  parallel log of data. (Streaming ingest will consume Lance's MemWAL rather
-  than building one — **(draft RFC-026)**.)
+  parallel log of data. High-rate bounded graph batches reuse the shared
+  ordinary Load transaction and are acknowledged only after manifest visibility;
+  [RFC-026's MemWAL path was rejected](wal-removal.md).
 - **Mixed constructive/destructive single mutations (D₂).** Keeps in-query
   read-your-writes unambiguous and each table at one commit per query; the
   alternative buys an in-query delete-view machine in the hot path.
@@ -910,8 +925,7 @@ cross-version rebuild/refusal evidence, duplicate-repair runbook, and passed
 **Roadmap / research:** durable table heads /
 heads format **(RFC-024, research-blocked after Gate A rejected the first
 physical access shape)**; checkpoint-pinned retention **(RFC-025, draft)**;
-MemWAL streaming ingest **(RFC-026, draft)**; lineage-based merge deltas
-**(RFC-027, research-blocked)**; background reconciler; planner
+lineage-based merge deltas **(RFC-027, research-blocked)**; background reconciler; planner
 statistics/cost model; policy pushdown; ingest-time embeddings; per-query
 resource budgets.
 
@@ -922,12 +936,12 @@ resource budgets.
 | Risk | Severity | Posture / mitigation |
 |---|---|---|
 | **R1: Destructive recovery beside a live foreign process.** Lance restore orphans concurrent commits; no conditional ref primitives; gates are process-local. | High | Documented single-writer-process support boundary; exact ownership prevents false adoption; distributed fence (lease on the schema-apply lock branch) is the sketched close **(roadmap)**. Do not promote multi-process write topologies before it exists. |
-| **R2: Pre-stable Lance pin.** 9.0.0-beta.21 via git rev; betas have regressed mid-line before (blob reads broke in beta.13, fixed beta.15). Blocks crates.io publishing (v0.8.1 is binaries-only; v0.9.0 gated on 9.0.0 stable). | High | Full alignment audit per bump (all commits reviewed, findings in [lance.md](lance.md)); surface guards as first smoke check; `cargo test --workspace` as the alignment gate, never the build alone. |
-| **R3: RFC-023 consumes a beta.21 route-dependent key-filter primitive.** Lance's filter emission and filtered/unfiltered resolution are directional (probed 2026-07-14). | Medium | v6 closes production insertion-bearing routes through exact-`id`, forced-v2 filtered staging and source-guards bare Append; the adapter verifies the emitted field-ID filter and effect-aware recovery refuses ambiguity. Guards pin both conflict orders so any upstream symmetry/route change forces an audit. Three-run release evidence passed the 1M forced-v2 50 ms median / 256 MiB max-RSS thresholds (29 ms / 243,875,840 bytes). |
+| **R2: Lance substrate churn.** Minor releases can change behavior that OmniGraph depends on, even without changing the public type surface. | High | Pin one audited release, review every intervening upstream commit, keep findings in [lance.md](lance.md), run the surface guards first, and use `cargo test --workspace --locked` as the alignment gate. |
+| **R3: RFC-023 consumes a route-dependent pinned-Lance key-filter primitive.** Lance's filter emission and filtered/unfiltered resolution remain directional on RC.1 (revalidated 2026-07-17). | Medium | v6 closes production insertion-bearing routes through exact-`id`, forced-v2 filtered staging and source-guards bare Append; the adapter verifies the emitted field-ID filter and effect-aware recovery refuses ambiguity. Guards pin both conflict orders so any upstream symmetry/route change forces an audit. Historical beta.21 release evidence passed the 1M forced-v2 50 ms median / 256 MiB max-RSS thresholds (29 ms / 243,875,840 bytes). |
 | **R4: Manifest fold cost grows with commit count.** Current-state resolution folds history. | Medium | `optimize` compacts internal tables (keeps periodically-optimized graphs flat — cost-gated every PR). RFC-024 Gate A found flat exact-BTREE scan work at width 10, including observable/reconcilable uncovered tails, but rejected the format because representative RustFS 20→80 uncompacted cold reads/bytes (34→94 / 61,947→121,592) and compacted byte terms grow. RFC-024 is research-blocked; v6 retains the journal fold and internal-table *cleanup* remains deferred behind the resurrection watermark. |
 | **R5: Schema identity corruption or alias/identity drift.** Internal schema v5 introduced stable IDs/incarnation as durable authority; v6 preserves them. | Medium | Open/init validate the SchemaIR domain and exact bidirectional IR↔manifest identity/path/alias contract; every active recovery envelope carries the identity pair; zero, duplicate, missing, or mismatched identity fails closed. |
-| **R6: Merge cost at divergence** — full-width classification, history-growing manifest opens. | Medium | Fast-forward path structurally pinned; `merge_cost.rs` keeps the terms visible; O(delta) merge blocked on a real deletion-delta source **(RFC-027)**; fragment adoption **(RFC-0001, draft)**. |
-| **R7: No streaming ingest** — per-branch write throughput is capped by the `graph_head` CAS rate; high-frequency small writes are wasteful. | Medium | Deliberate: the interactive path's guarantees come first. MemWAL-based ingest with durable per-row ack + graph-atomic folds is the design **(RFC-026)**. MemWAL is the strategic substrate, but beta.21's public initializer commits opaquely and shard provisioning is separate; activation waits for a public exact enrollment receipt plus reversible admission seal rather than using private APIs. |
+| **R6: Merge cost at divergence** — full-width classification and history-growing manifest folds. | Medium | Coherent coordinator scans plus retained probe handles reduced the pre-slice measured depth-5/depth-80 baseline from 59/651 manifest reads to 40/410 and cap the common fast-forward route at three internal opens and three scans, but the uncompacted-history slope remains. `merge_cost.rs` keeps both facts visible; O(delta) merge is blocked on a real deletion-delta source **(RFC-027)**; fragment adoption is **(draft RFC-0001)**. |
+| **R7: Small-request ingestion amplification.** Every graph batch is one ordinary graph transaction and therefore pays the manifest publication cost. | Medium | Batch logical graph NDJSON up to the ordinary Load bounds. The public path stays graph-first, uses the shared Load transaction, and acknowledges only after the graph commit is visible. The rejected MemWAL design and its measured failure are recorded in [wal-removal.md](wal-removal.md). |
 | **R8: Some operations lack enforced memory/time budgets.** | Medium | Known gap, narrowed and accepted for RFC-023. Its direct-substrate instrument rejected the first whole-delta fenced adopt (~447 MB peak at 100K × 256 versus ~74 MB Append), and the first corrected production 10K series failed at 30.0× / 108,625,920 bytes overhead; both negative results remain evidence. Mutation/Load now refuses a keyed table above 8,192 rows / 32 MiB before arm, while BranchMerge uses a recovery-enrolled chain with the same per-chunk bounds and a 1,024-transaction ceiling. The inductive certificate route removes the general diff, temporary delta, target preflight, and target join without weakening that chain. Final five-pair production medians passed at 31/8 ms (3.875×) for 10K and 136/35 ms (~3.886×) for 100K; maximum signed paired RSS overheads were 24,297,472 and 32,604,160 bytes. Inclusive row/transaction ceilings, byte refusal (including materialized blobs), operation-wide validation retention, exact source/target incarnation revalidation, second-generation certificate composition, and both between-chunk recovery directions are pinned; other operations still need explicit bounds. |
 | **R9: Local-FS conditional-write emulation** (`write_text_if_match` check-then-act gap). | Low | All current callers sit behind the cluster lock protocol; S3 uses true conditional puts; close before admitting any lock-free caller. |
 | **R10: Doc/spec drift as the system grows** — this document included. | Low | Maintenance contract (same-PR doc updates, `check-agents-md.sh` link CI, "don't lie" stale markers); this canon defers to area docs by construction. |
@@ -954,8 +968,8 @@ Live design questions, each owned by an RFC or a known gap — not a wishlist:
    weaken the gate or add a second authority dataset.
 4. **Which capability owns the next rebuild boundary after v6?** RFC-028
    activated stable identity in v5; RFC-023 assigns exact-`id` fencing to v6.
-   RFC-024's heads, RFC-025's retention, and RFC-026's stream capability remain
-   independently reviewable. Any later format activation requires its own
+   RFC-024's heads and RFC-025's retention remain independently reviewable.
+   Any later format activation requires its own
    export/init/load rebuild unless capabilities deliberately co-release after
    their combined matrix passes.
 5. **What is the checkpoint/retention contract?** RFC-025: checkpoint rows as
@@ -983,11 +997,11 @@ The plan of record is the RFC-022…028 family (all under
 | [0023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | Substrate-native keyed-write fencing via Lance's unenforced-PK filter; fleet/format activation barrier | **Implemented** (2026-07-15) |
 | [0024 — Durable table heads](../rfcs/0024-durable-table-heads.md) | Materialized head-row research; the first exact-BTREE candidate bounded scan work but failed the full latest-manifest/object-byte cost gate | **Research blocked** |
 | [0025 — Checkpoint-pinned retention](../rfcs/0025-checkpoint-retention.md) | Named checkpoints as authoritative retention roots, materialized as Lance tags | Draft |
-| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: ack on WAL durability, asynchronous graph-atomic folds | Draft |
+| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Historical durability-first streaming experiment; rejected in favor of ordinary commit-visible graph batches | **Rejected** — see [decision](wal-removal.md) |
 | [0027 — Lineage merge deltas](../rfcs/0027-lineage-merge-deltas.md) | O(delta) merge classification from row-version lineage | Research-blocked |
 
 Deliberately split, not one mega-format: identity, key fencing, head rows,
-retention, ingest, and merge deltas are separate irreversible decisions with
+retention, and merge deltas are separate irreversible decisions with
 different substrate gates and rollout barriers ("reversibility shapes evidence
 demand").
 Release-wise: v0.8.1 ships as binaries only (the Lance git pin blocks
