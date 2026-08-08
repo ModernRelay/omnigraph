@@ -99,9 +99,9 @@ pub(crate) fn certified_insert_absence_rows(
         || fields_for_preserving_frag_bitmap != expected_schema_preorder_ids
         || update_mode != &Some(UpdateMode::RewriteRows)
         || updated_fragment_offsets.is_some()
-        || !inserted_rows_filter
+        || inserted_rows_filter
             .as_ref()
-            .is_some_and(|filter| filter.field_ids == vec![id_field_id])
+            .is_none_or(|filter| filter.field_ids != vec![id_field_id])
     {
         return None;
     }
