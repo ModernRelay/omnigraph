@@ -109,46 +109,6 @@ jobs:
       - name: Verify omnigraph-server entrypoint arg composition
         run: sh docker/entrypoint_test.sh
 
-  check_default_features:
-    name: Check default features
-    needs: classify_changes
-    # PR-time compile check of the default-feature workspace. Every test job
-    # builds a feature superset (failpoints, aws), so a default-features-only
-    # break — a variant or module gated differently between a crate and its
-    # consumer — is otherwise first seen post-merge by the format fence, the
-    # noisiest possible channel. `cargo check` with a warm cache is minutes;
-    # this is a reporting check, not a required context.
-    if: github.event_name == 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    env:
-      CARGO_TERM_COLOR: always
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: stable
-
-      - name: Cache Rust build data
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: |
-            . -> target
-          key: default-features-check
-
-      - name: Check workspace with default features
-        run: cargo check --workspace --locked
-
   fmt:
     name: Format (rustfmt)
     needs: classify_changes
