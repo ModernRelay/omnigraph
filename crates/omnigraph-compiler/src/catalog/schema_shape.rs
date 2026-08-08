@@ -128,7 +128,7 @@ pub fn compile_schema_shape(schema: &SchemaFile) -> Result<SchemaShape> {
                 let mut properties = Vec::with_capacity(node.properties.len());
                 for effective in &node.properties {
                     let origin = node.property_origins.get(&effective.name);
-                    let declared_directly = origin.map_or(true, |origin| origin.declared_directly);
+                    let declared_directly = origin.is_none_or(|origin| origin.declared_directly);
                     let mut contributions = origin
                         .map(|origin| origin.interface_properties.clone())
                         .unwrap_or_default();

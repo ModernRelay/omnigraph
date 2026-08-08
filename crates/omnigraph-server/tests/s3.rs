@@ -24,9 +24,9 @@ async fn server_opens_s3_graph_directly_and_serves_snapshot_and_read() {
     Omnigraph::init(&uri, &fs::read_to_string(fixture("test.pg")).unwrap())
         .await
         .unwrap();
-    let mut db = Omnigraph::open(&uri).await.unwrap();
+    let db = Omnigraph::open(&uri).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         &fs::read_to_string(fixture("test.jsonl")).unwrap(),
         LoadMode::Overwrite,
     )
@@ -122,9 +122,9 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
         assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
 
         let graph_uri = format!("{root}/graphs/knowledge.omni");
-        let mut db = Omnigraph::open(&graph_uri).await.unwrap();
+        let db = Omnigraph::open(&graph_uri).await.unwrap();
         load_jsonl(
-            &mut db,
+            &db,
             "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n",
             LoadMode::Overwrite,
         )
@@ -144,10 +144,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
         graphs,
         config_path,
         server_policy,
-    } = settings.mode
-    else {
-        panic!("cluster boot must select multi-graph routing");
-    };
+    } = settings.mode;
     let state = omnigraph_server::open_multi_graph_state(
         graphs,
         Vec::new(),

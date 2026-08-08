@@ -127,8 +127,8 @@ query rrf_edges($q1: Vector(4), $q2: Vector(4)) {
 
 async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, SEARCH_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap();
+    load_jsonl(&db, SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
@@ -137,8 +137,8 @@ async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
 
 async fn init_ranked_edge_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, RANKED_EDGE_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, RANKED_EDGE_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, RANKED_EDGE_SCHEMA).await.unwrap();
+    load_jsonl(&db, RANKED_EDGE_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     db
@@ -146,8 +146,8 @@ async fn init_ranked_edge_db(dir: &tempfile::TempDir) -> Omnigraph {
 
 async fn init_mock_embedding_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, MOCK_SEARCH_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, &mock_embedding_seed_data(), LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, MOCK_SEARCH_SCHEMA).await.unwrap();
+    load_jsonl(&db, &mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
@@ -156,8 +156,8 @@ async fn init_mock_embedding_search_db(dir: &tempfile::TempDir) -> Omnigraph {
 
 async fn init_model_recorded_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, MODEL_RECORDED_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, &mock_embedding_seed_data(), LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, MODEL_RECORDED_SCHEMA).await.unwrap();
+    load_jsonl(&db, &mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
@@ -286,7 +286,7 @@ async fn deferred_indexes_do_not_block_hybrid_reads() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, MOCK_SEARCH_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, &mock_embedding_seed_data(), LoadMode::Overwrite)
+    load_jsonl(&db, &mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -538,7 +538,7 @@ async fn assert_filtered_nearest_returns_hits(query_name: &str) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, FILTERED_NEAREST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, FILTERED_NEAREST_DATA, LoadMode::Overwrite)
+    load_jsonl(&db, FILTERED_NEAREST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -1147,10 +1147,8 @@ node Doc {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
     assert_eq!(
         doc_user_index_count(&db).await,
         0,

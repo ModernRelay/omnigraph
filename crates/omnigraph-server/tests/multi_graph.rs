@@ -2,17 +2,12 @@
 //! Moved verbatim from tests/server.rs in the modularization.
 
 use std::fs;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
-use axum::body::{Body, Bytes, to_bytes};
-use axum::http::header::{CACHE_CONTROL, ETAG, HeaderValue, IF_MATCH};
+use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
-use futures::StreamExt;
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_server::api::{ChangeRequest, ErrorOutput, ExportRequest, QueryRequest, ReadRequest};
+use omnigraph_server::api::{ErrorOutput, ExportRequest, ReadRequest};
 use omnigraph_server::{AppState, build_app};
 use serde_json::Value;
 use serial_test::serial;
@@ -409,10 +404,7 @@ async fn cluster_boot_serves_applied_state() {
         graphs,
         config_path,
         server_policy,
-    } = settings.mode
-    else {
-        panic!("cluster boot must select multi-graph routing");
-    };
+    } = settings.mode;
     assert_eq!(graphs.len(), 1);
     assert_eq!(graphs[0].graph_id, "knowledge");
     assert!(server_policy.is_none());
@@ -724,10 +716,8 @@ graphs:
         .join("graphs/knowledge.omni")
         .to_string_lossy()
         .to_string();
-    let mut db = Omnigraph::open(&graph_uri).await.unwrap();
-    load_jsonl(&mut db, &data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::open(&graph_uri).await.unwrap();
+    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
 
     let _guard = EnvGuard::set(&[
         ("OMNIGRAPH_EMBEDDINGS_MOCK", None),
@@ -743,10 +733,7 @@ graphs:
         graphs,
         config_path,
         server_policy,
-    } = settings.mode
-    else {
-        panic!("cluster boot must select multi-graph routing");
-    };
+    } = settings.mode;
     let state = omnigraph_server::open_multi_graph_state(
         graphs,
         Vec::new(),
@@ -902,10 +889,7 @@ graphs:
         graphs,
         server_policy,
         ..
-    } = settings.mode
-    else {
-        panic!("cluster boot must select multi-graph routing");
-    };
+    } = settings.mode;
     // Cluster boots carry policy CONTENT (digest-verified catalog blobs),
     // not paths — the catalog may live on object storage.
     let omnigraph_server::PolicySource::Inline(graph_policy) =

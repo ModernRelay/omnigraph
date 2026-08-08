@@ -1457,7 +1457,7 @@ async fn test_commit_with_expected_accepts_matching_versions() {
         },
     );
 
-    mc.commit_with_expected(&[update.clone()], &expected)
+    mc.commit_with_expected(std::slice::from_ref(&update), &expected)
         .await
         .expect("matching expected versions should publish cleanly");
 
@@ -1918,8 +1918,8 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
     // before upgrading.
     let dir_old = tempfile::tempdir().unwrap();
     let uri_old = dir_old.path().to_str().unwrap();
-    let mut db_old = Omnigraph::init(uri_old, schema).await.unwrap();
-    load_jsonl(&mut db_old, seed, LoadMode::Overwrite)
+    let db_old = Omnigraph::init(uri_old, schema).await.unwrap();
+    load_jsonl(&db_old, seed, LoadMode::Overwrite)
         .await
         .unwrap();
     let exported = db_old.export_jsonl("main", &[], &[]).await.unwrap();
@@ -1954,8 +1954,8 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
     // Rebuild with this binary: fresh init + load the export.
     let dir_new = tempfile::tempdir().unwrap();
     let uri_new = dir_new.path().to_str().unwrap();
-    let mut db_new = Omnigraph::init(uri_new, schema).await.unwrap();
-    load_jsonl(&mut db_new, &exported, LoadMode::Overwrite)
+    let db_new = Omnigraph::init(uri_new, schema).await.unwrap();
+    load_jsonl(&db_new, &exported, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -2126,12 +2126,11 @@ async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
     let old_branch = open_manifest_dataset(uri, Some("feature")).await.unwrap();
     let old_identifier = old_branch.branch_identifier().await.unwrap();
     assert!(
-        read_publish_scan(&old_branch)
+        !read_publish_scan(&old_branch)
             .await
             .unwrap()
             .graph_heads
-            .get("feature")
-            .is_none(),
+            .contains_key("feature"),
         "fresh named branch starts without its own graph_head row"
     );
 

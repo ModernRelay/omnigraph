@@ -745,9 +745,9 @@ async fn fast_forward_merge_streams_blob_columns() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let main = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut main,
+        &main,
         "{\"type\":\"Document\",\"data\":{\"title\":\"seed\",\"content\":\"base64:U2VlZA==\",\"note\":\"base\"}}",
         LoadMode::Overwrite,
     )

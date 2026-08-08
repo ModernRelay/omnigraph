@@ -149,16 +149,10 @@ pub enum ConstraintBound {
 }
 
 /// Edge cardinality: `@card(min..max)`. Default is `0..*`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Cardinality {
     pub min: u32,
     pub max: Option<u32>,
-}
-
-impl Default for Cardinality {
-    fn default() -> Self {
-        Self { min: 0, max: None }
-    }
 }
 
 impl Cardinality {

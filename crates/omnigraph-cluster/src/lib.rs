@@ -1,7 +1,7 @@
-// The failpoint-only cluster state-machine tests compose several large async
-// futures. Linux rustc needs the wider layout-query budget while building the
-// lib-test harness; production and ordinary test builds keep the default.
-#![cfg_attr(all(test, feature = "failpoints"), recursion_limit = "256")]
+// The cluster state-machine tests compose several large async futures; rustc
+// needs the wider layout-query budget while building the lib-test harness
+// (with or without failpoints). Production builds keep the default.
+#![cfg_attr(test, recursion_limit = "256")]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self};
@@ -1059,10 +1059,10 @@ pub async fn apply_config_dir_with_options(
                     new_state.resource_statuses.remove(&change.resource);
                 }
             },
-            Some(ApplyDisposition::Blocked) => {
+            Some(ApplyDisposition::Blocked)
                 // The sweep owns recovery statuses (Drifted/Error with their
                 // conditions); a generic Blocked must not clobber them.
-                if change.reason.as_deref() != Some("cluster_recovery_pending") {
+                if change.reason.as_deref() != Some("cluster_recovery_pending") => {
                     set_resource_status(
                         &mut new_state,
                         &change.resource,
@@ -1071,7 +1071,6 @@ pub async fn apply_config_dir_with_options(
                         "waiting on an unapplied or missing dependency",
                     );
                 }
-            }
             _ => {}
         }
     }

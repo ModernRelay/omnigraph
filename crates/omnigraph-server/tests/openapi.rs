@@ -31,10 +31,8 @@ async fn init_loaded_graph() -> tempfile::TempDir {
     Omnigraph::init(graph.to_str().unwrap(), &schema)
         .await
         .unwrap();
-    let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
-    load_jsonl(&mut db, &data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
     temp
 }
 
@@ -1112,9 +1110,8 @@ fn invoke_stored_query_request_body_is_optional() {
         request_body.is_object(),
         "POST /queries/{{name}} should document its optional request body"
     );
-    assert_eq!(
-        request_body["required"].as_bool().unwrap_or(false),
-        false,
+    assert!(
+        !request_body["required"].as_bool().unwrap_or(false),
         "stored-query invocation body should be optional"
     );
     let schema = &request_body["content"]["application/json"]["schema"];

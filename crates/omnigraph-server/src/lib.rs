@@ -277,17 +277,21 @@ struct OpenedGraph {
     handle: Arc<GraphHandle>,
 }
 
+/// The structured-detail payloads are boxed to keep `Result<_, ApiError>` cheap
+/// to move: every handler returns one, and at most one detail is ever `Some`.
+/// The boxing is an in-memory representation only; [`api::ErrorOutput`] is what
+/// serializes.
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     code: Option<ErrorCode>,
     message: String,
     merge_conflicts: Vec<api::MergeConflictOutput>,
-    manifest_conflict: Option<api::ManifestConflictOutput>,
-    read_set_conflict: Option<api::ReadSetConflictOutput>,
-    key_conflict: Option<api::KeyConflictOutput>,
-    resource_limit: Option<api::ResourceLimitOutput>,
-    recovery_required: Option<api::RecoveryRequiredOutput>,
+    manifest_conflict: Option<Box<api::ManifestConflictOutput>>,
+    read_set_conflict: Option<Box<api::ReadSetConflictOutput>>,
+    key_conflict: Option<Box<api::KeyConflictOutput>>,
+    resource_limit: Option<Box<api::ResourceLimitOutput>>,
+    recovery_required: Option<Box<api::RecoveryRequiredOutput>>,
 }
 
 impl AppState {
@@ -779,7 +783,7 @@ impl ApiError {
             code: Some(ErrorCode::Conflict),
             message,
             merge_conflicts: Vec::new(),
-            manifest_conflict: Some(details),
+            manifest_conflict: Some(Box::new(details)),
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -794,7 +798,7 @@ impl ApiError {
             message,
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
-            read_set_conflict: Some(details),
+            read_set_conflict: Some(Box::new(details)),
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
@@ -809,7 +813,7 @@ impl ApiError {
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
-            key_conflict: Some(details),
+            key_conflict: Some(Box::new(details)),
             resource_limit: None,
             recovery_required: None,
         }
@@ -824,7 +828,7 @@ impl ApiError {
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
-            resource_limit: Some(details),
+            resource_limit: Some(Box::new(details)),
             recovery_required: None,
         }
     }
@@ -842,7 +846,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            recovery_required: Some(api::RecoveryRequiredOutput { operation_id }),
+            recovery_required: Some(Box::new(api::RecoveryRequiredOutput { operation_id })),
         }
     }
 
@@ -981,11 +985,11 @@ impl IntoResponse for ApiError {
                 error: self.message,
                 code: self.code,
                 merge_conflicts: self.merge_conflicts,
-                manifest_conflict: self.manifest_conflict,
-                read_set_conflict: self.read_set_conflict,
-                key_conflict: self.key_conflict,
-                resource_limit: self.resource_limit,
-                recovery_required: self.recovery_required,
+                manifest_conflict: self.manifest_conflict.map(|d| *d),
+                read_set_conflict: self.read_set_conflict.map(|d| *d),
+                key_conflict: self.key_conflict.map(|d| *d),
+                resource_limit: self.resource_limit.map(|d| *d),
+                recovery_required: self.recovery_required.map(|d| *d),
             }),
         )
             .into_response()
@@ -1323,7 +1327,7 @@ pub async fn open_multi_graph_state(
     };
 
     let configured_graphs = graphs.len();
-    let results = futures::stream::iter(graphs.into_iter())
+    let results = futures::stream::iter(graphs)
         .map(|cfg| async move {
             let graph_id = cfg.graph_id.clone();
             open_single_graph(cfg).await.map_err(|err| (graph_id, err))

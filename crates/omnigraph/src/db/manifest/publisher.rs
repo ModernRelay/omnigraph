@@ -203,6 +203,15 @@ struct LoadedPublishState {
     graph_heads: HashMap<String, String>,
 }
 
+/// What `fold_inputs` folds a publish batch down to: the alias/path
+/// registrations after the batch, the surviving version entries, and the
+/// `(identity, version)` pairs the batch tombstoned.
+type FoldedPublishInputs = (
+    HashMap<TableIdentity, TableRegistration>,
+    Vec<SubTableEntry>,
+    Vec<(TableIdentity, u64)>,
+);
+
 impl GraphNamespacePublisher {
     #[cfg(test)]
     pub(super) fn new(root_uri: &str, branch: Option<&str>) -> Self {
@@ -696,11 +705,7 @@ impl GraphNamespacePublisher {
         existing_tombstones: &HashMap<(TableIdentity, u64), ()>,
         rows: &[PendingVersionRow],
         registered_tables: &HashMap<TableIdentity, TableRegistration>,
-    ) -> Result<(
-        HashMap<TableIdentity, TableRegistration>,
-        Vec<SubTableEntry>,
-        Vec<(TableIdentity, u64)>,
-    )> {
+    ) -> Result<FoldedPublishInputs> {
         let mut registrations = registered_tables.clone();
         for row in rows {
             if row.object_type == OBJECT_TYPE_TABLE {
@@ -951,10 +956,9 @@ impl GraphNamespacePublisher {
         let registrations = self.load_publish_state().await?.registered_tables;
         let changes = requests
             .iter()
-            .cloned()
             .map(|request| {
                 let (table_key, table_version, row_count, table_branch, version_metadata) =
-                    parse_namespace_version_request(&request)
+                    parse_namespace_version_request(request)
                         .map_err(|e| OmniError::Lance(e.to_string()))?;
                 let identity = registrations
                     .values()

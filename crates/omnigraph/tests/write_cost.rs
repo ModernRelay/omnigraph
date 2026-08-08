@@ -360,7 +360,7 @@ async fn write_op_count_ceiling_at_shallow_depth() {
 #[tokio::test]
 async fn keyed_insert_routes_through_fenced_adapter_only() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = local_graph(&dir).await;
+    let db = local_graph(&dir).await;
     let (res, _io, staged) = measure_with_staged(db.mutate(
         "main",
         MUTATION_QUERIES,
@@ -459,7 +459,7 @@ async fn write_schema_io_is_bounded_to_capture_fence_and_effect_gate() {
 #[tokio::test]
 async fn keyed_insert_opens_table_at_most_once() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = local_graph(&dir).await;
+    let db = local_graph(&dir).await;
     let io = {
         let (res, io) = measure(db.mutate(
             "main",
@@ -564,20 +564,20 @@ node User {
     for rows in [4u64, 64] {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = omnigraph::db::Omnigraph::init(uri, UNIQUE_COST_SCHEMA)
+        let db = omnigraph::db::Omnigraph::init(uri, UNIQUE_COST_SCHEMA)
             .await
             .unwrap();
         // Committed baseline so the cross-version `@unique` probe has a
         // non-empty committed view (an empty view skips the probe entirely).
         omnigraph::loader::load_jsonl(
-            &mut db,
+            &db,
             &users_jsonl("seed", 4),
             omnigraph::loader::LoadMode::Append,
         )
         .await
         .unwrap();
         let (res, io) = measure(omnigraph::loader::load_jsonl(
-            &mut db,
+            &db,
             &users_jsonl(&format!("delta{rows}"), rows),
             omnigraph::loader::LoadMode::Append,
         ))
