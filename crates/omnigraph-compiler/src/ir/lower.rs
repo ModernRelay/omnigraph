@@ -412,6 +412,11 @@ fn lower_clauses(
             local_var_types
                 .entry(t.dst.as_str())
                 .or_insert(&edge.to_type);
+            // An edge binding (`$p $w:knows $f`) names the edge type, whose
+            // String properties are addressable in filters (`$w.note contains …`).
+            if let Some(eb) = &t.edge_binding {
+                local_var_types.entry(eb.as_str()).or_insert(&edge.name);
+            }
         }
     }
     for b in &bindings {
@@ -453,14 +458,31 @@ fn lower_clauses(
     Ok(())
 }
 
+/// Whether `type_name.property` is a non-list scalar String, resolving the
+/// type through node types first and then edge types (an edge-bound variable
+/// like `$w` in `$p $w:knows $f` names an edge type, whose properties are
+/// addressable in filters).
+fn is_scalar_string_property(catalog: &Catalog, type_name: &str, property: &str) -> bool {
+    catalog
+        .node_types
+        .get(type_name)
+        .and_then(|nt| nt.properties.get(property))
+        .or_else(|| {
+            catalog
+                .lookup_edge_by_name(type_name)
+                .and_then(|et| et.properties.get(property))
+        })
+        .is_some_and(|p| !p.list && matches!(p.scalar, ScalarType::String))
+}
+
 /// Resolve the overloaded `contains` keyword to its String-substring form
 /// (`StringContains`) when the left operand is a scalar String, so execution
 /// dispatches on the IR op alone and never re-derives operand types.
 ///
-/// Variable types come from `local_var_types` (this clause list's bindings +
-/// traversal endpoints) first, then the outer `TypeContext` — negation
-/// inners never reach the outer context, while outer variables referenced
-/// inside a negation only exist there.
+/// Variable types come from `local_var_types` (this clause list's node and
+/// edge bindings + traversal endpoints) first, then the outer `TypeContext`
+/// — negation inners never reach the outer context, while outer variables
+/// referenced inside a negation only exist there.
 fn resolve_filter_op(
     catalog: &Catalog,
     type_ctx: &TypeContext,
@@ -481,9 +503,7 @@ fn resolve_filter_op(
                     .get(variable)
                     .map(|bv| bv.type_name.as_str())
             })
-            .and_then(|type_name| catalog.node_types.get(type_name))
-            .and_then(|nt| nt.properties.get(property))
-            .is_some_and(|p| !p.list && matches!(p.scalar, ScalarType::String)),
+            .is_some_and(|type_name| is_scalar_string_property(catalog, type_name, property)),
         Expr::Literal(Literal::String(_)) => true,
         Expr::Variable(v) => param_types
             .get(v)
