@@ -806,3 +806,145 @@ node Task {
         "rejected init must not persist a schema IR"
     );
 }
+
+/// The local backend implements create-if-absent with `hard_link(2)`, which
+/// some filesystems refuse (Android app storage, FAT/exFAT — issue #453).
+/// Read-write binds probe the capability at the graph root before any claim,
+/// migration, or Lance commit can fail mid-flight on such a filesystem.
+mod local_create_if_absent_probe {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use omnigraph::db::Omnigraph;
+    use omnigraph::error::{OmniError, Result};
+    use omnigraph::storage::{ListDirBounds, StorageAdapter, storage_for_uri};
+
+    use super::helpers;
+
+    const PROBE_FILENAME: &str = "__create_if_absent_probe";
+    const SENTINEL: &str = "capability probe refused by test adapter";
+
+    /// Local-adapter decorator that refuses the create-if-absent capability
+    /// probe, simulating a filesystem without hard-link support.
+    #[derive(Debug)]
+    struct ProbeRefusingAdapter {
+        inner: Arc<dyn StorageAdapter>,
+    }
+
+    impl ProbeRefusingAdapter {
+        fn wrap(inner: Arc<dyn StorageAdapter>) -> Arc<dyn StorageAdapter> {
+            Arc::new(Self { inner })
+        }
+    }
+
+    #[async_trait]
+    impl StorageAdapter for ProbeRefusingAdapter {
+        async fn read_text(&self, uri: &str) -> Result<String> {
+            self.inner.read_text(uri).await
+        }
+
+        async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>> {
+            self.inner.read_text_if_exists(uri).await
+        }
+
+        async fn read_text_if_exists_bounded(
+            &self,
+            uri: &str,
+            max_bytes: u64,
+        ) -> Result<Option<String>> {
+            self.inner.read_text_if_exists_bounded(uri, max_bytes).await
+        }
+
+        async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+            self.inner.write_text(uri, contents).await
+        }
+
+        async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
+            if uri.ends_with(PROBE_FILENAME) {
+                return Err(OmniError::manifest_internal(SENTINEL));
+            }
+            self.inner.write_text_if_absent(uri, contents).await
+        }
+
+        async fn exists(&self, uri: &str) -> Result<bool> {
+            self.inner.exists(uri).await
+        }
+
+        async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
+            self.inner.rename_text(from_uri, to_uri).await
+        }
+
+        async fn delete(&self, uri: &str) -> Result<()> {
+            self.inner.delete(uri).await
+        }
+
+        async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
+            self.inner.list_dir(dir_uri).await
+        }
+
+        async fn list_dir_bounded(
+            &self,
+            dir_uri: &str,
+            matching_suffix: &str,
+            bounds: ListDirBounds,
+        ) -> Result<Vec<String>> {
+            self.inner
+                .list_dir_bounded(dir_uri, matching_suffix, bounds)
+                .await
+        }
+
+        async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
+            self.inner.read_text_versioned(uri).await
+        }
+
+        async fn write_text_if_match(
+            &self,
+            uri: &str,
+            contents: &str,
+            expected_version: &str,
+        ) -> Result<Option<String>> {
+            self.inner
+                .write_text_if_match(uri, contents, expected_version)
+                .await
+        }
+
+        async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
+            self.inner.delete_prefix(prefix_uri).await
+        }
+    }
+
+    /// A read-write open on a local root runs the create-if-absent probe before any
+    /// coordinator work, and a probe failure aborts the open with that error.
+    #[tokio::test]
+    async fn read_write_open_fails_fast_when_create_if_absent_probe_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let _ = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
+
+        let adapter = ProbeRefusingAdapter::wrap(storage_for_uri(uri).unwrap());
+        let err = match Omnigraph::open_with_storage(uri, adapter).await {
+            Ok(_) => panic!("read-write open must fail when the create-if-absent probe fails"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains(SENTINEL),
+            "open must surface the probe failure, got: {err}"
+        );
+    }
+
+    /// The probe object is removed before the open returns; it never persists
+    /// as residue in the graph root.
+    #[tokio::test]
+    async fn read_write_open_leaves_no_probe_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let _ = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
+
+        let db = Omnigraph::open(uri).await.unwrap();
+        drop(db);
+        assert!(
+            !dir.path().join(PROBE_FILENAME).exists(),
+            "capability probe must clean up after itself"
+        );
+    }
+}
