@@ -74,8 +74,8 @@ pub async fn open_dataset_head(uri: &str, branch: Option<&str>) -> lance::Datase
 /// Init a graph and load the standard test data.
 pub async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     // Mutation/load publish only exact data effects; physical indexes are

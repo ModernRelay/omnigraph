@@ -52,3 +52,6 @@ tower = { workspace = true }
 serial_test = "3"
 lance = { workspace = true }
 lance-index = { workspace = true }
+
+[lints]
+workspace = true

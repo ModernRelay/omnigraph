@@ -64,7 +64,7 @@ query connected_directional($name: String) {
     // Dedup: add the reverse edge Diana->Bob so (Bob, Diana) exists both
     // ways; Diana must still appear exactly once.
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"edge": "Knows", "from": "Diana", "to": "Bob"}"#,
         LoadMode::Merge,
     )
@@ -305,9 +305,7 @@ async fn nested_anti_join_with_fanout_correlates_correctly() {
 {"edge":"WorksAt","from":"p2","to":"Globex"}
 {"edge":"WorksAt","from":"p3","to":"Acme"}"#;
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let queries = r#"
 query no_nonacme_employer() {
@@ -357,9 +355,7 @@ async fn anti_join_respects_multi_hop_bounds() {
 {"edge":"Knows","from":"c","to":"d"}
 {"edge":"Knows","from":"d","to":"e"}"#;
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let queries = r#"
 query no_two_hop() {
@@ -404,8 +400,8 @@ const CHAIN_DATA: &str = r#"{"type": "Person", "data": {"name": "A"}}
 
 async fn init_chain(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CHAIN_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, CHAIN_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, CHAIN_SCHEMA).await.unwrap();
+    load_jsonl(&db, CHAIN_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     db
@@ -559,9 +555,7 @@ async fn traversal_no_edges_returns_empty() {
     let data = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Person", "data": {"name": "Bob", "age": 25}}
 {"type": "Company", "data": {"name": "Acme"}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     // Traversal should return empty, not crash
     let result = query_main(
@@ -1097,7 +1091,7 @@ async fn edge_binding_filters_and_projects_edge_properties() {
     // Fixture Knows edges (Alice->Bob, Alice->Charlie, Bob->Diana) carry no
     // `since`; give Alice two dated friendships on either side of the cutoff.
     load_jsonl(
-        &mut db,
+        &db,
         concat!(
             r#"{"edge": "Knows", "from": "Alice", "to": "Bob", "data": {"since": "2020-05-01"}}"#,
             "\n",

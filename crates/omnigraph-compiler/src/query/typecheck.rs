@@ -591,10 +591,8 @@ fn typecheck_clauses(
                                 has_outer = true;
                             }
                         }
-                        Clause::Binding(b) => {
-                            if outer_vars.contains(&b.variable) {
-                                has_outer = true;
-                            }
+                        Clause::Binding(b) if outer_vars.contains(&b.variable) => {
+                            has_outer = true;
                         }
                         _ => {}
                     }

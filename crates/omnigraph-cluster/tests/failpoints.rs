@@ -19,8 +19,8 @@ use omnigraph::error::OmniError;
 // it is registry-only (error-type agnostic) and lives in the lowest crate.
 use omnigraph::failpoints::ScopedFailPoint;
 use omnigraph_cluster::{
-    ApplyDisposition, ApplyOptions, apply_config_dir, apply_config_dir_with_options,
-    approve_config_dir, validate_config_dir,
+    ApplyOptions, apply_config_dir, apply_config_dir_with_options, approve_config_dir,
+    validate_config_dir,
 };
 use serial_test::serial;
 use tempfile::tempdir;

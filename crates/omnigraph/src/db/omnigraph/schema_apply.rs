@@ -1383,11 +1383,11 @@ async fn rebuild_blob_column(
     let mut non_null_row_ids = Vec::new();
     let mut row_has_blob = Vec::with_capacity(row_ids.len());
 
-    for row in 0..row_ids.len() {
+    for (row, row_id) in row_ids.iter().enumerate() {
         let is_null = blob_description_is_null(descriptions, row)?;
         row_has_blob.push(!is_null);
         if !is_null {
-            non_null_row_ids.push(row_ids[row]);
+            non_null_row_ids.push(*row_id);
         }
     }
 

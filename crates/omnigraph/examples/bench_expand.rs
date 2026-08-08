@@ -251,10 +251,8 @@ query sel($name: String) {
             // Fresh db per measurement so the query is cold (CSR pays its build).
             let dir = tempfile::tempdir().unwrap();
             let uri = dir.path().to_str().unwrap();
-            let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-            load_jsonl(&mut db, &jsonl, LoadMode::Overwrite)
-                .await
-                .unwrap();
+            let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+            load_jsonl(&db, &jsonl, LoadMode::Overwrite).await.unwrap();
             // SAFE: example main drives queries sequentially; no concurrent env reader.
             unsafe { std::env::set_var("OMNIGRAPH_TRAVERSAL_MODE", mode) };
 
@@ -295,14 +293,12 @@ async fn main() {
         let uri = dir.path().to_str().unwrap();
 
         let t = Instant::now();
-        let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
         let init_elapsed = t.elapsed();
 
         let jsonl = generate_jsonl(n, avg_deg, 42);
         let t = Instant::now();
-        load_jsonl(&mut db, &jsonl, LoadMode::Overwrite)
-            .await
-            .unwrap();
+        load_jsonl(&db, &jsonl, LoadMode::Overwrite).await.unwrap();
         let load_elapsed = t.elapsed();
 
         println!(

@@ -198,32 +198,21 @@ pub(crate) async fn diff_snapshots(
         let (kind, type_name) = parse_table_key(table_key);
         let is_edge = kind == EntityKind::Edge;
 
-        let table_changes = if from_entry.is_none() {
+        let table_changes = match (from_entry, to_entry) {
             // Table added — all rows are inserts
-            diff_table_added(table_store, to_entry.unwrap(), is_edge, filter).await?
-        } else if to_entry.is_none() {
+            (None, Some(to)) => diff_table_added(table_store, to, is_edge, filter).await?,
             // Table removed — all rows are deletes
-            diff_table_removed(table_store, from_entry.unwrap(), is_edge, filter).await?
-        } else if same_lineage(from_entry, to_entry) {
+            (Some(from), None) => diff_table_removed(table_store, from, is_edge, filter).await?,
             // Fast path: version-column diff
-            diff_table_same_lineage(
-                table_store,
-                from_entry.unwrap(),
-                to_entry.unwrap(),
-                is_edge,
-                filter,
-            )
-            .await?
-        } else {
+            (Some(from), Some(to)) if same_lineage(from_entry, to_entry) => {
+                diff_table_same_lineage(table_store, from, to, is_edge, filter).await?
+            }
             // Cross-branch path: streaming ID-based diff
-            diff_table_cross_branch(
-                table_store,
-                from_entry.unwrap(),
-                to_entry.unwrap(),
-                is_edge,
-                filter,
-            )
-            .await?
+            (Some(from), Some(to)) => {
+                diff_table_cross_branch(table_store, from, to, is_edge, filter).await?
+            }
+            // Unreachable: `same_state` above already skipped absent-on-both-sides tables.
+            (None, None) => continue,
         };
 
         for mut c in table_changes {

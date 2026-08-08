@@ -191,7 +191,7 @@ async fn assert_exact_id_primary_key(db: &Omnigraph, table_key: &str) {
 #[tokio::test]
 async fn export_jsonl_round_trips_branch_snapshot() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     db.branch_create_from(ReadTarget::branch("main"), "feature")
         .await
         .unwrap();
@@ -233,18 +233,17 @@ async fn export_jsonl_round_trips_branch_snapshot() {
 
     let imported_main_dir = tempfile::tempdir().unwrap();
     let imported_feature_dir = tempfile::tempdir().unwrap();
-    let mut imported_main =
-        Omnigraph::init(imported_main_dir.path().to_str().unwrap(), TEST_SCHEMA)
-            .await
-            .unwrap();
-    let mut imported_feature =
+    let imported_main = Omnigraph::init(imported_main_dir.path().to_str().unwrap(), TEST_SCHEMA)
+        .await
+        .unwrap();
+    let imported_feature =
         Omnigraph::init(imported_feature_dir.path().to_str().unwrap(), TEST_SCHEMA)
             .await
             .unwrap();
-    load_jsonl(&mut imported_main, &main_jsonl, LoadMode::Overwrite)
+    load_jsonl(&imported_main, &main_jsonl, LoadMode::Overwrite)
         .await
         .unwrap();
-    load_jsonl(&mut imported_feature, &feature_jsonl, LoadMode::Overwrite)
+    load_jsonl(&imported_feature, &feature_jsonl, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -866,20 +865,20 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
 #[tokio::test]
 async fn export_jsonl_preserves_explicit_ids_for_non_key_graphs() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Omnigraph::init(dir.path().to_str().unwrap(), NOTE_SCHEMA)
+    let db = Omnigraph::init(dir.path().to_str().unwrap(), NOTE_SCHEMA)
         .await
         .unwrap();
-    load_jsonl(&mut db, NOTE_DATA, LoadMode::Overwrite)
+    load_jsonl(&db, NOTE_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
     let exported = db.export_jsonl("main", &[], &[]).await.unwrap();
 
     let imported_dir = tempfile::tempdir().unwrap();
-    let mut imported = Omnigraph::init(imported_dir.path().to_str().unwrap(), NOTE_SCHEMA)
+    let imported = Omnigraph::init(imported_dir.path().to_str().unwrap(), NOTE_SCHEMA)
         .await
         .unwrap();
-    load_jsonl(&mut imported, &exported, LoadMode::Overwrite)
+    load_jsonl(&imported, &exported, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -924,14 +923,12 @@ node Document {
 }
 "#;
 
-    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
     let data = concat!(
         "{\"type\": \"Document\", \"data\": {\"title\": \"readme\", \"content\": \"base64:SGVsbG8=\"}}\n",
         "{\"type\": \"Document\", \"data\": {\"title\": \"empty\"}}\n",
     );
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     // Export should succeed
     let exported = db.export_jsonl("main", &[], &[]).await.unwrap();
@@ -949,8 +946,8 @@ node Document {
     // Round-trip: re-import and verify blob data survives
     let imported_dir = tempfile::tempdir().unwrap();
     let imported_uri = imported_dir.path().to_str().unwrap();
-    let mut imported = Omnigraph::init(imported_uri, BLOB_SCHEMA).await.unwrap();
-    load_jsonl(&mut imported, &exported, LoadMode::Overwrite)
+    let imported = Omnigraph::init(imported_uri, BLOB_SCHEMA).await.unwrap();
+    load_jsonl(&imported, &exported, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -964,7 +961,7 @@ node Document {
     // A later import into the already-populated v6 table must retain both the
     // physical PK contract and blob-v2 fidelity.
     load_jsonl(
-        &mut imported,
+        &imported,
         r#"{"type":"Document","data":{"title":"later","content":"base64:AAECA/8="}}"#,
         LoadMode::Append,
     )

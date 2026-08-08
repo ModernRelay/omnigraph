@@ -18,7 +18,8 @@ use crate::error::{OmniError, Result};
 /// Result of a recoverable native create attempt.
 pub(crate) enum BranchCreateOutcome {
     /// The requested branch is durably authoritative and its dataset opens.
-    Created(Dataset),
+    /// Boxed: `Dataset` is ~336 bytes and `RefAlreadyExists` carries none.
+    Created(Box<Dataset>),
     /// The target ref existed before this invocation. Callers classify its
     /// ownership at their own logical layer; this helper never deletes it.
     /// A ref that appears after target absence was captured is instead a typed
@@ -212,7 +213,7 @@ pub(crate) async fn create_branch_recoverably(
             Ok(created) => match crate::failpoints::maybe_fail(
                 crate::failpoints::names::BRANCH_CREATE_POST_NATIVE,
             ) {
-                Ok(()) => return Ok(BranchCreateOutcome::Created(created)),
+                Ok(()) => return Ok(BranchCreateOutcome::Created(Box::new(created))),
                 Err(error) => error,
             },
             Err(error) => error,
@@ -244,7 +245,7 @@ pub(crate) async fn create_branch_recoverably(
                     branch, error, native_error
                 ))
             })?;
-            return Ok(BranchCreateOutcome::Created(created));
+            return Ok(BranchCreateOutcome::Created(Box::new(created)));
         }
 
         match reclaim_ref_absent_tree(source, branch).await {

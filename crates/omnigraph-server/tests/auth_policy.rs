@@ -4,9 +4,8 @@
 use std::env;
 use std::fs;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::http::header::AUTHORIZATION;
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};

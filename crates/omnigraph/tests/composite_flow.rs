@@ -70,9 +70,7 @@ async fn composite_flow_canonical_lifecycle() {
     // Step 2: load JSONL seed data (Person + Company nodes,
     // Knows + WorksAt edges).
     // ─────────────────────────────────────────────────────────────────
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Append).await.unwrap();
     let v_after_load = version_branch(&db, "main").await.unwrap();
     assert!(
         v_after_load > v_init,
@@ -450,8 +448,8 @@ async fn composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh() {
     let uri = dir.path().to_str().unwrap();
 
     // Step 1: init + load on handle A.
-    let mut db_a = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db_a, TEST_DATA, LoadMode::Append)
+    let db_a = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db_a, TEST_DATA, LoadMode::Append)
         .await
         .unwrap();
     assert_eq!(count_rows(&db_a, "node:Person").await, 4);
@@ -583,9 +581,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // edges from test.jsonl).
     // ─────────────────────────────────────────────────────────────────
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Append).await.unwrap();
     assert_eq!(count_rows(&db, "node:Person").await, 4);
     assert_eq!(count_rows(&db, "edge:Knows").await, 3);
 

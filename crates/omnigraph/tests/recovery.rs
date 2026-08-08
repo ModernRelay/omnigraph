@@ -162,7 +162,7 @@ async fn recovery_refuses_corrupt_sidecar_on_open_and_write() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     // A truncated/garbage sidecar — e.g. a crashed writer or a partial
     // local-FS write (S3 PutObject is atomic; local fs::write is not).
@@ -171,14 +171,13 @@ async fn recovery_refuses_corrupt_sidecar_on_open_and_write() {
     // A live handle's write-entry heal must surface the parse failure
     // loudly instead of proceeding over a sidecar it cannot interpret.
     let err = load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"Alice","age":30}}
 "#,
         LoadMode::Merge,
     )
     .await
-    .err()
-    .expect("expected the write to fail on the corrupt sidecar");
+    .expect_err("expected the write to fail on the corrupt sidecar");
     assert!(
         err.to_string().contains("is not valid JSON"),
         "expected the corrupt-sidecar parse error, got: {}",
@@ -219,9 +218,9 @@ async fn drift_guard_advice_ignores_other_branch_sidecars() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n",
         LoadMode::Merge,
     )
@@ -272,13 +271,12 @@ async fn drift_guard_advice_ignores_other_branch_sidecars() {
     let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
 
     let err = load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
         LoadMode::Merge,
     )
     .await
-    .err()
-    .expect("uncovered main drift must fail the write");
+    .expect_err("uncovered main drift must fail the write");
     assert!(
         err.to_string().contains("run `omnigraph repair`"),
         "a feature-branch sidecar must not flip main's uncovered-drift \
@@ -299,9 +297,9 @@ async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n",
         LoadMode::Merge,
     )
@@ -349,7 +347,7 @@ async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
     // The next write's heal must classify the orphan and discard it,
     // not fail opening the dead branch.
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
         LoadMode::Merge,
     )
@@ -476,13 +474,11 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
 
     // Bootstrap a real graph with a Person table so we have a Lance dataset
     // to advance synthetically.
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Person","data":{"name":"bob","age":25}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
     let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
@@ -586,9 +582,9 @@ async fn recovery_rollback_converges_manifest_so_schema_apply_succeeds() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Person","data":{"name":"bob","age":25}}
 "#,
@@ -702,7 +698,7 @@ async fn read_latest_recovery_audit(
         .try_collect()
         .await
         .ok()?;
-    let last_batch = batches.iter().filter(|b| b.num_rows() > 0).last()?;
+    let last_batch = batches.iter().rfind(|b| b.num_rows() > 0)?;
     let row = last_batch.num_rows() - 1;
     let kinds = last_batch
         .column_by_name("recovery_kind")?
@@ -795,13 +791,11 @@ async fn recovery_rolls_forward_after_phase_b_completes() {
 
     // Bootstrap: init + load 2 rows. Manifest pin and Lance HEAD both
     // advance via the legitimate publisher path.
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Person","data":{"name":"bob","age":25}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
     let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
@@ -883,13 +877,11 @@ async fn recovery_records_rolled_forward_for_stale_sidecar_after_successful_roll
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Person","data":{"name":"bob","age":25}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
 
     // Capture the current manifest pin and Lance HEAD — these match
     // because the load went through the publisher.
@@ -975,7 +967,7 @@ async fn recovery_records_rolled_forward_for_stale_sidecar_after_successful_roll
         .try_collect()
         .await
         .unwrap();
-    let last = batches.iter().filter(|b| b.num_rows() > 0).last().unwrap();
+    let last = batches.iter().rfind(|b| b.num_rows() > 0).unwrap();
     let row = last.num_rows() - 1;
     let outcomes_json = last
         .column_by_name("per_table_outcomes_json")
@@ -1000,12 +992,10 @@ async fn recovery_rolls_back_records_audit_row_with_recovery_actor() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
     let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
@@ -1063,12 +1053,10 @@ async fn recovery_rolls_forward_with_null_actor() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
     let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
@@ -1136,13 +1124,11 @@ async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
     let uri = dir.path().to_str().unwrap();
 
     // Bootstrap: load Person and Company so both have committed datasets.
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Company","data":{"name":"acme"}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
     let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     let (company_uri, company_identity) = node_table_fixture(&db, "Company").await;
     drop(db);
@@ -1226,13 +1212,11 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Company","data":{"name":"acme"}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
     db.ensure_indices().await.unwrap();
     drop(db);
 
@@ -1366,9 +1350,9 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
 
     // Bootstrap: load Person rows; manifest pin and Lance HEAD == some
     // baseline N.
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#,
         LoadMode::Append,
@@ -1510,9 +1494,9 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#,
         LoadMode::Append,
@@ -1621,9 +1605,9 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#,
         LoadMode::Append,

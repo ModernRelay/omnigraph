@@ -33,9 +33,9 @@ use helpers::*;
 async fn load_does_not_create_run_branch() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -63,7 +63,7 @@ async fn load_does_not_create_run_branch() {
 async fn mutation_does_not_create_run_branch() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let result = db
         .mutate(
@@ -88,7 +88,7 @@ async fn mutation_does_not_create_run_branch() {
 #[tokio::test]
 async fn failed_mutation_leaves_target_unchanged() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let err = db
         .mutate(
@@ -125,7 +125,7 @@ async fn failed_mutation_leaves_target_unchanged() {
 #[tokio::test]
 async fn multi_statement_mutation_is_atomic_with_read_your_writes() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let result = db
         .mutate(
@@ -179,7 +179,7 @@ async fn multi_statement_mutation_is_atomic_with_read_your_writes() {
 #[tokio::test]
 async fn partial_failure_leaves_target_queryable_and_unblocks_next_mutation() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Op-1 stages a Person 'Eve' insert. Op-2 attempts an edge to
     // 'Missing' — fails at validate_edge_insert_endpoints because
@@ -256,8 +256,8 @@ async fn stale_non_strict_insert_reprepares_from_live_branch_state() {
     let uri = dir.path().to_string_lossy().into_owned();
 
     {
-        let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        let db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
     }
@@ -269,7 +269,7 @@ async fn stale_non_strict_insert_reprepares_from_live_branch_state() {
 
     // Writer A advances the manifest by inserting a new Person.
     {
-        let mut db_a = Omnigraph::open(&uri).await.unwrap();
+        let db_a = Omnigraph::open(&uri).await.unwrap();
         db_a.mutate(
             "main",
             MUTATION_QUERIES,
@@ -327,8 +327,8 @@ async fn cancelled_mutation_future_leaves_no_state() {
     let uri = dir.path().to_string_lossy().into_owned();
 
     {
-        let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        let db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
     }
@@ -340,7 +340,7 @@ async fn cancelled_mutation_future_leaves_no_state() {
 
     let uri_handle = uri.clone();
     let handle = tokio::spawn(async move {
-        let mut db = Omnigraph::open(&uri_handle).await.unwrap();
+        let db = Omnigraph::open(&uri_handle).await.unwrap();
         db.mutate(
             "main",
             MUTATION_QUERIES,
@@ -387,7 +387,7 @@ async fn cancelled_mutation_future_leaves_no_state() {
 async fn mutation_actor_id_lands_in_commit_graph() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     db.mutate_as(
         "main",
@@ -416,16 +416,14 @@ async fn mutation_actor_id_lands_in_commit_graph() {
 async fn repeated_loads_do_not_accumulate_branches() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     for i in 0..10 {
         let payload = format!(
             r#"{{"type":"Person","data":{{"name":"p{}","age":{}}}}}"#,
             i, i
         );
-        load_jsonl(&mut db, &payload, LoadMode::Append)
-            .await
-            .unwrap();
+        load_jsonl(&db, &payload, LoadMode::Append).await.unwrap();
     }
 
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
@@ -438,7 +436,7 @@ async fn repeated_loads_do_not_accumulate_branches() {
 #[tokio::test]
 async fn public_branch_apis_reject_internal_system_refs() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // `__run__*` is no longer reserved — creating it now succeeds.
     db.branch_create("__run__formerly_reserved")
@@ -633,10 +631,10 @@ query update_all() {
 "#;
 
     let exact_dir = tempfile::tempdir().unwrap();
-    let mut exact = Omnigraph::init(exact_dir.path().to_str().unwrap(), SCHEMA)
+    let exact = Omnigraph::init(exact_dir.path().to_str().unwrap(), SCHEMA)
         .await
         .unwrap();
-    load_jsonl(&mut exact, &bulk_update_fixture(LIMIT), LoadMode::Overwrite)
+    load_jsonl(&exact, &bulk_update_fixture(LIMIT), LoadMode::Overwrite)
         .await
         .unwrap();
     let exact_result = exact
@@ -647,16 +645,12 @@ query update_all() {
     assert_eq!(count_rows(&exact, "node:Thing").await, LIMIT);
 
     let over_dir = tempfile::tempdir().unwrap();
-    let mut over = Omnigraph::init(over_dir.path().to_str().unwrap(), SCHEMA)
+    let over = Omnigraph::init(over_dir.path().to_str().unwrap(), SCHEMA)
         .await
         .unwrap();
-    load_jsonl(
-        &mut over,
-        &bulk_update_fixture(LIMIT + 1),
-        LoadMode::Overwrite,
-    )
-    .await
-    .unwrap();
+    load_jsonl(&over, &bulk_update_fixture(LIMIT + 1), LoadMode::Overwrite)
+        .await
+        .unwrap();
     let before = snapshot_main(&over).await.unwrap();
     let before_manifest = before.version();
     let entry = before.entry("node:Thing").unwrap();
@@ -730,7 +724,7 @@ query update_note($note: String) {
     let external_uri = format!("file://{}", external_path.display());
 
     let graph_path = dir.path().join("graph");
-    let mut db = Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+    let db = Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
         .await
         .unwrap();
     let row = serde_json::json!({
@@ -741,9 +735,7 @@ query update_note($note: String) {
         }
     })
     .to_string();
-    load_jsonl(&mut db, &row, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, &row, LoadMode::Overwrite).await.unwrap();
     let before = snapshot_main(&db).await.unwrap();
     let before_manifest = before.version();
     let entry = before.entry("node:Document").unwrap();
@@ -807,7 +799,7 @@ query update_note($note: String) {
 #[tokio::test]
 async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Capture pre-mutation state on touched tables to confirm no I/O.
     let persons_before = count_rows(&db, "node:Person").await;
@@ -862,7 +854,7 @@ async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
 #[tokio::test]
 async fn overlapping_delete_predicates_do_not_double_count_affected() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let r = db
         .mutate(
@@ -926,10 +918,8 @@ edge Knows: Person -> Person
     let data = r#"{"type":"Person","data":{"name":"Charlie","age":35}}
 {"type":"Person","data":{"name":"Zoe"}}
 {"edge":"Knows","from":"Zoe","to":"Charlie"}"#;
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let q = r#"
 query del_age_then_name($threshold: I32, $name: String) {
@@ -969,7 +959,7 @@ query del_age_then_name($threshold: I32, $name: String) {
 #[tokio::test]
 async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let pre_version = version_main(&db).await.unwrap();
 
@@ -1039,7 +1029,7 @@ async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
 #[tokio::test]
 async fn multiple_edge_inserts_coalesce_to_one_fenced_write() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Add Eve so the second edge has a valid endpoint.
     db.mutate(
@@ -1086,7 +1076,7 @@ async fn multiple_edge_inserts_coalesce_to_one_fenced_write() {
 #[tokio::test]
 async fn multi_statement_inserts_publish_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let pre_version = version_main(&db).await.unwrap();
 
@@ -1142,10 +1132,10 @@ async fn multi_statement_inserts_publish_exactly_once() {
 async fn load_with_bad_edge_reference_unblocks_next_load() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     // Seed with the standard fixture so we're working from a non-empty
     // baseline.
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -1158,7 +1148,7 @@ async fn load_with_bad_edge_reference_unblocks_next_load() {
     let bad = r#"{"type": "Person", "data": {"name": "Mallory", "age": 5}}
 {"edge": "Knows", "from": "Mallory", "to": "Ghost"}
 "#;
-    let err = load_jsonl(&mut db, bad, LoadMode::Append)
+    let err = load_jsonl(&db, bad, LoadMode::Append)
         .await
         .expect_err("RI violation must fail the load");
     let OmniError::Manifest(manifest_err) = err else {
@@ -1184,7 +1174,7 @@ async fn load_with_bad_edge_reference_unblocks_next_load() {
 
     // Second load against the same tables — succeeds (no HEAD drift).
     let good = r#"{"type": "Person", "data": {"name": "Pat", "age": 55}}"#;
-    load_jsonl(&mut db, good, LoadMode::Append).await.unwrap();
+    load_jsonl(&db, good, LoadMode::Append).await.unwrap();
     assert_eq!(
         count_rows(&db, "node:Person").await,
         pre_persons + 1,
@@ -1196,8 +1186,8 @@ async fn load_with_bad_edge_reference_unblocks_next_load() {
 async fn load_overwrite_with_bad_edge_reference_unblocks_next_load() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -1207,7 +1197,7 @@ async fn load_overwrite_with_bad_edge_reference_unblocks_next_load() {
     let bad = r#"{"type": "Person", "data": {"name": "Mallory", "age": 5}}
 {"edge": "Knows", "from": "Mallory", "to": "Ghost"}
 "#;
-    let err = load_jsonl(&mut db, bad, LoadMode::Overwrite)
+    let err = load_jsonl(&db, bad, LoadMode::Overwrite)
         .await
         .expect_err("RI violation must fail overwrite before commit_staged");
     let OmniError::Manifest(manifest_err) = err else {
@@ -1231,9 +1221,7 @@ async fn load_overwrite_with_bad_edge_reference_unblocks_next_load() {
 {"edge": "Knows", "from": "Pat", "to": "Quinn"}
 {"edge": "WorksAt", "from": "Pat", "to": "Acme"}
 "#;
-    load_jsonl(&mut db, good, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, good, LoadMode::Overwrite).await.unwrap();
     assert_eq!(count_rows(&db, "node:Person").await, 2);
     assert_eq!(count_rows(&db, "edge:Knows").await, 1);
 }
@@ -1261,15 +1249,13 @@ edge WorksAt: Person -> Company @card(0..1)
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
 
     let seed = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Company", "data": {"name": "Acme"}}
 {"type": "Company", "data": {"name": "Bigco"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, seed, LoadMode::Overwrite).await.unwrap();
 
     let pre_works = count_rows(&db, "edge:WorksAt").await;
 
@@ -1277,7 +1263,7 @@ edge WorksAt: Person -> Company @card(0..1)
     let bad = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 {"edge": "WorksAt", "from": "Alice", "to": "Bigco"}
 "#;
-    let err = load_jsonl(&mut db, bad, LoadMode::Append)
+    let err = load_jsonl(&db, bad, LoadMode::Append)
         .await
         .expect_err("cardinality violation must fail the load");
     let OmniError::Manifest(manifest_err) = err else {
@@ -1294,7 +1280,7 @@ edge WorksAt: Person -> Company @card(0..1)
     assert_eq!(mid_works, pre_works);
 
     let good = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme"}"#;
-    load_jsonl(&mut db, good, LoadMode::Append).await.unwrap();
+    load_jsonl(&db, good, LoadMode::Append).await.unwrap();
     assert_eq!(
         count_rows(&db, "edge:WorksAt").await,
         pre_works + 1,
@@ -1317,22 +1303,20 @@ edge WorksAt: Person -> Company @card(0..1)
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
 
     let seed = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Company", "data": {"name": "Acme"}}
 {"type": "Company", "data": {"name": "Bigco"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, seed, LoadMode::Overwrite).await.unwrap();
 
     let pre_works = count_rows(&db, "edge:WorksAt").await;
 
     let bad = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 {"edge": "WorksAt", "from": "Alice", "to": "Bigco"}
 "#;
-    let err = load_jsonl(&mut db, bad, LoadMode::Overwrite)
+    let err = load_jsonl(&db, bad, LoadMode::Overwrite)
         .await
         .expect_err("cardinality violation must fail overwrite before commit_staged");
     let OmniError::Manifest(manifest_err) = err else {
@@ -1346,9 +1330,7 @@ edge WorksAt: Person -> Company @card(0..1)
     assert_eq!(count_rows(&db, "edge:WorksAt").await, pre_works);
 
     let good = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme"}"#;
-    load_jsonl(&mut db, good, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, good, LoadMode::Overwrite).await.unwrap();
     assert_eq!(count_rows(&db, "edge:WorksAt").await, 1);
 }
 
@@ -1375,7 +1357,7 @@ edge WorksAt: Person -> Company @card(0..1)
 #[tokio::test]
 async fn chained_updates_with_overlapping_predicate_respects_intermediate_value() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let pre_version = version_main(&db).await.unwrap();
 
@@ -1445,7 +1427,7 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value(
 #[tokio::test]
 async fn multi_statement_delete_on_same_node_table() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let pre_persons = count_rows(&db, "node:Person").await;
     let pre_version = version_main(&db).await.unwrap();
@@ -1504,7 +1486,7 @@ query cascade_then_explicit($name: String, $other: String) {
 "#;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // TEST_DATA seeds three Knows edges:
     //   Alice → Bob, Alice → Charlie (cascade target — should be deleted by op-1)
@@ -1564,14 +1546,12 @@ query add_friend($from: String, $to: String) {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, MIN_CARD_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, MIN_CARD_SCHEMA).await.unwrap();
 
     let seed = r#"{"type": "Person", "data": {"name": "Alice"}}
 {"type": "Person", "data": {"name": "Bob"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, seed, LoadMode::Overwrite).await.unwrap();
 
     // Single insert: count=1 < min=2 → reject with clear message.
     let err = db
@@ -1615,7 +1595,7 @@ edge WorksAt: Person -> Company @card(0..1)
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
 
     // Seed: Alice + Acme + Bigco + WorksAt(id=w1, Alice→Acme). Note the
     // loader reads edge ids from the `data.id` field (not top-level), so
@@ -1625,16 +1605,14 @@ edge WorksAt: Person -> Company @card(0..1)
 {"type": "Company", "data": {"name": "Bigco"}}
 {"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"id": "w1"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, seed, LoadMode::Overwrite).await.unwrap();
 
     // Merge-update the same edge id w1 to point at Bigco. Counted naively
     // as union, Alice has 2 WorksAt (committed Acme + pending Bigco) which
     // would trip @card(0..1). With merge dedupe, Alice has 1 WorksAt.
     let merge_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Bigco", "data": {"id": "w1"}}
 "#;
-    load_jsonl(&mut db, merge_data, LoadMode::Merge)
+    load_jsonl(&db, merge_data, LoadMode::Merge)
         .await
         .expect("Merge update must dedupe the committed edge by id");
 
@@ -1667,15 +1645,13 @@ edge WorksAt: Person -> Company @card(0..1)
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
 
     let seed = r#"{"type": "Person", "data": {"name": "Alice"}}
 {"type": "Company", "data": {"name": "Acme"}}
 {"type": "Company", "data": {"name": "Bigco"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, seed, LoadMode::Overwrite).await.unwrap();
 
     // Merge load with the SAME edge id twice — the second row supersedes
     // the first in the end-of-query dedupe. If pending-counting doesn't
@@ -1684,7 +1660,7 @@ edge WorksAt: Person -> Company @card(0..1)
     let dup_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"id": "w1"}}
 {"edge": "WorksAt", "from": "Alice", "to": "Bigco", "data": {"id": "w1"}}
 "#;
-    load_jsonl(&mut db, dup_data, LoadMode::Merge)
+    load_jsonl(&db, dup_data, LoadMode::Merge)
         .await
         .expect("Merge load with within-input dup ids must dedupe pending count");
 
@@ -1720,13 +1696,13 @@ query insert_then_update_note(
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
     // Keep one committed blob row as well as the just-inserted pending row so
     // the table has the real blob-v2 physical representation while this query
     // exercises the pending union.
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Document","data":{"title":"seed","content":"base64:AQID"}}"#,
         LoadMode::Overwrite,
     )
@@ -1794,7 +1770,7 @@ query insert_then_update_note(
 #[tokio::test]
 async fn second_sequential_update_on_same_row_succeeds() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     db.mutate(
         "main",
@@ -1991,10 +1967,8 @@ const CC_DATA: &str = r#"{"type":"Doc","data":{"slug":"d1","repoName":"acme","st
 async fn camelcase_mutation_predicate_updates_and_deletes() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
+    load_jsonl(&db, CC_DATA, LoadMode::Overwrite).await.unwrap();
 
     let m = r#"
 query set_status($repo: String, $st: String) { update Doc set { status: $st } where repoName = $repo }
@@ -2036,10 +2010,8 @@ query del($repo: String) { delete Doc where repoName = $repo }
 async fn camelcase_chained_mutation_reads_pending_by_camelcase() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
+    load_jsonl(&db, CC_DATA, LoadMode::Overwrite).await.unwrap();
 
     // op-1 stages a status change to the acme Doc; op-2 re-filters the same
     // camelCase column, so it must match op-1's pending row.
@@ -2132,7 +2104,7 @@ async fn node_delete_with_no_incident_edges_leaves_no_edge_table_drift() {
 async fn post_publish_fold_matches_fresh_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     db.mutate(
         "main",
@@ -2199,7 +2171,7 @@ async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() 
     let seed: String = (1..=40)
         .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
         .collect();
-    load_jsonl(&mut db, &seed, LoadMode::Merge).await.unwrap();
+    load_jsonl(&db, &seed, LoadMode::Merge).await.unwrap();
 
     // Same-key updates: Lance Operation::Update rewrites these 15 rows into
     // new fragments that keep their original stable row ids (the overlap).
@@ -2211,9 +2183,7 @@ async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() 
             )
         })
         .collect();
-    load_jsonl(&mut db, &updates, LoadMode::Merge)
-        .await
-        .unwrap();
+    load_jsonl(&db, &updates, LoadMode::Merge).await.unwrap();
 
     // The delete adds a deletion vector, so the overlapping region no longer
     // densely tiles its id range — the shape lance#7444 choked on.
@@ -2256,13 +2226,13 @@ async fn filtered_read_after_append_and_delete_is_consistent() {
     let seed: String = (1..=40)
         .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
         .collect();
-    load_jsonl(&mut db, &seed, LoadMode::Merge).await.unwrap();
+    load_jsonl(&db, &seed, LoadMode::Merge).await.unwrap();
 
     // Disjoint keys: plain inserts, no fragment rewrite, no id reuse.
     let more: String = (41..=55)
         .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
         .collect();
-    load_jsonl(&mut db, &more, LoadMode::Merge).await.unwrap();
+    load_jsonl(&db, &more, LoadMode::Merge).await.unwrap();
 
     mutate_main(
         &mut db,

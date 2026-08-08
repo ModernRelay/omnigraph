@@ -113,7 +113,7 @@ pub(crate) fn derive_chunk_plan(
     let batch_rows_u64 = max_rows_by_bytes.min(KEYED_WRITE_MAX_ROWS as u64);
     let batch_rows = usize::try_from(batch_rows_u64)
         .map_err(|_| "derived RFC-023 batch row count exceeds usize".to_string())?;
-    let transaction_count = rows / batch_rows + usize::from(rows % batch_rows != 0);
+    let transaction_count = rows / batch_rows + usize::from(!rows.is_multiple_of(batch_rows));
     let estimated_full_batch_bytes = row_bytes
         .checked_mul(batch_rows as u64)
         .and_then(|value| value.checked_add(BATCH_FIXED_OVERHEAD_BYTES))

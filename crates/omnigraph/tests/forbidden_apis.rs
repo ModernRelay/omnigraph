@@ -873,7 +873,7 @@ fn walk_into(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn relative_to_src<'a>(src: &Path, file: &'a Path) -> String {
+fn relative_to_src(src: &Path, file: &Path) -> String {
     file.strip_prefix(src)
         .unwrap_or(file)
         .to_string_lossy()

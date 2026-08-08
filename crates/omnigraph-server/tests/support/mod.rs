@@ -120,10 +120,8 @@ pub async fn init_graph_with_schema_and_data(schema: &str, data: &str) -> tempfi
     Omnigraph::init(graph.to_str().unwrap(), schema)
         .await
         .unwrap();
-    let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
     temp
 }
 

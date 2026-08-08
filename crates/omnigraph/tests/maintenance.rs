@@ -399,12 +399,12 @@ node Doc {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
 
     // Loads publish only data effects; establish the initial id + rank BTREEs
     // explicitly through the reconciler before creating partial coverage.
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
         LoadMode::Merge,
@@ -416,7 +416,7 @@ node Doc {
     // A second load with NEW keys appends a fragment the existing BTREEs do not
     // cover (the existence gate skips re-building an index that already exists).
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"rank\":3}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"rank\":4}}",
         LoadMode::Merge,
@@ -472,28 +472,28 @@ async fn optimize_compacts_blob_table_alongside_plain_table() {
     let schema = "\
 node Doc {\n    slug: String @key\n    content: Blob\n}\n\
 node Tag {\n    slug: String @key\n}\n";
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
 
     // Multi-fragment blob table: Overwrite creates fragment 1; each Merge of
     // new keys appends another. A >=2-fragment blob table exercises the rewrite
     // path that exposed the historical Lance regression (a single fragment
     // would be a no-op).
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"content\":\"base64:aGVsbG8x\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"content\":\"base64:aGVsbG8y\"}}",
         LoadMode::Overwrite,
     )
     .await
     .unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"content\":\"base64:aGVsbG8z\"}}",
         LoadMode::Merge,
     )
     .await
     .unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"content\":\"base64:aGVsbG80\"}}",
         LoadMode::Merge,
     )
@@ -501,14 +501,14 @@ node Tag {\n    slug: String @key\n}\n";
     .unwrap();
     // Plain table, also multi-fragment so it has something to compact.
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Tag\",\"data\":{\"slug\":\"t1\"}}\n{\"type\":\"Tag\",\"data\":{\"slug\":\"t2\"}}",
         LoadMode::Merge,
     )
     .await
     .unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Tag\",\"data\":{\"slug\":\"t3\"}}",
         LoadMode::Merge,
     )
@@ -863,7 +863,7 @@ async fn non_strict_load_refuses_uncovered_drift_before_folding_it() {
     let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
 
     let err = load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Person\",\"data\":{\"name\":\"Ivan\",\"age\":44}}",
         LoadMode::Merge,
     )
@@ -970,8 +970,8 @@ async fn ensure_indices_refuses_uncovered_drift_before_arming_recovery() {
         .trim_end_matches('/')
         .to_string();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     let (manifest_before, head_before, _) = forge_person_delete_drift(&db, &root).await;
@@ -1209,9 +1209,7 @@ async fn cleanup_older_than_zero_preserves_head() {
 
     // Smoke test: after aggressive cleanup, we can still read and write the
     // graph — head wasn't pruned.
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Merge)
-        .await
-        .unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Merge).await.unwrap();
 }
 
 #[tokio::test]
@@ -1460,9 +1458,7 @@ async fn cleanup_then_optimize_preserves_rows_and_table_remains_writable() {
     assert_eq!(count_rows(&db, "node:Company").await, companies_before);
 
     // Table is still writable after the cleanup+optimize sequence.
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Merge)
-        .await
-        .unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Merge).await.unwrap();
     assert_eq!(count_rows(&db, "node:Person").await, people_before);
 }
 
@@ -1606,10 +1602,10 @@ async fn index_build_tolerates_null_vector_rows() {
         n: I64 @index\n    \
         embedding: Vector(8)? @index\n\
         }\n";
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
     // Rows present, embeddings null (loaded but not yet embedded).
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"n\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"n\":2}}",
         LoadMode::Merge,
@@ -1664,9 +1660,9 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let v1 = "node Doc {\n    slug: String @key\n    rank: I32\n}\n";
-    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    let db = Omnigraph::init(uri, v1).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
         LoadMode::Merge,
@@ -1716,9 +1712,9 @@ async fn optimize_materializes_index_after_type_rename() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let v1 = "node Doc {\n    slug: String @key\n    rank: I32 @index\n}\n";
-    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    let db = Omnigraph::init(uri, v1).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
         LoadMode::Merge,

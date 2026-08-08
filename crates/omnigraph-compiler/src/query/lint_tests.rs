@@ -227,7 +227,7 @@ a_field: String?
 }
 "#,
         ),
-        &r#"
+        r#"
 query update_b($slug: String) {
 update Policy set { a_field: "x" } where slug = $slug
 }
