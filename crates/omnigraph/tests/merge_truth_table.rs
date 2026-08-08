@@ -98,8 +98,8 @@ query get_person($name: String) {
 
 async fn bootstrap(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TRUTH_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TRUTH_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, TRUTH_SCHEMA).await.unwrap();
+    load_jsonl(&db, TRUTH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     db

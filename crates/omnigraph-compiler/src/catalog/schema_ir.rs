@@ -712,7 +712,7 @@ fn shape_types(shape: &SchemaShape) -> Vec<(TypeKind, String, Option<&str>)> {
         .collect()
 }
 
-fn shape_properties<'a>(shape: &'a SchemaShape) -> Vec<(TypeKind, &'a str, &'a [PropertyShape])> {
+fn shape_properties(shape: &SchemaShape) -> Vec<(TypeKind, &str, &[PropertyShape])> {
     shape
         .interfaces
         .iter()

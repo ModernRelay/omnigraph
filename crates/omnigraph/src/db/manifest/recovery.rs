@@ -6099,10 +6099,10 @@ fn has_fixed_rollback_identity(sidecar: &RecoverySidecar) -> bool {
     has_exact_protocol(sidecar) || sidecar.ensure_indices_rollback_v6.is_some()
 }
 
-fn v4_effect_for<'a>(
-    sidecar: &'a RecoverySidecar,
+fn v4_effect_for(
+    sidecar: &RecoverySidecar,
     identity: TableIdentity,
-) -> Option<&'a RecoveryBranchMergeEffect> {
+) -> Option<&RecoveryBranchMergeEffect> {
     sidecar
         .protocol_v4
         .as_ref()?
@@ -10432,7 +10432,7 @@ mod tests {
         };
         let proof = prove_branch_merge_multi_commit_effect(
             &observation,
-            &[planned.clone()],
+            std::slice::from_ref(&planned),
             1,
             "node:Person",
         )

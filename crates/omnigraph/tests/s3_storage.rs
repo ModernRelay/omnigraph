@@ -17,8 +17,8 @@ async fn s3_compatible_graph_lifecycle_works() {
         return;
     };
 
-    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -91,12 +91,12 @@ async fn s3_branch_change_merge_flow_works() {
     };
 
     let mut main = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut main, TEST_DATA, LoadMode::Overwrite)
+    load_jsonl(&main, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(&uri).await.unwrap();
+    let feature = Omnigraph::open(&uri).await.unwrap();
     feature
         .mutate(
             "feature",
@@ -144,8 +144,8 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
         return;
     };
 
-    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -249,8 +249,8 @@ async fn s3_schema_apply_migrates_live_graph() {
         eprintln!("skipping s3 schema apply test: OMNIGRAPH_S3_TEST_BUCKET is not set");
         return;
     };
-    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -279,9 +279,9 @@ async fn s3_fresh_branch_traversal_reuses_main_graph_index_with_etags() {
         return;
     };
 
-    let mut writer = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    let writer = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
     // TEST_DATA seeds Alice->Bob and Alice->Charlie Knows edges.
-    load_jsonl(&mut writer, TEST_DATA, LoadMode::Overwrite)
+    load_jsonl(&writer, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 

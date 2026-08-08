@@ -347,7 +347,7 @@ impl PolicyConfig {
                     rule.id
                 );
             }
-            if let Some(_) = rule.allow.branch_scope {
+            if rule.allow.branch_scope.is_some() {
                 for action in &rule.allow.actions {
                     if !action.uses_branch_scope() {
                         bail!(
@@ -358,7 +358,7 @@ impl PolicyConfig {
                     }
                 }
             }
-            if let Some(_) = rule.allow.target_branch_scope {
+            if rule.allow.target_branch_scope.is_some() {
                 for action in &rule.allow.actions {
                     if !action.uses_target_branch_scope() {
                         bail!(

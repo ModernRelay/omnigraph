@@ -5,10 +5,10 @@ pub(crate) fn maybe_fail(_name: &str) -> Result<()> {
     {
         let name = _name;
         fail::fail_point!(name, |_| {
-            return Err(crate::error::OmniError::manifest(format!(
+            Err(crate::error::OmniError::manifest(format!(
                 "injected failpoint triggered: {}",
                 name
-            )));
+            )))
         });
     }
     Ok(())
@@ -25,9 +25,9 @@ pub(crate) fn maybe_fail_retryable_contention(name: &str) -> Result<()> {
     #[cfg(feature = "failpoints")]
     {
         fail::fail_point!(name, |_| {
-            return Err(crate::error::OmniError::manifest_row_level_cas_contention(
+            Err(crate::error::OmniError::manifest_row_level_cas_contention(
                 format!("injected retryable contention failpoint: {name}"),
-            ));
+            ))
         });
     }
     Ok(())

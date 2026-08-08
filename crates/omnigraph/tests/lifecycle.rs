@@ -344,7 +344,7 @@ async fn refresh_rejects_schema_ir_tables_missing_from_manifest() {
 async fn write_capture_rejects_schema_ir_tables_missing_from_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let accepted = db.catalog().bound_schema_ir().unwrap().clone();
     let with_temporary_source =
         format!("{TEST_SCHEMA}\nnode Temporary {{\n    key: String @key\n}}\n");
@@ -355,7 +355,7 @@ async fn write_capture_rejects_schema_ir_tables_missing_from_manifest() {
     persist_schema_contract(dir.path(), &replacement);
 
     let err = omnigraph::loader::load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"blocked"}}"#,
         omnigraph::loader::LoadMode::Merge,
     )
@@ -527,13 +527,13 @@ async fn snapshot_version_is_pinned() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     let snap1 = snapshot_main(&db).await.unwrap();
     let v1 = snap1.version();
 
     omnigraph::loader::load_jsonl(
-        &mut db,
+        &db,
         r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#,
         omnigraph::loader::LoadMode::Overwrite,
     )

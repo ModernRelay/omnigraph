@@ -34,10 +34,8 @@ const DATA: &str = r#"{"type":"Metric","data":{"name":"m1","score":2.5,"ratio":0
 
 async fn metric_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-    load_jsonl(&mut db, DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    load_jsonl(&db, DATA, LoadMode::Overwrite).await.unwrap();
     db
 }
 
@@ -194,9 +192,7 @@ async fn camelcase_property_filter_executes() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, CC_DATA, LoadMode::Overwrite).await.unwrap();
 
     let q =
         r#"query by_repo($r: String) { match { $d: Doc { repoName: $r } } return { $d.slug } }"#;

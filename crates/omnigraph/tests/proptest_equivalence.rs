@@ -152,8 +152,8 @@ fn config() -> Config {
 async fn load_graph(graph: &GenGraph) -> (tempfile::TempDir, Omnigraph) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, &graph.to_jsonl(), LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, &graph.to_jsonl(), LoadMode::Overwrite)
         .await
         .unwrap();
     (dir, db)

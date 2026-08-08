@@ -99,9 +99,9 @@ pub(crate) fn certified_insert_absence_rows(
         || fields_for_preserving_frag_bitmap != expected_schema_preorder_ids
         || update_mode != &Some(UpdateMode::RewriteRows)
         || updated_fragment_offsets.is_some()
-        || !inserted_rows_filter
+        || inserted_rows_filter
             .as_ref()
-            .is_some_and(|filter| filter.field_ids == vec![id_field_id])
+            .is_none_or(|filter| filter.field_ids != vec![id_field_id])
     {
         return None;
     }
@@ -175,6 +175,9 @@ impl From<&Transaction> for StagedTransactionIdentity {
 /// Without `removed_fragment_ids`, a `stage_merge_insert` that rewrites
 /// existing fragments would yield duplicate rows (the original fragment
 /// stays in the committed manifest while its rewrite shows up in `new_fragments`).
+// Sealed storage surface: `new_fragments`/`removed_fragment_ids` record the
+// read-your-writes fragment delta of a staged effect.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct StagedWrite {
     transaction: Transaction,
@@ -210,6 +213,9 @@ impl StagedCommitMetadata {
     }
 }
 
+// Sealed storage surface: the `new_fragments`/`removed_fragment_ids`
+// accessors complete the staged-effect vocabulary.
+#[allow(dead_code)]
 impl StagedWrite {
     fn new(
         transaction: Transaction,
@@ -299,6 +305,8 @@ impl TableStore {
         }
     }
 
+    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
+    #[allow(dead_code)]
     pub fn root_uri(&self) -> &str {
         &self.root_uri
     }
@@ -471,7 +479,7 @@ impl TableStore {
         )
         .await?
         {
-            crate::branch_control::BranchCreateOutcome::Created(dataset) => dataset,
+            crate::branch_control::BranchCreateOutcome::Created(dataset) => *dataset,
             crate::branch_control::BranchCreateOutcome::RefAlreadyExists => {
                 return Ok(ForkOutcome::RefAlreadyExists);
             }
@@ -497,6 +505,8 @@ impl TableStore {
         self.scan(ds, None, None, None).await
     }
 
+    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
+    #[allow(dead_code)]
     pub async fn scan_batches_for_rewrite(&self, ds: &Dataset) -> Result<Vec<RecordBatch>> {
         let has_blob_columns = ds.schema().fields_pre_order().any(|field| field.is_blob());
         if !has_blob_columns {
@@ -520,6 +530,8 @@ impl TableStore {
     /// downstream writer never materializes the whole table in memory. Blob
     /// columns are rebuilt asynchronously one scanner batch at a time; ordinary
     /// columns pass through the native lazy scan.
+    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
+    #[allow(dead_code)]
     pub async fn scan_stream_for_rewrite(&self, ds: &Dataset) -> Result<SendableRecordBatchStream> {
         let has_blob_columns = ds.schema().fields_pre_order().any(|field| field.is_blob());
         if has_blob_columns {
@@ -643,6 +655,9 @@ impl TableStore {
         Box::pin(RecordBatchStreamAdapter::new(schema, materialized))
     }
 
+    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; its
+    // only caller is the equally-unused `scan_batches_for_rewrite`.
+    #[allow(dead_code)]
     pub(crate) async fn materialize_blob_batch(
         ds: &Dataset,
         batch: RecordBatch,
@@ -758,11 +773,11 @@ impl TableStore {
         let mut non_null_row_ids = Vec::new();
         let mut row_has_blob = Vec::with_capacity(row_ids.len());
 
-        for row in 0..row_ids.len() {
+        for (row, row_id) in row_ids.iter().enumerate() {
             let is_null = Self::blob_description_is_null(descriptions, row)?;
             row_has_blob.push(!is_null);
             if !is_null {
-                non_null_row_ids.push(row_ids[row]);
+                non_null_row_ids.push(*row_id);
             }
         }
 
@@ -1152,7 +1167,6 @@ impl TableStore {
     pub async fn count_rows(&self, ds: &Dataset, filter: Option<String>) -> Result<usize> {
         ds.count_rows(filter)
             .await
-            .map(|count| count as usize)
             .map_err(|e| OmniError::Lance(e.to_string()))
     }
 
@@ -1170,12 +1184,13 @@ impl TableStore {
 
     /// Legacy inline-commit append: writes fragments AND commits in one
     /// call, advancing Lance HEAD as a side effect. Not on the
-    /// `TableStorage` trait surface — the staged primitive `stage_append`
-    /// + `commit_staged` is the engine write path. This inherent method
-    /// survives only for in-source recovery test setup, so it is
-    /// `#[cfg(test)]`-gated: engine code physically cannot call it (which
-    /// enforces "no new call sites" by construction and silences the
-    /// dead-code warning the non-test lib build would otherwise emit).
+    /// `TableStorage` trait surface — the staged primitive
+    /// `stage_append` + `commit_staged` is the engine write path. This
+    /// inherent method survives only for in-source recovery test setup,
+    /// so it is `#[cfg(test)]`-gated: engine code physically cannot call
+    /// it (which enforces "no new call sites" by construction and
+    /// silences the dead-code warning the non-test lib build would
+    /// otherwise emit).
     #[cfg(test)]
     pub(crate) async fn append_batch(
         &self,
@@ -2596,6 +2611,8 @@ impl TableStore {
     /// the committed scan via DataFusion `MemTable` for read-your-writes
     /// (see `scan_with_pending`), and no production caller passes a filter
     /// here. This method remains on the surface for primitive-level testing.
+    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
+    #[allow(dead_code)]
     pub async fn scan_with_staged(
         &self,
         ds: &Dataset,
@@ -2687,7 +2704,7 @@ impl TableStore {
         // either (a) include the key in projection or (b) drop
         // `key_column` if union is what they wanted.
         if let (Some(key_col), Some(cols)) = (key_column, projection) {
-            if !cols.iter().any(|c| *c == key_col) {
+            if !cols.contains(&key_col) {
                 return Err(OmniError::Lance(format!(
                     "scan_with_pending: key_column '{}' must appear in projection \
                      when merge-shadow semantics are requested (got projection = {:?})",
@@ -2927,6 +2944,8 @@ impl TableStore {
     /// edge-cardinality validation that needs to see staged edges before
     /// commit. Same `committed - removed + new` composition as
     /// `scan_with_staged`.
+    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
+    #[allow(dead_code)]
     pub async fn count_rows_with_staged(
         &self,
         ds: &Dataset,
@@ -3033,7 +3052,7 @@ impl TableStore {
             batch
                 .column_by_name("_rowid")
                 .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-                .and_then(|arr| (arr.len() > 0).then(|| arr.value(0)))
+                .and_then(|arr| (!arr.is_empty()).then(|| arr.value(0)))
         }))
     }
 
@@ -3099,6 +3118,8 @@ fn map_lance_commit_error(error: lance::Error) -> OmniError {
 /// `stage_append`'s D₂′ contract. For `stage_merge_insert` results the
 /// `new_fragments` include rewrites that don't add new rows, so this
 /// would over-count.
+// Staged-write helper retained alongside the sealed storage surface; no
+#[allow(dead_code)]
 fn prior_stages_fragment_count(prior_stages: &[StagedWrite]) -> u64 {
     prior_stages
         .iter()
@@ -3121,6 +3142,8 @@ fn assign_fragment_ids(fragments: &mut [Fragment], start_id: u64) {
     }
 }
 
+// Staged-write helper retained alongside the sealed storage surface; no
+#[allow(dead_code)]
 fn prior_stages_row_count(prior_stages: &[StagedWrite]) -> Result<u64> {
     let mut total: u64 = 0;
     for stage in prior_stages {
@@ -3440,6 +3463,9 @@ async fn scan_pending_batches(
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
+// Staged-write helper retained alongside the sealed storage surface; its
+// only callers are the equally-unused `*_with_staged` methods.
+#[allow(dead_code)]
 fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fragment> {
     let removed: std::collections::HashSet<u64> = staged
         .iter()
@@ -4386,6 +4412,8 @@ fn staged_keyed_merge_result(
 /// (`vec!["id".to_string()]`). The check restricts itself to that shape
 /// and surfaces an internal error if a future caller passes anything
 /// else — keeping the assumption explicit instead of silently degrading.
+// Staged-write helper retained alongside the sealed storage surface; no
+#[allow(dead_code)]
 fn check_batch_unique_by_keys(
     batch: &RecordBatch,
     key_columns: &[String],

@@ -73,3 +73,6 @@ libc = "0.2"
 # "Examples & benches". `harness = false`: the file provides its own main.
 name = "scenarios"
 harness = false
+
+[lints]
+workspace = true

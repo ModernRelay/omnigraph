@@ -124,8 +124,8 @@ fn write_sized_external_blob(path: &std::path::Path, bytes: u64) {
 
 async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, SEARCH_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap();
+    load_jsonl(&db, SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
@@ -138,10 +138,8 @@ async fn init_db_from_schema_and_data(
     data: &str,
 ) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
     db
 }
 
@@ -165,7 +163,7 @@ async fn assert_exact_id_primary_key_on_branch(db: &Omnigraph, branch: &str, tab
 async fn branch_create_open_list_and_lazy_branching_work() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     let main_person = snapshot_main(&main)
         .await
         .unwrap()
@@ -237,7 +235,7 @@ async fn branch_create_open_list_and_lazy_branching_work() {
 #[tokio::test]
 async fn explicit_target_query_reads_multiple_branches_from_one_handle() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     db.branch_create("feature").await.unwrap();
     db.mutate(
@@ -313,7 +311,7 @@ async fn resolved_snapshot_stays_pinned_after_branch_advances() {
 #[tokio::test]
 async fn explicit_target_load_writes_to_named_branch() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     db.branch_create("feature").await.unwrap();
     db.load(
@@ -406,7 +404,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     let uri = dir.path().to_str().unwrap();
     let mut main = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut main,
+        &main,
         concat!(
             "{\"type\":\"Document\",\"data\":{\"title\":\"seed\",\"content\":\"base64:U2VlZA==\",\"note\":\"original\"}}\n",
             "{\"type\":\"Document\",\"data\":{\"title\":\"main-doc\",\"content\":\"base64:TWFpbg==\",\"note\":\"main\"}}",
@@ -498,15 +496,13 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
     fs::write(&external_path, b"External").unwrap();
     let external_uri = format!("file://{}", external_path.display());
 
-    let mut main = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
-    load_jsonl(&mut main, "", LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let main = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    load_jsonl(&main, "", LoadMode::Overwrite).await.unwrap();
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = Omnigraph::open(uri).await.unwrap();
     load_jsonl(
-        &mut main,
+        &main,
         "{\"type\":\"Document\",\"data\":{\"title\":\"main-doc\",\"content\":\"base64:TWFpbg==\",\"note\":\"main\"}}",
         LoadMode::Append,
     )
@@ -577,11 +573,9 @@ async fn branch_merge_rejects_oversized_blob_payloads_pre_effect() {
         })
         .to_string();
 
-        let mut db = Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA).await.unwrap();
         let base = r#"{"type":"Document","data":{"title":"base"}}"#;
-        load_jsonl(&mut db, base, LoadMode::Overwrite)
-            .await
-            .unwrap();
+        load_jsonl(&db, base, LoadMode::Overwrite).await.unwrap();
         db.branch_create("feature").await.unwrap();
         db.load(
             "feature",
@@ -646,7 +640,7 @@ async fn branch_merge_rejects_oversized_blob_payloads_pre_effect() {
 async fn branch_merge_applies_node_insert_to_main() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -679,7 +673,7 @@ async fn branch_merge_applies_node_insert_to_main() {
 async fn branch_merge_records_single_latest_commit_with_two_parents() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -913,7 +907,7 @@ async fn same_branch_update_after_external_commit_and_read_is_linear() {
 async fn branch_merge_records_actor_on_latest_commit() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -947,7 +941,7 @@ async fn branch_merge_records_actor_on_latest_commit() {
 async fn already_up_to_date_branch_merge_returns_without_new_commit() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
     let source_head_before = CommitGraph::open_at_branch(uri, "feature")
@@ -1152,7 +1146,7 @@ async fn merged_rewritten_indexed_table_is_searchable_immediately() {
 async fn explicit_target_reads_see_branch_local_writes_without_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
     let mut writer = Omnigraph::open(uri).await.unwrap();
@@ -1195,7 +1189,7 @@ async fn explicit_target_reads_see_branch_local_writes_without_refresh() {
 async fn branch_created_from_non_main_inherits_branch_state() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -1258,7 +1252,7 @@ async fn branch_created_from_non_main_inherits_branch_state() {
 async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_needed() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -1276,7 +1270,7 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
         .await
         .unwrap();
 
-    let mut experiment = Omnigraph::open(uri).await.unwrap();
+    let experiment = Omnigraph::open(uri).await.unwrap();
     let experiment_inherited = snapshot_branch(&experiment, "experiment").await.unwrap();
     assert_eq!(
         experiment_inherited
@@ -1350,7 +1344,7 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
 async fn branch_edge_only_write_only_branches_edge_table() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -1405,7 +1399,7 @@ async fn branch_edge_only_write_only_branches_edge_table() {
 async fn branch_merge_into_non_main_target_works() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -1722,7 +1716,7 @@ query delete_person($name: String) {
 #[tokio::test]
 async fn branch_api_rejects_reserved_main_and_same_source_target_merge() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let err = db.branch_create("main").await.unwrap_err();
     assert!(err.to_string().contains("cannot create branch 'main'"));
@@ -1788,7 +1782,7 @@ async fn branch_delete_removes_owned_table_branches_and_allows_recreate() {
 #[tokio::test]
 async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     db.branch_create("feature").await.unwrap();
     let err = db.branch_create("feature/child").await.unwrap_err();
@@ -1831,7 +1825,7 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
 async fn branch_delete_refuses_legacy_physical_path_children() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     db.branch_create("feature/child").await.unwrap();
 
     // Forge a graph written before the prefix-disjoint namespace invariant.
@@ -1874,7 +1868,7 @@ async fn branch_delete_refuses_legacy_physical_path_children() {
 async fn branch_delete_rejects_branches_still_referenced_by_descendants() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
 
     main.branch_create("feature").await.unwrap();
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -1984,7 +1978,7 @@ async fn merged_table_preserves_row_version_for_unchanged_rows() {
 #[tokio::test]
 async fn edge_tables_have_id_btree_after_ensure_indices() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     db.ensure_indices().await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();

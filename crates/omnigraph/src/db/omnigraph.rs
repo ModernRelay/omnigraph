@@ -4017,10 +4017,10 @@ edge WorksAt: Person -> Company
         // no `__run__` branch behind, so schema apply proceeds.
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
         crate::loader::load_jsonl(
-            &mut db,
+            &db,
             r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#,
             crate::loader::LoadMode::Overwrite,
         )

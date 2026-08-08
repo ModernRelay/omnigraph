@@ -329,7 +329,7 @@ fn git_worktree_dirty() -> Option<bool> {
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .ok()?;
-    out.status.success().then(|| !out.stdout.is_empty())
+    out.status.success().then_some(!out.stdout.is_empty())
 }
 
 #[cfg(unix)]
@@ -367,6 +367,9 @@ const CHILD_PROTOCOL_EXIT_STATUS: i64 = 70;
 fn run_child_process(args: &Args) -> ChildRun {
     let exe = std::env::current_exe().expect("current_exe");
     let wall_start = Instant::now();
+    // Reaped by `wait4_rusage(pid)` below, which is used instead of
+    // `Child::wait` because only `wait4` reports the child's peak RSS.
+    #[allow(clippy::zombie_processes)]
     let mut child = std::process::Command::new(exe)
         .args(args.to_child_argv())
         .stdout(std::process::Stdio::piped())

@@ -14,3 +14,6 @@ omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.9.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 utoipa = { workspace = true }
+
+[lints]
+workspace = true

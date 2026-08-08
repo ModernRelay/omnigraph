@@ -37,10 +37,8 @@ fn names_in_order(result: &QueryResult) -> Vec<String> {
 /// Init the standard schema and load a custom Person-only dataset.
 async fn init_people(dir: &tempfile::TempDir, jsonl: &str) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, jsonl, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, jsonl, LoadMode::Overwrite).await.unwrap();
     db
 }
 
@@ -117,7 +115,7 @@ async fn ordering_parallel_edge_tie_breaks_by_physical_edge_id() {
     // order is deliberately the reverse of physical edge-id order. The two
     // rows are otherwise tied: same user sort key and same endpoint ids.
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"Alice","age":30}}
 {"type":"Person","data":{"name":"Bob","age":25}}
 {"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"edge-b","label":"loaded-first"}}"#,
@@ -126,7 +124,7 @@ async fn ordering_parallel_edge_tie_breaks_by_physical_edge_id() {
     .await
     .unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"edge-a","label":"id-first"}}"#,
         LoadMode::Merge,
     )
