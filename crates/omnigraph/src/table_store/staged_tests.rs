@@ -377,6 +377,7 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
             &ds,
             &[IndexBuildSpec::BTree {
                 column: "id".to_string(),
+                name: None,
             }],
         )
         .await
@@ -594,6 +595,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
             &ds,
             &[IndexBuildSpec::BTree {
                 column: "id".to_string(),
+                name: None,
             }],
         )
         .await
@@ -2170,9 +2172,17 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
             &[
                 IndexBuildSpec::BTree {
                     column: "id".to_string(),
+                    name: None,
                 },
                 IndexBuildSpec::FullText {
                     column: "body".to_string(),
+                },
+                // Second index on the SAME column: the explicit name keeps it
+                // from replacing the FTS index under Lance's shared default
+                // name (the dual-index shape free-text @index columns get).
+                IndexBuildSpec::BTree {
+                    column: "body".to_string(),
+                    name: Some("body_btree".to_string()),
                 },
                 IndexBuildSpec::Vector {
                     column: "embedding".to_string(),
@@ -2214,6 +2224,10 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
     );
     assert!(store.has_btree_index(&new_ds, "id").await.unwrap());
     assert!(store.has_fts_index(&new_ds, "body").await.unwrap());
+    assert!(
+        store.has_btree_index(&new_ds, "body").await.unwrap(),
+        "the explicitly-named companion BTREE must land beside the FTS index"
+    );
     assert!(store.has_vector_index(&new_ds, "embedding").await.unwrap());
 }
 

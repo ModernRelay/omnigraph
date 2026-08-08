@@ -738,6 +738,11 @@ fn collect_expr_variables(expr: &IRExpr, vars: &mut HashSet<String>) {
 }
 
 /// The set of binding variables a filter references, across both operands.
+///
+/// A single-binding pushable filter (`starts_with`, string `contains`,
+/// equality, range, …) is hoisted onto the op that introduces that binding,
+/// where Lance can probe a covering index; a cross-variable filter references
+/// two bindings and stays in the in-memory arm on the joined batch.
 fn filter_variables(filter: &IRFilter) -> HashSet<String> {
     let mut vars = HashSet::new();
     collect_expr_variables(&filter.left, &mut vars);
@@ -761,7 +766,10 @@ fn execute_pipeline<'a>(
         // binding move to that binding's NodeScan (`filter_expr`, which also
         // arms `prefilter(true)` so a `nearest`/`bm25` on the same scanner is
         // filtered BEFORE top-k instead of starved after it) or into the
-        // introducing Expand's `dst_filters` (applied during hydration).
+        // introducing Expand's `dst_filters` (applied during hydration). This
+        // single-binding rule is what pushes `starts_with` / string `contains`
+        // to a covering BTREE/NGRAM index while keeping a cross-variable
+        // predicate in the in-memory arm.
         // Multi-binding filters (e.g. the cycle-closing `temp.id = dst.id`)
         // and filters on a variable not introduced here (an outer binding
         // inside an anti-join pipeline) keep their end-of-pipeline placement.
@@ -2665,10 +2673,12 @@ pub(super) fn build_lance_filter_expr(
     use datafusion::prelude::Expr;
 
     let mut acc: Option<Expr> = None;
+    let mut pushed = 0u64;
     for f in filters {
         let Some(e) = ir_filter_to_expr(f, params, schema) else {
             continue;
         };
+        pushed += 1;
         acc = Some(match acc {
             None => e,
             Some(prev) => Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
@@ -2678,6 +2688,7 @@ pub(super) fn build_lance_filter_expr(
             )),
         });
     }
+    crate::instrumentation::record_pushed_filter_exprs(pushed);
     acc
 }
 
@@ -2706,6 +2717,22 @@ pub(super) fn ir_filter_to_expr(
         return Some(array_has(left, right));
     }
 
+    // Exact string predicates lower to the DataFusion `starts_with`/`contains`
+    // scalar functions. The function NAMES are load-bearing: Lance's scalar
+    // index expression parser matches them to probe a BTREE (`starts_with` →
+    // LikePrefix) or an NGRAM index (`contains` → StringContains + recheck)
+    // when one covers the column, and falls back to a plain filtered scan
+    // when none does — correct either way.
+    if matches!(filter.op, CompOp::StartsWith | CompOp::StringContains) {
+        use datafusion::functions::expr_fn::{contains, starts_with};
+        let left = ir_expr_to_expr(&filter.left, params, None)?;
+        let right = ir_expr_to_expr(&filter.right, params, None)?;
+        return Some(match filter.op {
+            CompOp::StartsWith => starts_with(left, right),
+            _ => contains(left, right),
+        });
+    }
+
     // A literal/param operand is coerced to the OTHER operand's column type so
     // the predicate stays a direct `col OP literal` and the scalar index is used.
     // Without this, DataFusion widens a narrow column (`CAST(col AS Int64)`),
@@ -2721,7 +2748,9 @@ pub(super) fn ir_filter_to_expr(
         CompOp::Lt => left.lt(right),
         CompOp::Ge => left.gt_eq(right),
         CompOp::Le => left.lt_eq(right),
-        CompOp::Contains => unreachable!("handled above"),
+        CompOp::Contains | CompOp::StartsWith | CompOp::StringContains => {
+            unreachable!("handled above")
+        }
     })
 }
 

@@ -83,7 +83,16 @@ pub enum CompOp {
     Lt,
     Ge,
     Le,
+    /// The parser emits `Contains` for the `contains` keyword; typecheck
+    /// accepts a list left operand (membership) or a scalar String left
+    /// operand (substring), and lowering resolves the String form to
+    /// `StringContains` so downstream consumers never re-derive types.
     Contains,
+    /// Exact, case-sensitive prefix match on a scalar String property.
+    StartsWith,
+    /// Exact, case-sensitive substring match on a scalar String property.
+    /// Never produced by the parser — lowering resolves it from `Contains`.
+    StringContains,
 }
 
 impl std::fmt::Display for CompOp {
@@ -95,7 +104,8 @@ impl std::fmt::Display for CompOp {
             Self::Lt => write!(f, "<"),
             Self::Ge => write!(f, ">="),
             Self::Le => write!(f, "<="),
-            Self::Contains => write!(f, "contains"),
+            Self::Contains | Self::StringContains => write!(f, "contains"),
+            Self::StartsWith => write!(f, "starts_with"),
         }
     }
 }
