@@ -799,21 +799,13 @@ fn apply_requested_memory_cap(cap_mb: u64) -> serde_json::Value {
             "error": "requested memory cap overflows bytes",
         });
     };
-    let Ok(requested_limit) = libc::rlim_t::try_from(requested_bytes) else {
-        return serde_json::json!({
-            "requested_mb": cap_mb,
-            "status": "invalid_requested_cap",
-            "cap_applied": false,
-            "effective_bytes": null,
-            "hard_limit_bytes": null,
-            "error": "requested memory cap does not fit rlim_t",
-        });
+    // The *64 rlimit API takes u64 limits on every libc; legacy `setrlimit`'s
+    // `rlim_t` is u32 on 32-bit glibc, which would need a fallible narrowing.
+    let requested = libc::rlimit64 {
+        rlim_cur: requested_bytes,
+        rlim_max: requested_bytes,
     };
-    let requested = libc::rlimit {
-        rlim_cur: requested_limit,
-        rlim_max: requested_limit,
-    };
-    if unsafe { libc::setrlimit(libc::RLIMIT_AS, &requested) } != 0 {
+    if unsafe { libc::setrlimit64(libc::RLIMIT_AS, &requested) } != 0 {
         return serde_json::json!({
             "requested_mb": cap_mb,
             "status": "setrlimit_failed",
@@ -824,8 +816,8 @@ fn apply_requested_memory_cap(cap_mb: u64) -> serde_json::Value {
         });
     }
 
-    let mut observed: libc::rlimit = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut observed) } != 0 {
+    let mut observed: libc::rlimit64 = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit64(libc::RLIMIT_AS, &mut observed) } != 0 {
         return serde_json::json!({
             "requested_mb": cap_mb,
             "status": "getrlimit_failed",
@@ -835,7 +827,7 @@ fn apply_requested_memory_cap(cap_mb: u64) -> serde_json::Value {
             "error": std::io::Error::last_os_error().to_string(),
         });
     }
-    let applied = observed.rlim_cur == requested_limit && observed.rlim_max == requested_limit;
+    let applied = observed.rlim_cur == requested_bytes && observed.rlim_max == requested_bytes;
     serde_json::json!({
         "requested_mb": cap_mb,
         "status": if applied { "applied" } else { "verification_mismatch" },
