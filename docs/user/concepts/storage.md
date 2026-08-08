@@ -111,9 +111,27 @@ The split — L2 owns the cross-dataset catalog; L1 owns the per-dataset interna
 
 | Scheme | Backend | Notes |
 |---|---|---|
-| local path / `file://` | local filesystem | Normalized to absolute paths; relative and dot-segment paths are lexically absolutized |
+| local path / `file://` | local filesystem | Normalized to absolute paths; relative and dot-segment paths are lexically absolutized. Requires hard-link support (below) |
 | `s3://bucket/prefix` | S3 object store | Honors `AWS_ENDPOINT_URL_S3`, `AWS_ALLOW_HTTP`, `AWS_S3_FORCE_PATH_STYLE` |
 | `http(s)://host:port` | HTTP client to `omnigraph-server` | Used by CLI as a target, not a storage backend |
+
+### Local filesystem requirement: hard links
+
+The local backend publishes every atomic create-if-absent write — the
+`_schema.pg` ownership claim at `init` and each Lance manifest commit, i.e.
+every graph write — via `hard_link(2)`. Filesystems that refuse hard links
+(Android app-private storage, FAT/exFAT, some network and FUSE mounts) cannot
+hold a writable local graph. `init` and read-write opens probe the graph
+root's filesystem and fail up front with an error naming this requirement,
+before any partial state is created; probing briefly creates and deletes
+internal objects in the graph root (names starting with `__`, a prefix
+reserved for OmniGraph internals, e.g. `__create_if_absent_probe`).
+Read-only opens (export, `commit list`) perform no writes and work on such
+filesystems. S3-compatible backends are unaffected — the store implements
+the conditional put server-side. The limitation comes from the upstream
+local object-store implementation, which performs conditional put via
+`hard_link(2)`; [apache/arrow-rs-object-store#826](https://github.com/apache/arrow-rs-object-store/pull/826)
+tracks a `renameat2(RENAME_NOREPLACE)` fallback.
 
 ## Object-store env vars (S3-compatible)
 
