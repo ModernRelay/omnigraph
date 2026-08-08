@@ -377,7 +377,11 @@ fn hard_link_refusal_in(dir: &Path) -> Option<std::io::Error> {
         return None;
     }
     let outcome = std::fs::hard_link(&src, &dst);
-    let _ = std::fs::remove_file(&dst);
+    // Remove only entries this probe created: on a failed link, `dst` is
+    // either absent or a foreign pre-placed entry that must survive.
+    if outcome.is_ok() {
+        let _ = std::fs::remove_file(&dst);
+    }
     let _ = std::fs::remove_file(&src);
     match outcome {
         Ok(()) => None,
