@@ -149,6 +149,77 @@ jobs:
       - name: Check workspace with default features
         run: cargo check --workspace --locked
 
+  fmt:
+    name: Format (rustfmt)
+    needs: classify_changes
+    # Own job so a fmt failure cannot mask the clippy result; fmt compiles
+    # nothing, so no dep or cache steps.
+    if: github.event_name == 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      # No dtolnay/rust-toolchain action (here or in `lint`): it exports
+      # RUSTUP_TOOLCHAIN, overriding the toml pin. Bare install reads the
+      # toml; explicit because rustup auto-install has changed across releases.
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  lint:
+    name: Lint (clippy)
+    needs: classify_changes
+    # PR gate. Lints stay `warn` in-tree; only this job denies, so a new
+    # toolchain's lints cannot break local builds. Main-push runs exist only
+    # to seed the cache (see save-if below).
+    if: (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && needs.classify_changes.outputs.run_full_ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      # See the toolchain note in `fmt`. Before the cache step so the cache
+      # key sees the pinned rustc.
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          key: lint
+          # Only main runs save: PR-branch saves are invisible to other PRs
+          # and only evict shared entries.
+          save-if: ${{ github.event_name == 'push' }}
+
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_macro
+
+      # Feature-gated code is invisible to the default build. Keep this
+      # feature list in sync with the post-merge test job's.
+      - name: Clippy (failpoints superset)
+        run: |
+          cargo clippy --workspace --all-targets --locked \
+            --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
+            -- -D warnings -W clippy::dbg_macro
+
   test:
     name: Test Workspace
     needs: classify_changes
