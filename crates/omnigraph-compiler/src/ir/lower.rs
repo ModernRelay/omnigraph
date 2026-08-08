@@ -406,8 +406,12 @@ fn lower_clauses(
     let mut local_var_types: HashMap<&str, &str> = HashMap::new();
     for t in &traversals {
         if let Some(edge) = catalog.lookup_edge_by_name(&t.edge_name) {
-            local_var_types.entry(t.src.as_str()).or_insert(&edge.from_type);
-            local_var_types.entry(t.dst.as_str()).or_insert(&edge.to_type);
+            local_var_types
+                .entry(t.src.as_str())
+                .or_insert(&edge.from_type);
+            local_var_types
+                .entry(t.dst.as_str())
+                .or_insert(&edge.to_type);
         }
     }
     for b in &bindings {

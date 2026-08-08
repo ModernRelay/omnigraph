@@ -206,7 +206,10 @@ query substr_all() { match { $m: Metric  $m.label contains "a" } return { $m.nam
 query key_prefix() { match { $m: Metric  $m.name starts_with "m" } return { $m.name } }
 "#;
     // Prefix: "alpha one", "alps" start with "alp"; NULL label (m4) is not a match.
-    assert_eq!(sorted_metric_names(&mut db, q, "prefix").await, vec!["m1", "m2"]);
+    assert_eq!(
+        sorted_metric_names(&mut db, q, "prefix").await,
+        vec!["m1", "m2"]
+    );
     // Substring across a token boundary — proves exact substring, not FTS
     // token matching ("ta r" spans "beta ray").
     assert_eq!(sorted_metric_names(&mut db, q, "substr").await, vec!["m3"]);
@@ -246,7 +249,9 @@ query cross() {
     return { $a.name, $b.name }
 }
 "#;
-    let r = query_main(&mut db, q, "cross", &ParamMap::new()).await.unwrap();
+    let r = query_main(&mut db, q, "cross", &ParamMap::new())
+        .await
+        .unwrap();
     // Only the three non-null self-pairs match; a wrongly-hoisted predicate
     // degenerates to `label starts_with label` on $b and returns 3×4 pairs.
     assert_eq!(
@@ -336,7 +341,8 @@ async fn standalone_string_predicate_is_hoisted_into_scan() {
 
     let dir = tempfile::tempdir().unwrap();
     let mut db = metric_db(&dir).await;
-    let q = r#"query prefix() { match { $m: Metric  $m.label starts_with "alp" } return { $m.name } }"#;
+    let q =
+        r#"query prefix() { match { $m: Metric  $m.label starts_with "alp" } return { $m.name } }"#;
 
     let probes = QueryIoProbes::default();
     let r = with_query_io_probes(
@@ -409,7 +415,10 @@ query tag_prefix() { match { $m: Metric  $m tagged $t  $t.tname starts_with "alp
 query tag_substr() { match { $m: Metric  $m tagged $t  $t.tname contains "sal" } return { $m.name } }
 "#;
     // Only m1 is tagged "alpine".
-    assert_eq!(sorted_metric_names(&mut db, q, "tag_prefix").await, vec!["m1"]);
+    assert_eq!(
+        sorted_metric_names(&mut db, q, "tag_prefix").await,
+        vec!["m1"]
+    );
     // "basalt" contains "sal": m1 and m3.
     assert_eq!(
         sorted_metric_names(&mut db, q, "tag_substr").await,

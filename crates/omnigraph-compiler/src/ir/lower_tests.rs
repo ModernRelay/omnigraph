@@ -72,11 +72,7 @@ return { $p.name }
         .collect();
     assert_eq!(
         filter_ops,
-        vec![
-            CompOp::StringContains,
-            CompOp::Contains,
-            CompOp::StartsWith
-        ]
+        vec![CompOp::StringContains, CompOp::Contains, CompOp::StartsWith]
     );
 }
 
