@@ -10186,6 +10186,72 @@ async fn init_failpoint_returns_original_error_not_cleanup_error() {
     );
 }
 
+// Local roots probe create-if-absent on init and on read-write open (issue
+// #453: no hard_link(2) breaks every write). The failpoint stands in for a
+// refusing filesystem; real refusals are classified by storage-crate tests.
+
+#[tokio::test]
+#[serial]
+async fn init_create_if_absent_probe_failure_leaves_empty_root() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let _failpoint = ScopedFailPoint::new(names::LOCAL_CREATE_IF_ABSENT_PROBE, "return");
+
+    let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
+        Ok(_) => panic!("expected Omnigraph::init to fail at the create-if-absent probe"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string()
+            .contains("injected failpoint triggered: storage.local_create_if_absent_probe"),
+        "got: {err}"
+    );
+    // The probe precedes the `_schema.pg` claim and every Lance commit, so a
+    // capability failure leaves the root with no artifacts at all.
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "capability-probe failure must leave the graph root empty"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn read_write_open_create_if_absent_probe_failure_aborts_open() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let _ = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
+
+    let _failpoint = ScopedFailPoint::new(names::LOCAL_CREATE_IF_ABSENT_PROBE, "return");
+    let err = match Omnigraph::open(uri).await {
+        Ok(_) => panic!("expected read-write open to fail at the create-if-absent probe"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string()
+            .contains("injected failpoint triggered: storage.local_create_if_absent_probe"),
+        "got: {err}"
+    );
+}
+
+/// Reads never need hard links, so a read-only open must stay usable on a
+/// filesystem that refuses them (export from a store copied onto FAT/exFAT).
+#[tokio::test]
+#[serial]
+async fn read_only_open_skips_create_if_absent_probe() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let _ = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
+
+    let _failpoint = ScopedFailPoint::new(names::LOCAL_CREATE_IF_ABSENT_PROBE, "return");
+    let _db = Omnigraph::open_read_only(uri)
+        .await
+        .expect("read-only open must not run the create-if-absent probe");
+}
+
 // The publisher's outer retry must re-run `load_publish_state` on a RETRYABLE error,
 // not propagate it fatally. A bounded internal loop can surface a `RowLevelCasContention`
 // on exhaustion EXPECTING this re-run (a clean second scan, by which point a concurrent

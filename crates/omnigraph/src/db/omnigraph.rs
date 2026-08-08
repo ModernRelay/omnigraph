@@ -29,7 +29,8 @@ use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot, Resolved
 use crate::error::{OmniError, Result};
 use crate::runtime_cache::RuntimeCache;
 use crate::storage::{
-    StorageAdapter, join_uri, normalize_root_uri, storage_for_uri, write_queue_root_identity,
+    StorageAdapter, StorageKind, join_uri, normalize_root_uri, storage_for_uri,
+    storage_kind_for_uri, write_queue_root_identity,
 };
 use crate::storage_layer::SnapshotHandle;
 use crate::table_store::TableStore;
@@ -377,6 +378,11 @@ impl Omnigraph {
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_physical_schemas(&mut catalog)?;
 
+        // Every init write needs atomic create-if-absent (the `_schema.pg`
+        // claim, each Lance commit), so refuse an incapable local
+        // filesystem here, while the root holds nothing to strand.
+        verify_local_create_if_absent(&root, storage.as_ref()).await?;
+
         // Establish an atomic ownership claim on `_schema.pg` before
         // writing the remaining init artifacts. A check-then-write preflight
         // is not enough under concurrent `init` calls: two callers can both
@@ -505,6 +511,12 @@ impl Omnigraph {
         // Both open modes refuse: there is no in-place migration, and the check is
         // a stamp read with no object-store writes, so it is safe under ReadOnly.
         crate::db::manifest::refuse_if_internal_schema_unsupported(&root).await?;
+        // Read-write opens write before the first user mutation (recovery
+        // sweeps, schema-stamp migration), and every write needs atomic
+        // create-if-absent; read-only opens perform no writes.
+        if matches!(mode, OpenMode::ReadWrite) {
+            verify_local_create_if_absent(&root, storage.as_ref()).await?;
+        }
         // Open the coordinator first so the schema-staging recovery sweep can
         // compare its snapshot against any leftover staging files.
         let control_session = lance_access.control_session();
@@ -3239,6 +3251,27 @@ fn validate_bound_catalog_against_snapshot(catalog: &Catalog, snapshot: &Snapsho
 fn read_schema_shape_from_source(schema_source: &str) -> Result<SchemaShape> {
     let schema_ast = parse_schema(schema_source)?;
     compile_schema_shape(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
+}
+
+/// Name of the transient object a read-write bind writes and deletes to
+/// prove the local filesystem supports atomic create-if-absent.
+const CREATE_IF_ABSENT_PROBE_FILENAME: &str = "__create_if_absent_probe";
+
+/// Refuse a local read-write bind (`init`, or `open` for read-write) whose
+/// filesystem cannot do atomic create-if-absent (no `hard_link(2)`: Android
+/// app storage, FAT/exFAT — issue #453). The `_schema.pg` claim and every
+/// Lance commit need it on every write, and it is a property of the mount
+/// behind the root (a store can be copied), so probe per root, per bind.
+async fn verify_local_create_if_absent(root: &str, storage: &dyn StorageAdapter) -> Result<()> {
+    if storage_kind_for_uri(root) != StorageKind::Local {
+        return Ok(());
+    }
+    crate::failpoints::maybe_fail(crate::failpoints::names::LOCAL_CREATE_IF_ABSENT_PROBE)?;
+    let probe_uri = join_uri(root, CREATE_IF_ABSENT_PROBE_FILENAME);
+    // Ok(false) (residue of a crashed probe) still proves the capability:
+    // reporting "already exists" requires the hard link to have run.
+    storage.write_text_if_absent(&probe_uri, "").await?;
+    storage.delete(&probe_uri).await
 }
 
 /// `--force` may replace orphan schema files, but it must never mint a new

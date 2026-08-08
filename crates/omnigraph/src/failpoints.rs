@@ -116,6 +116,11 @@ pub mod names {
     pub const INIT_AFTER_COORDINATOR_INIT: &str = "init.after_coordinator_init";
     pub const INIT_AFTER_SCHEMA_CONTRACT_WRITTEN: &str = "init.after_schema_contract_written";
     pub const INIT_AFTER_SCHEMA_PG_WRITTEN: &str = "init.after_schema_pg_written";
+    /// A read-write bind of a local graph root, before the create-if-absent
+    /// probe writes its probe object. Injecting here simulates a filesystem
+    /// without hard-link support (issue #453) for both `init` and
+    /// read-write `open`.
+    pub const LOCAL_CREATE_IF_ABSENT_PROBE: &str = "storage.local_create_if_absent_probe";
     pub const MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE: &str =
         "mutation.delete_node_pre_primary_delete";
     /// After every deferred first-touch table ref is created under a durable
