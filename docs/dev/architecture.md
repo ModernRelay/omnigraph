@@ -56,7 +56,7 @@ flowchart TB
         srv[omnigraph-server<br/>Axum + Cedar]:::l2
     end
 
-    subgraph compiler[omnigraph-compiler]
+    subgraph compiler[omnigraph::compiler]
         front[parse → AST → typecheck → catalog → IR]:::l2
     end
 
@@ -93,7 +93,7 @@ yet one complete substrate trait; that planner-facing boundary remains roadmap.
 
 ## Component zoom-ins
 
-### Compiler — `omnigraph-compiler`
+### Compiler — `omnigraph::compiler`
 
 ```mermaid
 flowchart LR
@@ -112,14 +112,14 @@ flowchart LR
     tc --> low --> ir
 ```
 
-The compiler crate has zero Lance dependency. It owns the schema language, the query language, and the AST → IR lowering.
+The compiler module has zero Lance dependency. It owns the schema language, the query language, and the AST → IR lowering.
 
 Code paths:
 
-- Parser: `crates/omnigraph-compiler/src/query/parser.rs`, `crates/omnigraph-compiler/src/query/query.pest`
-- Typecheck: `crates/omnigraph-compiler/src/query/typecheck.rs:83` (`typecheck_query`)
-- Lower: `crates/omnigraph-compiler/src/ir/lower.rs:11` (`lower_query`)
-- Catalog: `crates/omnigraph-compiler/src/catalog/`
+- Parser: `crates/omnigraph/src/compiler/query/parser.rs`, `crates/omnigraph/src/compiler/query/query.pest`
+- Typecheck: `crates/omnigraph/src/compiler/query/typecheck.rs:83` (`typecheck_query`)
+- Lower: `crates/omnigraph/src/compiler/ir/lower.rs:11` (`lower_query`)
+- Catalog: `crates/omnigraph/src/compiler/catalog/`
 
 ### Engine — `omnigraph` crate
 
@@ -148,7 +148,7 @@ flowchart TB
     subgraph io[Lance I/O]
         la[LanceAccessContext<br/>shared store registry<br/>split data/control sessions]:::l2
         ts[table_store]:::l2
-        st[control-object storage<br/>omnigraph-storage<br/>+ engine facade]:::l2
+        st[control-object storage<br/>omnigraph::storage_backend<br/>+ engine facade]:::l2
     end
 
     eq --> gi
@@ -370,10 +370,10 @@ Throughout the docs, capabilities are split into:
 
 ## Workspace crates
 
-- `omnigraph-compiler` — schema and query grammars, catalog, IR, lowering, type checker, lint, migration planner, OpenAI-style embedding client.
-- `omnigraph-storage` — the shared local/S3 control-object storage implementation and concrete backend handle used below the engine/cluster split.
-- `omnigraph` (engine, published as `omnigraph-engine` on crates.io since v0.2.2) — the Lance-backed runtime: manifest, commit graph, snapshot, exec (incl. per-query `MutationStaging` accumulator), merge, loader, Gemini embedding client.
-- `omnigraph-policy` — Cedar policy compilation and engine-facing enforcement.
+- `omnigraph-db` (dir `crates/omnigraph`; lib imported as `omnigraph`; the one published crate — earlier releases published it as `omnigraph-engine`) — the Lance-backed runtime: manifest, commit graph, snapshot, exec (incl. per-query `MutationStaging` accumulator), merge, loader, Gemini embedding client. Also carries three merged former sibling crates as modules:
+  - `omnigraph::compiler` — schema and query grammars, catalog, IR, lowering, type checker, lint, migration planner, OpenAI-style embedding client.
+  - `omnigraph::storage_backend` — the shared local/S3 control-object storage implementation and concrete backend handle used below the engine/cluster split.
+  - `omnigraph::policy` — Cedar policy compilation and engine-facing enforcement.
 - `omnigraph-api-types` — shared HTTP wire DTOs used by the server and CLI.
 - `omnigraph-cluster` — cluster config validation, planning, persisted state-lock ownership, state, and apply.
 - `omnigraph-cli` — the `omnigraph` binary.

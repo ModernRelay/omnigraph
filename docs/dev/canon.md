@@ -206,7 +206,7 @@ CLI (omnigraph)        HTTP Server (omnigraph-server: Axum + Cedar + admission)
         │                            │
         └─────────────┬──────────────┘
                       ▼
-           omnigraph-compiler   Pest grammars (.pg / .gq), catalog, typecheck,
+           omnigraph::compiler  Pest grammars (.pg / .gq), catalog, typecheck,
                       │         IR lowering, lint, migration planning — zero Lance dependency
                       ▼
            omnigraph (engine)   exec (query/mutation/loader), MutationStaging,
@@ -222,9 +222,9 @@ CLI (omnigraph)        HTTP Server (omnigraph-server: Axum + Cedar + admission)
            object store         local FS · S3 · RustFS · MinIO · S3-compatible
 ```
 
-Workspace crates: `omnigraph-compiler`, `omnigraph` (package name
-`omnigraph-engine` — the directory and package names differ),
-`omnigraph-storage` (shared control-object storage), `omnigraph-policy`,
+Workspace crates: `omnigraph-db` (dir `crates/omnigraph`, lib imported as
+`omnigraph` — the one published crate, carrying the `compiler`,
+`storage_backend`, and `policy` modules), plus four `publish = false` members:
 `omnigraph-api-types` (shared wire DTOs), `omnigraph-cluster` (control plane and
 persisted state-lock ownership), `omnigraph-cli`, `omnigraph-server`. Full
 diagrams and code paths: [architecture.md](architecture.md).

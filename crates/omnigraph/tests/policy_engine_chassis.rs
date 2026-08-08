@@ -37,7 +37,7 @@ use helpers::*;
 /// The rule split mirrors the per-action scope convention: Change uses
 /// `branch_scope`; SchemaApply, BranchCreate, BranchDelete, BranchMerge
 /// use `target_branch_scope` (see `PolicyAction::uses_branch_scope` and
-/// `uses_target_branch_scope` in `omnigraph-policy`).
+/// `uses_target_branch_scope` in `omnigraph::policy`).
 const POLICY_YAML: &str = r#"
 version: 1
 groups:

@@ -1,12 +1,12 @@
 [package]
-name = "omnigraph-engine"
+name = "omnigraph-db"
 version = "0.9.0"
 edition = "2024"
-description = "Runtime engine for the Omnigraph graph database."
+description = "OmniGraph — lakehouse graph database for context assembly & multi-agent coordination. Embedded engine, schema/query compiler, and Cedar policy in one crate (imported as `omnigraph`)."
 license = "MIT"
 repository = "https://github.com/ModernRelay/omnigraph"
 homepage = "https://github.com/ModernRelay/omnigraph"
-documentation = "https://docs.rs/omnigraph-engine"
+documentation = "https://docs.rs/omnigraph-db"
 
 [lib]
 name = "omnigraph"

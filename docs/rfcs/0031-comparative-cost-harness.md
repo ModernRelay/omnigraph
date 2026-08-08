@@ -311,7 +311,7 @@ dependencies; and a Rust crate keeps environment stamping and the record schema
 honest in a way shell scripts do not. It is an ordinary workspace member with
 `publish = false`; its fast parser/reporter/proxy/record-contract tests run
 under the canonical `cargo test --workspace --locked --features
-omnigraph-engine/failpoints,omnigraph-cluster/failpoints` graph. Only the
+omnigraph-db/failpoints,omnigraph-cluster/failpoints` graph. Only the
 external measurement grids are excluded from that command. Subprocess, `wait4`, binary-
 identity, clean-tree, stamping, and JSONL primitives are shared with
 `benches/scenarios.rs` through a dependency-neutral library surface rather than

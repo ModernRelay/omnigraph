@@ -2,6 +2,7 @@
 name = "omnigraph-cli"
 version = "0.9.0"
 edition = "2024"
+publish = false
 description = "CLI for the Omnigraph graph database."
 license = "MIT"
 repository = "https://github.com/ModernRelay/omnigraph"
@@ -13,7 +14,7 @@ name = "omnigraph"
 path = "src/main.rs"
 
 [dependencies]
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.9.0" }
+omnigraph = { package = "omnigraph-db", path = "../omnigraph", version = "0.9.0" }
 omnigraph-api-types = { path = "../omnigraph-api-types", version = "0.9.0" }
 omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.9.0" }
 omnigraph-server = { path = "../omnigraph-server", version = "0.9.0" }

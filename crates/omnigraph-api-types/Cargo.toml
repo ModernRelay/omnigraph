@@ -2,6 +2,7 @@
 name = "omnigraph-api-types"
 version = "0.9.0"
 edition = "2024"
+publish = false
 description = "Shared HTTP wire DTOs for Omnigraph — request/response types and engine-result → DTO mappings used by both omnigraph-server and omnigraph-cli (RFC-009). Plain serde/utoipa types; no transport or server internals."
 license = "MIT"
 repository = "https://github.com/ModernRelay/omnigraph"
@@ -9,7 +10,7 @@ homepage = "https://github.com/ModernRelay/omnigraph"
 documentation = "https://docs.rs/omnigraph-api-types"
 
 [dependencies]
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.9.0" }
+omnigraph = { package = "omnigraph-db", path = "../omnigraph", version = "0.9.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 utoipa = { workspace = true }

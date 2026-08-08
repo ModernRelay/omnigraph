@@ -2237,7 +2237,7 @@ advancement semantics.
 Run the production-size instrument explicitly:
 
 ```bash
-cargo test -p omnigraph-engine --features failpoints --test memwal_stream_cost f6b4_dead_letter_object_records_production_envelope_and_peak_rss -- --ignored --exact --nocapture
+cargo test -p omnigraph-db --features failpoints --test memwal_stream_cost f6b4_dead_letter_object_records_production_envelope_and_peak_rss -- --ignored --exact --nocapture
 ```
 
 ### 7.1 Operational guardrails

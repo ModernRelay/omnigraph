@@ -2,6 +2,7 @@
 name = "omnigraph-cluster"
 version = "0.9.0"
 edition = "2024"
+publish = false
 description = "Cluster configuration validation, planning, and config-only apply for Omnigraph."
 license = "MIT"
 repository = "https://github.com/ModernRelay/omnigraph"
@@ -14,7 +15,7 @@ documentation = "https://docs.rs/omnigraph-cluster"
 failpoints = ["dep:fail", "fail/failpoints", "omnigraph/failpoints"]
 
 [dependencies]
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.9.0" }
+omnigraph = { package = "omnigraph-db", path = "../omnigraph", version = "0.9.0" }
 fail = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -4,7 +4,7 @@
 
 Pipeline:
 
-1. Parse + typecheck via `omnigraph-compiler`.
+1. Parse + typecheck via `omnigraph::compiler`.
 2. Lower to IR.
 3. If `Expand` or `AntiJoin` is present, build (or fetch from `RuntimeCache`) a `GraphIndex` **scoped to the edge types the query actually traverses** (`referenced_edge_types`, recursing through `AntiJoin` inners) — not every edge type in the catalog. The CSR build full-scans each covered edge dataset, so scoping is what keeps a single-edge join (`$x identifiesPerson $p`) from scanning the whole graph's edge data. The `RuntimeCache` key is each covered edge table's **physical identity** `(stable_table_id, incarnation_id, table_key, version, table_branch, e_tag)` (not the resolved snapshot id), so a `{Knows}` index and a `{Knows, WorksAt}` index are distinct entries AND a lazy-fork branch whose edge tables physically *are* main's reuses main's built index instead of cold-scanning it.
 4. Run `execute_query` against the snapshot.
@@ -16,7 +16,7 @@ sequenceDiagram
     autonumber
     participant client as Client
     participant og as Omnigraph::query<br/>(query.rs:7)
-    participant cmp as omnigraph-compiler
+    participant cmp as omnigraph::compiler
     participant exec as execute_query<br/>(query.rs:347)
     participant gi as GraphIndex<br/>(RuntimeCache)
     participant ts as table_store
@@ -110,7 +110,7 @@ sequenceDiagram
     autonumber
     participant client as Client
     participant og as Omnigraph::mutate_as<br/>(mutation.rs)
-    participant cmp as omnigraph-compiler
+    participant cmp as omnigraph::compiler
     participant stg as MutationStaging<br/>(exec/staging.rs)
     participant ts as table_store
     participant rec as identity-bearing v9 recovery sidecar

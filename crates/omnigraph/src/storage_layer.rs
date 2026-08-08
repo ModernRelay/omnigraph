@@ -94,7 +94,7 @@ impl PendingScanBudget {
 // ─── sealed module ──────────────────────────────────────────────────────────
 
 pub(crate) mod sealed {
-    /// Sealed marker — only types defined in `omnigraph-engine` can
+    /// Sealed marker — only types defined in `omnigraph-db` can
     /// implement `TableStorage`. Combined with the trait being the only
     /// route to write APIs from engine code, this gives type-system
     /// enforcement of the staged-write invariant.

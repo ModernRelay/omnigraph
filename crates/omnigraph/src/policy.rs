@@ -122,7 +122,7 @@ impl PolicyAction {
 }
 
 /// Which Cedar entity an action's policies apply to. Internal to
-/// `omnigraph-policy` — drives the `compile_policy_source` template
+/// `omnigraph::policy` — drives the `compile_policy_source` template
 /// and the request-time resource UID construction.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PolicyResourceKind {
@@ -824,7 +824,7 @@ fn policy_schema_source() -> &'static str {
     // MR-668: `entity Server;` plus the `graph_list` action that
     // binds to it. Per-graph actions stay bound to `Graph`.
     // The Cedar schema string lives here (not on a fixture file) so any
-    // omnigraph-policy build picks up the new vocabulary in lock-step
+    // omnigraph::policy build picks up the new vocabulary in lock-step
     // with the Rust code.
     r#"
 namespace Omnigraph {

@@ -5012,7 +5012,7 @@ dependencies = [
 name = "omnigraph-api-types"
 version = "0.9.0"
 dependencies = [
- "omnigraph-engine",
+ "omnigraph-db",
  "serde",
  "serde_json",
  "utoipa",
@@ -5030,7 +5030,7 @@ dependencies = [
  "lance-index",
  "omnigraph-api-types",
  "omnigraph-cluster",
- "omnigraph-engine",
+ "omnigraph-db",
  "omnigraph-server",
  "predicates",
  "reqwest 0.12.28",
@@ -5046,7 +5046,7 @@ name = "omnigraph-cluster"
 version = "0.9.0"
 dependencies = [
  "fail",
- "omnigraph-engine",
+ "omnigraph-db",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -5060,7 +5060,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "omnigraph-engine"
+name = "omnigraph-db"
 version = "0.9.0"
 dependencies = [
  "ahash",
@@ -5130,7 +5130,7 @@ dependencies = [
  "lance-index",
  "omnigraph-api-types",
  "omnigraph-cluster",
- "omnigraph-engine",
+ "omnigraph-db",
  "regex",
  "serde",
  "serde_json",

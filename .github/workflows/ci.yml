@@ -163,7 +163,7 @@ jobs:
     #     reports would leave every PR permanently pending);
     # (2) run the full suite locally before merging risky changes
     #     (`cargo test --workspace --locked --features
-    #     omnigraph-engine/failpoints,omnigraph-cluster/failpoints`), or trigger
+    #     omnigraph-db/failpoints,omnigraph-cluster/failpoints`), or trigger
     #     this workflow via the Actions "Run workflow" button on your branch;
     # (3) openapi.json is not auto-regenerated — regenerate it locally for
     #     server/API changes
@@ -220,7 +220,7 @@ jobs:
           # failure behind it, which makes later regressions unattributable
           # (suite order decided what CI could see, not what was broken).
           cargo test --workspace --locked --no-fail-fast \
-            --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
+            --features omnigraph-db/failpoints,omnigraph-cluster/failpoints \
             -- --nocapture 2>&1 | tee "$test_log"
 
 
@@ -462,7 +462,7 @@ jobs:
           set -euo pipefail
           test_log="$RUNNER_TEMP/rustfs-default.log"
           cargo test --locked \
-            -p omnigraph-engine \
+            -p omnigraph-db \
             -p omnigraph-server \
             -p omnigraph-cluster \
             -p omnigraph-cli \
@@ -503,7 +503,7 @@ jobs:
       # performance/cost contracts belong in a dedicated perf harness on a stable
       # runner + own cadence, not on the every-merge correctness path. Moved out of
       # CI pending that harness; run it on demand with a bucket set:
-      #   OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-engine --test write_cost_s3
+      #   OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-db --test write_cost_s3
 
       - name: Run RustFS recovery-sidecar lifecycle
         if: matrix.shard == 'failpoints'
@@ -515,7 +515,7 @@ jobs:
         # with 0 tests matched) if those tests are ever renamed.
         run: |
           set +e
-          output=$(cargo test --locked -p omnigraph-engine --features failpoints --test failpoints s3_ -- --nocapture 2>&1); status=$?
+          output=$(cargo test --locked -p omnigraph-db --features failpoints --test failpoints s3_ -- --nocapture 2>&1); status=$?
           set -e
           echo "$output"
           [ "$status" -eq 0 ] || exit "$status"

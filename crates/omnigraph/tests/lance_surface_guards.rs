@@ -8,13 +8,13 @@
 //! rather than into wrong-state recovery in production.
 //!
 //! Pair this file with `docs/dev/lance.md`'s alignment audit stanza: any
-//! Lance bump runs `cargo test -p omnigraph-engine --test lance_surface_guards`
+//! Lance bump runs `cargo test -p omnigraph-db --test lance_surface_guards`
 //! first as the smoke check.
 //!
 //! ## Compile-only guards
 //!
 //! Functions prefixed with `_compile_` are gated with a broad `#[allow(...)]`
-//! and never called. They exist to make `cargo build -p omnigraph-engine --tests`
+//! and never called. They exist to make `cargo build -p omnigraph-db --tests`
 //! enforce the API shape. Using `unimplemented!()` as a placeholder lets type
 //! inference proceed without running anything.
 //!

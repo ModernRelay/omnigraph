@@ -99,7 +99,7 @@ actually controls:
    delegate, not a third implementation. The lower injection constructor is
    available only through a non-default
    `omnigraph-storage/adversarial-harness` feature;
-   `omnigraph-engine/failpoints` enables that feature for integration tests.
+   `omnigraph-db/failpoints` enables that feature for integration tests.
    `#[cfg(test)]` alone is insufficient because dependency crates are not built
    with it for an engine integration test. Both fronts model successful
    multipart initiation before returning the wrapped upload, then wrap part,

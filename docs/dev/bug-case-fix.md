@@ -213,5 +213,5 @@ tests because Lance reads `"col"` as a string literal — see Part 2).
 5. **Index preservation:** keep or add a plan/trace assertion that the
    camelCase `@index` equality predicate still reaches the scalar-index path.
    A result-only test can pass while silently falling back to a full scan.
-6. Run the full engine suite (`cargo test -p omnigraph-engine`) — in particular
+6. Run the full engine suite (`cargo test -p omnigraph-db`) — in particular
    the existing BTREE index-eligibility tests, which `ident()` must not disturb.

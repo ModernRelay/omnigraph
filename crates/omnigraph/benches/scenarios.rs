@@ -16,13 +16,13 @@
 //! needs crash isolation, not a bench failure).
 //!
 //! Run:
-//!   cargo bench -p omnigraph-engine --bench scenarios -- \
+//!   cargo bench -p omnigraph-db --bench scenarios -- \
 //!     --scenario merge-all-changed --rows 20000 --dims 256
-//!   cargo bench -p omnigraph-engine --bench scenarios -- \
+//!   cargo bench -p omnigraph-db --bench scenarios -- \
 //!     --scenario nearest-prefilter --rows 100000 --dims 64 --selectivity 0.05
-//!   cargo bench -p omnigraph-engine --bench scenarios -- \
+//!   cargo bench -p omnigraph-db --bench scenarios -- \
 //!     --scenario fenced-small-upsert --rows 100000 --dims 256
-//!   cargo bench -p omnigraph-engine --bench scenarios -- \
+//!   cargo bench -p omnigraph-db --bench scenarios -- \
 //!     --scenario fenced-adopt-all-new --rows 100000 --dims 256
 //!
 //! Mechanism: the parent re-invokes `current_exe()` with `--child` per run (or

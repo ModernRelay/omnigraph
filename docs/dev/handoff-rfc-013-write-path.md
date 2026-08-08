@@ -651,11 +651,11 @@ for #298** (which built none of those constructs) but are **load-bearing constra
 
 ## 10. Verification (the gate)
 - `cargo test --workspace --locked` — the canonical gate (matches CI).
-- `cargo test -p omnigraph-engine --features failpoints --test failpoints optimize` —
+- `cargo test -p omnigraph-db --features failpoints --test failpoints optimize` —
   the optimize concurrency/recovery tests.
-- `cargo test -p omnigraph-engine --test write_cost` / `write_cost_s3` (bucket-gated) —
+- `cargo test -p omnigraph-db --test write_cost` / `write_cost_s3` (bucket-gated) —
   cost gates (3b adds the schema-once + open-count asserts here).
-- `cargo test -p omnigraph-engine --test maintenance` — optimize/repair/cleanup.
+- `cargo test -p omnigraph-db --test maintenance` — optimize/repair/cleanup.
 - Re-read [`invariants.md`](invariants.md), [`lance.md`](lance.md), [`testing.md`](testing.md)
   before each change (always-on requirement).
 

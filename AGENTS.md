@@ -17,7 +17,7 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
 **Version surveyed:** 0.9.0
-**Workspace crates:** `omnigraph-compiler`, `omnigraph-storage` (shared control-object storage), `omnigraph` (engine), `omnigraph-policy`, `omnigraph-api-types` (shared HTTP wire DTOs), `omnigraph-cluster`, `omnigraph-cli`, `omnigraph-server`
+**Workspace crates:** `omnigraph-db` (dir `crates/omnigraph`; the one published crate — engine plus the `compiler`, `storage_backend`, and `policy` modules; lib imported as `omnigraph`), and four `publish = false` members: `omnigraph-api-types` (shared HTTP wire DTOs), `omnigraph-cluster`, `omnigraph-cli`, `omnigraph-server`
 **Storage substrate:** Lance 9.0.0 (columnar, versioned, branchable; crates.io release — the 9.x git-rev pin era ended 2026-07-25)
 **License:** MIT
 **Toolchain:** Rust stable, edition 2024
@@ -61,7 +61,7 @@ CLI (omnigraph)        HTTP Server (omnigraph-server, Axum)
         │                            │
         └─────────────┬──────────────┘
                       ▼
-           omnigraph-compiler  ── Pest grammars, catalog, IR, lowering, lint, migration plan
+           omnigraph::compiler ── Pest grammars, catalog, IR, lowering, lint, migration plan
                       │
                       ▼
            omnigraph (engine)  ── ManifestCoordinator, CommitGraph, RunRegistry, GraphIndex (CSR/CSC), exec
@@ -195,28 +195,28 @@ If a proposal fits one of these, the burden is on the proposer to justify why th
 
 ## Build, test, lint
 
-Rust stable workspace (edition 2024). `protoc` is a build dependency (`brew install protobuf` / `apt-get install protobuf-compiler libprotobuf-dev`). **Crate dir ≠ package name** for the engine: the directory is `crates/omnigraph` but its Cargo package is `omnigraph-engine` (use that in `-p`). The CLI binary built from `omnigraph-cli` is named `omnigraph`.
+Rust stable workspace (edition 2024). `protoc` is a build dependency (`brew install protobuf` / `apt-get install protobuf-compiler libprotobuf-dev`). **Crate dir ≠ package name** for the engine: the directory is `crates/omnigraph` but its Cargo package is `omnigraph-db` (use that in `-p`). The CLI binary built from `omnigraph-cli` is named `omnigraph`.
 
 ```bash
 cargo build --workspace --locked              # build everything
-cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+cargo test --workspace --locked --features omnigraph-db/failpoints,omnigraph-cluster/failpoints
                                                 # canonical CI test graph (one feature-superset build)
 cargo run -p omnigraph-cli -- <args>          # run the `omnigraph` CLI from source
 cargo run -p omnigraph-server -- --cluster <dir|s3://...> --bind 0.0.0.0:8080   # run the server from source
 
 # Run one crate / one test file / one test fn
-cargo test -p omnigraph-engine --test traversal           # one integration-test file (see docs/dev/testing.md)
-cargo test -p omnigraph-engine --test writes concurrent   # one test fn by name substring
-cargo test -p omnigraph-engine some_inline_test -- --nocapture   # show stdout
+cargo test -p omnigraph-db --test traversal           # one integration-test file (see docs/dev/testing.md)
+cargo test -p omnigraph-db --test writes concurrent   # one test fn by name substring
+cargo test -p omnigraph-db some_inline_test -- --nocapture   # show stdout
 
 # Focused feature-gated suites
-cargo test -p omnigraph-engine --features failpoints --test failpoints   # fault injection
+cargo test -p omnigraph-db --features failpoints --test failpoints   # fault injection
 cargo test -p omnigraph-server --features aws    # AWS Secrets Manager bearer-token source (CI runs this suite too)
 ```
 
 S3-backed tests (`s3_storage`, and the S3 paths in server/CLI system tests) **skip** unless `OMNIGRAPH_S3_TEST_BUCKET` + `AWS_*` (incl. `AWS_ENDPOINT_URL_S3` for non-AWS) are set; CI runs them against containerized RustFS. To run RustFS/MinIO yourself, see [docs/user/deployment.md](docs/user/deployment.md) → *Testing against S3 locally*.
 
-CI does **not** run `clippy` or `rustfmt` as gates. Its canonical test graph is `cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints`, which compiles the current tree once with failpoint hooks present but inert unless a test configures one; run it before pushing. The immediate-predecessor format fence and the default/failpoint configured-RustFS graphs are separate parallel jobs. Two non-test CI checks are `scripts/check-agents-md.sh` (doc cross-link integrity — run it after moving/renaming docs) and OpenAPI drift (`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json`; set `OMNIGRAPH_UPDATE_OPENAPI=1` to update the checked-in copy when a server/API change is intentional).
+CI does **not** run `clippy` or `rustfmt` as gates. Its canonical test graph is `cargo test --workspace --locked --features omnigraph-db/failpoints,omnigraph-cluster/failpoints`, which compiles the current tree once with failpoint hooks present but inert unless a test configures one; run it before pushing. The immediate-predecessor format fence and the default/failpoint configured-RustFS graphs are separate parallel jobs. Two non-test CI checks are `scripts/check-agents-md.sh` (doc cross-link integrity — run it after moving/renaming docs) and OpenAPI drift (`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json`; set `OMNIGRAPH_UPDATE_OPENAPI=1` to update the checked-in copy when a server/API change is intentional).
 
 ## Quick-reference flows
 
