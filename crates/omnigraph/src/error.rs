@@ -132,6 +132,22 @@ pub enum OmniError {
         operation_id: String,
         reason: String,
     },
+    /// A caller-supplied write precondition named a branch head commit that
+    /// is no longer (or never was) the branch's current head. The write had
+    /// no effect. Distinct from `ReadSetChanged`: that is the engine's own
+    /// authority check and may be reprepared, while this is the caller's
+    /// compare-and-swap token, so it is terminal — retrying against a newer
+    /// head would silently discard the condition the caller asked for.
+    /// `actual` is `None` on a branch with no commits.
+    #[error(
+        "precondition failed on branch '{branch}': expected head '{expected}' but current is {}",
+        actual.as_deref().unwrap_or("<absent>")
+    )]
+    PreconditionFailed {
+        branch: String,
+        expected: String,
+        actual: Option<String>,
+    },
     /// Engine-layer policy enforcement (MR-722). Wraps either a policy
     /// denial ("you can't do that") or a policy-evaluation failure
     /// ("the policy engine itself blew up"). The HTTP layer maps
@@ -268,6 +284,18 @@ impl OmniError {
                 },
             ),
         )
+    }
+
+    pub fn precondition_failed(
+        branch: impl Into<String>,
+        expected: impl Into<String>,
+        actual: Option<String>,
+    ) -> Self {
+        Self::PreconditionFailed {
+            branch: branch.into(),
+            expected: expected.into(),
+            actual,
+        }
     }
 
     pub fn recovery_required(operation_id: impl Into<String>, reason: impl Into<String>) -> Self {

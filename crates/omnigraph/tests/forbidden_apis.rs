@@ -221,7 +221,7 @@ macro_rules! write_surfaces {
 write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options"],
     "db/omnigraph.rs" => WriteProtocol::RecoveryExecutor => ["open", "open_with_storage", "refresh"],
-    "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_as"],
+    "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_as", "mutate_as_with_expected_head"],
     "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_file", "load_graph_batch"],
     "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v9") => ["load_as", "load_file_as", "load_graph_batch_as"],
     "loader/mod.rs" => WriteProtocol::Composed("branch create when absent, then Load v9 alias") => ["ingest", "ingest_as", "ingest_file", "ingest_file_as"],
@@ -265,6 +265,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "list_commits"),
     ("exec/query.rs", "query"),
+    ("exec/query.rs", "query_with_head"),
     ("exec/query.rs", "run_query_at"),
 ];
 

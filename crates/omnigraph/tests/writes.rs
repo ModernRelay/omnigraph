@@ -2256,3 +2256,137 @@ async fn filtered_read_after_append_and_delete_is_consistent() {
         assert_eq!(got, expected, "filtered read for {name}");
     }
 }
+
+async fn head_commit_id(uri: &str) -> String {
+    CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .expect("loaded graph has at least one commit")
+        .graph_commit_id
+}
+
+/// GitHub #365: `mutate_as_with_expected_head` is a caller-facing
+/// compare-and-swap on the branch head. A stale expectation is rejected with
+/// `PreconditionFailed` carrying the exact expected/actual commit ids and
+/// produces no commit; an expectation naming the current head passes.
+#[tokio::test]
+async fn mutate_expected_head_precondition_issue_365() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    let stale_head = head_commit_id(&uri).await;
+
+    // Writer A advances the head past the commit both writers read.
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+    let current_head = head_commit_id(&uri).await;
+    assert_ne!(stale_head, current_head);
+
+    // Writer B lost the race: its stale expectation must be rejected before
+    // any effect, with the ids the caller needs to re-read and decide again.
+    let err = db
+        .mutate_as_with_expected_head(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 52)]),
+            None,
+            Some(&stale_head),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        OmniError::PreconditionFailed {
+            branch,
+            expected,
+            actual,
+        } => {
+            assert_eq!(branch, "main");
+            assert_eq!(expected, stale_head);
+            assert_eq!(actual.as_deref(), Some(current_head.as_str()));
+        }
+        other => panic!("expected PreconditionFailed, got: {other}"),
+    }
+    assert_eq!(
+        head_commit_id(&uri).await,
+        current_head,
+        "rejected precondition must not produce a commit"
+    );
+
+    // An expectation naming the current head passes and commits.
+    db.mutate_as_with_expected_head(
+        "main",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 33)]),
+        None,
+        Some(&current_head),
+    )
+    .await
+    .unwrap();
+    assert_ne!(head_commit_id(&uri).await, current_head);
+}
+
+/// Tripwire for the precondition/reprepare interaction (GitHub #365): the
+/// pre-effect retry loop replays insert-only mutations after an internal
+/// `ReadSetChanged`, and a caller precondition must never ride that replay —
+/// a retry against the fresh head would silently discard the compare-and-swap
+/// the caller asked for. `PreconditionFailed` is a distinct variant so the
+/// loop cannot classify it as retryable.
+#[tokio::test]
+async fn insert_only_mutation_stale_expected_head_is_terminal_issue_365() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+    let stale_head = head_commit_id(&uri).await;
+
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "WriterA")], &[("$age", 41)]),
+    )
+    .await
+    .unwrap();
+    let current_head = head_commit_id(&uri).await;
+
+    let err = db
+        .mutate_as_with_expected_head(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "WriterB")], &[("$age", 42)]),
+            None,
+            Some(&stale_head),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, OmniError::PreconditionFailed { .. }),
+        "insert-only mutation with a stale expectation must surface \
+         PreconditionFailed, got: {err}"
+    );
+    assert_eq!(
+        head_commit_id(&uri).await,
+        current_head,
+        "rejected insert must not produce a commit"
+    );
+    let absent = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "WriterB")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(absent.num_rows(), 0, "rejected insert must leave no row");
+}

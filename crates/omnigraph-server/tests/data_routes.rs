@@ -2063,3 +2063,171 @@ async fn ingest_per_actor_admission_cap_returns_429() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mutate_if_match_precondition_issue_365() {
+    // GitHub #365: `If-Match: <commit_id>` makes `mutate` a
+    // single-round-trip compare-and-swap. A caller that read the branch at
+    // head X must be rejected atomically (412, structured
+    // `precondition_failure`, zero effect) once the head has advanced past
+    // X; a precondition naming the current head passes.
+    fn mutate_request(body: &Value, if_match: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .uri(g("/mutate"))
+            .method(Method::POST)
+            .header("content-type", "application/json");
+        if let Some(commit_id) = if_match {
+            builder = builder.header("if-match", commit_id);
+        }
+        builder
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+    async fn alice_age(app: &axum::Router) -> Value {
+        let (status, out) = json_response(
+            app,
+            Request::builder()
+                .uri(g("/query"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "query": FIND_PERSON_GQ,
+                        "params": { "name": "Alice" },
+                        "branch": "main",
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        out["rows"][0]["p.age"].clone()
+    }
+    async fn head_commit_id(app: &axum::Router) -> String {
+        let (status, out) = json_response(
+            app,
+            Request::builder()
+                .uri(g("/commits?branch=main"))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        out["commits"]
+            .as_array()
+            .expect("commit list")
+            .iter()
+            .max_by_key(|commit| commit["manifest_version"].as_u64().unwrap())
+            .expect("loaded graph has at least one commit")["graph_commit_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    let (_temp, app) = app_for_loaded_graph().await;
+    let stale_head = head_commit_id(&app).await;
+
+    // Writer A claims first (plain mutate) — the head advances past the
+    // commit both writers read.
+    let (status, body) = json_response(
+        &app,
+        mutate_request(
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "set_age",
+                "params": { "name": "Alice", "age": 31 },
+                "branch": "main",
+            }),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "writer A's plain mutate: {body}");
+
+    // Writer B lost the race: its precondition names the now-stale head, so
+    // the store must reject before any effect.
+    let (status, body) = json_response(
+        &app,
+        mutate_request(
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "set_age",
+                "params": { "name": "Alice", "age": 52 },
+                "branch": "main",
+            }),
+            Some(&stale_head),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PRECONDITION_FAILED,
+        "stale If-Match must be rejected with 412, got {status}: {body}"
+    );
+    let error: ErrorOutput = serde_json::from_value(body).unwrap();
+    // code stays None: closed wire contract (`recovery_required` precedent).
+    assert_eq!(error.code, None);
+    let failure = error
+        .precondition_failure
+        .expect("412 body must carry structured precondition_failure details");
+    assert_eq!(failure.expected, stale_head);
+    let current_head = head_commit_id(&app).await;
+    assert_eq!(failure.actual.as_deref(), Some(current_head.as_str()));
+    assert!(error.read_set_conflict.is_none());
+
+    // The rejected write had no effect: writer A's claim survives.
+    assert_eq!(alice_age(&app).await, 31);
+
+    // The read response itself carries the graph commit id of the snapshot
+    // the rows came from, so the caller needs no separate id fetch.
+    let (status, read_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/query"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "query": FIND_PERSON_GQ,
+                    "params": { "name": "Alice" },
+                    "branch": "main",
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let welded_id = read_body["graph_commit_id"]
+        .as_str()
+        .expect("read response must carry the snapshot's graph_commit_id")
+        .to_string();
+    assert_eq!(
+        welded_id, current_head,
+        "the read's id must equal the branch head it was served from"
+    );
+
+    // A precondition naming the CURRENT head passes — the CAS succeeds in a
+    // single round trip, using the id the read itself supplied.
+    let (status, body) = json_response(
+        &app,
+        mutate_request(
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "set_age",
+                "params": { "name": "Alice", "age": 33 },
+                "branch": "main",
+            }),
+            Some(&welded_id),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "If-Match naming the current head must pass: {body}"
+    );
+    assert_eq!(alice_age(&app).await, 33);
+}

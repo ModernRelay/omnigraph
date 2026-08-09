@@ -210,6 +210,13 @@ pub struct ReadOutput {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>,
     pub rows: Value,
+    /// Graph head commit id of the exact snapshot this read was served from
+    /// (absent on a branch with no commits). Pass it as the `If-Match` header
+    /// (CLI: `--if-commit`) of a subsequent mutation to make the write
+    /// conditional on the world these rows were read in: the id and the rows
+    /// come from one pinned version, so no separate id fetch is needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_commit_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -668,6 +675,17 @@ pub struct RecoveryRequiredOutput {
     pub operation_id: String,
 }
 
+/// Structured details for a caller write-precondition failure: HTTP 412, a
+/// mutation carried `If-Match: <commit_id>`, and the branch head no longer
+/// matches that id. The write had no effect; the caller re-reads the branch
+/// and decides again. `actual` is `None` on a branch with no commits.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PreconditionFailureOutput {
+    pub expected: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorOutput {
     pub error: String,
@@ -697,6 +715,11 @@ pub struct ErrorOutput {
     /// retry. Its table effects may or may not have started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_required: Option<RecoveryRequiredOutput>,
+    /// Set when a mutation's `If-Match` branch-head precondition failed
+    /// (HTTP 412). Like `recovery_required`, the meaning rides this additive
+    /// field — `ErrorCode` is a closed rolling wire contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precondition_failure: Option<PreconditionFailureOutput>,
 }
 
 pub fn snapshot_payload(
@@ -747,7 +770,12 @@ pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
     }
 }
 
-pub fn read_output(query_name: String, target: &ReadTarget, result: QueryResult) -> ReadOutput {
+pub fn read_output(
+    query_name: String,
+    target: &ReadTarget,
+    result: QueryResult,
+    graph_commit_id: Option<String>,
+) -> ReadOutput {
     let columns = result
         .schema()
         .fields()
@@ -760,6 +788,7 @@ pub fn read_output(query_name: String, target: &ReadTarget, result: QueryResult)
         row_count: result.num_rows(),
         columns,
         rows: result.to_rust_json(),
+        graph_commit_id,
     }
 }
 

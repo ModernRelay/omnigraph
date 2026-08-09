@@ -532,7 +532,7 @@ pub(crate) async fn server_read(
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<ReadRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ReadOutput>), ApiError> {
-    let (selected_name, target, result) = run_query(
+    let (selected_name, target, result, graph_commit_id) = run_query(
         handle,
         actor.as_ref().map(|Extension(actor)| actor),
         &request.query_source,
@@ -545,7 +545,12 @@ pub(crate) async fn server_read(
     .await?;
     Ok((
         deprecation_headers("<query>; rel=\"successor-version\""),
-        Json(api::read_output(selected_name, &target, result)),
+        Json(api::read_output(
+            selected_name,
+            &target,
+            result,
+            graph_commit_id,
+        )),
     ))
 }
 
@@ -577,7 +582,7 @@ pub(crate) async fn server_query(
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<QueryRequest>,
 ) -> std::result::Result<Json<ReadOutput>, ApiError> {
-    let (selected_name, target, result) = run_query(
+    let (selected_name, target, result, graph_commit_id) = run_query(
         handle,
         actor.as_ref().map(|Extension(actor)| actor),
         &request.query,
@@ -588,7 +593,12 @@ pub(crate) async fn server_query(
         true, // /query is read-only; reject mutations
     )
     .await?;
-    Ok(Json(api::read_output(selected_name, &target, result)))
+    Ok(Json(api::read_output(
+        selected_name,
+        &target,
+        result,
+        graph_commit_id,
+    )))
 }
 
 #[utoipa::path(
@@ -689,6 +699,54 @@ pub(crate) async fn server_export(
         .into_response())
 }
 
+/// Extract a mutation's `If-Match` branch-head precondition, if present.
+///
+/// Returns the expected head commit id, accepting both the bare id and the
+/// HTTP-idiomatic quoted entity-tag form (`"<id>"`). Rejects with 400:
+/// - a value that is not valid UTF-8,
+/// - an empty value (after unquoting),
+/// - `*` (HTTP "if any current representation" — a branch always has state,
+///   so the form would make every mutation pass vacuously),
+/// - a weak validator (`W/"<id>"` — head comparison is exact),
+/// - an entity-tag list (`"a", "b"` — the head equals one id, so a list is
+///   almost certainly a caller bug; rejecting beats a misleading mismatch).
+fn if_match_expected_head(
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<Option<String>, ApiError> {
+    let Some(value) = headers.get(axum::http::header::IF_MATCH) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::bad_request("If-Match header is not valid UTF-8"))?
+        .trim();
+    if value == "*" {
+        return Err(ApiError::bad_request(
+            "If-Match: * is not supported — pass the branch head commit id",
+        ));
+    }
+    if let Some(weak) = value.strip_prefix("W/") {
+        return Err(ApiError::bad_request(format!(
+            "If-Match weak validator {weak} is not supported — pass the exact branch head commit id"
+        )));
+    }
+    if value.contains(',') {
+        return Err(ApiError::bad_request(
+            "If-Match must name a single branch head commit id, not an entity-tag list",
+        ));
+    }
+    let value = value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(value);
+    if value.is_empty() {
+        return Err(ApiError::bad_request(
+            "If-Match header must name a branch head commit id",
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
 /// Shared implementation behind `POST /mutate` (canonical) and
 /// `POST /change` (deprecated alias). Returns the bare `ChangeOutput`;
 /// each route handler wraps it (the alias also attaches Deprecation
@@ -707,6 +765,7 @@ pub(crate) async fn run_mutate(
     name: Option<&str>,
     params_json: Option<&Value>,
     branch: String,
+    expected_head: Option<&str>,
 ) -> std::result::Result<ChangeOutput, ApiError> {
     let actor_arc = actor
         .map(|a| Arc::clone(&a.actor_id))
@@ -738,9 +797,16 @@ pub(crate) async fn run_mutate(
 
     let result = {
         let db = &handle.engine;
-        db.mutate_as(&branch, query, &selected_name, &params, actor_id)
-            .await
-            .map_err(ApiError::from_omni)?
+        db.mutate_as_with_expected_head(
+            &branch,
+            query,
+            &selected_name,
+            &params,
+            actor_id,
+            expected_head,
+        )
+        .await
+        .map_err(ApiError::from_omni)?
     };
     Ok(ChangeOutput {
         branch,
@@ -772,7 +838,15 @@ pub(crate) async fn run_query(
     branch: Option<String>,
     snapshot: Option<String>,
     reject_mutations: bool,
-) -> std::result::Result<(String, ReadTarget, omnigraph_compiler::result::QueryResult), ApiError> {
+) -> std::result::Result<
+    (
+        String,
+        ReadTarget,
+        omnigraph_compiler::result::QueryResult,
+        Option<String>,
+    ),
+    ApiError,
+> {
     if branch.is_some() && snapshot.is_some() {
         return Err(ApiError::bad_request(
             "request may specify branch or snapshot, not both",
@@ -812,13 +886,13 @@ pub(crate) async fn run_query(
     let params = query_params_from_json(&query_decl.params, params_json)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    let result = {
+    let (result, graph_commit_id) = {
         let db = &handle.engine;
-        db.query(target.clone(), query, &selected_name, &params)
+        db.query_with_head(target.clone(), query, &selected_name, &params)
             .await
             .map_err(ApiError::from_omni)?
     };
-    Ok((selected_name, target, result))
+    Ok((selected_name, target, result, graph_commit_id))
 }
 
 #[utoipa::path(
@@ -827,12 +901,16 @@ pub(crate) async fn run_query(
     tag = "mutations",
     operation_id = "change",
     request_body = ChangeRequest,
+    params(
+        ("If-Match" = Option<String>, Header, description = "Branch-head precondition: run only if the branch's head commit id still equals this value (from `GET /commits`). Mismatch returns 412 with `precondition_failure` details and no effect."),
+    ),
     responses(
         (status = 200, description = "Mutation results (response includes `Deprecation: true` + `Link: <mutate>; rel=\"successor-version\"`)", body = ChangeOutput),
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Write-authority conflict", body = ErrorOutput),
+        (status = 412, description = "`If-Match` branch-head precondition failed; the write had no effect", body = ErrorOutput),
         (status = 413, description = "Keyed write exceeds the per-commit row or byte ceiling", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
@@ -853,8 +931,10 @@ pub(crate) async fn server_change(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ChangeOutput>), ApiError> {
+    let expected_head = if_match_expected_head(&headers)?;
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     let output = run_mutate(
         state,
@@ -864,6 +944,7 @@ pub(crate) async fn server_change(
         request.name.as_deref(),
         request.params.as_ref(),
         branch,
+        expected_head.as_deref(),
     )
     .await?;
     Ok((
@@ -878,12 +959,16 @@ pub(crate) async fn server_change(
     tag = "mutations",
     operation_id = "mutate",
     request_body = ChangeRequest,
+    params(
+        ("If-Match" = Option<String>, Header, description = "Branch-head precondition: run only if the branch's head commit id still equals this value (from `GET /commits`). Mismatch returns 412 with `precondition_failure` details and no effect."),
+    ),
     responses(
         (status = 200, description = "Mutation results", body = ChangeOutput),
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Write-authority conflict", body = ErrorOutput),
+        (status = 412, description = "`If-Match` branch-head precondition failed; the write had no effect", body = ErrorOutput),
         (status = 413, description = "Keyed write exceeds the per-commit row or byte ceiling", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
@@ -898,14 +983,21 @@ pub(crate) async fn server_change(
 /// mutations may still acquire locks briefly. Returns 409 when the prepared
 /// write authority changes before effects.
 ///
+/// An `If-Match: <commit_id>` header makes the write conditional: it runs
+/// only if the branch's head commit still equals the given id (a
+/// compare-and-swap for read-then-write callers), and returns 412 with
+/// structured `precondition_failure` details otherwise.
+///
 /// Pairs with `POST /query` (read-only). The legacy `POST /change` route
 /// has identical semantics and is kept as a deprecated alias.
 pub(crate) async fn server_mutate(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
+    let expected_head = if_match_expected_head(&headers)?;
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     Ok(Json(
         run_mutate(
@@ -916,6 +1008,7 @@ pub(crate) async fn server_mutate(
             request.name.as_deref(),
             request.params.as_ref(),
             branch,
+            expected_head.as_deref(),
         )
         .await?,
     ))
@@ -945,7 +1038,10 @@ pub(crate) fn parse_optional_invoke_body(
     path = "/queries/{name}",
     tag = "queries",
     operation_id = "invoke_query",
-    params(("name" = String, Path, description = "Stored query name (the registry key)")),
+    params(
+        ("name" = String, Path, description = "Stored query name (the registry key)"),
+        ("If-Match" = Option<String>, Header, description = "Branch-head precondition, applied to stored mutations only: run only if the branch's head commit id still equals this value. Mismatch returns 412 with `precondition_failure` details and no effect. A valid header on a stored read has no effect; malformed values (`*`, weak, empty) are rejected with 400 for both kinds."),
+    ),
     request_body = Option<InvokeStoredQueryRequest>,
     responses(
         (status = 200, description = "Read envelope (ReadOutput) or mutation envelope (ChangeOutput), serialized untagged", body = InvokeStoredQueryResponse),
@@ -954,6 +1050,7 @@ pub(crate) fn parse_optional_invoke_body(
         (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
         (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
         (status = 409, description = "Stored mutation write-authority conflict", body = ErrorOutput),
+        (status = 412, description = "Stored mutation `If-Match` branch-head precondition failed; the write had no effect", body = ErrorOutput),
         (status = 413, description = "Stored keyed mutation exceeds the per-commit row or byte ceiling", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
@@ -977,8 +1074,10 @@ pub(crate) async fn server_invoke_query(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
+    let expected_head = if_match_expected_head(&headers)?;
     let req = parse_optional_invoke_body(body)?;
     // A caller without `invoke_query` can't tell a denial from a missing
     // query: both 404 with this exact message, so the catalog can't be
@@ -1061,11 +1160,12 @@ pub(crate) async fn server_invoke_query(
             Some(&query_name),
             req.params.as_ref(),
             branch,
+            expected_head.as_deref(),
         )
         .await?;
         Ok(Json(InvokeStoredQueryResponse::Change(output)))
     } else {
-        let (selected, target, result) = run_query(
+        let (selected, target, result, graph_commit_id) = run_query(
             handle,
             actor_ref,
             &source,
@@ -1077,7 +1177,10 @@ pub(crate) async fn server_invoke_query(
         )
         .await?;
         Ok(Json(InvokeStoredQueryResponse::Read(api::read_output(
-            selected, &target, result,
+            selected,
+            &target,
+            result,
+            graph_commit_id,
         ))))
     }
 }

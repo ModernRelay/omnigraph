@@ -292,6 +292,7 @@ pub struct ApiError {
     key_conflict: Option<Box<api::KeyConflictOutput>>,
     resource_limit: Option<Box<api::ResourceLimitOutput>>,
     recovery_required: Option<Box<api::RecoveryRequiredOutput>>,
+    precondition_failure: Option<Box<api::PreconditionFailureOutput>>,
 }
 
 impl AppState {
@@ -629,6 +630,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -643,6 +645,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -657,6 +660,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -671,6 +675,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -689,6 +694,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -703,6 +709,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -717,6 +724,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -731,6 +739,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -749,6 +758,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -774,6 +784,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -788,6 +799,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -802,6 +814,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -816,6 +829,7 @@ impl ApiError {
             key_conflict: Some(Box::new(details)),
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -830,6 +844,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: Some(Box::new(details)),
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -847,6 +862,25 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: Some(Box::new(api::RecoveryRequiredOutput { operation_id })),
+            precondition_failure: None,
+        }
+    }
+
+    /// HTTP 412 Precondition Failed — an `If-Match` branch-head precondition
+    /// no longer holds. `code` is omitted for the same closed-wire-contract
+    /// reason as [`Self::recovery_required`].
+    fn precondition_failed(message: String, details: api::PreconditionFailureOutput) -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_FAILED,
+            code: None,
+            message,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            recovery_required: None,
+            precondition_failure: Some(Box::new(details)),
         }
     }
 
@@ -917,6 +951,17 @@ impl ApiError {
             } => Self::recovery_required(
                 format!("recovery required for operation {operation_id}: {reason}"),
                 operation_id,
+            ),
+            OmniError::PreconditionFailed {
+                branch,
+                expected,
+                actual,
+            } => Self::precondition_failed(
+                format!(
+                    "precondition failed on branch '{branch}': expected head '{expected}' but current is {}",
+                    actual.as_deref().unwrap_or("<absent>")
+                ),
+                api::PreconditionFailureOutput { expected, actual },
             ),
             OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
             OmniError::RetryableCommitConflict(message) => {
@@ -990,6 +1035,7 @@ impl IntoResponse for ApiError {
                 key_conflict: self.key_conflict.map(|d| *d),
                 resource_limit: self.resource_limit.map(|d| *d),
                 recovery_required: self.recovery_required.map(|d| *d),
+                precondition_failure: self.precondition_failure.map(|d| *d),
             }),
         )
             .into_response()

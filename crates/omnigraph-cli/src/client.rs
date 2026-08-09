@@ -41,8 +41,9 @@ use serde_json::Value;
 use crate::cli::CliLoadMode;
 use crate::helpers::{
     apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
-    legacy_change_request_body, query_params_from_json, remote_json, remote_url, resolve_cli_actor,
-    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
+    legacy_change_request_body, precondition_failed_cli, query_params_from_json, remote_json,
+    remote_json_with_if_match, remote_url, resolve_cli_actor, resolve_cli_graph,
+    resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_result};
 
@@ -523,12 +524,18 @@ impl GraphClient {
 
     /// `mutate` — run a change query against `branch`. Folds
     /// `execute_change` / `execute_change_remote` + the legacy request body.
+    ///
+    /// `expected_head` is the `--if-commit` compare-and-swap precondition:
+    /// the write runs only if the branch head commit still equals it. A
+    /// mismatch surfaces as the typed [`PreconditionFailedCli`] on both
+    /// transports so the verb can exit with `EXIT_PRECONDITION_FAILED` (4).
     pub(crate) async fn mutate(
         &self,
         branch: &str,
         query_source: &str,
         query_name: Option<&str>,
         params_json: Option<&Value>,
+        expected_head: Option<&str>,
     ) -> Result<ChangeOutput> {
         match self {
             GraphClient::Remote {
@@ -536,7 +543,7 @@ impl GraphClient {
                 base_url,
                 token,
             } => {
-                remote_json(
+                remote_json_with_if_match(
                     http,
                     Method::POST,
                     remote_url(base_url, &["change"], &[])?,
@@ -547,6 +554,7 @@ impl GraphClient {
                         params_json,
                     )),
                     token.as_deref(),
+                    expected_head,
                 )
                 .await
             }
@@ -556,8 +564,26 @@ impl GraphClient {
                 let db = Self::open_embedded(uri).await?;
                 let actor = actor.as_deref();
                 let result = db
-                    .mutate_as(branch, query_source, &selected_name, &params, actor)
-                    .await?;
+                    .mutate_as_with_expected_head(
+                        branch,
+                        query_source,
+                        &selected_name,
+                        &params,
+                        actor,
+                        expected_head,
+                    )
+                    .await
+                    .map_err(|err| {
+                        let message = err.to_string();
+                        match err {
+                            omnigraph::error::OmniError::PreconditionFailed {
+                                branch: _,
+                                expected,
+                                actual,
+                            } => precondition_failed_cli(message, expected, actual).into(),
+                            other => color_eyre::eyre::Report::from(other),
+                        }
+                    })?;
                 Ok(ChangeOutput {
                     branch: branch.to_string(),
                     query_name: selected_name,
@@ -608,10 +634,10 @@ impl GraphClient {
                 let (selected_name, query_params) = select_named_query(query_source, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
                 let db = Self::open_embedded(uri).await?;
-                let result = db
-                    .query(target.clone(), query_source, &selected_name, &params)
+                let (result, graph_commit_id) = db
+                    .query_with_head(target.clone(), query_source, &selected_name, &params)
                     .await?;
-                Ok(read_output(selected_name, &target, result))
+                Ok(read_output(selected_name, &target, result, graph_commit_id))
             }
         }
     }
@@ -630,6 +656,7 @@ impl GraphClient {
         params_json: Option<&Value>,
         branch: Option<String>,
         snapshot: Option<String>,
+        expected_head: Option<&str>,
     ) -> Result<T> {
         match self {
             GraphClient::Remote {
@@ -643,12 +670,13 @@ impl GraphClient {
                     snapshot,
                     expect_mutation: Some(expect_mutation),
                 };
-                remote_json(
+                remote_json_with_if_match(
                     http,
                     Method::POST,
                     remote_url(base_url, &["queries", name], &[])?,
                     Some(serde_json::to_value(body)?),
                     token.as_deref(),
+                    expected_head,
                 )
                 .await
             }

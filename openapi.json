@@ -463,6 +463,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "Branch-head precondition: run only if the branch's head commit id still equals this value (from `GET /commits`). Mismatch returns 412 with `precondition_failure` details and no effect.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -518,6 +530,16 @@
           },
           "409": {
             "description": "Write-authority conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "`If-Match` branch-head precondition failed; the write had no effect",
             "content": {
               "application/json": {
                 "schema": {
@@ -1247,7 +1269,7 @@
           "mutations"
         ],
         "summary": "Apply a GQ mutation to a branch (canonical mutation endpoint).",
-        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.",
+        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nAn `If-Match: <commit_id>` header makes the write conditional: it runs\nonly if the branch's head commit still equals the given id (a\ncompare-and-swap for read-then-write callers), and returns 412 with\nstructured `precondition_failure` details otherwise.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.",
         "operationId": "cluster_mutate",
         "parameters": [
           {
@@ -1257,6 +1279,18 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "Branch-head precondition: run only if the branch's head commit id still equals this value (from `GET /commits`). Mismatch returns 412 with `precondition_failure` details and no effect.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -1313,6 +1347,16 @@
           },
           "409": {
             "description": "Write-authority conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "`If-Match` branch-head precondition failed; the write had no effect",
             "content": {
               "application/json": {
                 "schema": {
@@ -1443,6 +1487,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "Branch-head precondition, applied to stored mutations only: run only if the branch's head commit id still equals this value. Mismatch returns 412 with `precondition_failure` details and no effect. A valid header on a stored read has no effect; malformed values (`*`, weak, empty) are rejected with 400 for both kinds.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -1514,6 +1570,16 @@
           },
           "409": {
             "description": "Stored mutation write-authority conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Stored mutation `If-Match` branch-head precondition failed; the write had no effect",
             "content": {
               "application/json": {
                 "schema": {
@@ -2309,6 +2375,17 @@
               "$ref": "#/components/schemas/MergeConflictOutput"
             }
           },
+          "precondition_failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PreconditionFailureOutput",
+                "description": "Set when a mutation's `If-Match` branch-head precondition failed\n(HTTP 412). Like `recovery_required`, the meaning rides this additive\nfield — `ErrorCode` is a closed rolling wire contract."
+              }
+            ]
+          },
           "read_set_conflict": {
             "oneOf": [
               {
@@ -2783,6 +2860,24 @@
           "list"
         ]
       },
+      "PreconditionFailureOutput": {
+        "type": "object",
+        "description": "Structured details for a caller write-precondition failure: HTTP 412, a\nmutation carried `If-Match: <commit_id>`, and the branch head no longer\nmatches that id. The write had no effect; the caller re-reads the branch\nand decides again. `actual` is `None` on a branch with no commits.",
+        "required": [
+          "expected"
+        ],
+        "properties": {
+          "actual": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected": {
+            "type": "string"
+          }
+        }
+      },
       "QueriesCatalogOutput": {
         "type": "object",
         "description": "Response for `GET /queries`: every stored query in a graph's\nregistry, each with typed parameters.",
@@ -2892,6 +2987,13 @@
             "items": {
               "type": "string"
             }
+          },
+          "graph_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Graph head commit id of the exact snapshot this read was served from\n(absent on a branch with no commits). Pass it as the `If-Match` header\n(CLI: `--if-commit`) of a subsequent mutation to make the write\nconditional on the world these rows were read in: the id and the rows\ncome from one pinned version, so no separate id fetch is needed."
           },
           "query_name": {
             "type": "string"

@@ -240,7 +240,7 @@ fails.
 ## Error model
 
 Uniform
-`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, key_conflict?, read_set_conflict?, recovery_required?, resource_limit? }`
+`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, key_conflict?, read_set_conflict?, recovery_required?, resource_limit?, precondition_failure? }`
 with
 `code ∈ unauthorized | forbidden | bad_request | not_found | method_not_allowed | conflict | too_many_requests | internal`.
 Merge conflicts attach structured
@@ -268,7 +268,20 @@ structured field is additive and rolling-safe.
 Do not blindly resubmit the write: let a read-write open or the recovery sweep
 resolve that operation first, then retry from a fresh snapshot.
 
-HTTP status codes used include 200, 400, 401, 403, 404, 405, 409, 413,
+`precondition_failure` is set when a mutation carried an
+`If-Match: <commit_id>` branch-head precondition and the branch's head no
+longer matches that id. The HTTP status is 412 and
+`PreconditionFailureOutput { expected, actual? }` carries the id the caller
+named and the current head (`actual` is absent on a branch with no commits).
+The write had no effect and is never internally retried — losing the
+compare-and-swap is the signal the caller asked for; re-read the branch and
+decide again. Like `recovery_required`, the `code` field is omitted (closed
+enum); detect this outcome by the 412 status or the presence of the field.
+`If-Match` is honored on `POST /mutate`, `POST /change`, and stored-mutation
+invocation via `POST /queries/{name}`; the id comes from `GET /commits`. The
+`*` and weak (`W/"..."`) entity-tag forms are rejected with 400.
+
+HTTP status codes used include 200, 400, 401, 403, 404, 405, 409, 412, 413,
 415, 429, 500, and 503.
 
 ## Per-actor admission control

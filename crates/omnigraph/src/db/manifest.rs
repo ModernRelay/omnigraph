@@ -147,6 +147,12 @@ pub struct Snapshot {
     root_uri: String,
     version: u64,
     entries: HashMap<String, SubTableEntry>,
+    /// Exact materialized `graph_head:<branch>` commit ids from this SAME
+    /// pinned manifest version (see `ManifestState::graph_heads`). Carried so
+    /// a read can report the commit id of the world it was served from —
+    /// resolving the head separately (e.g. via `CommitGraph`) could pair this
+    /// snapshot's tables with a different version's head.
+    graph_heads: HashMap<String, String>,
     /// Per-graph read caches (shared `Session` + held-handle cache), injected by
     /// `Omnigraph::resolved_target` for live Branch reads so table opens reuse
     /// handles (0 IO on a warm repeat) and one `Session`. `None` for write-prelude
@@ -317,6 +323,17 @@ impl SnapshotTable {
 }
 
 impl Snapshot {
+    /// Exact `graph_head:<branch>` commit id from this snapshot's own pinned
+    /// manifest version (`None` = main). Absent on a branch with no commits.
+    ///
+    /// The value a caller passes back as an `If-Match` / `--if-commit`
+    /// precondition: same pinned version as every table this snapshot reads,
+    /// so it certifies exactly the world those reads observed.
+    pub fn graph_head(&self, branch: Option<&str>) -> Option<&str> {
+        let branch_key = branch.unwrap_or(MAIN_BRANCH_HEAD_KEY);
+        self.graph_heads.get(branch_key).map(String::as_str)
+    }
+
     /// Bind the current accepted catalog's aliases onto a historical snapshot
     /// by immutable table identity for query execution.
     ///
@@ -749,6 +766,7 @@ impl ManifestCoordinator {
                 .into_iter()
                 .map(|entry| (entry.table_key.clone(), entry))
                 .collect(),
+            graph_heads: state.graph_heads,
             read_caches: None,
         }
     }

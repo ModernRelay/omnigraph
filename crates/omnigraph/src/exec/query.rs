@@ -35,6 +35,25 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
+        self.query_with_head(target, query_source, query_name, params)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// [`Self::query`] additionally returning the graph head commit id of the
+    /// exact snapshot the query executed against (`None` on a branch with no
+    /// commits, or when the target's branch cannot be resolved).
+    ///
+    /// The id comes from the same pinned version as every table read — the
+    /// value a caller passes to [`Self::mutate_as_with_expected_head`] for a
+    /// read-then-write compare-and-swap.
+    pub async fn query_with_head(
+        &self,
+        target: impl Into<ReadTarget>,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+    ) -> Result<(QueryResult, Option<String>)> {
         // Capture the manifest snapshot and immutable catalog under the same
         // schema-publication gate. SchemaApply publishes its fixed manifest
         // outcome before promoting files/ArcSwap; without this gate a query on
@@ -61,7 +80,11 @@ impl Omnigraph {
             GraphIndexHandle::none()
         };
 
-        execute_query(
+        let head = resolved
+            .snapshot
+            .graph_head(resolved.branch.as_deref())
+            .map(str::to_string);
+        let result = execute_query(
             &ir,
             params,
             &resolved.snapshot,
@@ -72,7 +95,8 @@ impl Omnigraph {
                 config: self.embedding_config_ref(),
             },
         )
-        .await
+        .await?;
+        Ok((result, head))
     }
 
     /// Run a named query against the graph as it existed at a prior manifest version.

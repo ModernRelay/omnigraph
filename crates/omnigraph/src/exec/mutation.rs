@@ -668,6 +668,34 @@ impl Omnigraph {
         params: &ParamMap,
         actor_id: Option<&str>,
     ) -> Result<MutationResult> {
+        self.mutate_as_with_expected_head(branch, query_source, query_name, params, actor_id, None)
+            .await
+    }
+
+    /// [`Self::mutate_as`] with a caller-supplied compare-and-swap
+    /// precondition on the branch head (the HTTP `If-Match` surface).
+    ///
+    /// When `expected_head` is `Some`, the mutation runs only if the branch's
+    /// effective head commit id still equals it — i.e. nothing has committed
+    /// to the branch since the caller read that id. The comparison uses the
+    /// same pinned view the write executes against, and the publisher's
+    /// graph-head fence holds that view through commit, so a success proves
+    /// the head never moved between the caller's read and this write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OmniError::PreconditionFailed`] — before any effect, never
+    /// internally retried — when the head no longer matches. All other error
+    /// behavior matches [`Self::mutate_as`].
+    pub async fn mutate_as_with_expected_head(
+        &self,
+        branch: &str,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+        actor_id: Option<&str>,
+        expected_head: Option<&str>,
+    ) -> Result<MutationResult> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `Branch(branch)` to match the HTTP-layer convention at
         // `server_change` (branch=Some(branch), target_branch=None). When no
@@ -678,8 +706,15 @@ impl Omnigraph {
             &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
             actor_id,
         )?;
-        self.mutate_with_current_actor(branch, query_source, query_name, params, actor_id)
-            .await
+        self.mutate_with_current_actor(
+            branch,
+            query_source,
+            query_name,
+            params,
+            actor_id,
+            expected_head,
+        )
+        .await
     }
 
     /// End-of-query validation for a constructive mutation: build the change-set
@@ -715,6 +750,7 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
         actor_id: Option<&str>,
+        expected_head: Option<&str>,
     ) -> Result<MutationResult> {
         const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -730,6 +766,7 @@ impl Omnigraph {
                     query_name,
                     &resolved_params,
                     actor_id,
+                    expected_head,
                     &mut retryable,
                 )
                 .await
@@ -759,6 +796,7 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
         actor_id: Option<&str>,
+        expected_head: Option<&str>,
         retryable: &mut bool,
     ) -> Result<MutationResult> {
         let requested = Self::normalize_branch_name(branch)?;
@@ -782,6 +820,19 @@ impl Omnigraph {
         // revalidates the complete token under the root-shared schema → branch →
         // sorted-table gates before it arms recovery or advances Lance HEAD.
         let txn = self.open_write_txn(requested.as_deref()).await?;
+        // Caller CAS gate against the pinned view this attempt executes with —
+        // a separate head lookup would reopen the race. Re-checked per
+        // reprepare; not `ReadSetChanged`, so the retry loop never replays it.
+        if let Some(expected) = expected_head {
+            let actual = txn.effective_graph_head.as_deref();
+            if actual != Some(expected) {
+                return Err(OmniError::precondition_failed(
+                    requested.as_deref().unwrap_or("main"),
+                    expected,
+                    actual.map(str::to_string),
+                ));
+            }
+        }
         let resolved_params = params.clone();
 
         // Per-query staging accumulator. Inserts and updates push batches into

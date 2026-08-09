@@ -100,6 +100,52 @@ returns `recovery_required` with an operation id. Do not immediately retry that
 request; reopen the graph read-write (or restart the server) so the durable
 recovery intent is resolved first.
 
+## Conditional writes (`If-Match` / `--if-commit`)
+
+A mutation can carry a caller compare-and-swap precondition on the branch
+head: run only if nothing has committed to the branch since the caller read
+it. This turns read-then-write flows (claim a task, take a work item, edit
+what you last saw) into a single-round-trip atomic operation across any
+number of concurrent writers — a lost race is rejected by the store instead
+of silently overwriting the write that got there first.
+
+1. Read the data your decision depends on. The read response carries
+   `graph_commit_id` — the head commit id of the exact snapshot your rows
+   were served from.
+2. Send the mutation with that id as the precondition: `omnigraph mutate
+   <name> ... --if-commit <id>`, or the `If-Match: <id>` header on
+   `POST /mutate` / `POST /queries/{name}` (stored mutations).
+3. Branch head still `<id>` → the mutation runs and commits; the success
+   proves no other write interleaved. Head moved → HTTP **412** with
+   structured `precondition_failure { expected, actual }` (CLI: exit code 4)
+   and **zero effect** — re-read the branch and decide again.
+
+The precondition is branch-scoped: **any** commit to the branch invalidates
+an outstanding id, including writes to unrelated rows or tables. A 412 does
+not necessarily mean the rows you care about changed — it means *something*
+did, and your knowledge can no longer be proven current. Under concurrent
+writers this produces occasional rejections between operations that do not
+truly conflict; the re-read-and-retry loop is the intended handling, and its
+cost grows with the branch's total write rate.
+
+Use the id from the read response, not one fetched separately. The response's
+`graph_commit_id` comes from the same pinned version as the rows, so it
+certifies exactly the world you observed. If you must obtain the id some
+other way (`omnigraph commit list` / `GET /commits`), fetch it **before**
+the read: an id fetched before is conservative (any commit between fetch and
+read moves the head, and the write correctly fails), while an id fetched
+*after* the read certifies nothing — it can postdate the very commit that
+invalidated what you read, and the precondition then passes against a
+premise that is already false.
+
+The check is evaluated against the same pinned view the write executes
+against, and that view is held through commit, so there is no window between
+check and effect. A failed precondition is terminal: it is never internally retried
+(unlike the bounded reprepare that [Atomicity](#atomicity) describes for
+insert-only operations), because the rejection is precisely the information
+the caller requested. The `*` and weak (`W/"..."`) entity-tag forms are
+rejected.
+
 ## Inserts/updates and deletes cannot mix in one query
 
 A single change query must be **either insert/update-only or delete-only**.

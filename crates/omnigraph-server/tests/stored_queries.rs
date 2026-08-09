@@ -479,3 +479,91 @@ async fn list_queries_is_empty_when_no_registry() {
         "no stored-query registry → empty catalog"
     );
 }
+
+/// GitHub #365: a stored mutation invoked by name honors the same
+/// `If-Match` branch-head precondition as `POST /mutate` — this is the CLI's
+/// `mutate <name>` path in served deployments, so without it the flag would
+/// silently not apply to stored mutations.
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_mutation_if_match_precondition_issue_365() {
+    async fn head_commit_id(app: &axum::Router) -> String {
+        let (status, out) =
+            json_response(app, get_request(&g("/commits?branch=main"), "t-full")).await;
+        assert_eq!(status, StatusCode::OK, "body: {out}");
+        out["commits"]
+            .as_array()
+            .expect("commit list")
+            .iter()
+            .max_by_key(|commit| commit["manifest_version"].as_u64().unwrap())
+            .expect("loaded graph has at least one commit")["graph_commit_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+    fn invoke_with_if_match(
+        name: &str,
+        body: serde_json::Value,
+        if_match: &str,
+    ) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .uri(g(&format!("/queries/{name}")))
+            .method(axum::http::Method::POST)
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer t-full")
+            .header("if-match", if_match)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    let specs: &[(&str, &str, bool)] = &[(
+        "add_person",
+        "query add_person($name: String) { insert Person { name: $name } }",
+        false,
+    )];
+    let (_temp, app) =
+        app_with_stored_queries(specs, &[("act-full", "t-full")], INVOKE_POLICY_YAML).await;
+    let stale_head = head_commit_id(&app).await;
+
+    // A plain invoke advances the head past the commit the caller read.
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "add_person",
+            "t-full",
+            json!({ "params": { "name": "Eve" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Stale precondition: 412 with structured details, no effect.
+    let (status, body) = json_response(
+        &app,
+        invoke_with_if_match(
+            "add_person",
+            json!({ "params": { "name": "Zed" } }),
+            &stale_head,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PRECONDITION_FAILED,
+        "stale If-Match on a stored mutation must 412; body: {body}"
+    );
+    assert_eq!(body["precondition_failure"]["expected"], json!(stale_head));
+
+    // Current head passes and commits.
+    let current_head = head_commit_id(&app).await;
+    let (status, body) = json_response(
+        &app,
+        invoke_with_if_match(
+            "add_person",
+            json!({ "params": { "name": "Zed" } }),
+            &current_head,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["affected_nodes"], 1, "body: {body}");
+}
