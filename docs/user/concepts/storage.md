@@ -125,7 +125,9 @@ hold a writable local graph. `init` and read-write opens probe the graph
 root's filesystem and fail up front with an error naming this requirement,
 before any partial state is created; probing briefly creates and deletes
 internal objects in the graph root (names starting with `__`, a prefix
-reserved for OmniGraph internals, e.g. `__create_if_absent_probe`).
+reserved for OmniGraph internals, e.g. `__create_if_absent_probe_<unique-id>`).
+Each bind removes only the probe object it successfully created; a colliding
+foreign or crash-residue name is left untouched and retried with a fresh name.
 Read-only opens (export, `commit list`) perform no writes and work on such
 filesystems. S3-compatible backends are unaffected — the store implements
 the conditional put server-side. The limitation comes from the upstream
