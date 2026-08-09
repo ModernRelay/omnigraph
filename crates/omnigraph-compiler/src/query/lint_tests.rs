@@ -99,6 +99,7 @@ node Person {
 slug: String @key
 name: String?
 }
+edge Knows: Person -> Person @card(0..1)
 "#,
         ),
         r#"
@@ -109,6 +110,10 @@ return { $p.name }
 
 query insert_person() {
 insert Person { slug: "p1", name: "P1" }
+}
+
+query insert_knows($from: String, $to: String) {
+insert Knows { from: $from, to: $to }
 }
 "#,
         "/tmp/queries.gq",
@@ -130,6 +135,27 @@ insert Person { slug: "p1", name: "P1" }
         vec![QueryLintGraphFact {
             kind: QueryLintGraphFactKind::Node,
             type_name: "Person".to_string(),
+        }]
+    );
+    let constrained_edge = output.results[2].operation.as_ref().unwrap();
+    assert_eq!(
+        constrained_edge.reads,
+        vec![
+            QueryLintGraphFact {
+                kind: QueryLintGraphFactKind::Node,
+                type_name: "Person".to_string(),
+            },
+            QueryLintGraphFact {
+                kind: QueryLintGraphFactKind::Edge,
+                type_name: "Knows".to_string(),
+            },
+        ]
+    );
+    assert_eq!(
+        constrained_edge.writes,
+        vec![QueryLintGraphFact {
+            kind: QueryLintGraphFactKind::Edge,
+            type_name: "Knows".to_string(),
         }]
     );
 }
