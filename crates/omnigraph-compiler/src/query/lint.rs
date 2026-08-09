@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use arrow_schema::DataType;
 use serde::Serialize;
 
 use crate::catalog::Catalog;
 use crate::query::ast::{Mutation, QueryDecl};
 use crate::query::parser::parse_query;
-use crate::query::typecheck::typecheck_query_decl;
+use crate::query::typecheck::{
+    BindingKind, CheckedQuery, infer_query_result_schema, typecheck_query_decl,
+};
 
 const PARSE_ERROR_CODE: &str = "Q000";
 const L201_CODE: &str = "L201";
@@ -77,6 +80,36 @@ pub struct QueryLintQueryResult {
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<QueryLintOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueryLintOperation {
+    pub params: Vec<QueryLintValue>,
+    pub result: Vec<QueryLintValue>,
+    pub reads: Vec<QueryLintGraphFact>,
+    pub writes: Vec<QueryLintGraphFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueryLintValue {
+    pub name: String,
+    pub type_name: String,
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct QueryLintGraphFact {
+    pub kind: QueryLintGraphFactKind,
+    pub type_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryLintGraphFactKind {
+    Node,
+    Edge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -127,8 +160,10 @@ pub fn lint_query_file(
             for query in &parsed.queries {
                 let kind = query_kind(query);
                 let warnings = per_query_warnings(query);
-                match typecheck_query_decl(catalog, query) {
-                    Ok(_) => {
+                match typecheck_query_decl(catalog, query)
+                    .and_then(|checked| describe_operation(catalog, query, &checked))
+                {
+                    Ok(operation) => {
                         collect_update_coverage(query, &mut coverage);
                         results.push(QueryLintQueryResult {
                             name: query.name.clone(),
@@ -136,6 +171,7 @@ pub fn lint_query_file(
                             status: QueryLintStatus::Ok,
                             warnings,
                             error: None,
+                            operation: Some(operation),
                         });
                     }
                     Err(err) => {
@@ -145,6 +181,7 @@ pub fn lint_query_file(
                             status: QueryLintStatus::Error,
                             warnings,
                             error: Some(err.to_string()),
+                            operation: None,
                         });
                     }
                 }
@@ -208,6 +245,123 @@ pub fn lint_query_file(
                 query_names: Vec::new(),
             }],
         },
+    }
+}
+
+fn describe_operation(
+    catalog: &Catalog,
+    query: &QueryDecl,
+    checked: &CheckedQuery,
+) -> crate::error::Result<QueryLintOperation> {
+    let params = query
+        .params
+        .iter()
+        .map(|param| QueryLintValue {
+            name: param.name.clone(),
+            type_name: param.type_name.clone(),
+            nullable: param.nullable,
+        })
+        .collect();
+    let mut reads = BTreeSet::new();
+    let mut writes = BTreeSet::new();
+
+    let result = match checked {
+        CheckedQuery::Read(ctx) => {
+            for binding in ctx.bindings.values() {
+                reads.insert(QueryLintGraphFact {
+                    kind: match binding.kind {
+                        BindingKind::Node => QueryLintGraphFactKind::Node,
+                        BindingKind::Edge => QueryLintGraphFactKind::Edge,
+                    },
+                    type_name: binding.type_name.clone(),
+                });
+            }
+            for traversal in &ctx.traversals {
+                reads.insert(QueryLintGraphFact {
+                    kind: QueryLintGraphFactKind::Edge,
+                    type_name: traversal.edge_type.clone(),
+                });
+            }
+            infer_query_result_schema(catalog, query, ctx)?
+                .fields()
+                .iter()
+                .map(|field| QueryLintValue {
+                    name: field.name().clone(),
+                    type_name: result_type_name(field.data_type()),
+                    nullable: field.is_nullable(),
+                })
+                .collect()
+        }
+        CheckedQuery::Mutation(_) => {
+            for mutation in &query.mutations {
+                let type_name = match mutation {
+                    Mutation::Insert(insert) => &insert.type_name,
+                    Mutation::Update(update) => &update.type_name,
+                    Mutation::Delete(delete) => &delete.type_name,
+                };
+                let fact = graph_fact(catalog, type_name);
+                writes.insert(fact.clone());
+                match mutation {
+                    Mutation::Insert(_) => {
+                        if let Some(edge) = catalog.edge_types.get(type_name) {
+                            reads.insert(QueryLintGraphFact {
+                                kind: QueryLintGraphFactKind::Node,
+                                type_name: edge.from_type.clone(),
+                            });
+                            reads.insert(QueryLintGraphFact {
+                                kind: QueryLintGraphFactKind::Node,
+                                type_name: edge.to_type.clone(),
+                            });
+                        }
+                    }
+                    Mutation::Update(_) | Mutation::Delete(_) => {
+                        reads.insert(fact);
+                    }
+                }
+            }
+            Vec::new()
+        }
+    };
+
+    Ok(QueryLintOperation {
+        params,
+        result,
+        reads: reads.into_iter().collect(),
+        writes: writes.into_iter().collect(),
+    })
+}
+
+fn graph_fact(catalog: &Catalog, type_name: &str) -> QueryLintGraphFact {
+    QueryLintGraphFact {
+        kind: if catalog.edge_types.contains_key(type_name) {
+            QueryLintGraphFactKind::Edge
+        } else {
+            QueryLintGraphFactKind::Node
+        },
+        type_name: type_name.to_string(),
+    }
+}
+
+fn result_type_name(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Utf8 => "String".to_string(),
+        DataType::Boolean => "Bool".to_string(),
+        DataType::Int32 => "I32".to_string(),
+        DataType::Int64 => "I64".to_string(),
+        DataType::UInt32 => "U32".to_string(),
+        DataType::UInt64 => "U64".to_string(),
+        DataType::Float32 => "F32".to_string(),
+        DataType::Float64 => "F64".to_string(),
+        DataType::Date32 => "Date".to_string(),
+        DataType::Date64 => "DateTime".to_string(),
+        DataType::LargeBinary => "Blob".to_string(),
+        DataType::FixedSizeList(field, dim) if field.data_type() == &DataType::Float32 => {
+            format!("Vector({dim})")
+        }
+        DataType::List(field) => format!("[{}]", result_type_name(field.data_type())),
+        // Node projections remain opaque until the wire contract carries recursive field shapes.
+        DataType::Struct(_) => "Object".to_string(),
+        other => other.to_string(),
     }
 }
 

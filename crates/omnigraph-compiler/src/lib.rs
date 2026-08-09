@@ -31,8 +31,9 @@ pub use ir::lower::{lower_mutation_query, lower_query};
 pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};
 pub use query::ast::Literal;
 pub use query::lint::{
-    QueryLintFinding, QueryLintOutput, QueryLintQueryKind, QueryLintQueryResult,
-    QueryLintSchemaSource, QueryLintSchemaSourceKind, QueryLintSeverity, QueryLintStatus,
+    QueryLintFinding, QueryLintGraphFact, QueryLintGraphFactKind, QueryLintOperation,
+    QueryLintOutput, QueryLintQueryKind, QueryLintQueryResult, QueryLintSchemaSource,
+    QueryLintSchemaSourceKind, QueryLintSeverity, QueryLintStatus, QueryLintValue,
     lint_query_file,
 };
 pub use query_input::{

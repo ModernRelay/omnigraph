@@ -37,8 +37,8 @@ name: String?
 "#,
         ),
         r#"
-query list_people() {
-match { $p: Person }
+query list_people($slug: String) {
+match { $p: Person { slug: $slug } }
 return { $p.name }
 }
 
@@ -53,6 +53,32 @@ update Person set { missing: "nope" } where slug = $slug
     assert_eq!(output.queries_processed, 2);
     assert_eq!(output.results[0].name, "list_people");
     assert_eq!(output.results[0].status, QueryLintStatus::Ok);
+    let operation = output.results[0].operation.as_ref().unwrap();
+    assert_eq!(
+        operation.params,
+        vec![QueryLintValue {
+            name: "slug".to_string(),
+            type_name: "String".to_string(),
+            nullable: false,
+        }]
+    );
+    assert_eq!(
+        operation.result,
+        vec![QueryLintValue {
+            name: "name".to_string(),
+            type_name: "String".to_string(),
+            nullable: true,
+        }]
+    );
+    assert_eq!(
+        operation.reads,
+        vec![QueryLintGraphFact {
+            kind: QueryLintGraphFactKind::Node,
+            type_name: "Person".to_string(),
+        }]
+    );
+    assert!(operation.writes.is_empty());
+    assert!(output.results[1].operation.is_none());
     assert_eq!(output.results[1].name, "bad_update");
     assert_eq!(output.results[1].status, QueryLintStatus::Error);
     assert!(
@@ -95,6 +121,17 @@ insert Person { slug: "p1", name: "P1" }
         vec![HARDCODED_MUTATION_WARNING.to_string()]
     );
     assert_eq!(output.warnings, 1);
+    let mutation = output.results[1].operation.as_ref().unwrap();
+    assert!(mutation.params.is_empty());
+    assert!(mutation.result.is_empty());
+    assert!(mutation.reads.is_empty());
+    assert_eq!(
+        mutation.writes,
+        vec![QueryLintGraphFact {
+            kind: QueryLintGraphFactKind::Node,
+            type_name: "Person".to_string(),
+        }]
+    );
 }
 
 #[test]
