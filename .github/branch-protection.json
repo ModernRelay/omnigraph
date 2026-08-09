@@ -5,7 +5,9 @@
     "contexts": [
       "Classify Changes",
       "Check AGENTS.md Links",
-      "Test omnigraph-server --features aws"
+      "Test omnigraph-server --features aws",
+      "Format (rustfmt)",
+      "Lint (clippy)"
     ]
   },
   "enforce_admins": false,
