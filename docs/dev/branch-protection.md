@@ -8,7 +8,7 @@ This page explains what the policy says and how to change it.
 
 | Setting | Value | Why |
 |---|---|---|
-| **Required status checks (strict)** | `Classify Changes`, `Check AGENTS.md Links`, `Test omnigraph-server --features aws` | Every PR must pass the AWS-feature build/test and AGENTS.md link integrity. **`Test Workspace` is deliberately not required**: it runs only after merge to `main`, on tags, or by manual dispatch. A required check that never reports on PRs would leave every PR pending. The trade-off is explicit: a regression may make `main` briefly red, at which point unrelated merges stop until it is fixed or reverted. See [ci.md](ci.md). Each required context must exactly match a job name that reports on PRs. `strict: true` requires the branch to be up to date with `main`. |
+| **Required status checks (strict)** | `Classify Changes`, `Check AGENTS.md Links`, `Test omnigraph-server --features aws`, `Format (rustfmt)`, `Lint (clippy)` | Code-changing PRs must pass the pinned rustfmt and Clippy gates, the AWS-feature build/test, and AGENTS.md link integrity. The format and lint jobs still report as skipped for documentation-only PRs. **`Test Workspace` is deliberately not required**: it runs only after merge to `main`, on tags, or by manual dispatch. A required check that never reports on PRs would leave every PR pending. The trade-off is explicit: a regression may make `main` briefly red, at which point unrelated merges stop until it is fixed or reverted. See [ci.md](ci.md). Each required context must exactly match a job name that reports on PRs. `strict: true` requires the branch to be up to date with `main`. |
 | **Required approving reviews** | `0` | No human-review gate. With a 2-person team where both maintainers own everything, requiring an approval meant every PR needed the *other* person (or an admin/bypass override) — friction with no real review value. CI checks are the gate; maintainers merge their own PRs once checks pass. Raise this to `1` if an outside-contributor flow ever needs a review gate. |
 | **Require code-owner reviews** | `false` | CODEOWNERS was removed entirely (see the git history of `.github/`); there is no code-owner review requirement. |
 | **Require linear history** | `true` | No merge commits — squash or rebase only. Matches recent practice. |
@@ -77,6 +77,6 @@ The branch-protection policy is the foundation. Future hardening adds:
 - **Required signed commits** (`required_signatures: true`) — once maintainers enroll GPG/SSH signing.
 - **Tag protection** for `v*` tags via `repos/.../tags/protection`.
 - **Required reviewers from specific teams** for high-leverage paths (e.g., `docs/dev/invariants.md`) via a GitHub ruleset's path-scoped required-review rule, if a review gate is ever reintroduced.
-- **More required CI checks**: `cargo deny`, `cargo audit`, CodeQL, secret scanning, schema-lint (MR-946). The `cargo fmt --check` and `cargo clippy -D warnings` jobs exist as PR-time checks (`Format (rustfmt)`, `Lint (clippy)`); requiring them is a one-line addition to `.github/branch-protection.json` once a green run exists.
+- **More required CI checks**: `cargo deny`, `cargo audit`, CodeQL, secret scanning, schema-lint (MR-946).
 
 See the hardening playbook for the full plan.
