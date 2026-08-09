@@ -78,12 +78,11 @@ return { $p.name }
 
 #[test]
 fn test_lower_resolves_contains_overload_on_edge_bound_property() {
-    // `contains` on an edge-bound String property (`$w.note`, where `$w` binds
-    // the matched edge row) must lower to StringContains — the edge-binding
-    // feature makes edge properties addressable in filters, and resolution
-    // must consult edge types, not only node types.
+    // Node and edge type namespaces are independent. These deliberately share
+    // a type and property name but give that property different shapes, so
+    // lowering must retain the binding kind instead of searching by name.
     let schema = parse_schema(
-        "node Person { name: String }\nedge Knows: Person -> Person { note: String  tags: [String]? }",
+        "node Shared { text: [String]? }\nedge Shared: Shared -> Shared { text: String  tags: [String]? }",
     )
     .unwrap();
     let catalog = build_catalog(&schema).unwrap();
@@ -91,12 +90,14 @@ fn test_lower_resolves_contains_overload_on_edge_bound_property() {
         r#"
 query q() {
 match {
-    $p: Person
-    $p $w:knows $f
-    $w.note contains "sub"
+    $a: Shared
+    $a $w:shared $b
+    $a.text contains "node member"
+    $w.text contains "sub"
     $w.tags contains "member"
+    not { $w.text contains "outer sub" }
 }
-return { $f.name }
+return { $b.text }
 }
 "#,
     )
@@ -115,9 +116,25 @@ return { $f.name }
     // Edge String property -> substring; edge list property -> membership.
     assert_eq!(
         filter_ops,
-        vec![CompOp::StringContains, CompOp::Contains],
-        "edge-bound String `contains` must resolve to StringContains, list stays Contains"
+        vec![CompOp::Contains, CompOp::StringContains, CompOp::Contains],
+        "same-named node and edge bindings must resolve through separate namespaces"
     );
+
+    let anti_join_inner = ir
+        .pipeline
+        .iter()
+        .find_map(|op| match op {
+            IROp::AntiJoin { inner, .. } => Some(inner),
+            _ => None,
+        })
+        .expect("expected anti-join for negation");
+    assert!(matches!(
+        anti_join_inner.as_slice(),
+        [IROp::Filter(IRFilter {
+            op: CompOp::StringContains,
+            ..
+        })]
+    ));
 }
 
 #[test]
