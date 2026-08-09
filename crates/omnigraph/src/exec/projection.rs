@@ -143,40 +143,36 @@ fn evaluate_contains_filter(left: &ArrayRef, right: &ArrayRef) -> Result<Boolean
 /// Exact, case-sensitive string predicates (`starts_with` and the String
 /// overload of `contains`). NULL on either side is not a match, matching the
 /// pushdown arm's SQL semantics.
+///
+/// Uses Arrow's vectorized `like`-family kernels rather than a per-row scan:
+/// same O(rows) work, but columnar/SIMD-friendly, and it natively handles
+/// every string layout (`Utf8`/`LargeUtf8`/`Utf8View`) instead of only the
+/// `Utf8` a downcast would accept.
 fn evaluate_string_match_filter(
     op: CompOp,
     left: &ArrayRef,
     right: &ArrayRef,
 ) -> Result<BooleanArray> {
-    let left_str = left
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest(format!("{op} requires String operands")))?;
+    // The kernels require both operands to share a string type; the needle is
+    // typically a broadcast literal already matching, so this cast is usually
+    // a no-op.
     let right = if right.data_type() != left.data_type() {
         arrow_cast::cast::cast(right, left.data_type())
             .map_err(|e| OmniError::Lance(e.to_string()))?
     } else {
         Arc::clone(right)
     };
-    let right_str = right
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest(format!("{op} requires String operands")))?;
-
-    let mut values = Vec::with_capacity(left_str.len());
-    for row in 0..left_str.len() {
-        if left_str.is_null(row) || right_str.is_null(row) {
-            values.push(Some(false));
-            continue;
-        }
-        let (l, r) = (left_str.value(row), right_str.value(row));
-        let matched = match op {
-            CompOp::StartsWith => l.starts_with(r),
-            _ => l.contains(r),
-        };
-        values.push(Some(matched));
+    let (left_dyn, right_dyn): (&dyn Array, &dyn Array) = (left.as_ref(), right.as_ref());
+    let matches = match op {
+        CompOp::StartsWith => arrow_string::like::starts_with(&left_dyn, &right_dyn),
+        _ => arrow_string::like::contains(&left_dyn, &right_dyn),
     }
-    Ok(BooleanArray::from(values))
+    .map_err(|e| OmniError::manifest(format!("{op} requires String operands: {e}")))?;
+
+    // A NULL operand yields a NULL result; normalize to `false` so the mask
+    // explicitly excludes those rows (NULL is not a match) rather than relying
+    // on the downstream filter's null handling.
+    Ok(arrow_select::filter::prep_null_mask_filter(&matches))
 }
 
 fn array_value_eq(
