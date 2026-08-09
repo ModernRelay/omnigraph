@@ -385,9 +385,20 @@ fn hard_link_refusal_in(dir: &Path) -> Option<std::io::Error> {
     let _ = std::fs::remove_file(&src);
     match outcome {
         Ok(()) => None,
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => None,
-        Err(err) => Some(err),
+        Err(err) if is_hard_link_capability_refusal(&err) => Some(err),
+        Err(_) => None,
     }
+}
+
+/// Errors that prove the destination directory cannot provide the hard-link
+/// primitive used by the local backend's atomic create-if-absent path.
+/// Everything else is inconclusive and must preserve the original backend
+/// failure rather than replacing it with a filesystem-capability diagnosis.
+fn is_hard_link_capability_refusal(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+    )
 }
 
 #[async_trait]
@@ -1674,6 +1685,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(hard_link_refusal_in(dir.path()).is_none());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        assert!(is_hard_link_capability_refusal(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "hard links denied",
+        )));
+        assert!(is_hard_link_capability_refusal(&std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "hard links unsupported",
+        )));
+        for transient in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::OutOfMemory,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(
+                !is_hard_link_capability_refusal(&std::io::Error::new(
+                    transient,
+                    "transient probe failure",
+                )),
+                "{transient:?} must preserve the original backend error"
+            );
+        }
     }
 
     /// A missing directory is an inconclusive probe, not a capability

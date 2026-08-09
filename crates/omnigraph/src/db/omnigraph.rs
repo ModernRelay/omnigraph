@@ -24,6 +24,7 @@ use omnigraph_compiler::{
     SchemaShape, SchemaTypeKind, build_catalog_from_ir, compile_schema_shape, initialize_schema_ir,
     plan_schema_migration,
 };
+use ulid::Ulid;
 
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot, ResolvedCommitRange};
 use crate::error::{OmniError, Result};
@@ -3253,9 +3254,10 @@ fn read_schema_shape_from_source(schema_source: &str) -> Result<SchemaShape> {
     compile_schema_shape(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
 }
 
-/// Name of the transient object a read-write bind writes and deletes to
-/// prove the local filesystem supports atomic create-if-absent.
-const CREATE_IF_ABSENT_PROBE_FILENAME: &str = "__create_if_absent_probe";
+/// Prefix for transient objects a read-write bind owns while proving that the
+/// local filesystem supports atomic create-if-absent.
+const CREATE_IF_ABSENT_PROBE_FILENAME_PREFIX: &str = "__create_if_absent_probe";
+const CREATE_IF_ABSENT_PROBE_CLAIM_ATTEMPTS: usize = 4;
 
 /// Refuse a local read-write bind (`init`, or `open` for read-write) whose
 /// filesystem cannot do atomic create-if-absent (no `hard_link(2)`: Android
@@ -3267,11 +3269,19 @@ async fn verify_local_create_if_absent(root: &str, storage: &dyn StorageAdapter)
         return Ok(());
     }
     crate::failpoints::maybe_fail(crate::failpoints::names::LOCAL_CREATE_IF_ABSENT_PROBE)?;
-    let probe_uri = join_uri(root, CREATE_IF_ABSENT_PROBE_FILENAME);
-    // Ok(false) (residue of a crashed probe) still proves the capability:
-    // reporting "already exists" requires the hard link to have run.
-    storage.write_text_if_absent(&probe_uri, "").await?;
-    storage.delete(&probe_uri).await
+    for _ in 0..CREATE_IF_ABSENT_PROBE_CLAIM_ATTEMPTS {
+        let probe_name = format!("{CREATE_IF_ABSENT_PROBE_FILENAME_PREFIX}_{}", Ulid::new());
+        let probe_uri = join_uri(root, &probe_name);
+        if !storage.write_text_if_absent(&probe_uri, "").await? {
+            // A prior or foreign writer owns this candidate. It proves
+            // nothing about this bind and must not be deleted by it.
+            continue;
+        }
+        return storage.delete(&probe_uri).await;
+    }
+    Err(OmniError::manifest_internal(format!(
+        "local create-if-absent capability probe at '{root}' could not claim a unique object name after {CREATE_IF_ABSENT_PROBE_CLAIM_ATTEMPTS} attempts; refusing read-write bind"
+    )))
 }
 
 /// `--force` may replace orphan schema files, but it must never mint a new

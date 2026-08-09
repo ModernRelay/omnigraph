@@ -813,6 +813,7 @@ node Task {
 /// migration, or Lance commit can fail mid-flight on such a filesystem.
 mod local_create_if_absent_probe {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use omnigraph::db::Omnigraph;
@@ -821,7 +822,7 @@ mod local_create_if_absent_probe {
 
     use super::helpers;
 
-    const PROBE_FILENAME: &str = "__create_if_absent_probe";
+    const PROBE_FILENAME_PREFIX: &str = "__create_if_absent_probe";
     const SENTINEL: &str = "capability probe refused by test adapter";
 
     /// Local-adapter decorator that refuses the create-if-absent capability
@@ -829,11 +830,34 @@ mod local_create_if_absent_probe {
     #[derive(Debug)]
     struct ProbeRefusingAdapter {
         inner: Arc<dyn StorageAdapter>,
+        collide_once: bool,
+        probe_attempts: AtomicUsize,
+        deleted_probe: AtomicBool,
     }
 
     impl ProbeRefusingAdapter {
-        fn wrap(inner: Arc<dyn StorageAdapter>) -> Arc<dyn StorageAdapter> {
-            Arc::new(Self { inner })
+        fn wrap(inner: Arc<dyn StorageAdapter>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                collide_once: false,
+                probe_attempts: AtomicUsize::new(0),
+                deleted_probe: AtomicBool::new(false),
+            })
+        }
+
+        fn wrap_with_collision(inner: Arc<dyn StorageAdapter>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                collide_once: true,
+                probe_attempts: AtomicUsize::new(0),
+                deleted_probe: AtomicBool::new(false),
+            })
+        }
+
+        fn is_probe(uri: &str) -> bool {
+            uri.rsplit('/')
+                .next()
+                .is_some_and(|name| name.starts_with(PROBE_FILENAME_PREFIX))
         }
     }
 
@@ -860,7 +884,11 @@ mod local_create_if_absent_probe {
         }
 
         async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
-            if uri.ends_with(PROBE_FILENAME) {
+            if Self::is_probe(uri) {
+                let attempt = self.probe_attempts.fetch_add(1, Ordering::Relaxed);
+                if self.collide_once && attempt == 0 {
+                    return Ok(false);
+                }
                 return Err(OmniError::manifest_internal(SENTINEL));
             }
             self.inner.write_text_if_absent(uri, contents).await
@@ -875,6 +903,9 @@ mod local_create_if_absent_probe {
         }
 
         async fn delete(&self, uri: &str) -> Result<()> {
+            if Self::is_probe(uri) {
+                self.deleted_probe.store(true, Ordering::Relaxed);
+            }
             self.inner.delete(uri).await
         }
 
@@ -932,6 +963,35 @@ mod local_create_if_absent_probe {
         );
     }
 
+    /// An already-existing candidate belongs to a prior or foreign writer. It
+    /// proves nothing about this bind's hard-link capability and must neither
+    /// be accepted nor deleted; the bind retries with a fresh owned name.
+    #[tokio::test]
+    async fn read_write_open_retries_without_deleting_a_colliding_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let _ = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
+
+        let adapter = ProbeRefusingAdapter::wrap_with_collision(storage_for_uri(uri).unwrap());
+        let err = match Omnigraph::open_with_storage(uri, adapter.clone()).await {
+            Ok(_) => panic!("a colliding probe must not bypass the capability check"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains(SENTINEL),
+            "the fresh retry must surface its capability failure, got: {err}"
+        );
+        assert_eq!(
+            adapter.probe_attempts.load(Ordering::Relaxed),
+            2,
+            "the bind must retry once with a fresh candidate"
+        );
+        assert!(
+            !adapter.deleted_probe.load(Ordering::Relaxed),
+            "the bind must not delete a probe candidate it did not create"
+        );
+    }
+
     /// The probe object is removed before the open returns; it never persists
     /// as residue in the graph root.
     #[tokio::test]
@@ -943,7 +1003,13 @@ mod local_create_if_absent_probe {
         let db = Omnigraph::open(uri).await.unwrap();
         drop(db);
         assert!(
-            !dir.path().join(PROBE_FILENAME).exists(),
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(PROBE_FILENAME_PREFIX)
+            }),
             "capability probe must clean up after itself"
         );
     }
