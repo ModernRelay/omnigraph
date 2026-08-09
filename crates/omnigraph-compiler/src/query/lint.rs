@@ -304,6 +304,9 @@ fn describe_operation(
                 match mutation {
                     Mutation::Insert(_) => {
                         if let Some(edge) = catalog.edge_types.get(type_name) {
+                            if !edge.cardinality.is_default() {
+                                reads.insert(fact.clone());
+                            }
                             reads.insert(QueryLintGraphFact {
                                 kind: QueryLintGraphFactKind::Node,
                                 type_name: edge.from_type.clone(),

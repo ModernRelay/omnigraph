@@ -74,4 +74,18 @@ Codes seen so far:
 
 Lint output reports an overall status, per-query results (name, kind, status, any error and warnings), and structured findings (severity, code, message, and the type/property/query they apply to).
 
+With `omnigraph lint --json`, each successful per-query result also contains an
+`operation` object:
+
+- `params` and `result` are arrays of `{name, type_name, nullable}` in declaration
+  and projection order. `type_name` uses schema scalar names; mutation results are empty.
+- `reads` and `writes` are deduplicated, deterministically sorted arrays of
+  `{kind, type_name}`. `kind` is lowercase `node` or `edge`, and `type_name` is
+  the case-sensitive declared graph type.
+
+`reads` includes bound and traversed facts. Mutation reads additionally include
+the update/delete target, inserted-edge endpoint node types, and the target edge
+type when `@card` validation scans existing edges; `writes` lists mutation targets.
+`operation` is omitted when that query fails parsing or type checking.
+
 CLI exits non-zero only on `status = Error`.
