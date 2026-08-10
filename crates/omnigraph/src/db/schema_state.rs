@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph_compiler::schema::parser::parse_persisted_schema_contract;
 use omnigraph_compiler::{
     SchemaIR, SchemaIdentityDomain, SchemaShape, compile_schema_shape, schema_ir_hash,
     schema_ir_pretty_json, schema_shape_hash, schema_shape_hash_from_ir, validate_schema_ir,
@@ -441,7 +441,11 @@ fn validate_schema_state_envelope(state: &SchemaState) -> Result<()> {
 }
 
 fn compile_schema_source(source: &str) -> Result<SchemaShape> {
-    let schema = parse_schema(source).map_err(|err| {
+    // This source is already bound to the persisted identity-bearing IR and
+    // state hashes validated below. Use the compatibility parser so a v6 root
+    // admitted before v0.10 with body-level @unique(Blob) remains openable for
+    // inspection/export. Init and desired schema apply use the strict parser.
+    let schema = parse_persisted_schema_contract(source).map_err(|err| {
         schema_lock_conflict(format!(
             "current _schema.pg is not a valid accepted schema definition: {}",
             err

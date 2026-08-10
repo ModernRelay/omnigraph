@@ -1,6 +1,5 @@
 use arrow_array::{
-    Array, ArrayRef, LargeBinaryArray, RecordBatch, StringArray, StructArray, UInt8Array,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, LargeBinaryArray, RecordBatch, StringArray, StructArray, UInt64Array,
 };
 use arrow_schema::SchemaRef;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
@@ -17,7 +16,7 @@ use lance::dataset::{
     CommitBuilder, DeleteBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched,
     WriteMode, WriteParams,
 };
-use lance::datatypes::{BlobKind, Schema as LanceSchema};
+use lance::datatypes::Schema as LanceSchema;
 use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
 use lance_file::version::LanceFileVersion;
@@ -31,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::blob::BlobDescriptorDecoder;
 use crate::db::manifest::TableVersionMetadata;
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::{OmniError, Result};
@@ -773,8 +773,9 @@ impl TableStore {
         let mut non_null_row_ids = Vec::new();
         let mut row_has_blob = Vec::with_capacity(row_ids.len());
 
+        let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
         for (row, row_id) in row_ids.iter().enumerate() {
-            let is_null = Self::blob_description_is_null(descriptions, row)?;
+            let is_null = decoder.classify(row)?.is_null();
             row_has_blob.push(!is_null);
             if !is_null {
                 non_null_row_ids.push(*row_id);
@@ -846,64 +847,6 @@ impl TableStore {
         builder
             .finish()
             .map_err(|e| OmniError::Lance(e.to_string()))
-    }
-
-    fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bool> {
-        if descriptions.is_null(row) {
-            return Ok(true);
-        }
-
-        let position = descriptions
-            .column_by_name("position")
-            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "unrecognized blob description schema {:?}: missing UInt64 position field",
-                    descriptions.fields()
-                ))
-            })?;
-        let size = descriptions
-            .column_by_name("size")
-            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "unrecognized blob description schema {:?}: missing UInt64 size field",
-                    descriptions.fields()
-                ))
-            })?;
-
-        let Some(kind_column) = descriptions.column_by_name("kind") else {
-            return Ok(position.is_null(row) || size.is_null(row));
-        };
-        let kind = if let Some(kind) = kind_column.as_any().downcast_ref::<UInt8Array>() {
-            if kind.is_null(row) {
-                return Ok(true);
-            }
-            kind.value(row)
-        } else if let Some(kind) = kind_column.as_any().downcast_ref::<UInt32Array>() {
-            if kind.is_null(row) {
-                return Ok(true);
-            }
-            kind.value(row) as u8
-        } else {
-            return Err(OmniError::Lance(format!(
-                "unrecognized blob description schema {:?}: kind field must be UInt8 or UInt32",
-                descriptions.fields()
-            )));
-        };
-
-        let kind = BlobKind::try_from(kind).map_err(|e| OmniError::Lance(e.to_string()))?;
-        if kind != BlobKind::Inline {
-            return Ok(false);
-        }
-        let blob_uri = descriptions
-            .column_by_name("blob_uri")
-            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
-            .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
-
-        Ok((position.is_null(row) || position.value(row) == 0)
-            && (size.is_null(row) || size.value(row) == 0)
-            && blob_uri.unwrap_or("").is_empty())
     }
 
     pub async fn scan_stream(
