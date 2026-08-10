@@ -175,8 +175,8 @@ Pull the prebuilt public image (published for every `v*` release by
 `publish-image.yml`; built with the `aws` feature, linux/amd64):
 
 ```bash
-docker pull modernrelay/omnigraph-server:v0.8.1          # Docker Hub
-# or: docker pull ghcr.io/modernrelay/omnigraph-server:v0.8.1
+docker pull modernrelay/omnigraph-server:v0.9.0          # Docker Hub
+# or: docker pull ghcr.io/modernrelay/omnigraph-server:v0.9.0
 ```
 
 Or build it yourself:
@@ -273,9 +273,8 @@ Manager secret whose `SecretString` is a JSON object of
 `{"actor_id": "token", ...}`:
 
 ```bash
-omnigraph-server-aws s3://my-bucket/graphs/example ...
-  # Environment:
-  # OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET=arn:aws:secretsmanager:us-east-1:123456789012:secret:omnigraph-tokens-AbCdEf
+OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET=arn:aws:secretsmanager:us-east-1:123456789012:secret:omnigraph-tokens-AbCdEf \
+  omnigraph-server --cluster s3://my-bucket/cluster --bind 0.0.0.0:8080
 ```
 
 Credentials are resolved via the AWS default chain (env vars, shared config,

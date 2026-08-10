@@ -23,6 +23,7 @@
 | Expand mode override | `OMNIGRAPH_TRAVERSAL_MODE` (`indexed`\|`csr`; unset = cost-based auto) | traversal |
 | Default body limit | `1 MB` | HTTP server |
 | Load (bulk-write) body limit | `32 MiB` | HTTP server (`/load`, `/load/ndjson`, and the deprecated `/ingest` alias) |
+| Strict-input Arrow preflight | `strict_input_arrow_bytes` ceiling = `KEYED_WRITE_MAX_BYTES` (32 MiB) | a strict load's projected Arrow allocation per declaration group, charged before materialization. Applies to **every** load mode — Overwrite escapes the keyed row/byte ceilings above but not this preflight; a larger bulk replacement is one overwrite chunk followed by merge chunks |
 | Strict graph-batch line limit | `GRAPH_BATCH_MAX_LINE_BYTES = 33,554,432` (32 MiB) | each nonblank logical node/edge envelope read by `load_graph_batch{,_as}`; an oversized tail is discarded through its newline without retaining it |
 | Strict graph-batch structural limit | `GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS = 131,072` (64 MiB modeled DOM budget at 512 bytes/slot) | pre-DOM guard over JSON object/array delimiters, commas, and colons; excess fails as typed `graph_batch_json_structural_slots` |
 | Default embed provider/model | `openai-compatible` / `openai/text-embedding-3-large` | engine embedding |

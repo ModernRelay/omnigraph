@@ -7,7 +7,7 @@ destructive changes, and recovering from crashes.
 
 It is a **how-to**. The reference for every `cluster.yaml` key, command flag,
 state-file field, and diagnostic code is
-[cluster-config.md](config.md); the HTTP surface is
+[config.md](config.md); the HTTP surface is
 [server.md](../operations/server.md).
 
 ## The model in one paragraph

@@ -1,9 +1,9 @@
 # Cluster Config
 
 > New to the cluster tooling? Start with the operator how-to guide,
-> [cluster.md](index.md) — this document is the reference.
+> [index.md](index.md) — this document is the reference.
 
-Cluster config is the future control-plane configuration surface for a whole
+Cluster config is the control-plane configuration surface for a whole
 OmniGraph deployment. In this stage, OmniGraph can validate a local
 `cluster.yaml` folder, produce a deterministic read-only plan, inspect the
 local JSON state ledger, explicitly refresh/import graph observations into
