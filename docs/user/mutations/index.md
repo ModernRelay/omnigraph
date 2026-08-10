@@ -79,8 +79,13 @@ same-query pending IDs shadow committed rows; stored Blob size is checked before
 its payload is read. Exceeding either limit returns HTTP **413** with structured
 `resource_limit` details before the recovery intent is armed, with no durable
 effect. Submit a larger incremental load as explicit chunks—
-each chunk is a separate atomic graph commit—or use `--mode overwrite` for an
-initial bulk replacement.
+each chunk is a separate atomic graph commit. `--mode overwrite` escapes the
+keyed row ceiling (a whole-table replacement is not row-capped), but **not**
+the strict-input Arrow preflight: every strict load mode, Overwrite included,
+refuses a batch whose projected Arrow allocation exceeds 32 MiB with typed
+`strict_input_arrow_bytes` before any durable effect. A bulk replacement
+larger than that is loaded as one `--mode overwrite` chunk followed by
+`--mode merge` chunks.
 
 Blob values supplied as external URIs have mode-dependent storage semantics.
 Keyed insert/upsert and load `append`/`merge` sum the declared ranges or object

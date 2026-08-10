@@ -1,7 +1,9 @@
 # User Docs Coherence Ledger
 
-**Last review:** 2026-06-20 (against 0.7.1)
-**Status:** all open findings resolved — living ledger for future audits.
+**Last review:** 2026-08-10 (against 0.9.0; three-agent sweep — user docs vs
+code, dev docs vs architecture, mechanical staleness)
+**Status:** the 2026-08-10 findings were fixed in the same change that
+refreshed this header; one internal-rustdoc item below remains open.
 
 This page tracks stale or incoherent user-doc claims found during broad docs
 reviews. Findings are validated against current **code/behavior**, not just
@@ -27,13 +29,16 @@ fixed. Branch `docs/user-coherence-0-7-1`.
 | — | `config.md` `deferred` disposition described as "graph/schema change, later phase" | → "an unsupported change (e.g. standalone schema delete)". |
 | — | Stale stage labels (`Stage 3A`, `Stage 2C`, `Stage 1`) in active reference docs | Removed / reworded to plain language; release notes keep history. |
 
-## Open — surfaced 2026-06-20, not yet fixed
+## Open — surfaced 2026-06-20, still open at the 2026-08-10 review
 
 - **Stale "config-only apply" / "Stage 3A" comments in `omnigraph-cluster`
   source** (internal rustdoc, not user docs — out of scope for the docs sweep
-  above): `src/types.rs:147` ("Applied changes execute (config-only query/policy
-  catalog writes)"), `src/types.rs:265` ("Output of config-only cluster apply"),
-  `src/diff.rs:256`, and `src/tests.rs:1129` ("config-only apply (Stage 3A)").
+  above): `src/types.rs:152` ("Applied changes execute (config-only query/policy
+  catalog writes)"), `src/types.rs:270` ("Output of config-only cluster apply"),
+  `src/diff.rs:256`, and `src/tests.rs:1310` ("config-only apply (Stage 3A)");
+  the 2026-08-10 re-check found two further instances, `src/lib.rs:253`
+  ("Config-only `cluster apply` (Stage 3A)") and `src/config.rs:254`
+  ("Stage 2C supports only omitted state.backend").
   Apply now also runs graph creates, schema applies, and approved deletes
   (`diff.rs:411` `GraphCreate` / `SchemaApply`; the Stage-4 create/schema/delete
   executors + tests `apply_creates_graph_and_unblocks_dependents`,

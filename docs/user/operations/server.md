@@ -240,7 +240,7 @@ fails.
 ## Error model
 
 Uniform
-`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, read_set_conflict?, recovery_required?, resource_limit? }`
+`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, key_conflict?, read_set_conflict?, recovery_required?, resource_limit? }`
 with
 `code ∈ unauthorized | forbidden | bad_request | not_found | method_not_allowed | conflict | too_many_requests | internal`.
 Merge conflicts attach structured
@@ -268,7 +268,7 @@ structured field is additive and rolling-safe.
 Do not blindly resubmit the write: let a read-write open or the recovery sweep
 resolve that operation first, then retry from a fresh snapshot.
 
-HTTP status codes used include 200, 400, 401, 403, 404, 405, 409, 412, 413,
+HTTP status codes used include 200, 400, 401, 403, 404, 405, 409, 413,
 415, 429, 500, and 503.
 
 ## Per-actor admission control

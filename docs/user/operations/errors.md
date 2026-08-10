@@ -44,6 +44,17 @@
   budget did not become available within 250 ms. Those export limits are
   transient; finish or disconnect the earlier response and retry rather than
   changing graph data.
+  The full set of `resource_limit.resource` names a client can receive:
+  `strict_input_arrow_bytes` (a strict load's projected Arrow allocation
+  exceeded 32 MiB — this preflight applies to **every** load mode, Overwrite
+  included), `graph_batch_request_bytes`, `graph_batch_line_bytes`,
+  `graph_batch_json_structural_slots`, `stream_export_slots`, and
+  `stream_export_transport_bytes`, plus the keyed row/byte ceilings described
+  above.
+- `Policy(String)` — a Cedar policy denied the action for the resolved actor.
+  HTTP returns **403**.
+- `AlreadyInitialized { uri }` — `init` targeted a root that already holds a
+  graph. HTTP returns **409**.
 - `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id`. Resolve the sidecar through a read-write reopen/server restart before retrying; this is intentionally not an ordinary OCC retry.
 
 For RFC-023 Mutation/Load keyed writes, `KeyConflict` is returned only after

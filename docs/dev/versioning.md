@@ -85,5 +85,18 @@ not justify a wire-version gate.
 - **Recovery grammar:** bump the recovery-sidecar ceiling only when persisted
   recovery meaning changes. Never derive it from the manifest version.
 - **Wire:** keep changes additive and regenerate `openapi.json`.
-- **Lance:** follow the complete Lance-bump checklist in [lance.md](lance.md).
+- **Lance:** on a bump, run `lance_surface_guards.rs` first (see
+  [testing.md](testing.md)), review every intervening upstream commit, then
+  refresh [lance.md](lance.md)'s index and add a dated audit stanza in the
+  same change.
 - **Release:** update all published crates and generated metadata in lockstep.
+
+## Registry publication status
+
+crates.io publication is **paused** as of 2026-08. Access to the account
+owning the historical `omnigraph-*` crate names was lost, so those names are
+frozen at their 0.8.0 versions and no current release publishes to the
+registry; recovery of the account is being pursued. The name `omnigraph-db`
+is reserved (0.0.1) as a fallback. Binaries ship via the installer, Homebrew,
+Docker, and GitHub Releases; the TypeScript SDK ships via npm. Docs must not
+instruct users to `cargo install` until this paragraph is updated.

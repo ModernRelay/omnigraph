@@ -131,6 +131,30 @@ query related_to($slug: String) {
 }
 ```
 
+### Edge bindings — filtering and projecting edge properties (omnigraph >= 0.9.0)
+
+An optional `$var:` prefix on the edge word binds the matched edge *row*, so
+declared edge properties (confidence, role, provenance, …) become usable
+anywhere a node field is:
+
+```gq
+query asserted_links($slug: String) {
+    match {
+        $i: Issue { slug: $slug }
+        $i $w:issueRelated $r
+        $w.confidence = "asserted"
+    }
+    return { $r.slug, $w.confidence }
+}
+```
+
+Rules: composes with the undirected form (`$a $w:<related> $b`) and inside
+`not { }`. A bound traversal returns **one row per matching edge**, so
+parallel edges between the same endpoints appear individually (unbound
+traversals keep set-of-pairs semantics). Rejected with `T23`: binding a
+`{min,max}` multi-hop, rebinding a taken variable name, or projecting bare
+`$w` (project a property instead).
+
 Composes with hop bounds (`$a <knows>{1,3} $b`) and `not { }` ("no edge in
 either direction"). Asymmetric edges (e.g. `Comment -> Issue`) are rejected at
 typecheck (T22) — use the directional form there.
