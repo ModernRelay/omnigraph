@@ -163,7 +163,8 @@ match_value = { literal | variable | now_call }
 
 // Traversal: $p knows $f (directional) or $p <knows> $f (undirected, >= 0.8.1)
 // Edge binding: $p $w:knows $f then $w.prop in filter/return (>= 0.9.0)
-traversal = { variable ~ (undirected_edge | edge_ident) ~ traversal_bounds? ~ variable }
+traversal = { variable ~ edge_binding? ~ (undirected_edge | edge_ident) ~ traversal_bounds? ~ variable }
+edge_binding = { variable ~ ":" }
 undirected_edge = { "<" ~ edge_ident ~ ">" }
 traversal_bounds = { "{" ~ integer ~ "," ~ integer? ~ "}" }
 
