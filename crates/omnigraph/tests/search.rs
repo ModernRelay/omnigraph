@@ -624,6 +624,69 @@ async fn nearest_returns_k_closest() {
     assert_eq!(slugs.value(0), "ml-intro", "closest should be ml-intro");
 }
 
+/// Lance 10 still drops KNN ordering metadata when its sorted candidate stream
+/// is late-hydrated with ordinary node payload. Above one 8,192-row output
+/// batch, a parallel final coalesce can then put a later partition first. This
+/// engine-level cell proves the temporary one-output-partition fence is wired
+/// through the real stable-row-ID graph scan and preserves the complete rank.
+#[tokio::test(flavor = "multi_thread")]
+async fn nearest_large_k_preserves_global_order_through_payload_hydration() {
+    const ROWS_PER_FRAGMENT: usize = 5_000;
+    const LIMIT: usize = 8_193;
+
+    fn rows(start: usize) -> String {
+        (start..start + ROWS_PER_FRAGMENT)
+            .map(|row| {
+                format!(
+                    r#"{{"type":"Doc","data":{{"slug":"n{row:05}","embedding":[{row}.0,0.0,0.0,0.0]}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    let schema = r#"
+node Doc {
+    slug: String @key
+    embedding: Vector(4)
+}
+"#;
+    let query = format!(
+        r#"
+query ranked($q: Vector(4)) {{
+    match {{ $d: Doc }}
+    return {{ $d.slug }}
+    order {{ nearest($d.embedding, $q) }}
+    limit {LIMIT}
+}}
+"#
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, &rows(0), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    load_jsonl(&db, &rows(ROWS_PER_FRAGMENT), LoadMode::Append)
+        .await
+        .unwrap();
+
+    let result = query_main(
+        &mut db,
+        &query,
+        "ranked",
+        &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.num_rows(), LIMIT);
+    let slugs = result_slugs(&result);
+    for (rank, slug) in slugs.iter().enumerate() {
+        assert_eq!(slug, &format!("n{rank:05}"), "wrong result at rank {rank}");
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn nearest_string_param_matches_explicit_vector_under_mock_embeddings() {

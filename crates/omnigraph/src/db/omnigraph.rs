@@ -2352,7 +2352,7 @@ impl Omnigraph {
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
 
-        blobs.pop().ok_or_else(|| {
+        blobs.pop().flatten().ok_or_else(|| {
             OmniError::manifest(format!(
                 "blob '{}' on {} '{}' returned no data",
                 property, type_name, id

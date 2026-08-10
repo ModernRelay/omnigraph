@@ -32,7 +32,7 @@ toll paid at graph open, introduced somewhere across fifteen format strands,
 noticed by nobody. A companion run through the cluster server showed the same
 toll amortized to zero, and isolated a separate 4× request increase confined to
 export. That measured edge build belonged to the subsequently removed RFC-026
-lineage; current 0.9.0 returned to manifest schema v6. The numbers are historical
+lineage; 0.9.0 returned to manifest schema v6. The numbers are historical
 evidence of an instrumentation gap, not a claim about current-main cost.
 
 Two facts about that discovery matter more than the numbers:

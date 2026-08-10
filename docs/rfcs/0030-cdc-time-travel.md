@@ -21,8 +21,8 @@ publication, RFC-023 exact-`id` table fencing, and RFC-028 immutable table
 identity.
 
 **Surveyed:** OmniGraph `main` at commit
-`ad3da4170ee90cdd065256f61ebcb6634f35104b` (internal schema v6) and Lance
-9.0.0.
+`ad3da4170ee90cdd065256f61ebcb6634f35104b` (internal schema v6); the Lance
+surface was revalidated against the pinned 10.0.0 release.
 
 **Audience:** engine, server, CLI, and documentation maintainers.
 
@@ -44,7 +44,7 @@ The implementation reuses the coordinator we already have:
 3. Lance's native row-version tracking supplies inserts and updates from the
    dataset checked out at the **exact end version**.
 4. Deletes come from an exact, bounded comparison of live logical IDs at the
-   begin and end snapshots. Lance 9 has no complete deleted-row feed.
+   begin and end snapshots. Lance 10 has no complete deleted-row feed.
 5. One opaque caller-owned cursor resumes the graph feed. OmniGraph stores no
    per-consumer state.
 
@@ -66,7 +66,7 @@ not row-image availability.
 
 ## 1. What Lance gives us—and what it does not
 
-The design is based on the pinned Lance 9.0.0 implementation as well as the
+The design is based on the pinned Lance 10.0.0 implementation as well as the
 published format documentation.
 
 | Lance surface | Safe use in this RFC | Boundary |
@@ -85,10 +85,10 @@ Primary references:
 - [Lance transaction specification](https://lance.org/format/table/transaction/)
 - [Lance versioning guide](https://lance.org/quickstart/versioning/)
 - [Lance read/write and cleanup guide](https://lance.org/guide/read_and_write/)
-- [Lance 9.0.0 `DatasetDelta` source](https://github.com/lance-format/lance/blob/v9.0.0/rust/lance/src/dataset/delta.rs)
+- [Lance 10.0.0 `DatasetDelta` source](https://github.com/lance-format/lance/blob/v10.0.0/rust/lance/src/dataset/delta.rs)
 
-The `DatasetDelta` source on current Lance `main` is still byte-identical to
-the v9.0.0 file surveyed here. There is no merged deleted-row API. Draft
+The v10.0.0 `DatasetDelta` source is byte-identical to the v9.0.0 file
+originally surveyed here. There is no merged deleted-row API. Draft
 [Lance PR #5002](https://github.com/lance-format/lance/pull/5002) explores
 `_row_deleted_at_version`; its continuation
 [PR #6671](https://github.com/lance-format/lance/pull/6671) closed without
@@ -267,7 +267,7 @@ the design does not authorize one object-store round trip per candidate or an
 ad-hoc string `IN (...)` filter.
 
 The adapter prefers `DatasetDelta::get_upserted_rows()` if its runtime surface
-passes the projection, blob, and batch-memory gates in §9. Lance 9's convenience
+passes the projection, blob, and batch-memory gates in §9. Lance 10's convenience
 builder hardcodes wildcard projection and does not expose row/byte batch limits.
 If that cannot satisfy OmniGraph's bounds, the adapter uses one thin
 `DatasetScanner` over the same public version columns and predicates, with the

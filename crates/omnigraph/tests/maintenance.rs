@@ -7,8 +7,11 @@ mod helpers;
 
 use std::time::Duration;
 
+use arrow_array::{Array, LargeBinaryArray, StringArray};
+use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance_core::datatypes::BlobHandling;
 use omnigraph::IndexCoverage;
 use omnigraph::db::{
     CleanupPolicyOptions, Omnigraph, ReadTarget, RepairAction, RepairClassification, RepairOptions,
@@ -455,50 +458,107 @@ node Doc {
 // the same positive path as every other data table; a reintroduced skip would
 // hide both fragment growth and a Lance compatibility regression.
 //
-// History: through Lance 7.0.0 `compact_files` mis-decoded blob-v2 columns, so
-// `optimize` skipped blob tables (`SkipReason::BlobColumnsUnsupportedByLance`)
-// behind `LANCE_SUPPORTS_BLOB_COMPACTION`. Lance 8.0.0+ compacts blob-v2
-// correctly (upstream #7017/#7618), the gate and skip were removed at the
-// 9.0.0-beta.15 bump, and this test now pins the POSITIVE contract: a
-// multi-fragment blob table compacts in the same sweep as its non-blob
-// sibling, is published, and its rows survive. The surface-guard twin is
-// `lance_surface_guards.rs::compact_files_succeeds_on_blob_columns`.
+// History: Lance 8 fixed the first blob-v2 compaction failure, but Lance 9 still
+// misclassified a valid empty inline blob at the start of a fragment as null
+// during compaction (lance#7965), with a blob-v1 form that could damage a
+// neighbouring payload. Lance 10 is therefore the RFC-033 prerequisite. This
+// graph-level twin of `lance_surface_guards.rs::compact_files_succeeds_on_blob_columns`
+// proves `optimize` publishes the fixed result atomically with a plain table and
+// preserves Arrow validity plus exact bytes, not merely row count.
 #[tokio::test]
 async fn optimize_compacts_blob_table_alongside_plain_table() {
+    async fn assert_doc_blobs(db: &Omnigraph, expected: &[(String, Option<Vec<u8>>)]) {
+        let snapshot = snapshot_main(db).await.unwrap();
+        let table = snapshot.open("node:Doc").await.unwrap();
+        let mut scanner = table.scan();
+        scanner.project(&["slug", "content"]).unwrap();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let mut stream = scanner.try_into_stream().await.unwrap();
+        let mut actual = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let slugs = batch
+                .column_by_name("slug")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let contents = batch
+                .column_by_name("content")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                actual.push((
+                    slugs.value(row).to_owned(),
+                    contents.is_valid(row).then(|| contents.value(row).to_vec()),
+                ));
+            }
+        }
+        actual.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            actual, expected,
+            "graph-visible optimize result must preserve null validity, valid empty, and exact bytes"
+        );
+        assert_eq!(actual[1].1, None, "d1 must remain Arrow-null");
+        assert_eq!(
+            actual[2].1,
+            Some(Vec::new()),
+            "d2 must remain a non-null valid empty blob"
+        );
+    }
+
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     // One Blob node type (`Doc`) + one plain node type (`Tag`): proves both use
     // the normal compaction path in the same sweep.
     let schema = "\
-node Doc {\n    slug: String @key\n    content: Blob\n}\n\
+node Doc {\n    slug: String @key\n    content: Blob?\n}\n\
 node Tag {\n    slug: String @key\n}\n";
     let db = Omnigraph::init(uri, schema).await.unwrap();
 
-    // Multi-fragment blob table: Overwrite creates fragment 1; each Merge of
-    // new keys appends another. A >=2-fragment blob table exercises the rewrite
-    // path that exposed the historical Lance regression (a single fragment
-    // would be a no-op).
+    // Three two-row writes create the exact lance#7965 shape: payload + null in
+    // fragment one, valid empty leading fragment two followed by a neighbouring
+    // payload, and two more neighbouring payloads in fragment three.
     load_jsonl(
         &db,
-        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"content\":\"base64:aGVsbG8x\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"content\":\"base64:aGVsbG8y\"}}",
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d0\",\"content\":\"base64:cm93LXplcm8=\"}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"content\":null}}",
         LoadMode::Overwrite,
     )
     .await
     .unwrap();
     load_jsonl(
         &db,
-        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"content\":\"base64:aGVsbG8z\"}}",
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"content\":\"base64:\"}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"content\":\"base64:cm93LXRocmVl\"}}",
         LoadMode::Merge,
     )
     .await
     .unwrap();
     load_jsonl(
         &db,
-        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"content\":\"base64:aGVsbG80\"}}",
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"content\":\"base64:cm93LWZvdXI=\"}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d5\",\"content\":\"base64:cm93LWZpdmU=\"}}",
         LoadMode::Merge,
     )
     .await
     .unwrap();
+    let expected = vec![
+        ("d0".to_string(), Some(b"row-zero".to_vec())),
+        ("d1".to_string(), None),
+        ("d2".to_string(), Some(Vec::new())),
+        ("d3".to_string(), Some(b"row-three".to_vec())),
+        ("d4".to_string(), Some(b"row-four".to_vec())),
+        ("d5".to_string(), Some(b"row-five".to_vec())),
+    ];
+    assert_doc_blobs(&db, &expected).await;
+    let doc_uri = node_table_uri(&db, "Doc").await;
+    assert_eq!(
+        Dataset::open(&doc_uri).await.unwrap().get_fragments().len(),
+        3,
+        "test precondition: valid empty must lead the second of three fragments"
+    );
     // Plain table, also multi-fragment so it has something to compact.
     load_jsonl(
         &db,
@@ -535,7 +595,7 @@ node Tag {\n    slug: String @key\n}\n";
         .iter()
         .find(|s| s.table_key == "node:Tag")
         .expect("Tag stat present");
-    // The blob table compacts like any other (Lance 8+ blob-v2 compaction).
+    // Lance 10's null/empty-safe blob-v2 compaction uses the ordinary path.
     assert_eq!(doc.skipped, None, "blob table must no longer be skipped");
     assert!(doc.committed, "blob table compaction must be published");
     assert!(
@@ -563,9 +623,16 @@ node Tag {\n    slug: String @key\n}\n";
         "the graph-wide Optimize commit must extend the prior head"
     );
 
-    // Every blob row survives the rewrite and stays readable.
+    // Every exact blob value survives the rewrite through the graph-visible
+    // snapshot, including null-vs-empty Arrow validity and neighbouring bytes.
     let count = count_rows(&db, "node:Doc").await;
-    assert_eq!(count, 4, "all blob rows must survive compaction");
+    assert_eq!(count, 6, "all blob rows must survive compaction");
+    assert_doc_blobs(&db, &expected).await;
+    assert_eq!(
+        Dataset::open(&doc_uri).await.unwrap().get_fragments().len(),
+        1,
+        "graph-published Blob table should expose the compacted single-fragment head"
+    );
 }
 
 // Regression: `optimize` must publish its compaction to the `__manifest` so the

@@ -642,7 +642,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
             updated_fragments,
             new_fragments,
             fields_modified,
-            merged_generations,
+            compacted_sstables,
             fields_for_preserving_frag_bitmap,
             update_mode,
             inserted_rows_filter,
@@ -652,7 +652,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
             assert!(updated_fragments.is_empty());
             assert!(!new_fragments.is_empty());
             assert!(fields_modified.is_empty());
-            assert!(merged_generations.is_empty());
+            assert!(compacted_sstables.is_empty());
             assert_eq!(fields_for_preserving_frag_bitmap, &expected_field_ids);
             assert_eq!(
                 update_mode,

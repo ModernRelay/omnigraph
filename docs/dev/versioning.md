@@ -21,9 +21,11 @@ The current binary reads and writes exactly **internal manifest schema v6**.
 - **v5** is an unreleased development format that introduced SchemaIR v2,
   immutable stable-table/incarnation identity, identity-keyed manifest rows,
   and identity-derived table paths.
-- **v6** is the current format. It preserves v5 and makes every graph table's
-  exact non-null physical `id` field Lance's unenforced primary key; supported
-  strict insert/upsert writers use the exact-`id`, filter-bearing adapter.
+- **v6** is the current format. It shipped in OmniGraph 0.9.x and remains the
+  format written by 0.10.x. It preserves v5 and makes every graph table's exact
+  non-null physical `id` field Lance's unenforced primary key; supported strict
+  insert/upsert writers use the exact-`id`, filter-bearing adapter. The Lance
+  10 dependency bump is not a new OmniGraph format strand.
 - **v7-v19** were unreleased development formats belonging to the rejected
   RFC-026 MemWAL experiment. They are abandoned and are not compatibility
   obligations. The v6 binary refuses them as future formats before recovery or

@@ -70,7 +70,7 @@ flowchart TB
         ts[sealed TableStorage writes<br/>read-only snapshot facade]:::l2
     end
 
-    subgraph lance_layer[Lance 9.x — substrate]
+    subgraph lance_layer[Lance 10.x — substrate]
         lance[per-dataset versions, fragments<br/>BTREE · Inverted FTS · IVF/HNSW vector<br/>merge_insert · compact_files · cleanup_old_versions]:::l1
     end
 
