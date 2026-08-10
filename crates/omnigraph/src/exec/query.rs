@@ -2524,6 +2524,14 @@ async fn execute_node_scan(
                     scanner
                         .nearest(prop, &query_arr, k)
                         .map_err(|e| OmniError::Lance(format!("nearest: {}", e)))?;
+                    // Lance 10's late payload `LanceRead` drops the sorted
+                    // candidate stream's ordering metadata. With more than
+                    // one output partition, execute_plan may therefore use a
+                    // scheduling-ordered coalescer and scramble large-k ANN
+                    // or flat results. Keep one DataFusion output partition
+                    // until Lance preserves/remaps that ordering. Reads and
+                    // decoding inside the partition remain concurrent.
+                    scanner.target_parallelism(1);
                 }
             }
 
@@ -2565,7 +2573,6 @@ async fn execute_node_scan(
         arrow_select::concat::concat_batches(&schema, &batches)
             .map_err(|e| OmniError::Lance(e.to_string()))?
     };
-
     // Add null placeholder columns for excluded blob properties
     if has_blobs {
         return add_null_blob_columns(&scan_result, node_type);

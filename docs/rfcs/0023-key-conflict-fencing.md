@@ -26,8 +26,8 @@ conflict-resolver and merge-insert sources plus runtime surface probes
 **Evidence status (2026-07-17):** the beta.21 filter shape and directional
 conflict matrix were revalidated unchanged by the RC.1 surface guards. The
 historical performance measurements below remain labeled beta.21. The implementation now activates
-the contract in internal schema v6 (a 0.9.0-dev format; no published release
-served it): fresh
+the contract in internal schema v6 (shipped by 0.9.0 and retained unchanged by
+0.10.0): fresh
 node/edge datasets carry exact-`id` PK metadata from creation, all production
 graph insert/upsert routes use the sealed filter-bearing keyed adapter, bare
 keyed Append is source-guarded out of production, and effect-free conflicts
@@ -239,7 +239,6 @@ with an ad-hoc flag.
 | Strict insert / load append | merge-insert ON exactly `id`, `WhenMatched::Fail`, filtered path | `Append` allowed |
 | Upsert / load merge | merge-insert ON exactly `id`, `WhenMatched::UpdateAll`, filtered path | workload-specific |
 | Fast-forward branch merge of new rows | v1-proven filtered insert without a target join; otherwise exact-`id` filtered merge-insert with strict semantics | `Append` allowed |
-| Future RFC-026 WAL upsert fold (not implemented by this RFC) | filtered merge-insert with `merged_generations` | append transaction allowed |
 | Update existing row | merge-insert/update with affected-row conflict metadata | workload-specific |
 | Delete | staged Lance delete; PK filter is not the delete-conflict primitive | staged Lance delete |
 | Overwrite | staged overwrite whose output schema preserves the exact PK | staged overwrite |
@@ -339,7 +338,7 @@ incarnation at the exact base version. The transaction count must equal the
 numeric version interval. Every link must have a UUID, read exactly the prior
 version, carry the exact v1 property, and be a pure insertion-only
 `Operation::Update`: no removed or updated fragments, no modified fields,
-merged generations, or updated-fragment offsets; at least one new fragment;
+`compacted_sstables`, or updated-fragment offsets; at least one new fragment;
 `RewriteRows` mode; and an inserted-row filter over exactly the physical `id`
 field ID. Every new fragment must report its physical row count, and the sum
 across the interval must equal the manifest row-count delta.
@@ -578,9 +577,9 @@ compatibility check. A fencing-capable binary keeps
 instructions, and refuses a newer graph with “upgrade omnigraph.” An older
 binary refuses the fencing-capable stamp.
 
-The fencing-compatible format is internal schema **v6**, a 0.9.0-dev format
-(the planned 0.10.x mapping was superseded; the later v7+ development stamps
-were rejected with the RFC-026 experiment, and 0.9.0 shipped v6). It follows RFC-028's v5 identity format; RFC-024 and later draft
+The fencing-compatible format is internal schema **v6**, shipped by 0.9.0 and
+retained unchanged by 0.10.0 (the later v7+ development stamps were rejected
+with the RFC-026 experiment). It follows RFC-028's v5 identity format; RFC-024 and later draft
 capabilities are not included. Each later internal-format change requires its
 own rebuild under the strand policy unless independently accepted capabilities
 deliberately co-release after a combined initialization and recovery review.
@@ -1272,8 +1271,8 @@ correctness cells are recorded in §11.2 and are green.
 5. **Retained support boundary, not a current-topology acceptance gate:**
    cross-process recovery ownership must land before any broadened topology
    claim. V6 destructive recovery remains single-writer-process.
-6. **Satisfied 2026-07-15:** internal schema v6 is the fencing format (then
-   planned for 0.10.x; ultimately a 0.9.0-dev format), and a genuine final-v5
+6. **Satisfied 2026-07-15:** internal schema v6 is the fencing format (shipped
+   by 0.9.0 and retained unchanged by 0.10.0), and a genuine final-v5
    binary passed v6 refusal,
    export/init/load with row/vector/blob fidelity, exact blob bytes, and
    exact-`id` target PKs; duplicate input failed atomically with an empty target

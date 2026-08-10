@@ -28,10 +28,11 @@ mod helpers;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
-use lance::Dataset;
+use lance::dataset::BlobRangeRequest;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
 use lance::dataset::optimize::{CompactionOptions, compact_files};
@@ -47,6 +48,8 @@ use lance::dataset::{
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance::index::DatasetIndexExt;
 use lance::session::Session;
+use lance::{BlobArrayBuilder, Dataset};
+use lance_core::datatypes::BlobHandling;
 use lance_core::{
     ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, ROW_OFFSET,
     is_system_column,
@@ -497,21 +500,13 @@ async fn cached_and_zero_cache_sessions_share_store_registry_not_metadata_cache(
         after_cached.misses > before.misses,
         "the first Session open must create an object-store client"
     );
-    let cached_metadata_items = cached_session
-        .metadata_cache_keys()
-        .await
-        .expect("the default Lance cache backend must expose key inventory")
-        .count();
+    let cached_metadata_items = cached_session.metadata_cache_stats().await.num_entries;
     assert!(
         cached_metadata_items > 0,
         "a real data-Session open must populate its metadata cache"
     );
     assert_eq!(
-        control_session
-            .metadata_cache_keys()
-            .await
-            .expect("the zero-cache Session backend must expose key inventory")
-            .count(),
+        control_session.metadata_cache_stats().await.num_entries,
         0,
         "the control Session must not observe the data Session's metadata entries"
     );
@@ -533,11 +528,7 @@ async fn cached_and_zero_cache_sessions_share_store_registry_not_metadata_cache(
         "the second Session must not build a duplicate client for identical store parameters"
     );
     assert_eq!(
-        control_session
-            .metadata_cache_keys()
-            .await
-            .expect("the zero-cache Session backend must expose key inventory")
-            .count(),
+        control_session.metadata_cache_stats().await.num_entries,
         0,
         "a control-plane open must leave the zero-sized metadata cache empty"
     );
@@ -1313,97 +1304,274 @@ async fn native_tags_pin_exact_main_and_named_branch_versions_through_cleanup() 
 
 // --- Guard 10: blob-column compaction works in this Lance ------------------
 //
-// Historical: through Lance 7.0.0, `compact_files` forced
-// `BlobHandling::AllBinary` and the blob-v2 struct decoder mis-counted columns,
-// failing even a pristine uniform-V2_2 multi-fragment blob table; `optimize`
-// skipped blob-bearing tables behind `LANCE_SUPPORTS_BLOB_COMPACTION = false`.
-// Lance 8.0.0 shipped full blob-v2 compaction (upstream PR #7017; hardened by
-// #7618 in 9.0.0-beta.15 after a beta.13 regression), so the gate, the skip
-// branch, and the `BlobColumnsUnsupportedByLance` skip reason were removed at
-// the 9.0.0-beta.15 bump. This guard pins the POSITIVE behavior `optimize` now
-// relies on: a multi-fragment blob table compacts, preserving every row. If it
-// turns red on a future bump, blob compaction regressed — restore the skip
-// machinery from git history.
+// Historical: Lance 8 fixed the first blob-v2 compaction failure, but Lance 9
+// still misclassified a valid empty inline blob at the start of a fragment as
+// null during compaction (lance#7965); the blob-v1 form could also damage a
+// neighbouring payload. Lance 10 fixes that defect and makes the planned blob
+// selectors total: every requested stable row id produces one result, null is
+// `None`, and valid empty is `Some(empty)`. This is the exact positive guard for
+// the Lance 10 prerequisite. A future Lance bump that turns it red is blocked;
+// if that bump must proceed, it must carry an upstream fix or a tested
+// per-table compaction skip in the same change.
 
 #[tokio::test]
 async fn compact_files_succeeds_on_blob_columns() {
-    use arrow_array::{LargeBinaryArray, StructArray};
+    use arrow_array::types::{Int32Type, UInt64Type};
 
-    fn blob_batch(start: i32, n: i32) -> RecordBatch {
-        let ids: Vec<String> = (start..start + n).map(|i| format!("n{i}")).collect();
-        let data =
-            LargeBinaryArray::from_iter_values((start..start + n).map(|i| format!("blob{i}")));
-        let blob_uri = StringArray::from(vec![None::<&str>; n as usize]);
-        let DataType::Struct(fields) = lance::blob::blob_field("content", true).data_type().clone()
-        else {
-            unreachable!("blob_field is always a Struct");
-        };
-        let content = StructArray::new(
-            fields,
-            vec![Arc::new(data) as _, Arc::new(blob_uri) as _],
-            None,
+    async fn assert_exact_blob_contract(
+        dataset: &Arc<Dataset>,
+        expected: &[(i32, Option<Vec<u8>>)],
+    ) -> Vec<u64> {
+        let mut scanner = dataset.scan();
+        scanner.with_row_id();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batch = scanner
+            .project(&["id", "content"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let contents = batch.column_by_name("content").unwrap().as_binary::<i64>();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+
+        let arrow_values = (0..batch.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row),
+                    contents.is_valid(row).then(|| contents.value(row).to_vec()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arrow_values, expected,
+            "AllBinary scan must preserve null validity, valid empty, and exact neighbouring bytes"
         );
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            lance::blob::blob_field("content", true),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(ids)) as _,
-                Arc::new(content) as _,
-            ],
-        )
-        .unwrap()
+        assert!(contents.is_null(1), "the null blob must remain Arrow-null");
+        assert!(
+            contents.is_valid(2) && contents.value(2).is_empty(),
+            "the valid empty blob must remain non-null"
+        );
+
+        // Deliberately request row 3 twice and scramble the order. Every
+        // selection API below must preserve both request order and duplicates.
+        let request_order = [3_usize, 2, 3, 1, 0];
+        let requested_row_ids = request_order
+            .iter()
+            .map(|&index| row_ids[index])
+            .collect::<Vec<_>>();
+        let requested_values = request_order
+            .iter()
+            .map(|&index| &expected[index].1)
+            .collect::<Vec<_>>();
+        let planned = dataset
+            .read_blobs("content")
+            .unwrap()
+            .with_row_ids(requested_row_ids.clone())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            planned.len(),
+            requested_values.len(),
+            "read_blobs must return one result per stable-row-id selection"
+        );
+        for (actual, expected_bytes) in planned.iter().zip(&requested_values) {
+            assert_eq!(
+                actual.data.as_deref(),
+                expected_bytes.as_deref(),
+                "read_blobs must preserve order/duplicates and distinguish null from valid empty"
+            );
+        }
+
+        let files = dataset
+            .take_blobs(&requested_row_ids, "content")
+            .await
+            .unwrap();
+        assert_eq!(
+            files.len(),
+            requested_values.len(),
+            "take_blobs must return one result per stable-row-id selection"
+        );
+        for (actual, expected_bytes) in files.iter().zip(&requested_values) {
+            match (actual, *expected_bytes) {
+                (None, None) => {}
+                (Some(file), Some(expected_bytes)) => {
+                    assert_eq!(file.size(), expected_bytes.len() as u64);
+                    assert_eq!(file.read().await.unwrap().as_ref(), expected_bytes);
+                }
+                _ => panic!(
+                    "take_blobs must preserve order/duplicates and distinguish null from valid empty"
+                ),
+            }
+        }
+
+        let requests = [
+            BlobRangeRequest::new(row_ids[3], 0, 4),
+            BlobRangeRequest::new(row_ids[2], 0, 0),
+            BlobRangeRequest::new(row_ids[3], 4, 4),
+            // Blob-local bounds are not evaluated for null values.
+            BlobRangeRequest::new(row_ids[1], 128, 64),
+        ];
+        let ranges = dataset
+            .read_blob_ranges("content")
+            .unwrap()
+            .with_row_ids(requests)
+            .execute()
+            .await
+            .unwrap();
+        let expected_ranges: [Option<&[u8]>; 4] = [
+            Some(&expected[3].1.as_ref().unwrap()[..4]),
+            Some(&[]),
+            Some(&expected[3].1.as_ref().unwrap()[4..8]),
+            None,
+        ];
+        assert_eq!(ranges.len(), expected_ranges.len());
+        for (request_index, (actual, expected_bytes)) in
+            ranges.iter().zip(expected_ranges).enumerate()
+        {
+            assert_eq!(actual.request_index, request_index);
+            assert_eq!(actual.data.as_deref(), expected_bytes);
+        }
+
+        row_ids
     }
 
-    async fn write(uri: &str, batch: RecordBatch, mode: WriteMode) {
-        let schema = batch.schema();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        // Blob v2 requires file version >= 2.2; without the pin the *write*
-        // would fail with a different error, masking the guard's intent.
-        let params = WriteParams {
-            mode,
-            enable_stable_row_ids: true,
-            data_storage_version: Some(LanceFileVersion::V2_2),
-            ..Default::default()
-        };
-        Dataset::write(reader, uri, Some(params)).await.unwrap();
+    async fn assert_stable_row_id_failure(
+        dataset: &Arc<Dataset>,
+        valid_row_id: u64,
+        rejected_row_id: u64,
+        case: &str,
+    ) {
+        let row_ids = [valid_row_id, rejected_row_id, valid_row_id];
+        let error = dataset
+            .take_blobs(&row_ids, "content")
+            .await
+            .expect_err("take_blobs must reject the complete selection");
+        assert!(
+            matches!(error, lance::Error::InvalidInput { .. }),
+            "take_blobs {case} stable row id must be a typed InvalidInput, got {error:?}"
+        );
+
+        let error = dataset
+            .read_blobs("content")
+            .unwrap()
+            .with_row_ids(row_ids)
+            .execute()
+            .await
+            .expect_err("read_blobs must reject the complete selection");
+        assert!(
+            matches!(error, lance::Error::InvalidInput { .. }),
+            "read_blobs {case} stable row id must be a typed InvalidInput, got {error:?}"
+        );
+
+        let requests = row_ids.map(|row_id| BlobRangeRequest::new(row_id, 0, 0));
+        let error = dataset
+            .read_blob_ranges("content")
+            .unwrap()
+            .with_row_ids(requests)
+            .execute()
+            .await
+            .expect_err("read_blob_ranges must reject the complete selection");
+        assert!(
+            matches!(error, lance::Error::InvalidInput { .. }),
+            "read_blob_ranges {case} stable row id must be a typed InvalidInput, got {error:?}"
+        );
     }
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("guard10-blob.lance");
     let uri = uri.to_str().unwrap();
 
-    // Uniform V2_2, two fragments → forces compaction to actually rewrite.
-    write(uri, blob_batch(0, 2), WriteMode::Create).await;
-    write(uri, blob_batch(100, 2), WriteMode::Append).await;
-
-    let mut ds = Dataset::open(uri).await.unwrap();
-    assert!(
-        ds.get_fragments().len() >= 2,
-        "guard needs a multi-fragment table to trigger a real compaction rewrite"
+    let expected = vec![
+        (0, Some(vec![b'0'; 80])),
+        (1, None),
+        // `max_rows_per_file = 2`: valid empty leads the second fragment.
+        (2, Some(Vec::new())),
+        (3, Some(vec![b'3'; 80])),
+        (4, Some(vec![b'4'; 80])),
+        (5, Some(vec![b'5'; 80])),
+    ];
+    let mut content = BlobArrayBuilder::new(expected.len());
+    for (_, value) in &expected {
+        match value {
+            Some(value) => content.push_bytes(value).unwrap(),
+            None => content.push_null().unwrap(),
+        }
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        lance::blob::blob_field("content", true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..expected.len() as i32)),
+            content.finish().unwrap(),
+        ],
+    )
+    .unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ds.get_fragments().len(),
+        3,
+        "guard requires the empty blob to lead the second of three fragments"
     );
 
-    let rows_before = ds.count_rows(None).await.unwrap();
+    let row_ids_before = assert_exact_blob_contract(&Arc::new(ds.clone()), &expected).await;
     let metrics = compact_files(&mut ds, CompactionOptions::default(), None)
         .await
         .expect(
-            "compact_files FAILED on a blob table — the Lance blob-v2 compaction \
-             fix (present since 8.0.0, hardened by lance#7618) regressed. If this \
-             is a Lance downgrade, restore the pre-9 blob-skip branch in \
-             db/omnigraph/optimize.rs (see git history + docs/dev/lance.md).",
+            "compact_files failed the Lance 10 null/empty blob prerequisite; block the \
+             dependency bump unless it carries an upstream fix or a tested compaction skip",
         );
     assert!(
-        metrics.fragments_removed >= 2 && metrics.fragments_added >= 1,
+        metrics.fragments_removed >= 3 && metrics.fragments_added >= 1,
         "expected a real rewrite of the multi-fragment blob table, got {metrics:?}"
     );
-    let ds = Dataset::open(uri).await.unwrap();
     assert_eq!(
-        ds.count_rows(None).await.unwrap(),
-        rows_before,
-        "compaction must preserve every blob row"
+        ds.get_fragments().len(),
+        1,
+        "compaction must coalesce the three-fragment reproducer"
     );
+    let compacted = Arc::new(ds.clone());
+    let row_ids_after = assert_exact_blob_contract(&compacted, &expected).await;
+    assert_eq!(
+        row_ids_after, row_ids_before,
+        "compaction must preserve stable row ids as well as blob values"
+    );
+    assert_stable_row_id_failure(&compacted, row_ids_after[0], u64::MAX, "unknown").await;
+
+    let deleted_row_id = row_ids_after[4];
+    let deleted = ds.delete("id = 4").await.unwrap();
+    assert_eq!(deleted.num_deleted_rows, 1);
+    assert_stable_row_id_failure(
+        &deleted.new_dataset,
+        row_ids_after[0],
+        deleted_row_id,
+        "deleted",
+    )
+    .await;
 }
 
 // --- Guard 11: scalar-index coverage surface (physical_rows + index details) ---
@@ -1886,6 +2054,260 @@ async fn value_index_uncovered_count(ds: &Dataset) -> usize {
     // No `value` index found — treat as fully uncovered so a missing index
     // is never mistaken for full coverage.
     frag_ids.len()
+}
+
+/// Create the deterministic flat-vector shape shared by the two Lance 10
+/// regressions below.  The vector for logical row `i` is `[i, 0, ...]`, so an
+/// exact L2 search from the origin has one unambiguous result order.  Keeping
+/// construction here avoids two copies of the raw Lance fixture while still
+/// letting each guard choose the fragment shape that triggers its own bug.
+async fn linear_vector_dataset(
+    uri: &str,
+    rows: usize,
+    dimension: usize,
+    rows_per_fragment: usize,
+) -> Dataset {
+    use arrow_array::{FixedSizeListArray, Float32Array};
+
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(item.clone(), dimension as i32),
+            false,
+        ),
+    ]));
+    let mut vector_values = vec![0.0_f32; rows * dimension];
+    for (row, vector) in vector_values.chunks_exact_mut(dimension).enumerate() {
+        vector[0] = row as f32;
+    }
+    let vectors = FixedSizeListArray::new(
+        item,
+        dimension as i32,
+        Arc::new(Float32Array::from(vector_values)),
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..rows as i32)),
+            Arc::new(vectors),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            max_rows_per_file: rows_per_fragment,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+// --- Lance 10 regression: stable IDs stay aligned through IVF reshuffle ----
+//
+// lance#7704 fixed `filter_deleted_ids` returning an ID list longer than its
+// address list on stable-row-ID datasets.  The deterministic upstream split
+// reproducer is load-bearing here: one 20K-row IVF_FLAT partition, a scattered
+// delete, then `optimize_indices`.  The partition is large enough that optimize
+// must split/reshuffle it, which is the path that calls the fixed helper.  On
+// Lance 9 this fails before publication; merely asserting success would still
+// miss a future ID/address permutation, so the indexed result is checked all
+// the way back to logical IDs, stable IDs, and physical addresses.
+
+#[tokio::test]
+async fn vector_optimize_after_delete_keeps_stable_ids_and_addresses_aligned() {
+    use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
+    use datafusion::physical_plan::displayable;
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    const ROWS: usize = 20_000;
+    const DIMENSION: usize = 32;
+    const INDEX_NAME: &str = "vector_idx";
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("stable_id_vector_optimize.lance");
+    let uri = uri.to_str().unwrap();
+    let mut dataset = linear_vector_dataset(uri, ROWS, DIMENSION, ROWS).await;
+
+    let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+    dataset
+        .create_index_builder(&["vector"], IndexType::Vector, &params)
+        .name(INDEX_NAME.to_string())
+        .replace(true)
+        .await
+        .unwrap();
+
+    let deleted = dataset.delete("id % 5 = 0").await.unwrap();
+    assert_eq!(deleted.num_deleted_rows, (ROWS / 5) as u64);
+    let mut dataset = (*deleted.new_dataset).clone();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    let stats: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics(INDEX_NAME)
+            .await
+            .expect("the optimized IVF_FLAT index must expose statistics"),
+    )
+    .unwrap();
+    let partition_count = stats["indices"][0]["num_partitions"]
+        .as_u64()
+        .expect("IVF statistics must expose num_partitions") as usize;
+    assert!(
+        partition_count > 1,
+        "the guard must exercise the split/reshuffle path fixed by lance#7704; stats: {stats}"
+    );
+
+    let expected_ids = (0..ROWS as i32)
+        .filter(|id| id % 5 != 0)
+        .collect::<Vec<_>>();
+    let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vector", &query, expected_ids.len())
+        .unwrap();
+    scanner.nprobes(partition_count);
+    scanner.target_parallelism(1);
+    scanner.with_row_id().with_row_address();
+
+    let plan = scanner.create_plan().await.unwrap();
+    let plan = format!("{}", displayable(plan.as_ref()).indent(true));
+    assert!(
+        plan.contains("ANNIvfPartition"),
+        "the alignment check must read through the optimized vector index, got:\n{plan}"
+    );
+
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), expected_ids.len());
+    let ids = batch["id"].as_primitive::<Int32Type>();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+    let row_addresses = batch[ROW_ADDR].as_primitive::<UInt64Type>();
+    let distances = batch["_distance"].as_primitive::<Float32Type>();
+    for (position, expected_id) in expected_ids.iter().copied().enumerate() {
+        assert_eq!(ids.value(position), expected_id, "logical ID at {position}");
+        assert_eq!(
+            row_ids.value(position),
+            expected_id as u64,
+            "stable row ID must stay paired with logical ID {expected_id}"
+        );
+        assert_eq!(
+            row_addresses.value(position),
+            expected_id as u64,
+            "single-fragment physical address must stay paired with stable ID {expected_id}"
+        );
+    }
+    for pair in distances.values().windows(2) {
+        assert!(
+            pair[0] <= pair[1],
+            "indexed results must remain globally distance-ordered: {} before {}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+// --- Lance 10 compatibility: fence late-hydrated KNN ordering --------------
+//
+// lance#7868 makes execute_plan preserve order when the plan still advertises
+// its sorted KNN candidate stream. An ordinary projected payload adds a late
+// `LanceRead` that drops that metadata in Lance 10, so the parallel final
+// coalesce can still scramble large-k results. OmniGraph temporarily requests
+// one output partition for nearest scans. This full-payload stable-row-ID guard
+// pins both the residual and the fence's exact globally ordered result.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flat_knn_late_payload_order_is_fenced_to_one_output_partition() {
+    use arrow_array::types::{Float32Type, Int32Type};
+    use datafusion::physical_plan::ExecutionPlanProperties;
+
+    const DIMENSION: usize = 16;
+    const FRAGMENTS: usize = 4;
+    const ROWS_PER_FRAGMENT: usize = 5_000;
+    const K: usize = 8_193;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("flat_knn_global_order.lance");
+    let uri = uri.to_str().unwrap();
+    let dataset = linear_vector_dataset(
+        uri,
+        FRAGMENTS * ROWS_PER_FRAGMENT,
+        DIMENSION,
+        ROWS_PER_FRAGMENT,
+    )
+    .await;
+    assert_eq!(
+        dataset.fragments().len(),
+        FRAGMENTS,
+        "the guard needs four independently scheduled scan partitions"
+    );
+    let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
+
+    let mut unfenced = dataset.scan();
+    unfenced.nearest("vector", &query, K).unwrap();
+    unfenced.use_index(false);
+    unfenced.target_parallelism(8);
+    let unfenced_plan = unfenced.create_plan().await.unwrap();
+    assert!(
+        unfenced_plan.properties().partitioning.partition_count() > 1,
+        "the compatibility tripwire must exercise parallel late hydration"
+    );
+    assert!(
+        unfenced_plan.output_ordering().is_none(),
+        "Lance now preserves KNN ordering through late payload hydration; remove the \
+         target_parallelism(1) compatibility fence and replace this residual assertion"
+    );
+
+    let mut fenced_plan_scanner = dataset.scan();
+    fenced_plan_scanner.nearest("vector", &query, K).unwrap();
+    fenced_plan_scanner.use_index(false);
+    fenced_plan_scanner.target_parallelism(1);
+    let fenced_plan = fenced_plan_scanner.create_plan().await.unwrap();
+    assert_eq!(
+        fenced_plan.properties().partitioning.partition_count(),
+        1,
+        "the compatibility fence must leave no scheduling-ordered final coalesce"
+    );
+
+    // Keep repeated execution even behind the fence: a future optimizer may
+    // silently reintroduce partitions above the plan node asserted above.
+    for iteration in 0..10 {
+        let mut scanner = dataset.scan();
+        scanner.nearest("vector", &query, K).unwrap();
+        scanner.use_index(false);
+        scanner.target_parallelism(1);
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), K, "iteration {iteration}");
+
+        let ids = batch["id"].as_primitive::<Int32Type>();
+        for position in 0..K {
+            assert_eq!(
+                ids.value(position),
+                position as i32,
+                "flat KNN lost exact global order at result {position}, iteration {iteration}"
+            );
+        }
+        let distances = batch["_distance"].as_primitive::<Float32Type>();
+        for pair in distances.values().windows(2) {
+            assert!(
+                pair[0] <= pair[1],
+                "flat KNN results must be globally sorted at iteration {iteration}: {} before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
 }
 
 // --- Guard 16: scalar index use requires a literal matching the column type ---

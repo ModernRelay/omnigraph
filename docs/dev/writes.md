@@ -118,7 +118,7 @@ filter are requested semantics.
 
 The minting check binds the certificate to the exact parent `read_version`,
 nonempty UUID, exact physical `id` field filter, `RewriteRows` mode, no removed
-or updated fragments, no modified fields, no merged generations, no updated
+or updated fragments, no modified fields, no `compacted_sstables`, no updated
 offsets, and at least one new fragment. It also requires
 `fields_for_preserving_frag_bitmap` to equal the table schema's complete nested
 preorder of field IDs and requires every new fragment's `physical_rows` total
