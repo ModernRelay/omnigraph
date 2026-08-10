@@ -13,9 +13,7 @@ use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
 use lance::dataset::BlobFile;
 use lance::dataset::scanner::ColumnOrdering;
-use lance::datatypes::{
-    BlobKind, LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
-};
+use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::{PropType, ScalarType};
@@ -3108,45 +3106,6 @@ fn blob_properties_for_table_key<'a>(
         "invalid table key '{}'",
         table_key
     )))
-}
-
-fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bool> {
-    if descriptions.is_null(row) {
-        return Ok(true);
-    }
-
-    let kind = descriptions
-        .column_by_name("kind")
-        .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
-        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row) as u8))
-        .or_else(|| {
-            descriptions
-                .column_by_name("kind")
-                .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt8Array>())
-                .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)))
-        });
-    let position = descriptions
-        .column_by_name("position")
-        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
-    let size = descriptions
-        .column_by_name("size")
-        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
-    let blob_uri = descriptions
-        .column_by_name("blob_uri")
-        .and_then(|col| col.as_any().downcast_ref::<StringArray>())
-        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
-
-    let Some(kind) = kind else {
-        return Ok(true);
-    };
-    let kind = BlobKind::try_from(kind).map_err(|e| OmniError::Lance(e.to_string()))?;
-    if kind != BlobKind::Inline {
-        return Ok(false);
-    }
-
-    Ok(position.unwrap_or(0) == 0 && size.unwrap_or(0) == 0 && blob_uri.unwrap_or("").is_empty())
 }
 
 /// Convert compiler placeholders into the physical Lance schema contract.

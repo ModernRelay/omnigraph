@@ -166,6 +166,7 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     // Typecheck return projections
     for proj in &query.return_clause {
         let resolved = resolve_expr_type(catalog, &proj.expr, &ctx, &params)?;
+        reject_blob_read_value(&resolved, &proj.expr)?;
         if let Some(alias) = &proj.alias {
             ctx.aliases.insert(alias.clone(), resolved);
             alias_exprs.insert(alias.clone(), &proj.expr);
@@ -174,7 +175,8 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
 
     // Typecheck order expressions
     for ord in &query.order_clause {
-        resolve_expr_type(catalog, &ord.expr, &ctx, &params)?;
+        let resolved = resolve_expr_type(catalog, &ord.expr, &ctx, &params)?;
+        reject_blob_read_value(&resolved, &ord.expr)?;
     }
 
     let has_standalone_nearest = query
@@ -516,6 +518,12 @@ fn typecheck_edge_mutation_predicate(
                 type_name, predicate.property
             ))
         })?;
+    if matches!(prop_type.scalar, ScalarType::Blob) {
+        return Err(CompilerError::Type(format!(
+            "T11: blob property `{}` cannot be used in WHERE predicates",
+            predicate.property
+        )));
+    }
     check_match_value_type(
         &predicate.value,
         param_types,
@@ -940,6 +948,16 @@ fn typecheck_filter(
     let right_type = resolve_expr_type(catalog, &filter.right, ctx, params)?;
 
     if let (ResolvedType::Scalar(l), ResolvedType::Scalar(r)) = (&left_type, &right_type) {
+        // Blob values never participate in `.gq` filters. Keep this ahead of
+        // every operator-specific early return so public-AST callers cannot
+        // bypass containment with a list-membership shape such as
+        // `[Blob] contains Blob`.
+        if matches!(l.scalar, ScalarType::Blob) || matches!(r.scalar, ScalarType::Blob) {
+            return Err(CompilerError::Type(
+                "T7: blob comparisons in filters are not supported".to_string(),
+            ));
+        }
+
         if filter.op == CompOp::Contains {
             // Overloaded on the left operand: list → membership, scalar
             // String → exact substring. Lowering resolves the String form to
@@ -1014,11 +1032,6 @@ fn typecheck_filter(
         if matches!(l.scalar, ScalarType::Vector(_)) || matches!(r.scalar, ScalarType::Vector(_)) {
             return Err(CompilerError::Type(
                 "T7: vector comparisons in filters are not supported".to_string(),
-            ));
-        }
-        if matches!(l.scalar, ScalarType::Blob) || matches!(r.scalar, ScalarType::Blob) {
-            return Err(CompilerError::Type(
-                "T7: blob comparisons in filters are not supported".to_string(),
             ));
         }
         if !types_compatible(l, r) {
@@ -1098,12 +1111,6 @@ fn resolve_expr_type(
                             type_name
                         ))
                     })?;
-                    if edge_type.blob_properties.contains(property) {
-                        return Err(CompilerError::Type(format!(
-                            "T23: blob edge property `${}.{}` is not projectable; the bound edge scan excludes blob columns",
-                            variable, property
-                        )));
-                    }
                     edge_type.properties.get(property).ok_or_else(|| {
                         CompilerError::Type(format!(
                             "T6: edge `{}` has no property `{}`",
@@ -1112,6 +1119,13 @@ fn resolve_expr_type(
                     })?
                 }
             };
+
+            if matches!(prop.scalar, ScalarType::Blob) {
+                return Err(CompilerError::Type(format!(
+                    "T24: Blob property `${}.{}` is not available as a .gq read value; Blob values require a dedicated API",
+                    variable, property
+                )));
+            }
 
             Ok(ResolvedType::Scalar(prop.clone()))
         }
@@ -1498,6 +1512,7 @@ fn resolve_expr_type(
         Expr::Literal(lit) => Ok(ResolvedType::Scalar(literal_type(lit)?)),
         Expr::Aggregate { func, arg } => {
             let arg_type = resolve_expr_type(catalog, arg, ctx, params)?;
+            reject_blob_read_value(&arg_type, arg)?;
 
             // T8: sum/avg require numeric; min/max require numeric or string
             match func {
@@ -1540,6 +1555,26 @@ fn resolve_expr_type(
     }
 }
 
+fn reject_blob_read_value(resolved: &ResolvedType, expr: &Expr) -> Result<()> {
+    if matches!(
+        resolved,
+        ResolvedType::Scalar(PropType {
+            scalar: ScalarType::Blob,
+            ..
+        })
+    ) {
+        let subject = match expr {
+            Expr::Variable(name) => format!("Blob parameter `${name}`"),
+            Expr::AliasRef(name) => format!("Blob alias `{name}`"),
+            _ => "Blob expression".to_string(),
+        };
+        return Err(CompilerError::Type(format!(
+            "T24: {subject} is not available as a .gq read value; Blob values require a dedicated API"
+        )));
+    }
+    Ok(())
+}
+
 fn infer_projection_field(
     catalog: &Catalog,
     expr: &Expr,
@@ -1550,12 +1585,17 @@ fn infer_projection_field(
     let name = projection_name(expr, alias);
     match expr {
         Expr::Aggregate { func, arg } => {
+            // Keep result-schema inference fail-closed even when a caller has
+            // not first passed through `typecheck_read_query`. In particular,
+            // Count's output shape is fixed, but its argument may still be an
+            // unsupported Blob value.
+            let resolved_arg = resolve_expr_type(catalog, arg, ctx, params)?;
+            reject_blob_read_value(&resolved_arg, arg)?;
             let (data_type, nullable) = match func {
                 AggFunc::Count => (DataType::Int64, true),
                 AggFunc::Avg | AggFunc::Sum => (DataType::Float64, true),
                 AggFunc::Min | AggFunc::Max => {
-                    let resolved = resolve_expr_type(catalog, arg, ctx, params)?;
-                    let (data_type, _) = resolved_type_to_field_shape(catalog, &resolved)?;
+                    let (data_type, _) = resolved_type_to_field_shape(catalog, &resolved_arg)?;
                     (data_type, true)
                 }
             };
@@ -1563,6 +1603,7 @@ fn infer_projection_field(
         }
         _ => {
             let resolved = resolve_expr_type(catalog, expr, ctx, params)?;
+            reject_blob_read_value(&resolved, expr)?;
             let (data_type, nullable) = resolved_type_to_field_shape(catalog, &resolved)?;
             Ok(Field::new(name, data_type, nullable))
         }

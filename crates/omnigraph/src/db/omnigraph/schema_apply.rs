@@ -1379,62 +1379,66 @@ async fn rebuild_blob_column(
     descriptions: &StructArray,
     row_ids: &[u64],
 ) -> Result<Arc<dyn Array>> {
+    let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
     let mut builder = BlobArrayBuilder::new(row_ids.len());
-    let mut non_null_row_ids = Vec::new();
-    let mut row_has_blob = Vec::with_capacity(row_ids.len());
+    let mut managed_row_ids = Vec::new();
+    let mut row_descriptors = Vec::with_capacity(row_ids.len());
 
     for (row, row_id) in row_ids.iter().enumerate() {
-        let is_null = blob_description_is_null(descriptions, row)?;
-        row_has_blob.push(!is_null);
-        if !is_null {
-            non_null_row_ids.push(*row_id);
+        let descriptor = decoder.classify(row)?;
+        if matches!(descriptor, crate::blob::BlobDescriptor::Managed { .. }) {
+            managed_row_ids.push(*row_id);
         }
+        row_descriptors.push(descriptor);
     }
 
-    let blob_files = if non_null_row_ids.is_empty() {
+    let blob_files = if managed_row_ids.is_empty() {
         Vec::new()
     } else {
         Arc::new(source_ds.dataset().clone())
-            .take_blobs(&non_null_row_ids, column_name)
+            .take_blobs(&managed_row_ids, column_name)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?
     };
 
     let mut files = blob_files.into_iter();
-    for has_blob in row_has_blob {
-        if !has_blob {
-            builder
+    for descriptor in row_descriptors {
+        match descriptor {
+            crate::blob::BlobDescriptor::Null => builder
                 .push_null()
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-            continue;
-        }
-
-        let blob = files
-            .next()
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "blob rewrite for '{}' lost alignment with source rows",
-                    column_name
-                ))
-            })?
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "blob rewrite for '{}' returned a null accessor for a non-null description",
-                    column_name
-                ))
-            })?;
-        if let Some(uri) = blob.uri() {
-            builder
+                .map_err(|e| OmniError::Lance(e.to_string()))?,
+            crate::blob::BlobDescriptor::External { uri, .. } => builder
                 .push_uri(uri)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-        } else {
-            builder
-                .push_bytes(
-                    blob.read()
-                        .await
-                        .map_err(|e| OmniError::Lance(e.to_string()))?,
-                )
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+                .map_err(|e| OmniError::Lance(e.to_string()))?,
+            crate::blob::BlobDescriptor::Managed { .. } => {
+                let blob = files
+                    .next()
+                    .ok_or_else(|| {
+                        OmniError::Lance(format!(
+                            "blob rewrite for '{}' lost alignment with managed source rows",
+                            column_name
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        OmniError::Lance(format!(
+                            "blob rewrite for '{}' returned a null accessor for a managed description",
+                            column_name
+                        ))
+                    })?;
+                if blob.uri().is_some() {
+                    return Err(OmniError::Lance(format!(
+                        "blob rewrite for '{}' resolved a managed description as external",
+                        column_name
+                    )));
+                }
+                builder
+                    .push_bytes(
+                        blob.read()
+                            .await
+                            .map_err(|e| OmniError::Lance(e.to_string()))?,
+                    )
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            }
         }
     }
 

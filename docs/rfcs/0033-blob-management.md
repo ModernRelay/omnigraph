@@ -643,9 +643,10 @@ descriptor.
 
 V1 `.gq` cannot return or aggregate a Blob-valued expression. Typechecking
 rejects direct projection, ordering, every aggregate whose argument is Blob
-(including `count`, because nullness is part of its answer), comparison, match,
-and edge-property projection with a stable typed diagnostic that points to the
-Blob management surface. It must not execute and substitute null.
+(including `count`, because nullness is part of its answer), and edge-property
+projection with the stable `T24` diagnostic that points to the Blob management
+surface. Existing comparison, match, and mutation-predicate diagnostics also
+reject Blob operands. No rejected shape may execute and substitute null.
 
 Blob assignment from a string remains available only through existing mutation
 semantics and the external-reference policy. Raw bytes use `blob put`; there is
@@ -659,9 +660,12 @@ struct or Utf8 side channel.
 
 Blob remains ineligible for `@key`, `@unique`, `@index`, and `@embed`, whether
 the annotation is property-level or body-level and whether the property belongs
-to a node or edge. Compiler validation rejects the constraint before catalog
-acceptance. No schema-format bump is required; this closes a parser/validator
-hole for a shape that never had executable semantics.
+to a node or edge. New-schema validation rejects the constraint before catalog
+acceptance. A narrow accepted-contract parser still recognizes a body-level
+Blob `@unique` already persisted by an older v6 binary so the graph can open for
+inspection and export; it does not admit that shape through init/schema apply or
+make the constraint executable. No schema-format bump is required; this closes
+a parser/validator hole without stranding a historical root.
 
 ### 8.3 Export and rebuild
 
@@ -997,7 +1001,8 @@ sense:
 
 1. a query that returned false null for a Blob now fails typechecking;
 2. a body-level Blob `@unique` schema that failed only during writes is rejected
-   at schema validation; and
+   by new init/schema-apply admission; a historical accepted v6 contract remains
+   openable through the compatibility parser for inspection/export; and
 3. new external URI ingress is denied without explicit bases.
 
 All three replace unsafe or non-executable behavior. They require release-note

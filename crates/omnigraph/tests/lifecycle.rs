@@ -3,7 +3,7 @@ mod helpers;
 use std::fs;
 
 use omnigraph::db::{InitOptions, Omnigraph, ReadTarget};
-use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph_compiler::schema::parser::{parse_persisted_schema_contract, parse_schema};
 use omnigraph_compiler::{
     SchemaIR, SchemaIdentityDomain, compile_schema_shape, resolve_schema_ir, schema_ir_hash,
     schema_ir_pretty_json, schema_shape_hash, schema_shape_hash_from_ir,
@@ -13,6 +13,10 @@ use helpers::*;
 
 fn compile_shape(source: &str) -> omnigraph_compiler::SchemaShape {
     compile_schema_shape(&parse_schema(source).unwrap()).unwrap()
+}
+
+fn compile_persisted_shape(source: &str) -> omnigraph_compiler::SchemaShape {
+    compile_schema_shape(&parse_persisted_schema_contract(source).unwrap()).unwrap()
 }
 
 fn schema_state_json(ir: &SchemaIR) -> serde_json::Value {
@@ -141,6 +145,64 @@ async fn init_creates_graph() {
     assert_eq!(
         db.catalog().node_types["Person"].key_property(),
         Some("name")
+    );
+}
+
+#[tokio::test]
+async fn open_accepts_historical_body_unique_blob_but_init_rejects_it() {
+    const BASE_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+}
+"#;
+    const HISTORICAL_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    @unique(content)
+}
+"#;
+
+    let rejected_dir = tempfile::tempdir().unwrap();
+    let rejected_uri = rejected_dir.path().to_str().unwrap();
+    let error = match Omnigraph::init(rejected_uri, HISTORICAL_SCHEMA).await {
+        Ok(_) => panic!("new init must reject body-level @unique(Blob)"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("@unique is not supported on blob property Document.content")
+    );
+
+    // Build a normal v6 root, then replace its source/accepted identity
+    // artifacts with the exact shape the pre-v0.10 parser admitted. The table
+    // identity and physical schema are unchanged; only the logical constraint
+    // differs, so this models a historical root without weakening new init.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, BASE_SCHEMA).await.unwrap();
+    let accepted = db.catalog().bound_schema_ir().unwrap().clone();
+    drop(db);
+
+    let historical_ir = resolve_schema_ir(&accepted, &compile_persisted_shape(HISTORICAL_SCHEMA))
+        .unwrap()
+        .schema_ir;
+    fs::write(dir.path().join("_schema.pg"), HISTORICAL_SCHEMA).unwrap();
+    persist_schema_contract(dir.path(), &historical_ir);
+
+    let reopened = Omnigraph::open(uri)
+        .await
+        .expect("historically admitted v6 schema must remain openable");
+    assert_eq!(reopened.schema_source().as_str(), HISTORICAL_SCHEMA);
+    assert!(
+        reopened
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .entry("node:Document")
+            .is_some()
     );
 }
 

@@ -583,21 +583,64 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_path = external_dir.path().join("external.bin");
+    std::fs::write(&external_path, b"External").unwrap();
+    let external_uri = format!("file://{}", external_path.display());
+    let initial = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+    let db = Omnigraph::init(uri, initial).await.unwrap();
+    let data = [
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "valid-empty",
+                "content": "base64:",
+                "note": "drop me",
+            },
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "neighbor",
+                "content": "base64:TmVpZ2hib3I=",
+                "note": "drop me too",
+            },
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "external",
+                "content": external_uri,
+                "note": "drop me three",
+            },
+        }),
+    ]
+    .into_iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
 
-    let people_before = count_rows(&db, "node:Person").await;
+    let documents_before = count_rows(&db, "node:Document").await;
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
         .version();
 
-    // Drop `age` from Person. v1 + chassis commit #3 emit
+    // Drop `note` from Document. v1 + chassis commit #3 emit
     // `DropProperty { Soft }`; the rewrite path projects to the
-    // target schema (no `age`), commits via stage_overwrite. Row
+    // target schema (no `note`), commits via stage_overwrite. Row
     // counts are unchanged — only the column is dropped from the
     // current schema view.
-    let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
+    let desired = initial.replace("    note: String?\n", "");
 
     // Confirm the plan emits DropProperty { Soft } (not UnsupportedChange).
     let plan = db.plan_schema(&desired).await.unwrap();
@@ -611,15 +654,19 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
                 property_name,
                 mode: omnigraph_compiler::DropMode::Soft,
                 ..
-            } if type_name == "Person" && property_name == "age"
+            } if type_name == "Document" && property_name == "note"
         )),
-        "expected DropProperty {{ type=Person, property=age, mode=Soft }} in plan; got {plan:?}",
+        "expected DropProperty {{ type=Document, property=note, mode=Soft }} in plan; got {plan:?}",
     );
 
+    // An unrelated schema rewrite carries the descriptor, not the external
+    // payload. The caller-owned target may be unavailable without blocking
+    // schema evolution.
+    std::fs::remove_file(&external_path).unwrap();
     let result = db.apply_schema(&desired).await.unwrap();
     assert!(result.supported);
     assert!(result.applied);
-    assert_exact_id_primary_key(&db, "node:Person").await;
+    assert_exact_id_primary_key(&db, "node:Document").await;
 
     // Manifest advanced; row count unchanged.
     let after_version = db
@@ -631,11 +678,30 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
         after_version > before_version,
         "manifest version should advance after soft drop; before={before_version}, after={after_version}",
     );
-    assert_eq!(count_rows(&db, "node:Person").await, people_before);
+    assert_eq!(count_rows(&db, "node:Document").await, documents_before);
 
-    // (a) Current snapshot: `age` is gone from the dataset schema.
+    let empty = db
+        .read_blob("Document", "valid-empty", "content")
+        .await
+        .unwrap();
+    assert_eq!(empty.size(), 0);
+    assert!(empty.read().await.unwrap().is_empty());
+    let neighbor = db
+        .read_blob("Document", "neighbor", "content")
+        .await
+        .unwrap();
+    assert_eq!(&neighbor.read().await.unwrap()[..], b"Neighbor");
+    std::fs::write(&external_path, b"External").unwrap();
+    let external = db
+        .read_blob("Document", "external", "content")
+        .await
+        .unwrap();
+    assert_eq!(external.uri(), Some(external_uri.as_str()));
+    assert_eq!(&external.read().await.unwrap()[..], b"External");
+
+    // (a) Current snapshot: `note` is gone from the dataset schema.
     let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let current_ds = current_snapshot.open("node:Person").await.unwrap();
+    let current_ds = current_snapshot.open("node:Document").await.unwrap();
     let current_fields = current_ds
         .schema()
         .fields
@@ -643,15 +709,15 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
         .map(|f| f.name.clone())
         .collect::<Vec<_>>();
     assert!(
-        !current_fields.iter().any(|f| f == "age"),
-        "current Person dataset schema must not include 'age' after soft drop; got fields {current_fields:?}",
+        !current_fields.iter().any(|f| f == "note"),
+        "current Document dataset schema must not include 'note' after soft drop; got fields {current_fields:?}",
     );
 
     // (b) Time travel: at the pre-drop manifest version, the prior
-    // Person dataset version still has `age`. Soft drop is reversible
+    // Document dataset version still has `note`. Soft drop is reversible
     // via Lance's version graph until `omnigraph cleanup` runs.
     let pre_drop_snapshot = db.snapshot_at_version(before_version).await.unwrap();
-    let pre_drop_ds = pre_drop_snapshot.open("node:Person").await.unwrap();
+    let pre_drop_ds = pre_drop_snapshot.open("node:Document").await.unwrap();
     let pre_drop_fields = pre_drop_ds
         .schema()
         .fields
@@ -659,21 +725,21 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
         .map(|f| f.name.clone())
         .collect::<Vec<_>>();
     assert!(
-        pre_drop_fields.iter().any(|f| f == "age"),
-        "pre-drop Person dataset schema must still include 'age' (time-travel reversibility); got fields {pre_drop_fields:?}",
+        pre_drop_fields.iter().any(|f| f == "note"),
+        "pre-drop Document dataset schema must still include 'note' (time-travel reversibility); got fields {pre_drop_fields:?}",
     );
 
     // (c) Reopen consistency: close the engine, reopen, verify the
     // drop is preserved (column still absent from current schema).
-    let uri = dir.path().to_str().unwrap().to_string();
+    let uri = uri.to_string();
     drop(db);
     let reopened = Omnigraph::open(&uri).await.unwrap();
-    assert_exact_id_primary_key(&reopened, "node:Person").await;
+    assert_exact_id_primary_key(&reopened, "node:Document").await;
     let reopened_snapshot = reopened
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap();
-    let reopened_ds = reopened_snapshot.open("node:Person").await.unwrap();
+    let reopened_ds = reopened_snapshot.open("node:Document").await.unwrap();
     let reopened_fields = reopened_ds
         .schema()
         .fields
@@ -681,8 +747,8 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
         .map(|f| f.name.clone())
         .collect::<Vec<_>>();
     assert!(
-        !reopened_fields.iter().any(|f| f == "age"),
-        "after reopen, Person dataset schema must still lack 'age'; got fields {reopened_fields:?}",
+        !reopened_fields.iter().any(|f| f == "note"),
+        "after reopen, Document dataset schema must still lack 'note'; got fields {reopened_fields:?}",
     );
 }
 

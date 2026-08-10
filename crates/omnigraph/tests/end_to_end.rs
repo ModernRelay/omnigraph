@@ -903,18 +903,18 @@ node Document {
 const BLOB_QUERIES: &str = r#"
 query all_docs() {
     match { $d: Document }
-    return { $d.title, $d.content }
+    return { $d.title }
 }
 
 query get_doc($title: String) {
     match { $d: Document { title: $title } }
-    return { $d.title, $d.content }
+    return { $d.title }
 }
 
 query get_doc_clause($title: String) {
     match { $d: Document
         $d.title = $title }
-    return { $d.title, $d.content }
+    return { $d.title }
 }
 "#;
 
@@ -960,7 +960,7 @@ async fn blob_load_base64_inline() {
 }
 
 #[tokio::test]
-async fn blob_query_returns_metadata() {
+async fn blob_bearing_query_filters_without_projecting_blob() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
@@ -986,17 +986,15 @@ async fn blob_query_returns_metadata() {
         let json = result.to_sdk_json();
         let row = json.as_array().unwrap().first().unwrap();
         assert_eq!(row["d.title"], "readme", "{query_name}");
-        // Blob columns return null in query projections — data is accessed via take_blobs API.
-        // (Lance bug: BlobsDescriptions + filter triggers assertion, so blobs are excluded from scan)
         assert!(
-            row["d.content"].is_null(),
-            "{query_name}: blob column should return null in query projection"
+            row.get("d.content").is_none(),
+            "{query_name}: Blob values are accessed through the dedicated Blob API"
         );
     }
 }
 
 #[tokio::test]
-async fn blob_null_returns_null_in_query() {
+async fn blob_null_does_not_break_non_blob_projection() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
@@ -1017,11 +1015,9 @@ async fn blob_null_returns_null_in_query() {
     let json = result.to_sdk_json();
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "empty");
-    // Nullable blob with no value should return null
     assert!(
-        row["d.content"].is_null(),
-        "null blob should return null, got: {}",
-        row["d.content"]
+        row.get("d.content").is_none(),
+        "Blob values must not leak through ordinary query projection"
     );
 }
 
@@ -1055,11 +1051,17 @@ async fn blob_insert_mutation() {
     let json = qr.to_sdk_json();
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "new-doc");
-    // Blob column present but null in query projection (data accessed via take_blobs)
+    // Blob columns are not part of ordinary query projection.
     assert!(
-        row.get("d.content").is_some(),
-        "content column should be present"
+        row.get("d.content").is_none(),
+        "content column should be absent"
     );
+
+    let blob = db
+        .read_blob("Document", "new-doc", "content")
+        .await
+        .unwrap();
+    assert_eq!(&blob.read().await.unwrap()[..], &[1, 2, 3]);
 }
 
 #[tokio::test]
@@ -1562,8 +1564,8 @@ node Article {
 }
 "#;
     let mutations = r#"
-query insert_article($slug: String, $summary: String, $rating: I32) {
-    insert Article { slug: $slug, summary: $summary, rating: $rating }
+query insert_article($slug: String, $attachment: Blob, $summary: String, $rating: I32) {
+    insert Article { slug: $slug, attachment: $attachment, summary: $summary, rating: $rating }
 }
 query update_summary($slug: String, $summary: String) {
     update Article set { summary: $summary } where slug = $slug
@@ -1582,7 +1584,11 @@ query get_article($slug: String) {
         mutations,
         "insert_article",
         &mixed_params(
-            &[("$slug", "a1"), ("$summary", "hello")],
+            &[
+                ("$slug", "a1"),
+                ("$attachment", "base64:"),
+                ("$summary", "hello"),
+            ],
             &[("$rating", 42)],
         ),
     )
@@ -1610,6 +1616,10 @@ query get_article($slug: String) {
     .await
     .unwrap();
     assert_eq!(qr.num_rows(), 1);
+
+    let attachment = db.read_blob("Article", "a1", "attachment").await.unwrap();
+    assert_eq!(attachment.size(), 0);
+    assert!(attachment.read().await.unwrap().is_empty());
 }
 
 // ─── Regression: blob update null → non-null ─────────────────────────────────

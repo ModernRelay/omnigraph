@@ -406,7 +406,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     load_jsonl(
         &main,
         concat!(
-            "{\"type\":\"Document\",\"data\":{\"title\":\"seed\",\"content\":\"base64:U2VlZA==\",\"note\":\"original\"}}\n",
+            "{\"type\":\"Document\",\"data\":{\"title\":\"seed\",\"content\":\"base64:\",\"note\":\"original\"}}\n",
             "{\"type\":\"Document\",\"data\":{\"title\":\"main-doc\",\"content\":\"base64:TWFpbg==\",\"note\":\"main\"}}",
         ),
         LoadMode::Overwrite,
@@ -477,7 +477,10 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
 
     let seed = main.read_blob("Document", "seed", "content").await.unwrap();
     let seed_bytes = seed.read().await.unwrap();
-    assert_eq!(&seed_bytes[..], b"Seed");
+    assert!(
+        seed_bytes.is_empty(),
+        "a valid empty Blob must survive branch rewrite and merge"
+    );
 
     let main_doc = main
         .read_blob("Document", "main-doc", "content")
