@@ -169,13 +169,20 @@ When Lance ships a major release that changes any of the above (file format bump
 
 ### Last alignment audit: 2026-07-25 (Lance 9.0.0 stable; crates.io)
 
+> **Post-#449 note (2026-08-06):** the RFC-026 MemWAL/streaming machinery and
+> its test suites (`memwal_stream*`, `memwal_enrollment_gate`, the two B2b
+> guards) were removed after this audit ran. Bullets below that reference
+> them are provenance of the audit as executed, not commands to re-run; the
+> next Lance bump re-runs the surviving suites (`lance_surface_guards` first,
+> then the canonical workspace gate).
+
 **The git-pin era is over.** Lance 9.0.0 was released on 2026-07-24 and every
 crate OmniGraph depends on is published to crates.io at that version, so the
 workspace moved from the `v9.0.0-rc.1` git rev (`cec0b7df`) to ordinary
-registry version pins. `Cargo.lock` now contains **zero** git sources. This
-restores ordinary publishability: the release gate recorded in
-[versioning.md](versioning.md) — "registry publication resumes when Lance 9.0.0
-ships stable" — is satisfied.
+registry version pins. `Cargo.lock` now contains **zero** git sources, which
+removed the substrate-side blocker to registry publication. (Publication is
+nevertheless paused for an unrelated reason — see the registry-publication
+status in [versioning.md](versioning.md).)
 
 The delta is 35 commits and unusually cheap. It is **not** a storage-format
 event: there is no file-format or minimum-reader-version movement, OmniGraph
@@ -235,8 +242,10 @@ responsibility.
 
 **Known gaps carried by choosing 9.0.0 over the v10 beta line** (both fixes
 exist only on v10, which is 96 commits ahead *and* 36 behind 9.0.0 after a
-9.1→10.0 renumber, ships two breaking changes, and renames the MemWAL
-vocabulary OmniGraph's recovery sidecars bind to):
+9.1→10.0 renumber and ships two breaking changes; a third reason recorded at
+audit time — v10's rename of the MemWAL vocabulary — became moot when the
+RFC-026 path was removed on 2026-08-06, since no recovery sidecar binds to
+MemWAL anymore):
 
 - **#7704** — stable-row-id `filter_deleted_ids` alignment. OmniGraph sets
   `enable_stable_row_ids: true` everywhere, stages deletes, and calls

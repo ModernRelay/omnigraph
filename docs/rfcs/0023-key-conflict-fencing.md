@@ -579,8 +579,8 @@ instructions, and refuses a newer graph with “upgrade omnigraph.” An older
 binary refuses the fencing-capable stamp.
 
 The fencing-compatible format is internal schema **v6**, a 0.9.0-dev format
-(the planned 0.10.x mapping was superseded when v6–v8 stayed unreleased and
-0.9.0 shipped v9). It follows RFC-028's v5 identity format; RFC-024 and later draft
+(the planned 0.10.x mapping was superseded; the later v7+ development stamps
+were rejected with the RFC-026 experiment, and 0.9.0 shipped v6). It follows RFC-028's v5 identity format; RFC-024 and later draft
 capabilities are not included. Each later internal-format change requires its
 own rebuild under the strand policy unless independently accepted capabilities
 deliberately co-release after a combined initialization and recovery review.

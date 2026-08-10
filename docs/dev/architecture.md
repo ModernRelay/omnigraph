@@ -372,7 +372,7 @@ Throughout the docs, capabilities are split into:
 
 - `omnigraph-compiler` — schema and query grammars, catalog, IR, lowering, type checker, lint, migration planner, OpenAI-style embedding client.
 - `omnigraph-storage` — the shared local/S3 control-object storage implementation and concrete backend handle used below the engine/cluster split.
-- `omnigraph` (engine, published as `omnigraph-engine` on crates.io since v0.2.2) — the Lance-backed runtime: manifest, commit graph, snapshot, exec (incl. per-query `MutationStaging` accumulator), merge, loader, Gemini embedding client.
+- `omnigraph` (engine; package `omnigraph-engine` — published on crates.io through 0.8.0, currently paused, see [versioning.md](versioning.md)) — the Lance-backed runtime: manifest, commit graph, snapshot, exec (incl. per-query `MutationStaging` accumulator), merge, loader, Gemini embedding client.
 - `omnigraph-policy` — Cedar policy compilation and engine-facing enforcement.
 - `omnigraph-api-types` — shared HTTP wire DTOs used by the server and CLI.
 - `omnigraph-cluster` — cluster config validation, planning, persisted state-lock ownership, state, and apply.

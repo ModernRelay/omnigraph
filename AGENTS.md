@@ -64,7 +64,7 @@ CLI (omnigraph)        HTTP Server (omnigraph-server, Axum)
            omnigraph-compiler  ── Pest grammars, catalog, IR, lowering, lint, migration plan
                       │
                       ▼
-           omnigraph (engine)  ── ManifestCoordinator, CommitGraph, RunRegistry, GraphIndex (CSR/CSC), exec
+           omnigraph (engine)  ── ManifestCoordinator, CommitGraph, GraphIndex (CSR/CSC), exec
                       │
                       ▼
               Lance 9.x         ── columnar Arrow, fragments, per-dataset versions/branches, indexes

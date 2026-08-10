@@ -250,7 +250,7 @@ them:
 OmniGraph's relationship with Lance is a *contract*, managed like one:
 
 - **Pinned, audited versions.** The engine pins one Lance version
-  (currently 9.0.0-rc.1 via git rev, until 9.0.0 stable reaches crates.io).
+  (currently 9.0.0 stable from crates.io; the git-pin era ended 2026-07-25).
   Every bump gets a full alignment audit — all intervening upstream commits
   reviewed, findings recorded in [lance.md](lance.md)'s dated audit stanzas.
   History has justified the paranoia: audits have caught a default flip that
@@ -979,8 +979,11 @@ Live design questions, each owned by an RFC or a known gap — not a wishlist:
 6. **How does the background reconciler arrive without violating the recovery
    model?** It must serialize with writers through the same gates and stay
    roll-forward-only until the fence exists.
-7. **When Lance 9.0.0 stabilizes**, what does the beta→stable alignment audit
-   surface, and does crates.io publishing (v0.9.0) unblock cleanly?
+7. *(Answered 2026-08.)* Lance 9.0.0 stabilized 2026-07-24; the alignment
+   audit was cheap (35 commits, no format movement) and removed the
+   substrate-side publication blocker. crates.io publishing did **not**
+   unblock cleanly, for an unrelated reason — see the registry-publication
+   status in [versioning.md](versioning.md).
 
 ---
 
@@ -1004,8 +1007,9 @@ Deliberately split, not one mega-format: identity, key fencing, head rows,
 retention, and merge deltas are separate irreversible decisions with
 different substrate gates and rollout barriers ("reversibility shapes evidence
 demand").
-Release-wise: v0.8.1 ships as binaries only (the Lance git pin blocks
-crates.io); v0.9.0 is gated on Lance 9.0.0 stable.
+Release-wise: v0.9.0 shipped 2026-08-08 (binaries, Homebrew, container
+images, and the npm SDK/MCP pair); crates.io publication remains paused —
+see the registry-publication status in [versioning.md](versioning.md).
 
 ---
 
