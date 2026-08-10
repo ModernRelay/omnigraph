@@ -27,6 +27,16 @@ edits.
 
 > **`--mode` is required** — there is no default. Overwrite is destructive, so
 > the CLI never picks a mode for you.
+
+> **Per-load bounds (omnigraph >= 0.9.0).** One keyed load (`append`/`merge`)
+> stages at most **8,192 rows and 32 MiB of Arrow memory per table**; a larger
+> batch is refused up front (HTTP 413, typed `resource_limit`) with no durable
+> effect — split it into chunks, each an atomic graph commit. `overwrite`
+> escapes the row ceiling but not the 32 MiB strict-input Arrow preflight
+> (`strict_input_arrow_bytes`), so a bulk replacement above ~32 MiB is one
+> `overwrite` chunk followed by `merge` chunks. Also: against a non-local
+> target, `--mode overwrite` (like `cleanup` and `branch delete`) requires
+> explicit `--yes` consent in non-interactive runs.
 >
 > **Local and remote are one command.** `load` works against a local repo URI
 > (writing storage directly) *and* a remote `omnigraph-server` endpoint (the
