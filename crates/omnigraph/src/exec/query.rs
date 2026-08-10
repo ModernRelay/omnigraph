@@ -1848,6 +1848,19 @@ async fn execute_expand_indexed(
                     continue;
                 };
                 for &neighbor in neighbors {
+                    // A self-edge is a valid destination that reaches nothing
+                    // new: emit it without entering the frontier, so the
+                    // seeded-source `visited` pre-mark prunes only multi-hop
+                    // cycle returns. Same-type only: this path interns both
+                    // endpoint types into one dense space, so a cross-type id
+                    // collision could alias node == neighbor.
+                    if same_type && neighbor == node {
+                        if hop >= min_hops && seen_dst[i].insert(neighbor) {
+                            src_indices.push(i as u32);
+                            dst_dense.push(neighbor);
+                        }
+                        continue;
+                    }
                     if !same_type || visited[i].insert(neighbor) {
                         next.push(neighbor);
                         if hop >= min_hops && seen_dst[i].insert(neighbor) {
@@ -2075,6 +2088,17 @@ async fn execute_expand_csr(
             for &node in &frontier {
                 let rev: &[u32] = adj_rev.map(|a| a.neighbors(node)).unwrap_or(&[]);
                 for &neighbor in adj.neighbors(node).iter().chain(rev) {
+                    // Self-edge: emit without entering the frontier — same
+                    // contract as execute_expand_indexed. Same-type only:
+                    // cross-type dense ids live in different TypeIndex
+                    // namespaces, where node == neighbor is meaningless.
+                    if same_type && neighbor == node {
+                        if hop >= min_hops && seen_dst_dense.insert(neighbor) {
+                            src_indices.push(i as u32);
+                            dst_dense_list.push(neighbor);
+                        }
+                        continue;
+                    }
                     if !same_type || visited.insert(neighbor) {
                         next_frontier.push(neighbor);
                         if hop >= min_hops && seen_dst_dense.insert(neighbor) {
