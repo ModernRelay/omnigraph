@@ -15,12 +15,12 @@
         "tags": [
           "management"
         ],
-        "summary": "List every graph currently registered with this server.",
-        "description": "Multi-graph mode only. In single mode, the route returns 405 — there's\nno registry to enumerate. Cedar-gated by the server-level policy via\nthe `graph_list` action against `Omnigraph::Server::\"root\"`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
+        "summary": "List every graph configured for this server, including graphs that have not\nopened successfully.",
+        "description": "Cedar-gated by the server-level policy via the `graph_list` action against\n`Omnigraph::Server::\"root\"`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
         "operationId": "listGraphs",
         "responses": {
           "200": {
-            "description": "List of registered graphs",
+            "description": "List of configured graphs and runtime status",
             "content": {
               "application/json": {
                 "schema": {
@@ -41,16 +41,6 @@
           },
           "403": {
             "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "405": {
-            "description": "Method not allowed (single-graph mode)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2281,6 +2271,17 @@
           "error": {
             "type": "string"
           },
+          "graph_unavailable": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GraphUnavailableOutput",
+                "description": "Present when the graph id is configured but cannot currently serve the\nrequested operation. Unknown graph ids remain ordinary 404 responses."
+              }
+            ]
+          },
           "key_conflict": {
             "oneOf": [
               {
@@ -2443,23 +2444,61 @@
       },
       "GraphInfo": {
         "type": "object",
-        "description": "One entry in the response from `GET /graphs`. Cluster operators\nconsume this list to discover which graphs the server is currently\nserving. The shape is intentionally minimal — `graph_id` and `uri`\nare the only fields a routing client needs.",
+        "description": "One configured graph and its current serving state.",
         "required": [
           "graph_id",
-          "uri"
+          "uri",
+          "state",
+          "read_ready",
+          "write_ready"
         ],
         "properties": {
+          "blocking_operation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failure_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "graph_id": {
             "type": "string"
           },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "read_ready": {
+            "type": "boolean"
+          },
+          "retry_after_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "state": {
+            "$ref": "#/components/schemas/GraphState"
+          },
           "uri": {
             "type": "string"
+          },
+          "write_ready": {
+            "type": "boolean"
           }
         }
       },
       "GraphListResponse": {
         "type": "object",
-        "description": "Response from `GET /graphs`. Lists every graph registered with the\nserver in alphabetical order by `graph_id` (sorted server-side so\nclients get deterministic output across requests).",
+        "description": "Response from `GET /graphs`. Lists every graph configured on the\nserver in alphabetical order by `graph_id` (sorted server-side so\nclients get deterministic output across requests).",
         "required": [
           "graphs"
         ],
@@ -2469,6 +2508,39 @@
             "items": {
               "$ref": "#/components/schemas/GraphInfo"
             }
+          }
+        }
+      },
+      "GraphState": {
+        "type": "string",
+        "enum": [
+          "ready",
+          "recovering",
+          "degraded",
+          "opening",
+          "unavailable"
+        ]
+      },
+      "GraphUnavailableOutput": {
+        "type": "object",
+        "required": [
+          "graph_id",
+          "state"
+        ],
+        "properties": {
+          "graph_id": {
+            "type": "string"
+          },
+          "retry_after_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "state": {
+            "$ref": "#/components/schemas/GraphState"
           }
         }
       },
@@ -2991,7 +3063,8 @@
         ],
         "properties": {
           "operation_id": {
-            "type": "string"
+            "type": "string",
+            "description": "The durable operation that blocked this request. This is not a request\nidentifier for the current HTTP call."
           }
         }
       },

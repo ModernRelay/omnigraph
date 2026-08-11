@@ -665,7 +665,27 @@ pub struct ResourceLimitOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RecoveryRequiredOutput {
+    /// The durable operation that blocked this request. This is not a request
+    /// identifier for the current HTTP call.
     pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphState {
+    Ready,
+    Recovering,
+    Degraded,
+    Opening,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GraphUnavailableOutput {
+    pub graph_id: String,
+    pub state: GraphState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -697,6 +717,10 @@ pub struct ErrorOutput {
     /// retry. Its table effects may or may not have started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_required: Option<RecoveryRequiredOutput>,
+    /// Present when the graph id is configured but cannot currently serve the
+    /// requested operation. Unknown graph ids remain ordinary 404 responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_unavailable: Option<GraphUnavailableOutput>,
 }
 
 pub fn snapshot_payload(
@@ -844,17 +868,25 @@ pub fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {
 
 // ─── MR-668 — management endpoint shapes ──────────────────────────────────
 
-/// One entry in the response from `GET /graphs`. Cluster operators
-/// consume this list to discover which graphs the server is currently
-/// serving. The shape is intentionally minimal — `graph_id` and `uri`
-/// are the only fields a routing client needs.
+/// One configured graph and its current serving state.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GraphInfo {
     pub graph_id: String,
     pub uri: String,
+    pub state: GraphState,
+    pub read_ready: bool,
+    pub write_ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocking_operation_id: Option<String>,
 }
 
-/// Response from `GET /graphs`. Lists every graph registered with the
+/// Response from `GET /graphs`. Lists every graph configured on the
 /// server in alphabetical order by `graph_id` (sorted server-side so
 /// clients get deterministic output across requests).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

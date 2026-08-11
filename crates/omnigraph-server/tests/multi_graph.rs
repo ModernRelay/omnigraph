@@ -475,6 +475,7 @@ async fn served_export_process_queue_budget_refuses_then_releases() {
             graph_id,
             uri: uri.to_string_lossy().to_string(),
             policy: None,
+            startup_error: None,
             embedding: None,
             queries: stored_query_registry(&[]),
         });
@@ -542,7 +543,7 @@ async fn served_export_process_queue_budget_refuses_then_releases() {
 }
 
 #[tokio::test]
-async fn cluster_boot_quarantines_graph_open_failures() {
+async fn cluster_boot_tracks_graph_open_failures() {
     let temp = tempfile::tempdir().unwrap();
     let schema = "\nnode Person {\n  name: String @key\n}\n";
     let good_uri = temp.path().join("good.omni");
@@ -568,6 +569,7 @@ rules:
             graph_id: "broken".to_string(),
             uri: bad_uri.to_string_lossy().to_string(),
             policy: None,
+            startup_error: None,
             embedding: None,
             queries: stored_query_registry(&[]),
         },
@@ -575,6 +577,7 @@ rules:
             graph_id: "good".to_string(),
             uri: good_uri.to_string_lossy().to_string(),
             policy: None,
+            startup_error: None,
             embedding: None,
             queries: stored_query_registry(&[]),
         },
@@ -606,15 +609,15 @@ rules:
     )
     .await
     .unwrap();
-    let mut ready: Vec<_> = state
+    let mut configured: Vec<_> = state
         .routing()
         .registry
         .list()
         .iter()
-        .map(|handle| handle.key.graph_id.as_str().to_string())
+        .map(|entry| entry.key.graph_id.as_str().to_string())
         .collect();
-    ready.sort();
-    assert_eq!(ready, vec!["good"]);
+    configured.sort();
+    assert_eq!(configured, vec!["broken", "good"]);
     let app = build_app(state);
 
     let (status, body) = json_response(
@@ -634,8 +637,15 @@ rules:
             .iter()
             .map(|graph| graph["graph_id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["good"]
+        vec!["broken", "good"]
     );
+    let graphs = body["graphs"].as_array().unwrap();
+    assert_eq!(graphs[0]["state"], "unavailable");
+    assert_eq!(graphs[0]["read_ready"], false);
+    assert_eq!(graphs[0]["write_ready"], false);
+    assert_eq!(graphs[1]["state"], "ready");
+    assert_eq!(graphs[1]["read_ready"], true);
+    assert_eq!(graphs[1]["write_ready"], true);
 
     let (status, body) = json_response(
         &app,
@@ -646,7 +656,62 @@ rules:
             .unwrap(),
     )
     .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["graph_unavailable"]["graph_id"], "broken");
+    assert_eq!(body["graph_unavailable"]["state"], "unavailable");
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs/unknown/queries")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(body.get("graph_unavailable").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn default_boot_serves_liveness_with_zero_open_graphs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = omnigraph_server::open_multi_graph_state(
+        vec![omnigraph_server::GraphStartupConfig {
+            graph_id: "broken".to_string(),
+            uri: temp
+                .path()
+                .join("missing.omni")
+                .to_string_lossy()
+                .to_string(),
+            policy: None,
+            startup_error: None,
+            embedding: None,
+            queries: stored_query_registry(&[]),
+        }],
+        Vec::new(),
+        None,
+        temp.path().join("cluster.yaml"),
+        false,
+    )
+    .await
+    .expect("default boot must bind even when no graph opens");
+    assert_eq!(state.routing().registry.len(), 1);
+    assert_eq!(
+        state.routing().registry.list()[0].availability().state,
+        "unavailable"
+    );
+    let app = build_app(state);
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "ok");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -770,7 +835,7 @@ graphs:
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn cluster_boot_refuses_missing_embedding_secret_env() {
+async fn cluster_boot_reports_missing_embedding_secret_env() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(
         temp.path().join("people.pg"),
@@ -810,13 +875,29 @@ graphs:
         ("OG_TEST_MISSING_EMBED_KEY", None),
         ("OMNIGRAPH_EMBEDDINGS_MOCK", None),
     ]);
-    let err = cluster_settings(temp.path()).await.unwrap_err();
-    let message = err.to_string();
+    let settings = cluster_settings(temp.path()).await.unwrap();
+    let omnigraph_server::ServerConfigMode::Multi { graphs, .. } = &settings.mode;
+    assert_eq!(graphs.len(), 1);
+    let message = graphs[0]
+        .startup_error
+        .as_deref()
+        .expect("missing provider secret must be retained as graph status");
     assert!(
         message.contains("embedding provider for graph 'knowledge'"),
         "{message}"
     );
     assert!(message.contains("OG_TEST_MISSING_EMBED_KEY"), "{message}");
+
+    let strict =
+        omnigraph_server::load_server_settings(Some(&temp.path().to_path_buf()), None, true, true)
+            .await
+            .unwrap_err();
+    assert!(
+        strict
+            .to_string()
+            .contains("strict cluster boot requires every graph"),
+        "{strict}"
+    );
 }
 
 #[tokio::test]

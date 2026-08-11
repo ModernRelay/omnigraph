@@ -34,18 +34,17 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
     tag = "management",
     operation_id = "listGraphs",
     responses(
-        (status = 200, description = "List of registered graphs", body = GraphListResponse),
+        (status = 200, description = "List of configured graphs and runtime status", body = GraphListResponse),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 405, description = "Method not allowed (single-graph mode)", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
-/// List every graph currently registered with this server.
+/// List every graph configured for this server, including graphs that have not
+/// opened successfully.
 ///
-/// Multi-graph mode only. In single mode, the route returns 405 — there's
-/// no registry to enumerate. Cedar-gated by the server-level policy via
-/// the `graph_list` action against `Omnigraph::Server::"root"`.
+/// Cedar-gated by the server-level policy via the `graph_list` action against
+/// `Omnigraph::Server::"root"`.
 ///
 /// Order: alphabetical by `graph_id` (server-sorted so clients see
 /// deterministic output across requests).
@@ -75,13 +74,33 @@ pub(crate) async fn server_graphs_list(
     let mut graphs: Vec<GraphInfo> = registry
         .list()
         .into_iter()
-        .map(|handle| GraphInfo {
-            graph_id: handle.key.graph_id.as_str().to_string(),
-            uri: handle.uri.clone(),
+        .map(|entry| {
+            let availability = entry.availability();
+            GraphInfo {
+                graph_id: entry.key.graph_id.as_str().to_string(),
+                uri: entry.uri.clone(),
+                state: graph_state_output(availability.state),
+                read_ready: availability.read_ready,
+                write_ready: availability.write_ready,
+                failure_class: availability.failure_class.map(str::to_string),
+                last_error: availability.last_error,
+                retry_after_seconds: availability.retry_after_seconds,
+                blocking_operation_id: availability.blocking_operation_id,
+            }
         })
         .collect();
     graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
     Ok(Json(GraphListResponse { graphs }))
+}
+
+fn graph_state_output(state: &str) -> api::GraphState {
+    match state {
+        "ready" => api::GraphState::Ready,
+        "recovering" => api::GraphState::Recovering,
+        "degraded" => api::GraphState::Degraded,
+        "opening" => api::GraphState::Opening,
+        _ => api::GraphState::Unavailable,
+    }
 }
 
 pub(crate) async fn server_openapi(
@@ -280,6 +299,9 @@ pub(crate) async fn resolve_graph_handle(
     let key = GraphKey::cluster(graph_id.clone());
     let handle = match registry.get(&key) {
         RegistryLookup::Ready(handle) => handle,
+        RegistryLookup::Unavailable(availability) => {
+            return Err(ApiError::graph_unavailable(&graph_id, &availability));
+        }
         RegistryLookup::Gone => {
             return Err(ApiError::not_found(format!("graph '{graph_id}' not found")));
         }
