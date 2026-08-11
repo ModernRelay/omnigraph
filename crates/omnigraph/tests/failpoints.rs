@@ -10159,6 +10159,53 @@ async fn init_failpoint_after_coordinator_init_cleans_up_schema_files() {
     // root is fully empty.
 }
 
+// The torn-init regression: the `__manifest` Create commit is the manifest's
+// entire birth (entries, genesis lineage, and the internal-schema stamp ride
+// the one commit), so a crash immediately after it — previously the
+// create-to-stamp gap, which left a durable-but-unstamped manifest that every
+// later open misdiagnosed as "created by omnigraph 0.3.1 or earlier" and no
+// re-init could recover — must now leave a store that opens cleanly and
+// serves reads and writes. The crash is a panic (not an error return) so
+// init's best-effort cleanup does not run, modeling a process death.
+#[tokio::test]
+#[serial]
+async fn init_crash_after_manifest_create_leaves_openable_store() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let crash = ScopedFailPoint::new(names::INIT_POST_MANIFEST_CREATE, "panic");
+    let cloned = uri.clone();
+    let died = tokio::spawn(async move {
+        Omnigraph::init(&cloned, helpers::TEST_SCHEMA)
+            .await
+            .map(|_| ())
+    })
+    .await;
+    drop(crash);
+    assert!(
+        died.expect_err("init must die at the injected crash point")
+            .is_panic(),
+        "the injected failpoint action is a panic"
+    );
+
+    // The Create commit carried the stamp, so the store is fully born: it
+    // opens without the ancient-version misdiagnosis and serves a write and
+    // a read.
+    let mut db = Omnigraph::open(&uri)
+        .await
+        .expect("store must open cleanly after a crash in the post-create window");
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "torn-init-survivor")], &[("$age", 1)]),
+    )
+    .await
+    .expect("store must accept writes after the crash");
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
 #[tokio::test]
 #[serial]
 async fn init_failpoint_returns_original_error_not_cleanup_error() {

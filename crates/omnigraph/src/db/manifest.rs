@@ -84,7 +84,6 @@ const OBJECT_TYPE_GRAPH_COMMIT: &str = "graph_commit";
 /// Mutable per-branch head pointer for the graph lineage (RFC-013 Phase 7).
 /// `object_id` is `graph_head:<branch>` (`graph_head:main` for the main branch).
 const OBJECT_TYPE_GRAPH_HEAD: &str = "graph_head";
-const TABLE_VERSION_MANAGEMENT_KEY: &str = "table_version_management";
 
 /// Stable head-key segment for the main branch in `graph_head:<branch>` rows.
 /// `table_branch`/`manifest_branch` encode main as null, but `object_id` must be
@@ -105,9 +104,14 @@ pub(crate) struct CommitOutcome {
 }
 
 /// The on-disk internal-schema stamp of `__manifest` at `branch` (main when
-/// `None`). Used by the open-path refusal guard and to surface the storage
-/// version to operators (`omnigraph snapshot`).
-pub(crate) async fn internal_schema_stamp_at(root_uri: &str, branch: Option<&str>) -> Result<u32> {
+/// `None`), or `None` when no parseable stamp exists (a torn init by an
+/// older binary, a genuine pre-stamp store, or corrupt metadata — see
+/// `migrations::guard_stamp`, which the open paths use instead). Surfaces
+/// the storage version to operators (`omnigraph snapshot`).
+pub(crate) async fn internal_schema_stamp_at(
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<Option<u32>> {
     let control_session = crate::lance_access::control_session();
     let dataset = open_manifest_dataset_with_session(root_uri, branch, &control_session).await?;
     Ok(migrations::read_stamp(&dataset))
@@ -129,8 +133,9 @@ pub(crate) async fn internal_schema_stamp_at(root_uri: &str, branch: Option<&str
 /// (writes are refused per-branch by the publisher; a newer binary advancing
 /// main is refused here). See the matching known gap in `docs/dev/invariants.md`.
 pub(crate) async fn refuse_if_internal_schema_unsupported(root_uri: &str) -> Result<()> {
-    let stamp = internal_schema_stamp_at(root_uri, None).await?;
-    migrations::refuse_if_stamp_unsupported(stamp)
+    let control_session = crate::lance_access::control_session();
+    let dataset = open_manifest_dataset_with_session(root_uri, None, &control_session).await?;
+    migrations::guard_stamp(&dataset).map(|_| ())
 }
 
 /// Immutable point-in-time view of the database.

@@ -51,6 +51,13 @@ You can also check versions before you hit a refusal:
 If the graph's stamp is **higher** than the binary's, the binary is too old —
 upgrade omnigraph rather than rebuilding the graph.
 
+If the refusal says `__manifest` has the current manifest layout but **no
+internal-schema stamp at all**, the graph is not old: an `omnigraph init` on
+that root crashed before completing (older binaries wrote the stamp in a
+separate commit after creating `__manifest`). The store was never fully
+initialized and holds no committed data — delete the graph root and run
+`omnigraph init` again. No export or rebuild is involved.
+
 ## What is preserved (and what is not)
 
 | Preserved | Not preserved |

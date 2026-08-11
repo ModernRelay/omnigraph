@@ -48,7 +48,16 @@ The rationale and historical links are in
 state:
 
 - a stamp below v6 is refused with rebuild guidance;
-- a stamp above v6 is refused with an upgrade-binary message.
+- a stamp above v6 is refused with an upgrade-binary message;
+- an absent stamp on a manifest with the modern (v5+) column layout is refused
+  as a torn init (an `omnigraph init` that crashed between creating
+  `__manifest` and stamping it — older binaries stamped in a separate commit)
+  with delete-and-re-init guidance; an absent stamp on a pre-modern layout is
+  the genuine pre-stamp world, treated as v1; a stamp that is present but not
+  a version number is refused naming the raw value. Current binaries cannot
+  produce the torn state: the `__manifest` Create commit is the manifest's
+  entire birth — entries, genesis lineage, and the stamp ride that single
+  commit, so the stamp is atomic with manifest birth.
 
 There is no in-place migration dispatcher. A released v4 graph is exported with
 its v0.8.x binary, initialized as a fresh v6 graph, and loaded through the

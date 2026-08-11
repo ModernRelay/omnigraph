@@ -11,10 +11,9 @@ use omnigraph_compiler::catalog::Catalog;
 
 use crate::error::{OmniError, Result};
 
-use super::TABLE_VERSION_MANAGEMENT_KEY;
 use super::layout::{manifest_uri, open_manifest_dataset_with_session};
 use super::metadata::TableVersionMetadata;
-use super::migrations::stamp_current_version;
+use super::migrations::current_stamp_entry;
 use super::state::{
     GraphLineageRow, ManifestState, SubTableEntry, entries_to_batch, graph_lineage_row_parts,
     manifest_schema, read_manifest_state, read_manifest_state_and_lineage,
@@ -23,9 +22,9 @@ use super::{TableIdentity, table_path_for_identity};
 
 /// The manifest version the init `Dataset::write` produces (Lance datasets start
 /// at version one). The genesis graph commit pins this version — a snapshot at
-/// it is the empty, freshly-initialized graph. The two config-only commits that
-/// follow (`update_config`, `stamp_current_version`) advance the live manifest
-/// version but add no table data, so genesis correctly stays pinned at one.
+/// it is the empty, freshly-initialized graph, and since the whole manifest
+/// birth is that single Create commit (entries, lineage, and the
+/// internal-schema stamp all ride it), genesis IS the live version at init.
 const GENESIS_MANIFEST_VERSION: u64 = 1;
 
 pub(super) async fn init_manifest_graph(
@@ -51,7 +50,24 @@ pub(super) async fn init_manifest_graph(
     let genesis_lineage = graph_lineage_row_parts(&genesis, None)?;
 
     let manifest_batch = entries_to_batch(&entries, &version_metadata, &genesis_lineage)?;
-    let schema = manifest_schema();
+    // The internal-schema stamp rides the Create write's schema metadata, so
+    // the stamp is atomic with manifest birth: no crash window can leave
+    // `__manifest` durable but unstamped. The Create commit is the manifest's
+    // entire birth — entries, genesis lineage, and the stamp in one commit,
+    // with nothing failable after it. (A `table_version_management` config
+    // key is deliberately not written: nothing in Lance 9 or this crate
+    // reads it.)
+    let (stamp_key, stamp_value) = current_stamp_entry();
+    let schema: SchemaRef = Arc::new(
+        manifest_schema()
+            .as_ref()
+            .clone()
+            .with_metadata([(stamp_key, stamp_value)].into_iter().collect()),
+    );
+    let manifest_batch = RecordBatch::try_new(schema.clone(), manifest_batch.columns().to_vec())
+        .map_err(|e| {
+            OmniError::manifest_internal(format!("attach stamp metadata to init batch: {e}"))
+        })?;
     let reader = RecordBatchIterator::new(vec![Ok(manifest_batch)], schema);
     let params = WriteParams {
         mode: WriteMode::Create,
@@ -63,14 +79,10 @@ pub(super) async fn init_manifest_graph(
         ..Default::default()
     };
     let manifest_path = manifest_uri(root);
-    let mut dataset = Dataset::write(reader, &manifest_path, Some(params))
+    let dataset = Dataset::write(reader, &manifest_path, Some(params))
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
-    dataset
-        .update_config([(TABLE_VERSION_MANAGEMENT_KEY, Some("true"))])
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    stamp_current_version(&mut dataset).await?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_POST_MANIFEST_CREATE)?;
 
     let (known_state, lineage_rows) = read_manifest_state_and_lineage(&dataset).await?;
     Ok((dataset, known_state, lineage_rows))

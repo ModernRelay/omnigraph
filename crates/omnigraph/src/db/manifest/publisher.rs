@@ -35,7 +35,7 @@ use super::layout::{
     open_manifest_dataset_with_session, table_object_id, tombstone_object_id, version_object_id,
 };
 use super::metadata::{TableVersionMetadata, parse_namespace_version_request};
-use super::migrations::{read_stamp, refuse_if_stamp_unsupported};
+use super::migrations::guard_stamp;
 use super::state::{
     GraphLineageRow, GraphLineageRowPart, ManifestState, assemble_manifest_state,
     graph_head_object_id, graph_lineage_row_parts, head_lineage_row, manifest_rows_batch,
@@ -254,7 +254,7 @@ impl GraphNamespacePublisher {
         // format) is refused with the rebuild-via-export/import message. There is
         // no in-place migration — storage-format changes are a cutover. See
         // `db/manifest/migrations.rs`.
-        refuse_if_stamp_unsupported(read_stamp(&dataset))?;
+        guard_stamp(&dataset)?;
         // ONE `__manifest` scan for everything the publish needs: table
         // locations, version entries, tombstones, `graph_commit` lineage rows
         // for parent resolution, AND exact `graph_head` rows for OCC (RFC-013

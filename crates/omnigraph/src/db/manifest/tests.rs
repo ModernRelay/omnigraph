@@ -1717,8 +1717,86 @@ async fn test_init_stamps_internal_schema_version() {
     let ds = open_manifest_dataset(uri, None).await.unwrap();
     assert_eq!(
         super::migrations::read_stamp(&ds),
-        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+        Some(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION),
         "init should stamp the manifest at the current internal schema version",
+    );
+
+    // The stamp must ride the Create commit itself — checking out manifest
+    // version one (the genesis Create write) must already show it. This is the
+    // torn-init guarantee: there is no on-disk moment where `__manifest`
+    // exists unstamped.
+    let genesis = ds.checkout_version(1).await.unwrap();
+    assert_eq!(
+        super::migrations::read_stamp(&genesis),
+        Some(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION),
+        "the stamp must land in the same Lance commit that creates __manifest",
+    );
+}
+
+// The absent-stamp arm of the open guard. An unstamped manifest that carries
+// the modern (v5+) identity columns cannot be a genuine pre-stamp v1 store —
+// only an init torn by a pre-atomic-stamp binary produces that shape — so the
+// guard must name the torn init and its real remedy, never the "created by
+// omnigraph 0.3.1 or earlier, rebuild via export" misdiagnosis (whose remedy
+// is impossible: no binary opens the store to export it).
+#[tokio::test]
+async fn unstamped_modern_manifest_is_diagnosed_as_torn_init() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    let mut ds = open_manifest_dataset(uri, None).await.unwrap();
+    super::migrations::remove_stamp_for_test(&mut ds)
+        .await
+        .unwrap();
+
+    let ds = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(super::migrations::read_stamp(&ds), None);
+    let err = super::migrations::guard_stamp(&ds)
+        .expect_err("an unstamped manifest must be refused")
+        .to_string();
+    assert!(
+        err.contains("crashed before completing"),
+        "the refusal must name the torn init: {err}"
+    );
+    assert!(
+        err.contains("Delete the graph root"),
+        "the refusal must carry the real remedy: {err}"
+    );
+    assert!(
+        !err.contains("0.3.1"),
+        "an unstamped-modern manifest must not be misdiagnosed as ancient: {err}"
+    );
+}
+
+// The unreadable-stamp arm: a stamp key that is present but not a version
+// number must be refused naming the raw value — never classified as absent,
+// because the absent-modern arm advises deleting the root, and corrupt
+// metadata must not flow into destructive advice.
+#[tokio::test]
+async fn unreadable_stamp_is_refused_without_delete_advice() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    let mut ds = open_manifest_dataset(uri, None).await.unwrap();
+    super::migrations::set_raw_stamp_for_test(&mut ds, "not-a-number")
+        .await
+        .unwrap();
+
+    let ds = open_manifest_dataset(uri, None).await.unwrap();
+    let err = super::migrations::guard_stamp(&ds)
+        .expect_err("an unreadable stamp must be refused")
+        .to_string();
+    assert!(
+        err.contains("not-a-number"),
+        "the refusal must name the raw value: {err}"
+    );
+    assert!(
+        !err.contains("Delete the graph root") && !err.contains("0.3.1"),
+        "corrupt metadata must not trigger delete advice or the ancient misdiagnosis: {err}"
     );
 }
 
@@ -1742,7 +1820,7 @@ async fn branch_inherits_main_internal_schema_stamp() {
     let feature_ds = open_manifest_dataset(uri, Some("feature")).await.unwrap();
     assert_eq!(
         super::migrations::read_stamp(&main_ds),
-        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+        Some(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION),
         "fresh graph stamps main at CURRENT",
     );
     assert_eq!(
