@@ -350,7 +350,6 @@ impl SupervisorSet {
         set
     }
 
-    #[allow(dead_code)]
     pub async fn shutdown(&self) {
         let _ = self.shutdown.send(true);
         let tasks =

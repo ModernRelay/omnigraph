@@ -9,7 +9,7 @@ This file is the always-on map of the test surface. **Consult it before every ta
 | `omnigraph` (engine) | `crates/omnigraph/tests/` | Integration tests (one file per behavior area — see the table below), fixture-driven, share `tests/helpers/mod.rs` |
 | `omnigraph-cli` | `crates/omnigraph-cli/tests/` | Per-area suites: cluster lifecycle, data/load/read/change/branch/commit/export/snapshot/policy/embed/maintenance, schema/config, stored queries, embedded-vs-remote parity, local/remote system journeys, and genuine released-format upgrade fences. Shared support keeps `OMNIGRAPH_HOME` hermetic by default. |
 | `omnigraph-cluster` | mostly in-source `#[cfg(test)] mod tests`; `tests/failpoints.rs`; `tests/s3_cluster.rs` | Cluster config plus strict policy YAML, semantic policy rules, graph/server binding-kind separation, and one-bundle-per-scope validation; state CAS and locking; validate/plan/status/refresh/import; idempotent apply; graph create/schema/delete; policy binding; serving snapshots; crash windows; and object-storage lifecycle. |
-| `omnigraph-server` | `crates/omnigraph-server/tests/` | Auth/policy, data and schema routes, bounded streaming export/cut ownership and backpressure, stored queries, multi-graph cluster boot, boot settings, S3, and OpenAPI drift. Shared support lives in `tests/support/mod.rs`. |
+| `omnigraph-server` | `crates/omnigraph-server/tests/` | Auth/policy, data and schema routes, bounded streaming export/cut ownership and backpressure, stored queries, configured-graph supervision, cancellation-independent writes (HTTP/1 disconnect, HTTP/2 reset, and timeout middleware), multi-graph cluster boot, boot settings, S3, and OpenAPI drift. Shared support lives in `tests/support/mod.rs`. |
 | `omnigraph-compiler` | mostly in-source `#[cfg(test)] mod tests` | Parser, type-checker, IR lowering, lint. Schema parser and SchemaIR validation tests both reject the five exact Lance virtual system-column property names while preserving near-miss identifiers |
 
 The engine's `tests/` is the principal coverage surface; most graph-shaped behavior is exercised there.
@@ -91,7 +91,7 @@ it is not inferred from a local syntax check. See [ci.md](ci.md).
 
 - **Engine** — `crates/omnigraph/tests/helpers/mod.rs`: `init_and_load()` (bootstrap a temp graph + load standard fixture), `snapshot_main()`, `snapshot_branch()`, query/mutation runners, row collection and counting. Use these instead of hand-rolling.
 - **CLI** — `crates/omnigraph-cli/tests/support/mod.rs`: `Command`-style wrapper for invoking `omnigraph`, server-process spawning, fixture resolution, output assertion helpers.
-- **Server** — no shared helpers; server tests call the `Omnigraph` engine API directly and exercise endpoints over the wire.
+- **Server** — `crates/omnigraph-server/tests/support/mod.rs`: graph/app fixtures, request builders, policy fixtures, and concurrency harnesses. `write_cancellation.rs` deliberately uses a real ephemeral TCP listener because in-memory `Router::oneshot` cannot reproduce HTTP/1 disconnect or HTTP/2 reset semantics.
 
 > Note: the shared storage adapter has an in-memory backend (`ObjectStorageAdapter::in_memory()`, full contract including true conditional updates) used by the adapter contract tests in `crates/omnigraph-storage/src/lib.rs`. Those tests also pin the optional single-GET text-read contract: present objects return `Some`, typed `NotFound` returns `None`, and non-absence failures remain loud. The engine's `crates/omnigraph/src/storage.rs` is a compatibility facade over that implementation. This covers only the text-object layer (sidecars, schema staging, cluster state) — **Lance datasets bypass the adapter**, so engine integration tests still use `tempfile::tempdir()`. An in-memory Lance substrate remains an architectural ask — keep it explicit in [docs/dev/invariants.md](invariants.md) under known gaps.
 
@@ -102,6 +102,12 @@ ordinary recovery-v9 sidecar creation, each table effect, confirmation,
 manifest publication, audit, cleanup, first-touch branch refs, and cluster-state
 CAS. Extend those existing owners when changing a writer; do not create a
 parallel recovery suite for a transport facade over Load.
+
+The server's `failpoints` feature forwards the engine feature only for
+transport-lifetime coverage. Run
+`cargo test -p omnigraph-server --features failpoints --test write_cancellation`
+to prove that disconnect/reset/timeout drops the HTTP receiver while the
+already-armed engine write remains owned through terminal publication.
 
 ## RustFS / S3 integration
 

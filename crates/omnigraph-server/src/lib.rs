@@ -3,6 +3,7 @@ mod export_transport;
 mod handlers;
 mod settings;
 mod supervisor;
+mod tracked_write;
 use handlers::*;
 use settings::*;
 pub use settings::{ServerRuntimeState, classify_server_runtime_state, load_server_settings};
@@ -280,8 +281,9 @@ pub struct AppState {
     /// response body and detached producer jointly retain each reservation.
     export_transport: export_transport::ExportTransport,
     /// One coalescing open/recovery supervisor per configured graph.
-    #[allow(dead_code)]
     supervisors: Arc<supervisor::SupervisorSet>,
+    /// Cancellation-independent owner for every served mutation.
+    write_executor: Arc<tracked_write::TrackedWriteExecutor>,
 }
 
 /// The structured-detail payloads are boxed to keep `Result<_, ApiError>` cheap
@@ -542,6 +544,7 @@ impl AppState {
             GraphRegistry::from_handles(vec![handle])
                 .expect("a single handle never collides on graph id"),
         );
+        let write_executor = tracked_write::TrackedWriteExecutor::new(Arc::clone(&registry));
         Self {
             routing: GraphRouting {
                 registry,
@@ -552,6 +555,7 @@ impl AppState {
             server_policy: None,
             export_transport: export_transport::ExportTransport::with_defaults(),
             supervisors: supervisor::SupervisorSet::idle(),
+            write_executor,
         }
     }
 
@@ -570,6 +574,7 @@ impl AppState {
     ) -> std::result::Result<Self, InsertError> {
         let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let registry = Arc::new(GraphRegistry::from_handles(handles)?);
+        let write_executor = tracked_write::TrackedWriteExecutor::new(Arc::clone(&registry));
         Ok(Self {
             routing: GraphRouting {
                 registry,
@@ -580,6 +585,7 @@ impl AppState {
             server_policy: server_policy.map(Arc::new),
             export_transport: export_transport::ExportTransport::with_defaults(),
             supervisors: supervisor::SupervisorSet::idle(),
+            write_executor,
         })
     }
 
@@ -590,6 +596,7 @@ impl AppState {
         config_path: PathBuf,
     ) -> Self {
         let supervisors = supervisor::SupervisorSet::start(Arc::clone(&registry));
+        let write_executor = tracked_write::TrackedWriteExecutor::new(Arc::clone(&registry));
         Self {
             routing: GraphRouting {
                 registry,
@@ -600,6 +607,7 @@ impl AppState {
             server_policy: server_policy.map(Arc::new),
             export_transport: export_transport::ExportTransport::with_defaults(),
             supervisors,
+            write_executor,
         }
     }
 
@@ -1416,9 +1424,45 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         stdout.flush()?;
     }
 
-    axum::serve(listener, build_app(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let shutdown_lifecycle = state.clone();
+    let emergency_lifecycle = state.clone();
+    let (shutdown_started, await_shutdown) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        // Close served-write admission before telling Axum to stop accepting
+        // requests. The executor gate makes this transition atomic with task
+        // submission; already-owned operations retain their permits.
+        shutdown_lifecycle.write_executor.close_admission();
+        let _ = shutdown_started.send(());
+        shutdown_lifecycle
+            .write_executor
+            .drain(std::time::Duration::from_secs(30))
+            .await;
+        shutdown_lifecycle.supervisors.shutdown().await;
+    });
+
+    let serve_result = axum::serve(listener, build_app(state))
+        .with_graceful_shutdown(async move {
+            let _ = await_shutdown.await;
+        })
+        .await;
+
+    if serve_result.is_err() {
+        // An accept-loop failure can precede an OS shutdown signal. Do not
+        // leave lifecycle tasks behind in that exceptional path.
+        shutdown_task.abort();
+        emergency_lifecycle.write_executor.close_admission();
+        emergency_lifecycle
+            .write_executor
+            .drain(std::time::Duration::from_secs(30))
+            .await;
+        emergency_lifecycle.supervisors.shutdown().await;
+    } else {
+        shutdown_task
+            .await
+            .map_err(|error| eyre!("server shutdown task failed: {error}"))?;
+    }
+    serve_result?;
     Ok(())
 }
 

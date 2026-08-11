@@ -547,7 +547,7 @@ selector. It has no MemWAL, token ledger, hidden row metadata, or asynchronous
 fold. A producer sends successive bounded requests when it needs continuous
 ingestion. See [the RFC-026 removal decision](wal-removal.md).
 
-### Open-time recovery sweep
+### Full recovery sweep (read-write open and live refresh)
 
 The staged-write rewire eliminates one drift class **by construction at
 the writer layer**: an op that fails before pushing to the in-memory
@@ -557,7 +557,7 @@ the case the `partial_failure_leaves_target_queryable_and_unblocks_next_mutation
 test pins.
 
 A second, narrower drift class — the **finalize → publisher window** —
-is closed across one open cycle by the open-time recovery sweep:
+is closed by the shared Full recovery sweep:
 
 `MutationStaging::stage_all` prepares the table transactions and `commit_all`
 runs their independent HEAD advances before the publisher commits the manifest. Lance has
@@ -650,9 +650,12 @@ identity, incarnation, path, and Lance version.
 > reader of `recovery.rs`, `failpoints.rs`, or this document only
 > encounters phase letters in the per-writer context.
 
-A failure between Phase A and Phase D leaves the sidecar on disk. The
-next `Omnigraph::open` (gated on `OpenMode::ReadWrite`) runs the
-recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
+A failure between Phase A and Phase D leaves the sidecar on disk. The next
+read-write `Omnigraph::open`, or an explicit `Omnigraph::refresh()` on a live
+handle, runs the same recovery implementation in
+`crates/omnigraph/src/db/manifest/recovery.rs`. Both hold the process-global
+root schema gate; recovery adds the sidecar branch and sorted table gates and
+re-reads the sidecar after waiting before classifying any effect:
 
 All current writers emit sidecar schema v9. The JSON field names
 `protocol_v3`, `protocol_v4`, `protocol_v7`, and `protocol_v8` are retained
@@ -760,11 +763,13 @@ contention exceeding `PUBLISHER_RETRY_BUDGET = 5` retries.
 
 **Long-running servers**: the write entry points (`load_as`,
 `mutate_as`, `apply_schema_as`, `branch_merge_as`), the explicit
-`ensure_indices{,_on}` reconciler, and `Omnigraph::refresh` run
-roll-forward-only recovery in-process
+`ensure_indices{,_on}` reconciler run roll-forward-only recovery in-process
 (`recovery::heal_pending_sidecars_roll_forward`) — the common
 Phase B → Phase C residual closes on the next enrolled entry, without a
-restart and without an explicit refresh. The heal lists `__recovery/`
+restart. `Omnigraph::refresh()` is the Full path: under the root schema gate it
+uses a temporary fresh coordinator, runs schema staging plus complete sidecar
+classification, adopts the recovered coordinator only after success, reloads
+the ArcSwap schema/catalog view, and invalidates derived caches. The heal lists `__recovery/`
 (one `list_dir`; empty in the steady state) and, per sidecar, acquires
 schema → branch → sorted-table gates that overlap the writer's guarded
 sidecar lifetime. RFC-022 mutation/load writers hold the complete order. Branch
@@ -816,7 +821,7 @@ Pinned by the four
 `tests/failpoints.rs::*_after_finalize_publisher_failure_heals_without_reopen`
 tests (load, mutation, schema apply, branch merge), plus
 `recovery_rolls_forward_ensure_indices_on_feature_branch`, which retains the
-next-read-write-open roll-forward boundary and then completes a second
+roll-forward-only entry boundary and then completes a second
 roll-forward-eligible `EffectsConfirmed` predecessor under its unchanged token
 on the same handle before new planning. The authority-clean
 `ensure_indices_complete_armed_effects_roll_back` keeps the complete-effect
@@ -829,9 +834,9 @@ apply re-plans rewrites from the manifest pin and orphans the drifted
 Phase-B commit (dropping its rows), and a branch merge publishes the
 drift as an unattributed side effect — both while the stale sidecar
 lingers to misclassify later.
-Sidecars that would require a `Dataset::restore` (mixed / unexpected
-state) are deferred to the next `OpenMode::ReadWrite` open. Full open-time
-recovery uses the same root-scoped ordered gates and post-wait optional body reread,
+Sidecars that would require a `Dataset::restore` (mixed / unexpected state) are
+deferred by the cheap write-entry healer to the next Full refresh or read-write
+open. Full recovery uses the same root-scoped ordered gates and post-wait optional body reread,
 so it cannot Restore/delete under a live writer owned by another handle in the
 same process. Restore remains unsafe across processes because Lance's
 `check_restore_txn` accepts
@@ -839,15 +844,17 @@ the restore against in-flight Append/Update/Delete commits and
 silently orphans them (pinned by
 `src/table_store/staged_tests.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
 When such a deferred sidecar blocks a write, the commit-time drift
-guard says so explicitly ("a pending recovery sidecar requires
-rollback — reopen the graph read-write") instead of pointing at
+guard says so explicitly ("run a Full graph refresh") instead of pointing at
 `omnigraph repair`, which refuses while a sidecar is pending.
 `cleanup` refuses pending sidecars at entry as well, before orphan reconciliation
 or version GC: v3/v4 ownership and compensation recovery may need the retained
 Lance transaction/version history, so garbage collection cannot outrun the
 recovery barrier.
-Continuous in-process recovery for the rollback path is the goal of a
-future background reconciler. EnsureIndices' entry barrier remains
+The server owns background scheduling: a tracked write returning
+`RecoveryRequired` blocks new writes for that graph and wakes a coalescing
+supervisor that calls Full `refresh()` on the same handle. The engine exposes
+no second public recovery method, and the server exposes no repair endpoint.
+EnsureIndices' entry barrier remains
 roll-forward-only: it never performs a `Dataset::restore` under a live handle.
 It runs before schema-idle checking and `open_write_txn`, so unresolved
 rollback state cannot be mistaken for a fresh base or trigger another expensive
@@ -890,8 +897,8 @@ storage-fault failpoints `recovery.sidecar_{write,delete,list}` /
   write's entry heal (or the next open) via the stale-sidecar
   audit-recovery path, recorded as `RolledForward`.
 - **`__recovery/` list fails** (S3 ListObjectsV2): loud at every
-  consumer — the write-entry heal fails the write, the open-time sweep
-  fails the open. Silently skipping recovery would be consumer
+  consumer — the write-entry heal fails the write, and the Full sweep fails
+  its open or refresh. Silently skipping recovery would be consumer
   tolerance of drift.
 - **A listed sidecar disappears before its body is read**: benign
   concurrent completion. A writer may publish and delete its sidecar

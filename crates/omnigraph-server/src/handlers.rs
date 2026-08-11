@@ -733,7 +733,7 @@ pub(crate) async fn run_mutate(
     let actor_arc = actor
         .map(|a| Arc::clone(&a.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor.map(|a| a.actor_id.as_ref());
+    let actor_id = actor.map(|a| a.actor_id.as_ref().to_string());
     authorize_request(
         actor,
         handle.policy.as_deref(),
@@ -743,33 +743,45 @@ pub(crate) async fn run_mutate(
             target_branch: None,
         },
     )?;
-    // Per-actor admission: bound concurrent in-flight mutations and
-    // estimated bytes per actor. Cedar runs FIRST so denied requests
-    // don't consume admission slots. Estimate uses the request body
-    // size as a coarse proxy; engine memory pressure can run higher.
-    let est_bytes =
-        query.len() as u64 + params_json.map(|p| p.to_string().len() as u64).unwrap_or(0);
-    let _admission = state
-        .workload
-        .try_admit(&actor_arc, est_bytes)
-        .map_err(ApiError::from_workload_reject)?;
     let (selected_name, query_params) =
         select_named_query(query, name).map_err(|err| ApiError::bad_request(err.to_string()))?;
     let params = query_params_from_json(&query_params, params_json)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let query = query.to_string();
 
-    let result = {
-        let db = &handle.engine;
-        db.mutate_as(&branch, query, &selected_name, &params, actor_id)
-            .await
-            .map_err(ApiError::from_omni)?
-    };
+    // Authorization and request validation are complete before admission.
+    // The guard moves into the owned task so disconnect cannot recycle actor
+    // capacity while the engine is still writing.
+    let est_bytes =
+        query.len() as u64 + params_json.map(|p| p.to_string().len() as u64).unwrap_or(0);
+    let admission = state
+        .workload
+        .try_admit(&actor_arc, est_bytes)
+        .map_err(ApiError::from_workload_reject)?;
+    let operation_branch = branch.clone();
+    let operation_name = selected_name.clone();
+    let operation_actor = actor_id.clone();
+    let result = state
+        .write_executor
+        .execute(handle, admission, move |handle| async move {
+            handle
+                .engine
+                .mutate_as(
+                    &operation_branch,
+                    &query,
+                    &operation_name,
+                    &params,
+                    operation_actor.as_deref(),
+                )
+                .await
+        })
+        .await?;
     Ok(ChangeOutput {
         branch,
         query_name: selected_name,
         affected_nodes: result.affected_nodes,
         affected_edges: result.affected_edges,
-        actor_id: actor_id.map(str::to_string),
+        actor_id,
     })
 }
 
@@ -1224,7 +1236,7 @@ pub(crate) async fn server_schema_apply(
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor
         .as_ref()
-        .map(|Extension(actor)| actor.actor_id.as_ref());
+        .map(|Extension(actor)| actor.actor_id.as_ref().to_string());
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -1246,42 +1258,46 @@ pub(crate) async fn server_schema_apply(
         ));
     }
     let est_bytes = request.schema_source.len() as u64;
-    let _admission = state
+    let admission = state
         .workload
         .try_admit(&actor_arc, est_bytes)
         .map_err(ApiError::from_workload_reject)?;
-    let result = {
-        let db = &handle.engine;
-        let registry = handle.queries.as_deref();
-        let label = handle.key.graph_id.as_str().to_string();
-        // Engine-layer policy enforcement (MR-722): pass the resolved
-        // actor through so apply_schema_as can call enforce() with the
-        // authoritative identity. With a policy installed in AppState,
-        // engine-side enforcement re-checks the same decision the
-        // HTTP-layer authorize_request just made above. PR #3 collapses
-        // the redundancy.
-        db.apply_schema_as_with_catalog_check(
-            &request.schema_source,
-            omnigraph::db::SchemaApplyOptions {
-                allow_data_loss: request.allow_data_loss,
-            },
-            actor_id,
-            |catalog| {
-                if let Some(registry) = registry {
-                    validate_registry_against_catalog(registry, catalog, &label)?;
-                }
-                Ok(())
-            },
-        )
-        .await
-        .map_err(ApiError::from_omni)?
-    };
+    let uri = handle.uri.clone();
+    let registry = handle.queries.clone();
+    let label = handle.key.graph_id.as_str().to_string();
+    let schema_source = request.schema_source;
+    let allow_data_loss = request.allow_data_loss;
+    let result = state
+        .write_executor
+        .execute(handle, admission, move |handle| async move {
+            // Engine-layer policy enforcement (MR-722): pass the resolved
+            // actor through so apply_schema_as can call enforce() with the
+            // authoritative identity. With a policy installed in AppState,
+            // engine-side enforcement re-checks the same decision the
+            // HTTP-layer authorize_request just made above. PR #3 collapses
+            // the redundancy.
+            handle
+                .engine
+                .apply_schema_as_with_catalog_check(
+                    &schema_source,
+                    omnigraph::db::SchemaApplyOptions { allow_data_loss },
+                    actor_id.as_deref(),
+                    |catalog| {
+                        if let Some(registry) = registry.as_deref() {
+                            validate_registry_against_catalog(registry, catalog, &label)?;
+                        }
+                        Ok(())
+                    },
+                )
+                .await
+        })
+        .await?;
     // Physical indexes are derived state. Schema apply records intent only;
     // explicit `ensure_indices` / `optimize` maintenance owns convergence on
     // every surface, including a long-lived server. Keeping the handler free
     // of detached physical writes also makes a successful response describe
     // the complete effect envelope of this request.
-    Ok(Json(schema_apply_output(handle.uri.as_str(), result)))
+    Ok(Json(schema_apply_output(uri.as_str(), result)))
 }
 
 /// Authorize one load target without touching request data.
@@ -1346,28 +1362,36 @@ async fn run_ingest(
     let actor_arc = actor
         .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor.map(|actor| actor.actor_id.as_ref());
+    let actor_id = actor.map(|actor| actor.actor_id.as_ref().to_string());
 
     authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
     let est_bytes = request.data.len() as u64;
-    let _admission = state
+    let admission = state
         .workload
         .try_admit(&actor_arc, est_bytes)
         .map_err(ApiError::from_workload_reject)?;
+    let uri = handle.uri.clone();
+    let data = request.data;
+    let operation_branch = branch.clone();
+    let operation_from = from.clone();
+    let operation_actor = actor_id.clone();
+    let result = state
+        .write_executor
+        .execute(handle, admission, move |handle| async move {
+            handle
+                .engine
+                .load_as(
+                    &operation_branch,
+                    operation_from.as_deref(),
+                    &data,
+                    mode,
+                    operation_actor.as_deref(),
+                )
+                .await
+        })
+        .await?;
 
-    let result = {
-        let db = &handle.engine;
-        db.load_as(&branch, from.as_deref(), &request.data, mode, actor_id)
-            .await
-            .map_err(ApiError::from_omni)?
-    };
-
-    Ok(ingest_output(
-        handle.uri.as_str(),
-        &result,
-        mode,
-        actor_id.map(str::to_string),
-    ))
+    Ok(ingest_output(uri.as_str(), &result, mode, actor_id))
 }
 
 #[utoipa::path(
@@ -1522,26 +1546,35 @@ pub(crate) async fn server_load_ndjson(
 
     let data = collect_graph_batch_body(request.into_body()).await?;
     let data = std::str::from_utf8(&data)
-        .map_err(|_| ApiError::bad_request("graph-batch request body must be valid UTF-8"))?;
+        .map_err(|_| ApiError::bad_request("graph-batch request body must be valid UTF-8"))?
+        .to_string();
     let actor_arc = actor
         .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor.map(|actor| actor.actor_id.as_ref());
-    let _admission = state
+    let actor_id = actor.map(|actor| actor.actor_id.as_ref().to_string());
+    let admission = state
         .workload
         .try_admit(&actor_arc, data.len() as u64)
         .map_err(ApiError::from_workload_reject)?;
-
-    let result = handle
-        .engine
-        .load_graph_batch_as(&branch, from.as_deref(), data, mode, actor_id)
-        .await
-        .map_err(ApiError::from_omni)?;
-    Ok(Json(graph_batch_load_output(
-        &result,
-        mode,
-        actor_id.map(str::to_string),
-    )))
+    let operation_branch = branch.clone();
+    let operation_from = from.clone();
+    let operation_actor = actor_id.clone();
+    let result = state
+        .write_executor
+        .execute(handle, admission, move |handle| async move {
+            handle
+                .engine
+                .load_graph_batch_as(
+                    &operation_branch,
+                    operation_from.as_deref(),
+                    &data,
+                    mode,
+                    operation_actor.as_deref(),
+                )
+                .await
+        })
+        .await?;
+    Ok(Json(graph_batch_load_output(&result, mode, actor_id)))
 }
 
 #[utoipa::path(
@@ -1654,6 +1687,7 @@ pub(crate) async fn server_branch_create(
     Json(request): Json<BranchCreateRequest>,
 ) -> std::result::Result<Json<BranchCreateOutput>, ApiError> {
     let from = request.from.unwrap_or_else(|| "main".to_string());
+    let name = request.name;
     let actor_arc = actor
         .as_ref()
         .map(|Extension(actor)| Arc::clone(&actor.actor_id))
@@ -1664,31 +1698,39 @@ pub(crate) async fn server_branch_create(
         PolicyRequest {
             action: PolicyAction::BranchCreate,
             branch: Some(from.clone()),
-            target_branch: Some(request.name.clone()),
+            target_branch: Some(name.clone()),
         },
     )?;
     // Branch metadata only — small constant bytes estimate. The Lance
     // shallow-clone work is bounded by the parent's manifest size, not
     // the request body.
-    let _admission = state
+    let admission = state
         .workload
         .try_admit(&actor_arc, 256)
         .map_err(ApiError::from_workload_reject)?;
-    {
-        let db = &handle.engine;
-        db.branch_create_from_as(
-            ReadTarget::branch(&from),
-            &request.name,
-            actor.as_ref().map(|Extension(a)| a.actor_id.as_ref()),
-        )
-        .await
-        .map_err(ApiError::from_omni)?;
-    }
+    let actor_id = actor.map(|Extension(actor)| actor.actor_id.as_ref().to_string());
+    let operation_from = from.clone();
+    let operation_name = name.clone();
+    let operation_actor = actor_id.clone();
+    let uri = handle.uri.clone();
+    state
+        .write_executor
+        .execute(handle, admission, move |handle| async move {
+            handle
+                .engine
+                .branch_create_from_as(
+                    ReadTarget::branch(&operation_from),
+                    &operation_name,
+                    operation_actor.as_deref(),
+                )
+                .await
+        })
+        .await?;
     Ok(Json(BranchCreateOutput {
-        uri: handle.uri.clone(),
+        uri,
         from,
-        name: request.name,
-        actor_id: actor.map(|Extension(actor)| actor.actor_id.as_ref().to_string()),
+        name,
+        actor_id,
     }))
 }
 
@@ -1741,7 +1783,7 @@ pub(crate) async fn server_branch_delete(
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor
         .as_ref()
-        .map(|Extension(actor)| actor.actor_id.as_ref());
+        .map(|Extension(actor)| actor.actor_id.as_ref().to_string());
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -1752,20 +1794,26 @@ pub(crate) async fn server_branch_delete(
         },
     )?;
     // Metadata-only manifest tombstone — small constant estimate.
-    let _admission = state
+    let admission = state
         .workload
         .try_admit(&actor_arc, 256)
         .map_err(ApiError::from_workload_reject)?;
-    {
-        let db = &handle.engine;
-        db.branch_delete_as(&branch, actor_id)
-            .await
-            .map_err(ApiError::from_omni)?;
-    }
+    let uri = handle.uri.clone();
+    let operation_branch = branch.clone();
+    let operation_actor = actor_id.clone();
+    state
+        .write_executor
+        .execute(handle, admission, move |handle| async move {
+            handle
+                .engine
+                .branch_delete_as(&operation_branch, operation_actor.as_deref())
+                .await
+        })
+        .await?;
     Ok(Json(BranchDeleteOutput {
-        uri: handle.uri.clone(),
+        uri,
         name: branch,
-        actor_id: actor_id.map(str::to_string),
+        actor_id,
     }))
 }
 
@@ -1805,88 +1853,103 @@ pub(crate) async fn server_branch_merge(
     Json(request): Json<BranchMergeRequest>,
 ) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
     let target = request.target.unwrap_or_else(|| "main".to_string());
+    let source = request.source;
+    let delete_branch = request.delete_branch;
     let actor_arc = actor
         .as_ref()
         .map(|Extension(actor)| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor
         .as_ref()
-        .map(|Extension(actor)| actor.actor_id.as_ref());
+        .map(|Extension(actor)| actor.actor_id.as_ref().to_string());
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::BranchMerge,
-            branch: Some(request.source.clone()),
+            branch: Some(source.clone()),
             target_branch: Some(target.clone()),
         },
     )?;
+    let delete_authorization = if delete_branch {
+        Some(
+            match authorize(
+                actor.as_ref().map(|Extension(actor)| actor),
+                handle.policy.as_deref(),
+                PolicyRequest {
+                    action: PolicyAction::BranchDelete,
+                    branch: None,
+                    target_branch: Some(source.clone()),
+                },
+            ) {
+                Ok(Authz::Allowed) => Ok(()),
+                Ok(Authz::Denied(message)) => Err(message),
+                Err(error) => Err(error.message),
+            },
+        )
+    } else {
+        None
+    };
     // Merge body is small JSON; the heavy work is in the engine but is
     // bounded per-(table, branch) by the writer queue. Small constant
     // estimate suffices for the actor in-flight count.
-    let _admission = state
+    let admission = state
         .workload
         .try_admit(&actor_arc, 256)
         .map_err(ApiError::from_workload_reject)?;
-    let outcome = {
-        let db = &handle.engine;
-        db.branch_merge_as(&request.source, &target, actor_id)
-            .await
-            .map_err(ApiError::from_omni)?
-    };
-    let (branch_deleted, branch_delete_error) = if request.delete_branch {
-        match delete_merged_source_branch(
-            &handle,
-            actor.as_ref().map(|Extension(a)| a),
-            &request.source,
-        )
-        .await
-        {
-            Ok(()) => (Some(true), None),
-            Err(message) => (Some(false), Some(message)),
-        }
-    } else {
-        (None, None)
-    };
+    let operation_source = source.clone();
+    let operation_target = target.clone();
+    let operation_actor = actor_id.clone();
+    let registry = Arc::clone(&state.routing.registry);
+    let graph_key = handle.key.clone();
+    let (outcome, branch_deleted, branch_delete_error) = state
+        .write_executor
+        .execute(handle, admission, move |handle| async move {
+            let outcome = handle
+                .engine
+                .branch_merge_as(
+                    &operation_source,
+                    &operation_target,
+                    operation_actor.as_deref(),
+                )
+                .await?;
+            let deletion = match delete_authorization {
+                None => (None, None),
+                Some(Err(message)) => (Some(false), Some(message)),
+                Some(Ok(())) => match handle
+                    .engine
+                    .branch_delete_as(&operation_source, operation_actor.as_deref())
+                    .await
+                {
+                    Ok(()) => (Some(true), None),
+                    Err(OmniError::RecoveryRequired {
+                        operation_id,
+                        reason,
+                    }) => {
+                        registry
+                            .mark_recovering(&graph_key, Some(operation_id.clone()))
+                            .await;
+                        (
+                            Some(false),
+                            Some(format!(
+                                "recovery required for operation {operation_id}: {reason}"
+                            )),
+                        )
+                    }
+                    Err(error) => (Some(false), Some(error.to_string())),
+                },
+            };
+            Ok((outcome, deletion.0, deletion.1))
+        })
+        .await?;
     Ok(Json(BranchMergeOutput {
-        source: request.source,
+        source,
         target,
         outcome: outcome.into(),
-        actor_id: actor_id.map(str::to_string),
+        actor_id,
         branch_deleted,
         branch_delete_error,
     }))
-}
-
-/// Delete the source branch of a just-landed merge, mirroring
-/// `server_branch_delete`'s authorization (same action and target scope) but
-/// converting every failure — policy denial, dependent-branch refusal,
-/// operational error — into a message instead of an error status: the merge is
-/// already durable, so the request must not report failure for it.
-async fn delete_merged_source_branch(
-    handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
-    source: &str,
-) -> std::result::Result<(), String> {
-    match authorize(
-        actor,
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::BranchDelete,
-            branch: None,
-            target_branch: Some(source.to_string()),
-        },
-    ) {
-        Ok(Authz::Allowed) => {}
-        Ok(Authz::Denied(message)) => return Err(message),
-        Err(err) => return Err(err.message),
-    }
-    let actor_id = actor.map(|actor| actor.actor_id.as_ref());
-    handle
-        .engine
-        .branch_delete_as(source, actor_id)
-        .await
-        .map_err(|err| err.to_string())
 }
 
 #[utoipa::path(

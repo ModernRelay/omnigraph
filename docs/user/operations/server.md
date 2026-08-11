@@ -27,25 +27,29 @@ host that is reachable from the client.
 `omnigraph-server --cluster <dir-or-uri>` boots from the cluster catalog's
 **applied revision**. The server resolves that revision into per-graph
 startup configs (id, URI, optional per-graph policy, stored-query
-registry) plus an optional server-level policy, then opens every
-configured graph in parallel at startup (bounded concurrency = 4,
-quarantining graph-specific open failures). Routing is always multi-graph —
+registry) plus an optional server-level policy. It validates every graph id,
+canonical URI, and duplicate URI owner before beginning any open, then makes
+one initial open attempt per graph with process-wide concurrency four. Routing
+is always multi-graph —
 requests to bare flat protected paths (`/read`, `/snapshot`, …) return
 404; the served surface is `/graphs/{graph_id}/...`. See
 [cluster-config.md](../clusters/config.md#serving-from-the-cluster-the-mode-switch)
 for what is read and the readiness rules.
 
-Readiness is fail-fast for cluster-global problems: missing or unreadable
-state, invalid/unattributable recovery sidecars, unreadable shared catalog
-payloads, cluster policy errors, or zero healthy graphs. Graph-attributed
-pending recovery sidecars and graph-specific startup failures quarantine
-that graph instead; the server logs startup diagnostics and serves the
-remaining healthy graphs. `GET /graphs` enumerates ready/served graphs only,
-so quarantined graphs are absent and their routes return 404.
+Readiness is fail-fast for cluster-global configuration problems: missing or
+unreadable applied state, unreadable shared catalog payloads, and cluster
+policy errors. Every configured graph remains in the runtime registry even if
+it cannot open. Proven I/O and timeout failures retry with full-jitter
+exponential backoff (one-second base, sixty-second cap); invalid graph/query/
+policy/schema configuration, unsupported storage formats, and invariant
+failures remain unavailable until the operator corrects the applied cluster
+configuration and restarts. Default boot binds even when zero graphs opened.
+`GET /graphs` reports every configured graph and its read/write readiness;
+configured unavailable routes return 503, while unknown graph ids return 404.
 
 Operators who want the original all-or-nothing boot contract can pass
 `--require-all-graphs` or set `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`. In that mode,
-any graph quarantine, graph-open failure, stored-query startup failure, or
+any graph-open failure, stored-query startup failure, or
 embedding-provider resolution failure aborts startup.
 
 A scheme-qualified argument (`s3://…`) reads the ledger straight from the
@@ -54,7 +58,7 @@ storage root, with no local config directory. `--bind`,
 
 ### Stored-query validation at startup
 
-If a graph declares a `queries:` registry (see [cli-reference](../cli/reference.md)), the server **loads and type-checks every stored query against that graph's live schema at startup**. Query parse/type failures quarantine that graph; if no graph remains healthy, startup refuses. Two MCP-exposed queries claiming the same tool name are likewise graph-local startup failures. Non-blocking advisories (e.g. an MCP-exposed query with a vector parameter an agent cannot supply) are logged. Validate offline before deploying with `omnigraph queries validate`. Discover the stored queries as a typed tool catalog with `GET /queries`, and invoke one over HTTP with `POST /queries/{name}` (both below).
+If a graph declares a `queries:` registry (see [cli-reference](../cli/reference.md)), the server **loads and type-checks every stored query against that graph's live schema at startup**. Query parse/type failures mark that graph unavailable. Two MCP-exposed queries claiming the same tool name are likewise permanent graph-local configuration failures. Non-blocking advisories (e.g. an MCP-exposed query with a vector parameter an agent cannot supply) are logged. Validate offline before deploying with `omnigraph queries validate`. Discover the stored queries as a typed tool catalog with `GET /queries`, and invoke one over HTTP with `POST /queries/{name}` (both below).
 
 ## Endpoint inventory
 
@@ -89,7 +93,7 @@ Server-level management endpoints:
 
 | Method | Path | Auth | Action |
 |---|---|---|---|
-| GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list ready/served graphs |
+| GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list every configured graph and its runtime status |
 
 > The per-graph subsections below name routes in shorthand (`GET /queries`,
 > `POST /query`, `POST /mutate`, `POST /queries/{name}`); every one is served
@@ -240,7 +244,7 @@ fails.
 ## Error model
 
 Uniform
-`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, key_conflict?, read_set_conflict?, recovery_required?, resource_limit? }`
+`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, key_conflict?, read_set_conflict?, recovery_required?, resource_limit?, graph_unavailable? }`
 with
 `code ∈ unauthorized | forbidden | bad_request | not_found | method_not_allowed | conflict | too_many_requests | internal`.
 Merge conflicts attach structured
@@ -262,16 +266,54 @@ load `overwrite` return the 409 to the caller instead of being replayed.
 `recovery_required` is set when an overlapping durable recovery intent remains
 unresolved; its table effects may or may not have started. The HTTP status is 503 and
 `RecoveryRequiredOutput { operation_id }` names the durable recovery intent.
+It is the prior operation blocking this request, not a request id for the
+current HTTP call.
 The optional `code` field is omitted for this response: adding a new value to
 the closed error-code enum would break older clients, while the optional
 structured field is additive and rolling-safe.
-Do not blindly resubmit the write: let a read-write open or the recovery sweep
-resolve that operation first, then retry from a fresh snapshot.
+The server immediately blocks new writes for that graph and schedules a live
+Full recovery through the existing engine handle. Coherent reads remain
+available while recovery is retrying. A transient recovery failure reports the
+graph as `degraded`; a permanent coherence/invariant failure removes the handle
+from routing and reports it as `unavailable`. There is no manual recovery
+endpoint. Do not blindly resubmit the write: wait for `write_ready: true`, then
+retry from a fresh snapshot. Recovery/opening 503 responses include
+`Retry-After`, rounded up to at least one second.
+
+`graph_unavailable` distinguishes a configured graph that cannot currently
+serve the route from an unknown id. It contains `{ graph_id, state,
+retry_after_seconds? }`; the former returns 503, the latter remains 404.
+
+`GET /graphs` returns `GraphInfo { graph_id, uri, state, read_ready,
+write_ready, failure_class?, last_error?, retry_after_seconds?,
+blocking_operation_id? }`. `state` is one of `ready`, `recovering`, `degraded`,
+`opening`, or `unavailable`. Errors are sanitized and bounded before they are
+stored in status.
+
+`GET /healthz` remains process/supervisor liveness only and returns `200` while
+individual or all graphs are unavailable. Authenticated `GET /graphs` is the
+graph-readiness surface; no separate readiness or manual-recovery endpoint is
+exposed.
 
 HTTP status codes used include 200, 400, 401, 403, 404, 405, 409, 413,
 415, 429, 500, and 503.
 
 ## Per-actor admission control
+
+Every served mutation runs in a tracked server-owned task after extraction,
+authentication, authorization, and request validation. The task owns the graph
+handle, resolved actor, inputs, and admission guard until the engine operation
+reaches a terminal result. An HTTP/1.1 disconnect, HTTP/2 reset, proxy timeout,
+or dropped Axum response future therefore drops only the result receiver; it
+does not cancel the write or release its workload permit early. This guarantees
+server-side terminal execution, not client certainty about the result. Clients
+that require safe retry after a lost response need the planned idempotency and
+operation-status contract; the server never replays the request itself.
+
+During graceful shutdown the listener stops accepting requests, write
+admission closes, tracked writes drain for up to thirty seconds, and graph
+supervisors stop after any active recovery attempt settles. A drain timeout is
+logged; durable sidecars remain the next-boot recovery authority.
 
 RFC-022-enrolled mutation/load preparation runs outside the effect gates, so
 parsing, validation, and reclaimable fragment staging can overlap across branches.

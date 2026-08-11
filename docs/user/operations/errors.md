@@ -55,7 +55,7 @@
   HTTP returns **403**.
 - `AlreadyInitialized { uri }` — `init` targeted a root that already holds a
   graph. HTTP returns **409**.
-- `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id`. Resolve the sidecar through a read-write reopen/server restart before retrying; this is intentionally not an ordinary OCC retry.
+- `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id` and `Retry-After`. The id names the prior blocking operation, not the current request. A served write marks the graph recovering and schedules live Full recovery through the same engine handle; it is intentionally not an ordinary OCC retry and the server never replays it. Wait for `GET /graphs` to report `write_ready: true` before deciding whether to retry. If the response was lost, server-side terminal execution does not tell the client which outcome occurred; durable request idempotency/status is a separate follow-up contract.
 
 For RFC-023 Mutation/Load keyed writes, `KeyConflict` is returned only after
 the writer proves that none of its planned table effects landed, finalizes the
