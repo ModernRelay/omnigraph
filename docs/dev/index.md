@@ -34,6 +34,7 @@ roadmap). The per-area docs below remain the mechanical authority.
 | Branch and commit internals | [branches-commits.md](../user/branching/index.md) |
 | Three-way merge implementation and conflicts | [merge.md](merge.md) |
 | Branch-merge algorithmic complexity + object-store cost (timeout diagnosis) | [merge-complexity.md](merge-complexity.md) |
+| Merge latency L1–L3 implementation plan | [merge-l1-l3-plan.md](merge-l1-l3-plan.md) |
 | Diff/change-feed implementation | [changes.md](../user/branching/changes.md) |
 | Branch protection policy | [branch-protection.md](branch-protection.md) |
 

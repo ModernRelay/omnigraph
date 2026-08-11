@@ -533,9 +533,12 @@ different algorithm).
 
 ### Recommended sequence
 
-1. **L1** — smallest sealed-adapter change; helps Mutation/Load and merge; assumptions already in RFC-023.
-2. **L3** — deny-list alignment; removes vector build from three-way critical path.
-3. **L2** — adopt publish partition; then optional three-way split.
+Implementation plan (PR slices, tests, L2 staged-Update blocker):
+[merge-l1-l3-plan.md](merge-l1-l3-plan.md).
+
+1. **L3** first (independent) — deny-list alignment; removes vector build from three-way critical path.
+2. **L1** — sealed join-free StrictInsert after preflight; helps Mutation/Load and merge.
+3. **L2a** — adopt known-present update adapter; then optional **L2b** three-way split.
 4. **L4** — recover cleaned-history fast-forwards onto L1.
 5. **L5** when Lance ships; keep forced-v2 until guards pass.
 6. **L6** when reclaim/GC assumptions are closed (RFC-0001).
