@@ -2,6 +2,10 @@
 
 `exec/merge.rs`.
 
+For asymptotic cost, object-store request patterns, and timeout diagnosis
+(including Lance upstream `SortExec` / `use_index(false)` full-table
+`merge_insert` joins), see [merge-complexity.md](merge-complexity.md).
+
 ## Strategy
 
 The fast-forward all-new case first attempts an inductive substrate proof before
