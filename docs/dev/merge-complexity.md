@@ -354,20 +354,208 @@ Structural probes to classify the route of a timed-out merge:
 
 ---
 
+## Highest-leverage correctness-by-design fixes (validated)
+
+Ranked by leverage against the timeout tax × assumption risk × whether the
+fix closes a class rather than papering over an instance. Validated against
+OmniGraph main, RFC-023 / RFC-0001 / RFC-027, and Lance 9.0.0 (`v9.0.0`; tip
+of `origin/main` still has `inserted_rows_filter: None // not implemented for v1`
+on the indexed MergeInsert route).
+
+### L1 — After absence is proven, drop the MergeInsert join (StrictInsert)
+
+**Fix.** Once `preflight_strict_insert_ids` (or equivalent) has proven the
+chunk's keys absent at the pinned parent, stage with the existing
+`stage_proven_strict_insert` shape (`InsertBuilder` fragments + filtered
+insertion-only `Update` + exact-`id` `KeyExistenceFilter`), not
+`MergeInsertBuilder` with `use_index(false)`.
+
+**Why this is correctness-by-design.** RFC-023 §5.2 already states the
+complete-history proof makes the target merge join *redundant*;
+`certify_insert_absence` documents that a strict preflight **or** an all-new
+MergeInsert result is the same absence proof. Today's general StrictInsert
+pays the proof **and then** the O(N) join anyway — a class of wasted work the
+design already declared unnecessary. Closing it removes **`C × O(N_target)`**
+from every StrictInsert surface (Mutation/Load Append **and** merge
+`AdoptWithDelta` inserts), not only one caller.
+
+**Assumptions (must hold):**
+
+1. Preflight is against the **same pinned parent** that becomes
+   `transaction.read_version`.
+2. OCC for concurrent same-key writers is carried by the exact-`id`
+   `KeyExistenceFilter` on the pure-insert `Update` (same compatibility class
+   as forced-v2 MergeInsert) — already the proven-path contract.
+3. `fields_for_preserving_frag_bitmap` remains the **full nested schema
+   preorder** (silent index over-claim otherwise).
+4. Stable row IDs remain on; blob URI cells stay materialized (proven adapter
+   rejects external refs).
+5. Does **not** by itself make Upsert or three-way classification cheap.
+
+**Invalidates if:** Lance conflict resolution ever treats manually-minted
+filters differently from MergeInsert-emitted ones (surface guards must keep
+pinning equality). Bloom false positives stay typed read-set / internal, never
+silent duplicates (already RFC-023).
+
+### L2 — Partition adopt/three-way publish by classification disposition
+
+**Fix.** On `AdoptWithDelta` the ordered walk already partitions ids into
+**new / changed / deleted**. Drive physical ops from that partition:
+
+| Disposition | Today | Design-correct cheaper op |
+|---|---|---|
+| New | StrictInsert → full-table MergeInsert | L1 join-free filtered insert |
+| Changed | Upsert → full-table MergeInsert | Filtered `UpdateBuilder` / rewrite of those ids (presence known) |
+| Deleted | `DeleteBuilder` | unchanged |
+
+Optionally extend to `RewriteMerged` by splitting the three-way selection the
+same way (target absent → insert; target present → update) instead of one
+undifferentiated Upsert stream.
+
+**Why this is correctness-by-design.** Classification already proved
+presence/absence relative to the merge base; when `target == base` (adopt) or
+when the three-way walk observed target membership, re-joining the whole
+target to rediscover that fact is a second, weaker mechanism. One mechanism
+(partition + disposition-matched Lance op + read-set revalidation) replaces
+two.
+
+**Assumptions:**
+
+1. Final gate revalidation still proves target incarnation / HEAD equals the
+   classification baseline before sidecar arm (`ReadSetChanged` otherwise).
+2. Changed-id sets are **disjoint** from insert sets (true today by the single
+   ordered walk).
+3. Filtered update uses **full-row rewrite** of the staged image (merge already
+   stages full rows); `inserted_rows_filter` is correctly `None` because the
+   txn inserts nothing — conflict coverage is `affected_rows`.
+4. **Indexes are derived:** `id IN (...)` may fall back to a table scan when
+   BTREE coverage is pending. Worst case remains O(N) I/O **per chunk**, but
+   avoids DataFusion's full hash-join + `ReplayExec(Capacity::Unbounded)`
+   memory profile. Must not require index presence for correctness (invariant 7).
+5. Sealed adapters + `forbidden_apis` / recovery identity planning must grow
+   exact new shapes; no raw `UpdateBuilder` from call sites.
+
+**Invalidates if:** a future classifier emits "changed" without proving the id
+exists on the publish baseline, or partial-column updates are introduced
+without updating conflict metadata.
+
+### L3 — Defer `RewriteMerged` inline index build (align with adopt + deny-list)
+
+**Fix.** Stop calling `build_indices_on_dataset` on the three-way publish path;
+leave coverage to `ensure_indices` / `optimize`, exactly as `publish_adopted_delta`
+already documents.
+
+**Why this is correctness-by-design.** Invariant 7 + deny-list: physical
+acceleration must not gate logical publish; adopt path already instantiates
+that rule. Three-way's inline IVF/FTS/BTREE is the inconsistency that puts
+`O(N log N)` / `O(N·dim)` on the timeout-critical path for embedding tables.
+
+**Assumptions:**
+
+1. Reads remain correct under partial coverage (already guaranteed).
+2. Recovery must not treat a missing index tail as required for merge
+   success (adopt already accepts this; three-way's "CreateIndex tail" headroom
+   in the scan ceiling becomes unused for the happy path).
+3. Operators still run maintenance; this is convergence, not omission of the
+   logical contract.
+
+### L4 — Widen insert-absence admission when history is cleaned
+
+**Fix.** When `try_proven_pure_insert_adopt` misses only because `_transactions`
+were GC'd / cleaned, but classification shows **insert-only** delta and
+`target == base`, admit the join-free publish from the **revalidated**
+classification proof (or from L1 after a single chunked preflight), and mint
+v1 so the next generation composes.
+
+**Why this is correctness-by-design.** Today's miss converts an all-new
+fast-forward into `AdoptWithDelta` + full joins — an optimization hole that
+changes cost class without a logical reason. The durable certificate remains
+the composition mechanism; classification/preflight is the admission evidence
+when history is absent.
+
+**Assumptions:**
+
+1. Miss reason is distinguishable (cleaned history vs unfamiliar op vs
+   non-insert delta). Unfamiliar ops must still fall back.
+2. `K > 1024` remains a hard optimization budget, not silently unbounded work.
+3. Same L1 OCC / preorder / stable-row-id assumptions.
+
+### L5 — Upstream: indexed MergeInsert emits `KeyExistenceFilter` (RFC-023 option 2)
+
+**Fix.** Consume a Lance revision where the indexed path sets
+`inserted_rows_filter` (today still hardcoded `None` on 9.0.0 and current
+`main`). Then production may set `use_index(true)` and keep fencing.
+
+**Leverage.** Unlocks O(lookup) joins for **all** keyed Upserts (mutation +
+merge), not only merge adopt. Highest cross-surface payoff once shipped.
+
+**Assumptions:**
+
+1. Filter field IDs and Bloom semantics match forced-v2 exactly (surface
+   guards).
+2. Indexed path still uses `ReplayExec(Capacity::Unbounded)` — large source
+   chunks can OOM before S3 is the bottleneck; chunk caps (8 192 / 32 MiB)
+   remain mandatory.
+3. Partial index coverage must fail closed to full join or refuse — never
+   under-match.
+4. Until upstream lands, **do not** flip `use_index(true)` — that reopens the
+   unfiltered-writer conflict class RFC-023 closed.
+
+### L6 — Fragment adopt for `AdoptWithDelta` (draft RFC-0001)
+
+**Fix.** Graft source fragments via `base_paths` instead of row copy; re-home
+in `optimize`; reclaim guard before branch GC.
+
+**Leverage.** Removes classify+copy+join+reindex for the common
+target-equals-base divergent case — the production OOM/timeout shape RFC-0001
+names. Does **not** fix `RewriteMerged` (explicitly deferred; needs #7263 or a
+different algorithm).
+
+**Assumptions (heavier / partly irreversible):**
+
+1. Cross-dataset `base_paths` GC protection is implemented by OmniGraph
+   reachability **or** Lance #7514/#7515/#7185 land.
+2. Single-writer-process boundary (or a lease) until distributed fencing exists.
+3. On-disk layout commitment: target manifests reference branch trees until
+   re-home.
+4. Index adopt is Phase 2 / evidence-gated; Phase 1 may still rebuild via
+   reconciler (compatible with L3).
+
+### Explicitly lower leverage or blocked
+
+| Idea | Verdict |
+|---|---|
+| Cheaper `row_signature` / skip embedding stringify only | **Symptomatic** for publish OOM (RFC-0001): helps detect, does not remove copy/join. Still worth as a **secondary** classify-CPU win after L1–L3. |
+| RFC-027 lineage O(Δ) classify | **Research-blocked** on a sublinear **deletion-delta** source; without it, delete discovery stays O(N). Do not remove `OrderedTableCursor` on hope. |
+| Cross-table parallel publish | Separate design; single recovery sidecar / one CAS today. |
+| `optimize` `__manifest` | **Operational** lever, high practical value, not a merge-design fix. |
+| Wait only for Lance #7263 native branch merge | Correct end state for L6; not a substitute for L1–L3 which need no format change. |
+
+### Recommended sequence
+
+1. **L1** — smallest sealed-adapter change; helps Mutation/Load and merge; assumptions already in RFC-023.
+2. **L3** — deny-list alignment; removes vector build from three-way critical path.
+3. **L2** — adopt publish partition; then optional three-way split.
+4. **L4** — recover cleaned-history fast-forwards onto L1.
+5. **L5** when Lance ships; keep forced-v2 until guards pass.
+6. **L6** when reclaim/GC assumptions are closed (RFC-0001).
+
+Instrument each with existing probes: `stage_merge_insert_calls` must fall to 0
+on StrictInsert-after-preflight and on partitioned adopt inserts;
+`stage_fenced_insert_calls` rises; three-way must show zero inline vector index
+builds after L3.
+
 ## What this investigation intentionally deprioritizes
 
 Relative to clarity of the cost model:
 
-- **Efficiency of an alternate join-free general merge** — would need Lance
-  API changes or accepting the indexed MergeInsert route without the exact key
-  filter (RFC-023 currently forbids that).
 - **Cross-table parallel publish** — correctness/recovery envelopes are
   single-sidecar; parallelism is a separate design.
+- **Shipping `use_index(true)` before L5** — would drop fencing.
 
-The right near-term levers for timeouts are therefore: keep merges on
-**`AdoptPureInserts`**, compact `__manifest`/data tables (`optimize`), avoid
-unnecessary three-way divergence, and treat `use_index(false)` × `C` × `N`
-as the primary publish tax when the proof path misses.
+Near-term timeout relief without design work remains: keep merges on
+**`AdoptPureInserts`**, compact `__manifest`/data tables (`optimize`), and
+avoid unnecessary three-way divergence. Design work should start at **L1**.
 
 ## Related checked-in instruments
 
