@@ -9,10 +9,14 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{HeaderValue, Method, Request, StatusCode};
+use futures::TryStreamExt;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::loader::LoadMode;
+use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{
+    BLOB_READ_RANGE_MAX_BYTES, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy,
+};
 use omnigraph_server::api::{
-    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
+    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorCode, ErrorOutput, ExportRequest,
     GraphBatchLoadOutput, IngestRequest, QueryRequest, ReadRequest,
 };
 use omnigraph_server::{AppState, build_app};
@@ -22,6 +26,695 @@ use tower::ServiceExt;
 
 mod support;
 use support::*;
+
+const BLOB_HTTP_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+}
+
+edge Attachment: Document -> Document {
+    payload: Blob?
+}
+"#;
+
+const BLOB_HTTP_DATA: &str = r#"{"type":"Document","data":{"title":"readme","content":"base64:SGVsbG8gV29ybGQ="}}
+{"type":"Document","data":{"title":"empty","content":"base64:"}}
+{"type":"Document","data":{"title":"null"}}
+{"type":"Document","data":{"title":"peer"}}
+{"edge":"Attachment","from":"readme","to":"peer","data":{"id":"attachment-1","payload":"base64:RWRnZQ=="}}"#;
+
+async fn app_for_blob_http_data(data: &str) -> (tempfile::TempDir, axum::Router) {
+    let temp = init_graph_with_schema_and_data(BLOB_HTTP_SCHEMA, data).await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    (temp, build_app(state))
+}
+
+fn blob_uri(entity: &str, type_name: &str, id: &str, property: &str, target: &str) -> String {
+    g(&format!(
+        "/blob?entity={entity}&type={type_name}&id={id}&property={property}{target}"
+    ))
+}
+
+fn repeated_zero_blob_input(length: usize) -> String {
+    let full_triples = length / 3;
+    let tail = match length % 3 {
+        0 => "",
+        1 => "AA==",
+        2 => "AAA=",
+        _ => unreachable!(),
+    };
+    format!("base64:{}{tail}", "AAAA".repeat(full_triples))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
+    let (_temp, app) = app_for_blob_http_data(BLOB_HTTP_DATA).await;
+    let uri = blob_uri("node", "Document", "readme", "content", "");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+    assert_eq!(response.headers().get("content-length").unwrap(), "11");
+    assert_eq!(response.headers().get("accept-ranges").unwrap(), "bytes");
+    let etag = response
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(etag.starts_with('"') && etag.ends_with('"'));
+    let snapshot_id = response
+        .headers()
+        .get("omnigraph-snapshot-id")
+        .expect("managed response carries its exact resolved snapshot")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(!snapshot_id.is_empty());
+    assert_eq!(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+        b"Hello World"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::GET)
+                .header("if-match", "\"stale\"")
+                .header("if-none-match", format!("W/{etag}"))
+                .header("range", "bytes=0-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(response.headers().get("etag").unwrap(), etag.as_str());
+    assert_eq!(
+        response.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+    let output: ErrorOutput =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(output.code, Some(ErrorCode::Conflict));
+
+    for (range, expected_range, expected) in [
+        ("bytes=1-4", "bytes 1-4/11", &b"ello"[..]),
+        ("bytes=6-", "bytes 6-10/11", &b"World"[..]),
+        ("bytes=-5", "bytes 6-10/11", &b"World"[..]),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .method(Method::GET)
+                    .header("range", range)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{range}");
+        assert_eq!(
+            response.headers().get("content-range").unwrap(),
+            expected_range
+        );
+        assert_eq!(response.headers().get("etag").unwrap(), etag.as_str());
+        assert_eq!(
+            response.headers().get("omnigraph-snapshot-id").unwrap(),
+            snapshot_id.as_str()
+        );
+        assert_eq!(
+            &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+            expected,
+            "{range}"
+        );
+    }
+
+    // V1 deliberately ignores multipart ranges and returns the full
+    // representation instead of silently inventing multipart framing.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::GET)
+                .header("range", "bytes=0-1,6-10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("content-range").is_none());
+    assert_eq!(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+        b"Hello World"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::GET)
+                .header("if-none-match", format!("\"other\", W/{etag}"))
+                .header("range", "bytes=0-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(response.headers().get("content-length").unwrap(), "11");
+    assert_eq!(response.headers().get("etag").unwrap(), etag.as_str());
+    assert_eq!(
+        response.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+    assert!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let weak_etag = format!("W/{etag}");
+    for (if_range, expected_status, expected) in [
+        (etag.as_str(), StatusCode::PARTIAL_CONTENT, &b"Hello"[..]),
+        (weak_etag.as_str(), StatusCode::OK, &b"Hello World"[..]),
+        ("\"different\"", StatusCode::OK, &b"Hello World"[..]),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .method(Method::GET)
+                    .header("range", "bytes=0-4")
+                    .header("if-range", if_range)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status, "If-Range: {if_range}");
+        assert_eq!(
+            &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+            expected,
+            "If-Range: {if_range}"
+        );
+    }
+
+    // HEAD is an explicit metadata path: it ignores Range and If-Range, but
+    // still honors If-None-Match. In particular, an unsatisfiable range cannot
+    // turn HEAD into 416 and no response carries payload bytes.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::HEAD)
+                .header("range", "bytes=99-")
+                .header("if-range", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-length").unwrap(), "11");
+    assert_eq!(response.headers().get("etag").unwrap(), etag.as_str());
+    assert_eq!(
+        response.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+    assert!(response.headers().get("content-range").is_none());
+    assert!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::HEAD)
+                .header("if-none-match", "*")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(response.headers().get("content-length").unwrap(), "11");
+    assert_eq!(
+        response.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+    assert!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::HEAD)
+                .header("if-match", "W/\"stale\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(response.headers().get("etag").unwrap(), etag.as_str());
+    assert_eq!(
+        response.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+    assert!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
+    let (temp, app) = app_for_blob_http_data(BLOB_HTTP_DATA).await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let snapshot_id = db.resolve_snapshot("main").await.unwrap().to_string();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    drop(db);
+
+    let empty_uri = blob_uri("node", "Document", "empty", "content", "");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&empty_uri)
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-length").unwrap(), "0");
+    assert!(response.headers().get("etag").is_some());
+    assert!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A byte range cannot select any representation bytes from a valid empty
+    // Blob. This is 416, not the engine's valid half-open descriptor range
+    // 0..0 (which HTTP's inclusive Range syntax cannot express).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&empty_uri)
+                .method(Method::GET)
+                .header("range", "bytes=0-0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        response.headers().get("content-range").unwrap(),
+        "bytes */0"
+    );
+    assert_eq!(response.headers().get("accept-ranges").unwrap(), "bytes");
+    assert!(response.headers().get("etag").is_some());
+    assert!(response.headers().get("omnigraph-snapshot-id").is_some());
+    let error: ErrorOutput =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        error.code,
+        Some(omnigraph_server::api::ErrorCode::BadRequest)
+    );
+    let range = error
+        .blob_range
+        .expect("HTTP 416 carries the normalized half-open range");
+    assert_eq!((range.start, range.end, range.length), (0, 1, 0));
+
+    for (id, expected) in [
+        ("null", StatusCode::NOT_FOUND),
+        ("missing", StatusCode::NOT_FOUND),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(blob_uri("node", "Document", id, "content", ""))
+                    .method(Method::GET)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "id={id}");
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(blob_uri("node", "Document", "readme", "title", ""))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(blob_uri(
+                    "edge",
+                    "Attachment",
+                    "attachment-1",
+                    "payload",
+                    "",
+                ))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+        b"Edge"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(blob_uri(
+                    "node",
+                    "Document",
+                    "readme",
+                    "content",
+                    &format!("&snapshot={snapshot_id}"),
+                ))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(blob_uri(
+                    "node",
+                    "Document",
+                    "readme",
+                    "content",
+                    "&branch=feature",
+                ))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("omnigraph-snapshot-id").is_some());
+    assert_eq!(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+        b"Hello World"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(blob_uri(
+                    "node",
+                    "Document",
+                    "readme",
+                    "content",
+                    &format!("&branch=main&snapshot={snapshot_id}"),
+                ))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let malformed_selectors = [
+        (
+            "missing property",
+            g("/blob?entity=node&type=Document&id=readme"),
+        ),
+        (
+            "invalid entity kind",
+            g("/blob?entity=dataset&type=Document&id=readme&property=content"),
+        ),
+    ];
+    for method in [Method::GET, Method::HEAD] {
+        for (case, uri) in &malformed_selectors {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .method(method.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{method} {case}"
+            );
+            assert_eq!(
+                response.headers().get("content-type").unwrap(),
+                "application/json",
+                "{method} {case}"
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            if method == Method::HEAD {
+                assert!(body.is_empty(), "HEAD {case}");
+                continue;
+            }
+            let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                output.code,
+                Some(omnigraph_server::api::ErrorCode::BadRequest),
+                "{case}"
+            );
+            assert!(
+                output
+                    .error
+                    .starts_with("invalid Blob selector query parameters:"),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_external_get_and_head_redirect_without_target_io() {
+    let temp = tempfile::tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    fs::create_dir_all(&graph).unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_path = external_dir.path().join("external.bin");
+    fs::write(&external_path, b"must not be read by the Blob route").unwrap();
+    let external_uri = format!("file://{}", external_path.display());
+    let canonical_external_uri = format!(
+        "file://{}",
+        fs::canonicalize(&external_path).unwrap().display()
+    );
+    let external_base = format!("file://{}/", external_dir.path().display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(external_base, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
+    let db = Omnigraph::init(graph.to_str().unwrap(), BLOB_HTTP_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
+    load_jsonl(
+        &db,
+        &serde_json::json!({
+            "type": "Document",
+            "data": {"title": "external", "content": external_uri},
+        })
+        .to_string(),
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    fs::remove_file(&external_path).unwrap();
+
+    let app = build_app(AppState::new(graph.to_string_lossy().to_string(), db));
+    let uri = blob_uri("node", "Document", "external", "content", "");
+    for method in [Method::GET, Method::HEAD] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .method(method.clone())
+                    .header("range", "bytes=1-2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND, "{method}");
+        assert_eq!(
+            response.headers().get("location").unwrap(),
+            canonical_external_uri.as_str()
+        );
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        assert!(response.headers().get("omnigraph-snapshot-id").is_some());
+        assert!(response.headers().get("etag").is_none());
+        if let Some(content_length) = response.headers().get("content-length") {
+            assert_eq!(
+                content_length, "0",
+                "a redirect may frame its empty response body but never assert the external object's length"
+            );
+        }
+        assert!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_get_streams_large_managed_values_in_bounded_chunks() {
+    let payload_len = usize::try_from(BLOB_READ_RANGE_MAX_BYTES + 1).unwrap();
+    let data = serde_json::json!({
+        "type": "Document",
+        "data": {
+            "title": "large",
+            "content": repeated_zero_blob_input(payload_len),
+        },
+    })
+    .to_string();
+    let (_temp, app) = app_for_blob_http_data(&data).await;
+    let uri = blob_uri("node", "Document", "large", "content", "");
+    let head = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::HEAD)
+                .header("range", "bytes=0-0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(
+        head.headers().get("content-length").unwrap(),
+        payload_len.to_string().as_str()
+    );
+    assert!(
+        to_bytes(head.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-length").unwrap(),
+        payload_len.to_string().as_str()
+    );
+
+    let mut body = response.into_body().into_data_stream();
+    let mut chunks = 0_u64;
+    let mut bytes = 0_usize;
+    while let Some(chunk) = body.try_next().await.unwrap() {
+        chunks += 1;
+        bytes += chunk.len();
+        assert!(
+            chunk.len() <= usize::try_from(BLOB_READ_RANGE_MAX_BYTES).unwrap(),
+            "one HTTP payload chunk exceeded the engine's 4 MiB read bound"
+        );
+        assert!(chunk.iter().all(|byte| *byte == 0));
+    }
+    assert_eq!(bytes, payload_len);
+    assert!(
+        chunks >= 2,
+        "the fixture must cross at least one chunk boundary"
+    );
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn export_route_returns_jsonl_for_branch_snapshot() {

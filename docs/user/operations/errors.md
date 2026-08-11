@@ -68,8 +68,9 @@
   Embedded `BlobReader::read_range` also returns this variant with resource
   exactly `Blob read range bytes` when an otherwise-valid half-open range is
   wider than `BLOB_READ_RANGE_MAX_BYTES` (4 MiB). The check happens before
-  payload I/O. Phase 1 has no HTTP Blob route; 413 is the reserved mapping for
-  a later delivery surface, not a currently reachable endpoint.
+  payload I/O. HTTP Blob delivery splits a full or single-range representation
+  into consecutive bounded engine reads, so an HTTP range wider than 4 MiB is
+  served under backpressure rather than mapped to 413.
   The full set of `resource_limit.resource` names a client can receive is:
   `strict_input_arrow_bytes` (a strict load's projected Arrow allocation
   exceeded 32 MiB — this preflight applies to **every** load mode, Overwrite
@@ -120,13 +121,13 @@
   Embedded callers match this variant rather than interpreting malformed state
   as null, absence, or plausible bytes or accepting a weaker validator. The
   server's exhaustive conversion maps it through the existing 5xx integrity
-  class without exposing substrate display
-  strings, but Phase 1 exposes no HTTP Blob route that can produce it.
+  class; the Blob delivery route returns a generic pre-header 500 and logs only
+  a non-sensitive error class, never substrate paths or persisted identities.
 - `BlobRangeNotSatisfiable { start, end, length }` — an embedded managed-Blob
   range violates `start <= end <= length`. Half-open empty ranges are valid at
   every in-bounds position, including `length..length`. The server's exhaustive
-  conversion maps it to 416, but Phase 1 exposes no HTTP Blob route that can
-  produce it.
+  conversion and the HTTP Blob delivery range parser map it to 416 with
+  structured `blob_range { start, end, length }` details.
 - `Policy(String)` — a Cedar policy denied the action for the resolved actor.
   HTTP returns **403**.
 - `AlreadyInitialized { uri }` — `init` targeted a root that already holds a

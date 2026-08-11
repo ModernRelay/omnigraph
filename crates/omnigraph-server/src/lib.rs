@@ -1,4 +1,5 @@
 pub mod api;
+mod blob_transport;
 mod export_transport;
 mod handlers;
 mod settings;
@@ -25,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use api::{
-    BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
+    BlobReadQuery, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
     GraphBatchLoadQuery, GraphInfo, GraphListResponse, HealthOutput, IngestOutput, IngestRequest,
@@ -36,9 +37,10 @@ use api::{
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
-use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -93,6 +95,8 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_health,
         handlers::server_graphs_list,
         handlers::server_snapshot,
+        handlers::server_blob_get,
+        handlers::server_blob_head,
         // deprecated; the #[deprecated] attribute on the handler
         // surfaces as `deprecated: true` on the OpenAPI operation.
         #[allow(deprecated)] handlers::server_read,
@@ -118,6 +122,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_commit_list,
         handlers::server_commit_show,
     ),
+    components(schemas(api::BlobEntityKind)),
     modifiers(&SecurityAddon),
 )]
 pub struct ApiDoc;
@@ -296,6 +301,7 @@ pub struct ApiError {
     read_set_conflict: Option<Box<api::ReadSetConflictOutput>>,
     key_conflict: Option<Box<api::KeyConflictOutput>>,
     resource_limit: Option<Box<api::ResourceLimitOutput>>,
+    blob_range: Option<Box<api::BlobRangeOutput>>,
     external_blob_source: Option<Box<api::ExternalBlobSourceOutput>>,
     recovery_required: Option<Box<api::RecoveryRequiredOutput>>,
     precondition_failure: Option<Box<api::PreconditionFailureOutput>>,
@@ -635,6 +641,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -651,6 +658,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -667,6 +675,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -683,6 +692,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -703,6 +713,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -719,6 +730,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -735,22 +747,49 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
         }
     }
 
-    fn range_not_satisfiable(message: impl Into<String>) -> Self {
+    pub(crate) fn range_not_satisfiable(start: u64, end: u64, length: u64) -> Self {
         Self {
             status: StatusCode::RANGE_NOT_SATISFIABLE,
             code: Some(ErrorCode::BadRequest),
+            // Keep the pre-existing `OmniError` display spelling stable while
+            // adding the structured wire fields below.
+            message: format!(
+                "blob range [{start}, {end}) is not satisfiable for a value of length {length}"
+            ),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            blob_range: Some(Box::new(api::BlobRangeOutput { start, end, length })),
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
+    /// HTTP 412 for a Blob representation validator mismatch. This is distinct
+    /// from the graph-commit write precondition below: it retains the existing
+    /// closed [`ErrorCode::Conflict`] signal and has no write-precondition
+    /// details because no mutation was attempted.
+    pub(crate) fn blob_precondition_failed(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_FAILED,
+            code: Some(ErrorCode::Conflict),
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -767,6 +806,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -788,6 +828,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: Some(Box::new(api::ExternalBlobSourceOutput { uri, reason })),
             recovery_required: None,
             precondition_failure: None,
@@ -808,6 +849,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -835,6 +877,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -851,6 +894,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -867,6 +911,7 @@ impl ApiError {
             read_set_conflict: Some(Box::new(details)),
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -883,6 +928,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: Some(Box::new(details)),
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -899,6 +945,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: Some(Box::new(details)),
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
@@ -918,6 +965,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: Some(Box::new(api::RecoveryRequiredOutput { operation_id })),
             precondition_failure: None,
@@ -938,6 +986,7 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: Some(Box::new(details)),
@@ -1027,8 +1076,8 @@ impl ApiError {
             OmniError::ExternalBlobSource { uri, reason } => {
                 Self::external_blob_source(uri, reason)
             }
-            err @ OmniError::BlobRangeNotSatisfiable { .. } => {
-                Self::range_not_satisfiable(err.to_string())
+            OmniError::BlobRangeNotSatisfiable { start, end, length } => {
+                Self::range_not_satisfiable(start, end, length)
             }
             err @ OmniError::BlobIntegrity { .. } => Self::internal(err.to_string()),
             OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
@@ -1102,6 +1151,7 @@ impl IntoResponse for ApiError {
                 read_set_conflict: self.read_set_conflict.map(|d| *d),
                 key_conflict: self.key_conflict.map(|d| *d),
                 resource_limit: self.resource_limit.map(|d| *d),
+                blob_range: self.blob_range.map(|d| *d),
                 external_blob_source: self.external_blob_source.map(|d| *d),
                 recovery_required: self.recovery_required.map(|d| *d),
                 precondition_failure: self.precondition_failure.map(|d| *d),
@@ -1196,6 +1246,12 @@ mod api_error_tests {
             .unwrap();
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.code, Some(ErrorCode::BadRequest));
+        assert_eq!(
+            error.error,
+            "blob range [4, 9) is not satisfiable for a value of length 8"
+        );
+        let range = error.blob_range.expect("structured Blob range");
+        assert_eq!((range.start, range.end, range.length), (4, 9, 8));
 
         let response = ApiError::from_omni(OmniError::BlobIntegrity {
             reason: "malformed descriptor".to_string(),
@@ -1405,6 +1461,10 @@ pub fn build_app(state: AppState) -> Router {
     //      `{graph_id}` in the URI path).
     let per_graph_protected = Router::new()
         .route("/snapshot", get(server_snapshot))
+        // Register HEAD explicitly. Axum's GET fallback would invoke the GET
+        // handler and could begin payload work before stripping the body; the
+        // dedicated handler makes the zero-payload-read contract structural.
+        .route("/blob", get(server_blob_get).head(server_blob_head))
         .route("/export", post(server_export))
         // /read and /change are kept indefinitely for back-compat;
         // their handlers carry #[deprecated] so the OpenAPI operation is

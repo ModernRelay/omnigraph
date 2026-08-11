@@ -371,6 +371,35 @@ pub struct QueryRequest {
     pub snapshot: Option<String>,
 }
 
+/// Logical graph entity selected by the Blob delivery surface.
+///
+/// This is intentionally graph vocabulary. The wire contract never exposes a
+/// Lance dataset, table key, stable row id, or per-table lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BlobEntityKind {
+    Node,
+    Edge,
+}
+
+/// Query parameters shared by `GET` and `HEAD /graphs/{graph_id}/blob`.
+#[derive(Debug, Clone, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct BlobReadQuery {
+    /// Select a logical node or edge cell.
+    pub entity: BlobEntityKind,
+    /// Accepted-schema node or edge type name.
+    pub r#type: String,
+    /// Logical entity id within the selected type.
+    pub id: String,
+    /// Accepted-schema Blob property name.
+    pub property: String,
+    /// Branch to read. Mutually exclusive with `snapshot`; defaults to `main`.
+    pub branch: Option<String>,
+    /// Immutable graph snapshot id. Mutually exclusive with `branch`.
+    pub snapshot: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeRequest {
     /// GQ mutation source containing `insert`, `update`, or `delete` statements.
@@ -700,6 +729,17 @@ pub struct ResourceLimitOutput {
     pub actual: u64,
 }
 
+/// Normalized half-open range details for an unsatisfiable managed Blob read.
+///
+/// HTTP also returns `Content-Range: bytes */N`; these fields let SDKs inspect
+/// the failure without parsing either that header or the human-readable text.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BlobRangeOutput {
+    pub start: u64,
+    pub end: u64,
+    pub length: u64,
+}
+
 /// Structured details for an allowed external Blob source that could not be
 /// probed or read. The top-level `code` remains optional so this additive
 /// detail can roll out without extending the closed [`ErrorCode`] enum.
@@ -753,6 +793,10 @@ pub struct ErrorOutput {
     /// rejected attempt has no durable sidecar and no table effect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limit: Option<ResourceLimitOutput>,
+    /// Set with HTTP 416 for a valid but unsatisfiable managed Blob byte range.
+    /// `start..end` is half-open and `length` is the selected Blob length.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob_range: Option<BlobRangeOutput>,
     /// Set with HTTP 424 when an external Blob URI passed admission policy but
     /// its source could not be probed or read. This optional detail is the
     /// rolling-safe machine-readable discriminator; `code` is omitted because
