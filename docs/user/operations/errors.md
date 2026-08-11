@@ -11,6 +11,25 @@
   - `ManifestConflictDetails::ReadSetChanged { member, expected, actual }` — an RFC-022 prepared write's branch/head/table authority changed before physical effects. HTTP returns **409** with `read_set_conflict`. A retry must start from preparation; strict writes leave that choice to the caller.
   - `ManifestConflictDetails::RowLevelCasContention` — Lance row-level CAS rejected the publish because a concurrent writer landed the same `object_id`. Retried internally by the publisher; only surfaces if the retry budget exhausts.
   - **D₂ parse-time rejection**: a single mutation query that mixes inserts/updates with deletes errors out *before any I/O* with kind `BadRequest`. Message: `mutation '<name>' on the same query mixes inserts/updates and deletes; split into separate mutations: (1) inserts and updates, then (2) deletes`. See [query-language.md](../queries/index.md) for the rule.
+  - **Blob property-lifetime refusal**: `read_blob_at` returns `BadRequest` when
+    the selected field's persisted `omnigraph.stable_property_id` belongs to a
+    different property lifetime, or when an older pre-0.10 v6 snapshot has no
+    persisted property-lifetime witness. OmniGraph never substitutes Lance field
+    ID, field position, or same-name spelling as graph identity.
+    Schema-preserving Append, Merge, and mutation writes retain an upgraded
+    table's unmarked schema; full-table Overwrite adopts the 0.10 catalog marker
+    on its replacement fields. Every older snapshot of an unmarked field is
+    refused even when no rename occurred; only its exact current physical entry
+    is admitted.
+  - **Blob native-branch-incarnation refusal**: `read_blob_at` returns
+    `BadRequest` when an explicit snapshot's reopened named manifest no longer
+    carries its resolved graph commit, for an older snapshot of a
+    named-branch-owned table, or for a live branch-owned read whose captured
+    effective head changed before the post-open proof. V6 did not persist the
+    native `BranchIdentifier`; a manifest e-tag is not a sufficient substitute.
+    Genuine main/inherited-main table history remains eligible after the graph
+    snapshot authenticates; independent property/schema checks may still refuse
+    the read.
 - `MergeConflicts(Vec<MergeConflict>)`
 - `KeyConflict { table_key, key }` — a strict insert found an existing `id` in
   its pinned table image or lost an effect-free concurrent same-key race. HTTP
@@ -46,14 +65,20 @@
   budget did not become available within 250 ms. Those export limits are
   transient; finish or disconnect the earlier response and retry rather than
   changing graph data.
+  Embedded `BlobReader::read_range` also returns this variant with resource
+  exactly `Blob read range bytes` when an otherwise-valid half-open range is
+  wider than `BLOB_READ_RANGE_MAX_BYTES` (4 MiB). The check happens before
+  payload I/O. Phase 1 has no HTTP Blob route; 413 is the reserved mapping for
+  a later delivery surface, not a currently reachable endpoint.
   The full set of `resource_limit.resource` names a client can receive is:
   `strict_input_arrow_bytes` (a strict load's projected Arrow allocation
   exceeded 32 MiB — this preflight applies to **every** load mode, Overwrite
   included), `graph_batch_request_bytes`, `graph_batch_line_bytes`,
   `graph_batch_json_structural_slots`, `stream_export_slots`,
-  `stream_export_transport_bytes`, `external Blob URI bytes`, `external Blob
-  reference cells`, `external Blob URI metadata bytes`, `external Blob object
-  bytes`, `decoded blob input bytes`, `materialized blob payload bytes`,
+  `stream_export_transport_bytes`, `Blob read range bytes`, `external Blob URI
+  bytes`, `external Blob reference cells`, `external Blob URI metadata bytes`,
+  `external Blob object bytes`, `decoded blob input bytes`, `materialized blob
+  payload bytes`,
   `materialized external blob payload bytes`, `branch-merge delete filter
   bytes`, `branch-merge retained delete plan bytes`, `branch-merge fenced row
   bytes`, `branch-merge recovery transaction chain`, and `branch-merge retained
@@ -85,6 +110,23 @@
   begun—that is what this error reports—but the operation fails before recovery
   is armed, a target HEAD/ref moves, or graph-visible state changes. Scalar-only
   input preparation may already have created reclaimable temporary staging.
+- `BlobIntegrity { reason }` — persisted table or Blob state contradicts the
+  exact selected identity or logical Blob contract. Examples include a
+  malformed Blob-v2 descriptor, a malformed
+  `omnigraph.stable_property_id` marker, the wrong table incarnation/version or
+  manifest e-tag, a missing or empty immutable-manifest `transaction_file`
+  identity required for a strong ETag, and a physical non-Blob field behind a
+  catalog Blob property.
+  Embedded callers match this variant rather than interpreting malformed state
+  as null, absence, or plausible bytes or accepting a weaker validator. The
+  server's exhaustive conversion maps it through the existing 5xx integrity
+  class without exposing substrate display
+  strings, but Phase 1 exposes no HTTP Blob route that can produce it.
+- `BlobRangeNotSatisfiable { start, end, length }` — an embedded managed-Blob
+  range violates `start <= end <= length`. Half-open empty ranges are valid at
+  every in-bounds position, including `length..length`. The server's exhaustive
+  conversion maps it to 416, but Phase 1 exposes no HTTP Blob route that can
+  produce it.
 - `Policy(String)` — a Cedar policy denied the action for the resolved actor.
   HTTP returns **403**.
 - `AlreadyInitialized { uri }` — `init` targeted a root that already holds a

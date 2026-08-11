@@ -103,6 +103,99 @@ descriptor without policy approval or source I/O. Existing stored external
 references remain readable and exportable when new ingress is denied;
 OmniGraph never deletes their target objects.
 
+## Embedded Blob reads
+
+Blob delivery is deliberately separate from `.gq` projection. Embedded Rust
+callers use `Omnigraph::read_blob_at(ReadTarget, BlobCell)` for either a node or
+an edge cell. The selector names the logical entity kind, current accepted type
+and property aliases, and exact logical entity `id`; caller text is matched
+through a typed exact-ID expression, never flattened into SQL. The engine
+resolves one branch or snapshot, the handle's current accepted catalog, and one
+exact table version for the complete call.
+
+For the fail-closed compatibility checks below, the engine may compare current
+branch authority, but only as an admission witness. Row, descriptor, ETag, and
+payload data remain on the immutable selected target and never retarget to live
+branch data.
+
+The result is one of two non-null states:
+
+- managed content exposes its logical length, a strong engine-owned ETag, and a
+  `Send + Sync` `BlobReader`; or
+- external content exposes the stored absolute URI, offset, and optional length
+  without opening, probing, signing, or reading that caller-owned object.
+
+A null cell is typed `NotFound`, not a zero-length payload. A valid empty managed
+Blob has length zero and `read_range(0..0)` succeeds with empty bytes. Managed
+reader ranges are half-open and valid exactly when
+`start <= end <= logical_length`; an empty `logical_length..logical_length` is
+valid. Reversed or out-of-bounds ranges return
+`BlobRangeNotSatisfiable { start, end, length }`. One read returns at most
+`BLOB_READ_RANGE_MAX_BYTES` (4 MiB). A wider in-bounds request returns typed
+`ResourceLimitExceeded` for `Blob read range bytes` before payload I/O, so larger
+values are consumed through consecutive bounded ranges. Malformed persisted
+descriptors return `BlobIntegrity { reason }`, never null or plausible bytes.
+
+Managed ETags are quoted lowercase hex over a stable identity tuple at the exact
+table version plus the exact non-empty `transaction_file` identity stored in
+that immutable opened Lance manifest. They are deliberately
+table-version-granular, so an unrelated write to the same table can change a
+token even when this cell's bytes do not. Exact numeric version plus immutable
+manifest identity prevents branch deletion/recreation from reusing a token
+without widening it to graph-snapshot granularity. A missing or empty witness
+is `BlobIntegrity { reason }`, never a weaker token. External references have no
+ETag because their current bytes are not owned by the graph.
+
+After a pure type rename, the current type alias can still address pre-rename
+table history because stable table/incarnation identity crosses the rename. The
+retired type alias is not accepted. This table-identity binding remains subject
+to the independent physical-name, property-lifetime, and branch-incarnation
+checks below. Property renames are deliberately narrower in Phase 1: a
+pre-rename table version does not expose the current property
+spelling, while the retired spelling is absent from the current catalog. Such a
+historical property read returns `BadRequest`; the engine does not infer by
+column position. Historical property-field crossing is deferred.
+
+Physical user fields newly initialized, added, or schema-rebuilt by 0.10 persist
+their authoritative graph property lifetime as `omnigraph.stable_property_id`
+metadata. Blob reads compare that marker with the current accepted catalog. A
+soft-dropped property re-added under the same name has a different stable ID,
+so its old snapshot is refused with `BadRequest`; Lance field IDs and positions
+are never identity. A
+malformed marker is `BlobIntegrity`.
+
+Existing pre-0.10 v6 fields lack the marker. Schema-preserving Append, Merge,
+and mutation writes retain that unmarked schema. Full-table Overwrite instead
+carries the 0.10 catalog schema and adopts the marker on its replacement fields;
+it does not rewrite older versions. An unmarked field remains readable when the
+selected snapshot points at the exact current physical table entry. An older
+snapshot without the marker fails `BadRequest` with `no persisted
+property-lifetime witness`, because OmniGraph cannot prove that the same
+spelling did not cross a drop/re-add lifetime. This refusal applies even when no
+rename occurred. This is additive field metadata, not a manifest-format bump.
+
+Named-branch reads have a separate incarnation fence. An explicit snapshot's
+reopened manifest must still carry the resolved graph commit, so deleting and
+recreating a named graph ref cannot retarget even an inherited-main table. V6
+entries do not persist Lance's native `BranchIdentifier`, and a manifest e-tag
+is not a sufficient substitute. After opening a table stored on a named native
+branch, OmniGraph cold-rechecks that the selected graph ref still has the
+captured effective head. A raced live read and an older branch-owned snapshot
+therefore return `BadRequest` with `no persisted native-branch incarnation
+witness` rather than retargeting. Genuine main/inherited-main table history
+remains eligible after the graph-snapshot proof; the independent property/schema
+checks still apply.
+
+The returned reader stays on its captured version if a branch advances.
+Deletion of that branch and physical tree reclamation are destructive
+boundaries, like `cleanup`: Phase 1 adds no durable or cross-process live-reader
+lease. A reader never redirects to newer bytes, but an uncached later range may
+fail loudly after reclamation. Quiesce readers before deleting their branch or
+running version GC when they must finish. HTTP Blob delivery and CLI
+`blob get`/`blob stat` are later phases and are not exposed by this engine-only
+slice. The pre-1.0 Lance-returning `Omnigraph::read_blob` method has been removed;
+there is no compatibility wrapper that leaks `BlobFile`.
+
 For a keyed node, `id` is derived from the complete typed `@key` tuple. A
 single-column key keeps its canonical scalar spelling. A composite key is an
 unambiguous JSON array of those canonical scalar strings, ordered by stable

@@ -6,10 +6,25 @@
 //! a managed value, and malformed persisted descriptors fail before a caller
 //! can silently reinterpret them.
 
+use std::fmt;
+use std::fmt::Write as _;
+use std::ops::Range;
+use std::sync::Arc;
+
 use arrow_array::{Array, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array};
 use arrow_schema::DataType;
+use bytes::Bytes;
+use datafusion::prelude::{col, lit};
+use futures::TryStreamExt;
+use lance::Dataset;
+use lance::dataset::BlobFile;
+use lance::datatypes::BlobHandling;
+use lance_core::datatypes::BlobKind;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
+use crate::changes::EntityKind;
+use crate::db::{Omnigraph, ReadTarget, ResolvedTarget};
 use crate::error::{OmniError, Result};
 
 /// Inclusive raw-byte ceiling for one configured or input external Blob URI.
@@ -19,6 +34,131 @@ use crate::error::{OmniError, Result};
 /// operation-wide retained-metadata budget.
 pub const EXTERNAL_BLOB_URI_MAX_BYTES: u64 = 64 * 1024;
 const EXTERNAL_BLOB_URI_BYTES_RESOURCE: &str = "external Blob URI bytes";
+
+/// Maximum managed Blob bytes returned by one [`BlobReader::read_range`] call.
+///
+/// Larger values remain readable through multiple bounded calls. This is a
+/// per-call returned-buffer ceiling, not a Blob-size limit.
+pub const BLOB_READ_RANGE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const BLOB_READ_RANGE_BYTES_RESOURCE: &str = "Blob read range bytes";
+
+/// One logical Blob cell addressed at graph level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobCell {
+    pub entity: EntityKind,
+    pub type_name: String,
+    pub id: String,
+    pub property: String,
+}
+
+/// Strong, quoted entity tag for one managed Blob value in one exact table
+/// version and immutable-manifest transaction-file identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlobEtag(String);
+
+impl BlobEtag {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for BlobEtag {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Descriptor-only external Blob reference. Reading the cell never probes or
+/// dereferences this URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalBlobRef {
+    pub uri: String,
+    pub offset: u64,
+    pub length: Option<u64>,
+}
+
+/// Snapshot-pinned, bounded reader for one managed Blob value.
+///
+/// The Lance dataset and Blob handle remain private so callers cannot recover
+/// a writable dataset or substrate-specific API from this graph-level facade.
+/// Pinning prevents retargeting; it is not a durable lease, so branch-tree or
+/// version reclamation may make an uncached later range fail loudly.
+#[derive(Clone)]
+pub struct BlobReader {
+    _dataset: Arc<Dataset>,
+    file: Arc<BlobFile>,
+    length: u64,
+}
+
+impl fmt::Debug for BlobReader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlobReader")
+            .field("length", &self.length)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BlobReader {
+    pub fn len(&self) -> u64 {
+        self.length
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// Read one Blob-local half-open byte range without changing reader state.
+    pub async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+        if range.start > range.end || range.end > self.length {
+            return Err(OmniError::BlobRangeNotSatisfiable {
+                start: range.start,
+                end: range.end,
+                length: self.length,
+            });
+        }
+
+        let requested = range.end - range.start;
+        if requested > BLOB_READ_RANGE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                BLOB_READ_RANGE_BYTES_RESOURCE,
+                BLOB_READ_RANGE_MAX_BYTES,
+                requested,
+            ));
+        }
+        if requested == 0 {
+            return Ok(Bytes::new());
+        }
+
+        self.file
+            .read_range(range)
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))
+    }
+}
+
+/// Logical content of one non-null Blob cell.
+#[derive(Debug, Clone)]
+pub enum BlobContent {
+    Managed {
+        length: u64,
+        etag: BlobEtag,
+        reader: BlobReader,
+    },
+    External(ExternalBlobRef),
+}
+
+/// One Blob cell resolved against an immutable graph read target.
+#[derive(Debug, Clone)]
+pub struct BlobRead {
+    pub cell: BlobCell,
+    pub resolved_target: ResolvedTarget,
+    pub content: BlobContent,
+}
 
 /// Bound unavoidable URI parser/builder scratch before any caller copies or
 /// interprets an external reference.
@@ -578,6 +718,7 @@ pub(crate) enum BlobDescriptor {
 /// Construction validates the exact five-child v2 shape once. Per-row
 /// classification then validates child validity and range arithmetic without
 /// repeating schema lookup/downcasts for every row.
+#[derive(Debug)]
 pub(crate) struct BlobDescriptorDecoder<'a> {
     descriptions: &'a StructArray,
     kinds: &'a UInt8Array,
@@ -771,8 +912,483 @@ impl<'a> BlobDescriptorDecoder<'a> {
     }
 }
 
+struct ResolvedBlobCell {
+    table_key: String,
+    stable_table_id: u64,
+    table_incarnation_id: u64,
+    stable_property_id: u64,
+}
+
+impl Omnigraph {
+    /// Resolve and read one Blob cell against a branch or immutable snapshot.
+    ///
+    /// External references are returned descriptor-only, without policy
+    /// evaluation, object-store setup, metadata probes, or payload reads.
+    pub async fn read_blob_at(
+        &self,
+        target: impl Into<ReadTarget>,
+        cell: BlobCell,
+    ) -> Result<BlobRead> {
+        let requested_target = target.into();
+        let (resolved_target, catalog) = self.capture_read_view(requested_target.clone()).await?;
+        let resolved_cell = resolve_blob_cell(&catalog, &cell)?;
+
+        // Resolving an old commit reopens its persisted `(manifest branch,
+        // version)`. A deleted and recreated named branch can reuse both, so
+        // prove that the reopened graph snapshot still contains the requested
+        // commit before trusting any of its table entries. Main snapshots are
+        // checked too; this keeps the rule structural even though main cannot
+        // undergo branch-name ABA.
+        if matches!(requested_target, ReadTarget::Snapshot(_))
+            && resolved_target
+                .snapshot
+                .graph_head(resolved_target.branch.as_deref())
+                != resolved_target.graph_commit_id.as_deref()
+        {
+            return Err(OmniError::manifest(format!(
+                "Blob property '{}.{}' has no persisted native-branch incarnation witness at the selected target",
+                cell.type_name, cell.property
+            )));
+        }
+
+        let entry = resolved_target
+            .snapshot
+            .entry(&resolved_cell.table_key)
+            .ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "{} type '{}' is unavailable at the selected target",
+                    entity_label(cell.entity),
+                    cell.type_name
+                ))
+            })?;
+        if entry.identity.stable_table_id != resolved_cell.stable_table_id
+            || entry.identity.table_incarnation_id != resolved_cell.table_incarnation_id
+        {
+            return Err(OmniError::blob_integrity(format!(
+                "selected table '{}' has identity {}, expected {:016x}:{:016x}",
+                resolved_cell.table_key,
+                entry.identity,
+                resolved_cell.stable_table_id,
+                resolved_cell.table_incarnation_id
+            )));
+        }
+        let expected_table_version = entry.table_version;
+        let stable_table_id = entry.identity.stable_table_id;
+        let table_incarnation_id = entry.identity.table_incarnation_id;
+
+        crate::failpoints::maybe_fail(crate::failpoints::names::BLOB_READ_POST_CAPTURE)?;
+
+        let dataset = Arc::new(if entry.table_branch.is_some() {
+            // Local filesystems provide no manifest e-tag, so the ordinary
+            // live-read cache key cannot distinguish delete/recreate ABA at the
+            // same named branch and numeric table version. Blob reads need a
+            // coherent physical-incarnation witness; bypass the held handle for
+            // named-native-branch tables and prove the graph ref again below.
+            entry.open(self.uri(), None).await?
+        } else {
+            resolved_target
+                .snapshot
+                .open_dataset(&resolved_cell.table_key)
+                .await?
+        });
+        let actual_table_version = dataset.version().version;
+        if actual_table_version != expected_table_version {
+            return Err(OmniError::blob_integrity(format!(
+                "selected table '{}' opened at version {}, expected {}",
+                resolved_cell.table_key, actual_table_version, expected_table_version
+            )));
+        }
+        if entry.table_branch.is_some() {
+            // A named Lance branch can be deleted and recreated at the same
+            // path and numeric version. Neither V6 graph entries nor Lance's
+            // local manifest e-tag persist a branch-incarnation witness strong
+            // enough to distinguish that ABA. Re-proving the effective current
+            // graph head *after* the table open therefore covers both explicit
+            // branch-owned snapshots and a live-branch capture racing
+            // delete/recreate. A concurrent ordinary branch advance may also
+            // make this read fail loudly; it never retargets.
+            // This proof must bypass the handle's warm read coordinator: a
+            // delete/recreate can reuse the same native path and version while
+            // that coordinator still holds the old graph head. Control-plane
+            // opens use the zero-cache Lance session, so this observes the
+            // selected graph ref that exists now. Its effective head is exact
+            // once materialized and inherited on a fresh fork.
+            let live_branch = resolved_target.branch.as_deref().ok_or_else(|| {
+                OmniError::blob_integrity(format!(
+                    "selected named-branch table '{}' has no graph branch identity",
+                    resolved_cell.table_key
+                ))
+            })?;
+            let expected_graph_head = resolved_target.graph_commit_id.as_deref().ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "Blob property '{}.{}' has no persisted native-branch incarnation witness at the selected target",
+                    cell.type_name, cell.property
+                ))
+            })?;
+            let live_coordinator = self.open_coordinator_for_branch(Some(live_branch)).await?;
+            if live_coordinator.effective_graph_head().await?.as_deref()
+                != Some(expected_graph_head)
+            {
+                return Err(OmniError::manifest(format!(
+                    "Blob property '{}.{}' has no persisted native-branch incarnation witness at the selected target",
+                    cell.type_name, cell.property
+                )));
+            }
+        }
+        if let Some(expected_e_tag) = entry.version_metadata.e_tag()
+            && dataset.manifest_location().e_tag.as_deref() != Some(expected_e_tag)
+        {
+            return Err(OmniError::blob_integrity(format!(
+                "selected table '{}' opened a different manifest incarnation at version {}",
+                resolved_cell.table_key, expected_table_version
+            )));
+        }
+
+        let field = dataset.schema().field(&cell.property).ok_or_else(|| {
+            OmniError::manifest(format!(
+                "Blob property '{}.{}' is unavailable at the selected target",
+                cell.type_name, cell.property
+            ))
+        })?;
+        if !field.is_blob() {
+            return Err(OmniError::blob_integrity(format!(
+                "catalog Blob property '{}.{}' is not physically encoded as Blob-v2",
+                cell.type_name, cell.property
+            )));
+        }
+        match field
+            .metadata
+            .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
+        {
+            Some(persisted_id) => {
+                let persisted_id = persisted_id.parse::<u64>().map_err(|error| {
+                    OmniError::blob_integrity(format!(
+                        "Blob property '{}.{}' has invalid persisted stable-property identity: {error}",
+                        cell.type_name, cell.property
+                    ))
+                })?;
+                if persisted_id != resolved_cell.stable_property_id {
+                    return Err(OmniError::manifest(format!(
+                        "Blob property '{}.{}' belongs to a different property lifetime at the selected target",
+                        cell.type_name, cell.property
+                    )));
+                }
+            }
+            None if matches!(requested_target, ReadTarget::Snapshot(_)) => {
+                // Pre-0.10 v6 tables did not persist stable property identity.
+                // A snapshot at the exact current physical table version is
+                // still covered by current-catalog validation.  Older physical
+                // versions cannot prove that an identically-spelled field did
+                // not cross a drop/re-add boundary, so fail closed instead of
+                // inferring identity from Lance field ids or positions.
+                let live_branch = resolved_target.branch.as_deref().unwrap_or("main");
+                let (live_target, live_catalog) = self
+                    .capture_read_view(ReadTarget::branch(live_branch))
+                    .await?;
+                let live_cell = resolve_blob_cell(&live_catalog, &cell)?;
+                let live_entry = live_target
+                    .snapshot
+                    .entry(&live_cell.table_key)
+                    .ok_or_else(|| {
+                        OmniError::manifest(format!(
+                            "{} type '{}' is unavailable at the current branch head",
+                            entity_label(cell.entity),
+                            cell.type_name
+                        ))
+                    })?;
+                if live_cell.stable_table_id != resolved_cell.stable_table_id
+                    || live_cell.table_incarnation_id != resolved_cell.table_incarnation_id
+                    || live_cell.stable_property_id != resolved_cell.stable_property_id
+                    || live_entry.table_version != entry.table_version
+                    || live_entry.table_branch != entry.table_branch
+                    || live_entry.version_metadata != entry.version_metadata
+                {
+                    return Err(OmniError::manifest(format!(
+                        "Blob property '{}.{}' has no persisted property-lifetime witness at the selected target",
+                        cell.type_name, cell.property
+                    )));
+                }
+            }
+            None => {}
+        }
+
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&[cell.property.as_str()])
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        scanner.filter_expr(col("id").eq(lit(cell.id.clone())));
+        scanner.blob_handling(BlobHandling::BlobsDescriptions);
+        scanner.with_row_id();
+        scanner
+            .limit(Some(2), None)
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let stream = scanner
+            .try_into_stream()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let batches = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+
+        let mut selected = None;
+        for batch in &batches {
+            let descriptions = batch
+                .column_by_name(&cell.property)
+                .and_then(|column| column.as_any().downcast_ref::<StructArray>())
+                .ok_or_else(|| {
+                    OmniError::blob_integrity(format!(
+                        "Blob property '{}.{}' did not scan as a Blob-v2 descriptor",
+                        cell.type_name, cell.property
+                    ))
+                })?;
+            let row_ids = batch
+                .column_by_name("_rowid")
+                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    OmniError::blob_integrity(format!(
+                        "Blob lookup for '{}.{}' omitted its stable row id",
+                        cell.type_name, cell.property
+                    ))
+                })?;
+            if descriptions.len() != row_ids.len() {
+                return Err(OmniError::blob_integrity(format!(
+                    "Blob descriptor and stable-row-id cardinalities differ for '{}.{}'",
+                    cell.type_name, cell.property
+                )));
+            }
+            let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
+            for row in 0..batch.num_rows() {
+                if selected.is_some() {
+                    return Err(OmniError::blob_integrity(format!(
+                        "logical id '{}' appears more than once in table '{}'",
+                        cell.id, resolved_cell.table_key
+                    )));
+                }
+                if row_ids.is_null(row) {
+                    return Err(OmniError::blob_integrity(format!(
+                        "Blob lookup for '{}.{}' returned a null stable row id",
+                        cell.type_name, cell.property
+                    )));
+                }
+                selected = Some((row_ids.value(row), decoder.classify(row)?));
+            }
+        }
+
+        let (stable_row_id, descriptor) = selected.ok_or_else(|| {
+            OmniError::manifest_not_found(format!(
+                "no {} '{}' with id '{}' found",
+                entity_label(cell.entity),
+                cell.type_name,
+                cell.id
+            ))
+        })?;
+
+        let content = match descriptor {
+            BlobDescriptor::Null => {
+                return Err(OmniError::manifest_not_found(format!(
+                    "Blob property '{}.{}' is null for id '{}'",
+                    cell.type_name, cell.property, cell.id
+                )));
+            }
+            BlobDescriptor::External {
+                uri,
+                offset,
+                length,
+            } => BlobContent::External(ExternalBlobRef {
+                uri,
+                offset,
+                length,
+            }),
+            BlobDescriptor::Managed { length } => {
+                // Lance's branch identifier is resolved from the *current*
+                // named ref and can change underneath an older pinned Dataset
+                // after branch delete/recreate. The transaction-file identity
+                // is stored in this exact immutable manifest and carries the
+                // UUID of the transaction that produced this table version.
+                let transaction_file = immutable_transaction_witness(
+                    dataset.manifest().transaction_file.as_deref(),
+                    &cell,
+                )?;
+                let mut files = dataset
+                    .take_blobs(&[stable_row_id], &cell.property)
+                    .await
+                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                if files.len() != 1 {
+                    return Err(OmniError::blob_integrity(format!(
+                        "managed Blob lookup returned {} slots instead of one",
+                        files.len()
+                    )));
+                }
+                let file = files.pop().flatten().ok_or_else(|| {
+                    OmniError::blob_integrity(
+                        "a non-null managed Blob descriptor resolved to a null payload slot",
+                    )
+                })?;
+                if file.kind() == BlobKind::External || file.uri().is_some() {
+                    return Err(OmniError::blob_integrity(
+                        "a managed Blob descriptor resolved to an external payload handle",
+                    ));
+                }
+                if file.size() != length {
+                    return Err(OmniError::blob_integrity(format!(
+                        "managed Blob descriptor length {} disagrees with payload length {}",
+                        length,
+                        file.size()
+                    )));
+                }
+                BlobContent::Managed {
+                    length,
+                    etag: blob_etag(
+                        stable_table_id,
+                        table_incarnation_id,
+                        resolved_cell.stable_property_id,
+                        actual_table_version,
+                        stable_row_id,
+                        transaction_file,
+                    ),
+                    reader: BlobReader {
+                        _dataset: Arc::clone(&dataset),
+                        file: Arc::new(file),
+                        length,
+                    },
+                }
+            }
+        };
+
+        Ok(BlobRead {
+            cell,
+            resolved_target,
+            content,
+        })
+    }
+}
+
+fn resolve_blob_cell(
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    cell: &BlobCell,
+) -> Result<ResolvedBlobCell> {
+    let (table_prefix, blob_properties, stable_table_id, table_incarnation_id, property_id) =
+        match cell.entity {
+            EntityKind::Node => {
+                let node = catalog.node_types.get(&cell.type_name).ok_or_else(|| {
+                    OmniError::manifest(format!("unknown node type '{}'", cell.type_name))
+                })?;
+                (
+                    "node",
+                    &node.blob_properties,
+                    catalog.node_type_id(&cell.type_name),
+                    catalog.node_table_incarnation_id(&cell.type_name),
+                    catalog.node_property_id(&cell.type_name, &cell.property),
+                )
+            }
+            EntityKind::Edge => {
+                let edge = catalog.edge_types.get(&cell.type_name).ok_or_else(|| {
+                    OmniError::manifest(format!("unknown edge type '{}'", cell.type_name))
+                })?;
+                (
+                    "edge",
+                    &edge.blob_properties,
+                    catalog.edge_type_id(&cell.type_name),
+                    catalog.edge_table_incarnation_id(&cell.type_name),
+                    catalog.edge_property_id(&cell.type_name, &cell.property),
+                )
+            }
+        };
+
+    if !blob_properties.contains(&cell.property) {
+        return Err(OmniError::manifest(format!(
+            "property '{}.{}' is not a Blob",
+            cell.type_name, cell.property
+        )));
+    }
+    let stable_table_id = stable_table_id.ok_or_else(|| {
+        OmniError::blob_integrity(format!(
+            "{} type '{}' lacks a stable type id",
+            entity_label(cell.entity),
+            cell.type_name
+        ))
+    })?;
+    let table_incarnation_id = table_incarnation_id.ok_or_else(|| {
+        OmniError::blob_integrity(format!(
+            "{} type '{}' lacks a table incarnation id",
+            entity_label(cell.entity),
+            cell.type_name
+        ))
+    })?;
+    let property_id = property_id.ok_or_else(|| {
+        OmniError::blob_integrity(format!(
+            "Blob property '{}.{}' lacks a stable property id",
+            cell.type_name, cell.property
+        ))
+    })?;
+
+    Ok(ResolvedBlobCell {
+        table_key: format!("{table_prefix}:{}", cell.type_name),
+        stable_table_id: stable_table_id.get(),
+        table_incarnation_id: table_incarnation_id.get(),
+        stable_property_id: property_id.get(),
+    })
+}
+
+fn entity_label(kind: EntityKind) -> &'static str {
+    match kind {
+        EntityKind::Node => "node",
+        EntityKind::Edge => "edge",
+    }
+}
+
+fn immutable_transaction_witness<'a>(
+    transaction_file: Option<&'a str>,
+    cell: &BlobCell,
+) -> Result<&'a str> {
+    transaction_file
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            OmniError::blob_integrity(format!(
+                "managed Blob '{}.{}' has no immutable Lance transaction witness",
+                cell.type_name, cell.property
+            ))
+        })
+}
+
+fn blob_etag(
+    stable_table_id: u64,
+    table_incarnation_id: u64,
+    stable_property_id: u64,
+    table_version: u64,
+    stable_row_id: u64,
+    transaction_file: &str,
+) -> BlobEtag {
+    let mut digest = Sha256::new();
+    digest.update(b"omnigraph/blob-etag/v1\0");
+    for value in [
+        stable_table_id,
+        table_incarnation_id,
+        stable_property_id,
+        table_version,
+        stable_row_id,
+    ] {
+        digest.update(value.to_be_bytes());
+    }
+    digest.update(
+        u64::try_from(transaction_file.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    digest.update(transaction_file.as_bytes());
+    let digest = digest.finalize();
+    let mut value = String::with_capacity(34);
+    value.push('"');
+    for byte in digest.iter().take(16) {
+        write!(&mut value, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    value.push('"');
+    BlobEtag(value)
+}
+
 fn malformed_descriptor(message: impl Into<String>) -> OmniError {
-    OmniError::Lance(format!("malformed Blob-v2 descriptor: {}", message.into()))
+    OmniError::blob_integrity(format!("malformed Blob-v2 descriptor: {}", message.into()))
 }
 
 #[cfg(test)]
@@ -783,6 +1399,49 @@ mod tests {
     use arrow_schema::{Field, Fields};
 
     use super::*;
+
+    fn assert_blob_integrity(error: OmniError, expected: &str) {
+        match error {
+            OmniError::BlobIntegrity { reason } => assert!(
+                reason.contains(expected),
+                "BlobIntegrity reason '{reason}' must contain '{expected}'"
+            ),
+            other => panic!("expected BlobIntegrity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blob_reader_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<BlobReader>();
+    }
+
+    #[test]
+    fn blob_etag_v1_uses_big_endian_identity_components() {
+        let etag = blob_etag(1, 2, 3, 4, 5, "6-00000000000000000000000000000007.txn");
+        assert_eq!(etag.as_str(), "\"f0e89bc86388accc9a7877df658a1f1c\"");
+        assert_eq!(etag.to_string(), etag.clone().into_string());
+    }
+
+    #[test]
+    fn managed_blob_requires_an_immutable_transaction_witness() {
+        let cell = BlobCell {
+            entity: EntityKind::Node,
+            type_name: "Document".to_string(),
+            id: "doc-1".to_string(),
+            property: "content".to_string(),
+        };
+        for missing in [None, Some("")] {
+            assert_blob_integrity(
+                immutable_transaction_witness(missing, &cell).unwrap_err(),
+                "no immutable Lance transaction witness",
+            );
+        }
+        assert_eq!(
+            immutable_transaction_witness(Some("opaque-version-witness"), &cell).unwrap(),
+            "opaque-version-witness"
+        );
+    }
 
     fn assert_external_uri_byte_limit(role: UriRole) {
         let prefix = "s3://bucket/base/";
@@ -1057,7 +1716,10 @@ mod tests {
             ],
             None,
         );
-        assert!(BlobDescriptorDecoder::try_new(&child_null).is_err());
+        assert_blob_integrity(
+            BlobDescriptorDecoder::try_new(&child_null).unwrap_err(),
+            "expected exact children",
+        );
     }
 
     #[test]
@@ -1145,7 +1807,10 @@ mod tests {
             ],
             None,
         );
-        assert!(BlobDescriptorDecoder::try_new(&wrong_type).is_err());
+        assert_blob_integrity(
+            BlobDescriptorDecoder::try_new(&wrong_type).unwrap_err(),
+            "expected exact children",
+        );
 
         let missing_child = StructArray::new(
             Fields::from(fields().iter().take(4).cloned().collect::<Vec<_>>()),
@@ -1157,46 +1822,28 @@ mod tests {
             ],
             None,
         );
-        assert!(BlobDescriptorDecoder::try_new(&missing_child).is_err());
+        assert_blob_integrity(
+            BlobDescriptorDecoder::try_new(&missing_child).unwrap_err(),
+            "expected exact children",
+        );
 
         let unknown = descriptor(Some(4), Some(0), Some(0), Some(0), Some(""));
         let decoder = BlobDescriptorDecoder::try_new(&unknown).unwrap();
-        assert!(
-            decoder
-                .classify(0)
-                .unwrap_err()
-                .to_string()
-                .contains("unknown")
-        );
+        assert_blob_integrity(decoder.classify(0).unwrap_err(), "unknown");
 
         let overflow = descriptor(Some(0), Some(u64::MAX), Some(1), Some(0), Some(""));
         let decoder = BlobDescriptorDecoder::try_new(&overflow).unwrap();
-        assert!(
-            decoder
-                .classify(0)
-                .unwrap_err()
-                .to_string()
-                .contains("overflows")
-        );
-        assert!(
-            decoder
-                .classify(1)
-                .unwrap_err()
-                .to_string()
-                .contains("outside")
-        );
+        assert_blob_integrity(decoder.classify(0).unwrap_err(), "overflows");
+        assert_blob_integrity(decoder.classify(1).unwrap_err(), "outside");
     }
 
     #[test]
     fn managed_and_external_uri_invariants_fail_closed() {
         let inline_with_sidecar_id = descriptor(Some(0), Some(0), Some(1), Some(9), Some(""));
         let decoder = BlobDescriptorDecoder::try_new(&inline_with_sidecar_id).unwrap();
-        assert!(
-            decoder
-                .classify(0)
-                .unwrap_err()
-                .to_string()
-                .contains("inline row 0 uses nonzero blob_id")
+        assert_blob_integrity(
+            decoder.classify(0).unwrap_err(),
+            "inline row 0 uses nonzero blob_id",
         );
 
         for kind in [1, 2] {
@@ -1211,14 +1858,10 @@ mod tests {
 
         let dedicated_with_position = descriptor(Some(2), Some(7), Some(1), Some(9), Some(""));
         let decoder = BlobDescriptorDecoder::try_new(&dedicated_with_position).unwrap();
-        assert!(
-            decoder
-                .classify(0)
-                .unwrap_err()
-                .to_string()
-                .contains("dedicated row 0 uses nonzero position")
+        assert_blob_integrity(
+            decoder.classify(0).unwrap_err(),
+            "dedicated row 0 uses nonzero position",
         );
-
         let managed_uri = descriptor(
             Some(0),
             Some(0),
@@ -1269,8 +1912,7 @@ mod tests {
         let descriptor = descriptor(Some(3), Some(0), Some(0), Some(0), Some(&oversized));
         let decoder = BlobDescriptorDecoder::try_new(&descriptor).unwrap();
         let error = decoder.classify(0).unwrap_err();
-        assert!(matches!(error, OmniError::Lance(_)));
         assert!(error.to_string().contains("malformed Blob-v2 descriptor"));
-        assert!(error.to_string().contains("persisted URI contract"));
+        assert_blob_integrity(error, "persisted URI contract");
     }
 }

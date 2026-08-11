@@ -5,8 +5,9 @@ use std::fs;
 use std::sync::Arc;
 
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
+use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
 
 use helpers::*;
@@ -163,6 +164,8 @@ async fn long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token() {
     // newly created table incarnation. Neither may drop the immutable v6 PK.
     assert_exact_id_primary_key(&schema_owner, "node:Person").await;
     assert_exact_id_primary_key(&schema_owner, "node:Project").await;
+    assert_stable_property_markers(&schema_owner, "node:Person").await;
+    assert_stable_property_markers(&schema_owner, "node:Project").await;
 
     let projects = stale_handle
         .query(
@@ -703,24 +706,37 @@ node Document {
     );
     assert_eq!(count_rows(&db, "node:Document").await, documents_before);
 
-    let empty = db
-        .read_blob("Document", "valid-empty", "content")
-        .await
-        .unwrap();
-    assert_eq!(empty.size(), 0);
-    assert!(empty.read().await.unwrap().is_empty());
-    let neighbor = db
-        .read_blob("Document", "neighbor", "content")
-        .await
-        .unwrap();
-    assert_eq!(&neighbor.read().await.unwrap()[..], b"Neighbor");
-    std::fs::write(&external_path, b"External").unwrap();
+    let empty = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "valid-empty", "content"),
+    )
+    .await;
+    assert!(empty.is_empty());
+    let neighbor = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "neighbor", "content"),
+    )
+    .await;
+    assert_eq!(&neighbor[..], b"Neighbor");
     let external = db
-        .read_blob("Document", "external", "content")
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "external", "content"),
+        )
         .await
         .unwrap();
-    assert_eq!(external.uri(), Some(canonical_external_uri.as_str()));
-    assert_eq!(&external.read().await.unwrap()[..], b"External");
+    match external.content {
+        BlobContent::External(reference) => {
+            assert_eq!(reference.uri, canonical_external_uri);
+            assert_eq!(reference.offset, 0);
+            assert_eq!(reference.length, None);
+        }
+        BlobContent::Managed { .. } => {
+            panic!("schema rewrite must preserve the external Blob descriptor")
+        }
+    }
 
     // (a) Current snapshot: `note` is gone from the dataset schema.
     let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
@@ -772,6 +788,31 @@ node Document {
     assert!(
         !reopened_fields.iter().any(|f| f == "note"),
         "after reopen, Document dataset schema must still lack 'note'; got fields {reopened_fields:?}",
+    );
+
+    // A soft drop followed by a same-name add mints a new stable property and
+    // a new Lance field id.  The current selector must not reinterpret the old
+    // snapshot's identically-spelled Blob as that new property lifetime.
+    let retired_content_snapshot = reopened.resolve_snapshot("main").await.unwrap();
+    let without_content = desired.replace("    content: Blob?\n", "");
+    reopened.apply_schema(&without_content).await.unwrap();
+    reopened.apply_schema(&desired).await.unwrap();
+    let lifetime_error = reopened
+        .read_blob_at(
+            ReadTarget::snapshot(retired_content_snapshot),
+            node_blob_cell("Document", "valid-empty", "content"),
+        )
+        .await
+        .expect_err("same-name Blob re-add must not adopt the retired property lifetime");
+    assert!(
+        matches!(
+            lifetime_error,
+            OmniError::Manifest(ref error)
+                if error.kind == ManifestErrorKind::BadRequest
+                    && error.message
+                        == "Blob property 'Document.content' belongs to a different property lifetime at the selected target"
+        ),
+        "retired Blob property lifetime must fail closed; got {lifetime_error:?}"
     );
 }
 
@@ -1129,8 +1170,16 @@ async fn plan_schema_for_property_type_narrowing_is_not_supported() {
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_pure_type_rename_preserves_identity_path_and_version() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let initial = TEST_SCHEMA.replace("    age: I32?", "    age: I32?\n    avatar: Blob?");
+    let data = TEST_DATA.replace(
+        r#"{"name": "Alice", "age": 30}"#,
+        r#"{"name": "Alice", "age": 30, "avatar": "base64:QXZhdGFy"}"#,
+    );
+    let db = Omnigraph::init(uri, &initial).await.unwrap();
+    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
+    let before_snapshot_id = db.resolve_snapshot("main").await.unwrap();
     let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let before_version = before_snapshot.version();
     let before = before_snapshot.entry("node:Person").unwrap().clone();
@@ -1138,11 +1187,26 @@ async fn apply_schema_pure_type_rename_preserves_identity_path_and_version() {
     let before_incarnation = db.catalog().table_incarnation_id("Person").unwrap();
     let before_name_property_id = db.catalog().property_id("Person", "name").unwrap();
     let people_before = count_rows(&db, "node:Person").await;
+    let before_avatar = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Person", "Alice", "avatar"),
+        )
+        .await
+        .unwrap();
+    let BlobContent::Managed {
+        etag: before_avatar_etag,
+        ..
+    } = before_avatar.content
+    else {
+        panic!("fixture avatar must be managed")
+    };
 
     let desired = r#"
 node Human @rename_from("Person") {
     name: String @key
     age: I32?
+    avatar: Blob?
 }
 
 node Company {
@@ -1192,6 +1256,54 @@ edge WorksAt: Human -> Company
     );
     assert_eq!(count_rows(&db, "node:Human").await, people_before);
     assert!(after_snapshot.entry("node:Person").is_none());
+
+    let current_avatar = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Human", "Alice", "avatar"),
+    )
+    .await;
+    assert_eq!(&current_avatar[..], b"Avatar");
+    let renamed_avatar = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Human", "Alice", "avatar"),
+        )
+        .await
+        .unwrap();
+    let BlobContent::Managed {
+        etag: renamed_avatar_etag,
+        ..
+    } = renamed_avatar.content
+    else {
+        panic!("renamed avatar must remain managed")
+    };
+    assert_eq!(
+        renamed_avatar_etag, before_avatar_etag,
+        "a pure type alias rename over the same exact table version must preserve the Blob ETag"
+    );
+    let historical_avatar = read_managed_blob_bytes(
+        &db,
+        ReadTarget::snapshot(before_snapshot_id),
+        node_blob_cell("Human", "Alice", "avatar"),
+    )
+    .await;
+    assert_eq!(
+        &historical_avatar[..],
+        b"Avatar",
+        "the current type alias must bind the same stable table identity in a pre-rename snapshot"
+    );
+    let retired_type_error = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Person", "Alice", "avatar"),
+        )
+        .await
+        .expect_err("the retired type alias must not remain addressable");
+    assert!(matches!(
+        retired_type_error,
+        OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::BadRequest
+    ));
 
     let historical_snapshot = db.snapshot_at_version(before_version).await.unwrap();
     let historical = historical_snapshot.entry("node:Person").unwrap();
@@ -1269,7 +1381,15 @@ async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
     // "supported" half of the destructive-vs-supported boundary that the
     // rejections above cover.
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let initial = TEST_SCHEMA.replace("    age: I32?", "    age: I32?\n    avatar: Blob?");
+    let data = TEST_DATA.replace(
+        r#"{"name": "Alice", "age": 30}"#,
+        r#"{"name": "Alice", "age": 30, "avatar": "base64:QXZhdGFy"}"#,
+    );
+    let db = Omnigraph::init(uri, &initial).await.unwrap();
+    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
+    let before_snapshot_id = db.resolve_snapshot("main").await.unwrap();
     let before = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -1280,18 +1400,21 @@ async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
     let before_type_id = db.catalog().type_id("Person").unwrap();
     let before_incarnation = db.catalog().table_incarnation_id("Person").unwrap();
     let before_name_property_id = db.catalog().property_id("Person", "name").unwrap();
+    let before_avatar_property_id = db.catalog().property_id("Person", "avatar").unwrap();
     let people_before = count_rows(&db, "node:Person").await;
     assert!(
         people_before > 0,
         "fixture should seed Person rows for this test to be meaningful"
     );
 
-    // Rename Person -> Human (and the keying property name -> full_name).
+    // Rename Person -> Human, the keying property name -> full_name, and the
+    // Blob property avatar -> portrait.
     // Edges that referenced Person must update to Human in the same migration.
     let desired = r#"
 node Human @rename_from("Person") {
     full_name: String @key @rename_from("name")
     age: I32?
+    portrait: Blob? @rename_from("avatar")
 }
 
 node Company {
@@ -1354,11 +1477,55 @@ edge WorksAt: Human -> Company
         db.catalog().property_id("Human", "full_name"),
         Some(before_name_property_id)
     );
+    assert_eq!(
+        db.catalog().property_id("Human", "portrait"),
+        Some(before_avatar_property_id)
+    );
     assert_eq!(count_rows(&db, "node:Human").await, people_before);
     assert!(
         after_snapshot.entry("node:Person").is_none(),
         "old node:Person table key should be unmapped after rename"
     );
+
+    let current_portrait = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Human", "Alice", "portrait"),
+    )
+    .await;
+    assert_eq!(&current_portrait[..], b"Avatar");
+
+    let historical_error = db
+        .read_blob_at(
+            ReadTarget::snapshot(before_snapshot_id),
+            node_blob_cell("Human", "Alice", "portrait"),
+        )
+        .await
+        .expect_err("the current property alias must not guess across a v6 historical rewrite");
+    assert!(
+        matches!(
+            historical_error,
+            OmniError::Manifest(ref error)
+                if error.kind == ManifestErrorKind::BadRequest
+                    && error.message
+                        == "Blob property 'Human.portrait' is unavailable at the selected target"
+        ),
+        "the current type alias must bind the pre-rename table, then the unavailable current property alias must be BadRequest; got {historical_error:?}"
+    );
+    for retired_cell in [
+        node_blob_cell("Person", "Alice", "avatar"),
+        node_blob_cell("Human", "Alice", "avatar"),
+    ] {
+        let error = db
+            .read_blob_at(ReadTarget::branch("main"), retired_cell)
+            .await
+            .expect_err("retired type/property aliases must not remain addressable");
+        assert!(matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == ManifestErrorKind::BadRequest
+        ));
+    }
 }
 
 #[tokio::test]

@@ -260,7 +260,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "export_jsonl"),
     ("db/omnigraph.rs", "export_jsonl_to_writer"),
     ("db/omnigraph.rs", "graph_index"),
-    ("db/omnigraph.rs", "read_blob"),
+    ("blob.rs", "read_blob_at"),
     ("db/omnigraph.rs", "branch_list"),
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "list_commits"),
@@ -758,7 +758,6 @@ durable_calls! {
     ("exec/merge.rs", "TableStore::create_empty_dataset(", 1, WriteProtocol::EphemeralScratch),
     ("exec/merge.rs", "TableStore::append_or_create_batch(", 1, WriteProtocol::EphemeralScratch),
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph.rs", ".into_arc()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/table_ops.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 2, SCHEMA_V9),
@@ -2199,6 +2198,70 @@ fn public_snapshot_and_storage_boundaries_do_not_leak_writable_datasets() {
             }
         }
     }
+
+    let blob_contents = std::fs::read_to_string(src.join("blob.rs")).unwrap();
+    let blob = parse_rust_source(&blob_contents, "blob.rs");
+    let reader = blob.items.iter().find_map(|item| match item {
+        Item::Struct(structure) if structure.ident == "BlobReader" => Some(structure),
+        _ => None,
+    });
+    let reader = reader.expect("missing public BlobReader");
+    assert!(matches!(reader.vis, Visibility::Public(_)));
+    assert!(
+        reader
+            .fields
+            .iter()
+            .all(|field| matches!(field.vis, Visibility::Inherited)),
+        "BlobReader fields must remain private so callers cannot recover BlobFile or Dataset"
+    );
+    for item in &blob.items {
+        let Item::Impl(implementation) = item else {
+            continue;
+        };
+        for item in &implementation.items {
+            let syn::ImplItem::Fn(function) = item else {
+                continue;
+            };
+            if !matches!(function.vis, Visibility::Public(_)) {
+                continue;
+            }
+            for forbidden in ["BlobFile", "Dataset"] {
+                assert!(
+                    !return_type_contains_identifier(&function.sig.output, forbidden),
+                    "public blob facade method {} must not return raw `{forbidden}`",
+                    function.sig.ident
+                );
+            }
+        }
+    }
+    let public_blob_reader_methods = blob
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Impl(implementation)
+                if implementation.trait_.is_none()
+                    && is_named_type(&implementation.self_ty, "BlobReader") =>
+            {
+                Some(implementation)
+            }
+            _ => None,
+        })
+        .flat_map(|implementation| implementation.items.iter())
+        .filter_map(|item| match item {
+            syn::ImplItem::Fn(function) if matches!(function.vis, Visibility::Public(_)) => {
+                Some(function.sig.ident.to_string())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        public_blob_reader_methods,
+        ["is_empty", "len", "read_range"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>(),
+        "BlobReader must remain a bounded range-only facade"
+    );
 }
 
 #[test]

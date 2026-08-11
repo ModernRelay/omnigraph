@@ -88,6 +88,10 @@ pub mod names {
     pub const BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE: &str =
         "branch_merge.rewrite_after_merge_pre_delete";
     pub const CLASSIFY_FRESH_READ: &str = "classify.fresh_read";
+    /// A Blob read has captured one exact graph snapshot and table authority,
+    /// but has not opened the selected Lance table version yet. Tests replace
+    /// a named branch here to prove a live read fails rather than retargeting.
+    pub const BLOB_READ_POST_CAPTURE: &str = "blob_read.post_capture";
     pub const CLEANUP_RECONCILE_FORK: &str = "cleanup.reconcile_fork";
     /// After cleanup's fast empty-sidecar probe, before it acquires the closed
     /// schema/branch/table GC gate set and performs the authoritative recheck.

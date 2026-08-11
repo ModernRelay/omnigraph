@@ -11,7 +11,6 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
-use lance::dataset::BlobFile;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
@@ -2351,60 +2350,6 @@ impl Omnigraph {
         optimize::cleanup_all_tables(self, options).await
     }
 
-    /// Read a blob from a node by its string ID and property name.
-    ///
-    /// Returns a `BlobFile` handle with async `read()`, `seek()`, `tell()`,
-    /// and metadata accessors (`size()`, `kind()`, `uri()`).
-    ///
-    /// ```ignore
-    /// let blob = db.read_blob("Document", "readme", "content").await?;
-    /// let bytes = blob.read().await?;
-    /// ```
-    pub async fn read_blob(&self, type_name: &str, id: &str, property: &str) -> Result<BlobFile> {
-        let (resolved, catalog) = self.capture_current_read_view().await?;
-        let node_type = catalog
-            .node_types
-            .get(type_name)
-            .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
-        if !node_type.blob_properties.contains(property) {
-            return Err(OmniError::manifest(format!(
-                "property '{}' on type '{}' is not a Blob",
-                property, type_name
-            )));
-        }
-
-        let table_key = format!("node:{}", type_name);
-        let handle = self
-            .storage()
-            .open_snapshot_at_table(&resolved.snapshot, &table_key)
-            .await?;
-
-        let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
-        let row_id = self
-            .storage()
-            .first_row_id_for_filter(&handle, &filter_sql)
-            .await?
-            .ok_or_else(|| {
-                OmniError::manifest(format!("no {} with id '{}' found", type_name, id))
-            })?;
-
-        // `take_blobs` is a Lance-specific blob accessor not surfaced
-        // through the `TableStorage` trait — reach the inner `Arc<Dataset>`
-        // via the `pub(crate)` accessor for this read-only call.
-        let ds = handle.into_arc();
-        let mut blobs = ds
-            .take_blobs(&[row_id], property)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-        blobs.pop().flatten().ok_or_else(|| {
-            OmniError::manifest(format!(
-                "blob '{}' on {} '{}' returned no data",
-                property, type_name, id
-            ))
-        })
-    }
-
     pub(crate) async fn active_branch(&self) -> Option<String> {
         self.coordinator
             .read()
@@ -3159,24 +3104,70 @@ fn blob_properties_for_table_key<'a>(
 /// it can create, overwrite, or rebuild a physical graph table:
 ///
 /// - `ScalarType::Blob`'s `LargeBinary` placeholder becomes a blob-v2 field;
+/// - every user property carries its authoritative stable-property ID;
 /// - exactly the injected, non-null top-level `id` field is the Lance PK; and
 /// - schema metadata and unrelated field metadata survive the reconstruction.
 ///
-/// RFC-023 makes this part of internal format v6. Older physical images are
-/// never annotated in place: the strict format floor rejects them before a v6
-/// catalog is allowed to write.
+/// V6's exact-`id` primary-key fence remains unchanged. Starting in 0.10, every
+/// newly initialized, added, or schema-rebuilt physical user field also carries
+/// its graph property lifetime. Schema-preserving Append, Merge, and mutation
+/// writes retain an earlier v6 image's unmarked schema; full-table Overwrite
+/// carries the 0.10 catalog schema and adopts the marker on its replacement
+/// fields. Blob reads admit a missing marker only at the exact current physical
+/// table entry and refuse every older snapshot rather than inferring identity
+/// from Lance field IDs or positions, even when no rename occurred.
 fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
-    for (name, node_type) in &mut catalog.node_types {
+    let node_names = catalog.node_types.keys().cloned().collect::<Vec<_>>();
+    for name in node_names {
+        let stable_property_ids = catalog.node_types[&name]
+            .properties
+            .keys()
+            .map(|property| {
+                catalog
+                    .node_property_id(&name, property)
+                    .map(|id| (property.clone(), id.get()))
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "node property '{name}.{property}' lacks stable identity"
+                        ))
+                    })
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let node_type = catalog
+            .node_types
+            .get_mut(&name)
+            .expect("node name came from catalog keys");
         node_type.arrow_schema = physical_table_schema(
             &node_type.arrow_schema,
             &node_type.blob_properties,
+            &stable_property_ids,
             &format!("node:{name}"),
         )?;
     }
-    for (name, edge_type) in &mut catalog.edge_types {
+    let edge_names = catalog.edge_types.keys().cloned().collect::<Vec<_>>();
+    for name in edge_names {
+        let stable_property_ids = catalog.edge_types[&name]
+            .properties
+            .keys()
+            .map(|property| {
+                catalog
+                    .edge_property_id(&name, property)
+                    .map(|id| (property.clone(), id.get()))
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "edge property '{name}.{property}' lacks stable identity"
+                        ))
+                    })
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let edge_type = catalog
+            .edge_types
+            .get_mut(&name)
+            .expect("edge name came from catalog keys");
         edge_type.arrow_schema = physical_table_schema(
             &edge_type.arrow_schema,
             &edge_type.blob_properties,
+            &stable_property_ids,
             &format!("edge:{name}"),
         )?;
     }
@@ -3186,6 +3177,7 @@ fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
 fn physical_table_schema(
     schema: &Arc<Schema>,
     blob_properties: &HashSet<String>,
+    stable_property_ids: &HashMap<String, u64>,
     table_key: &str,
 ) -> Result<Arc<Schema>> {
     let mut id_count = 0;
@@ -3215,11 +3207,25 @@ fn physical_table_schema(
                 metadata.insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string());
             } else {
                 metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY);
+                if let Some(stable_property_id) = stable_property_ids.get(physical.name()) {
+                    metadata.insert(
+                        crate::db::STABLE_PROPERTY_ID_METADATA_KEY.to_string(),
+                        stable_property_id.to_string(),
+                    );
+                } else if matches!(physical.name().as_str(), "src" | "dst") {
+                    metadata.remove(crate::db::STABLE_PROPERTY_ID_METADATA_KEY);
+                } else {
+                    return Err(OmniError::manifest_internal(format!(
+                        "physical property '{}.{}' lacks stable identity",
+                        table_key,
+                        physical.name()
+                    )));
+                }
             }
             physical.set_metadata(metadata);
-            physical
+            Ok(physical)
         })
-        .collect::<Vec<Field>>();
+        .collect::<Result<Vec<Field>>>()?;
 
     if id_count != 1 {
         return Err(OmniError::manifest_internal(format!(

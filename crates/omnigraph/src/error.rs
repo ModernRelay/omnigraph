@@ -134,6 +134,15 @@ pub enum OmniError {
     /// or a misleading malformed-request response.
     #[error("external blob source '{uri}' is unavailable: {reason}")]
     ExternalBlobSource { uri: String, reason: String },
+    /// Persisted table or Blob state contradicted the logical Blob contract.
+    /// This is a typed integrity failure rather than a generic storage string so
+    /// callers never reinterpret corrupt identity, metadata, or descriptors as
+    /// null or ordinary absence.
+    #[error("blob integrity violation: {reason}")]
+    BlobIntegrity { reason: String },
+    /// A managed Blob range used reversed or out-of-bounds coordinates.
+    #[error("blob range [{start}, {end}) is not satisfiable for a value of length {length}")]
+    BlobRangeNotSatisfiable { start: u64, end: u64, length: u64 },
     /// A durable recovery intent overlaps this write. Its physical effects may
     /// already have landed, or it may still be armed before its first effect;
     /// either way the sidecar named by `operation_id` must be resolved before
@@ -227,6 +236,12 @@ impl OmniError {
     pub(crate) fn external_blob_source(uri: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::ExternalBlobSource {
             uri: uri.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn blob_integrity(reason: impl Into<String>) -> Self {
+        Self::BlobIntegrity {
             reason: reason.into(),
         }
     }
