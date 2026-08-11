@@ -2,6 +2,7 @@ pub mod api;
 mod export_transport;
 mod handlers;
 mod settings;
+mod supervisor;
 use handlers::*;
 use settings::*;
 pub use settings::{ServerRuntimeState, classify_server_runtime_state, load_server_settings};
@@ -15,7 +16,10 @@ pub mod workload;
 
 pub use graph_id::GraphId;
 pub use identity::{AuthSource, GraphKey, ResolvedActor, Scope, TenantId};
-pub use registry::{GraphHandle, GraphRegistry, InsertError, RegistryLookup, RegistrySnapshot};
+pub use registry::{
+    FailureClass, GraphAvailability, GraphEntry, GraphHandle, GraphRegistry, GraphRuntimeState,
+    InsertError, RegistryLookup, RegistrySnapshot, WriteState,
+};
 
 use crate::queries::{QueryRegistry, check, format_check_breakages};
 
@@ -220,6 +224,10 @@ pub struct GraphStartupConfig {
     pub graph_id: String,
     pub uri: String,
     pub policy: Option<PolicySource>,
+    /// Permanent graph-attributed failure discovered while resolving the
+    /// applied cluster snapshot. The graph still enters the configured
+    /// registry so policy and URI ownership cannot disappear.
+    pub startup_error: Option<String>,
     /// Pre-resolved embedding config from an applied cluster provider profile.
     /// Legacy config paths leave this unset and continue to use env resolution.
     pub embedding: Option<omnigraph::embedding::EmbeddingConfig>,
@@ -271,10 +279,9 @@ pub struct AppState {
     /// Bounded process-wide ownership for queued served-export bytes. The
     /// response body and detached producer jointly retain each reservation.
     export_transport: export_transport::ExportTransport,
-}
-
-struct OpenedGraph {
-    handle: Arc<GraphHandle>,
+    /// One coalescing open/recovery supervisor per configured graph.
+    #[allow(dead_code)]
+    supervisors: Arc<supervisor::SupervisorSet>,
 }
 
 /// The structured-detail payloads are boxed to keep `Result<_, ApiError>` cheap
@@ -292,6 +299,7 @@ pub struct ApiError {
     key_conflict: Option<Box<api::KeyConflictOutput>>,
     resource_limit: Option<Box<api::ResourceLimitOutput>>,
     recovery_required: Option<Box<api::RecoveryRequiredOutput>>,
+    graph_unavailable: Option<Box<api::GraphUnavailableOutput>>,
 }
 
 impl AppState {
@@ -543,6 +551,7 @@ impl AppState {
             bearer_tokens,
             server_policy: None,
             export_transport: export_transport::ExportTransport::with_defaults(),
+            supervisors: supervisor::SupervisorSet::idle(),
         }
     }
 
@@ -570,7 +579,28 @@ impl AppState {
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
             export_transport: export_transport::ExportTransport::with_defaults(),
+            supervisors: supervisor::SupervisorSet::idle(),
         })
+    }
+
+    fn from_configured_registry(
+        registry: Arc<GraphRegistry>,
+        bearer_tokens: Vec<(String, String)>,
+        server_policy: Option<PolicyEngine>,
+        config_path: PathBuf,
+    ) -> Self {
+        let supervisors = supervisor::SupervisorSet::start(Arc::clone(&registry));
+        Self {
+            routing: GraphRouting {
+                registry,
+                config_path: Some(config_path),
+            },
+            workload: Arc::new(workload::WorkloadController::from_env()),
+            bearer_tokens: hash_bearer_tokens(bearer_tokens),
+            server_policy: server_policy.map(Arc::new),
+            export_transport: export_transport::ExportTransport::with_defaults(),
+            supervisors,
+        }
     }
 
     /// Runtime routing accessor. Handlers don't typically inspect this —
@@ -629,6 +659,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -643,6 +674,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -657,6 +689,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -671,6 +704,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -689,6 +723,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -703,6 +738,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -717,6 +753,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -731,6 +768,22 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            graph_unavailable: None,
+        }
+    }
+
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: None,
+            message: message.into(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -749,6 +802,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -774,6 +828,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -788,6 +843,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -802,6 +858,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -816,6 +873,7 @@ impl ApiError {
             key_conflict: Some(Box::new(details)),
             resource_limit: None,
             recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -830,6 +888,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: Some(Box::new(details)),
             recovery_required: None,
+            graph_unavailable: None,
         }
     }
 
@@ -847,6 +906,42 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: Some(Box::new(api::RecoveryRequiredOutput { operation_id })),
+            graph_unavailable: None,
+        }
+    }
+
+    fn graph_unavailable(graph_id: &GraphId, availability: &registry::GraphAvailability) -> Self {
+        let state = match availability.state {
+            "ready" => api::GraphState::Ready,
+            "recovering" => api::GraphState::Recovering,
+            "degraded" => api::GraphState::Degraded,
+            "opening" => api::GraphState::Opening,
+            _ => api::GraphState::Unavailable,
+        };
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: None,
+            message: format!(
+                "graph '{}' is {}{}",
+                graph_id,
+                availability.state,
+                availability
+                    .last_error
+                    .as_deref()
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            ),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            recovery_required: None,
+            graph_unavailable: Some(Box::new(api::GraphUnavailableOutput {
+                graph_id: graph_id.as_str().to_string(),
+                state,
+                retry_after_seconds: availability.retry_after_seconds,
+            })),
         }
     }
 
@@ -982,6 +1077,19 @@ impl IntoResponse for ApiError {
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
             );
+        } else if self.recovery_required.is_some() {
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        } else if let Some(seconds) = self
+            .graph_unavailable
+            .as_ref()
+            .and_then(|detail| detail.retry_after_seconds)
+        {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.max(1).to_string()) {
+                headers.insert(axum::http::header::RETRY_AFTER, value);
+            }
         }
         (
             self.status,
@@ -995,6 +1103,7 @@ impl IntoResponse for ApiError {
                 key_conflict: self.key_conflict.map(|d| *d),
                 resource_limit: self.resource_limit.map(|d| *d),
                 recovery_required: self.recovery_required.map(|d| *d),
+                graph_unavailable: self.graph_unavailable.map(|d| *d),
             }),
         )
             .into_response()
@@ -1014,6 +1123,7 @@ mod api_error_tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -1023,6 +1133,31 @@ mod api_error_tests {
             error.recovery_required.unwrap().operation_id,
             "01JTESTRECOVERY"
         );
+    }
+
+    #[tokio::test]
+    async fn configured_opening_graph_is_503_with_detail_and_retry_after() {
+        let graph_id = GraphId::try_from("opening").unwrap();
+        let availability = GraphAvailability {
+            state: "opening",
+            read_ready: false,
+            write_ready: false,
+            failure_class: Some("io"),
+            last_error: Some("temporary object-store failure".to_string()),
+            retry_after_seconds: Some(3),
+            blocking_operation_id: None,
+        };
+        let response = ApiError::graph_unavailable(&graph_id, &availability).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "3");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        let detail = error.graph_unavailable.expect("graph detail");
+        assert_eq!(detail.graph_id, "opening");
+        assert_eq!(detail.state, api::GraphState::Opening);
+        assert_eq!(detail.retry_after_seconds, Some(3));
     }
 
     #[tokio::test]
@@ -1300,14 +1435,10 @@ fn load_graph_policy(source: &PolicySource, graph_id: &str) -> Result<PolicyEngi
     }
 }
 
-/// Parallel open of every graph in the startup config, with bounded
-/// concurrency (`buffer_unordered(4)`). Graph-specific open failures
-/// quarantine that graph; startup succeeds as long as at least one graph
-/// opens.
-///
-/// The bound 4 is a rule-of-thumb for I/O-bound work. At N ≤ 10 this
-/// trades startup latency for a small amount of concurrent S3 / Lance
-/// open pressure.
+/// Validate the complete configured set, make one bounded initial open attempt
+/// per graph, then start one coalescing supervisor per graph. Default boot does
+/// not require a healthy graph; strict boot retains the explicit fail-fast
+/// override.
 pub async fn open_multi_graph_state(
     graphs: Vec<GraphStartupConfig>,
     tokens: Vec<(String, String)>,
@@ -1315,11 +1446,17 @@ pub async fn open_multi_graph_state(
     config_path: PathBuf,
     require_all_graphs: bool,
 ) -> Result<AppState> {
-    use futures::StreamExt;
-
     if graphs.is_empty() {
         bail!("multi-graph mode requires at least one graph in the `graphs:` map");
     }
+
+    // All graph ids and canonical URIs, including duplicate URI ownership, are
+    // validated before the first graph open begins. A configured entry remains
+    // present even if every subsequent open attempt fails.
+    let registry = Arc::new(
+        GraphRegistry::from_configs(graphs)
+            .map_err(|error| color_eyre::eyre::eyre!("multi-graph registry: {error}"))?,
+    );
 
     // Server-level policy (loaded once, applies to management endpoints).
     // The placeholder graph_id `"server"` is the sentinel the Cedar
@@ -1331,95 +1468,27 @@ pub async fn open_multi_graph_state(
         None => None,
     };
 
-    let configured_graphs = graphs.len();
-    let results = futures::stream::iter(graphs)
-        .map(|cfg| async move {
-            let graph_id = cfg.graph_id.clone();
-            open_single_graph(cfg).await.map_err(|err| (graph_id, err))
-        })
-        .buffer_unordered(4)
-        .collect::<Vec<_>>()
-        .await;
-    let mut handles = Vec::new();
-    let mut failed = 0usize;
-    for result in results {
-        match result {
-            Ok(opened) => {
-                handles.push(opened.handle);
-            }
-            Err((graph_id, err)) => {
-                failed += 1;
-                warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "graph quarantined during startup"
-                );
-            }
-        }
-    }
-    if require_all_graphs && failed > 0 {
+    let configured_graphs = registry.len();
+    supervisor::initial_open_all(Arc::clone(&registry)).await;
+    let unavailable = registry
+        .list()
+        .into_iter()
+        .filter(|entry| !entry.availability().write_ready)
+        .count();
+    if require_all_graphs && unavailable > 0 {
         bail!(
             "strict multi-graph startup requires every graph to open ({} configured, {} failed)",
             configured_graphs,
-            failed
-        );
-    }
-    if handles.is_empty() {
-        bail!(
-            "no healthy graphs opened from multi-graph startup config ({} configured, {} failed)",
-            configured_graphs,
-            failed
+            unavailable
         );
     }
 
-    let workload = workload::WorkloadController::from_env();
-    let state = AppState::new_multi(handles, tokens, server_policy, workload, Some(config_path))
-        .map_err(|err| color_eyre::eyre::eyre!("multi-graph registry: {err}"))?;
-    Ok(state)
-}
-
-/// Open one graph and wrap it in a `GraphHandle`. Used at startup by
-/// `open_multi_graph_state`.
-async fn open_single_graph(cfg: GraphStartupConfig) -> Result<OpenedGraph> {
-    let graph_id = GraphId::try_from(cfg.graph_id.clone())
-        .map_err(|err| color_eyre::eyre::eyre!("graph id '{}': {err}", cfg.graph_id))?;
-    let uri = normalize_root_uri(&cfg.uri)
-        .wrap_err_with(|| format!("normalize URI for graph '{}'", cfg.graph_id))?;
-
-    let db = Omnigraph::open(&uri)
-        .await
-        .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, uri))?;
-    let db = if let Some(embedding) = cfg.embedding {
-        db.with_embedding_config(Arc::new(embedding))
-    } else {
-        db
-    };
-
-    // Validate this graph's stored queries against the live schema and
-    // resolve them to an attachable handle (refuse boot on breakage).
-    // Done before the policy match rebinds `db`; the catalog handle is an
-    // owned `Arc`, so no borrow of `db` survives into the match.
-    let queries = validate_and_attach(cfg.queries, &db.catalog(), graph_id.as_str())?;
-
-    let (policy_arc, db) = match &cfg.policy {
-        Some(source) => {
-            let policy = load_graph_policy(source, graph_id.as_str())?;
-            let policy_arc: Arc<PolicyEngine> = Arc::new(policy);
-            let checker = Arc::clone(&policy_arc) as Arc<dyn omnigraph_policy::PolicyChecker>;
-            (Some(policy_arc), db.with_policy(checker))
-        }
-        None => (None, db),
-    };
-
-    Ok(OpenedGraph {
-        handle: Arc::new(GraphHandle {
-            key: GraphKey::cluster(graph_id),
-            uri,
-            engine: Arc::new(db),
-            policy: policy_arc,
-            queries,
-        }),
-    })
+    Ok(AppState::from_configured_registry(
+        registry,
+        tokens,
+        server_policy,
+        config_path,
+    ))
 }
 
 async fn wait_for_ctrl_c() {

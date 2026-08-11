@@ -236,7 +236,7 @@ applied revision is not safely servable. Each refusal names its remedy:
 |---|---|---|
 | `cluster_state_missing` | no ledger | `cluster import`, then `apply` |
 | `cluster_recovery_pending` | graph was quarantined because an interrupted operation awaits sweep | run `cluster apply` (or any state-mutating command), restart |
-| `cluster_no_healthy_graphs` | every applied graph is quarantined or failed startup | sweep/fix the graph-specific failures, then restart |
+| `cluster_no_healthy_graphs` | strict boot was requested and every applied graph failed startup | fix the graph-specific failures, then restart without `--require-all-graphs` for status-only boot |
 | `catalog_payload_missing` / `…_digest_mismatch` | catalog blob lost or tampered | `cluster refresh`, then `apply`, restart |
 | `policy_bindings_missing` | ledger predates binding metadata | re-run `cluster apply` (backfills), restart |
 | `cluster_empty` | applied revision has no graphs | apply a cluster with ≥1 graph |
@@ -246,12 +246,15 @@ A held *state lock* is deliberately **not** a boot error — the server reads
 the atomically-replaced ledger without locking, so serving never contends
 with an in-flight apply.
 
-When at least one graph is healthy, graph-attributed recovery sidecars and
-graph-local startup failures do not block the whole server. The affected
-graph is skipped, its graph-only policy bindings and queries are omitted,
-and `/graphs` lists only the ready graphs. Pass
+Graph-local startup failures do not block default server boot, even when zero
+graphs open. Every configured graph remains in the registry so its policy
+presence, URI ownership, and status cannot disappear. `/graphs` lists all
+configured graphs with `read_ready`/`write_ready`; a configured graph without a
+usable handle returns 503, while an unknown id returns 404. Proven transient
+I/O/timeouts retry under a bounded per-graph supervisor. Pass
 `omnigraph-server --require-all-graphs` or set
-`OMNIGRAPH_REQUIRE_ALL_GRAPHS=1` to make any such quarantine fail startup.
+`OMNIGRAPH_REQUIRE_ALL_GRAPHS=1` to make any initial graph-open failure abort
+startup.
 
 ## 6. Deployment patterns
 

@@ -5161,6 +5161,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "dashmap",
+ "fastrand",
  "futures",
  "lance",
  "lance-index",

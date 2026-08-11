@@ -426,6 +426,10 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "ErrorCode",
     "ErrorOutput",
     "ExportRequest",
+    "GraphInfo",
+    "GraphListResponse",
+    "GraphState",
+    "GraphUnavailableOutput",
     "HealthOutput",
     "IngestOutput",
     "IngestRequest",
@@ -666,6 +670,35 @@ fn error_output_schema_has_expected_fields() {
     assert!(props.contains_key("key_conflict"));
     assert!(props.contains_key("resource_limit"));
     assert!(props.contains_key("recovery_required"));
+    assert!(props.contains_key("graph_unavailable"));
+}
+
+#[test]
+fn graph_status_schemas_have_expected_fields() {
+    let doc = openapi_json();
+    let info = &doc["components"]["schemas"]["GraphInfo"];
+    let props = info["properties"].as_object().unwrap();
+    for field in [
+        "graph_id",
+        "uri",
+        "state",
+        "read_ready",
+        "write_ready",
+        "failure_class",
+        "last_error",
+        "retry_after_seconds",
+        "blocking_operation_id",
+    ] {
+        assert!(props.contains_key(field), "GraphInfo missing {field}");
+    }
+    assert_eq!(
+        doc["components"]["schemas"]["GraphState"]["enum"],
+        serde_json::json!(["ready", "recovering", "degraded", "opening", "unavailable"])
+    );
+    let unavailable = &doc["components"]["schemas"]["GraphUnavailableOutput"]["properties"];
+    assert!(unavailable.get("graph_id").is_some());
+    assert!(unavailable.get("state").is_some());
+    assert!(unavailable.get("retry_after_seconds").is_some());
 }
 
 #[test]

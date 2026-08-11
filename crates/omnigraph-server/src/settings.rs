@@ -104,8 +104,8 @@ pub(crate) async fn load_cluster_settings(
     }
 
     let mut graphs = Vec::new();
-    let mut skipped_graphs = Vec::new();
     for graph in &snapshot.graphs {
+        let mut startup_errors = Vec::new();
         let specs: Vec<queries::RegistrySpec> = snapshot
             .queries
             .iter()
@@ -131,13 +131,10 @@ pub(crate) async fn load_cluster_settings(
                 warn!(
                     graph_id = %graph.graph_id,
                     errors = %details,
-                    "graph quarantined because stored queries failed to parse"
+                    "graph unavailable because stored queries failed to parse"
                 );
-                skipped_graphs.push(format!(
-                    "{}: stored queries failed to parse: {details}",
-                    graph.graph_id
-                ));
-                continue;
+                startup_errors.push(format!("stored queries failed to parse: {details}"));
+                QueryRegistry::default()
             }
         };
         let embedding = match graph
@@ -155,36 +152,34 @@ pub(crate) async fn load_cluster_settings(
                 warn!(
                     graph_id = %graph.graph_id,
                     error = %err,
-                    "graph quarantined because embedding provider configuration failed"
+                    "graph unavailable because embedding provider configuration failed"
                 );
-                skipped_graphs.push(format!("{}: {err}", graph.graph_id));
-                continue;
+                startup_errors.push(err.to_string());
+                None
             }
         };
         graphs.push(GraphStartupConfig {
             graph_id: graph.graph_id.clone(),
             uri: graph.root.to_string_lossy().to_string(),
             policy: graph_policies.get(&graph.graph_id).cloned(),
+            startup_error: (!startup_errors.is_empty()).then(|| startup_errors.join("; ")),
             embedding,
             queries: registry,
         });
     }
-    if graphs.is_empty() {
-        let skipped = skipped_graphs.join(", ");
+    let startup_failures = graphs
+        .iter()
+        .filter_map(|graph| {
+            graph
+                .startup_error
+                .as_ref()
+                .map(|error| format!("{}: {error}", graph.graph_id))
+        })
+        .collect::<Vec<_>>();
+    if require_all_graphs && !startup_failures.is_empty() {
         bail!(
-            "the cluster at '{}' has no healthy graphs to serve{}",
-            cluster_dir.display(),
-            if skipped.is_empty() {
-                String::new()
-            } else {
-                format!(" (quarantined: {skipped})")
-            }
-        );
-    }
-    if require_all_graphs && !skipped_graphs.is_empty() {
-        bail!(
-            "strict cluster boot requires every graph to build startup settings (quarantined: {})",
-            skipped_graphs.join(", ")
+            "strict cluster boot requires every graph to build startup settings (unavailable: {})",
+            startup_failures.join(", ")
         );
     }
 
@@ -640,6 +635,7 @@ mod tests {
                         .to_string_lossy()
                         .into_owned(),
                     policy: None,
+                    startup_error: None,
                     embedding: None,
                     queries: crate::queries::QueryRegistry::default(),
                 }],
@@ -693,6 +689,7 @@ mod tests {
                         .to_string_lossy()
                         .into_owned(),
                     policy: None,
+                    startup_error: None,
                     embedding: None,
                     queries: crate::queries::QueryRegistry::default(),
                 }],

@@ -1,32 +1,22 @@
-//! `GraphRegistry` — the multi-graph routing substrate (MR-668).
+//! Configured-graph registry and atomically readable runtime state.
 //!
-//! Holds the open `Arc<GraphHandle>` for every graph the server is currently
-//! serving. Lock-free reads via `ArcSwap<RegistrySnapshot>`; mutations
-//! serialize through `mutate: Mutex<()>` for read-modify-write atomicity.
-//!
-//! **Deletion is deferred** in v0.6.0 (MR-668 scope cut). The registry has
-//! no `tombstones` field, no `RegistryLookup::Tombstoned` variant, no
-//! `tombstone()` / `clear_tombstone()` methods. When `DELETE /graphs/{id}`
-//! lands in a follow-up release, those return without breaking caller
-//! signatures (`Gone` is the closest semantic — the graph is no longer
-//! in the registry).
-//!
-//! Engine instance survival across registry mutations:
-//! a request that grabbed `Arc<GraphHandle>` before a registry swap keeps
-//! the engine alive via its own `Arc` clone (see `server_export` at
-//! `lib.rs:1019-1033` for the spawn-and-clone pattern). The engine drops
-//! when the last `Arc<Omnigraph>` clone drops, regardless of the
-//! registry's current state.
+//! The configured graph set is immutable for the lifetime of a server process;
+//! runtime add/remove and config hot reload are deliberately out of scope. Each
+//! entry owns canonical configuration plus a small state machine that can move
+//! between opening, serving, recovery-blocked, and unavailable without
+//! rebuilding the registry or replacing a live engine handle.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use omnigraph::db::Omnigraph;
 use omnigraph::storage::normalize_root_uri;
-#[cfg(test)]
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
+use crate::GraphStartupConfig;
+use crate::graph_id::GraphId;
 use crate::identity::GraphKey;
 use crate::policy::PolicyEngine;
 use crate::queries::QueryRegistry;
@@ -55,29 +45,279 @@ pub struct GraphHandle {
     pub queries: Option<Arc<QueryRegistry>>,
 }
 
-/// Immutable snapshot of the registry's current state. Replaced atomically
-/// via `ArcSwap`; readers see a consistent view of all graphs without locking.
-///
-/// Derived state (`any_per_graph_policy`) is computed at snapshot
-/// construction so request-time middleware doesn't have to walk the
-/// graph map every call. Construct only via [`RegistrySnapshot::new`]
-/// (or `Default`) so the field stays in sync with `graphs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    Io,
+    Timeout,
+    InvalidConfiguration,
+    UnsupportedFormat,
+    InvariantViolation,
+    Unknown,
+}
+
+impl FailureClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Io => "io",
+            Self::Timeout => "timeout",
+            Self::InvalidConfiguration => "invalid_configuration",
+            Self::UnsupportedFormat => "unsupported_format",
+            Self::InvariantViolation => "invariant_violation",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn retryable(self) -> bool {
+        matches!(self, Self::Io | Self::Timeout)
+    }
+}
+
+#[derive(Clone)]
+pub enum WriteState {
+    Ready,
+    Recovering {
+        attempts: u32,
+        blocking_operation_id: Option<String>,
+    },
+    Blocked {
+        attempts: u32,
+        next_retry: Instant,
+        failure_class: FailureClass,
+        last_error: String,
+        blocking_operation_id: Option<String>,
+    },
+}
+
+#[derive(Clone)]
+pub enum GraphRuntimeState {
+    Serving {
+        handle: Arc<GraphHandle>,
+        writes: WriteState,
+    },
+    Opening {
+        attempts: u32,
+        next_retry: Instant,
+        failure_class: Option<FailureClass>,
+        last_error: Option<String>,
+    },
+    Unavailable {
+        failure_class: FailureClass,
+        last_error: String,
+    },
+}
+
+/// Request- and wire-facing projection of a configured graph's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphAvailability {
+    pub state: &'static str,
+    pub read_ready: bool,
+    pub write_ready: bool,
+    pub failure_class: Option<&'static str>,
+    pub last_error: Option<String>,
+    pub retry_after_seconds: Option<u64>,
+    pub blocking_operation_id: Option<String>,
+}
+
+fn retry_after_seconds(deadline: Instant) -> u64 {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+        .max(1)
+}
+
+fn sanitize_status_error(message: &str) -> String {
+    message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(512)
+        .collect()
+}
+
+impl GraphRuntimeState {
+    pub fn availability(&self) -> GraphAvailability {
+        match self {
+            Self::Serving {
+                writes: WriteState::Ready,
+                ..
+            } => GraphAvailability {
+                state: "ready",
+                read_ready: true,
+                write_ready: true,
+                failure_class: None,
+                last_error: None,
+                retry_after_seconds: None,
+                blocking_operation_id: None,
+            },
+            Self::Serving {
+                writes:
+                    WriteState::Recovering {
+                        blocking_operation_id,
+                        ..
+                    },
+                ..
+            } => GraphAvailability {
+                state: "recovering",
+                read_ready: true,
+                write_ready: false,
+                failure_class: None,
+                last_error: None,
+                retry_after_seconds: Some(1),
+                blocking_operation_id: blocking_operation_id.clone(),
+            },
+            Self::Serving {
+                writes:
+                    WriteState::Blocked {
+                        next_retry,
+                        failure_class,
+                        last_error,
+                        blocking_operation_id,
+                        ..
+                    },
+                ..
+            } => GraphAvailability {
+                state: "degraded",
+                read_ready: true,
+                write_ready: false,
+                failure_class: Some(failure_class.as_str()),
+                last_error: Some(last_error.clone()),
+                retry_after_seconds: Some(retry_after_seconds(*next_retry)),
+                blocking_operation_id: blocking_operation_id.clone(),
+            },
+            Self::Opening {
+                next_retry,
+                failure_class,
+                last_error,
+                ..
+            } => GraphAvailability {
+                state: "opening",
+                read_ready: false,
+                write_ready: false,
+                failure_class: failure_class.map(FailureClass::as_str),
+                last_error: last_error.clone(),
+                retry_after_seconds: Some(retry_after_seconds(*next_retry)),
+                blocking_operation_id: None,
+            },
+            Self::Unavailable {
+                failure_class,
+                last_error,
+            } => GraphAvailability {
+                state: "unavailable",
+                read_ready: false,
+                write_ready: false,
+                failure_class: Some(failure_class.as_str()),
+                last_error: Some(last_error.clone()),
+                retry_after_seconds: None,
+                blocking_operation_id: None,
+            },
+        }
+    }
+}
+
+/// One immutable configured graph plus its atomically replaceable runtime
+/// state. `mutation` serializes short state transitions only; no graph I/O is
+/// performed while it is held.
+pub struct GraphEntry {
+    pub key: GraphKey,
+    pub uri: String,
+    pub policy_configured: bool,
+    startup: Option<Arc<GraphStartupConfig>>,
+    runtime: ArcSwap<GraphRuntimeState>,
+    pub(crate) mutation: Mutex<()>,
+    pub(crate) notify: Notify,
+}
+
+impl GraphEntry {
+    fn from_handle(handle: Arc<GraphHandle>) -> Result<Self, InsertError> {
+        let (canonical_uri, handle) = canonicalize_handle_uri(handle)?;
+        Ok(Self {
+            key: handle.key.clone(),
+            uri: canonical_uri,
+            policy_configured: handle.policy.is_some(),
+            startup: None,
+            runtime: ArcSwap::from_pointee(GraphRuntimeState::Serving {
+                handle,
+                writes: WriteState::Ready,
+            }),
+            mutation: Mutex::new(()),
+            notify: Notify::new(),
+        })
+    }
+
+    fn from_config(mut config: GraphStartupConfig) -> Result<Self, InsertError> {
+        let graph_id = GraphId::try_from(config.graph_id.clone()).map_err(|err| {
+            InsertError::InvalidGraphId {
+                graph_id: config.graph_id.clone(),
+                message: err.to_string(),
+            }
+        })?;
+        config.uri = normalize_root_uri(&config.uri).map_err(|err| InsertError::InvalidUri {
+            uri: config.uri.clone(),
+            message: err.to_string(),
+        })?;
+        let policy_configured = config.policy.is_some();
+        let runtime = match config.startup_error.as_deref() {
+            Some(error) => GraphRuntimeState::Unavailable {
+                failure_class: FailureClass::InvalidConfiguration,
+                last_error: sanitize_status_error(error),
+            },
+            None => GraphRuntimeState::Opening {
+                attempts: 0,
+                next_retry: Instant::now(),
+                failure_class: None,
+                last_error: None,
+            },
+        };
+        Ok(Self {
+            key: GraphKey::cluster(graph_id),
+            uri: config.uri.clone(),
+            policy_configured,
+            startup: Some(Arc::new(config)),
+            runtime: ArcSwap::from_pointee(runtime),
+            mutation: Mutex::new(()),
+            notify: Notify::new(),
+        })
+    }
+
+    pub fn startup_config(&self) -> Option<Arc<GraphStartupConfig>> {
+        self.startup.clone()
+    }
+
+    pub fn runtime(&self) -> arc_swap::Guard<Arc<GraphRuntimeState>> {
+        self.runtime.load()
+    }
+
+    pub(crate) fn store_runtime(&self, state: GraphRuntimeState) {
+        self.runtime.store(Arc::new(state));
+    }
+
+    pub fn availability(&self) -> GraphAvailability {
+        self.runtime.load().availability()
+    }
+
+    pub fn serving_handle(&self) -> Option<Arc<GraphHandle>> {
+        match self.runtime.load().as_ref() {
+            GraphRuntimeState::Serving { handle, .. } => Some(Arc::clone(handle)),
+            GraphRuntimeState::Opening { .. } | GraphRuntimeState::Unavailable { .. } => None,
+        }
+    }
+
+    pub fn wake(&self) {
+        self.notify.notify_one();
+    }
+}
+
+/// Immutable configured-set snapshot. Entry runtime changes do not rebuild it.
 pub struct RegistrySnapshot {
-    pub graphs: HashMap<GraphKey, Arc<GraphHandle>>,
-    /// `true` iff any registered graph has a per-graph policy installed.
-    /// Used by `AppState::requires_bearer_auth` to decide whether the
-    /// auth middleware should challenge a request — a per-graph policy
-    /// implies bearer auth is required even when no server-level tokens
-    /// or policy are configured.
+    pub graphs: HashMap<GraphKey, Arc<GraphEntry>>,
     pub any_per_graph_policy: bool,
 }
 
 impl RegistrySnapshot {
-    /// Build a snapshot from a graph map, deriving cached fields.
-    /// The only construction path — direct struct-literal use elsewhere
-    /// would let derived state drift from `graphs`.
-    pub fn new(graphs: HashMap<GraphKey, Arc<GraphHandle>>) -> Self {
-        let any_per_graph_policy = graphs.values().any(|h| h.policy.is_some());
+    pub fn new(graphs: HashMap<GraphKey, Arc<GraphEntry>>) -> Self {
+        let any_per_graph_policy = graphs.values().any(|entry| entry.policy_configured);
         Self {
             graphs,
             any_per_graph_policy,
@@ -91,12 +331,9 @@ impl Default for RegistrySnapshot {
     }
 }
 
-/// Result of a registry lookup. Two-valued — `Tombstoned` deferred with DELETE.
 pub enum RegistryLookup {
-    /// Graph is open and ready to serve.
     Ready(Arc<GraphHandle>),
-    /// Graph is not in the registry (never existed, or was unregistered in a
-    /// future release). Handlers respond with 404.
+    Unavailable(GraphAvailability),
     Gone,
 }
 
@@ -114,14 +351,12 @@ pub enum InsertError {
     /// A handle carried an invalid graph URI. Maps to startup failure.
     #[error("URI '{uri}' is invalid: {message}")]
     InvalidUri { uri: String, message: String },
+    #[error("graph id '{graph_id}' is invalid: {message}")]
+    InvalidGraphId { graph_id: String, message: String },
 }
 
 pub struct GraphRegistry {
     snapshot: ArcSwap<RegistrySnapshot>,
-    /// Serializes runtime mutations through [`GraphRegistry::insert`].
-    /// Gated with `insert` because they share a single contract — if
-    /// the consumer goes away, so does the lock. Re-introducing one
-    /// requires re-introducing the other.
     #[cfg(test)]
     mutate: Mutex<()>,
 }
@@ -136,21 +371,36 @@ impl GraphRegistry {
         }
     }
 
-    /// Build a registry from a startup-time list of open handles.
-    /// Rejects duplicate `GraphKey`s and duplicate URIs.
     pub fn from_handles(handles: Vec<Arc<GraphHandle>>) -> Result<Self, InsertError> {
-        let mut graphs: HashMap<GraphKey, Arc<GraphHandle>> = HashMap::with_capacity(handles.len());
-        let mut seen_uris: HashMap<String, GraphKey> = HashMap::with_capacity(handles.len());
+        let mut entries = Vec::with_capacity(handles.len());
         for handle in handles {
-            let (canonical_uri, handle) = canonicalize_handle_uri(handle)?;
-            if graphs.contains_key(&handle.key) {
-                return Err(InsertError::DuplicateKey(handle.key.clone()));
+            entries.push(Arc::new(GraphEntry::from_handle(handle)?));
+        }
+        Self::from_entries(entries)
+    }
+
+    /// Validate every graph id and canonical URI, including collisions, before
+    /// any open attempt can begin.
+    pub fn from_configs(configs: Vec<GraphStartupConfig>) -> Result<Self, InsertError> {
+        let mut entries = Vec::with_capacity(configs.len());
+        for config in configs {
+            entries.push(Arc::new(GraphEntry::from_config(config)?));
+        }
+        Self::from_entries(entries)
+    }
+
+    fn from_entries(entries: Vec<Arc<GraphEntry>>) -> Result<Self, InsertError> {
+        let mut graphs = HashMap::with_capacity(entries.len());
+        let mut seen_uris = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            if graphs.contains_key(&entry.key) {
+                return Err(InsertError::DuplicateKey(entry.key.clone()));
             }
-            if seen_uris.contains_key(&canonical_uri) {
-                return Err(InsertError::DuplicateUri(handle.uri.clone()));
+            if seen_uris.contains_key(&entry.uri) {
+                return Err(InsertError::DuplicateUri(entry.uri.clone()));
             }
-            seen_uris.insert(canonical_uri, handle.key.clone());
-            graphs.insert(handle.key.clone(), handle);
+            seen_uris.insert(entry.uri.clone(), entry.key.clone());
+            graphs.insert(entry.key.clone(), entry);
         }
         Ok(Self {
             snapshot: ArcSwap::from_pointee(RegistrySnapshot::new(graphs)),
@@ -167,21 +417,71 @@ impl GraphRegistry {
         self.snapshot.load()
     }
 
-    /// Lock-free read. Returns `Ready` if the graph is in the current snapshot,
-    /// `Gone` otherwise.
     pub fn get(&self, key: &GraphKey) -> RegistryLookup {
         let snapshot = self.snapshot.load();
         match snapshot.graphs.get(key) {
-            Some(handle) => RegistryLookup::Ready(Arc::clone(handle)),
+            Some(entry) => match entry.serving_handle() {
+                Some(handle) => RegistryLookup::Ready(handle),
+                None => RegistryLookup::Unavailable(entry.availability()),
+            },
             None => RegistryLookup::Gone,
         }
     }
 
-    /// Snapshot the full set of currently-registered handles. Ordering
-    /// matches the underlying `HashMap` iteration (intentionally
-    /// non-deterministic — callers that need a stable order sort by
-    /// `handle.key.graph_id`).
-    pub fn list(&self) -> Vec<Arc<GraphHandle>> {
+    pub fn entry(&self, key: &GraphKey) -> Option<Arc<GraphEntry>> {
+        self.snapshot.load().graphs.get(key).cloned()
+    }
+
+    /// Block new writes and coalesce a Full-recovery wake-up for a serving
+    /// graph. The prior blocking operation remains the public diagnostic until
+    /// recovery succeeds; later requests are never treated as replays of it.
+    pub async fn mark_recovering(
+        &self,
+        key: &GraphKey,
+        blocking_operation_id: Option<String>,
+    ) -> bool {
+        let Some(entry) = self.entry(key) else {
+            return false;
+        };
+        let _guard = entry.mutation.lock().await;
+        let current = entry.runtime().as_ref().clone();
+        let next = match current {
+            GraphRuntimeState::Serving { handle, writes } => {
+                let existing = match writes {
+                    WriteState::Ready => None,
+                    WriteState::Recovering {
+                        blocking_operation_id,
+                        ..
+                    }
+                    | WriteState::Blocked {
+                        blocking_operation_id,
+                        ..
+                    } => blocking_operation_id,
+                };
+                GraphRuntimeState::Serving {
+                    handle,
+                    writes: WriteState::Recovering {
+                        attempts: 0,
+                        blocking_operation_id: existing.or(blocking_operation_id),
+                    },
+                }
+            }
+            GraphRuntimeState::Opening { .. } | GraphRuntimeState::Unavailable { .. } => {
+                return false;
+            }
+        };
+        entry.store_runtime(next);
+        drop(_guard);
+        entry.wake();
+        true
+    }
+
+    pub fn write_availability(&self, key: &GraphKey) -> Option<GraphAvailability> {
+        self.entry(key).map(|entry| entry.availability())
+    }
+
+    /// Snapshot every configured entry, including graphs that never opened.
+    pub fn list(&self) -> Vec<Arc<GraphEntry>> {
         let snapshot = self.snapshot.load();
         snapshot.graphs.values().cloned().collect()
     }
@@ -195,41 +495,21 @@ impl GraphRegistry {
         self.len() == 0
     }
 
-    /// Add a new handle. Async because the mutex is `tokio::sync::Mutex`
-    /// (a future managed-catalog flow may hold it across `.await` points
-    /// during atomic registry mutations). Rejects duplicate `GraphKey`
-    /// and duplicate `uri`.
-    ///
-    /// **Test-only surface.** No production code reaches this — startup
-    /// uses `from_handles`, and runtime add/remove is deferred. The
-    /// race-contract tests below pin the mutex linearization point so
-    /// that when a real consumer ships (managed cluster catalog), the
-    /// concurrency contract is already proven. Ungate by removing
-    /// `#[cfg(test)]` once that consumer is in scope.
-    ///
-    /// Race semantics (pinned by `concurrent_insert_same_key_exactly_one_succeeds`):
-    /// under N concurrent calls with the same key, exactly one returns
-    /// `Ok(())` and the rest return `Err(InsertError::DuplicateKey(_))`.
     #[cfg(test)]
     pub async fn insert(&self, handle: Arc<GraphHandle>) -> Result<(), InsertError> {
         let _guard = self.mutate.lock().await;
         let current = self.snapshot.load();
-        let (canonical_uri, handle) = canonicalize_handle_uri(handle)?;
-        if current.graphs.contains_key(&handle.key) {
-            return Err(InsertError::DuplicateKey(handle.key.clone()));
+        let entry = Arc::new(GraphEntry::from_handle(handle)?);
+        if current.graphs.contains_key(&entry.key) {
+            return Err(InsertError::DuplicateKey(entry.key.clone()));
         }
         for existing in current.graphs.values() {
-            let existing_uri =
-                normalize_root_uri(&existing.uri).map_err(|err| InsertError::InvalidUri {
-                    uri: existing.uri.clone(),
-                    message: err.to_string(),
-                })?;
-            if existing_uri == canonical_uri {
-                return Err(InsertError::DuplicateUri(handle.uri.clone()));
+            if existing.uri == entry.uri {
+                return Err(InsertError::DuplicateUri(entry.uri.clone()));
             }
         }
         let mut new_graphs = current.graphs.clone();
-        new_graphs.insert(handle.key.clone(), handle);
+        new_graphs.insert(entry.key.clone(), entry);
         self.snapshot
             .store(Arc::new(RegistrySnapshot::new(new_graphs)));
         Ok(())
@@ -273,6 +553,17 @@ mod tests {
 
     const TEST_SCHEMA: &str = "node Person { name: String @key }\n";
 
+    fn startup_config(graph_id: &str, uri: String) -> GraphStartupConfig {
+        GraphStartupConfig {
+            graph_id: graph_id.to_string(),
+            uri,
+            policy: None,
+            startup_error: None,
+            embedding: None,
+            queries: QueryRegistry::default(),
+        }
+    }
+
     async fn build_handle(graph_id: &str, dir: &Path) -> Arc<GraphHandle> {
         let graph_uri = dir.join(graph_id).to_str().unwrap().to_string();
         let engine = Omnigraph::init(&graph_uri, TEST_SCHEMA)
@@ -295,6 +586,45 @@ mod tests {
         assert!(registry.list().is_empty());
     }
 
+    #[test]
+    fn configured_entries_exist_before_open_and_validate_all_collisions() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("same").to_string_lossy().to_string();
+        let duplicate = GraphRegistry::from_configs(vec![
+            startup_config("alpha", uri.clone()),
+            startup_config("beta", format!("file://{uri}/")),
+        ]);
+        assert!(matches!(duplicate, Err(InsertError::DuplicateUri(_))));
+
+        let mut configured = startup_config("alpha", uri);
+        configured.policy = Some(crate::PolicySource::Inline(
+            "version: 1\nrules: []\n".into(),
+        ));
+        let registry = GraphRegistry::from_configs(vec![configured]).unwrap();
+        assert_eq!(registry.len(), 1);
+        assert!(registry.snapshot_ref().any_per_graph_policy);
+        let entry = registry.list().pop().unwrap();
+        assert_eq!(entry.availability().state, "opening");
+        assert!(!entry.availability().read_ready);
+        assert!(matches!(
+            registry.get(&entry.key),
+            RegistryLookup::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn configured_entries_reject_invalid_ids_before_open() {
+        let dir = TempDir::new().unwrap();
+        let error = match GraphRegistry::from_configs(vec![startup_config(
+            "not/valid",
+            dir.path().join("graph").to_string_lossy().to_string(),
+        )]) {
+            Ok(_) => panic!("invalid graph id must fail preflight"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, InsertError::InvalidGraphId { .. }));
+    }
+
     #[tokio::test]
     async fn insert_then_get_returns_ready() {
         let dir = TempDir::new().unwrap();
@@ -306,6 +636,7 @@ mod tests {
             RegistryLookup::Ready(found) => {
                 assert!(Arc::ptr_eq(&found, &handle));
             }
+            RegistryLookup::Unavailable(_) => panic!("expected Ready, got Unavailable"),
             RegistryLookup::Gone => panic!("expected Ready, got Gone"),
         }
     }
@@ -317,6 +648,7 @@ mod tests {
         match registry.get(&key) {
             RegistryLookup::Gone => {}
             RegistryLookup::Ready(_) => panic!("expected Gone"),
+            RegistryLookup::Unavailable(_) => panic!("expected Gone"),
         }
     }
 
@@ -548,14 +880,19 @@ mod tests {
             for _ in 0..200 {
                 let snap = reader_registry.list();
                 assert!(snap.len() <= N_WRITES);
-                for handle in &snap {
-                    match reader_registry.get(&handle.key) {
+                for entry in &snap {
+                    match reader_registry.get(&entry.key) {
                         RegistryLookup::Ready(found) => {
-                            assert!(Arc::ptr_eq(&found, handle));
+                            let expected = entry.serving_handle().expect("listed entry is serving");
+                            assert!(Arc::ptr_eq(&found, &expected));
                         }
+                        RegistryLookup::Unavailable(_) => panic!(
+                            "snapshot listed key {} but get() returned Unavailable",
+                            entry.key.graph_id
+                        ),
                         RegistryLookup::Gone => panic!(
                             "snapshot listed key {} but get() returned Gone",
-                            handle.key.graph_id
+                            entry.key.graph_id
                         ),
                     }
                 }
