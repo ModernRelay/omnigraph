@@ -349,26 +349,25 @@ pub(crate) const MAX_EFFECT_IDENTITY_SCAN_VERSIONS: u64 = MAX_BRANCH_MERGE_DATA_
 
 /// Selects which recovery actions are allowed in a sweep.
 ///
-/// Open-time recovery (`Omnigraph::open` with `OpenMode::ReadWrite`)
-/// runs the full sweep — `Dataset::restore` is safe because no other
-/// writers are active yet. In-process recovery (called from
-/// `Omnigraph::refresh` during a long-running server) must NOT call
-/// `Dataset::restore`: it "wins" against concurrent Append/Update/
-/// Delete/CreateIndex/Merge per `check_restore_txn`, silently orphaning
-/// the concurrent writer's commit (pinned by
-/// `src/table_store/staged_tests.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
-/// Roll-forward is safe under concurrency because
-/// `ManifestBatchPublisher::publish` uses row-level CAS.
+/// Read-write open and explicit `Omnigraph::refresh` run the Full sweep.
+/// `Dataset::restore` would silently orphan a concurrent Lance commit without
+/// higher-level serialization (pinned by
+/// `src/table_store/staged_tests.rs::lance_restore_loses_to_concurrent_append_via_orphaning`),
+/// so Full recovery is valid only while the caller holds the process-global
+/// root schema gate and this module adds the sidecar's branch and sorted table
+/// gates. That protects every `Omnigraph` handle in this process, but not a
+/// foreign writer process. Ordinary write-entry healing remains
+/// RollForwardOnly because it is a cheap synchronous barrier, not the owner of
+/// destructive recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveryMode {
-    /// Open-time: the full sweep. RolledPastExpected → roll forward;
+    /// Gated Full sweep. RolledPastExpected → roll forward;
     /// mixed/unexpected → roll back via `Dataset::restore`; invariant
     /// violation → abort with a loud error.
     Full,
-    /// In-process (refresh): roll-forward only. Sidecars that would
-    /// require restore or abort are LEFT ON DISK for the next ReadWrite
-    /// open. Closes the common case (mutation/load finalize → publisher
-    /// failure) without restart.
+    /// Write-entry fast path: roll-forward only. Sidecars that require restore
+    /// or abort remain on disk for an explicit Full refresh (the server
+    /// schedules one after `RecoveryRequired`).
     RollForwardOnly,
 }
 
@@ -2998,9 +2997,8 @@ pub(crate) async fn restore_table_to_version(
     Ok(())
 }
 
-/// In-process heal for pending recovery sidecars — the entry point for
-/// long-lived handles (`Omnigraph::refresh` and the staged-write entry
-/// points `load_as` / `mutate_as`).
+/// In-process roll-forward heal for pending recovery sidecars — the cheap
+/// barrier used by staged-write entry points such as `load_as` / `mutate_as`.
 ///
 /// Steady-state cost is one `list_dir` of `__recovery/` (typically
 /// empty → immediate return), so write entry points can afford to call
@@ -3008,8 +3006,8 @@ pub(crate) async fn restore_table_to_version(
 /// `RecoveryMode::RollForwardOnly`: the common Phase B → Phase C
 /// residual (per-table `commit_staged` landed, manifest publish did
 /// not) rolls forward in-process; rollback-eligible or invariant-
-/// violating sidecars are deferred to the next ReadWrite open, exactly
-/// as `Omnigraph::refresh` documents.
+/// violating sidecars are left for the next explicit Full refresh or
+/// read-write open.
 ///
 /// Concurrency: unlike the open-time sweep, this runs while other writers may
 /// be in flight. RFC-022 mutation/load holds root-scoped schema → branch →
@@ -3860,14 +3858,13 @@ async fn process_sidecar(
                 )))
             }
             RecoveryMode::RollForwardOnly => {
-                // In-process refresh-time recovery: leave the sidecar
-                // and defer the loud abort to the next ReadWrite open.
-                // Operator-actionable error surfacing belongs at open,
-                // not silently inside refresh.
+                // The synchronous write-entry healer leaves the sidecar for an
+                // explicit Full refresh/read-write open, where the invariant
+                // violation is surfaced loudly.
                 warn!(
                     operation_id = sidecar.operation_id.as_str(),
                     writer_kind = ?sidecar.writer_kind,
-                    "recovery: deferring sidecar with invariant violation to next ReadWrite open"
+                    "recovery: deferring sidecar with invariant violation to next Full recovery"
                 );
                 Ok(false)
             }
@@ -3988,14 +3985,13 @@ async fn process_sidecar(
                 .map(|()| true);
             }
             if matches!(mode, RecoveryMode::RollForwardOnly) {
-                // In-process recovery cannot run Dataset::restore safely
-                // (would orphan a concurrent writer's commit). Leave the
-                // sidecar in place; the next ReadWrite open will handle
-                // it via the full sweep.
+                // The write-entry fast path does not own destructive recovery.
+                // Leave the sidecar for the next gated Full refresh/read-write
+                // open.
                 warn!(
                     operation_id = sidecar.operation_id.as_str(),
                     writer_kind = ?sidecar.writer_kind,
-                    "recovery: deferring rollback-eligible sidecar to next ReadWrite open"
+                    "recovery: deferring rollback-eligible sidecar to next Full recovery"
                 );
                 return Ok(false);
             }
