@@ -4,7 +4,9 @@ use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::{LoadMode, load_jsonl, load_jsonl_file};
+use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::ir::ParamMap;
 
 use helpers::*;
@@ -1659,33 +1661,95 @@ async fn blob_update_null_to_non_null() {
 
 #[tokio::test]
 async fn blob_load_external_file_uri() {
-    // Regression: loading blobs with external file:// URIs was rejected with
-    // "External blob URI '...' is outside registered external bases" because
-    // allow_external_blob_outside_bases was not set on data table write paths.
+    // Overwrite is the one write mode that intentionally retains an authorized
+    // URI descriptor. Keyed modes consume the URI as a source and materialize
+    // managed bytes instead.
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    // Create a temp file to reference
+    // Create a temp file beneath one exact embedded-only base.
     let blob_dir = tempfile::tempdir().unwrap();
-    let blob_path = blob_dir.path().join("test.txt");
+    let blob_path = blob_dir.path().join("shared~source.txt");
     std::fs::write(&blob_path, b"Hello from file").unwrap();
-    let file_uri = format!("file://{}", blob_path.display());
+    let file_uri = url::Url::from_file_path(&blob_path)
+        .expect("external blob path is absolute")
+        .to_string();
+    let base_uri = url::Url::from_directory_path(blob_dir.path())
+        .expect("external blob base is absolute")
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
 
-    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
     let data = format!(
         r#"{{"type": "Document", "data": {{"title": "from-file", "content": "{}"}}}}"#,
         file_uri
     );
 
-    // Load with external URI
+    // Overwrite preserves the exact authorized reference rather than silently
+    // copying it into managed storage.
     load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
 
-    // Verify the blob is accessible
     let blob = db
         .read_blob("Document", "from-file", "content")
         .await
         .unwrap();
-    assert!(blob.uri().is_some(), "external blob should have a URI");
+    assert_eq!(blob.uri(), Some(file_uri.as_str()));
+    assert_eq!(&blob.read().await.unwrap()[..], b"Hello from file");
+
+    // Two raw spellings normalize to the same URI. The operation-wide
+    // preflight must share one source entry (and therefore one payload read)
+    // before either strict-insert row is staged.
+    let encoded_alias = file_uri.replace("~source", "%7Esource");
+    assert_ne!(encoded_alias, file_uri);
+    let duplicate_source_rows = format!(
+        "{}\n{}",
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "copy-a", "content": file_uri},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "copy-b", "content": encoded_alias},
+        })
+    );
+    let probes = MergeWriteProbes::default();
+    with_merge_write_probes(
+        probes.clone(),
+        load_jsonl(&db, &duplicate_source_rows, LoadMode::Append),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        probes.external_blob_probe_inputs(),
+        2,
+        "both URI-bearing cells must participate in operation-wide preflight"
+    );
+    assert_eq!(
+        probes.external_blob_probe_calls(),
+        1,
+        "normalized-equivalent URI inputs must cause one metadata probe"
+    );
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        1,
+        "normalized-equivalent URI inputs must share one preflighted payload"
+    );
+    for title in ["copy-a", "copy-b"] {
+        let copied = db.read_blob("Document", title, "content").await.unwrap();
+        assert_eq!(
+            copied.uri(),
+            None,
+            "keyed append must materialize the source URI"
+        );
+        assert_eq!(&copied.read().await.unwrap()[..], b"Hello from file");
+    }
 }
 
 // ─── Regression: execute_update on edge type ─────────────────────────────────

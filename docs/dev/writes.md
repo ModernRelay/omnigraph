@@ -91,6 +91,22 @@ Mutation and load use a closed prepare → effect → publish attempt:
    earlier effect or ambiguous ownership leaves the sidecar authoritative and
    returns `RecoveryRequired`.
 
+Every new external Blob URI first passes the immutable graph-level
+`ExternalBlobPolicy`; the default is deny. New logical Mutation/Load input and
+every row-writing BranchMerge build one operation-wide admission plan. Scalar
+table preparation may already have produced temporary inputs; the promised
+boundary is that URI admission completes before any external payload read,
+recovery arm, target HEAD or branch-ref movement, or graph-visible effect.
+Admitted URIs are normalized, equivalent spellings share one metadata probe,
+and every logical cell is charged at full size. A predicate mutation that
+carries already-persisted external descriptors discovers them through its
+bounded materialization scan instead; aliases share one probe within each scan
+batch and may be probed again in a later batch, while the graph's object-store
+registry remains shared. Payload reuse is likewise bounded to one prepared
+table batch or merge chunk rather than cached for the operation's lifetime.
+Policy failures and missing or unreadable sources are typed and remain
+pre-arm/no-effect.
+
 Keyed StrictInsert/Upsert has one additional Phase-A blob rule. Lance's
 `MergeInsertBuilder` has no `WriteParams` hook, so it cannot set
 `allow_external_blob_outside_bases`. Before staging, the adapter sums external
@@ -521,7 +537,10 @@ touched table and fail before sidecar arm above 8,192 rows or 32 MiB. Operators
 split larger incremental inputs into separate graph commits; initial bulk
 replacement uses Overwrite. For Blob values supplied as external URIs, Append
 and Merge copy the referenced payload under the same 32 MiB aggregate pre-read
-ceiling; Overwrite retains the external URI cell as a reference.
+ceiling; Overwrite retains the external URI cell as a reference. Independently
+of those keyed row limits, every Mutation/Load mode—including Overwrite—admits
+at most 8,192 new external-URI cells across the complete multi-table graph
+operation, with a separate 32 MiB retained URI-planning budget before HEAD.
 
 `LoadMode::Overwrite` accumulates
 replacement batches in memory, validates node/edge constraints, referential

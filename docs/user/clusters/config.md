@@ -80,6 +80,10 @@ graphs:
     schema: knowledge.pg
     embedding_provider: default
     queries: queries/          # discover every `query <name>` in queries/*.gq
+    external_blobs:
+      allow:
+        - base: s3://assets-bucket/knowledge/
+          scope: server_safe
 
 policies:
   base:
@@ -117,6 +121,53 @@ only when a `--cluster` server boots, so `cluster validate`, `plan`, and
 `apply` do not need deployment secrets. `mock` is deterministic and does not
 require `api_key`. Vector dimensions stay schema-driven by the target
 `Vector(N)` column, not the provider profile.
+
+`graphs.<id>.external_blobs` is the graph-level resource boundary for new
+external Blob URI ingress. Missing `external_blobs`, or an empty `allow` list,
+means deny. Every entry requires an exact absolute `base` plus a `scope`:
+
+- `server_safe` admits an S3 base to a cluster-served graph;
+- `embedded_only` may admit an existing local `file://` directory to an
+  embedded engine, but is removed from the policy used by the HTTP server.
+
+An `embedded_only` entry in cluster configuration does not make direct-store
+CLI commands policy-aware. It is authority an embedded host may explicitly
+consume and install on its engine handle; the direct CLI remains deny-only.
+
+Validation canonicalizes bases, compares URI components rather than string
+prefixes, rejects overlapping bases, credentials, query/fragment components,
+path traversal, ambiguous encodings, and a `file://` server-safe entry. Local
+bases are canonicalized as directories so a symlink below an allowed directory
+cannot escape it. The normalized policy is part of the graph resource digest
+and is recorded in applied state; the server never re-reads mutable desired
+config to obtain it. Cedar still decides which actor may write the graph. The
+external Blob policy independently limits which objects any authorized writer
+may cause the process to probe or copy, and cannot be overridden per request.
+
+Applied ledgers that contain an allow policy use a new optional 0.10 state
+field. This does not change the graph's manifest or recovery format, but an old
+0.9 control-plane binary will reject that newer ledger shape. Deny remains the
+historical omitted/default spelling, so clusters that do not enable external
+Blob ingress retain the old serialized graph-resource shape.
+
+To roll a cluster that enabled allow rules back to a 0.9 control plane, first
+keep the 0.10 binary in place, remove each graph's `external_blobs` field, and
+run `omnigraph cluster apply --config <dir>` to convergence. While v0.10 is
+still running, that applies deny, removes `external_blob_policy` from the
+applied graph resource, and restores its historical digest; this is a
+control-state update and does not move the graph manifest or any data-table
+version. The purpose is only to restore a state shape that v0.9 can parse.
+v0.9 does not preserve the boundary: its writers admit arbitrary supported
+external URIs, including `file://`. Quiesce writers first, replace the complete
+server/control-plane fleet, and do not run mixed v0.9/v0.10 writers. If
+default-deny or the configured bases are a required security boundary, do not
+roll back to v0.9. Merely changing desired YAML leaves the newer applied ledger
+intact, while manually deleting the state field breaks the digest-bound
+authority record. Serving boot, `cluster refresh`, and `cluster apply` all
+refuse that ledger before recovery can reuse or re-sign its metadata. Restore
+`state.json` from a trusted copy before retrying; if the ledger is genuinely
+lost or corrupt, follow the import recovery procedure in the cluster operator
+guide instead of editing resource fields or digests.
 
 `storage:` (optional) is the **storage root URI** for everything the cluster
 stores — the state ledger, lock, content-addressed catalog, recovery
@@ -156,6 +207,7 @@ operation is active.
 - policy `applies_to` graph references, one runtime kind per bundle, and one
   bundle per served graph or cluster scope
 - embedding provider profiles and graph `embedding_provider` references
+- external Blob bases, scopes, normalization, and non-overlap
 
 Fields reserved for later phases, such as `pipelines`, top-level
 `embeddings`, `ui`, `aliases`, and `bindings`, fail with a typed diagnostic
@@ -193,7 +245,16 @@ resource is planned as a create. If present, the file must use this shape:
       },
       "graph.knowledge": {
         "digest": "...",
-        "embedding_provider": "provider.embedding.default"
+        "embedding_provider": "provider.embedding.default",
+        "external_blob_policy": {
+          "mode": "allow",
+          "bases": [
+            {
+              "uri": "s3://assets-bucket/knowledge/",
+              "scope": "server_safe"
+            }
+          ]
+        }
       },
       "policy.base": {
         "digest": "...",

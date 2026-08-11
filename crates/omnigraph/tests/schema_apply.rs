@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
 
 use helpers::*;
@@ -588,6 +589,15 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
     let external_path = external_dir.path().join("external.bin");
     std::fs::write(&external_path, b"External").unwrap();
     let external_uri = format!("file://{}", external_path.display());
+    let external_policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(external_dir.path())
+                .expect("external blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
     let initial = r#"
 node Document {
     title: String @key
@@ -595,7 +605,11 @@ node Document {
     note: String?
 }
 "#;
-    let db = Omnigraph::init(uri, initial).await.unwrap();
+    let db = Omnigraph::init(uri, initial)
+        .await
+        .unwrap()
+        .with_external_blob_policy(external_policy)
+        .unwrap();
     let data = [
         serde_json::json!({
             "type": "Document",
@@ -627,6 +641,11 @@ node Document {
     .collect::<Vec<_>>()
     .join("\n");
     load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
+
+    // Admission policy is not durable graph data. Reopen with the default
+    // deny policy so the rewrite proves that a historical descriptor is
+    // carried without re-authorizing or probing its caller-owned target.
+    let db = Omnigraph::open(uri).await.unwrap();
 
     let documents_before = count_rows(&db, "node:Document").await;
     let before_version = db

@@ -3,7 +3,7 @@ use arrow_array::{
 };
 use arrow_schema::SchemaRef;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
@@ -27,10 +27,12 @@ use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use crate::blob::BlobDescriptorDecoder;
+use crate::blob::{
+    BlobDescriptor, BlobDescriptorDecoder, ExternalBlobPolicy, NormalizedExternalBlobUri,
+};
 use crate::db::manifest::TableVersionMetadata;
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::{OmniError, Result};
@@ -51,6 +53,10 @@ use crate::storage_layer::{
 /// that the actual effect inserted every source row and updated nothing.
 pub(crate) const INSERT_ABSENCE_PROPERTY: &str = "omnigraph.insert_absence";
 pub(crate) const INSERT_ABSENCE_V1: &str = "v1";
+
+const EXTERNAL_BLOB_PROBE_CONCURRENCY: usize = 8;
+const EXTERNAL_BLOB_REFERENCE_RESOURCE: &str = "external Blob reference cells";
+const EXTERNAL_BLOB_URI_METADATA_RESOURCE: &str = "external Blob URI metadata bytes";
 
 pub(crate) fn has_insert_absence_certificate(transaction: &Transaction) -> bool {
     transaction
@@ -287,6 +293,321 @@ impl StagedWrite {
     }
 }
 
+struct PreflightedExternalBlob {
+    normalized_uri: NormalizedExternalBlobUri,
+    store: Arc<lance::io::ObjectStore>,
+    path: object_store::path::Path,
+    object_size: u64,
+}
+
+impl PreflightedExternalBlob {
+    fn range_size(&self, offset: u64, length: Option<u64>) -> Result<u64> {
+        let payload_size = match length {
+            Some(length) => length,
+            None => self.object_size.checked_sub(offset).ok_or_else(|| {
+                OmniError::external_blob_source(
+                    self.normalized_uri.as_str(),
+                    format!(
+                        "external Blob offset {offset} exceeds object size {}",
+                        self.object_size
+                    ),
+                )
+            })?,
+        };
+        let end = offset.checked_add(payload_size).ok_or_else(|| {
+            OmniError::external_blob_source(
+                self.normalized_uri.as_str(),
+                "external Blob range overflows u64",
+            )
+        })?;
+        if end > self.object_size {
+            return Err(OmniError::external_blob_source(
+                self.normalized_uri.as_str(),
+                format!(
+                    "external Blob range {offset}..{end} exceeds object size {}",
+                    self.object_size
+                ),
+            ));
+        }
+        Ok(payload_size)
+    }
+
+    async fn read_full(&self) -> Result<Arc<[u8]>> {
+        let uri = self.normalized_uri.as_str().to_string();
+        if self.object_size == 0 {
+            return Ok(Arc::<[u8]>::from([]));
+        }
+        let end = usize::try_from(self.object_size).map_err(|_| {
+            OmniError::resource_limit(
+                "external Blob object bytes",
+                usize::MAX as u64,
+                self.object_size,
+            )
+        })?;
+        let bytes = self
+            .store
+            .read_one_range(&self.path, 0..end)
+            .await
+            .map_err(|error| OmniError::external_blob_source(&uri, error.to_string()))?;
+        crate::instrumentation::record_blob_payload_read();
+        crate::instrumentation::record_external_blob_payload_read();
+        Ok(Arc::<[u8]>::from(bytes.as_ref()))
+    }
+
+    async fn read_range(&self, offset: u64, length: Option<u64>) -> Result<Arc<[u8]>> {
+        let payload_size = self.range_size(offset, length)?;
+        let end_u64 = offset.checked_add(payload_size).ok_or_else(|| {
+            OmniError::external_blob_source(
+                self.normalized_uri.as_str(),
+                "external Blob range overflows u64",
+            )
+        })?;
+        if end_u64 > self.object_size {
+            return Err(OmniError::external_blob_source(
+                self.normalized_uri.as_str(),
+                format!(
+                    "external Blob range {offset}..{end_u64} exceeds object size {}",
+                    self.object_size
+                ),
+            ));
+        }
+        if offset == 0 && end_u64 == self.object_size {
+            return self.read_full().await;
+        }
+        if payload_size == 0 {
+            return Ok(Arc::<[u8]>::from([]));
+        }
+        let start = usize::try_from(offset).map_err(|_| {
+            OmniError::external_blob_source(
+                self.normalized_uri.as_str(),
+                "external Blob range start does not fit usize",
+            )
+        })?;
+        let end = usize::try_from(end_u64).map_err(|_| {
+            OmniError::external_blob_source(
+                self.normalized_uri.as_str(),
+                "external Blob range end does not fit usize",
+            )
+        })?;
+        let bytes = self
+            .store
+            .read_one_range(&self.path, start..end)
+            .await
+            .map_err(|error| {
+                OmniError::external_blob_source(self.normalized_uri.as_str(), error.to_string())
+            })?;
+        crate::instrumentation::record_blob_payload_read();
+        crate::instrumentation::record_external_blob_payload_read();
+        Ok(Arc::<[u8]>::from(bytes.as_ref()))
+    }
+}
+
+/// Effect-free, operation-wide proof for every external Blob URI admitted by
+/// an input batch. Entries retain the shared object-store client and exact
+/// observed size so keyed materialization does not repeat setup or HEAD.
+#[derive(Default)]
+pub(crate) struct ExternalBlobPreflight {
+    by_input: HashMap<String, Arc<PreflightedExternalBlob>>,
+}
+
+pub(crate) type ExternalBlobPayloadCache = HashMap<(String, u64, Option<u64>), Arc<[u8]>>;
+
+#[derive(Debug, Clone)]
+struct ExternalBlobRangeRequest {
+    uri: String,
+    offset: u64,
+    length: Option<u64>,
+}
+
+/// Descriptor-only accounting for the exact persisted Blob cells a branch
+/// merge will carry. The first pass stores only bounded external requests and
+/// a scalar managed-byte total; it never retains source rows or payloads.
+#[derive(Debug, Default)]
+pub(crate) struct PersistedBlobSelection {
+    managed_payload_bytes: u64,
+    external: Vec<ExternalBlobRangeRequest>,
+    retained_uri_metadata_bytes: u64,
+}
+
+impl PersistedBlobSelection {
+    pub(crate) fn include_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        append_persisted_blob_selection(self, batch)
+    }
+
+    pub(crate) fn external_cell_count(&self) -> usize {
+        self.external.len()
+    }
+
+    fn push_external(&mut self, uri: String, offset: u64, length: Option<u64>) -> Result<()> {
+        let next_count = self.external.len().checked_add(1).ok_or_else(|| {
+            OmniError::manifest_internal("external Blob reference count overflow")
+        })?;
+        if next_count > KEYED_WRITE_MAX_ROWS {
+            return Err(OmniError::resource_limit(
+                EXTERNAL_BLOB_REFERENCE_RESOURCE,
+                KEYED_WRITE_MAX_ROWS as u64,
+                next_count as u64,
+            ));
+        }
+        let retained = retained_string_bytes(&uri)?;
+        let next_metadata = self
+            .retained_uri_metadata_bytes
+            .checked_add(retained)
+            .ok_or_else(|| {
+                OmniError::manifest_internal("external Blob URI metadata byte count overflow")
+            })?;
+        if next_metadata > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                EXTERNAL_BLOB_URI_METADATA_RESOURCE,
+                KEYED_WRITE_MAX_BYTES,
+                next_metadata,
+            ));
+        }
+        self.retained_uri_metadata_bytes = next_metadata;
+        self.external.push(ExternalBlobRangeRequest {
+            uri,
+            offset,
+            length,
+        });
+        Ok(())
+    }
+
+    fn add_managed_payload(&mut self, length: u64) -> Result<()> {
+        self.managed_payload_bytes =
+            self.managed_payload_bytes
+                .checked_add(length)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("materialized Blob payload byte count overflow")
+                })?;
+        Ok(())
+    }
+
+    pub(crate) fn materialized_payload_bytes(
+        &self,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<u64> {
+        self.external
+            .iter()
+            .try_fold(self.managed_payload_bytes, |total, request| {
+                total
+                    .checked_add(
+                        preflight
+                            .entry(&request.uri)?
+                            .range_size(request.offset, request.length)?,
+                    )
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "materialized Blob payload byte count overflow",
+                        )
+                    })
+            })
+    }
+}
+
+#[derive(Default)]
+struct ExternalBlobMetadataBudget {
+    bytes: u64,
+}
+
+impl ExternalBlobMetadataBudget {
+    fn retain_string(&mut self, value: &str) -> Result<()> {
+        self.retain_bytes(retained_string_bytes(value)?)
+    }
+
+    fn retain_bytes(&mut self, bytes: u64) -> Result<()> {
+        let next = self.bytes.checked_add(bytes).ok_or_else(|| {
+            OmniError::manifest_internal("external Blob URI metadata byte count overflow")
+        })?;
+        if next > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                EXTERNAL_BLOB_URI_METADATA_RESOURCE,
+                KEYED_WRITE_MAX_BYTES,
+                next,
+            ));
+        }
+        self.bytes = next;
+        Ok(())
+    }
+}
+
+/// Bounded ownership for logical external-URI cells discovered after
+/// last-write-wins folding. The source Arrow batches keep the original
+/// strings; this collector charges its one retained copy before allocation so
+/// an operation cannot build an unbounded URI vector and reject only later in
+/// preflight.
+#[derive(Default)]
+pub(crate) struct ExternalBlobUriCollector {
+    uris: Vec<String>,
+    metadata: ExternalBlobMetadataBudget,
+}
+
+impl ExternalBlobUriCollector {
+    pub(crate) fn include_batch(&mut self, batch: &RecordBatch) -> Result<std::ops::Range<usize>> {
+        let start = self.uris.len();
+        visit_external_blob_uris(batch, |uri| {
+            let next_count = self.uris.len().checked_add(1).ok_or_else(|| {
+                OmniError::manifest_internal("external Blob reference count overflow")
+            })?;
+            if next_count > KEYED_WRITE_MAX_ROWS {
+                return Err(OmniError::resource_limit(
+                    EXTERNAL_BLOB_REFERENCE_RESOURCE,
+                    KEYED_WRITE_MAX_ROWS as u64,
+                    next_count as u64,
+                ));
+            }
+            self.metadata.retain_string(uri)?;
+            self.uris.push(uri.to_owned());
+            Ok(())
+        })?;
+        Ok(start..self.uris.len())
+    }
+
+    pub(crate) fn as_slice(&self) -> &[String] {
+        &self.uris
+    }
+
+    fn into_vec(self) -> Vec<String> {
+        self.uris
+    }
+}
+
+fn retained_string_bytes(value: &str) -> Result<u64> {
+    let bytes = value
+        .len()
+        .checked_add(std::mem::size_of::<String>())
+        .ok_or_else(|| {
+            OmniError::manifest_internal("external Blob URI metadata byte count overflow")
+        })?;
+    u64::try_from(bytes)
+        .map_err(|_| OmniError::manifest_internal("external Blob URI metadata does not fit u64"))
+}
+
+impl ExternalBlobPreflight {
+    fn entry(&self, uri: &str) -> Result<&Arc<PreflightedExternalBlob>> {
+        self.by_input.get(uri).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "external Blob URI '{uri}' was not included in operation-wide preflight"
+            ))
+        })
+    }
+
+    /// Sum logical copied bytes with multiplicity. URI probes are deduplicated;
+    /// payload reuse is separately bounded to one materialization batch. Two
+    /// cells referencing the same object still become two managed values and
+    /// therefore consume the operation budget twice.
+    pub(crate) fn materialized_payload_bytes<T: AsRef<str>>(&self, uris: &[T]) -> Result<u64> {
+        uris.iter().try_fold(0_u64, |total, uri| {
+            total
+                .checked_add(self.entry(uri.as_ref())?.object_size)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "materialized external Blob payload byte count overflow",
+                    )
+                })
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TableStore {
     root_uri: String,
@@ -295,6 +616,9 @@ pub struct TableStore {
     /// this store performs attaches it; the read path's handle cache shares
     /// the same instance via `ReadCaches`.
     session: Arc<lance::session::Session>,
+    /// Immutable graph-level resource policy. The default is deny; an engine
+    /// builder replaces it before exposing the handle to writers.
+    external_blob_policy: Arc<ExternalBlobPolicy>,
 }
 
 impl TableStore {
@@ -302,7 +626,121 @@ impl TableStore {
         Self {
             root_uri: root_uri.trim_end_matches('/').to_string(),
             session,
+            external_blob_policy: Arc::new(ExternalBlobPolicy::Deny),
         }
+    }
+
+    pub(crate) fn with_external_blob_policy(mut self, policy: ExternalBlobPolicy) -> Result<Self> {
+        self.external_blob_policy = Arc::new(policy.validated()?);
+        Ok(self)
+    }
+
+    /// Authorize, normalize, deduplicate, and probe every URI before any
+    /// external payload read, recovery arm, target HEAD/ref movement, or
+    /// graph-visible effect. Scalar-only preparation may already have produced
+    /// temporary in-memory or staged inputs. The graph session supplies the
+    /// process-wide shared registry, so one operation does not create cold
+    /// clients per row.
+    pub(crate) async fn preflight_external_blob_uris(
+        &self,
+        uris: &[String],
+    ) -> Result<ExternalBlobPreflight> {
+        self.preflight_external_blob_uri_iter(uris.len(), uris.iter().map(String::as_str))
+            .await
+    }
+
+    pub(crate) async fn preflight_persisted_blob_selection(
+        &self,
+        selection: &PersistedBlobSelection,
+    ) -> Result<ExternalBlobPreflight> {
+        self.preflight_external_blob_uri_iter(
+            selection.external_cell_count(),
+            selection
+                .external
+                .iter()
+                .map(|request| request.uri.as_str()),
+        )
+        .await
+    }
+
+    async fn preflight_external_blob_uri_iter<'a>(
+        &self,
+        uri_count: usize,
+        uris: impl IntoIterator<Item = &'a str>,
+    ) -> Result<ExternalBlobPreflight> {
+        if uri_count > KEYED_WRITE_MAX_ROWS {
+            return Err(OmniError::resource_limit(
+                EXTERNAL_BLOB_REFERENCE_RESOURCE,
+                KEYED_WRITE_MAX_ROWS as u64,
+                uri_count as u64,
+            ));
+        }
+
+        // At peak the caller still retains its raw URI vector while this pass
+        // owns one alias key per occurrence and two normalized strings per
+        // distinct object (the grouping key and the eventual proof entry).
+        // Charge every retained String slot plus bytes before cloning it.
+        let mut metadata = ExternalBlobMetadataBudget::default();
+        let mut pending: BTreeMap<String, (NormalizedExternalBlobUri, Vec<String>)> =
+            BTreeMap::new();
+        for uri in uris {
+            // The caller's raw URI remains live and this pass retains one
+            // alias copy. Reserve both before normalization allocates.
+            metadata.retain_string(uri)?;
+            metadata.retain_string(uri)?;
+            let normalized = self.external_blob_policy.authorize(uri)?;
+            if let Some((_, aliases)) = pending.get_mut(normalized.as_str()) {
+                aliases.push(uri.to_string());
+            } else {
+                metadata.retain_string(normalized.as_str())?;
+                metadata.retain_string(normalized.as_str())?;
+                let normalized_uri = normalized.as_str().to_string();
+                pending.insert(normalized_uri, (normalized, vec![uri.to_string()]));
+            }
+        }
+
+        crate::instrumentation::record_external_blob_preflight_inputs(uri_count);
+        let registry = self.session.store_registry();
+        let entries = futures::stream::iter(pending.into_values().map(|(normalized, aliases)| {
+            let registry = Arc::clone(&registry);
+            async move {
+                let uri = normalized.as_str().to_string();
+                let (store, path) = lance::io::ObjectStore::from_uri_and_params(
+                    registry,
+                    &uri,
+                    &lance::io::ObjectStoreParams::default(),
+                )
+                .await
+                .map_err(|error| OmniError::external_blob_source(&uri, error.to_string()))?;
+                crate::instrumentation::record_external_blob_probe();
+                let object_size = store
+                    .size(&path)
+                    .await
+                    .map_err(|error| OmniError::external_blob_source(&uri, error.to_string()))?;
+                Ok::<_, OmniError>((
+                    aliases,
+                    Arc::new(PreflightedExternalBlob {
+                        normalized_uri: normalized,
+                        store,
+                        path,
+                        object_size,
+                    }),
+                ))
+            }
+        }))
+        .buffer_unordered(EXTERNAL_BLOB_PROBE_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+        let mut preflight = ExternalBlobPreflight {
+            by_input: HashMap::with_capacity(uri_count),
+        };
+        for (aliases, entry) in entries {
+            for input in aliases {
+                preflight.by_input.insert(input, Arc::clone(&entry));
+            }
+        }
+        Ok(preflight)
     }
 
     // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
@@ -520,7 +958,7 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         let mut materialized = Vec::with_capacity(batches.len());
         for batch in batches {
-            materialized.push(Self::materialize_blob_batch(ds, batch).await?);
+            materialized.push(self.materialize_blob_batch(ds, batch).await?);
         }
         Ok(materialized)
     }
@@ -538,12 +976,7 @@ impl TableStore {
             let arrow_schema: SchemaRef = Arc::new(ds.schema().into());
             let raw: SendableRecordBatchStream =
                 Self::scan_stream(ds, None, None, None, true).await?.into();
-            return Ok(Self::materialize_blob_stream(
-                ds.clone(),
-                arrow_schema,
-                raw,
-                None,
-            ));
+            return Ok(self.materialize_blob_stream(ds.clone(), arrow_schema, raw, None));
         }
         // Non-blob: a true lazy scan. `DatasetRecordBatchStream` converts to the
         // `SendableRecordBatchStream` that `execute_uncommitted_stream` consumes.
@@ -579,7 +1012,7 @@ impl TableStore {
                 })
                 .await?
                 .into();
-            return Ok(Self::materialize_blob_stream(
+            return Ok(self.materialize_blob_stream(
                 ds.clone(),
                 arrow_schema,
                 raw,
@@ -598,6 +1031,7 @@ impl TableStore {
     }
 
     fn materialize_blob_stream(
+        &self,
         ds: Dataset,
         schema: SchemaRef,
         raw: SendableRecordBatchStream,
@@ -610,23 +1044,21 @@ impl TableStore {
             // writer-defined recovery chunks. `try_unfold` is sequential: at
             // most one row's blob payload is read before downstream consumes it.
             let materialized = futures::stream::try_unfold(
-                (raw, None::<RecordBatch>, 0_usize, ds),
-                move |(mut raw, mut current, mut offset, ds)| async move {
+                (raw, None::<RecordBatch>, 0_usize, ds, self.clone()),
+                move |(mut raw, mut current, mut offset, ds, store)| async move {
                     loop {
                         if let Some(batch) = current.as_ref()
                             && offset < batch.num_rows()
                         {
                             let row = batch.slice(offset, 1);
                             offset += 1;
-                            let materialized =
-                                Self::materialize_blob_batch_with_limit(&ds, row, Some(limit))
-                                    .await
-                                    .map_err(|error| {
-                                        datafusion::error::DataFusionError::Execution(
-                                            error.to_string(),
-                                        )
-                                    })?;
-                            return Ok(Some((materialized, (raw, current, offset, ds))));
+                            let materialized = store
+                                .materialize_blob_batch_with_limit(&ds, row, Some(limit))
+                                .await
+                                .map_err(|error| {
+                                    datafusion::error::DataFusionError::Execution(error.to_string())
+                                })?;
+                            return Ok(Some((materialized, (raw, current, offset, ds, store))));
                         }
 
                         match raw.try_next().await? {
@@ -642,10 +1074,13 @@ impl TableStore {
             return Box::pin(RecordBatchStreamAdapter::new(schema, materialized));
         }
 
+        let store = self.clone();
         let materialized = raw.and_then(move |batch| {
             let ds = ds.clone();
+            let store = store.clone();
             async move {
-                Self::materialize_blob_batch_with_limit(&ds, batch, None)
+                store
+                    .materialize_blob_batch_with_limit(&ds, batch, None)
                     .await
                     .map_err(|error| {
                         datafusion::error::DataFusionError::Execution(error.to_string())
@@ -659,24 +1094,45 @@ impl TableStore {
     // only caller is the equally-unused `scan_batches_for_rewrite`.
     #[allow(dead_code)]
     pub(crate) async fn materialize_blob_batch(
+        &self,
         ds: &Dataset,
         batch: RecordBatch,
     ) -> Result<RecordBatch> {
-        Self::materialize_blob_batch_with_limit(ds, batch, None).await
+        self.materialize_blob_batch_with_limit(ds, batch, None)
+            .await
     }
 
-    /// Blob-aware materialization with a pre-read payload ceiling. Lance's
-    /// scanner accounts for descriptor bytes, so the referenced file sizes
-    /// must be checked separately before `BlobFile::read` allocates them.
-    pub(crate) async fn materialize_blob_batch_bounded(
+    /// Branch-merge sibling that reuses normalized external payloads only
+    /// within the caller's current bounded staging chunk.
+    pub(crate) async fn materialize_blob_batch_bounded_with_preflight_cache(
+        &self,
         ds: &Dataset,
         batch: RecordBatch,
         max_blob_bytes: u64,
+        external_preflight: &ExternalBlobPreflight,
+        external_payloads: &mut ExternalBlobPayloadCache,
     ) -> Result<RecordBatch> {
-        Self::materialize_blob_batch_with_limit(ds, batch, Some(max_blob_bytes)).await
+        let row_ids = batch
+            .column_by_name("_rowid")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::Lance("expected _rowid column when materializing Blobs".to_string())
+            })?
+            .values()
+            .to_vec();
+        self.materialize_blob_batch_with_row_ids(
+            ds,
+            batch,
+            &row_ids,
+            Some(max_blob_bytes),
+            Some(external_preflight),
+            Some(external_payloads),
+        )
+        .await
     }
 
     async fn materialize_blob_batch_with_limit(
+        &self,
         ds: &Dataset,
         batch: RecordBatch,
         max_blob_bytes: Option<u64>,
@@ -697,7 +1153,8 @@ impl TableStore {
             .copied()
             .collect::<Vec<_>>();
 
-        Self::materialize_blob_batch_with_row_ids(ds, batch, &row_ids, max_blob_bytes).await
+        self.materialize_blob_batch_with_row_ids(ds, batch, &row_ids, max_blob_bytes, None, None)
+            .await
     }
 
     /// Rebuild the blob columns in `batch` using explicit stable row ids.
@@ -709,10 +1166,13 @@ impl TableStore {
     /// non-blob columns + `_rowid`, takes the full descriptor rows by id, and
     /// calls this sibling with the ids captured by the safe scan.
     async fn materialize_blob_batch_with_row_ids(
+        &self,
         ds: &Dataset,
         batch: RecordBatch,
         row_ids: &[u64],
         max_blob_bytes: Option<u64>,
+        supplied_external_preflight: Option<&ExternalBlobPreflight>,
+        supplied_external_payloads: Option<&mut ExternalBlobPayloadCache>,
     ) -> Result<RecordBatch> {
         if batch.num_rows() != row_ids.len() {
             return Err(OmniError::Lance(format!(
@@ -723,8 +1183,31 @@ impl TableStore {
         }
 
         let schema: SchemaRef = Arc::new(ds.schema().into());
+        let owned_external_preflight;
+        let external_preflight = match supplied_external_preflight {
+            Some(preflight) => {
+                self.validate_persisted_blob_batch_preflight(
+                    ds,
+                    &batch,
+                    max_blob_bytes,
+                    preflight,
+                )?;
+                preflight
+            }
+            None => {
+                owned_external_preflight = self
+                    .preflight_persisted_blob_batch(ds, &batch, max_blob_bytes)
+                    .await?;
+                &owned_external_preflight
+            }
+        };
+        // Payload reuse is scoped to this already-bounded materialized batch.
+        // Keeping it out of ExternalBlobPreflight prevents a long branch merge
+        // from retaining every distinct copied object for the operation's
+        // lifetime.
+        let mut owned_external_payloads = ExternalBlobPayloadCache::new();
+        let external_payloads = supplied_external_payloads.unwrap_or(&mut owned_external_payloads);
         let mut columns = Vec::with_capacity(schema.fields().len());
-        let mut materialized_blob_bytes = 0_u64;
         for field in schema.fields() {
             let lance_field = lance::datatypes::Field::try_from(field.as_ref())
                 .map_err(|e| OmniError::Lance(e.to_string()))?;
@@ -743,13 +1226,13 @@ impl TableStore {
                             ))
                         })?;
                 columns.push(
-                    Self::rebuild_blob_column(
+                    self.rebuild_blob_column(
                         ds,
                         field.name(),
                         descriptions,
                         row_ids,
-                        max_blob_bytes,
-                        &mut materialized_blob_bytes,
+                        external_preflight,
+                        external_payloads,
                     )
                     .await?,
                 );
@@ -761,85 +1244,192 @@ impl TableStore {
         RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
     }
 
+    async fn preflight_persisted_blob_batch(
+        &self,
+        ds: &Dataset,
+        batch: &RecordBatch,
+        max_blob_bytes: Option<u64>,
+    ) -> Result<ExternalBlobPreflight> {
+        let mut selection = PersistedBlobSelection::default();
+        selection.include_batch(batch)?;
+        let external = self.preflight_persisted_blob_selection(&selection).await?;
+        self.validate_persisted_blob_batch_preflight(ds, batch, max_blob_bytes, &external)?;
+        Ok(external)
+    }
+
+    fn validate_persisted_blob_batch_preflight(
+        &self,
+        ds: &Dataset,
+        batch: &RecordBatch,
+        max_blob_bytes: Option<u64>,
+        external: &ExternalBlobPreflight,
+    ) -> Result<()> {
+        let total = self.persisted_blob_payload_bytes(ds, batch, external)?;
+        if let Some(limit) = max_blob_bytes
+            && total > limit
+        {
+            return Err(OmniError::resource_limit(
+                "materialized blob payload bytes",
+                limit,
+                total,
+            ));
+        }
+        Ok(())
+    }
+
+    fn persisted_blob_payload_bytes(
+        &self,
+        ds: &Dataset,
+        batch: &RecordBatch,
+        external: &ExternalBlobPreflight,
+    ) -> Result<u64> {
+        let mut total = 0_u64;
+        for field in ds
+            .schema()
+            .fields_pre_order()
+            .filter(|field| field.is_blob())
+        {
+            let descriptions = batch
+                .column_by_name(&field.name)
+                .and_then(|column| column.as_any().downcast_ref::<StructArray>())
+                .ok_or_else(|| {
+                    OmniError::Lance(format!("expected Blob descriptions for '{}'", field.name))
+                })?;
+            let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
+            for row in 0..descriptions.len() {
+                let bytes = match decoder.classify(row)? {
+                    BlobDescriptor::Null => 0,
+                    BlobDescriptor::Managed { length } => length,
+                    BlobDescriptor::External {
+                        uri,
+                        offset,
+                        length,
+                    } => external.entry(&uri)?.range_size(offset, length)?,
+                };
+                total = total.checked_add(bytes).ok_or_else(|| {
+                    OmniError::manifest_internal("materialized Blob payload byte count overflow")
+                })?;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Conservative pre-read size for a persisted descriptor batch. The raw
+    /// one-row Arrow allocation already accounts every ordinary column and
+    /// descriptor buffer; adding logical payload bytes may overestimate the
+    /// smaller logical Blob descriptor, but cannot understate retained memory.
+    pub(crate) fn predicted_materialized_blob_batch_bytes(
+        &self,
+        ds: &Dataset,
+        batch: &RecordBatch,
+        external: &ExternalBlobPreflight,
+        max_blob_bytes: u64,
+    ) -> Result<u64> {
+        let payload = self.persisted_blob_payload_bytes(ds, batch, external)?;
+        if payload > max_blob_bytes {
+            return Err(OmniError::resource_limit(
+                "materialized blob payload bytes",
+                max_blob_bytes,
+                payload,
+            ));
+        }
+        let retained = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+            OmniError::manifest_internal("persisted Blob batch memory size exceeds u64")
+        })?;
+        retained.checked_add(payload).ok_or_else(|| {
+            OmniError::manifest_internal("materialized Blob batch byte count overflow")
+        })
+    }
+
     async fn rebuild_blob_column(
+        &self,
         ds: &Dataset,
         column_name: &str,
         descriptions: &StructArray,
         row_ids: &[u64],
-        max_blob_bytes: Option<u64>,
-        materialized_blob_bytes: &mut u64,
+        external_preflight: &ExternalBlobPreflight,
+        external_payloads: &mut ExternalBlobPayloadCache,
     ) -> Result<ArrayRef> {
         let mut builder = BlobArrayBuilder::new(row_ids.len());
-        let mut non_null_row_ids = Vec::new();
-        let mut row_has_blob = Vec::with_capacity(row_ids.len());
-
         let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
+        let mut descriptors = Vec::with_capacity(row_ids.len());
+        let mut managed_row_ids = Vec::new();
         for (row, row_id) in row_ids.iter().enumerate() {
-            let is_null = decoder.classify(row)?.is_null();
-            row_has_blob.push(!is_null);
-            if !is_null {
-                non_null_row_ids.push(*row_id);
+            let descriptor = decoder.classify(row)?;
+            if matches!(descriptor, BlobDescriptor::Managed { .. }) {
+                managed_row_ids.push(*row_id);
             }
+            descriptors.push(descriptor);
         }
 
-        let blob_files = if non_null_row_ids.is_empty() {
+        let blob_files = if managed_row_ids.is_empty() {
             Vec::new()
         } else {
             Arc::new(ds.clone())
-                .take_blobs(&non_null_row_ids, column_name)
+                .take_blobs(&managed_row_ids, column_name)
                 .await
                 .map_err(|e| OmniError::Lance(e.to_string()))?
         };
 
-        let mut files = blob_files.into_iter();
-        for has_blob in row_has_blob {
-            if !has_blob {
-                builder
+        let mut managed_files = blob_files.into_iter();
+        for descriptor in descriptors {
+            match descriptor {
+                BlobDescriptor::Null => builder
                     .push_null()
-                    .map_err(|e| OmniError::Lance(e.to_string()))?;
-                continue;
+                    .map_err(|error| OmniError::Lance(error.to_string()))?,
+                BlobDescriptor::Managed { length } => {
+                    let blob = managed_files
+                        .next()
+                        .ok_or_else(|| {
+                            OmniError::Lance(format!(
+                                "Blob rewrite for '{column_name}' lost alignment with source rows"
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            OmniError::Lance(format!(
+                                "Blob rewrite for '{column_name}' returned null for a managed descriptor"
+                            ))
+                        })?;
+                    if blob.size() != length {
+                        return Err(OmniError::Lance(format!(
+                            "Blob rewrite for '{column_name}' observed managed length {}, descriptor recorded {length}",
+                            blob.size()
+                        )));
+                    }
+                    crate::instrumentation::record_blob_payload_read();
+                    builder
+                        .push_bytes(
+                            blob.read()
+                                .await
+                                .map_err(|error| OmniError::Lance(error.to_string()))?,
+                        )
+                        .map_err(|error| OmniError::Lance(error.to_string()))?;
+                }
+                BlobDescriptor::External {
+                    uri,
+                    offset,
+                    length,
+                } => {
+                    let entry = external_preflight.entry(&uri)?;
+                    let key = (entry.normalized_uri.as_str().to_string(), offset, length);
+                    let bytes = match external_payloads.get(&key) {
+                        Some(bytes) => Arc::clone(bytes),
+                        None => {
+                            let bytes = entry.read_range(offset, length).await?;
+                            external_payloads.insert(key, Arc::clone(&bytes));
+                            bytes
+                        }
+                    };
+                    builder
+                        .push_bytes(bytes.as_ref())
+                        .map_err(|error| OmniError::Lance(error.to_string()))?;
+                }
             }
-
-            let blob = files
-                .next()
-                .ok_or_else(|| {
-                    OmniError::Lance(format!(
-                        "blob rewrite for '{}' lost alignment with source rows",
-                        column_name
-                    ))
-                })?
-                .ok_or_else(|| {
-                    OmniError::Lance(format!(
-                        "blob rewrite for '{}' returned a null accessor for a non-null description",
-                        column_name
-                    ))
-                })?;
-            let next_blob_bytes = materialized_blob_bytes
-                .checked_add(blob.size())
-                .ok_or_else(|| OmniError::manifest_internal("blob byte count overflow"))?;
-            if let Some(limit) = max_blob_bytes
-                && next_blob_bytes > limit
-            {
-                return Err(OmniError::resource_limit(
-                    "materialized blob payload bytes",
-                    limit,
-                    next_blob_bytes,
-                ));
-            }
-            *materialized_blob_bytes = next_blob_bytes;
-            crate::instrumentation::record_blob_payload_read();
-            builder
-                .push_bytes(
-                    blob.read()
-                        .await
-                        .map_err(|e| OmniError::Lance(e.to_string()))?,
-                )
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
         }
 
-        if files.next().is_some() {
+        if managed_files.next().is_some() {
             return Err(OmniError::Lance(format!(
-                "blob rewrite for '{}' produced extra source blobs",
+                "Blob rewrite for '{}' produced extra managed source blobs",
                 column_name
             )));
         }
@@ -1735,8 +2325,46 @@ impl TableStore {
         table_key: &str,
         batch: RecordBatch,
     ) -> Result<RecordBatch> {
+        let external_uris = collect_external_blob_uris(&batch)?;
+        let preflight = self.preflight_external_blob_uris(&external_uris).await?;
+        self.prepare_keyed_write_batch_with_preflight(table_key, batch, &preflight)
+            .await
+    }
+
+    /// Operation-wide sibling of [`Self::prepare_keyed_write_batch`]. The
+    /// caller has already admitted and probed every URI across all pending
+    /// tables, so this method must not repeat policy checks or HEAD requests.
+    pub(crate) async fn prepare_keyed_write_batch_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch> {
         self.validate_keyed_write_batch(table_key, &batch)?;
-        let batch = materialize_external_blob_inputs(batch, KEYED_WRITE_MAX_BYTES).await?;
+        let external_uris = collect_external_blob_uris(&batch)?;
+        let payload_bytes = preflight.materialized_payload_bytes(&external_uris)?;
+        if payload_bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                "materialized external blob payload bytes",
+                KEYED_WRITE_MAX_BYTES,
+                payload_bytes,
+            ));
+        }
+        let retained_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+            OmniError::manifest_internal("keyed write input batch bytes exceed u64")
+        })?;
+        let predicted_bytes = retained_bytes.checked_add(payload_bytes).ok_or_else(|| {
+            OmniError::manifest_internal("materialized keyed Blob byte count overflow")
+        })?;
+        if predicted_bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                format!("keyed write bytes for {table_key}"),
+                KEYED_WRITE_MAX_BYTES,
+                predicted_bytes,
+            ));
+        }
+        let batch =
+            materialize_external_blob_inputs(batch, KEYED_WRITE_MAX_BYTES, preflight).await?;
         let materialized_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
             OmniError::manifest_internal("materialized keyed write batch bytes exceed u64")
         })?;
@@ -1946,6 +2574,7 @@ impl TableStore {
     /// and rechecked against both hard ceilings before it reaches the per-chunk
     /// strict keyed writer.
     pub async fn scan_proven_insert_delta_bounded(
+        &self,
         source: &Dataset,
         table_key: &str,
         begin_version: u64,
@@ -2024,8 +2653,14 @@ impl TableStore {
         .into();
         let raw = observe_proven_insert_raw_stream(raw);
         let materialized = futures::stream::try_unfold(
-            (raw, None::<RecordBatch>, 0_usize, source.clone()),
-            |(mut raw, mut current, mut offset, source)| async move {
+            (
+                raw,
+                None::<RecordBatch>,
+                0_usize,
+                source.clone(),
+                self.clone(),
+            ),
+            |(mut raw, mut current, mut offset, source, store)| async move {
                 loop {
                     if let Some(batch) = current.as_ref()
                         && offset < batch.num_rows()
@@ -2050,17 +2685,20 @@ impl TableStore {
                             .map_err(|error| {
                                 datafusion::error::DataFusionError::Execution(error.to_string())
                             })?;
-                        let materialized = Self::materialize_blob_batch_with_row_ids(
-                            &source,
-                            descriptors,
-                            &[row_id],
-                            Some(KEYED_WRITE_MAX_BYTES),
-                        )
-                        .await
-                        .map_err(|error| {
-                            datafusion::error::DataFusionError::Execution(error.to_string())
-                        })?;
-                        return Ok(Some((materialized, (raw, current, offset, source))));
+                        let materialized = store
+                            .materialize_blob_batch_with_row_ids(
+                                &source,
+                                descriptors,
+                                &[row_id],
+                                Some(KEYED_WRITE_MAX_BYTES),
+                                None,
+                                None,
+                            )
+                            .await
+                            .map_err(|error| {
+                                datafusion::error::DataFusionError::Execution(error.to_string())
+                            })?;
+                        return Ok(Some((materialized, (raw, current, offset, source, store))));
                     }
 
                     match raw.try_next().await? {
@@ -2911,13 +3549,16 @@ impl TableStore {
                 .take_rows(&row_ids, committed_ds.schema().clone())
                 .await
                 .map_err(|error| OmniError::Lance(error.to_string()))?;
-            let materialized = match Self::materialize_blob_batch_with_row_ids(
-                committed_ds,
-                descriptors,
-                &row_ids,
-                Some(payload_budget),
-            )
-            .await
+            let materialized = match self
+                .materialize_blob_batch_with_row_ids(
+                    committed_ds,
+                    descriptors,
+                    &row_ids,
+                    Some(payload_budget),
+                    None,
+                    None,
+                )
+                .await
             {
                 Err(OmniError::ResourceLimitExceeded { actual, .. }) => {
                     let actual = account
@@ -3195,9 +3836,10 @@ fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<(
 ///
 /// The retained `Vec<RecordBatch>` never grows past this account: pending
 /// results are charged first, and each committed scanner emission is charged
-/// only after pending-key shadowing. `initial_*` represents batches already
-/// retained by `MutationStaging`, so a chained update receives only the
-/// remaining transaction budget.
+/// only after pending-key shadowing. `initial_rows` represents this table's
+/// retained batches, while `initial_bytes` represents every table retained by
+/// `MutationStaging`, so a chained cross-table update receives only the
+/// remaining graph-operation byte budget.
 struct PendingScanAccount {
     table_key: String,
     rows: u64,
@@ -3487,23 +4129,178 @@ fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fr
     combined
 }
 
-/// Materialize logical external-URI blob cells before keyed merge-insert.
-///
-/// Lance's keyed builder currently has no `WriteParams` hook for allowing an
-/// absolute external reference. Size is resolved and charged before the read,
-/// and columns are processed sequentially under one aggregate payload budget.
-/// The returned arrays retain the target's logical blob schema, so Lance can
-/// still choose inline, packed, or dedicated physical storage normally.
+struct LogicalBlobInput<'a> {
+    data: &'a LargeBinaryArray,
+    uris: &'a StringArray,
+}
+
+fn logical_blob_input<'a>(
+    descriptions: &'a StructArray,
+    field_name: &str,
+) -> Result<LogicalBlobInput<'a>> {
+    let fields = descriptions.fields();
+    let exact_shape = fields.len() == 2
+        && fields[0].name() == "data"
+        && fields[0].data_type() == &arrow_schema::DataType::LargeBinary
+        && fields[0].is_nullable()
+        && fields[1].name() == "uri"
+        && fields[1].data_type() == &arrow_schema::DataType::Utf8
+        && fields[1].is_nullable();
+    if !exact_shape {
+        return Err(OmniError::manifest(format!(
+            "logical Blob input '{field_name}' must have exact nullable children data:LargeBinary and uri:Utf8; prepared storage descriptors are not accepted"
+        )));
+    }
+    let data = descriptions
+        .column(0)
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .ok_or_else(|| {
+            OmniError::manifest(format!(
+                "logical Blob input '{field_name}' has a non-LargeBinary data child"
+            ))
+        })?;
+    let uris = descriptions
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            OmniError::manifest(format!(
+                "logical Blob input '{field_name}' has a non-Utf8 uri child"
+            ))
+        })?;
+    Ok(LogicalBlobInput { data, uris })
+}
+
+/// Add persisted Blob-v2 descriptors to a bounded, descriptor-only operation
+/// selection without opening a target object. Managed lengths and exact
+/// external ranges survive this pass so branch merge neither undercounts
+/// carried bytes nor charges a small range as the whole external object.
+fn append_persisted_blob_selection(
+    selection: &mut PersistedBlobSelection,
+    batch: &RecordBatch,
+) -> Result<()> {
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if !lance_field.is_blob() {
+            continue;
+        }
+        let descriptions = column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "persisted Blob descriptor '{}' is not a struct",
+                    field.name()
+                ))
+            })?;
+        let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
+        for row in 0..descriptions.len() {
+            match decoder.classify(row)? {
+                BlobDescriptor::Null => {}
+                BlobDescriptor::Managed { length } => {
+                    selection.add_managed_payload(length)?;
+                }
+                BlobDescriptor::External {
+                    uri,
+                    offset,
+                    length,
+                } => {
+                    selection.push_external(uri, offset, length)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the exact logical Blob input shape and visit URI cells with
+/// multiplicity. Raw length is checked before the visitor can retain a copy.
+/// This function performs no object-store I/O.
+fn visit_external_blob_uris<'a>(
+    batch: &'a RecordBatch,
+    mut visit: impl FnMut(&'a str) -> Result<()>,
+) -> Result<()> {
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if !lance_field.is_blob() {
+            continue;
+        }
+        let descriptions = column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "logical Blob input '{}' is not a struct",
+                    field.name()
+                ))
+            })?;
+        let input = logical_blob_input(descriptions, field.name())?;
+        for row in 0..descriptions.len() {
+            if descriptions.is_null(row) {
+                continue;
+            }
+            let has_data = input.data.is_valid(row);
+            let has_uri = input.uris.is_valid(row) && !input.uris.value(row).is_empty();
+            match (has_data, has_uri) {
+                (true, false) => {}
+                (false, true) => {
+                    let uri = input.uris.value(row);
+                    crate::blob::validate_external_blob_uri_raw_limit(uri)?;
+                    visit(uri)?;
+                }
+                (true, true) => {
+                    return Err(OmniError::manifest(format!(
+                        "Blob '{}' row {row} cannot contain both inline data and a URI",
+                        field.name()
+                    )));
+                }
+                (false, false) => {
+                    return Err(OmniError::manifest(format!(
+                        "non-null Blob '{}' row {row} contains neither data nor a URI",
+                        field.name()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate and collect one batch's external URI cells under the same bounded
+/// ownership contract used by graph-operation staging.
+pub(crate) fn collect_external_blob_uris(batch: &RecordBatch) -> Result<Vec<String>> {
+    let mut collector = ExternalBlobUriCollector::default();
+    collector.include_batch(batch)?;
+    Ok(collector.into_vec())
+}
+
+/// Materialize logical external-URI Blob cells before keyed merge-insert.
+/// Preflight owns policy, normalization, shared-client setup, and HEAD. This
+/// pass charges every URI occurrence before its first payload read.
 async fn materialize_external_blob_inputs(
     batch: RecordBatch,
     max_payload_bytes: u64,
+    preflight: &ExternalBlobPreflight,
 ) -> Result<RecordBatch> {
+    let external_uris = collect_external_blob_uris(&batch)?;
+    let materialized_payload_bytes = preflight.materialized_payload_bytes(&external_uris)?;
+    if materialized_payload_bytes > max_payload_bytes {
+        return Err(OmniError::resource_limit(
+            "materialized external blob payload bytes",
+            max_payload_bytes,
+            materialized_payload_bytes,
+        ));
+    }
+    if external_uris.is_empty() {
+        return Ok(batch);
+    }
+
     let schema = batch.schema();
     let mut columns = Vec::with_capacity(batch.num_columns());
-    let mut materialized_payload_bytes = 0_u64;
-    let mut changed = false;
-    let registry = Arc::new(lance::io::ObjectStoreRegistry::default());
-
+    let mut external_payloads: HashMap<String, Arc<[u8]>> = HashMap::new();
     for (field, column) in schema.fields().iter().zip(batch.columns()) {
         let lance_field = lance::datatypes::Field::try_from(field.as_ref())
             .map_err(|error| OmniError::Lance(error.to_string()))?;
@@ -3514,161 +4311,33 @@ async fn materialize_external_blob_inputs(
         let descriptions = column
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| {
-                OmniError::Lance(format!("expected blob struct input for '{}'", field.name()))
-            })?;
-        // Dataset scans can already yield prepared descriptors. Those are
-        // handled by the branch-merge materializer before this adapter.
-        if descriptions.column_by_name("kind").is_some() {
-            columns.push(column.clone());
-            continue;
-        }
-        let uris = descriptions
-            .column_by_name("uri")
-            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "logical blob input '{}' is missing Utf8 child 'uri'",
-                    field.name()
-                ))
-            })?;
-        if !(0..descriptions.len()).any(|row| {
-            descriptions.is_valid(row) && uris.is_valid(row) && !uris.value(row).is_empty()
-        }) {
-            columns.push(column.clone());
-            continue;
-        }
-        let data = descriptions
-            .column_by_name("data")
-            .and_then(|array| array.as_any().downcast_ref::<LargeBinaryArray>())
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "logical blob input '{}' is missing LargeBinary child 'data'",
-                    field.name()
-                ))
-            })?;
-        let positions = descriptions
-            .column_by_name("position")
-            .map(|array| {
-                array.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
-                    OmniError::Lance(format!(
-                        "logical blob input '{}' has non-UInt64 child 'position'",
-                        field.name()
-                    ))
-                })
-            })
-            .transpose()?;
-        let sizes = descriptions
-            .column_by_name("size")
-            .map(|array| {
-                array.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
-                    OmniError::Lance(format!(
-                        "logical blob input '{}' has non-UInt64 child 'size'",
-                        field.name()
-                    ))
-                })
-            })
-            .transpose()?;
-
+            .ok_or_else(|| OmniError::manifest("logical Blob input is not a struct"))?;
+        let input = logical_blob_input(descriptions, field.name())?;
         let mut builder = BlobArrayBuilder::new(descriptions.len());
         for row in 0..descriptions.len() {
             if descriptions.is_null(row) {
                 builder
                     .push_null()
                     .map_err(|error| OmniError::Lance(error.to_string()))?;
-                continue;
-            }
-            let has_data = data.is_valid(row);
-            let has_uri = uris.is_valid(row) && !uris.value(row).is_empty();
-            match (has_data, has_uri) {
-                (true, false) => builder
-                    .push_bytes(data.value(row))
-                    .map_err(|error| OmniError::Lance(error.to_string()))?,
-                (false, true) => {
-                    let uri = uris.value(row);
-                    url::Url::parse(uri).map_err(|_| {
-                        OmniError::manifest(format!(
-                            "external blob URI '{uri}' is not a valid absolute URI"
-                        ))
-                    })?;
-                    let (store, path) = lance::io::ObjectStore::from_uri_and_params(
-                        registry.clone(),
-                        uri,
-                        &lance::io::ObjectStoreParams::default(),
-                    )
-                    .await
+            } else if input.data.is_valid(row) {
+                builder
+                    .push_bytes(input.data.value(row))
                     .map_err(|error| OmniError::Lance(error.to_string()))?;
-                    let object_size = store
-                        .size(&path)
-                        .await
-                        .map_err(|error| OmniError::Lance(error.to_string()))?;
-                    let position =
-                        positions.and_then(|array| array.is_valid(row).then(|| array.value(row)));
-                    let declared_size =
-                        sizes.and_then(|array| array.is_valid(row).then(|| array.value(row)));
-                    let (offset, payload_size) = match (position, declared_size) {
-                        (Some(offset), Some(size)) => {
-                            let end = offset.checked_add(size).ok_or_else(|| {
-                                OmniError::manifest("external blob range overflows u64")
-                            })?;
-                            if end > object_size {
-                                return Err(OmniError::manifest(format!(
-                                    "external blob range {offset}..{end} exceeds object size {object_size}"
-                                )));
-                            }
-                            (offset, size)
-                        }
-                        (None, None) => (0, object_size),
-                        _ => {
-                            return Err(OmniError::manifest(format!(
-                                "external blob URI '{uri}' must set both position and size"
-                            )));
-                        }
-                    };
-                    materialized_payload_bytes = materialized_payload_bytes
-                        .checked_add(payload_size)
-                        .ok_or_else(|| {
-                            OmniError::manifest_internal("external blob payload byte overflow")
-                        })?;
-                    if materialized_payload_bytes > max_payload_bytes {
-                        return Err(OmniError::resource_limit(
-                            "materialized external blob payload bytes",
-                            max_payload_bytes,
-                            materialized_payload_bytes,
-                        ));
+            } else {
+                let uri = input.uris.value(row);
+                let entry = preflight.entry(uri)?;
+                let normalized = entry.normalized_uri.as_str();
+                let bytes = match external_payloads.get(normalized) {
+                    Some(bytes) => Arc::clone(bytes),
+                    None => {
+                        let bytes = entry.read_full().await?;
+                        external_payloads.insert(normalized.to_string(), Arc::clone(&bytes));
+                        bytes
                     }
-                    let start = usize::try_from(offset).map_err(|_| {
-                        OmniError::manifest("external blob offset does not fit usize")
-                    })?;
-                    let end_u64 = offset
-                        .checked_add(payload_size)
-                        .ok_or_else(|| OmniError::manifest("external blob range overflows u64"))?;
-                    let end = usize::try_from(end_u64).map_err(|_| {
-                        OmniError::manifest("external blob range does not fit usize")
-                    })?;
-                    // Read the exact size proven above. `read_one_all` could
-                    // exceed the budget if a mutable external object grows
-                    // between HEAD and GET.
-                    let bytes = store
-                        .read_one_range(&path, start..end)
-                        .await
-                        .map_err(|error| OmniError::Lance(error.to_string()))?;
-                    builder
-                        .push_bytes(bytes)
-                        .map_err(|error| OmniError::Lance(error.to_string()))?;
-                }
-                (true, true) => {
-                    return Err(OmniError::manifest(format!(
-                        "blob '{}' row {row} cannot contain both inline data and a URI",
-                        field.name()
-                    )));
-                }
-                (false, false) => {
-                    return Err(OmniError::manifest(format!(
-                        "non-null blob '{}' row {row} contains neither data nor a URI",
-                        field.name()
-                    )));
-                }
+                };
+                builder
+                    .push_bytes(bytes.as_ref())
+                    .map_err(|error| OmniError::Lance(error.to_string()))?;
             }
         }
         columns.push(
@@ -3676,11 +4345,6 @@ async fn materialize_external_blob_inputs(
                 .finish()
                 .map_err(|error| OmniError::Lance(error.to_string()))?,
         );
-        changed = true;
-    }
-
-    if !changed {
-        return Ok(batch);
     }
     RecordBatch::try_new(schema, columns).map_err(|error| OmniError::Lance(error.to_string()))
 }
@@ -4525,13 +5189,213 @@ fn check_batch_unique_by_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::StringArray;
+    use arrow_array::{StringArray, UInt8Array, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
+    use lance::blob::BlobArrayBuilder;
 
     fn batch_with_ids(ids: &[&str]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
         let col = Arc::new(StringArray::from(ids.to_vec())) as ArrayRef;
         RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    fn logical_blob_batch(values: &[&str]) -> RecordBatch {
+        let mut builder = BlobArrayBuilder::new(values.len());
+        for value in values {
+            builder.push_uri(*value).unwrap();
+        }
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![lance::blob::blob_field("payload", false)])),
+            vec![builder.finish().unwrap()],
+        )
+        .unwrap()
+    }
+
+    fn persisted_external_blob_batch(values: &[&str]) -> RecordBatch {
+        let fields = lance::datatypes::BLOB_V2_DESC_FIELDS.clone();
+        let descriptions = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(UInt8Array::from(vec![3; values.len()])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![0; values.len()])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![0; values.len()])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![0; values.len()])) as ArrayRef,
+                Arc::new(StringArray::from(values.to_vec())) as ArrayRef,
+            ],
+            None,
+        );
+        let field = Field::new("payload", DataType::Struct(fields), false)
+            .with_metadata(lance::datatypes::BLOB_V2_DESC_FIELD.metadata().clone());
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field])),
+            vec![Arc::new(descriptions)],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn logical_blob_uri_collection_preserves_multiplicity() {
+        let batch = logical_blob_batch(&["s3://bucket/base/object", "s3://bucket/base/%6Fbject"]);
+        assert_eq!(
+            collect_external_blob_uris(&batch).unwrap(),
+            vec![
+                "s3://bucket/base/object".to_string(),
+                "s3://bucket/base/%6Fbject".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn file_preflight_deduplicates_normalized_target_but_counts_cells() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = directory.path().join("file");
+        std::fs::write(&object, b"payload").unwrap();
+        let base_uri = url::Url::from_directory_path(directory.path()).unwrap();
+        let object_uri = url::Url::from_file_path(&object).unwrap().to_string();
+        let equivalent_uri = format!(
+            "{}%66ile",
+            object_uri
+                .strip_suffix("file")
+                .expect("test file URI suffix")
+        );
+        let policy = ExternalBlobPolicy::allow(vec![
+            crate::blob::ExternalBlobBase::new(
+                base_uri.as_str(),
+                crate::blob::ExternalBlobExecutionScope::EmbeddedOnly,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let store = TableStore::new(
+            directory.path().to_string_lossy().as_ref(),
+            crate::lance_access::LanceAccessContext::new().data_session(),
+        )
+        .with_external_blob_policy(policy)
+        .unwrap();
+        let uris = vec![object_uri, equivalent_uri];
+        let preflight = store.preflight_external_blob_uris(&uris).await.unwrap();
+        assert_eq!(preflight.materialized_payload_bytes(&uris).unwrap(), 14);
+        let first = preflight.entry(&uris[0]).unwrap();
+        let second = preflight.entry(&uris[1]).unwrap();
+        assert!(Arc::ptr_eq(first, second));
+    }
+
+    #[test]
+    fn external_blob_metadata_budget_accepts_exact_limit_and_refuses_one_more() {
+        let mut budget = ExternalBlobMetadataBudget::default();
+        budget.retain_bytes(KEYED_WRITE_MAX_BYTES).unwrap();
+        let error = budget.retain_bytes(1).unwrap_err();
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: KEYED_WRITE_MAX_BYTES,
+                actual,
+            } if resource == EXTERNAL_BLOB_URI_METADATA_RESOURCE
+                && actual == KEYED_WRITE_MAX_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn persisted_blob_selection_admits_exact_external_cells_and_refuses_one_over() {
+        let batch = persisted_external_blob_batch(
+            &(0..KEYED_WRITE_MAX_ROWS)
+                .map(|_| "s3://bucket/base/object")
+                .collect::<Vec<_>>(),
+        );
+        let mut selection = PersistedBlobSelection::default();
+        selection.include_batch(&batch).unwrap();
+        assert_eq!(selection.external_cell_count(), KEYED_WRITE_MAX_ROWS);
+
+        let one_more = persisted_external_blob_batch(&["s3://bucket/base/object"]);
+        let error = selection.include_batch(&one_more).unwrap_err();
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit,
+                actual,
+            } if resource == EXTERNAL_BLOB_REFERENCE_RESOURCE
+                && limit == KEYED_WRITE_MAX_ROWS as u64
+                && actual == KEYED_WRITE_MAX_ROWS as u64 + 1
+        ));
+    }
+
+    #[test]
+    fn persisted_blob_selection_uri_metadata_exact_and_plus_one_use_descriptor_batch() {
+        let uri = "s3://bucket/base/object";
+        let batch = persisted_external_blob_batch(&[uri]);
+        let charge = retained_string_bytes(uri).unwrap();
+
+        let mut exact = PersistedBlobSelection {
+            retained_uri_metadata_bytes: KEYED_WRITE_MAX_BYTES - charge,
+            ..PersistedBlobSelection::default()
+        };
+        exact.include_batch(&batch).unwrap();
+        assert_eq!(
+            exact.retained_uri_metadata_bytes, KEYED_WRITE_MAX_BYTES,
+            "the final descriptor at the exact metadata ceiling must be admitted"
+        );
+
+        let mut plus_one = PersistedBlobSelection {
+            retained_uri_metadata_bytes: KEYED_WRITE_MAX_BYTES - charge + 1,
+            ..PersistedBlobSelection::default()
+        };
+        let error = plus_one.include_batch(&batch).unwrap_err();
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: KEYED_WRITE_MAX_BYTES,
+                actual,
+            } if resource == EXTERNAL_BLOB_URI_METADATA_RESOURCE
+                && actual == KEYED_WRITE_MAX_BYTES + 1
+        ));
+        assert_eq!(
+            plus_one.external_cell_count(),
+            0,
+            "metadata refusal must precede retaining the descriptor"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_blob_selection_charges_exact_external_range_not_whole_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = directory.path().join("large-sparse-object");
+        std::fs::File::create(&object)
+            .unwrap()
+            .set_len(KEYED_WRITE_MAX_BYTES + 1)
+            .unwrap();
+        let base_uri = url::Url::from_directory_path(directory.path()).unwrap();
+        let object_uri = url::Url::from_file_path(&object).unwrap().to_string();
+        let policy = ExternalBlobPolicy::allow(vec![
+            crate::blob::ExternalBlobBase::new(
+                base_uri.as_str(),
+                crate::blob::ExternalBlobExecutionScope::EmbeddedOnly,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let store = TableStore::new(
+            directory.path().to_string_lossy().as_ref(),
+            crate::lance_access::LanceAccessContext::new().data_session(),
+        )
+        .with_external_blob_policy(policy)
+        .unwrap();
+        let mut selection = PersistedBlobSelection::default();
+        selection.add_managed_payload(7).unwrap();
+        selection
+            .push_external(object_uri, 1024, Some(2048))
+            .unwrap();
+        let preflight = store
+            .preflight_persisted_blob_selection(&selection)
+            .await
+            .unwrap();
+        assert_eq!(
+            selection.materialized_payload_bytes(&preflight).unwrap(),
+            2055,
+            "a persisted range must not be charged as its whole backing object"
+        );
     }
 
     #[test]

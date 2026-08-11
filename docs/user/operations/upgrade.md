@@ -104,6 +104,13 @@ columns including vectors and blobs) of the chosen branch (default `main`; pass
 `--branch` for another) to stdout. `omnigraph load --mode overwrite` replaces the
 target graph's contents with that snapshot.
 
+The direct-store recipe above can import managed Blob values only. In v0.10 a
+bare direct CLI open has no allow-policy source and rejects every new external
+URI reference. If the export contains external Blob URIs, initialize the target
+as a cluster graph, configure exact `external_blobs` bases, and load through its
+server, or write the export through an embedded `Omnigraph` handle with an
+`ExternalBlobPolicy` installed. There is deliberately no per-load escape flag.
+
 Once you have verified the rebuilt graph, retire the old one. If you rebuilt
 through a storage-format boundary, the target must be a different URI: keep the
 source root intact until row/vector/blob verification and fleet cutover are
@@ -117,12 +124,18 @@ complete. Do not use force-init to turn the old root into the new format.
 - **Embeddings are not recomputed.** Export carries the stored vectors verbatim, so
   a load does not re-run the embedding pipeline. If you changed the embedding model,
   re-embed after loading.
-- **External Blob URIs remain references during rebuild.** Export preserves the
-  URI and the documented rebuild uses `--mode overwrite`, so verify that the new
-  fleet can still read the referenced object before cutover. Later keyed
-  `append`/`merge` writes copy external payloads instead, as described below.
-- **Server deployments**: take the graph out of the serving set, rebuild it offline
-  with the CLI, then point the cluster at the rebuilt graph (`cluster apply`).
+- **External Blob URIs remain references only through a policy-aware rebuild.**
+  Export preserves the URI and an allowed `--mode overwrite` retains it, so
+  verify that the new fleet can still read the referenced object before
+  cutover. The direct-store CLI recipe cannot admit the URI in v0.10; use the
+  configured cluster-server or embedded-policy route described above. Later
+  allowed keyed `append`/`merge` writes copy external payloads instead.
+- **Server deployments**: for a managed-Blob-only export, take the graph out of
+  the serving set, rebuild it offline with the direct CLI, then point the
+  cluster at the rebuilt graph (`cluster apply`). If the export contains
+  external references, rebuild through a staging cluster server with the exact
+  allow bases configured, or through an embedded handle with the graph policy
+  installed; the direct-store CLI cannot admit those references.
 
 ## Migrating to v0.8.0
 
@@ -244,10 +257,12 @@ The user-visible load modes are now deliberately distinct:
 - `--mode overwrite` replaces the target image as before; the replacement
   dataset still carries the exact-`id` PK metadata.
 
-For Blob values supplied as external URIs, `append` and `merge` copy referenced
-payload bytes after enforcing a 32 MiB aggregate pre-read ceiling. `overwrite`
-retains Lance's external-reference behavior. This is intentional: Lance's
-merge-insert builder has no `WriteParams` hook, while Overwrite does.
+For Blob values admitted by the graph's external-Blob policy, `append` and
+`merge` copy referenced payload bytes after enforcing a 32 MiB aggregate
+pre-read ceiling. `overwrite` retains Lance's external-reference behavior. This
+is intentional: Lance's merge-insert builder has no `WriteParams` hook, while
+Overwrite does. A direct-store CLI open has no allow-policy source in this
+phase; use a configured cluster server or an embedded handle for such an import.
 
 This format cannot be obtained by adding metadata to a live v4 or development
 v5 root. Lance's filtered/unfiltered conflict behavior is directional, so every

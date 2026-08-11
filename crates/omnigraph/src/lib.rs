@@ -25,4 +25,7 @@ pub(crate) mod storage_layer;
 pub(crate) mod table_store;
 pub(crate) mod validate;
 
+pub use blob::{
+    EXTERNAL_BLOB_URI_MAX_BYTES, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy,
+};
 pub use table_store::IndexCoverage;

@@ -74,6 +74,35 @@ descriptor-backed extension column: null is the Arrow parent validity, while a
 non-null zero-length value is a valid empty Blob. Physical placement is
 Lance-owned and is not part of the `.pg` schema contract.
 
+Blob input keeps one JSON spelling across nodes and edges:
+
+- `base64:<payload>` supplies managed bytes owned by the graph;
+- any other string requests an external URI reference.
+
+New external URI ingress is denied by default. Embedded callers must install a
+graph-level `ExternalBlobPolicy` with an exact allowed base; cluster-served
+graphs declare the equivalent per-graph policy in `cluster.yaml`. The policy is
+an additional resource boundary, not a per-request option. It compares
+normalized URI components rather than string prefixes, never permits
+`file://` in server execution, and probes each distinct approved source before
+the write's first durable effect.
+
+The direct-store CLI has no allow-policy source in this phase, so a bare
+`--store`/positional graph open admits managed `base64:` Blob input only. To
+write a new external reference from the CLI, target a cluster server whose
+graph has configured bases; an embedded application can instead install the
+same graph-level policy on its engine builder. There is no command flag that
+weakens the policy for one request.
+
+Write mode determines ownership. Overwrite preserves an approved external URI
+as a caller-owned reference. Strict insert, upsert, append/merge load,
+mutation-update carry, and a HEAD-advancing branch merge that writes rows copy
+approved source bytes into managed Blob storage under the existing 32 MiB
+keyed-write ceiling. A pointer-only branch fast-forward preserves the existing
+descriptor without policy approval or source I/O. Existing stored external
+references remain readable and exportable when new ingress is denied;
+OmniGraph never deletes their target objects.
+
 For a keyed node, `id` is derived from the complete typed `@key` tuple. A
 single-column key keeps its canonical scalar spelling. A composite key is an
 unambiguous JSON array of those canonical scalar strings, ordered by stable

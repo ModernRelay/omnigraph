@@ -178,6 +178,17 @@ fn duplicate_yaml_key_rejection_keeps_quoted_hashes() {
 }
 
 #[test]
+fn duplicate_yaml_key_guard_scopes_sequence_mapping_items() {
+    let valid = "allow:\n  - base: s3://one/\n    scope: server_safe\n  - base: s3://two/\n    scope: server_safe\n";
+    assert!(duplicate_key_diagnostics(valid).is_empty());
+
+    let invalid = "allow:\n  - base: s3://one/\n    scope: server_safe\n    scope: embedded_only\n";
+    let diagnostics = duplicate_key_diagnostics(invalid);
+    assert_eq!(diagnostics.len(), 1);
+    assert!(diagnostics[0].path.ends_with("allow[].scope"));
+}
+
+#[test]
 fn missing_schema_query_and_policy_files() {
     let dir = fixture();
     fs::write(
@@ -489,6 +500,130 @@ graphs:
     );
     assert!(
         codes.contains("dangling_embedding_provider_reference"),
+        "{:?}",
+        out.diagnostics
+    );
+}
+
+#[test]
+fn external_blob_config_normalizes_once_and_defaults_to_deny() {
+    let dir = fixture();
+    let default = load_desired(dir.path());
+    assert!(
+        !has_errors(&default.diagnostics),
+        "{:?}",
+        default.diagnostics
+    );
+    assert_eq!(
+        default.desired.unwrap().graphs[0].external_blob_policy,
+        omnigraph::ExternalBlobPolicy::Deny
+    );
+    let validated = validate_config_dir(dir.path());
+    assert!(validated.ok, "{:?}", validated.diagnostics);
+    let warning = validated
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "external_blob_ingress_default_deny")
+        .expect("cluster validate must call out the secure-default behavior change");
+    assert_eq!(warning.path, "graphs.knowledge.external_blobs");
+    assert_eq!(warning.severity, DiagnosticSeverity::Warning);
+
+    let embedded = dir.path().join("external-assets");
+    fs::create_dir(&embedded).unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        format!(
+            r#"
+version: 1
+graphs:
+  knowledge:
+    schema: ./people.pg
+    external_blobs:
+      allow:
+        - base: S3://Assets-Bucket/knowledge
+          scope: server_safe
+        - base: file://{}
+          scope: embedded_only
+"#,
+            embedded.display()
+        ),
+    )
+    .unwrap();
+
+    let outcome = load_desired(dir.path());
+    assert!(
+        !has_errors(&outcome.diagnostics),
+        "{:?}",
+        outcome.diagnostics
+    );
+    let policy = &outcome.desired.unwrap().graphs[0].external_blob_policy;
+    assert_eq!(policy.bases().len(), 2);
+    let server = policy
+        .bases()
+        .iter()
+        .find(|base| base.scope() == omnigraph::ExternalBlobExecutionScope::ServerSafe)
+        .unwrap();
+    assert_eq!(server.uri(), "s3://assets-bucket/knowledge/");
+    let embedded = policy
+        .bases()
+        .iter()
+        .find(|base| base.scope() == omnigraph::ExternalBlobExecutionScope::EmbeddedOnly)
+        .unwrap();
+    assert!(embedded.uri().starts_with("file:///"));
+    assert!(embedded.uri().ends_with("/external-assets/"));
+    let validated = validate_config_dir(dir.path());
+    assert!(validated.ok, "{:?}", validated.diagnostics);
+    assert!(
+        validated
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "external_blob_ingress_default_deny"),
+        "an explicit allow policy must not be described as default deny: {:?}",
+        validated.diagnostics
+    );
+}
+
+#[test]
+fn external_blob_config_rejects_unsafe_and_overlapping_bases() {
+    let dir = fixture();
+    let embedded = dir.path().join("external-assets");
+    fs::create_dir(&embedded).unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        format!(
+            r#"
+version: 1
+graphs:
+  unsafe_file:
+    schema: ./people.pg
+    external_blobs:
+      allow:
+        - base: file://{}
+          scope: server_safe
+  overlap:
+    schema: ./people.pg
+    external_blobs:
+      allow:
+        - base: s3://assets/knowledge/
+          scope: server_safe
+        - base: s3://assets/knowledge/images/
+          scope: server_safe
+"#,
+            embedded.display()
+        ),
+    )
+    .unwrap();
+
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    let codes: BTreeSet<_> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
+    assert!(
+        codes.contains("invalid_external_blob_base"),
+        "{:?}",
+        out.diagnostics
+    );
+    assert!(
+        codes.contains("invalid_external_blob_policy"),
         "{:?}",
         out.diagnostics
     );
@@ -1093,11 +1228,19 @@ async fn refresh_existing_minimal_state_increments_revision_and_updates_cas() {
     init_derived_graph(dir.path()).await;
     let state_dir = dir.path().join(CLUSTER_STATE_DIR);
     fs::create_dir_all(&state_dir).unwrap();
+    let graph_digest = historical_graph_digest("knowledge", None, &[]);
     fs::write(
-            state_dir.join("state.json"),
-            r#"{"version":1,"applied_revision":{"config_digest":"old","resources":{"graph.knowledge":{"digest":"old"}}}}"#,
-        )
-        .unwrap();
+        state_dir.join("state.json"),
+        serde_json::to_string(&json!({
+            "version": 1,
+            "applied_revision": {
+                "config_digest": "old",
+                "resources": { "graph.knowledge": { "digest": graph_digest } }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     let out = refresh_config_dir(dir.path()).await;
     assert!(out.ok, "{:?}", out.diagnostics);
@@ -1137,10 +1280,11 @@ async fn refresh_records_live_schema_digest_and_manifest_version() {
 #[tokio::test]
 async fn missing_derived_graph_root_marks_drifted_and_plans_creates() {
     let dir = fixture();
+    let graph_digest = historical_graph_digest("knowledge", Some("old-schema"), &[]);
     write_state_resources(
         dir.path(),
         &[
-            ("graph.knowledge", "old-graph"),
+            ("graph.knowledge", graph_digest.as_str()),
             ("schema.knowledge", "old-schema"),
         ],
     );
@@ -1178,11 +1322,19 @@ async fn live_schema_mismatch_marks_drifted_and_causes_plan_update() {
     .unwrap();
     let state_dir = dir.path().join(CLUSTER_STATE_DIR);
     fs::create_dir_all(&state_dir).unwrap();
+    let graph_digest = historical_graph_digest("knowledge", Some("old-schema"), &[]);
     fs::write(
-            state_dir.join("state.json"),
-            r#"{"version":1,"applied_revision":{"resources":{"graph.knowledge":{"digest":"old-graph"},"schema.knowledge":{"digest":"old-schema"}}}}"#,
-        )
-        .unwrap();
+        state_dir.join("state.json"),
+        serde_json::to_string(&json!({
+            "version": 1,
+            "applied_revision": { "resources": {
+                "graph.knowledge": { "digest": graph_digest },
+                "schema.knowledge": { "digest": "old-schema" }
+            }}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     let out = refresh_config_dir(dir.path()).await;
     assert!(out.ok, "{:?}", out.diagnostics);
@@ -1354,6 +1506,28 @@ fn write_state_resources(config_dir: &Path, resources: &[(&str, &str)]) {
     .unwrap();
 }
 
+/// Historical graph resources omitted `external_blob_policy`; that wire shape
+/// is valid only when its stored digest binds the resulting default-Deny
+/// composite exactly.
+fn historical_graph_digest(
+    graph_id: &str,
+    schema_digest: Option<&str>,
+    query_digests: &[(&str, &str)],
+) -> String {
+    let schema_digest = schema_digest.map(str::to_string);
+    let query_digests = query_digests
+        .iter()
+        .map(|(name, digest)| ((*name).to_string(), (*digest).to_string()))
+        .collect();
+    graph_digest(
+        graph_id,
+        schema_digest.as_ref(),
+        Some(&query_digests),
+        None,
+        None,
+    )
+}
+
 fn read_state_json(config_dir: &Path) -> serde_json::Value {
     serde_json::from_str(&fs::read_to_string(config_dir.join(CLUSTER_STATE_FILE)).unwrap()).unwrap()
 }
@@ -1450,6 +1624,12 @@ async fn apply_writes_payloads_state_and_statuses() {
         None,
     );
     assert_eq!(resources["graph.knowledge"]["digest"], expected_composite);
+    assert!(
+        resources["graph.knowledge"]
+            .get("external_blob_policy")
+            .is_none(),
+        "default deny must retain the historical applied-state shape"
+    );
     assert_eq!(
         state["applied_revision"]["config_digest"],
         desired_revision_digest(&out)
@@ -1463,6 +1643,82 @@ async fn apply_writes_payloads_state_and_statuses() {
         "applied"
     );
     assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+}
+
+#[tokio::test]
+async fn external_blob_policy_allow_to_deny_restores_historical_state_without_graph_movement() {
+    let dir = fixture();
+    let config_path = dir.path().join(CLUSTER_CONFIG_FILE);
+    let historical_config = fs::read_to_string(&config_path).unwrap();
+    let historical = load_desired(dir.path()).desired.unwrap();
+    let historical_config_digest = historical.config_digest;
+    let historical_graph_digest = historical.resource_digests["graph.knowledge"].clone();
+
+    let external_blob_block = r#"    external_blobs:
+      allow:
+        - base: s3://assets-bucket/knowledge/
+          scope: server_safe
+"#;
+    let allow_config = historical_config.replacen(
+        "    queries:\n",
+        &format!("{external_blob_block}    queries:\n"),
+        1,
+    );
+    assert_ne!(allow_config, historical_config);
+    fs::write(&config_path, &allow_config).unwrap();
+
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path());
+    let allow = apply_config_dir(dir.path()).await;
+    assert!(allow.ok && allow.converged, "{allow:?}");
+    let allowed_state = read_state_json(dir.path());
+    assert_eq!(
+        allowed_state["applied_revision"]["resources"]["graph.knowledge"]["external_blob_policy"]["mode"],
+        "allow"
+    );
+    assert_ne!(
+        allowed_state["applied_revision"]["resources"]["graph.knowledge"]["digest"],
+        historical_graph_digest
+    );
+
+    let graph_uri = dir
+        .path()
+        .join(CLUSTER_GRAPHS_DIR)
+        .join("knowledge.omni")
+        .to_string_lossy()
+        .into_owned();
+    let before = Omnigraph::open_read_only(&graph_uri).await.unwrap();
+    let before = before
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let before_manifest_version = before.version();
+    let before_table_version = before.entry("node:Person").unwrap().table_version;
+
+    // Rollback preparation must be performed by the 0.10 control plane: remove
+    // the field entirely (so 0.9 can parse desired config) and re-apply deny.
+    fs::write(&config_path, &historical_config).unwrap();
+    let deny = apply_config_dir(dir.path()).await;
+    assert!(deny.ok && deny.converged, "{deny:?}");
+
+    let denied_state = read_state_json(dir.path());
+    assert_eq!(
+        denied_state["applied_revision"]["config_digest"],
+        historical_config_digest
+    );
+    assert_eq!(
+        denied_state["applied_revision"]["resources"]["graph.knowledge"],
+        json!({ "digest": historical_graph_digest })
+    );
+
+    let after = Omnigraph::open_read_only(&graph_uri).await.unwrap();
+    let after = after.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(after.version(), before_manifest_version);
+    assert_eq!(
+        after.entry("node:Person").unwrap().table_version,
+        before_table_version
+    );
+    assert!(recovery_sidecars(dir.path()).is_empty());
 }
 
 #[tokio::test]
@@ -1593,12 +1849,10 @@ async fn apply_update_changes_query_digest_and_keeps_old_blob() {
         .unwrap()
         .clone();
     let old_digest = "0".repeat(64);
-    let graph_composite = graph_digest(
+    let graph_composite = historical_graph_digest(
         "knowledge",
         Some(&schema_digest),
-        Some(&BTreeMap::new()),
-        None,
-        None,
+        &[("find_person", &old_digest)],
     );
     write_state_resources(
         dir.path(),
@@ -1638,12 +1892,10 @@ async fn apply_deletes_removed_resources_but_keeps_blobs() {
         .clone();
     let stale_query_digest = "1".repeat(64);
     let stale_policy_digest = "2".repeat(64);
-    let graph_composite = graph_digest(
+    let graph_composite = historical_graph_digest(
         "knowledge",
         Some(&schema_digest),
-        Some(&BTreeMap::new()),
-        None,
-        None,
+        &[("orphan", &stale_query_digest)],
     );
     write_state_resources(
         dir.path(),
@@ -2013,12 +2265,13 @@ async fn apply_blocks_graph_delete_without_approval() {
         None,
         None,
     );
+    let old_graph_composite = historical_graph_digest("old", Some("4444"), &[("q", "5555")]);
     write_state_resources(
         dir.path(),
         &[
             ("graph.knowledge", graph_composite.as_str()),
             ("schema.knowledge", schema_digest.as_str()),
-            ("graph.old", "3333"),
+            ("graph.old", old_graph_composite.as_str()),
             ("schema.old", "4444"),
             ("query.old.q", "5555"),
         ],
@@ -2053,7 +2306,7 @@ async fn apply_blocks_graph_delete_without_approval() {
     // State intact; nothing destroyed without the artifact.
     let state = read_state_json(dir.path());
     let resources = &state["applied_revision"]["resources"];
-    assert_eq!(resources["graph.old"]["digest"], "3333");
+    assert_eq!(resources["graph.old"]["digest"], old_graph_composite);
     assert_eq!(resources["schema.old"]["digest"], "4444");
     assert_eq!(resources["query.old.q"]["digest"], "5555");
 }
@@ -2072,12 +2325,13 @@ async fn approve_writes_digest_bound_artifact() {
         .as_str()
         .unwrap()
         .to_string();
+    let old_graph_composite = historical_graph_digest("old", Some("4444"), &[]);
     write_state_resources(
         dir.path(),
         &[
             ("graph.knowledge", graph_digest_str.as_str()),
             ("schema.knowledge", schema_digest_str.as_str()),
-            ("graph.old", "3333"),
+            ("graph.old", old_graph_composite.as_str()),
             ("schema.old", "4444"),
         ],
     );
@@ -2097,7 +2351,7 @@ async fn approve_writes_digest_bound_artifact() {
     assert_eq!(artifact["resource"], "graph.old");
     assert_eq!(artifact["operation"], "delete");
     assert_eq!(artifact["approved_by"], "andrew");
-    assert_eq!(artifact["bound_before_digest"], "3333");
+    assert_eq!(artifact["bound_before_digest"], old_graph_composite);
     assert!(artifact["bound_after_digest"].is_null());
     assert!(artifact["bound_config_digest"].is_string());
     assert!(artifact["consumed_at"].is_null());
@@ -2126,12 +2380,13 @@ async fn stale_approval_is_ignored() {
         .as_str()
         .unwrap()
         .to_string();
+    let old_graph_composite = historical_graph_digest("old", None, &[]);
     write_state_resources(
         dir.path(),
         &[
             ("graph.knowledge", graph_digest_str.as_str()),
             ("schema.knowledge", schema_digest_str.as_str()),
-            ("graph.old", "3333"),
+            ("graph.old", old_graph_composite.as_str()),
         ],
     );
     let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
@@ -2164,7 +2419,7 @@ async fn stale_approval_is_ignored() {
     let state = read_state_json(dir.path());
     assert_eq!(
         state["applied_revision"]["resources"]["graph.old"]["digest"],
-        "3333"
+        old_graph_composite
     );
 }
 
@@ -2181,12 +2436,13 @@ async fn compute_approvals_one_gate_per_subtree() {
         .as_str()
         .unwrap()
         .to_string();
+    let old_graph_composite = historical_graph_digest("old", Some("4444"), &[("q", "5555")]);
     write_state_resources(
         dir.path(),
         &[
             ("graph.knowledge", g.as_str()),
             ("schema.knowledge", sc.as_str()),
-            ("graph.old", "3333"),
+            ("graph.old", old_graph_composite.as_str()),
             ("schema.old", "4444"),
             ("query.old.q", "5555"),
         ],
@@ -3021,12 +3277,13 @@ async fn seed_deletable_state(config_dir: &Path) {
         .as_str()
         .unwrap()
         .to_string();
+    let old_graph_composite = historical_graph_digest("old", Some("4444"), &[("q", "5555")]);
     write_state_resources(
         config_dir,
         &[
             ("graph.knowledge", g.as_str()),
             ("schema.knowledge", sc.as_str()),
-            ("graph.old", "3333"),
+            ("graph.old", old_graph_composite.as_str()),
             ("schema.old", "4444"),
             ("query.old.q", "5555"),
         ],
@@ -3625,6 +3882,181 @@ async fn serving_snapshot_uses_applied_embedding_provider_profile() {
     let profile = snapshot.graphs[0].embedding.as_ref().unwrap();
     assert_eq!(profile.kind.as_deref(), Some("mock"));
     assert_eq!(profile.model.as_deref(), Some("recorded-x"));
+}
+
+#[tokio::test]
+async fn serving_snapshot_uses_applied_server_safe_external_blob_policy() {
+    let dir = fixture();
+    let embedded = dir.path().join("external-assets");
+    fs::create_dir(&embedded).unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        format!(
+            r#"
+version: 1
+graphs:
+  knowledge:
+    schema: ./people.pg
+    external_blobs:
+      allow:
+        - base: s3://assets-bucket/knowledge
+          scope: server_safe
+        - base: file://{}
+          scope: embedded_only
+"#,
+            embedded.display()
+        ),
+    )
+    .unwrap();
+    init_derived_graph(dir.path()).await;
+    write_applyable_state(dir.path());
+
+    let applied = apply_config_dir(dir.path()).await;
+    assert!(applied.ok && applied.converged, "{applied:?}");
+    let state = read_state_json(dir.path());
+    let policy = &state["applied_revision"]["resources"]["graph.knowledge"]["external_blob_policy"];
+    assert_eq!(policy["mode"], "allow");
+    assert_eq!(policy["bases"].as_array().unwrap().len(), 2);
+
+    // A server must not resolve or revalidate an embedded-only directory on
+    // its own host. Projection drops it before validating retained bases.
+    fs::remove_dir(&embedded).unwrap();
+    let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
+    let applied_policy = &snapshot.graphs[0].external_blob_policy;
+    assert_eq!(applied_policy.bases().len(), 2);
+    let policy = applied_policy.server_safe_only().unwrap();
+    assert_eq!(policy.bases().len(), 1);
+    assert_eq!(
+        policy.bases()[0].scope(),
+        omnigraph::ExternalBlobExecutionScope::ServerSafe
+    );
+    assert_eq!(policy.bases()[0].uri(), "s3://assets-bucket/knowledge/");
+
+    // State is an authority boundary, not a permissive DTO. Unknown fields at
+    // either nested policy layer must fail during ledger decoding, before the
+    // known fields could be sanitized and pass the recorded digest check.
+    let mut unknown_policy_field = state.clone();
+    unknown_policy_field["applied_revision"]["resources"]["graph.knowledge"]["external_blob_policy"]
+        ["unexpected"] = json!(true);
+    let mut unknown_base_field = state.clone();
+    unknown_base_field["applied_revision"]["resources"]["graph.knowledge"]["external_blob_policy"]
+        ["bases"][0]["unexpected"] = json!(true);
+    for (case, forged) in [
+        ("policy", unknown_policy_field),
+        ("base", unknown_base_field),
+    ] {
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&forged).unwrap(),
+        )
+        .unwrap();
+        let diagnostics = read_serving_snapshot(dir.path()).await.unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "invalid_state_json"),
+            "{case}: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "external_blob_policy_digest_mismatch"),
+            "{case}: nested unknown fields must fail before digest validation: {diagnostics:?}"
+        );
+    }
+
+    // Missing means Deny for a historical ledger, but it cannot silently revoke
+    // an applied Allow while retaining the Allow-bound composite digest. Default
+    // Deny deliberately hashes exactly like the historical graph resource, so
+    // the same validation is compatible with genuine pre-policy state.
+    let mut missing_policy = state.clone();
+    missing_policy["applied_revision"]["resources"]["graph.knowledge"]
+        .as_object_mut()
+        .unwrap()
+        .remove("external_blob_policy");
+    fs::write(
+        dir.path().join(CLUSTER_STATE_FILE),
+        serde_json::to_string_pretty(&missing_policy).unwrap(),
+    )
+    .unwrap();
+    let diagnostics = read_serving_snapshot(dir.path()).await.unwrap_err();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "external_blob_policy_digest_mismatch"),
+        "deleting an Allow policy must sever and fail its digest binding: {diagnostics:?}"
+    );
+
+    let mut state = state;
+    let bases =
+        state["applied_revision"]["resources"]["graph.knowledge"]["external_blob_policy"]["bases"]
+            .as_array_mut()
+            .unwrap();
+    bases
+        .iter_mut()
+        .find(|base| base["scope"] == "server_safe")
+        .unwrap()["uri"] = json!("s3://other-bucket/");
+    fs::write(
+        dir.path().join(CLUSTER_STATE_FILE),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    let diagnostics = read_serving_snapshot(dir.path()).await.unwrap_err();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "external_blob_policy_digest_mismatch"),
+        "{diagnostics:?}"
+    );
+
+    // Refresh must validate the existing composite before its observation or
+    // recovery passes reuse state-resident policy metadata. Otherwise it can
+    // bless this hand-edited policy by simply persisting its recomputed digest.
+    fs::create_dir(&embedded).unwrap();
+    let state_path = dir.path().join(CLUSTER_STATE_FILE);
+    let forged_state = fs::read(&state_path).unwrap();
+    let refreshed = refresh_config_dir(dir.path()).await;
+    assert!(!refreshed.ok, "{refreshed:?}");
+    assert!(
+        refreshed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "external_blob_policy_digest_mismatch"),
+        "{refreshed:?}"
+    );
+    assert_eq!(
+        fs::read(&state_path).unwrap(),
+        forged_state,
+        "refresh must not persist a rebound graph digest"
+    );
+
+    // Apply has the same pre-diff recovery sweep and must not be an authority
+    // bypass. The only safe repair is restoring a trusted ledger; desired
+    // config cannot overwrite forged metadata before pending recovery is
+    // classified.
+    let applied = apply_config_dir(dir.path()).await;
+    assert!(!applied.ok && !applied.converged, "{applied:?}");
+    let diagnostic = applied
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "external_blob_policy_digest_mismatch")
+        .unwrap_or_else(|| panic!("missing digest refusal: {applied:?}"));
+    assert!(
+        diagnostic.message.contains("trusted copy"),
+        "the refusal must name an actionable repair that does not recurse into apply: {diagnostic:?}"
+    );
+    assert_eq!(
+        fs::read(&state_path).unwrap(),
+        forged_state,
+        "apply must not persist a rebound graph digest"
+    );
+    let diagnostics = read_serving_snapshot(dir.path()).await.unwrap_err();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "external_blob_policy_digest_mismatch"),
+        "the forged policy must remain unservable after refresh: {diagnostics:?}"
+    );
 }
 
 #[tokio::test]

@@ -8,6 +8,7 @@ use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
 
@@ -927,8 +928,21 @@ node Document {
     let external_path = external_dir.path().join("external.bin");
     std::fs::write(&external_path, b"External").unwrap();
     let external_uri = format!("file://{}", external_path.display());
+    let external_policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(external_dir.path())
+                .expect("external blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
 
-    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(external_policy.clone())
+        .unwrap();
     let first_fragment = [
         serde_json::json!({
             "type": "Document",
@@ -983,15 +997,19 @@ node Document {
     assert!(document("null")["content"].is_null());
     assert_eq!(document("external")["content"], external_uri);
 
-    // Phase 0B will make rebuild ingress policy-aware. Keep this Phase 0A
-    // fixture focused on source-side export independence by restoring the
-    // external target before importing the exported URI.
+    // Rebuild ingress is policy-aware. Restore the caller-owned source and
+    // explicitly authorize the import rather than relying on ambient file
+    // access.
     std::fs::write(&external_path, b"External").unwrap();
 
     // Round-trip: re-import and verify blob data survives
     let imported_dir = tempfile::tempdir().unwrap();
     let imported_uri = imported_dir.path().to_str().unwrap();
-    let imported = Omnigraph::init(imported_uri, BLOB_SCHEMA).await.unwrap();
+    let imported = Omnigraph::init(imported_uri, BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(external_policy)
+        .unwrap();
     load_jsonl(&imported, &exported, LoadMode::Overwrite)
         .await
         .unwrap();

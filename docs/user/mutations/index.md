@@ -87,12 +87,15 @@ refuses a batch whose projected Arrow allocation exceeds 32 MiB with typed
 larger than that is loaded as one `--mode overwrite` chunk followed by
 `--mode merge` chunks.
 
-Blob values supplied as external URIs have mode-dependent storage semantics.
-Keyed insert/upsert and load `append`/`merge` sum the declared ranges or object
-sizes before reading payload bytes, reject an aggregate above 32 MiB, and copy
-accepted bytes into the staged blob. Load `overwrite` keeps the external URI
-cell as a reference. This distinction exists because Lance's merge-insert
-builder cannot accept the `WriteParams` option used by Overwrite.
+Blob values supplied as external URIs must first pass the graph's immutable
+external-Blob policy; new URI ingress is denied by default. Keyed insert/upsert
+and load `append`/`merge` then sum the declared ranges or object sizes before
+reading payload bytes, reject an aggregate above 32 MiB, and copy accepted bytes
+into the staged blob. Load `overwrite` keeps the accepted external URI cell as a
+reference. This distinction exists because Lance's merge-insert builder cannot
+accept the `WriteParams` option used by Overwrite. Direct-store CLI execution is
+deny-only in this phase; use a configured cluster server or the embedded builder
+to supply graph-level allow bases.
 
 If the synchronous barrier finds an unresolved overlapping recovery intent, or
 if a conflict is discovered after a Lance table effect is durable, the request

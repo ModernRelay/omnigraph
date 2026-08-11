@@ -55,7 +55,9 @@ use lance::dataset::{WhenMatched, WhenNotMatched};
 
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::{OmniError, Result};
-use crate::table_store::{StagedTransactionIdentity, StagedWrite, TableState, TableStore};
+use crate::table_store::{
+    ExternalBlobPreflight, StagedTransactionIdentity, StagedWrite, TableState, TableStore,
+};
 
 /// One fenced merge chunk is bounded in both rows and materialized Arrow
 /// bytes. The byte ceiling bounds the staging adapter; the row ceiling
@@ -68,12 +70,14 @@ pub(crate) const KEYED_WRITE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Resource budget for a pending-aware keyed scan that will feed one mutation
 /// table transaction.
 ///
-/// `initial_*` accounts for batches the mutation has already accumulated on
-/// this table.  A later `update` allocates another full-row batch before the
+/// `initial_rows` accounts for batches already accumulated on this table;
+/// `initial_bytes` accounts for every table already retained by the graph
+/// mutation. A later `update` allocates another full-row batch before the
 /// end-of-query dedupe, so its matched committed/pending view must fit in the
-/// *remaining* table budget rather than receiving a fresh 8,192-row / 32-MiB
-/// allowance.  Keeping this value on the sealed storage boundary makes the
-/// bounded streaming scan part of the only production read-modify-write path.
+/// remaining operation byte budget rather than receiving a fresh 32-MiB
+/// allowance per table. Keeping this value on the sealed storage boundary
+/// makes the bounded streaming scan part of the only production
+/// read-modify-write path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingScanBudget {
     pub(crate) table_key: String,
@@ -585,6 +589,19 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         batch: RecordBatch,
     ) -> Result<RecordBatch>;
 
+    /// Authorize and probe the complete operation's distinct external Blob
+    /// sources before any participant writes staged files.
+    async fn preflight_external_blob_uris(&self, uris: &[String]) -> Result<ExternalBlobPreflight>;
+
+    /// Materialize one keyed source batch from an operation-wide preflight
+    /// proof without repeating source HEAD requests.
+    async fn prepare_keyed_write_batch_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch>;
+
     /// Validate the physical key contract shared by every v6 graph-table
     /// write batch: exact Utf8 `id`, no nulls, and no duplicate ids within the
     /// batch. Callers preparing a deferred first-touch or Overwrite plan must
@@ -1030,6 +1047,20 @@ impl TableStorage for TableStore {
         TableStore::prepare_keyed_write_batch(self, table_key, batch).await
     }
 
+    async fn preflight_external_blob_uris(&self, uris: &[String]) -> Result<ExternalBlobPreflight> {
+        TableStore::preflight_external_blob_uris(self, uris).await
+    }
+
+    async fn prepare_keyed_write_batch_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch> {
+        TableStore::prepare_keyed_write_batch_with_preflight(self, table_key, batch, preflight)
+            .await
+    }
+
     fn validate_keyed_write_batch(&self, table_key: &str, batch: &RecordBatch) -> Result<()> {
         TableStore::validate_keyed_write_batch(self, table_key, batch)
     }
@@ -1116,6 +1147,7 @@ impl TableStorage for TableStore {
         end_version: u64,
     ) -> Result<SendableRecordBatchStream> {
         TableStore::scan_proven_insert_delta_bounded(
+            self,
             source.dataset(),
             table_key,
             begin_version,

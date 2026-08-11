@@ -693,6 +693,25 @@ impl Omnigraph {
         self
     }
 
+    /// Install the immutable graph-level external Blob ingress policy.
+    ///
+    /// The default on every initialized or opened handle is deny. This
+    /// consuming builder validates deserialized configuration before replacing
+    /// that default, so no writer can observe a partially configured policy.
+    pub fn with_external_blob_policy(
+        mut self,
+        policy: crate::blob::ExternalBlobPolicy,
+    ) -> Result<Self> {
+        self.table_store = self.table_store.with_external_blob_policy(policy)?;
+        Ok(self)
+    }
+
+    /// Policy-aware Blob materializer for internal rewrite/merge paths that
+    /// must carry the graph policy and shared Lance object-store registry.
+    pub(crate) fn blob_materializer(&self) -> crate::table_store::TableStore {
+        self.table_store.clone()
+    }
+
     /// The lazily-initialized, reused-across-queries embedding client cell
     /// (see the `embedding` field doc). The query executor resolves the client
     /// through this on the first `nearest($v, "string")` that needs embedding.

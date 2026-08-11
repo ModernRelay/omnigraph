@@ -700,6 +700,18 @@ pub struct ResourceLimitOutput {
     pub actual: u64,
 }
 
+/// Structured details for an allowed external Blob source that could not be
+/// probed or read. The top-level `code` remains optional so this additive
+/// detail can roll out without extending the closed [`ErrorCode`] enum.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ExternalBlobSourceOutput {
+    /// Normalized, credential-free URI spelling (or a redacted placeholder).
+    pub uri: String,
+    /// Source-side failure diagnosis. Clients should branch on the presence of
+    /// `external_blob_source`, not parse this human-readable text.
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RecoveryRequiredOutput {
     pub operation_id: String,
@@ -741,6 +753,12 @@ pub struct ErrorOutput {
     /// rejected attempt has no durable sidecar and no table effect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limit: Option<ResourceLimitOutput>,
+    /// Set with HTTP 424 when an external Blob URI passed admission policy but
+    /// its source could not be probed or read. This optional detail is the
+    /// rolling-safe machine-readable discriminator; `code` is omitted because
+    /// [`ErrorCode`] is a closed compatibility contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_blob_source: Option<ExternalBlobSourceOutput>,
     /// Set when an overlapping durable recovery intent must be resolved before
     /// retry. Its table effects may or may not have started.
     #[serde(skip_serializing_if = "Option::is_none")]

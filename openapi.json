@@ -321,6 +321,16 @@
               }
             }
           },
+          "424": {
+            "description": "A merge could not probe or read an allowed external Blob source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "429": {
             "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
             "content": {
@@ -528,6 +538,16 @@
           },
           "413": {
             "description": "Keyed write exceeds the per-commit row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "An allowed external Blob source could not be probed or read",
             "content": {
               "application/json": {
                 "schema": {
@@ -906,7 +926,17 @@
             }
           },
           "413": {
-            "description": "Keyed load exceeds the per-commit row or byte ceiling",
+            "description": "Load input or external Blob admission exceeds a bounded per-operation row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "An allowed external Blob source could not be probed or read",
             "content": {
               "application/json": {
                 "schema": {
@@ -1025,7 +1055,17 @@
             }
           },
           "413": {
-            "description": "Keyed load exceeds the per-commit row or byte ceiling",
+            "description": "Load input or external Blob admission exceeds a bounded per-operation row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "An allowed external Blob source could not be probed or read",
             "content": {
               "application/json": {
                 "schema": {
@@ -1194,7 +1234,7 @@
             }
           },
           "413": {
-            "description": "Request or keyed load exceeds a bounded ceiling",
+            "description": "Request, load, or external Blob admission exceeds a bounded ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -1205,6 +1245,16 @@
           },
           "415": {
             "description": "Content-Type must be application/x-ndjson",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "An allowed external Blob source could not be probed or read",
             "content": {
               "application/json": {
                 "schema": {
@@ -1323,6 +1373,16 @@
           },
           "413": {
             "description": "Keyed write exceeds the per-commit row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "An allowed external Blob source could not be probed or read",
             "content": {
               "application/json": {
                 "schema": {
@@ -1661,6 +1721,16 @@
           },
           "413": {
             "description": "Stored keyed mutation exceeds the per-commit row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "A stored mutation could not probe or read an allowed external Blob source",
             "content": {
               "application/json": {
                 "schema": {
@@ -2590,6 +2660,17 @@
           "error": {
             "type": "string"
           },
+          "external_blob_source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExternalBlobSourceOutput",
+                "description": "Set with HTTP 424 when an external Blob URI passed admission policy but\nits source could not be probed or read. This optional detail is the\nrolling-safe machine-readable discriminator; `code` is omitted because\n[`ErrorCode`] is a closed compatibility contract."
+              }
+            ]
+          },
           "key_conflict": {
             "oneOf": [
               {
@@ -2687,6 +2768,24 @@
               "type": "string"
             },
             "description": "Restrict the export to these node/edge type names. Empty exports all types."
+          }
+        }
+      },
+      "ExternalBlobSourceOutput": {
+        "type": "object",
+        "description": "Structured details for an allowed external Blob source that could not be\nprobed or read. The top-level `code` remains optional so this additive\ndetail can roll out without extending the closed [`ErrorCode`] enum.",
+        "required": [
+          "uri",
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "Source-side failure diagnosis. Clients should branch on the presence of\n`external_blob_source`, not parse this human-readable text."
+          },
+          "uri": {
+            "type": "string",
+            "description": "Normalized, credential-free URI spelling (or a redacted placeholder)."
           }
         }
       },

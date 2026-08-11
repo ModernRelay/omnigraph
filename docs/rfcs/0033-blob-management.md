@@ -573,6 +573,12 @@ server-safe or embedded-only. Configuration validation normalizes it once,
 rejects URI user-info and query/fragment credentials, and rejects overlapping or
 ambiguous encodings.
 
+Every raw configured base and input URI is capped at 64 KiB inclusive before
+trimming, URL parsing, percent decoding, or filesystem resolution. This bounds
+normalizer scratch independently of the operation-wide retained-metadata
+budget; a one-over value returns the typed `external Blob URI bytes` resource
+limit without source I/O.
+
 Containment compares normalized scheme, authority, and path components; it is
 not string `starts_with`. A scheme allowlist without a base is insufficient.
 Server-safe bases may use only storage schemes supported by the shared object-
@@ -585,6 +591,14 @@ depend on HTTP code. Server, CLI, and embedded callers cannot set a per-request
 escape hatch. Cedar still decides who may change the graph; external-base policy
 decides which server resources any authorized writer may reference. Both gates
 must pass.
+
+Phase 0B exposes allow-policy authority through applied cluster state and the
+embedded builder, not through a direct-store CLI flag. A direct CLI graph open
+therefore remains default-Deny. CLI ingestion of an external reference targets a
+cluster-served graph with configured bases; rebuild tooling with direct storage
+can import managed `base64:` values, while a rebuild containing external URIs
+must use that served route or an embedded handle with the graph policy installed.
+This is a deliberate trust-boundary choice, not a temporary per-request bypass.
 
 ### 7.2 Ingest behavior
 
@@ -600,20 +614,44 @@ input into Lance remains exactly `{ data: LargeBinary, uri: Utf8 }`. Prepared
 OmniGraph input boundaries. Persisting an alternate child shape previously
 poisoned later keyed writes; the boundary assertion remains mandatory.
 
-An allowed external URI is probed once before the first durable effect of the
-write that consumes it. Probes use the graph's shared object-store registry,
-deduplicate identical normalized URIs, and run with bounded parallelism. A
-malformed, disallowed, missing, or unreadable object fails loudly. Cost tests
-include external references so the implementation cannot regress to a new
-registry and sequential HEAD per row.
+New logical Mutation/Load input and every row-writing BranchMerge build one
+operation-wide source-admission plan before the first durable effect. Probes use
+the graph's shared object-store registry, deduplicate identical normalized URIs,
+and run with at most eight concurrent metadata requests. Scalar table
+preparation may precede this plan; admission still completes before any external
+payload read, recovery arm, target HEAD or branch-ref movement, or graph-visible
+effect. A predicate mutation that carries an existing persisted external
+descriptor discovers it through bounded materialization scans: equivalent
+spellings deduplicate within each scan batch, but a source may be probed again
+in a later batch. A malformed, disallowed, missing, or unreadable object fails
+loudly before its batch can stage a payload-bearing effect. Cost tests include
+external references so the implementation cannot regress to a new registry and
+sequential HEAD per row.
+
+All new logical Mutation/Load modes, including Overwrite, refuse more than
+8,192 external-reference cells across the complete multi-table graph operation.
+This is an external-source admission bound, not the keyed-write row ceiling:
+Overwrite may contain more than 8,192 logical rows when no more than 8,192 of
+their Blob cells are external. The admission plan also refuses more than 32 MiB
+of retained raw/normalized URI metadata before issuing a HEAD.
+
+BranchMerge's descriptor-only first pass refuses more than 8,192 selected
+external-reference cells or more than 32 MiB of retained raw/normalized URI
+metadata before issuing a HEAD. It preserves each descriptor's offset and
+length, then charges exact selected ranges together with managed Blob lengths
+against one 32 MiB carried-payload budget. It never retains an operation-wide
+payload cache.
 
 Storage semantics remain explicit while Lance lacks a keyed-write `WriteParams`
 hook:
 
 - overwrite preserves an allowed external reference;
-- strict insert, upsert, load append/merge, mutation update, and branch merge
-  pre-size and copy the allowed bytes into managed Blob storage under the
-  operation's 32 MiB aggregate ceiling.
+- strict insert, upsert, load append/merge, mutation update, and a
+  HEAD-advancing branch merge that writes selected rows pre-size and copy the
+  allowed bytes into managed Blob storage under the operation's 32 MiB
+  aggregate ceiling;
+- a pointer-only branch fast-forward writes no row and preserves the existing
+  descriptor without policy approval or source I/O.
 
 The URI therefore names a source; write mode determines whether the resulting
 cell remains a reference. This is existing observable behavior and remains
@@ -762,9 +800,11 @@ Physical row addresses never become public stable identity.
 |---|---|
 | Server-side file/object read through URI input | Default-deny engine policy, exact normalized bases, no server `file://`, no per-request override |
 | URI credential disclosure | Reject user-info/query/fragment credentials at config and input; return URI only to an authorized Blob reader |
+| URI parser amplification | Reject a raw configured or input URI above 64 KiB before trimming, parsing, decoding, or filesystem resolution |
 | External SSRF during read | Descriptor-first classification; redirect only; no proxy or validation on GET/HEAD |
 | Oversize upload | Route and engine 32 MiB inclusive limits; refusal before effect |
-| Rewrite amplification | Pre-size all carried Blob payloads under one 32 MiB operation budget before read |
+| Rewrite amplification | New logical input and row-writing branch merge pre-size all carried Blob payloads under one 32 MiB operation budget before read; predicate mutation carry applies the same cumulative byte ceiling while materializing bounded scan batches |
+| External-source planning | Row-writing branch merge admits at most 8,192 external-reference cells and 32 MiB of retained URI metadata before HEAD; probes are bounded and normalized aliases deduplicate within the applicable operation or scan-batch envelope |
 | Download memory | ≤4 MiB chunks, two-chunk queue, backpressure, prompt cancellation |
 | Range arithmetic | Checked `u64` addition and exact logical-size bounds |
 | Stale overwrite | Optional strong `If-Match`, evaluated at each freshly pinned attempt |
@@ -790,7 +830,7 @@ depends on typed code and fields, not an opaque Lance string.
 | Non-Blob property, invalid selector, non-nullable clear | `bad_request` | 400 |
 | Branch and snapshot together / snapshot on write | `bad_request` | 400 |
 | Disallowed or malformed external URI | `bad_request` with policy reason | 400 |
-| External source missing/unreadable | typed external source error | 400 or mapped dependency failure; never generic 500 |
+| External source missing/unreadable | typed external source error | 424 Failed Dependency; never generic 500 |
 | Upload/rewrite budget exceeded | `resource_limit` with limit/observed | 413 |
 | Unsatisfiable range | `range_not_satisfiable` with length | 416 |
 | If-Match failed | `PreconditionFailed` outcome | 412 |
@@ -799,8 +839,9 @@ depends on typed code and fields, not an opaque Lance string.
 
 Instrumentation records operation, entity kind, managed/external/null
 classification, requested and served byte count, range/full mode, precondition
-result, external probe count/dedup count, and time-to-first-byte. It never logs
-payload bytes, bearer tokens, URI credentials, or complete sensitive URIs.
+result, admitted external cells, actual metadata-probe attempts, successful
+external payload reads, and time-to-first-byte. It never logs payload bytes,
+bearer tokens, URI credentials, or complete sensitive URIs.
 URI metrics use scheme plus a keyed/irreversible base identifier.
 
 ## 12. Test and acceptance plan
@@ -832,7 +873,9 @@ The implementation extends existing owners before creating new fixtures, per
   re-evaluate against the fresh base and return 412 with the winner's ETag,
   without a lost update or an extra table, manifest, lineage, or sidecar effect.
 - `branching.rs`: edge and node Blob reads on branches, merge preservation of
-  empty bytes, and external-source accounting.
+  empty bytes, operation-wide managed-plus-exact-range accounting, the 8,192
+  external-cell and 32 MiB URI-metadata admission bounds, normalized probe
+  deduplication, chunk-bounded payload reuse, and pointer-only no-I/O adoption.
 - `export.rs`: four-way null/empty/non-empty/external round trip.
 - Existing schema-apply coverage gains an empty Blob and a neighboring non-empty
   Blob rather than adding a duplicate initialization fixture.
@@ -877,6 +920,8 @@ The implementation extends existing owners before creating new fixtures, per
   the failures listed in §6.
 - `write_cost.rs` and its S3 owner: fixed external-reference counts prove shared
   registry reuse, URI deduplication, bounded probes, and no per-row cold setup.
+  The live S3 cell uses 64 normalized-equivalent references and requires exactly
+  64 admitted cells, one metadata request, and one payload read.
 - Extend the bounded transport/backpressure owner with a paused-client test that
   records at most two retained chunks and at most 8 MiB of retained payload for a
   near-limit managed Blob. Disconnect must drop the reader and snapshot pin.
@@ -941,7 +986,7 @@ correctness gate.
 Existing stored external references need no migration. Operators who require
 new URI ingress must add explicit bases before upgrading a workload that writes
 them. This intentional secure-default change is called out in release notes and
-`cluster validate` output.
+as a graph-attributed effective-Deny warning in `cluster validate` output.
 
 ## 14. Invariants and deny-list check
 
@@ -1009,6 +1054,22 @@ All three replace unsafe or non-executable behavior. They require release-note
 callouts but not a storage migration. Existing external references remain
 readable, which keeps rollback and staged policy rollout possible.
 
+The applied allow-list is nevertheless a control-plane compatibility boundary:
+v0.10 stores its normalized form in an optional graph-resource field that the
+strict v0.9 state parser does not know. A rollback therefore uses v0.10 to
+remove `external_blobs` from desired configuration and apply default deny to
+convergence before starting v0.9. That transition omits the optional field and
+restores the historical graph-resource digest without a manifest or data-table
+write. It restores only a v0.9-readable state shape: v0.9 itself has no
+external-base policy and admits arbitrary supported external URIs, including
+`file://`. Writers must be quiesced and the whole serving/control-plane fleet
+cut over together; mixed v0.9/v0.10 writers are not a supported policy rollout.
+If the external-ingress boundary is required, rollback to v0.9 is prohibited.
+Editing desired YAML alone leaves the applied allow authority in place;
+hand-editing the ledger severs the digest binding. Serving and every
+state-mutating command refuse that ledger before a recovery sweep can reuse or
+re-sign its metadata; restore the ledger from a trusted copy before retrying.
+
 ### 15.3 Substrate dependency
 
 The exact positive compaction surface guard is a permanent dependency-bump gate;
@@ -1070,20 +1131,17 @@ implementation. A future regression blocks its dependency bump unless that same
 change supplies a proven fix or a tested skip; logical bytes are never put at
 risk merely to retain compaction throughput.
 
-## 17. Unresolved questions
+## 17. Resolved implementation choices
 
-The product contract is intentionally closed enough to implement. Review still
-needs to settle two narrow implementation details:
+Phase 0 fixed the two spellings that were open when this RFC was drafted:
 
-1. **Configuration spelling.** The engine policy and semantics in §7 are fixed;
-   the exact `cluster.yaml` field names and operator-config override shape should
-   follow the cluster schema's existing naming conventions during implementation.
-   There is no per-request override regardless of spelling.
-2. **External dependency error mapping.** A malformed/disallowed URI is 400 and
-   a missing entity is 404. Review must choose the existing structured error
-   family for a configured external source that is temporarily unreadable so it
-   is stable across server and embedded arms; it must not collapse to an opaque
-   500 or silently retain an unchecked reference.
+1. **Configuration spelling.** `graphs.<id>.external_blobs.allow[]` carries
+   exact `{ base, scope }` entries. Scope is `server_safe` or `embedded_only`;
+   there is no operator- or request-level override.
+2. **External dependency error mapping.** A malformed or disallowed URI is a
+   typed policy failure and HTTP 400. A configured source that is missing or
+   unreadable is a typed external-source failure and HTTP 424 Failed
+   Dependency, never an opaque 500 or an unchecked retained reference.
 
-Neither question changes storage semantics, the trust boundary, or the one-
+These choices do not change storage semantics, the trust boundary, or the one-
 publisher architecture.
