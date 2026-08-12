@@ -83,4 +83,29 @@ Codes seen so far:
 
 Lint output reports an overall status, per-query results (name, kind, status, any error and warnings), and structured findings (severity, code, message, and the type/property/query they apply to).
 
+With `omnigraph lint --json`, each successfully compiled per-query result also
+contains an `operation` object with `result`, `reads`, and `writes`:
+
+- `result` preserves projection order. Each field has `name`, `kind`, and
+  `nullable`; list fields also have `item_kind`, and vector fields also have
+  `vector_dim`. The structured `kind` vocabulary is `string`, `bool`, `int`,
+  `bigint`, `float`, `date`, `datetime`, `blob`, `vector`, `list`, and
+  `object`, so consumers never need to parse a display string. Mutation results
+  are empty.
+- `reads` and `writes` are deduplicated, deterministically sorted arrays of
+  `{kind, type_name}`. `kind` is lowercase `node` or `edge`, and `type_name` is
+  the case-sensitive declared graph type.
+
+`reads` is conservative: it lists every graph table that the supported
+execution path may inspect. For read queries this includes explicit node
+bindings, each traversed edge and both of its endpoint node types, including
+traversals nested inside `not { ... }`. Every mutation target is both read and
+written, including an insert target; an edge insert also reads its endpoint node
+types. Deleting a node can cascade to every incident edge type declared in the
+schema, so those edge types appear in both `reads` and `writes`.
+
+`writes` is the exact set of graph tables that the mutation may change; it is
+empty for a read query. No operation descriptor is emitted for a parse or type
+checking failure.
+
 CLI exits non-zero only on `status = Error`.

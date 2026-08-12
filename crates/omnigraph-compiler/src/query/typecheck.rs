@@ -74,9 +74,19 @@ impl ResolvedType {
     }
 }
 
+/// The exact graph namespace selected for a mutation target.
+///
+/// Node and edge declarations may share a name, so consumers must carry the
+/// resolved kind from type checking instead of re-deriving it from spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationTarget {
+    Node { type_name: String },
+    Edge { type_name: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct MutationTypeContext {
-    pub target_types: Vec<String>,
+    pub targets: Vec<MutationTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,12 +97,11 @@ pub enum CheckedQuery {
 
 pub fn typecheck_query_decl(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedQuery> {
     if !query.mutations.is_empty() {
-        let mut target_types = Vec::with_capacity(query.mutations.len());
+        let mut targets = Vec::with_capacity(query.mutations.len());
         for mutation in &query.mutations {
-            let target_type = typecheck_mutation(catalog, mutation, &query.params)?;
-            target_types.push(target_type);
+            targets.push(typecheck_mutation(catalog, mutation, &query.params)?);
         }
-        Ok(CheckedQuery::Mutation(MutationTypeContext { target_types }))
+        Ok(CheckedQuery::Mutation(MutationTypeContext { targets }))
     } else {
         Ok(CheckedQuery::Read(typecheck_read_query(catalog, query)?))
     }
@@ -235,7 +244,11 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     Ok(ctx)
 }
 
-fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) -> Result<String> {
+fn typecheck_mutation(
+    catalog: &Catalog,
+    mutation: &Mutation,
+    params: &[Param],
+) -> Result<MutationTarget> {
     let param_types = parse_declared_param_types(params)?;
 
     match mutation {
@@ -296,7 +309,9 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                         insert.type_name, prop_name
                     )));
                 }
-                return Ok(insert.type_name.clone());
+                return Ok(MutationTarget::Node {
+                    type_name: insert.type_name.clone(),
+                });
             }
 
             if let Some(edge_type) = catalog.edge_types.get(&insert.type_name) {
@@ -367,7 +382,9 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                         )));
                     }
                 }
-                return Ok(insert.type_name.clone());
+                return Ok(MutationTarget::Edge {
+                    type_name: insert.type_name.clone(),
+                });
             }
 
             Err(CompilerError::Type(format!(
@@ -422,7 +439,9 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                 node_type,
                 &param_types,
             )?;
-            Ok(update.type_name.clone())
+            Ok(MutationTarget::Node {
+                type_name: update.type_name.clone(),
+            })
         }
         Mutation::Delete(delete) => {
             if let Some(node_type) = catalog.node_types.get(&delete.type_name) {
@@ -432,7 +451,9 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                     node_type,
                     &param_types,
                 )?;
-                Ok(delete.type_name.clone())
+                Ok(MutationTarget::Node {
+                    type_name: delete.type_name.clone(),
+                })
             } else if let Some(edge_type) = catalog.edge_types.get(&delete.type_name) {
                 typecheck_edge_mutation_predicate(
                     &delete.type_name,
@@ -440,7 +461,9 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                     edge_type,
                     &param_types,
                 )?;
-                Ok(delete.type_name.clone())
+                Ok(MutationTarget::Edge {
+                    type_name: delete.type_name.clone(),
+                })
             } else {
                 Err(CompilerError::Type(format!(
                     "T10: unknown node/edge type `{}`",

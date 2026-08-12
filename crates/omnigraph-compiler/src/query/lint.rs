@@ -4,8 +4,8 @@ use serde::Serialize;
 
 use crate::catalog::Catalog;
 use crate::query::ast::{Mutation, QueryDecl};
+use crate::query::descriptor::{QueryOperationDescriptor, describe_query_operation};
 use crate::query::parser::parse_query;
-use crate::query::typecheck::typecheck_query_decl;
 
 const PARSE_ERROR_CODE: &str = "Q000";
 const L201_CODE: &str = "L201";
@@ -77,6 +77,8 @@ pub struct QueryLintQueryResult {
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<QueryOperationDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -127,8 +129,8 @@ pub fn lint_query_file(
             for query in &parsed.queries {
                 let kind = query_kind(query);
                 let warnings = per_query_warnings(query);
-                match typecheck_query_decl(catalog, query) {
-                    Ok(_) => {
+                match describe_query_operation(catalog, query) {
+                    Ok(operation) => {
                         collect_update_coverage(query, &mut coverage);
                         results.push(QueryLintQueryResult {
                             name: query.name.clone(),
@@ -136,6 +138,7 @@ pub fn lint_query_file(
                             status: QueryLintStatus::Ok,
                             warnings,
                             error: None,
+                            operation: Some(operation),
                         });
                     }
                     Err(err) => {
@@ -145,6 +148,7 @@ pub fn lint_query_file(
                             status: QueryLintStatus::Error,
                             warnings,
                             error: Some(err.to_string()),
+                            operation: None,
                         });
                     }
                 }

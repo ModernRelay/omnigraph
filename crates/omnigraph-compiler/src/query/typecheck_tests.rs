@@ -78,6 +78,30 @@ embedding: Vector(3)
     build_catalog(&schema).unwrap()
 }
 
+#[test]
+fn mutation_target_retains_node_namespace_when_an_edge_shares_its_name() {
+    let catalog = setup_same_named_node_and_edge();
+    let qf = parse_query(
+        r#"
+query insert_shared() {
+insert Shared { label: "node" }
+}
+"#,
+    )
+    .unwrap();
+
+    let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+    match checked {
+        CheckedQuery::Mutation(ctx) => assert_eq!(
+            ctx.targets,
+            vec![MutationTarget::Node {
+                type_name: "Shared".to_string(),
+            }]
+        ),
+        CheckedQuery::Read(_) => panic!("expected mutation typecheck result"),
+    }
+}
+
 fn setup_list() -> Catalog {
     let schema = parse_schema(
         r#"
@@ -1102,7 +1126,12 @@ insert Person {
     .unwrap();
     let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
     match checked {
-        CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_types[0], "Person"),
+        CheckedQuery::Mutation(ctx) => assert_eq!(
+            ctx.targets[0],
+            MutationTarget::Node {
+                type_name: "Person".to_string(),
+            }
+        ),
         _ => panic!("expected mutation typecheck result"),
     }
 }
@@ -1138,7 +1167,12 @@ insert Doc {
     .unwrap();
     let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
     match checked {
-        CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_types[0], "Doc"),
+        CheckedQuery::Mutation(ctx) => assert_eq!(
+            ctx.targets[0],
+            MutationTarget::Node {
+                type_name: "Doc".to_string(),
+            }
+        ),
         _ => panic!("expected mutation typecheck result"),
     }
 }
@@ -1209,7 +1243,12 @@ insert Knows {
     .unwrap();
     let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
     match checked {
-        CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_types[0], "Knows"),
+        CheckedQuery::Mutation(ctx) => assert_eq!(
+            ctx.targets[0],
+            MutationTarget::Edge {
+                type_name: "Knows".to_string(),
+            }
+        ),
         _ => panic!("expected mutation typecheck result"),
     }
 }
@@ -1244,7 +1283,12 @@ delete Knows where from = $from
     .unwrap();
     let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
     match checked {
-        CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_types[0], "Knows"),
+        CheckedQuery::Mutation(ctx) => assert_eq!(
+            ctx.targets[0],
+            MutationTarget::Edge {
+                type_name: "Knows".to_string(),
+            }
+        ),
         _ => panic!("expected mutation typecheck result"),
     }
 }
@@ -1279,7 +1323,17 @@ insert Knows { from: $name, to: $friend }
     let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
     match checked {
         CheckedQuery::Mutation(ctx) => {
-            assert_eq!(ctx.target_types, vec!["Person", "Knows"]);
+            assert_eq!(
+                ctx.targets,
+                vec![
+                    MutationTarget::Node {
+                        type_name: "Person".to_string(),
+                    },
+                    MutationTarget::Edge {
+                        type_name: "Knows".to_string(),
+                    },
+                ]
+            );
         }
         _ => panic!("expected mutation typecheck result"),
     }

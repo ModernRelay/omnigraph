@@ -378,6 +378,11 @@ node Policy {
 query update_policy($slug: String, $name: String) {
     update Policy set { name: $name } where slug = $slug
 }
+
+query list_policies() {
+    match { $p: Policy }
+    return { $p.name $p.effectiveTo }
+}
 "#,
     );
 
@@ -395,13 +400,79 @@ query update_policy($slug: String, $name: String) {
 
     assert_eq!(payload["status"], "ok");
     assert_eq!(payload["schema_source"]["kind"], "file");
-    assert_eq!(payload["queries_processed"], 1);
+    assert_eq!(payload["queries_processed"], 2);
     assert_eq!(payload["warnings"], 1);
+    assert_eq!(
+        payload["results"][0]["operation"],
+        serde_json::json!({
+            "result": [],
+            "reads": [{ "kind": "node", "type_name": "Policy" }],
+            "writes": [{ "kind": "node", "type_name": "Policy" }]
+        })
+    );
+    assert_eq!(
+        payload["results"][1]["operation"],
+        serde_json::json!({
+            "result": [
+                {
+                    "name": "name",
+                    "kind": "string",
+                    "nullable": true
+                },
+                {
+                    "name": "effectiveTo",
+                    "kind": "datetime",
+                    "nullable": true
+                }
+            ],
+            "reads": [{ "kind": "node", "type_name": "Policy" }],
+            "writes": []
+        })
+    );
     assert_eq!(payload["findings"][0]["code"], "L201");
     assert_eq!(
         payload["findings"][0]["message"],
         "Policy.effectiveTo exists in schema but no update query sets it"
     );
+}
+
+#[test]
+fn query_lint_json_omits_operation_after_compile_failure() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    let query_path = temp.path().join("queries.gq");
+    write_file(
+        &schema_path,
+        r#"
+node Person {
+    slug: String @key
+}
+"#,
+    );
+    write_query_file(
+        &query_path,
+        r#"
+query broken($slug: String) {
+    update Person set { missing: "nope" } where slug = $slug
+}
+"#,
+    );
+
+    let output = output_failure(
+        cli()
+            .arg("query")
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(payload["status"], "error");
+    assert_eq!(payload["results"][0]["status"], "error");
+    assert!(payload["results"][0].get("operation").is_none());
 }
 
 #[test]
