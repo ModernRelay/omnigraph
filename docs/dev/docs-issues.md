@@ -54,6 +54,16 @@ fixed. Branch `docs/user-coherence-0-7-1`.
     *after* the v0.7.1 tag — so it is in no tag yet and a hand-edit would be
     overwritten on the next sync. It flows in automatically when the SDK bumps
     to a tag containing the fix (v0.7.2+). Tracked, not actioned.
+  - `omnigraph-ts` SDK — OmniGraph v0.10 adds HTTP 424 plus the optional
+    `ErrorOutput.external_blob_source` detail for admitted-but-unavailable
+    external Blob sources. The generated SDK must not be hand-edited from an
+    unreleased core commit: its supported sync consumes a tagged OmniGraph
+    OpenAPI document and runs against that released binary. Treat the SDK 0.10
+    sync as a **release blocker immediately after the OmniGraph v0.10.0 tag**;
+    run the normal spec sync/generator, add a public 424
+    `FailedDependencyError` mapping and dispatcher coverage, and retain the
+    closed `ErrorCode` enum. Older 0.9 clients preserve the real HTTP status and
+    response body but expose the failure through their generic error fallback.
   - `omnigraph-cookbooks/docs/best-practices.md` `bearer_token_env` chain —
     **RESOLVED** by omnigraph-cookbooks PR #26 (2026-06-21), which deleted
     `docs/best-practices.md` as part of the 0.7 restructure; the stale chain

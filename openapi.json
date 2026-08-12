@@ -1528,6 +1528,16 @@
               }
             }
           },
+          "424": {
+            "description": "An allowed external Blob source could not be probed or read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "429": {
             "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
             "content": {
@@ -1903,6 +1913,16 @@
           },
           "413": {
             "description": "Stored keyed mutation exceeds the per-commit row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "A stored mutation could not probe or read an allowed external Blob source",
             "content": {
               "application/json": {
                 "schema": {

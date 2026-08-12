@@ -455,6 +455,7 @@ pub(crate) fn precondition_failed_cli(
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            external_blob_source: None,
             recovery_required: None,
             precondition_failure: Some(omnigraph_api_types::PreconditionFailureOutput {
                 expected,

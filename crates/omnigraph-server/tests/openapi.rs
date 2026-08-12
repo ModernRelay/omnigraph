@@ -856,7 +856,9 @@ fn external_blob_source_error_is_structured_and_declared_on_write_routes() {
     for path in [
         "/graphs/{graph_id}/change",
         "/graphs/{graph_id}/mutate",
+        "/graphs/{graph_id}/mutate/if-graph-commit",
         "/graphs/{graph_id}/queries/{name}",
+        "/graphs/{graph_id}/queries/{name}/if-graph-commit",
         "/graphs/{graph_id}/load",
         "/graphs/{graph_id}/load/ndjson",
         "/graphs/{graph_id}/ingest",
