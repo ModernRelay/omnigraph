@@ -866,9 +866,10 @@ impl ApiError {
         }
     }
 
-    /// HTTP 412 Precondition Failed — an `If-Match` branch-head precondition
-    /// no longer holds. `code` is omitted for the same closed-wire-contract
-    /// reason as [`Self::recovery_required`].
+    /// HTTP 412 Precondition Failed — an
+    /// `Omnigraph-If-Graph-Commit` graph-head precondition no longer holds.
+    /// `code` is omitted for the same closed-wire-contract reason as
+    /// [`Self::recovery_required`].
     fn precondition_failed(message: String, details: api::PreconditionFailureOutput) -> Self {
         Self {
             status: StatusCode::PRECONDITION_FAILED,

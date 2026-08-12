@@ -1260,17 +1260,22 @@ impl Omnigraph {
         let normalized = normalize_branch_name(branch.unwrap_or("main"))?;
         let coord = self.coordinator.read().await;
         if normalized.as_deref() == coord.current_branch() {
-            let snapshot_id = coord.head_commit_id().await?.unwrap_or_else(|| {
-                SnapshotId::synthetic(
-                    coord.current_branch(),
-                    coord.version(),
-                    coord.manifest_incarnation().e_tag.as_deref(),
-                )
-            });
+            let graph_commit_id = coord.effective_graph_head().await?;
+            let snapshot_id = graph_commit_id
+                .as_deref()
+                .map(SnapshotId::new)
+                .unwrap_or_else(|| {
+                    SnapshotId::synthetic(
+                        coord.current_branch(),
+                        coord.version(),
+                        coord.manifest_incarnation().e_tag.as_deref(),
+                    )
+                });
             return Ok(ResolvedTarget {
                 requested,
                 branch: coord.current_branch().map(str::to_string),
                 snapshot_id,
+                graph_commit_id,
                 snapshot: coord.snapshot(),
             });
         }
@@ -2076,9 +2081,10 @@ impl Omnigraph {
     /// Resolve a read target to its snapshot, without attaching read caches.
     /// Same-branch reads reuse the warm coordinator, gated by a cheap version
     /// probe (invariant 6: strong consistency, never a blind warm read). Reads do
-    /// not need the commit graph (the manifest version is the visibility
-    /// authority, invariant 2), so the id is synthetic and no commit-graph scan
-    /// happens on this path.
+    /// not need to reopen the commit graph to pin visibility (the manifest
+    /// version is the authority, invariant 2). The cache id stays synthetic;
+    /// the effective graph head comes from the coordinator's already-loaded
+    /// lineage projection, so no commit-graph scan happens on this path.
     async fn resolve_target_inner(&self, target: &ReadTarget) -> Result<ResolvedTarget> {
         if let ReadTarget::Branch(branch) = target {
             let normalized = normalize_branch_name(branch)?;
@@ -2090,7 +2096,7 @@ impl Omnigraph {
                 }
                 let held = coord.manifest_incarnation();
                 if coord.probe_latest_incarnation().await?.matches(&held) {
-                    return Ok(warm_resolved_target(&coord, target));
+                    return warm_resolved_target(&coord, target).await;
                 }
                 // Stale: refresh under the write lock below.
             }
@@ -2104,7 +2110,7 @@ impl Omnigraph {
                     coord.refresh_manifest_only().await?;
                     refreshed = true;
                 }
-                let resolved = warm_resolved_target(&coord, target);
+                let resolved = warm_resolved_target(&coord, target).await?;
                 drop(coord);
                 if refreshed {
                     self.invalidate_read_caches().await;
@@ -3054,11 +3060,14 @@ pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
 
 /// Build a `ResolvedTarget` from the warm coordinator without opening the commit
 /// graph. The live branch snapshot is pinned by the manifest incarnation, so the
-/// id is synthetic `(branch, version, e_tag when available)`; nothing on the read
-/// path needs a real commit ULID (only `RuntimeCache` keys on the id, where
-/// synthetic is consistent).
-fn warm_resolved_target(coord: &GraphCoordinator, requested: &ReadTarget) -> ResolvedTarget {
-    ResolvedTarget {
+/// cache id is synthetic `(branch, version, e_tag when available)`. The effective
+/// lineage head is derived separately from that same coordinator so a fresh fork
+/// exposes its inherited source commit as a conditional-write token.
+async fn warm_resolved_target(
+    coord: &GraphCoordinator,
+    requested: &ReadTarget,
+) -> Result<ResolvedTarget> {
+    Ok(ResolvedTarget {
         requested: requested.clone(),
         branch: coord.current_branch().map(str::to_string),
         snapshot_id: SnapshotId::synthetic(
@@ -3066,8 +3075,9 @@ fn warm_resolved_target(coord: &GraphCoordinator, requested: &ReadTarget) -> Res
             coord.version(),
             coord.manifest_incarnation().e_tag.as_deref(),
         ),
+        graph_commit_id: coord.effective_graph_head().await?,
         snapshot: coord.snapshot(),
-    }
+    })
 }
 
 pub(crate) fn ensure_public_branch_ref(branch: &str, operation: &str) -> Result<()> {

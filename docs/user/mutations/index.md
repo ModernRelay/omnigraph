@@ -100,7 +100,7 @@ returns `recovery_required` with an operation id. Do not immediately retry that
 request; reopen the graph read-write (or restart the server) so the durable
 recovery intent is resolved first.
 
-## Conditional writes (`If-Match` / `--if-commit`)
+## Conditional writes (`Omnigraph-If-Graph-Commit` / `--if-commit`)
 
 A mutation can carry a caller compare-and-swap precondition on the branch
 head: run only if nothing has committed to the branch since the caller read
@@ -113,8 +113,9 @@ of silently overwriting the write that got there first.
    `graph_commit_id` — the head commit id of the exact snapshot your rows
    were served from.
 2. Send the mutation with that id as the precondition: `omnigraph mutate
-   <name> ... --if-commit <id>`, or the `If-Match: <id>` header on
-   `POST /mutate` / `POST /queries/{name}` (stored mutations).
+   <name> ... --if-commit <id>`, or the
+   `Omnigraph-If-Graph-Commit: <id>` header on `POST /mutate` /
+   `POST /queries/{name}` (stored mutations).
 3. Branch head still `<id>` → the mutation runs and commits; the success
    proves no other write interleaved. Head moved → HTTP **412** with
    structured `precondition_failure { expected, actual }` (CLI: exit code 4)

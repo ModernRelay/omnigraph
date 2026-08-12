@@ -2334,6 +2334,44 @@ async fn mutate_expected_head_precondition_issue_365() {
     .await
     .unwrap();
     assert_ne!(head_commit_id(&uri).await, current_head);
+
+    // A fresh named branch has no materialized `graph_head:feature` row, but
+    // it inherits main's exact lineage head. The read token must expose that
+    // effective head because this is the value the mutation gate compares.
+    let inherited_head = head_commit_id(&uri).await;
+    db.branch_create("feature").await.unwrap();
+    let (_, read_head) = db
+        .query_with_head(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_head.as_deref(), Some(inherited_head.as_str()));
+
+    // The token returned by the fresh-branch read is immediately usable for a
+    // conditional first write on that branch.
+    db.mutate_as_with_expected_head(
+        "feature",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 34)]),
+        None,
+        read_head.as_deref(),
+    )
+    .await
+    .unwrap();
+    let feature_head = CommitGraph::open_at_branch(&uri, "feature")
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .expect("feature first write creates a branch-owned head")
+        .graph_commit_id;
+    assert_ne!(feature_head, inherited_head);
 }
 
 /// Tripwire for the precondition/reprepare interaction (GitHub #365): the

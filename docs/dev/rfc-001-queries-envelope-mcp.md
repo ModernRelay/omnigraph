@@ -121,7 +121,7 @@ Today's request carries auth + body. The envelope adds five fields, all optional
 POST /graphs/prod/queries/find_user
 Authorization: Bearer <token>
 Idempotency-Key: 01HXYZ...              # mutations only
-If-Match: 01HABC...                     # optimistic concurrency
+Omnigraph-If-Graph-Commit: 01HABC...    # graph-head optimistic concurrency
 X-Deadline: 2026-05-28T19:30:00Z        # or X-Timeout-Ms: 5000
 X-Trace-Id: 01HDEF...
 Content-Type: application/json
@@ -140,7 +140,7 @@ Field semantics:
 | Field | Applies to | Purpose |
 |---|---|---|
 | `Idempotency-Key` | Mutations | Server caches `(token, key)` → response for 10 minutes. Replays return cached response with `Idempotency-Replay: true` header. Prevents double-write on retry. |
-| `If-Match` | Mutations | Run only if branch HEAD matches the given commit ID. 412 Precondition Failed otherwise. Enables read-then-write without races. |
+| `Omnigraph-If-Graph-Commit` | Mutations | Run only if branch HEAD matches the given raw commit ID. 412 Precondition Failed otherwise. Enables read-then-write without races without overloading HTTP representation validators. |
 | `X-Deadline` / `X-Timeout-Ms` | All | Server respects; returns 504-typed error past the deadline. Bounds execution for context-budget-constrained callers. |
 | `X-Trace-Id` | All | Caller-supplied; server echoes back. Lets agents correlate multi-call sequences. |
 | `expect` | All | Caller asserts shape: `"read_only"`, `{"max_rows_scanned": 10000}`. Server validates against parsed AST or planner estimate; rejects before running. |
@@ -281,7 +281,7 @@ Existing callers see no breakage:
 - `ChangeRequest` field names `query_source` / `query_name` accepted as serde aliases (MR-656).
 - `aliases:` block in `omnigraph.yaml` unchanged; both `read`/`change` and `query`/`mutate` accepted as `command:` values (MR-656).
 - New envelope fields are additive; old clients ignoring them keep working.
-- `Idempotency-Key`, `If-Match`, `X-Deadline` are opt-in headers; absence is the current behavior.
+- `Idempotency-Key`, `Omnigraph-If-Graph-Commit`, and `X-Deadline` are opt-in headers; absence is the current behavior.
 
 Callers move at their own pace. The envelope upgrades + URL rename ship in v0.6.x (small PRs). Stored queries + MCP ship in v0.7.0.
 
@@ -291,7 +291,7 @@ Callers move at their own pace. The envelope upgrades + URL rename ship in v0.6.
 
 1. Wrap responses in the structured envelope. Add `audit_id`, `snapshot_id`, `commit_id`, `stats`, `warnings`. Backward-compatible if we keep today's top-level fields and add new ones alongside; cleaner break if we move to nested `result.*`. Pick one and live with it.
 2. Honor `Idempotency-Key` on `/mutate` (and the deprecated `/change`). Server-side cache keyed by `(token, key)`.
-3. Honor `If-Match` on `/mutate`. Wire through to the publisher CAS layer.
+3. Honor `Omnigraph-If-Graph-Commit` on `/mutate`. Wire through to the publisher CAS layer.
 4. Honor `X-Deadline` / `X-Timeout-Ms` on every endpoint. Return 504-typed error past deadline.
 
 **Phase 2: MR-969 PR 1 (registry).** The stored-query registry, `/queries/{name}` route, `InvokeQuery` Cedar action with per-name scope, `.gq` pragma parsing (`@description`, `@returns`, `@mcp`), read-vs-mutate classification at registry load. Inline keeps working unchanged.

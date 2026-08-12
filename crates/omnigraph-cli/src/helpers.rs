@@ -419,7 +419,8 @@ pub(crate) fn apply_bearer_token(
     }
 }
 
-/// Typed marker for a 412 `If-Match` rejection, carried through `eyre` so the
+/// Typed marker for a 412 graph-commit precondition rejection, carried through
+/// `eyre` so the
 /// `mutate` verb can downcast it and exit with `EXIT_PRECONDITION_FAILED` (4)
 /// instead of the generic failure exit. Holds the full structured error body
 /// for `--json` passthrough.
@@ -470,23 +471,26 @@ pub(crate) async fn remote_json<T: DeserializeOwned>(
     body: Option<Value>,
     bearer_token: Option<&str>,
 ) -> Result<T> {
-    remote_json_with_if_match(client, method, url, body, bearer_token, None).await
+    remote_json_with_graph_commit_precondition(client, method, url, body, bearer_token, None).await
 }
 
-/// [`remote_json`] with an optional `If-Match` branch-head precondition
-/// header (mutation routes only). A 412 whose body carries
+/// [`remote_json`] with an optional `Omnigraph-If-Graph-Commit` graph-head
+/// precondition (mutation routes only). A 412 whose body carries
 /// `precondition_failure` surfaces as the typed [`PreconditionFailedCli`].
-pub(crate) async fn remote_json_with_if_match<T: DeserializeOwned>(
+pub(crate) async fn remote_json_with_graph_commit_precondition<T: DeserializeOwned>(
     client: &reqwest::Client,
     method: Method,
     url: String,
     body: Option<Value>,
     bearer_token: Option<&str>,
-    if_match: Option<&str>,
+    expected_commit: Option<&str>,
 ) -> Result<T> {
     let request = apply_bearer_token(client.request(method, url), bearer_token);
-    let request = if let Some(commit_id) = if_match {
-        request.header(reqwest::header::IF_MATCH, commit_id)
+    let request = if let Some(commit_id) = expected_commit {
+        request.header(
+            omnigraph_api_types::GRAPH_COMMIT_PRECONDITION_HEADER,
+            commit_id,
+        )
     } else {
         request
     };

@@ -1275,6 +1275,88 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(verify_payload["rows"][0]["p.name"], "Eve");
 }
 
+/// GitHub #365: the embedded transport must preserve the typed stale-head
+/// outcome all the way through the CLI boundary. This is deliberately local
+/// and non-ignored so exit code 4 cannot depend on loopback/server coverage.
+#[test]
+fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
+    const FIND_PERSON: &str =
+        "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
+    const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
+
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+
+    let read = output_success(
+        cli()
+            .arg("query")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg(FIND_PERSON)
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    );
+    let stale_head = parse_stdout_json(&read)["graph_commit_id"]
+        .as_str()
+        .expect("embedded read must expose graph_commit_id")
+        .to_string();
+
+    output_success(
+        cli()
+            .arg("mutate")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg(SET_AGE)
+            .arg("--params")
+            .arg(r#"{"name":"Alice","age":31}"#)
+            .arg("--json"),
+    );
+
+    let lost = cli()
+        .arg("mutate")
+        .arg("--store")
+        .arg(&graph)
+        .arg("-e")
+        .arg(SET_AGE)
+        .arg("--params")
+        .arg(r#"{"name":"Alice","age":52}"#)
+        .arg("--if-commit")
+        .arg(&stale_head)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(
+        lost.status.code(),
+        Some(4),
+        "lost embedded --if-commit must exit 4; stderr: {}",
+        String::from_utf8_lossy(&lost.stderr)
+    );
+    let body: Value = serde_json::from_slice(&lost.stdout)
+        .expect("--json must emit structured precondition details on stdout");
+    assert_eq!(
+        body["precondition_failure"]["expected"],
+        Value::String(stale_head)
+    );
+
+    let verify = output_success(
+        cli()
+            .arg("query")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg(FIND_PERSON)
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    );
+    assert_eq!(parse_stdout_json(&verify)["rows"][0]["p.age"], 31);
+}
+
 #[test]
 fn change_resolves_uri_and_default_branch_from_store_scope() {
     // RFC-011: a mutate resolves its graph from `--store` and defaults the

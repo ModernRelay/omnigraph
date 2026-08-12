@@ -42,7 +42,7 @@ use crate::cli::CliLoadMode;
 use crate::helpers::{
     apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
     legacy_change_request_body, precondition_failed_cli, query_params_from_json, remote_json,
-    remote_json_with_if_match, remote_url, resolve_cli_actor, resolve_cli_graph,
+    remote_json_with_graph_commit_precondition, remote_url, resolve_cli_actor, resolve_cli_graph,
     resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_result};
@@ -543,7 +543,7 @@ impl GraphClient {
                 base_url,
                 token,
             } => {
-                remote_json_with_if_match(
+                remote_json_with_graph_commit_precondition(
                     http,
                     Method::POST,
                     remote_url(base_url, &["change"], &[])?,
@@ -670,7 +670,7 @@ impl GraphClient {
                     snapshot,
                     expect_mutation: Some(expect_mutation),
                 };
-                remote_json_with_if_match(
+                remote_json_with_graph_commit_precondition(
                     http,
                     Method::POST,
                     remote_url(base_url, &["queries", name], &[])?,

@@ -699,49 +699,44 @@ pub(crate) async fn server_export(
         .into_response())
 }
 
-/// Extract a mutation's `If-Match` branch-head precondition, if present.
+/// Extract a mutation's graph-head precondition, if present.
 ///
-/// Returns the expected head commit id, accepting both the bare id and the
-/// HTTP-idiomatic quoted entity-tag form (`"<id>"`). Rejects with 400:
-/// - a value that is not valid UTF-8,
-/// - an empty value (after unquoting),
-/// - `*` (HTTP "if any current representation" — a branch always has state,
-///   so the form would make every mutation pass vacuously),
-/// - a weak validator (`W/"<id>"` — head comparison is exact),
-/// - an entity-tag list (`"a", "b"` — the head equals one id, so a list is
-///   almost certainly a caller bug; rejecting beats a misleading mismatch).
-fn if_match_expected_head(
+/// `Omnigraph-If-Graph-Commit` deliberately carries one raw graph commit id,
+/// not an HTTP entity tag. Keeping this graph-level CAS off `If-Match`
+/// preserves the standard header for representation-specific strong ETags
+/// (including the blob-cell contract). Duplicate values and entity-tag syntax
+/// are rejected rather than silently reinterpreted.
+fn graph_commit_expected_head(
     headers: &axum::http::HeaderMap,
 ) -> std::result::Result<Option<String>, ApiError> {
-    let Some(value) = headers.get(axum::http::header::IF_MATCH) else {
+    let mut values = headers
+        .get_all(api::GRAPH_COMMIT_PRECONDITION_HEADER)
+        .iter();
+    let Some(value) = values.next() else {
         return Ok(None);
     };
+    if values.next().is_some() {
+        return Err(ApiError::bad_request(
+            "Omnigraph-If-Graph-Commit must be sent exactly once",
+        ));
+    }
     let value = value
         .to_str()
-        .map_err(|_| ApiError::bad_request("If-Match header is not valid UTF-8"))?
+        .map_err(|_| ApiError::bad_request("Omnigraph-If-Graph-Commit is not valid UTF-8"))?
         .trim();
-    if value == "*" {
-        return Err(ApiError::bad_request(
-            "If-Match: * is not supported — pass the branch head commit id",
-        ));
-    }
-    if let Some(weak) = value.strip_prefix("W/") {
-        return Err(ApiError::bad_request(format!(
-            "If-Match weak validator {weak} is not supported — pass the exact branch head commit id"
-        )));
-    }
-    if value.contains(',') {
-        return Err(ApiError::bad_request(
-            "If-Match must name a single branch head commit id, not an entity-tag list",
-        ));
-    }
-    let value = value
-        .strip_prefix('"')
-        .and_then(|inner| inner.strip_suffix('"'))
-        .unwrap_or(value);
     if value.is_empty() {
         return Err(ApiError::bad_request(
-            "If-Match header must name a branch head commit id",
+            "Omnigraph-If-Graph-Commit must name a graph commit id",
+        ));
+    }
+    if value == "*"
+        || value.starts_with("W/")
+        || value.starts_with('"')
+        || value.ends_with('"')
+        || value.contains(',')
+    {
+        return Err(ApiError::bad_request(
+            "Omnigraph-If-Graph-Commit must contain one raw graph commit id, not entity-tag syntax",
         ));
     }
     Ok(Some(value.to_string()))
@@ -902,7 +897,7 @@ pub(crate) async fn run_query(
     operation_id = "change",
     request_body = ChangeRequest,
     params(
-        ("If-Match" = Option<String>, Header, description = "Branch-head precondition: run only if the branch's head commit id still equals this value (from `GET /commits`). Mismatch returns 412 with `precondition_failure` details and no effect."),
+        ("Omnigraph-If-Graph-Commit" = Option<String>, Header, description = "Graph-head precondition: run only if the branch's effective head commit id still equals this raw value (also returned by reads). Mismatch returns 412 with `precondition_failure` details and no effect."),
     ),
     responses(
         (status = 200, description = "Mutation results (response includes `Deprecation: true` + `Link: <mutate>; rel=\"successor-version\"`)", body = ChangeOutput),
@@ -910,7 +905,7 @@ pub(crate) async fn run_query(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Write-authority conflict", body = ErrorOutput),
-        (status = 412, description = "`If-Match` branch-head precondition failed; the write had no effect", body = ErrorOutput),
+        (status = 412, description = "Graph-commit precondition failed; the write had no effect", body = ErrorOutput),
         (status = 413, description = "Keyed write exceeds the per-commit row or byte ceiling", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
@@ -934,7 +929,7 @@ pub(crate) async fn server_change(
     headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ChangeOutput>), ApiError> {
-    let expected_head = if_match_expected_head(&headers)?;
+    let expected_head = graph_commit_expected_head(&headers)?;
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     let output = run_mutate(
         state,
@@ -960,7 +955,7 @@ pub(crate) async fn server_change(
     operation_id = "mutate",
     request_body = ChangeRequest,
     params(
-        ("If-Match" = Option<String>, Header, description = "Branch-head precondition: run only if the branch's head commit id still equals this value (from `GET /commits`). Mismatch returns 412 with `precondition_failure` details and no effect."),
+        ("Omnigraph-If-Graph-Commit" = Option<String>, Header, description = "Graph-head precondition: run only if the branch's effective head commit id still equals this raw value (also returned by reads). Mismatch returns 412 with `precondition_failure` details and no effect."),
     ),
     responses(
         (status = 200, description = "Mutation results", body = ChangeOutput),
@@ -968,7 +963,7 @@ pub(crate) async fn server_change(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Write-authority conflict", body = ErrorOutput),
-        (status = 412, description = "`If-Match` branch-head precondition failed; the write had no effect", body = ErrorOutput),
+        (status = 412, description = "Graph-commit precondition failed; the write had no effect", body = ErrorOutput),
         (status = 413, description = "Keyed write exceeds the per-commit row or byte ceiling", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
@@ -983,10 +978,10 @@ pub(crate) async fn server_change(
 /// mutations may still acquire locks briefly. Returns 409 when the prepared
 /// write authority changes before effects.
 ///
-/// An `If-Match: <commit_id>` header makes the write conditional: it runs
-/// only if the branch's head commit still equals the given id (a
-/// compare-and-swap for read-then-write callers), and returns 412 with
-/// structured `precondition_failure` details otherwise.
+/// An `Omnigraph-If-Graph-Commit: <commit_id>` header makes the write
+/// conditional: it runs only if the branch's effective graph head still
+/// equals the given id (a compare-and-swap for read-then-write callers), and
+/// returns 412 with structured `precondition_failure` details otherwise.
 ///
 /// Pairs with `POST /query` (read-only). The legacy `POST /change` route
 /// has identical semantics and is kept as a deprecated alias.
@@ -997,7 +992,7 @@ pub(crate) async fn server_mutate(
     headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
-    let expected_head = if_match_expected_head(&headers)?;
+    let expected_head = graph_commit_expected_head(&headers)?;
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     Ok(Json(
         run_mutate(
@@ -1040,7 +1035,7 @@ pub(crate) fn parse_optional_invoke_body(
     operation_id = "invoke_query",
     params(
         ("name" = String, Path, description = "Stored query name (the registry key)"),
-        ("If-Match" = Option<String>, Header, description = "Branch-head precondition, applied to stored mutations only: run only if the branch's head commit id still equals this value. Mismatch returns 412 with `precondition_failure` details and no effect. A valid header on a stored read has no effect; malformed values (`*`, weak, empty) are rejected with 400 for both kinds."),
+        ("Omnigraph-If-Graph-Commit" = Option<String>, Header, description = "Graph-head precondition for stored mutations only: run only if the branch's effective head commit id still equals this raw value. Mismatch returns 412 with `precondition_failure` details and no effect. The header is rejected on stored reads."),
     ),
     request_body = Option<InvokeStoredQueryRequest>,
     responses(
@@ -1050,7 +1045,7 @@ pub(crate) fn parse_optional_invoke_body(
         (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
         (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
         (status = 409, description = "Stored mutation write-authority conflict", body = ErrorOutput),
-        (status = 412, description = "Stored mutation `If-Match` branch-head precondition failed; the write had no effect", body = ErrorOutput),
+        (status = 412, description = "Stored mutation graph-commit precondition failed; the write had no effect", body = ErrorOutput),
         (status = 413, description = "Stored keyed mutation exceeds the per-commit row or byte ceiling", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
@@ -1077,7 +1072,6 @@ pub(crate) async fn server_invoke_query(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
-    let expected_head = if_match_expected_head(&headers)?;
     let req = parse_optional_invoke_body(body)?;
     // A caller without `invoke_query` can't tell a denial from a missing
     // query: both 404 with this exact message, so the catalog can't be
@@ -1146,6 +1140,7 @@ pub(crate) async fn server_invoke_query(
     );
 
     if is_mutation {
+        let expected_head = graph_commit_expected_head(&headers)?;
         if req.snapshot.is_some() {
             return Err(ApiError::bad_request(
                 "stored mutation cannot target a snapshot",
@@ -1165,6 +1160,11 @@ pub(crate) async fn server_invoke_query(
         .await?;
         Ok(Json(InvokeStoredQueryResponse::Change(output)))
     } else {
+        if headers.contains_key(api::GRAPH_COMMIT_PRECONDITION_HEADER) {
+            return Err(ApiError::bad_request(
+                "Omnigraph-If-Graph-Commit applies only to stored mutations",
+            ));
+        }
         let (selected, target, result, graph_commit_id) = run_query(
             handle,
             actor_ref,

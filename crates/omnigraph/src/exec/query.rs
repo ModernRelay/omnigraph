@@ -41,8 +41,9 @@ impl Omnigraph {
     }
 
     /// [`Self::query`] additionally returning the graph head commit id of the
-    /// exact snapshot the query executed against (`None` on a branch with no
-    /// commits, or when the target's branch cannot be resolved).
+    /// exact snapshot the query executed against. A fresh named branch returns
+    /// its inherited source commit even though it has no materialized
+    /// branch-owned head row yet.
     ///
     /// The id comes from the same pinned version as every table read — the
     /// value a caller passes to [`Self::mutate_as_with_expected_head`] for a
@@ -80,10 +81,7 @@ impl Omnigraph {
             GraphIndexHandle::none()
         };
 
-        let head = resolved
-            .snapshot
-            .graph_head(resolved.branch.as_deref())
-            .map(str::to_string);
+        let head = resolved.graph_commit_id.clone();
         let result = execute_query(
             &ir,
             params,

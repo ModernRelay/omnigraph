@@ -2065,19 +2065,19 @@ async fn ingest_per_actor_admission_cap_returns_429() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mutate_if_match_precondition_issue_365() {
-    // GitHub #365: `If-Match: <commit_id>` makes `mutate` a
+async fn mutate_graph_commit_precondition_issue_365() {
+    // GitHub #365: `Omnigraph-If-Graph-Commit: <commit_id>` makes `mutate` a
     // single-round-trip compare-and-swap. A caller that read the branch at
     // head X must be rejected atomically (412, structured
     // `precondition_failure`, zero effect) once the head has advanced past
     // X; a precondition naming the current head passes.
-    fn mutate_request(body: &Value, if_match: Option<&str>) -> Request<Body> {
+    fn mutate_request(body: &Value, expected_commit: Option<&str>) -> Request<Body> {
         let mut builder = Request::builder()
             .uri(g("/mutate"))
             .method(Method::POST)
             .header("content-type", "application/json");
-        if let Some(commit_id) = if_match {
-            builder = builder.header("if-match", commit_id);
+        if let Some(commit_id) = expected_commit {
+            builder = builder.header("omnigraph-if-graph-commit", commit_id);
         }
         builder
             .body(Body::from(serde_json::to_vec(body).unwrap()))
@@ -2164,7 +2164,7 @@ async fn mutate_if_match_precondition_issue_365() {
     assert_eq!(
         status,
         StatusCode::PRECONDITION_FAILED,
-        "stale If-Match must be rejected with 412, got {status}: {body}"
+        "stale graph-commit precondition must be rejected with 412, got {status}: {body}"
     );
     let error: ErrorOutput = serde_json::from_value(body).unwrap();
     // code stays None: closed wire contract (`recovery_required` precedent).
@@ -2227,7 +2227,70 @@ async fn mutate_if_match_precondition_issue_365() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "If-Match naming the current head must pass: {body}"
+        "graph-commit precondition naming the current head must pass: {body}"
     );
     assert_eq!(alice_age(&app).await, 33);
+
+    // A newly forked branch has no branch-owned graph-head row yet. Its read
+    // response must nevertheless expose main's inherited effective head — the
+    // same value the engine compares for the branch's conditional first write.
+    let inherited_head = head_commit_id(&app).await;
+    let create = BranchCreateRequest {
+        from: Some("main".to_string()),
+        name: "fresh-cas".to_string(),
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create fresh CAS branch: {body}");
+
+    let (status, fresh_read) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/query"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "query": FIND_PERSON_GQ,
+                    "params": { "name": "Alice" },
+                    "branch": "fresh-cas",
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "read fresh CAS branch: {fresh_read}"
+    );
+    assert_eq!(fresh_read["graph_commit_id"], json!(inherited_head));
+
+    let (status, body) = json_response(
+        &app,
+        mutate_request(
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "set_age",
+                "params": { "name": "Alice", "age": 35 },
+                "branch": "fresh-cas",
+            }),
+            Some(&inherited_head),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "fresh branch must accept its read token on the first write: {body}"
+    );
 }

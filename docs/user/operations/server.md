@@ -269,17 +269,19 @@ Do not blindly resubmit the write: let a read-write open or the recovery sweep
 resolve that operation first, then retry from a fresh snapshot.
 
 `precondition_failure` is set when a mutation carried an
-`If-Match: <commit_id>` branch-head precondition and the branch's head no
-longer matches that id. The HTTP status is 412 and
+`Omnigraph-If-Graph-Commit: <commit_id>` branch-head precondition and the
+branch's head no longer matches that id. The HTTP status is 412 and
 `PreconditionFailureOutput { expected, actual? }` carries the id the caller
 named and the current head (`actual` is absent on a branch with no commits).
 The write had no effect and is never internally retried — losing the
 compare-and-swap is the signal the caller asked for; re-read the branch and
 decide again. Like `recovery_required`, the `code` field is omitted (closed
 enum); detect this outcome by the 412 status or the presence of the field.
-`If-Match` is honored on `POST /mutate`, `POST /change`, and stored-mutation
-invocation via `POST /queries/{name}`; the id comes from `GET /commits`. The
-`*` and weak (`W/"..."`) entity-tag forms are rejected with 400.
+`Omnigraph-If-Graph-Commit` is honored on `POST /mutate`, `POST /change`, and
+stored-mutation invocation via `POST /queries/{name}`; the id comes directly
+from a read response or from `GET /commits`. Stored reads reject the header.
+The value is one raw graph commit id; HTTP entity-tag forms such as `*`, lists,
+quoted tags, and weak (`W/"..."`) tags are rejected with 400.
 
 HTTP status codes used include 200, 400, 401, 403, 404, 405, 409, 412, 413,
 415, 429, 500, and 503.

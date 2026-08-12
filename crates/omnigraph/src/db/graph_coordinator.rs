@@ -80,6 +80,10 @@ pub struct ResolvedTarget {
     pub requested: ReadTarget,
     pub branch: Option<String>,
     pub snapshot_id: SnapshotId,
+    /// Effective graph-lineage head of this exact snapshot. On a freshly
+    /// forked named branch this is the inherited source commit even though the
+    /// branch intentionally has no materialized `graph_head:<branch>` row yet.
+    pub graph_commit_id: Option<String>,
     pub snapshot: Snapshot,
 }
 
@@ -226,6 +230,21 @@ impl GraphCoordinator {
     /// state as [`Self::snapshot`], not the separately refreshed lineage cache.
     pub(crate) fn exact_graph_head(&self) -> Option<String> {
         self.manifest.exact_graph_head()
+    }
+
+    /// Effective lineage head for the manifest snapshot held by this
+    /// coordinator. The exact branch-head row is authoritative once the branch
+    /// owns a commit. Its absence is first-class only for a fresh fork, where
+    /// the commit projection loaded from the same branch manifest supplies the
+    /// inherited source head.
+    pub(crate) async fn effective_graph_head(&self) -> Result<Option<String>> {
+        match self.exact_graph_head() {
+            Some(head) => Ok(Some(head)),
+            None => self
+                .head_commit_id()
+                .await
+                .map(|head| head.map(|head| head.as_str().to_string())),
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -392,17 +411,22 @@ impl GraphCoordinator {
                         .await?
                     }
                 };
-                let snapshot_id = other.head_commit_id().await?.unwrap_or_else(|| {
-                    SnapshotId::synthetic(
-                        other.current_branch(),
-                        other.version(),
-                        other.manifest_incarnation().e_tag.as_deref(),
-                    )
-                });
+                let graph_commit_id = other.effective_graph_head().await?;
+                let snapshot_id = graph_commit_id
+                    .as_deref()
+                    .map(SnapshotId::new)
+                    .unwrap_or_else(|| {
+                        SnapshotId::synthetic(
+                            other.current_branch(),
+                            other.version(),
+                            other.manifest_incarnation().e_tag.as_deref(),
+                        )
+                    });
                 Ok(ResolvedTarget {
                     requested: target.clone(),
                     branch: other.bound_branch.clone(),
                     snapshot_id,
+                    graph_commit_id,
                     snapshot: other.snapshot(),
                 })
             }
@@ -418,6 +442,7 @@ impl GraphCoordinator {
                     requested: target.clone(),
                     branch: commit.manifest_branch.clone(),
                     snapshot_id: snapshot_id.clone(),
+                    graph_commit_id: Some(commit.graph_commit_id),
                     snapshot,
                 })
             }

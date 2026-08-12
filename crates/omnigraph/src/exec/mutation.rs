@@ -673,7 +673,8 @@ impl Omnigraph {
     }
 
     /// [`Self::mutate_as`] with a caller-supplied compare-and-swap
-    /// precondition on the branch head (the HTTP `If-Match` surface).
+    /// precondition on the branch head (the HTTP
+    /// `Omnigraph-If-Graph-Commit` surface).
     ///
     /// When `expected_head` is `Some`, the mutation runs only if the branch's
     /// effective head commit id still equals it — i.e. nothing has committed

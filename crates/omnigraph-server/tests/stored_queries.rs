@@ -92,6 +92,28 @@ async fn invoke_stored_read_returns_rows() {
         "Alice is in the fixture; body: {body}"
     );
     assert!(body["rows"].is_array(), "read envelope shape; body: {body}");
+
+    // The graph-head precondition is mutation-only. A stored read must reject
+    // it instead of silently ignoring a caller's concurrency requirement.
+    let request = axum::http::Request::builder()
+        .uri(g("/queries/find_person"))
+        .method(axum::http::Method::POST)
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer t-invoke")
+        .header("omnigraph-if-graph-commit", "unused-on-reads")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "params": { "name": "Alice" } })).unwrap(),
+        ))
+        .unwrap();
+    let (status, body) = json_response(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("applies only to stored mutations"),
+        "mutation-only header must not be ignored by a stored read; body: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -481,11 +503,11 @@ async fn list_queries_is_empty_when_no_registry() {
 }
 
 /// GitHub #365: a stored mutation invoked by name honors the same
-/// `If-Match` branch-head precondition as `POST /mutate` — this is the CLI's
-/// `mutate <name>` path in served deployments, so without it the flag would
-/// silently not apply to stored mutations.
+/// `Omnigraph-If-Graph-Commit` branch-head precondition as `POST /mutate` —
+/// this is the CLI's `mutate <name>` path in served deployments, so without it
+/// the flag would silently not apply to stored mutations.
 #[tokio::test(flavor = "multi_thread")]
-async fn invoke_stored_mutation_if_match_precondition_issue_365() {
+async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
     async fn head_commit_id(app: &axum::Router) -> String {
         let (status, out) =
             json_response(app, get_request(&g("/commits?branch=main"), "t-full")).await;
@@ -500,17 +522,17 @@ async fn invoke_stored_mutation_if_match_precondition_issue_365() {
             .unwrap()
             .to_string()
     }
-    fn invoke_with_if_match(
+    fn invoke_with_graph_commit_precondition(
         name: &str,
         body: serde_json::Value,
-        if_match: &str,
+        expected_commit: &str,
     ) -> axum::http::Request<Body> {
         axum::http::Request::builder()
             .uri(g(&format!("/queries/{name}")))
             .method(axum::http::Method::POST)
             .header("content-type", "application/json")
             .header("authorization", "Bearer t-full")
-            .header("if-match", if_match)
+            .header("omnigraph-if-graph-commit", expected_commit)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
     }
@@ -539,7 +561,7 @@ async fn invoke_stored_mutation_if_match_precondition_issue_365() {
     // Stale precondition: 412 with structured details, no effect.
     let (status, body) = json_response(
         &app,
-        invoke_with_if_match(
+        invoke_with_graph_commit_precondition(
             "add_person",
             json!({ "params": { "name": "Zed" } }),
             &stale_head,
@@ -549,7 +571,7 @@ async fn invoke_stored_mutation_if_match_precondition_issue_365() {
     assert_eq!(
         status,
         StatusCode::PRECONDITION_FAILED,
-        "stale If-Match on a stored mutation must 412; body: {body}"
+        "stale graph-commit precondition on a stored mutation must 412; body: {body}"
     );
     assert_eq!(body["precondition_failure"]["expected"], json!(stale_head));
 
@@ -557,7 +579,7 @@ async fn invoke_stored_mutation_if_match_precondition_issue_365() {
     let current_head = head_commit_id(&app).await;
     let (status, body) = json_response(
         &app,
-        invoke_with_if_match(
+        invoke_with_graph_commit_precondition(
             "add_person",
             json!({ "params": { "name": "Zed" } }),
             &current_head,

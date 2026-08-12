@@ -326,9 +326,9 @@ impl Snapshot {
     /// Exact `graph_head:<branch>` commit id from this snapshot's own pinned
     /// manifest version (`None` = main). Absent on a branch with no commits.
     ///
-    /// The value a caller passes back as an `If-Match` / `--if-commit`
-    /// precondition: same pinned version as every table this snapshot reads,
-    /// so it certifies exactly the world those reads observed.
+    /// This exact row is write authority when present. A fresh named branch has
+    /// no materialized row yet; callers that need its effective inherited
+    /// lineage head must resolve it through `GraphCoordinator`.
     pub fn graph_head(&self, branch: Option<&str>) -> Option<&str> {
         let branch_key = branch.unwrap_or(MAIN_BRANCH_HEAD_KEY);
         self.graph_heads.get(branch_key).map(String::as_str)
