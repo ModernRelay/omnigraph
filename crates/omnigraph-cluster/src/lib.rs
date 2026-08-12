@@ -1131,7 +1131,7 @@ pub async fn apply_config_dir_with_options(
             record_approval_consumed(&mut new_state, approval_id, "apply");
         }
     }
-    recompute_state_graph_digests(&mut new_state, &desired);
+    recompute_state_graph_digests(&mut new_state, &desired, &changes);
 
     let mut residual = diff_resources(
         &state_resource_digests(&new_state),
@@ -1852,7 +1852,11 @@ async fn write_resource_payload(
 /// state's own schema/query components. Without this, an applied query change
 /// would leave the prior composite digest in state and `graph.<id>` would show
 /// a phantom update in every later plan — apply could never converge.
-fn recompute_state_graph_digests(state: &mut ClusterState, desired: &DesiredCluster) {
+fn recompute_state_graph_digests(
+    state: &mut ClusterState,
+    desired: &DesiredCluster,
+    changes: &[PlanChange],
+) {
     for graph in &desired.graphs {
         let graph_address = graph_address(&graph.id);
         if !state
@@ -1872,14 +1876,33 @@ fn recompute_state_graph_digests(state: &mut ClusterState, desired: &DesiredClus
         let embedding_provider_digest = embedding_provider
             .and_then(|address| state.applied_revision.resources.get(address))
             .map(|resource| resource.digest.clone());
-        let external_blob_policy = &graph.external_blob_policy;
+        // A graph composite is normally derived from desired graph metadata
+        // after its executable changes settle. A blocked graph/schema change
+        // is different: that run did not apply the desired graph authority, so
+        // keep the policy already recorded in the applied ledger. Otherwise a
+        // failed schema migration could still broaden Deny to Allow (or revoke
+        // an existing Allow) for the next serving process.
+        let graph_change_blocked = changes.iter().any(|change| {
+            change.disposition == Some(ApplyDisposition::Blocked)
+                && match resource_kind(&change.resource) {
+                    ResourceKind::Graph(graph_id) | ResourceKind::Schema(graph_id) => {
+                        graph_id == graph.id
+                    }
+                    _ => false,
+                }
+        });
+        let external_blob_policy = if graph_change_blocked {
+            state_graph_external_blob_policy(state, &graph.id)
+        } else {
+            graph.external_blob_policy.clone()
+        };
         let digest = graph_digest_with_external_blob_policy(
             &graph.id,
             schema_digest.as_ref(),
             Some(&query_digests),
             embedding_provider,
             embedding_provider_digest.as_ref(),
-            external_blob_policy,
+            &external_blob_policy,
         );
         state.applied_revision.resources.insert(
             graph_address,
@@ -1888,7 +1911,7 @@ fn recompute_state_graph_digests(state: &mut ClusterState, desired: &DesiredClus
                 applies_to: None,
                 embedding_provider: graph.embedding_provider.clone(),
                 embedding_profile: None,
-                external_blob_policy: persisted_external_blob_policy(external_blob_policy),
+                external_blob_policy: persisted_external_blob_policy(&external_blob_policy),
             },
         );
     }

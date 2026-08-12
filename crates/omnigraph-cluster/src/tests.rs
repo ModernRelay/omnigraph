@@ -2008,10 +2008,19 @@ async fn apply_schema_update_and_dependent_query_in_one_run() {
 }
 
 #[tokio::test]
-async fn apply_unsupported_schema_change_fails_loudly() {
+async fn apply_unsupported_schema_change_preserves_applied_external_blob_policy() {
     let dir = fixture();
     init_derived_graph(dir.path()).await;
     write_applyable_state(dir.path());
+    let config_path = dir.path().join(CLUSTER_CONFIG_FILE);
+    let deny_config = fs::read_to_string(&config_path).unwrap();
+    let allow_config = deny_config.replacen(
+        "    queries:\n",
+        "    external_blobs:\n      allow:\n        - base: s3://assets-bucket/knowledge/\n          scope: server_safe\n    queries:\n",
+        1,
+    );
+    assert_ne!(allow_config, deny_config);
+    fs::write(&config_path, &allow_config).unwrap();
     // Property type changes are unsupported by the engine planner.
     fs::write(
         dir.path().join("people.pg"),
@@ -2045,6 +2054,18 @@ async fn apply_unsupported_schema_change_fails_loudly() {
         state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
         desired.resource_digests["schema.knowledge"]
     );
+    assert!(
+        state["applied_revision"]["resources"]["graph.knowledge"]
+            .get("external_blob_policy")
+            .is_none(),
+        "a failed schema apply must not broaden the applied Deny policy: {state}"
+    );
+    let serving = read_serving_snapshot(dir.path()).await.unwrap();
+    assert_eq!(
+        serving.graphs[0].external_blob_policy,
+        omnigraph::ExternalBlobPolicy::Deny,
+        "serving authority must remain the previously applied policy"
+    );
     let db = Omnigraph::open_read_only(&derived_graph_uri(dir.path(), "knowledge"))
         .await
         .unwrap();
@@ -2074,6 +2095,54 @@ async fn apply_unsupported_schema_change_fails_loudly() {
     fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
     let recovered = apply_config_dir(dir.path()).await;
     assert!(recovered.ok && recovered.converged, "{recovered:?}");
+    let allowed_state = read_state_json(dir.path());
+    assert_eq!(
+        allowed_state["applied_revision"]["resources"]["graph.knowledge"]["external_blob_policy"]["mode"],
+        "allow",
+        "the desired policy must install after the graph apply succeeds"
+    );
+
+    // The fence is symmetric. A failed graph/schema apply must not silently
+    // revoke an already-applied Allow either; only a successful later apply
+    // may replace serving authority with desired Deny.
+    fs::write(&config_path, &deny_config).unwrap();
+    fs::write(
+        dir.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n  age: I64?\n}\n",
+    )
+    .unwrap();
+    let failed_deny = apply_config_dir(dir.path()).await;
+    assert!(!failed_deny.ok, "{failed_deny:?}");
+    assert!(
+        failed_deny
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "schema_apply_failed"),
+        "{failed_deny:?}"
+    );
+    let still_allowed_state = read_state_json(dir.path());
+    assert_eq!(
+        still_allowed_state["applied_revision"]["resources"]["graph.knowledge"]["external_blob_policy"]
+            ["mode"],
+        "allow",
+        "a failed schema apply must preserve the applied Allow policy"
+    );
+    let serving = read_serving_snapshot(dir.path()).await.unwrap();
+    assert!(matches!(
+        serving.graphs[0].external_blob_policy,
+        omnigraph::ExternalBlobPolicy::Allow { .. }
+    ));
+
+    fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
+    let denied = apply_config_dir(dir.path()).await;
+    assert!(denied.ok && denied.converged, "{denied:?}");
+    let denied_state = read_state_json(dir.path());
+    assert!(
+        denied_state["applied_revision"]["resources"]["graph.knowledge"]
+            .get("external_blob_policy")
+            .is_none(),
+        "successful Allow-to-Deny apply must restore the historical state shape"
+    );
 }
 
 #[tokio::test]
