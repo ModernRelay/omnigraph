@@ -2,6 +2,9 @@
 //! Moved verbatim from tests/cli.rs in the modularization.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+use std::sync::mpsc;
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -1355,6 +1358,59 @@ fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
             .arg("--json"),
     );
     assert_eq!(parse_stdout_json(&verify)["rows"][0]["p.age"], 31);
+}
+
+/// A conditional remote mutation must advertise the capability in its path,
+/// not only in an optional header. An older server can ignore an unknown
+/// header after executing `/change` or `/mutate`; it cannot accidentally run a
+/// route it does not have, so the new CLI must receive 404 before any mutation
+/// handler is reachable.
+#[test]
+fn remote_if_commit_fails_closed_against_an_older_server() {
+    const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (line_tx, line_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        line_tx.send(request_line).unwrap();
+        let body = r#"{"error":"not found"}"#;
+        write!(
+            reader.get_mut(),
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+        reader.get_mut().flush().unwrap();
+    });
+
+    let output = cli()
+        .arg("mutate")
+        .arg("--server")
+        .arg(format!("http://{address}"))
+        .arg("--graph")
+        .arg("legacy")
+        .arg("-e")
+        .arg(SET_AGE)
+        .arg("--params")
+        .arg(r#"{"name":"Alice","age":52}"#)
+        .arg("--if-commit")
+        .arg("01HOLDHEAD")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "an old server must fail closed");
+    server.join().unwrap();
+    assert_eq!(
+        line_rx.recv().unwrap().trim_end(),
+        "POST /graphs/legacy/mutate/if-graph-commit HTTP/1.1",
+        "the CLI must not send a conditional write to an older server's ordinary mutation route"
+    );
 }
 
 #[test]

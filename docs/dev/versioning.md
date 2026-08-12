@@ -89,6 +89,12 @@ additive. New fields are optional, old clients ignore unknown fields, and the
 OpenAPI drift test guards unintended breaking changes. Storage strictness does
 not justify a wire-version gate.
 
+An optional field or header is safe only when an older peer may ignore it
+without changing correctness. Behavior-bearing opt-ins use a fail-closed
+capability shape instead. For example, graph-head conditional mutations use a
+dedicated route: an older server returns 404 before execution rather than
+ignoring an unknown header and writing unconditionally.
+
 ## When changing an axis
 
 - **Storage format:** bump the manifest version, keep

@@ -2374,6 +2374,69 @@ async fn mutate_expected_head_precondition_issue_365() {
     assert_ne!(feature_head, inherited_head);
 }
 
+/// A warm handle may refresh its manifest after another handle publishes.
+/// The read token and the following write capture must both prefer the exact
+/// graph-head row from that refreshed manifest over the handle's older derived
+/// lineage cache, or a token returned by the read falsely rejects immediately.
+#[tokio::test]
+async fn refreshed_warm_read_token_is_accepted_by_next_conditional_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let reader = init_and_load(&dir).await;
+    let writer = Omnigraph::open(&uri).await.unwrap();
+
+    let (_, before) = reader
+        .query_with_head(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+    writer
+        .mutate(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+        )
+        .await
+        .unwrap();
+
+    let (_, refreshed) = reader
+        .query_with_head(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        refreshed, before,
+        "the warm read must observe writer's commit"
+    );
+    let durable_head = head_commit_id(&uri).await;
+    assert_eq!(
+        refreshed.as_deref(),
+        Some(durable_head.as_str()),
+        "the token must come from the exact refreshed manifest snapshot"
+    );
+
+    reader
+        .mutate_as_with_expected_head(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 32)]),
+            None,
+            refreshed.as_deref(),
+        )
+        .await
+        .expect("a just-returned warm read token must be usable immediately");
+}
+
 /// Tripwire for the precondition/reprepare interaction (GitHub #365): the
 /// pre-effect retry loop replays insert-only mutations after an internal
 /// `ReadSetChanged`, and a caller precondition must never ride that replay —

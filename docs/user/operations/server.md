@@ -70,9 +70,11 @@ graph id from the cluster's applied revision:
 | POST | `/graphs/{id}/read` | bearer + `read` | **deprecated** alias of `/query` (legacy field names `query_source`/`query_name`, byte-stable response; carries `Deprecation: true` + `Link: <query>; rel="successor-version"`) |
 | POST | `/graphs/{id}/export` | bearer + `export` | NDJSON stream |
 | POST | `/graphs/{id}/mutate` | bearer + `change` | mutation (canonical; `query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) |
+| POST | `/graphs/{id}/mutate/if-graph-commit` | bearer + `change` | conditional mutation; requires `Omnigraph-If-Graph-Commit` |
 | POST | `/graphs/{id}/change` | bearer + `change` | **deprecated** alias of `/mutate` (carries `Deprecation: true` + `Link: <mutate>; rel="successor-version"`) |
 | GET | `/graphs/{id}/queries` | bearer + `read` | list the graph's stored queries as a typed tool catalog |
 | POST | `/graphs/{id}/queries/{name}` | bearer + `invoke_query` (+ `change` for a stored mutation) | invoke a named query from the `queries:` registry; deny == 404 |
+| POST | `/graphs/{id}/queries/{name}/if-graph-commit` | bearer + `invoke_query` + `change` | invoke a stored mutation conditionally; requires `Omnigraph-If-Graph-Commit` |
 | GET | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source |
 | POST | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | disabled for cluster-backed serving; returns 409 and points operators at `omnigraph cluster apply` + restart |
 | POST | `/graphs/{id}/load` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | JSON-envelope load (`data` contains NDJSON), retained for compatibility (32 MB body limit) |
@@ -141,10 +143,12 @@ request body uses clean field names that match the CLI `-e` flag and the GQ
 }
 ```
 
-Response shape is identical to `/read` (`ReadOutput`). If the inline source
-contains mutations (`insert` / `update` / `delete`), the request is rejected
-with HTTP 400 and an error pointing the caller at `POST /mutate` — the
-read-only contract is enforced at the URL.
+The response uses `ReadOutput`: it shares `/read`'s query rows and target
+fields and additionally carries the pinned `graph_commit_id`. The deprecated
+`/read` route intentionally keeps its older token-free body byte-stable. If
+the inline source contains mutations (`insert` / `update` / `delete`), the
+request is rejected with HTTP 400 and an error pointing the caller at
+`POST /mutate` — the read-only contract is enforced at the URL.
 
 `POST /mutate` is the canonical mutation endpoint. It accepts the same clean
 field names (`query`, `name`); the legacy field names `query_source` and
@@ -153,10 +157,11 @@ working without changes.
 
 ## Deprecated names (`/read`, `/change`)
 
-`POST /read` and `POST /change` are kept for back-compat indefinitely — they
-are byte-stable on the request side and otherwise behave identically to
-`/query` / `/mutate`. They are flagged as deprecated through three independent
-channels:
+`POST /read` and `POST /change` are kept for back-compat indefinitely. They
+retain their legacy request shapes and otherwise share `/query` / `/mutate`
+execution semantics. `/read` also retains its legacy token-free response body;
+only `/query` exposes `graph_commit_id`. They are flagged as deprecated through
+three independent channels:
 
 - **OpenAPI**: the operations carry `deprecated: true` in `openapi.json`, so
   every OpenAPI codegen (typescript-fetch, openapi-generator, oapi-codegen,
@@ -168,8 +173,10 @@ channels:
   `Link: <mutate>; rel="successor-version"` for `/change`. SDKs and HTTP
   proxies can pick the successor up automatically.
 
-Migration is purely cosmetic on the client side — swap the URL path, leave
-the request body and response handling alone.
+Migration keeps the same query and row semantics, but `/query` adds the
+optional `graph_commit_id` response field. Permissive JSON decoders can ignore
+it; strict-schema or byte-sensitive clients must update their response model
+when swapping the URL path.
 
 ## Bounded graph-batch ingestion
 
@@ -277,11 +284,22 @@ The write had no effect and is never internally retried — losing the
 compare-and-swap is the signal the caller asked for; re-read the branch and
 decide again. Like `recovery_required`, the `code` field is omitted (closed
 enum); detect this outcome by the 412 status or the presence of the field.
-`Omnigraph-If-Graph-Commit` is honored on `POST /mutate`, `POST /change`, and
-stored-mutation invocation via `POST /queries/{name}`; the id comes directly
-from a read response or from `GET /commits`. Stored reads reject the header.
+`Omnigraph-If-Graph-Commit` is required on the dedicated
+`POST /mutate/if-graph-commit` and
+`POST /queries/{name}/if-graph-commit` routes; the id comes directly from a
+canonical read response or from `GET /commits`. Ordinary mutation routes and
+stored reads reject the header. A distinct route makes rolling upgrades fail
+closed: an older server returns 404 before execution rather than silently
+ignoring a new optional header.
 The value is one raw graph commit id; HTTP entity-tag forms such as `*`, lists,
 quoted tags, and weak (`W/"..."`) tags are rejected with 400.
+
+This 412 contract is enforced across concurrent requests within the supported
+single-writer-process topology. The gate is not a distributed lease. If an
+unsupported foreign writer advances the branch after local pre-effect
+arbitration, the exact publisher still prevents a silent lost update, but the
+losing request may already own durable table effects and therefore returns
+`recovery_required` (503) for recovery instead of 412.
 
 HTTP status codes used include 200, 400, 401, 403, 404, 405, 409, 412, 413,
 415, 429, 500, and 503.

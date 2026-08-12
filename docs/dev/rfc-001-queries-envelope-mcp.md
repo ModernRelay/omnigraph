@@ -115,13 +115,14 @@ Pragmas live in source, not in a separate YAML registry. Drop a file in `queries
 
 ### Request envelope ("before")
 
-Today's request carries auth + body. The envelope adds five fields, all optional:
+Today's request carries auth + body. Most envelope fields are optional. A
+graph-commit precondition instead selects the dedicated conditional
+stored-mutation route and is required on that route; the ordinary route
+rejects the header so older servers fail closed before executing a write:
 
 ```http
 POST /graphs/prod/queries/find_user
 Authorization: Bearer <token>
-Idempotency-Key: 01HXYZ...              # mutations only
-Omnigraph-If-Graph-Commit: 01HABC...    # graph-head optimistic concurrency
 X-Deadline: 2026-05-28T19:30:00Z        # or X-Timeout-Ms: 5000
 X-Trace-Id: 01HDEF...
 Content-Type: application/json
@@ -140,14 +141,17 @@ Field semantics:
 | Field | Applies to | Purpose |
 |---|---|---|
 | `Idempotency-Key` | Mutations | Server caches `(token, key)` → response for 10 minutes. Replays return cached response with `Idempotency-Replay: true` header. Prevents double-write on retry. |
-| `Omnigraph-If-Graph-Commit` | Mutations | Run only if branch HEAD matches the given raw commit ID. 412 Precondition Failed otherwise. Enables read-then-write without races without overloading HTTP representation validators. |
+| `Omnigraph-If-Graph-Commit` | Dedicated conditional-mutation routes | Run only if branch HEAD matches the given raw commit ID. The separate route is a fail-closed rolling-version capability gate; ordinary routes reject the header. Inside the supported single-writer-process topology, mismatch is 412 Precondition Failed with no effect. An unsupported foreign post-effect race remains `recovery_required` (503) until distributed fencing exists. |
 | `X-Deadline` / `X-Timeout-Ms` | All | Server respects; returns 504-typed error past the deadline. Bounds execution for context-budget-constrained callers. |
 | `X-Trace-Id` | All | Caller-supplied; server echoes back. Lets agents correlate multi-call sequences. |
 | `expect` | All | Caller asserts shape: `"read_only"`, `{"max_rows_scanned": 10000}`. Server validates against parsed AST or planner estimate; rejects before running. |
 | `dry_run` | Mutations | Returns what *would* happen without committing. Implemented via scratch branch + diff + discard. |
 | `fields` | Reads | Server returns only listed columns. Saves bandwidth + agent context window. |
 
-All five fields are optional; today's call shape continues working.
+On ordinary routes, every additive envelope field remains optional, so today's
+call shape continues working. Supplying `Omnigraph-If-Graph-Commit` instead
+selects `/queries/{name}/if-graph-commit`, where that header is required and
+the stored declaration must be a mutation.
 
 ### Response envelope ("after")
 
@@ -281,7 +285,7 @@ Existing callers see no breakage:
 - `ChangeRequest` field names `query_source` / `query_name` accepted as serde aliases (MR-656).
 - `aliases:` block in `omnigraph.yaml` unchanged; both `read`/`change` and `query`/`mutate` accepted as `command:` values (MR-656).
 - New envelope fields are additive; old clients ignoring them keep working.
-- `Idempotency-Key`, `Omnigraph-If-Graph-Commit`, and `X-Deadline` are opt-in headers; absence is the current behavior.
+- `Idempotency-Key` and `X-Deadline` are opt-in headers; absence is the current behavior. `Omnigraph-If-Graph-Commit` is required only on its dedicated conditional routes, so an older server fails with 404 before executing.
 
 Callers move at their own pace. The envelope upgrades + URL rename ship in v0.6.x (small PRs). Stored queries + MCP ship in v0.7.0.
 
@@ -291,7 +295,10 @@ Callers move at their own pace. The envelope upgrades + URL rename ship in v0.6.
 
 1. Wrap responses in the structured envelope. Add `audit_id`, `snapshot_id`, `commit_id`, `stats`, `warnings`. Backward-compatible if we keep today's top-level fields and add new ones alongside; cleaner break if we move to nested `result.*`. Pick one and live with it.
 2. Honor `Idempotency-Key` on `/mutate` (and the deprecated `/change`). Server-side cache keyed by `(token, key)`.
-3. Honor `Omnigraph-If-Graph-Commit` on `/mutate`. Wire through to the publisher CAS layer.
+3. Honor `Omnigraph-If-Graph-Commit` on the dedicated
+   `/mutate/if-graph-commit` route. Carry it through the mutation authority
+   and recheck it under the pre-effect branch gate; the exact publisher remains
+   the final lost-update fence. Ordinary routes reject the header.
 4. Honor `X-Deadline` / `X-Timeout-Ms` on every endpoint. Return 504-typed error past deadline.
 
 **Phase 2: MR-969 PR 1 (registry).** The stored-query registry, `/queries/{name}` route, `InvokeQuery` Cedar action with per-name scope, `.gq` pragma parsing (`@description`, `@returns`, `@mcp`), read-vs-mutate classification at registry load. Inline keeps working unchanged.

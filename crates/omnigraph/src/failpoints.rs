@@ -145,7 +145,15 @@ pub mod names {
     /// first writer here, commit a conflicting second writer, then prove the
     /// first attempt is discarded and validation is rerun from a fresh token.
     pub const MUTATION_POST_STAGE_PRE_EFFECT_GATE: &str = "mutation.post_stage_pre_effect_gate";
+    /// After a conditional mutation has executed to a zero-effect result, but
+    /// before it acquires the branch gate and revalidates the caller's graph
+    /// head. This pins the linearization point for successful no-op CAS calls.
+    pub const MUTATION_POST_NO_EFFECT_PRE_GATE: &str = "mutation.post_no_effect_pre_gate";
     pub const MUTATION_POST_FINALIZE_PRE_PUBLISHER: &str = "mutation.post_finalize_pre_publisher";
+    /// A stale live read has opened and decoded a replacement manifest whose
+    /// exact branch-head row is absent, but has not yet decoded the inherited
+    /// lineage fallback. Failure here must leave the old coordinator coherent.
+    pub const READ_REFRESH_POST_STATE_PRE_LINEAGE: &str = "read.refresh_post_state_pre_lineage";
     /// Open owns the schema gate and is about to read source/IR/state as one
     /// catalog view.
     pub const OPEN_BEFORE_SCHEMA_CONTRACT_READ: &str = "open.before_schema_contract_read";

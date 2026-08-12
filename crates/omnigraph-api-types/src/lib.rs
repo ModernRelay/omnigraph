@@ -224,6 +224,31 @@ pub struct ReadOutput {
     pub graph_commit_id: Option<String>,
 }
 
+/// Indefinitely byte-stable response shape for the deprecated `POST /read`
+/// route. The canonical [`ReadOutput`] may grow additive fields; this legacy
+/// envelope deliberately cannot carry them.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LegacyReadOutput {
+    pub query_name: String,
+    pub target: ReadTargetOutput,
+    pub row_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
+    pub rows: Value,
+}
+
+impl From<ReadOutput> for LegacyReadOutput {
+    fn from(value: ReadOutput) -> Self {
+        Self {
+            query_name: value.query_name,
+            target: value.target,
+            row_count: value.row_count,
+            columns: value.columns,
+            rows: value.rows,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeOutput {
     pub branch: String,

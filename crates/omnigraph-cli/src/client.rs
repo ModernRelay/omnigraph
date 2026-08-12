@@ -28,11 +28,11 @@ use color_eyre::eyre::bail;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
-    BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
-    ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphListResponse, IngestOutput,
-    IngestRequest, InvokeStoredQueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
-    SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output, ingest_output, read_output,
-    schema_apply_output, snapshot_payload,
+    BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
+    CommitOutput, ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphListResponse,
+    IngestOutput, IngestRequest, InvokeStoredQueryRequest, QueryRequest, ReadOutput,
+    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
+    ingest_output, read_output, schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::Method;
@@ -543,16 +543,27 @@ impl GraphClient {
                 base_url,
                 token,
             } => {
+                let (url, body) = if expected_head.is_some() {
+                    (
+                        remote_url(base_url, &["mutate", "if-graph-commit"], &[])?,
+                        serde_json::to_value(ChangeRequest {
+                            query: query_source.to_string(),
+                            name: query_name.map(ToOwned::to_owned),
+                            params: params_json.cloned(),
+                            branch: Some(branch.to_string()),
+                        })?,
+                    )
+                } else {
+                    (
+                        remote_url(base_url, &["change"], &[])?,
+                        legacy_change_request_body(query_source, query_name, branch, params_json),
+                    )
+                };
                 remote_json_with_graph_commit_precondition(
                     http,
                     Method::POST,
-                    remote_url(base_url, &["change"], &[])?,
-                    Some(legacy_change_request_body(
-                        query_source,
-                        query_name,
-                        branch,
-                        params_json,
-                    )),
+                    url,
+                    Some(body),
                     token.as_deref(),
                     expected_head,
                 )
@@ -618,10 +629,10 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::POST,
-                    remote_url(base_url, &["read"], &[])?,
-                    Some(serde_json::to_value(ReadRequest {
-                        query_source: query_source.to_string(),
-                        query_name: query_name.map(ToOwned::to_owned),
+                    remote_url(base_url, &["query"], &[])?,
+                    Some(serde_json::to_value(QueryRequest {
+                        query: query_source.to_string(),
+                        name: query_name.map(ToOwned::to_owned),
                         params: params_json.cloned(),
                         branch,
                         snapshot,
@@ -673,7 +684,11 @@ impl GraphClient {
                 remote_json_with_graph_commit_precondition(
                     http,
                     Method::POST,
-                    remote_url(base_url, &["queries", name], &[])?,
+                    if expected_head.is_some() {
+                        remote_url(base_url, &["queries", name, "if-graph-commit"], &[])?
+                    } else {
+                        remote_url(base_url, &["queries", name], &[])?
+                    },
                     Some(serde_json::to_value(body)?),
                     token.as_deref(),
                     expected_head,

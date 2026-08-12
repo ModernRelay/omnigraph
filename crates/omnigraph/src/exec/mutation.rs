@@ -679,15 +679,21 @@ impl Omnigraph {
     /// When `expected_head` is `Some`, the mutation runs only if the branch's
     /// effective head commit id still equals it — i.e. nothing has committed
     /// to the branch since the caller read that id. The comparison uses the
-    /// same pinned view the write executes against, and the publisher's
-    /// graph-head fence holds that view through commit, so a success proves
-    /// the head never moved between the caller's read and this write.
+    /// same pinned view the write executes against and is re-evaluated under
+    /// the process-wide branch gate immediately before effects (or before a
+    /// no-op is acknowledged). Within OmniGraph's supported
+    /// single-writer-process topology, success therefore proves that no other
+    /// write interleaved after the caller's read.
     ///
     /// # Errors
     ///
     /// Returns [`OmniError::PreconditionFailed`] — before any effect, never
-    /// internally retried — when the head no longer matches. All other error
-    /// behavior matches [`Self::mutate_as`].
+    /// internally retried — when the local authoritative check observes a
+    /// mismatch. This is not a distributed lease: an unsupported foreign
+    /// writer that races after that check is rejected by the exact publisher,
+    /// but may require recovery after table effects and therefore returns
+    /// [`OmniError::RecoveryRequired`]. All other error behavior matches
+    /// [`Self::mutate_as`].
     pub async fn mutate_as_with_expected_head(
         &self,
         branch: &str,
@@ -820,7 +826,7 @@ impl Omnigraph {
         // staging, and publication all use this immutable attempt. `commit_all`
         // revalidates the complete token under the root-shared schema → branch →
         // sorted-table gates before it arms recovery or advances Lance HEAD.
-        let txn = self.open_write_txn(requested.as_deref()).await?;
+        let mut txn = self.open_write_txn(requested.as_deref()).await?;
         // Caller CAS gate against the pinned view this attempt executes with —
         // a separate head lookup would reopen the race. Re-checked per
         // reprepare; not `ReadSetChanged`, so the retry loop never replays it.
@@ -833,6 +839,7 @@ impl Omnigraph {
                     actual.map(str::to_string),
                 ));
             }
+            txn.caller_expected_graph_head = Some(expected.to_string());
         }
         let resolved_params = params.clone();
 
@@ -870,7 +877,28 @@ impl Omnigraph {
 
         match exec_result {
             Err(e) => Err(e),
-            Ok(total) if staging.is_empty() => Ok(total),
+            Ok(total) if staging.is_empty() => {
+                if txn.caller_expected_graph_head.is_some() {
+                    crate::failpoints::maybe_fail(
+                        crate::failpoints::names::MUTATION_POST_NO_EFFECT_PRE_GATE,
+                    )?;
+                    // A no-op has no table transaction, so it never reaches
+                    // `commit_all`. It still needs a linearization point for
+                    // the caller's CAS promise: under the same schema -> branch
+                    // ordering as effectful writes, re-read the complete
+                    // authority and map a moved caller head to terminal 412.
+                    let _schema_guard = self
+                        .write_queue()
+                        .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+                        .await;
+                    let _branch_guard = self
+                        .write_queue()
+                        .acquire_branch(requested.as_deref())
+                        .await;
+                    self.revalidate_write_txn(&txn).await?;
+                }
+                Ok(total)
+            }
             Ok(total) => {
                 self.validate_staged_mutation(&staging, &txn).await?;
                 let staged = staging.stage_all(self, requested.as_deref()).await?;

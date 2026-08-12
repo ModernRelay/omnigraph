@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{HeaderValue, Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph_server::api::{
@@ -1050,6 +1050,17 @@ async fn read_endpoint_emits_deprecation_headers() {
         Some("<query>; rel=\"successor-version\""),
         "POST /read must point at /query via `Link` rel=successor-version (RFC 8288)"
     );
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        body_bytes.as_ref(),
+        br#"{"query_name":"get_person","target":{"branch":"main","snapshot":null},"row_count":1,"columns":["p.name","p.age"],"rows":[{"p.name":"Alice","p.age":30}]}"#,
+        "POST /read's legacy response bytes are an indefinite compatibility contract"
+    );
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(
+        body.get("graph_commit_id").is_none(),
+        "POST /read has an indefinite byte-stable body contract and must not gain the canonical route's graph_commit_id: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1083,6 +1094,12 @@ async fn query_endpoint_does_not_emit_deprecation_headers() {
     assert!(
         response.headers().get("deprecation").is_none(),
         "POST /query is canonical and must not advertise itself as deprecated"
+    );
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        body["graph_commit_id"].as_str().is_some(),
+        "POST /query must expose the pinned graph-commit token used by conditional writes: {body}"
     );
 }
 
@@ -2072,8 +2089,13 @@ async fn mutate_graph_commit_precondition_issue_365() {
     // `precondition_failure`, zero effect) once the head has advanced past
     // X; a precondition naming the current head passes.
     fn mutate_request(body: &Value, expected_commit: Option<&str>) -> Request<Body> {
+        let path = if expected_commit.is_some() {
+            "/mutate/if-graph-commit"
+        } else {
+            "/mutate"
+        };
         let mut builder = Request::builder()
-            .uri(g("/mutate"))
+            .uri(g(path))
             .method(Method::POST)
             .header("content-type", "application/json");
         if let Some(commit_id) = expected_commit {
@@ -2128,6 +2150,83 @@ async fn mutate_graph_commit_precondition_issue_365() {
 
     let (_temp, app) = app_for_loaded_graph().await;
     let stale_head = head_commit_id(&app).await;
+
+    let conditional_body = json!({
+        "query": MUTATION_QUERIES,
+        "name": "set_age",
+        "params": { "name": "Alice", "age": 77 },
+        "branch": "main",
+    });
+    let (status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/mutate/if-graph-commit"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the conditional capability route must require its header"
+    );
+    for invalid in ["W/\"weak\"", "\"quoted\"", "one,two"] {
+        let (status, _) = json_response(
+            &app,
+            Request::builder()
+                .uri(g("/mutate/if-graph-commit"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .header("omnigraph-if-graph-commit", invalid)
+                .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "entity-tag/list syntax must be refused: {invalid}"
+        );
+    }
+    let mut duplicate = Request::builder()
+        .uri(g("/mutate/if-graph-commit"))
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+        .unwrap();
+    duplicate.headers_mut().append(
+        "omnigraph-if-graph-commit",
+        HeaderValue::from_static("first"),
+    );
+    duplicate.headers_mut().append(
+        "omnigraph-if-graph-commit",
+        HeaderValue::from_static("second"),
+    );
+    let (status, _) = json_response(&app, duplicate).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "duplicate graph-head preconditions must be refused"
+    );
+    let (status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/mutate"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .header("omnigraph-if-graph-commit", &stale_head)
+            .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the ordinary mutation route must refuse an unsafe optional CAS header"
+    );
+    assert_eq!(alice_age(&app).await, 30, "both refusals are pre-effect");
 
     // Writer A claims first (plain mutate) — the head advances past the
     // commit both writers read.

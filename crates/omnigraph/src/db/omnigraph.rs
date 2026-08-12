@@ -144,6 +144,12 @@ pub(crate) struct WriteTxn {
     /// forked named branch whose materialized `graph_head:<branch>` row is
     /// intentionally absent.
     pub(crate) effective_graph_head: Option<String>,
+    /// Optional caller compare-and-swap token for this mutation attempt.
+    /// Unlike the internal authority token, a mismatch is terminal and must
+    /// surface as `PreconditionFailed`; it is re-evaluated from fresh authority
+    /// under the pre-effect gates so update/delete behavior cannot depend on
+    /// the engine's internal reprepare policy.
+    pub(crate) caller_expected_graph_head: Option<String>,
     /// Catalog built from the exact accepted IR whose identity is recorded in
     /// `authority`. Mutation/load planning and validation must use this snapshot,
     /// never the handle-global catalog, which can lag a schema apply performed by
@@ -1022,6 +1028,7 @@ impl Omnigraph {
                     schema_identity_version: schema_state.schema_identity_version,
                 },
                 effective_graph_head,
+                caller_expected_graph_head: None,
                 catalog: Arc::new(catalog),
                 manifest_probe,
             });
@@ -1112,6 +1119,7 @@ impl Omnigraph {
                         schema_identity_version: schema_state.schema_identity_version,
                     },
                     effective_graph_head,
+                    caller_expected_graph_head: None,
                     catalog: Arc::clone(&catalog),
                     manifest_probe,
                 };
@@ -1309,10 +1317,7 @@ impl Omnigraph {
                     return Ok((
                         coord.branch_identifier().await?,
                         coord.exact_graph_head(),
-                        coord
-                            .head_commit_id()
-                            .await?
-                            .map(|head| head.as_str().to_string()),
+                        coord.effective_graph_head().await?,
                         coord.snapshot(),
                         coord.captured_manifest_probe(),
                     ));
@@ -1324,10 +1329,7 @@ impl Omnigraph {
         Ok((
             coord.branch_identifier().await?,
             coord.exact_graph_head(),
-            coord
-                .head_commit_id()
-                .await?
-                .map(|head| head.as_str().to_string()),
+            coord.effective_graph_head().await?,
             coord.snapshot(),
             coord.captured_manifest_probe(),
         ))
@@ -1389,13 +1391,22 @@ impl Omnigraph {
         // Recheck the durable sentinel inside that critical section so a schema
         // apply observed after preparation cannot be followed by a table effect.
         self.ensure_schema_apply_not_locked("write commit").await?;
-        let (branch_identifier, graph_head, _effective_graph_head, snapshot, _) = self
+        let (branch_identifier, graph_head, effective_graph_head, snapshot, _) = self
             .write_authority_for_known_branch(txn.branch.as_deref(), true)
             .await?;
         let (schema_ir, schema_state) =
             load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
         self.ensure_schema_apply_not_locked("write commit").await?;
         validate_schema_ir_against_snapshot(&schema_ir, &snapshot)?;
+        if let Some(expected) = txn.caller_expected_graph_head.as_deref()
+            && effective_graph_head.as_deref() != Some(expected)
+        {
+            return Err(OmniError::precondition_failed(
+                txn.branch.as_deref().unwrap_or("main"),
+                expected,
+                effective_graph_head,
+            ));
+        }
         if branch_identifier != txn.authority.branch_identifier {
             return Err(OmniError::manifest_read_set_changed(
                 format!(
@@ -2081,10 +2092,11 @@ impl Omnigraph {
     /// Resolve a read target to its snapshot, without attaching read caches.
     /// Same-branch reads reuse the warm coordinator, gated by a cheap version
     /// probe (invariant 6: strong consistency, never a blind warm read). Reads do
-    /// not need to reopen the commit graph to pin visibility (the manifest
-    /// version is the authority, invariant 2). The cache id stays synthetic;
-    /// the effective graph head comes from the coordinator's already-loaded
-    /// lineage projection, so no commit-graph scan happens on this path.
+    /// not need to reopen a separate commit store to pin visibility (the
+    /// manifest version is the authority, invariant 2). The cache id stays
+    /// synthetic. A stale refresh may remain manifest-only when that snapshot
+    /// carries an exact head row; an absent row triggers a coherent lineage
+    /// refresh before exposing the effective inherited head.
     async fn resolve_target_inner(&self, target: &ReadTarget) -> Result<ResolvedTarget> {
         if let ReadTarget::Branch(branch) = target {
             let normalized = normalize_branch_name(branch)?;
@@ -2107,7 +2119,11 @@ impl Omnigraph {
                 let held = coord.manifest_incarnation();
                 let mut refreshed = false;
                 if !coord.probe_latest_incarnation().await?.matches(&held) {
-                    coord.refresh_manifest_only().await?;
+                    // An exact head row keeps this state-only; a fresh/recreated
+                    // branch atomically refreshes its inherited lineage too.
+                    // No fallible second phase can leave replacement rows
+                    // paired with the deleted branch's cached private head.
+                    coord.refresh_for_live_read().await?;
                     refreshed = true;
                 }
                 let resolved = warm_resolved_target(&coord, target).await?;

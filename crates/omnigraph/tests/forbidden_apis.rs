@@ -305,7 +305,12 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
-        "refresh_manifest_only",
+        "effective_graph_head",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "refresh_for_live_read",
     ),
     ("db/graph_coordinator.rs", "GraphCoordinator", "branch_list"),
     (
@@ -363,11 +368,15 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     ),
     ("db/manifest.rs", "ManifestCoordinator", "open_with_lineage"),
     ("db/manifest.rs", "ManifestCoordinator", "snapshot_at"),
-    ("db/manifest.rs", "ManifestCoordinator", "refresh"),
     (
         "db/manifest.rs",
         "ManifestCoordinator",
         "refresh_with_lineage",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "refresh_for_live_read",
     ),
     (
         "db/manifest.rs",

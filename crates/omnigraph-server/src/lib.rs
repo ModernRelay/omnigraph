@@ -29,9 +29,9 @@ use api::{
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
     GraphBatchLoadQuery, GraphInfo, GraphListResponse, HealthOutput, IngestOutput, IngestRequest,
-    InvokeStoredQueryRequest, InvokeStoredQueryResponse, QueriesCatalogOutput, QueryRequest,
-    ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery,
-    graph_batch_load_output, ingest_output, schema_apply_output, snapshot_payload,
+    InvokeStoredQueryRequest, InvokeStoredQueryResponse, LegacyReadOutput, QueriesCatalogOutput,
+    QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput,
+    SnapshotQuery, graph_batch_load_output, ingest_output, schema_apply_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
@@ -100,8 +100,10 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_export,
         #[allow(deprecated)] handlers::server_change,
         handlers::server_mutate,
+        handlers::server_mutate_if_graph_commit,
         handlers::server_list_queries,
         handlers::server_invoke_query,
+        handlers::server_invoke_query_if_graph_commit,
         handlers::server_schema_apply,
         handlers::server_schema_get,
         handlers::server_load,
@@ -1193,8 +1195,16 @@ pub fn build_app(state: AppState) -> Router {
             }),
         )
         .route("/mutate", post(server_mutate))
+        .route(
+            "/mutate/if-graph-commit",
+            post(server_mutate_if_graph_commit),
+        )
         .route("/queries", get(server_list_queries))
         .route("/queries/{name}", post(server_invoke_query))
+        .route(
+            "/queries/{name}/if-graph-commit",
+            post(server_invoke_query_if_graph_commit),
+        )
         .route("/schema", get(server_schema_get))
         .route("/schema/apply", post(server_schema_apply))
         .route(

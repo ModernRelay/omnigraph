@@ -146,7 +146,8 @@ pub(crate) enum Command {
         #[arg(long)]
         branch: Option<String>,
         /// Compare-and-swap precondition: run only if the branch's head
-        /// commit id (from `omnigraph commit list`) still equals this value.
+        /// commit id (from `omnigraph query --json` or `omnigraph commit list`)
+        /// still equals this value.
         /// A lost race exits with code 4 and, with --json, the structured
         /// `precondition_failure` body — re-read the branch and decide again.
         #[arg(long = "if-commit", value_name = "COMMIT_ID")]

@@ -111,7 +111,7 @@ async fn invoke_stored_read_returns_rows() {
         body["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("applies only to stored mutations"),
+            .contains("requires the fail-closed conditional route"),
         "mutation-only header must not be ignored by a stored read; body: {body}"
     );
 }
@@ -528,7 +528,7 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
         expected_commit: &str,
     ) -> axum::http::Request<Body> {
         axum::http::Request::builder()
-            .uri(g(&format!("/queries/{name}")))
+            .uri(g(&format!("/queries/{name}/if-graph-commit")))
             .method(axum::http::Method::POST)
             .header("content-type", "application/json")
             .header("authorization", "Bearer t-full")
@@ -545,6 +545,35 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
     let (_temp, app) =
         app_with_stored_queries(specs, &[("act-full", "t-full")], INVOKE_POLICY_YAML).await;
     let stale_head = head_commit_id(&app).await;
+
+    let conditional_body = json!({ "params": { "name": "Refused" } });
+    let request = axum::http::Request::builder()
+        .uri(g("/queries/add_person/if-graph-commit"))
+        .method(axum::http::Method::POST)
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer t-full")
+        .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+        .unwrap();
+    let (status, _) = json_response(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the stored conditional capability route requires its header"
+    );
+    let request = axum::http::Request::builder()
+        .uri(g("/queries/add_person"))
+        .method(axum::http::Method::POST)
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer t-full")
+        .header("omnigraph-if-graph-commit", &stale_head)
+        .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+        .unwrap();
+    let (status, _) = json_response(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the ordinary stored route must reject an unsafe optional CAS header"
+    );
 
     // A plain invoke advances the head past the commit the caller read.
     let (status, body) = json_response(

@@ -24,8 +24,8 @@ use helpers::recovery::{
     branch_head_commit_id, recovery_audit_kinds, single_sidecar_operation_id,
 };
 use helpers::{
-    MUTATION_QUERIES, collect_column_strings, count_rows, mixed_params, mutate_main, params,
-    read_table, version_main,
+    MUTATION_QUERIES, TEST_QUERIES, collect_column_strings, count_rows, mixed_params, mutate_main,
+    params, read_table, version_main,
 };
 
 const SCHEMA_V1: &str = "node Person { name: String @key }\n";
@@ -2388,6 +2388,245 @@ async fn strict_mutation_rejects_disjoint_head_change_before_effects() {
         (winner_person_pin, winner_person_head),
         "strict rejection must happen before any Person table effect"
     );
+}
+
+/// A caller graph-head precondition is terminal even when the race occurs
+/// after the initial capture. Update and delete are intentionally not eligible
+/// for internal reprepare, so the authoritative under-gate check must map both
+/// shapes to `PreconditionFailed` rather than leaking the engine's internal
+/// `ReadSetChanged` classification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn conditional_update_and_delete_races_return_precondition_failed_before_effects() {
+    let _scenario = FailScenario::setup();
+
+    for query_name in ["set_age", "remove_person"] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+        let expected = branch_head_commit_id(dir.path(), "main").await.unwrap();
+        let mutation_params = if query_name == "set_age" {
+            helpers::mixed_params(&[("$name", "Alice")], &[("$age", 99)])
+        } else {
+            helpers::mixed_params(&[("$name", "Alice")], &[])
+        };
+
+        let rendezvous =
+            helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+        let writer_a_db = std::sync::Arc::clone(&db);
+        let expected_for_writer = expected.clone();
+        let writer_a = tokio::spawn(async move {
+            writer_a_db
+                .mutate_as_with_expected_head(
+                    "main",
+                    MUTATION_QUERIES,
+                    query_name,
+                    &mutation_params,
+                    None,
+                    Some(&expected_for_writer),
+                )
+                .await
+        });
+
+        rendezvous.wait_until_reached().await;
+        db.mutate(
+            "main",
+            OCC_DISJOINT_MUTATIONS,
+            "insert_company",
+            &params(&[("$name", "ConcurrentCo")]),
+        )
+        .await
+        .expect("the disjoint winner commits while the conditional mutation is parked");
+        let winner_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
+        let winner_person_pin = helpers::snapshot_main(&db)
+            .await
+            .unwrap()
+            .entry("node:Person")
+            .unwrap()
+            .table_version;
+        let person_uri = node_table_uri(&db, "Person").await;
+        let winner_person_head = lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .latest_version_id()
+            .await
+            .unwrap();
+        rendezvous.release();
+
+        let err = writer_a
+            .await
+            .unwrap()
+            .expect_err("the raced caller precondition must fail");
+        match err {
+            OmniError::PreconditionFailed {
+                branch,
+                expected: actual_expected,
+                actual,
+            } => {
+                assert_eq!(branch, "main");
+                assert_eq!(actual_expected, expected);
+                assert_eq!(actual.as_deref(), Some(winner_head.as_str()));
+            }
+            other => {
+                panic!("conditional {query_name} race must be PreconditionFailed, got: {other}")
+            }
+        }
+
+        let final_person_pin = helpers::snapshot_main(&db)
+            .await
+            .unwrap()
+            .entry("node:Person")
+            .unwrap()
+            .table_version;
+        let final_person_head = lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .latest_version_id()
+            .await
+            .unwrap();
+        assert_eq!(
+            (final_person_pin, final_person_head),
+            (winner_person_pin, winner_person_head),
+            "conditional {query_name} must fail before any Person effect"
+        );
+        assert_eq!(
+            count_rows(&db, "node:Person").await,
+            4,
+            "conditional {query_name} must preserve the fixture rows"
+        );
+    }
+
+    // A zero-match update has no staged table transaction and therefore uses
+    // the no-effect branch-gated linearization path instead of `commit_all`.
+    // It must not acknowledge a stale caller token merely because there is no
+    // payload effect to publish.
+    let dir = tempfile::tempdir().unwrap();
+    let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+    let expected = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_NO_EFFECT_PRE_GATE);
+    let writer_a_db = std::sync::Arc::clone(&db);
+    let expected_for_writer = expected.clone();
+    let writer_a = tokio::spawn(async move {
+        writer_a_db
+            .mutate_as_with_expected_head(
+                "main",
+                MUTATION_QUERIES,
+                "set_age",
+                &helpers::mixed_params(&[("$name", "Missing")], &[("$age", 99)]),
+                None,
+                Some(&expected_for_writer),
+            )
+            .await
+    });
+
+    rendezvous.wait_until_reached().await;
+    db.mutate(
+        "main",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "NoOpRaceWinner")]),
+    )
+    .await
+    .expect("the winner commits while the conditional no-op is parked");
+    let winner_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    rendezvous.release();
+
+    let err = writer_a
+        .await
+        .unwrap()
+        .expect_err("a raced conditional no-op must fail its caller precondition");
+    match err {
+        OmniError::PreconditionFailed {
+            branch,
+            expected: actual_expected,
+            actual,
+        } => {
+            assert_eq!(branch, "main");
+            assert_eq!(actual_expected, expected);
+            assert_eq!(actual.as_deref(), Some(winner_head.as_str()));
+        }
+        other => panic!("conditional no-op race must be PreconditionFailed, got: {other}"),
+    }
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "main").await.unwrap(),
+        winner_head,
+        "the losing no-op must not publish a second graph commit"
+    );
+}
+
+/// A fresh named branch needs its inherited lineage fallback because it has no
+/// exact branch-head row. If that second read fails after opening the
+/// replacement manifest, the warm handle must keep its previous manifest and
+/// lineage paired so the next request retries the coherent refresh instead of
+/// serving replacement rows with the deleted branch's private head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn live_read_refresh_failure_keeps_manifest_and_lineage_coherent() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut writer = helpers::init_and_load(&dir).await;
+    let reader = Omnigraph::open(uri).await.unwrap();
+
+    writer.branch_create("feature").await.unwrap();
+    helpers::mutate_branch(
+        &mut writer,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "OldFeature")], &[("$age", 21)]),
+    )
+    .await
+    .unwrap();
+    reader.sync_branch("feature").await.unwrap();
+    let (_, old_head) = reader
+        .query_with_head(
+            omnigraph::db::ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "OldFeature")]),
+        )
+        .await
+        .unwrap();
+    let old_head = old_head.expect("old feature owns a private head");
+
+    writer.branch_delete("feature").await.unwrap();
+    helpers::mutate_main(
+        &mut writer,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "ReplacementMain")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    let replacement_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    writer.branch_create("feature").await.unwrap();
+
+    {
+        let _failpoint = ScopedFailPoint::new(names::READ_REFRESH_POST_STATE_PRE_LINEAGE, "return");
+        reader
+            .query_with_head(
+                omnigraph::db::ReadTarget::branch("feature"),
+                TEST_QUERIES,
+                "get_person",
+                &params(&[("$name", "ReplacementMain")]),
+            )
+            .await
+            .expect_err("the injected lineage-refresh failure must surface");
+    }
+
+    let (rows, served_head) = reader
+        .query_with_head(
+            omnigraph::db::ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "ReplacementMain")]),
+        )
+        .await
+        .expect("the next read must retry one coherent refresh");
+    assert_eq!(rows.num_rows(), 1);
+    assert_eq!(served_head.as_deref(), Some(replacement_head.as_str()));
+    assert_ne!(served_head.as_deref(), Some(old_head.as_str()));
 }
 
 /// The load adapter shares the same prepared-write boundary as mutations.

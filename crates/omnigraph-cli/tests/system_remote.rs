@@ -135,6 +135,10 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(read_payload, local_read);
     assert_eq!(read_payload["row_count"], 1);
     assert_eq!(read_payload["rows"][0]["p.name"], "Alice");
+    assert!(
+        read_payload["graph_commit_id"].as_str().is_some(),
+        "remote CLI reads must use canonical /query and retain its conditional-write token"
+    );
 
     // Served write: no `--as` (the server resolves the actor; here the server
     // is `--unauthenticated`, so the actor is the server default).
@@ -170,6 +174,10 @@ query insert_person($name: String, $age: I32) {
         .unwrap();
     assert_eq!(http_read["row_count"], 1);
     assert_eq!(http_read["rows"][0]["p.name"], "Mina");
+    assert!(
+        http_read.get("graph_commit_id").is_none(),
+        "deprecated /read must preserve its byte-stable legacy body"
+    );
 
     let local_verify = parse_stdout_json(&output_success(
         cli()
