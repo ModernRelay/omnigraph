@@ -165,6 +165,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/healthz",
     "/graphs",
     "/graphs/{graph_id}/snapshot",
+    "/graphs/{graph_id}/blob",
     "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/query",
     "/graphs/{graph_id}/export",
@@ -228,6 +229,166 @@ fn openapi_healthz_is_get() {
 fn openapi_read_is_post() {
     let doc = openapi_json();
     assert!(doc["paths"]["/graphs/{graph_id}/read"]["post"].is_object());
+}
+
+#[test]
+fn openapi_blob_supports_get_and_explicit_head() {
+    let doc = openapi_json();
+    let path = &doc["paths"]["/graphs/{graph_id}/blob"];
+    assert!(path["get"].is_object());
+    assert!(path["head"].is_object());
+
+    for method in ["get", "head"] {
+        let parameters = path[method]["parameters"].as_array().unwrap();
+        for required in ["entity", "type", "id", "property"] {
+            let parameter = parameters
+                .iter()
+                .find(|parameter| parameter["name"] == required)
+                .unwrap_or_else(|| panic!("{method} /blob is missing `{required}`"));
+            assert_eq!(parameter["in"], "query");
+            assert_eq!(parameter["required"], true);
+        }
+        for optional in ["branch", "snapshot"] {
+            let parameter = parameters
+                .iter()
+                .find(|parameter| parameter["name"] == optional)
+                .unwrap_or_else(|| panic!("{method} /blob is missing `{optional}`"));
+            assert_eq!(parameter["in"], "query");
+            assert_ne!(parameter["required"], true);
+        }
+        let entity = parameters
+            .iter()
+            .find(|parameter| parameter["name"] == "entity")
+            .unwrap();
+        assert_eq!(
+            entity["schema"]["$ref"],
+            "#/components/schemas/BlobEntityKind"
+        );
+        assert_eq!(
+            doc["components"]["schemas"]["BlobEntityKind"]["enum"],
+            serde_json::json!(["node", "edge"])
+        );
+    }
+
+    let head_parameters = path["head"]["parameters"].as_array().unwrap();
+    for ignored_header in ["Range", "If-Range"] {
+        let parameter = head_parameters
+            .iter()
+            .find(|parameter| parameter["name"] == ignored_header)
+            .unwrap_or_else(|| panic!("HEAD /blob is missing `{ignored_header}`"));
+        assert_eq!(parameter["in"], "header");
+        assert!(
+            parameter["description"]
+                .as_str()
+                .is_some_and(|description| description.to_ascii_lowercase().contains("ignored")),
+            "HEAD /blob must state that {ignored_header} is ignored"
+        );
+    }
+    for method in ["get", "head"] {
+        let parameters = path[method]["parameters"].as_array().unwrap();
+        let if_match = parameters
+            .iter()
+            .find(|parameter| parameter["name"] == "If-Match")
+            .unwrap_or_else(|| panic!("{method} /blob is missing `If-Match`"));
+        assert_eq!(if_match["in"], "header");
+        assert!(
+            if_match["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Strong")),
+            "{method} /blob must document strong If-Match comparison"
+        );
+    }
+}
+
+#[test]
+fn openapi_blob_documents_binary_redirect_conditional_and_range_contracts() {
+    let doc = openapi_json();
+    let path = &doc["paths"]["/graphs/{graph_id}/blob"];
+    let get = &path["get"];
+    let head = &path["head"];
+
+    for status in ["200", "206"] {
+        let schema = &get["responses"][status]["content"]["application/octet-stream"]["schema"];
+        assert_eq!(
+            schema["type"], "string",
+            "GET /blob {status} must describe a byte string"
+        );
+        assert_eq!(
+            schema["format"], "binary",
+            "GET /blob {status} must describe binary transfer, not a JSON integer array"
+        );
+    }
+    for status in [
+        "302", "304", "400", "401", "403", "404", "412", "416", "500",
+    ] {
+        assert!(
+            get["responses"][status].is_object(),
+            "GET /blob must document {status}"
+        );
+    }
+    for status in [
+        "200", "302", "304", "400", "401", "403", "404", "412", "500",
+    ] {
+        assert!(
+            head["responses"][status].is_object(),
+            "HEAD /blob must document {status}"
+        );
+    }
+    assert!(head["responses"].get("206").is_none());
+    assert!(head["responses"].get("416").is_none());
+    for status in ["400", "401", "403", "404", "412", "500"] {
+        assert!(
+            head["responses"][status].get("content").is_none(),
+            "HEAD /blob {status} must not promise a JSON body that Axum strips"
+        );
+    }
+
+    for (status, headers) in [
+        (
+            "200",
+            &[
+                "Accept-Ranges",
+                "Content-Length",
+                "ETag",
+                "Omnigraph-Snapshot-Id",
+            ][..],
+        ),
+        (
+            "206",
+            &[
+                "Accept-Ranges",
+                "Content-Length",
+                "Content-Range",
+                "ETag",
+                "Omnigraph-Snapshot-Id",
+            ][..],
+        ),
+        (
+            "302",
+            &["Location", "Cache-Control", "Omnigraph-Snapshot-Id"][..],
+        ),
+        (
+            "304",
+            &["Content-Length", "ETag", "Omnigraph-Snapshot-Id"][..],
+        ),
+        ("412", &["ETag", "Omnigraph-Snapshot-Id"][..]),
+        ("416", &["Content-Range"][..]),
+    ] {
+        for header in headers {
+            assert!(
+                get["responses"][status]["headers"][header].is_object(),
+                "GET /blob {status} must document {header}"
+            );
+        }
+    }
+
+    for status in ["400", "401", "403", "404", "412", "416", "500"] {
+        assert_eq!(
+            get["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ErrorOutput",
+            "GET /blob {status} must use ErrorOutput"
+        );
+    }
 }
 
 #[test]
@@ -451,6 +612,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "BranchMergeOutcome",
     "BranchMergeOutput",
     "BranchMergeRequest",
+    "BlobEntityKind",
     "ChangeOutput",
     "ChangeRequest",
     "QueryRequest",
@@ -458,6 +620,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "CommitOutput",
     "ErrorCode",
     "ErrorOutput",
+    "BlobRangeOutput",
     "ExternalBlobSourceOutput",
     "ExportRequest",
     "HealthOutput",
@@ -472,6 +635,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "ReadRequest",
     "ReadSetConflictOutput",
     "ReadTargetOutput",
+    "PreconditionFailureOutput",
     "RecoveryRequiredOutput",
     "ResourceLimitOutput",
     "ManifestConflictOutput",
@@ -699,7 +863,10 @@ fn error_output_schema_has_expected_fields() {
     assert!(props.contains_key("read_set_conflict"));
     assert!(props.contains_key("key_conflict"));
     assert!(props.contains_key("resource_limit"));
+    assert!(props.contains_key("blob_range"));
+    assert!(props.contains_key("external_blob_source"));
     assert!(props.contains_key("recovery_required"));
+    assert!(props.contains_key("precondition_failure"));
 }
 
 #[test]
@@ -874,6 +1041,44 @@ fn external_blob_source_error_is_structured_and_declared_on_write_routes() {
 }
 
 #[test]
+fn blob_range_error_is_structured_and_declared_on_get() {
+    let doc = openapi_json();
+    let detail = &doc["components"]["schemas"]["BlobRangeOutput"];
+    let required: HashSet<&str> = detail["required"]
+        .as_array()
+        .expect("Blob range details must declare required fields")
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    assert_eq!(required, HashSet::from(["start", "end", "length"]));
+
+    let output_field = &doc["components"]["schemas"]["ErrorOutput"]["properties"]["blob_range"];
+    let output_ref = output_field["oneOf"]
+        .as_array()
+        .and_then(|schemas| schemas.iter().find_map(|schema| schema["$ref"].as_str()))
+        .expect("blob_range must reference its structured details");
+    assert_eq!(output_ref, "#/components/schemas/BlobRangeOutput");
+    assert_eq!(
+        doc["paths"]["/graphs/{graph_id}/blob"]["get"]["responses"]["416"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/ErrorOutput"
+    );
+
+    // The Blob detail is additive beside the graph-commit write-precondition
+    // detail introduced by #470; neither slice may erase the other's schema.
+    let precondition =
+        &doc["components"]["schemas"]["ErrorOutput"]["properties"]["precondition_failure"];
+    let precondition_ref = precondition["oneOf"]
+        .as_array()
+        .and_then(|schemas| schemas.iter().find_map(|schema| schema["$ref"].as_str()))
+        .expect("precondition_failure must reference its structured details");
+    assert_eq!(
+        precondition_ref,
+        "#/components/schemas/PreconditionFailureOutput"
+    );
+}
+
+#[test]
 fn merge_conflict_kind_output_schema_has_expected_variants() {
     let doc = openapi_json();
     let schema = &doc["components"]["schemas"]["MergeConflictKindOutput"];
@@ -905,6 +1110,8 @@ fn protected_endpoints_reference_bearer_token_security() {
     let doc = openapi_json();
     let protected_paths = [
         ("/graphs/{graph_id}/read", "post"),
+        ("/graphs/{graph_id}/blob", "get"),
+        ("/graphs/{graph_id}/blob", "head"),
         ("/graphs/{graph_id}/change", "post"),
         ("/graphs/{graph_id}/schema/apply", "post"),
         ("/graphs/{graph_id}/queries", "get"),
@@ -1302,6 +1509,8 @@ async fn auth_mode_spec_has_security_on_protected_operations() {
     // routes under `/graphs/{graph_id}/...`.
     let protected_paths = [
         ("/graphs/{graph_id}/read", "post"),
+        ("/graphs/{graph_id}/blob", "get"),
+        ("/graphs/{graph_id}/blob", "head"),
         ("/graphs/{graph_id}/change", "post"),
         ("/graphs/{graph_id}/snapshot", "get"),
         ("/graphs/{graph_id}/branches", "get"),
@@ -1380,6 +1589,7 @@ fn openapi_spec_is_up_to_date() {
 
 const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/snapshot",
+    "/graphs/{graph_id}/blob",
     "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/export",
     "/graphs/{graph_id}/change",
@@ -1458,6 +1668,7 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
     // None of the legacy flat protected paths should appear in multi mode.
     let flat_protected = [
         "/snapshot",
+        "/blob",
         "/read",
         "/export",
         "/change",
@@ -1522,7 +1733,7 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
         if path == "/healthz" || path == "/graphs" {
             continue;
         }
-        for method in ["get", "post", "put", "delete", "patch"] {
+        for method in ["get", "head", "post", "put", "delete", "patch"] {
             if let Some(op) = item.get(method).filter(|v| v.is_object()) {
                 if let Some(id) = op["operationId"].as_str() {
                     assert!(
@@ -1556,7 +1767,7 @@ async fn multi_mode_openapi_declares_graph_id_path_parameter() {
         let item = paths
             .get(*expected_path)
             .unwrap_or_else(|| panic!("missing cluster path {expected_path}"));
-        for method in ["get", "post", "put", "delete", "patch"] {
+        for method in ["get", "head", "post", "put", "delete", "patch"] {
             let Some(operation) = item.get(method).filter(|value| value.is_object()) else {
                 continue;
             };
@@ -1584,7 +1795,7 @@ async fn multi_mode_openapi_declares_graph_id_path_parameter() {
 
     for flat in ["/healthz", "/graphs"] {
         let item = paths.get(flat).unwrap();
-        for method in ["get", "post", "put", "delete", "patch"] {
+        for method in ["get", "head", "post", "put", "delete", "patch"] {
             if let Some(operation) = item.get(method).filter(|value| value.is_object()) {
                 let has_graph_id = operation["parameters"]
                     .as_array()
@@ -1619,7 +1830,7 @@ async fn multi_mode_operation_ids_are_unique() {
     let paths = json["paths"].as_object().unwrap();
     let mut seen_ids: HashSet<String> = HashSet::new();
     for (_, item) in paths {
-        for method in ["get", "post", "put", "delete", "patch"] {
+        for method in ["get", "head", "post", "put", "delete", "patch"] {
             if let Some(op) = item.get(method).filter(|v| v.is_object()) {
                 if let Some(id) = op["operationId"].as_str() {
                     assert!(
@@ -1655,6 +1866,7 @@ async fn served_spec_always_nests_under_cluster_prefix() {
     // cluster surface plus the always-flat `/healthz` and `/graphs`.
     let flat_protected = [
         "/snapshot",
+        "/blob",
         "/read",
         "/query",
         "/export",

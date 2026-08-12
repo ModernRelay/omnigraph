@@ -20,6 +20,10 @@ blob-v2 (`lance.blob.v2`) on file format V2_2.
 and Lance 10.0.0 as the required implementation substrate.
 **Audience:** engine, compiler, server, CLI, security, storage, maintenance,
 and documentation maintainers.
+**Implementation:** Phases 0, 1, and 2A (HTTP read delivery) are implemented on
+the v0.10 development line. Phase 2B (CLI get/stat), Phase 3 (mutation), Phase 4
+(measured optimization), and the production delivery telemetry named in §11
+remain open.
 
 This RFC is the required successor to an earlier reverted blob-delivery
 experiment. The relevant evidence and decisions are restated here; no untracked
@@ -577,32 +581,54 @@ action and the same snapshot-to-policy-branch resolution as `/read`.
 For managed content:
 
 - `200 OK` with `Content-Type: application/octet-stream`, exact
-  `Content-Length`, `Accept-Ranges: bytes`, and the strong `ETag`;
+  `Content-Length`, `Accept-Ranges: bytes`, the strong `ETag`, and
+  `Omnigraph-Snapshot-Id` naming the exact resolved graph snapshot;
 - one RFC 9110 byte range (`start-end`, `start-`, or `-suffix`) returns `206`
   with `Content-Range`;
 - an unsatisfiable range returns `416` with `Content-Range: bytes */N`;
-- multiple ranges are not implemented in V1 and cause Range to be ignored, so
-  the complete representation is returned;
+- multiple ranges, malformed syntax, and unknown range units are not
+  implemented in V1 and cause Range to be ignored, so the complete
+  representation is returned;
+- `If-Match` uses strong comparison over an entity-tag list and supports `*`;
+  it is evaluated first, and failure returns 412 with the current managed ETag
+  before any payload read;
 - `If-None-Match` uses weak comparison over an entity-tag list and supports `*`;
 - `If-Range` accepts one strong validator; mismatch ignores Range and serves the
   complete representation; and
-- HEAD produces the same status and headers without reading payload bytes.
+- HEAD ignores `Range` and `If-Range`, honors `If-Match` and
+  `If-None-Match`, and returns the
+  full representation's status and headers without reading payload bytes. A
+  Range that would be partial or unsatisfiable on GET therefore does not produce
+  206 or 416 on HEAD.
+
+An explicit byte range against a valid zero-length managed Blob is
+unsatisfiable: for example, `bytes=0-0` returns 416 and records the attempted
+normalized half-open range as `{ start: 0, end: 1, length: 0 }`. HTTP has no
+syntax for the engine's valid empty `0..0` range; a full GET remains 200 with a
+zero-length body.
 
 Payload chunks are at most 4 MiB and are pulled under transport backpressure.
-At most two chunks are retained for one response. Disconnect drops the reader
-and its snapshot pin promptly. No implementation may call `read_all()` before
-starting a response.
+At most two chunks / 8 MiB are retained for one response. Disconnect drops the
+reader and its snapshot pin promptly. No implementation may call `read_all()`
+before starting a response.
 
 For external content, GET and HEAD return `302 Found`, the stored absolute URI
-in `Location`, and `Cache-Control: no-store`. The server performs no `HEAD`, GET,
-credential lookup, signing, proxying, MIME sniffing, or range translation
-against that URI. There is no ETag or asserted length. A client that needs a
-managed copy uploads the bytes through `PUT`; V1 does not add a server-side
-copy-from-URI endpoint.
+in `Location`, `Cache-Control: no-store`, and the exact resolved
+`Omnigraph-Snapshot-Id`. The server performs no `HEAD`, GET, credential lookup,
+signing, proxying, MIME sniffing, or range translation against that URI. There
+is no ETag or asserted external-object length; `Content-Length: 0` may describe
+the empty redirect response body. A client that needs a managed copy uploads
+the bytes through `PUT`; V1 does not add a server-side copy-from-URI endpoint.
+Phase 2A redirects only a whole-object external descriptor (`offset = 0`, no
+logical length); a persisted ranged external descriptor fails loudly with 500
+rather than widening its logical bytes to the complete target object.
 
 Unknown entity/null maps to 404; non-Blob property or invalid target maps to
-400; authorization retains the existing 401/403 behavior; range failure maps to
-416; recovery/integrity failures retain their existing typed mappings.
+400; authorization retains the existing 401/403 behavior; a failed managed
+`If-Match` maps to 412; range failure maps to 416 with
+`Content-Range: bytes */N` and additive
+`blob_range { start, end, length }` details; recovery/integrity failures retain
+their existing typed mappings.
 
 ### 5.2 `PUT`
 
@@ -942,7 +968,7 @@ Physical row addresses never become public stable identity.
 | Rewrite amplification | New logical input and row-writing branch merge pre-size all carried Blob payloads under one 32 MiB operation budget before read; predicate mutation carry applies the same cumulative byte ceiling while materializing bounded scan batches |
 | External-source planning | Row-writing branch merge admits at most 8,192 external-reference cells and 32 MiB of retained URI metadata before HEAD; probes are bounded and normalized aliases deduplicate within the applicable operation or scan-batch envelope |
 | Engine read memory | `BlobReader::read_range` returns at most `BLOB_READ_RANGE_MAX_BYTES` (4 MiB); larger values require consecutive calls and there is no unbounded full-read method |
-| Delivery memory | Phase 2 adds a two-chunk queue, backpressure, and prompt cancellation without weakening the engine's 4 MiB per-call bound |
+| Delivery memory | Phase 2A adds a two-chunk queue, backpressure, and prompt cancellation without weakening the engine's 4 MiB per-call bound |
 | Range arithmetic | Half-open `start <= end <= length`; empty-at-end is valid; reversed/out-of-bounds ranges are typed and carry the logical length |
 | Stale overwrite | Optional strong `If-Match`, evaluated at each freshly pinned attempt |
 | Actor spoofing | Existing server-resolved actor and engine-wide Cedar enforcement |
@@ -969,18 +995,26 @@ depends on typed code and fields, not an opaque Lance string.
 | Disallowed or malformed external URI | `bad_request` with policy reason | 400 |
 | External source missing/unreadable | typed external source error | 424 Failed Dependency; never generic 500 |
 | Upload/rewrite budget exceeded | `resource_limit` with limit/observed | 413 |
-| Managed read range exceeds 4 MiB | `resource_limit` for `Blob read range bytes` | existing server mapping is 413; no HTTP Blob route in Phase 1 |
-| Reversed or out-of-bounds range | `BlobRangeNotSatisfiable { start, end, length }` | exhaustive server mapping is 416; no HTTP Blob route in Phase 1 |
+| Managed HTTP range exceeds 4 MiB | consecutive bounded engine reads | 200/206; the 4 MiB ceiling bounds each payload read, not the requested representation |
+| Valid but unsatisfiable HTTP range | `BlobRangeNotSatisfiable { start, end, length }` details | 416 plus `Content-Range: bytes */N` and `blob_range` |
 | If-Match failed | `PreconditionFailed` outcome | 412 |
 | Recovery intent armed but completion uncertain | `recovery_required` | existing mapping |
-| Persisted table/Blob integrity contradiction | `BlobIntegrity { reason }` | exhaustive server mapping is 5xx; no HTTP Blob route in Phase 1 |
+| Persisted table/Blob integrity contradiction | `BlobIntegrity { reason }` | exhaustive server mapping is 5xx |
 
-Instrumentation records operation, entity kind, managed/external/null
-classification, requested and served byte count, range/full mode, precondition
-result, admitted external cells, actual metadata-probe attempts, successful
-external payload reads, and time-to-first-byte. It never logs payload bytes,
-bearer tokens, URI credentials, or complete sensitive URIs.
-URI metrics use scheme plus a keyed/irreversible base identifier.
+Phase 0 implements deterministic test probes for admitted external cells,
+actual metadata-probe attempts, and successful external payload reads. Phase 2A
+adds deterministic transport probes for zero-read HEAD, retained chunk/byte
+bounds, backpressure, and disconnect cancellation. These are structural
+acceptance evidence, not production telemetry.
+
+Production delivery telemetry remains required before RFC-033 is complete. It
+must record operation, entity kind, managed/external/null classification,
+requested and served byte count, range/full mode, precondition result, and
+time-to-first-byte. It must never log payload bytes, bearer tokens, URI
+credentials, or complete sensitive URIs. URI metrics use scheme plus a
+keyed/irreversible base identifier. Phase 2A deliberately does not add a new
+metrics backend merely to claim this box; the telemetry ships in a focused
+follow-up against the repository's eventual production observability owner.
 
 ## 12. Test and acceptance plan
 
@@ -1093,11 +1127,13 @@ The implementation extends existing owners before creating new fixtures, per
 
 ### 12.4 Server, CLI, parity, and cost
 
-- `data_routes.rs`: GET/HEAD headers; empty 200; ranges and conditionals; external
-  302 with zero external I/O; branch/snapshot validation; PUT/DELETE; 412/413;
-  node and edge selectors; authorization and actor attribution. A payload-read
-  probe must remain at zero for managed HEAD on both empty and near-limit values.
-- `openapi.rs`: regenerate and compare the binary request/response surface.
+- Phase 2A extends `data_routes.rs` with GET/HEAD headers; empty 200; ranges and
+  conditionals; external 302 with zero external I/O; branch/snapshot validation;
+  node and edge selectors; and authorization. A payload-read probe remains at
+  zero for managed HEAD on both empty and near-limit values. Phase 3 extends the
+  same owner with PUT/DELETE, 412/413, and actor attribution.
+- `openapi.rs`: regenerate and compare each phase's binary request/response
+  surface; Phase 2A contains read methods only.
 - `cli_data.rs`: stdin/file PUT, stdout/file GET, stat, clear, ranges, snapshots,
   external no-follow behavior, JSON output, and stable failure text.
 - `parity_matrix.rs`: byte and structured-output equality for every CLI verb and
@@ -1190,9 +1226,19 @@ correctness gate.
   integration-fixture migrations are allowed, but no HTTP route, CLI verb, HTTP
   wire DTO, or OpenAPI schema is added.
 
-### Phase 2 — delivery
+### Phase 2A — HTTP read delivery
 
 - Add HTTP GET/HEAD, ranges and conditionals.
+- Keep selectors graph-level and return the exact resolved snapshot header for
+  managed and external cells.
+- Pin the two-chunk/8-MiB backpressure envelope, zero-read HEAD, and prompt
+  disconnect cancellation before adding another carrier.
+- Keep the deterministic transport probes as the acceptance owner; add the
+  production delivery telemetry specified in §11 as a focused follow-up rather
+  than coupling an observability substrate to this route slice.
+
+### Phase 2B — CLI read delivery
+
 - Add CLI get/stat and parity coverage.
 
 ### Phase 3 — mutation

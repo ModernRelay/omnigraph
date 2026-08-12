@@ -66,6 +66,7 @@ graph id from the cluster's applied revision:
 | GET | `/healthz` | none | — |
 | GET | `/openapi.json` | none | — (strips security if auth disabled; emits the nested cluster paths with `cluster_` operation-id prefix) |
 | GET | `/graphs/{id}/snapshot?branch=` | bearer + `read` | snapshot of branch |
+| GET / HEAD | `/graphs/{id}/blob?entity=&type=&id=&property=&branch=|snapshot=` | bearer + `read` | stream one logical node/edge Blob cell, or return its metadata without payload bytes |
 | POST | `/graphs/{id}/query` | bearer + `read` | inline read query (canonical; clean field names `query`/`name`; mutations → 400) |
 | POST | `/graphs/{id}/read` | bearer + `read` | **deprecated** alias of `/query` (legacy field names `query_source`/`query_name`, byte-stable response; carries `Deprecation: true` + `Link: <query>; rel="successor-version"`) |
 | POST | `/graphs/{id}/export` | bearer + `export` | NDJSON stream |
@@ -244,10 +245,64 @@ response body as a stream error; it cannot be rewritten into a JSON error after
 headers. Clients must discard a partial artifact whenever body consumption
 fails.
 
+## Blob delivery
+
+`GET /graphs/{graph_id}/blob` and its explicit `HEAD` twin select one logical
+node or edge property; they never expose a Lance dataset, table key, row
+address, or physical Blob placement:
+
+```http
+GET /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
+```
+
+`entity` is `node` or `edge`. `type`, `id`, and `property` are required.
+Choose at most one of `branch` and `snapshot`; omitting both reads `main`.
+Snapshot requests use the same snapshot-to-policy-branch resolution and Cedar
+`read` authorization as `/query`.
+
+A managed value returns `application/octet-stream`, its exact
+`Content-Length`, `Accept-Ranges: bytes`, a strong `ETag`, and
+`Omnigraph-Snapshot-Id`, which identifies the exact graph snapshot selected by
+the request. The body is pulled from the snapshot-pinned engine reader in
+chunks no larger than 4 MiB. Transport backpressure retains no more than two
+chunks (8 MiB) for one response; disconnect cancels the reader promptly. A
+storage failure after success headers terminates the body loudly, so clients
+must discard a partial artifact.
+
+GET supports one `bytes` range (`start-end`, `start-`, or `-suffix`) and returns
+`206` with `Content-Range`. A valid but unsatisfiable range—including
+`bytes=0-0` on a valid empty Blob—returns `416`, `Content-Range: bytes */N`, and
+structured `blob_range { start, end, length }` details. Multiple ranges,
+malformed ranges, and unknown range units are intentionally ignored in V1, so
+the complete representation is returned instead of multipart output.
+
+`If-Match` uses strong comparison over an entity-tag list and supports `*`; it
+is evaluated first, and failure returns `412` with `code: conflict` and the
+current managed `ETag` before any payload read.
+`If-None-Match` uses weak comparison over an entity-tag list and supports `*`;
+a match returns `304`. `If-Range` honors a Range only when it contains the one
+matching strong validator; otherwise GET returns the complete representation.
+HEAD deliberately ignores `Range` and `If-Range`, honors `If-Match` and
+`If-None-Match`, and
+returns full-representation headers without reading payload bytes. It is a
+dedicated handler, not an automatic GET fallback.
+
+A null cell or unknown entity is `404`; invalid selectors and non-Blob
+properties are `400`; a failed managed `If-Match` is `412`. An external
+descriptor is never opened or proxied by the
+server: GET and HEAD return `302`, its exact stored absolute URI in `Location`,
+`Cache-Control: no-store`, and the selected `Omnigraph-Snapshot-Id`, with no
+ETag or asserted external-object length. A `Content-Length: 0` may frame the
+empty redirect response body; it says nothing about the target. The server does
+not issue an external HEAD/GET, resolve credentials, sign the URI, or translate
+ranges. Phase 2A redirects only whole-object external descriptors; a persisted
+descriptor whose logical value is an external sub-range fails loudly with 500
+rather than widening that value to the whole target object.
+
 ## Error model
 
 Uniform
-`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, key_conflict?, read_set_conflict?, resource_limit?, external_blob_source?, recovery_required?, precondition_failure? }`
+`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, key_conflict?, read_set_conflict?, resource_limit?, external_blob_source?, blob_range?, recovery_required?, precondition_failure? }`
 with
 `code ∈ unauthorized | forbidden | bad_request | not_found | method_not_allowed | conflict | too_many_requests | internal`.
 Merge conflicts attach structured
@@ -275,6 +330,12 @@ must not parse `reason`. The optional `code` field is omitted because adding a
 new value to the closed error-code enum would break older clients, while the
 optional structured field is additive and rolling-safe. Policy or URI-shape
 refusals remain HTTP 400 with `code: bad_request`.
+
+`blob_range` is set on a Blob GET whose single valid byte range is
+unsatisfiable. HTTP 416 also carries `Content-Range: bytes */N`;
+`BlobRangeOutput { start, end, length }` records the normalized attempted
+half-open range and logical representation length without requiring clients to
+parse the human-readable error string.
 
 `recovery_required` is set when an overlapping durable recovery intent remains
 unresolved; its table effects may or may not have started. The HTTP status is 503 and
@@ -311,8 +372,8 @@ arbitration, the exact publisher still prevents a silent lost update, but the
 losing request may already own durable table effects and therefore returns
 `recovery_required` (503) for recovery instead of 412.
 
-HTTP status codes used include 200, 400, 401, 403, 404, 405, 409, 412, 413,
-415, 424, 429, 500, and 503.
+HTTP status codes used include 200, 206, 302, 304, 400, 401, 403, 404, 405,
+409, 412, 413, 415, 416, 424, 429, 500, and 503.
 
 ## Per-actor admission control
 
@@ -346,8 +407,8 @@ Today admission gates every mutating handler: `/mutate` (and its
 deprecated alias `/change`), `/load` (and its deprecated alias `/ingest`),
 `/load/ndjson`,
 `/branches/{create,delete,merge}`,
-and `/schema/apply`. Read-only endpoints (`/snapshot`, `/query`, `/read`,
-`/export`, `/branches` GET, `/commits`, `/schema` GET) are not
+and `/schema/apply`. Read-only endpoints (`/snapshot`, `/blob`, `/query`,
+`/read`, `/export`, `/branches` GET, `/commits`, `/schema` GET) are not
 admission-gated.
 
 

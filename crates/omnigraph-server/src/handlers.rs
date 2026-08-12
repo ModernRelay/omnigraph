@@ -599,6 +599,212 @@ pub(crate) async fn server_query(
     )))
 }
 
+/// OpenAPI-only marker for an unstructured octet-stream response body.
+#[derive(utoipa::ToSchema)]
+#[schema(value_type = String, format = Binary)]
+#[allow(dead_code)]
+struct BlobBinaryBody(Vec<u8>);
+
+#[utoipa::path(
+    get,
+    path = "/blob",
+    tag = "blobs",
+    operation_id = "getBlob",
+    params(
+        BlobReadQuery,
+        ("If-Match" = Option<String>, Header, description = "Strong entity-tag-list precondition, including `*`, evaluated before If-None-Match and Range."),
+        ("Range" = Option<String>, Header, description = "One `bytes` range. Malformed, unknown-unit, and multiple ranges are ignored in V1."),
+        ("If-None-Match" = Option<String>, Header, description = "Weak entity-tag-list comparison, including `*`, evaluated before Range."),
+        ("If-Range" = Option<String>, Header, description = "One strong entity tag. A mismatch causes the complete representation to be served."),
+    ),
+    responses(
+        (status = 200, description = "Complete managed Blob", body = inline(BlobBinaryBody), content_type = "application/octet-stream",
+            headers(
+                ("Accept-Ranges" = String, description = "The literal value `bytes` for managed content"),
+                ("Content-Length" = u64, description = "Exact served payload length"),
+                ("ETag" = String, description = "Strong validator for the selected managed Blob"),
+                ("Omnigraph-Snapshot-Id" = String, description = "Exact resolved graph snapshot"),
+            )),
+        (status = 206, description = "One satisfiable managed byte range", body = inline(BlobBinaryBody), content_type = "application/octet-stream",
+            headers(
+                ("Accept-Ranges" = String),
+                ("Content-Length" = u64),
+                ("Content-Range" = String),
+                ("ETag" = String),
+                ("Omnigraph-Snapshot-Id" = String),
+            )),
+        (status = 302, description = "External Blob descriptor; the server does not dereference it",
+            headers(
+                ("Location" = String, description = "Exact stored absolute URI"),
+                ("Cache-Control" = String, description = "The literal value `no-store`"),
+                ("Omnigraph-Snapshot-Id" = String, description = "Exact resolved graph snapshot"),
+            )),
+        (status = 304, description = "If-None-Match matched the managed Blob validator",
+            headers(
+                ("Accept-Ranges" = String),
+                ("Content-Length" = u64, description = "Complete managed Blob length, as required for a valid 304 Content-Length"),
+                ("ETag" = String),
+                ("Omnigraph-Snapshot-Id" = String),
+            )),
+        (status = 400, description = "Invalid selector, target, or non-Blob property", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Unknown entity or null Blob cell", body = ErrorOutput),
+        (status = 412, description = "If-Match did not strongly match the selected managed Blob validator", body = ErrorOutput,
+            headers(
+                ("Accept-Ranges" = String),
+                ("ETag" = String),
+                ("Omnigraph-Snapshot-Id" = String),
+            )),
+        (status = 416, description = "Requested managed byte range is unsatisfiable", body = ErrorOutput,
+            headers(
+                ("Accept-Ranges" = String),
+                ("Content-Range" = String, description = "Unsatisfied range in the form `bytes */N`"),
+                ("ETag" = String),
+                ("Omnigraph-Snapshot-Id" = String),
+            )),
+        (status = 500, description = "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Deliver one logical node or edge Blob cell.
+///
+/// Managed content is streamed through the bounded transport. External
+/// descriptors redirect without target-store I/O. Authorization and target
+/// resolution share the exact helper used by `/query`.
+pub(crate) async fn server_blob_get(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    headers: HeaderMap,
+    query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
+) -> std::result::Result<Response, ApiError> {
+    let query = parse_blob_read_query(query)?;
+    let read = read_blob_for_delivery(&handle, actor.as_ref().map(|Extension(actor)| actor), query)
+        .await?;
+    blob_transport::serve_blob_get(read, &headers)
+}
+
+#[utoipa::path(
+    head,
+    path = "/blob",
+    tag = "blobs",
+    operation_id = "headBlob",
+    params(
+        BlobReadQuery,
+        ("If-Match" = Option<String>, Header, description = "Strong entity-tag-list precondition, including `*`, evaluated before If-None-Match."),
+        ("If-None-Match" = Option<String>, Header, description = "Weak entity-tag-list comparison, including `*`. Range and If-Range are ignored for HEAD."),
+        ("Range" = Option<String>, Header, description = "Accepted but ignored for HEAD; metadata always describes the complete selected Blob."),
+        ("If-Range" = Option<String>, Header, description = "Accepted but ignored for HEAD together with Range."),
+    ),
+    responses(
+        (status = 200, description = "Managed Blob metadata with no response body",
+            headers(
+                ("Accept-Ranges" = String, description = "The literal value `bytes`"),
+                ("Content-Length" = u64, description = "Complete managed Blob length"),
+                ("ETag" = String, description = "Strong validator for the selected managed Blob"),
+                ("Omnigraph-Snapshot-Id" = String, description = "Exact resolved graph snapshot"),
+            )),
+        (status = 302, description = "External Blob descriptor; the server does not dereference it",
+            headers(
+                ("Location" = String, description = "Exact stored absolute URI"),
+                ("Cache-Control" = String, description = "The literal value `no-store`"),
+                ("Omnigraph-Snapshot-Id" = String, description = "Exact resolved graph snapshot"),
+            )),
+        (status = 304, description = "If-None-Match matched the managed Blob validator",
+            headers(
+                ("Accept-Ranges" = String),
+                ("Content-Length" = u64, description = "Complete managed Blob length, as required for a valid 304 Content-Length"),
+                ("ETag" = String),
+                ("Omnigraph-Snapshot-Id" = String),
+            )),
+        (status = 400, description = "Invalid selector, target, or non-Blob property; HEAD responses have no body"),
+        (status = 401, description = "Unauthorized; HEAD responses have no body"),
+        (status = 403, description = "Forbidden; HEAD responses have no body"),
+        (status = 404, description = "Unknown entity or null Blob cell; HEAD responses have no body"),
+        (status = 412, description = "If-Match did not strongly match the selected managed Blob validator; HEAD responses have no body",
+            headers(
+                ("Accept-Ranges" = String),
+                ("ETag" = String),
+                ("Omnigraph-Snapshot-Id" = String),
+            )),
+        (status = 500, description = "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected; HEAD responses have no body"),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Return the status and representation headers for one Blob cell.
+///
+/// This is a distinct handler rather than Axum's automatic GET-to-HEAD
+/// fallback. It never calls `BlobReader::read_range`; Range and If-Range are
+/// deliberately ignored while If-None-Match is still evaluated.
+pub(crate) async fn server_blob_head(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    headers: HeaderMap,
+    query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
+) -> std::result::Result<Response, ApiError> {
+    let query = parse_blob_read_query(query)?;
+    let read = read_blob_for_delivery(&handle, actor.as_ref().map(|Extension(actor)| actor), query)
+        .await?;
+    blob_transport::serve_blob_head(read, &headers)
+}
+
+fn parse_blob_read_query(
+    query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
+) -> std::result::Result<BlobReadQuery, ApiError> {
+    query.map(|Query(query)| query).map_err(|rejection| {
+        ApiError::bad_request(format!(
+            "invalid Blob selector query parameters: {}",
+            rejection.body_text()
+        ))
+    })
+}
+
+async fn read_blob_for_delivery(
+    handle: &GraphHandle,
+    actor: Option<&ResolvedActor>,
+    query: BlobReadQuery,
+) -> std::result::Result<omnigraph::BlobRead, ApiError> {
+    let target = resolve_authorized_read_target(handle, actor, query.branch, query.snapshot)
+        .await
+        .map_err(redact_blob_api_error)?;
+    let entity = match query.entity {
+        api::BlobEntityKind::Node => omnigraph::EntityKind::Node,
+        api::BlobEntityKind::Edge => omnigraph::EntityKind::Edge,
+    };
+    handle
+        .engine
+        .read_blob_at(
+            target,
+            omnigraph::BlobCell {
+                entity,
+                type_name: query.r#type,
+                id: query.id,
+                property: query.property,
+            },
+        )
+        .await
+        .map_err(map_blob_read_error)
+}
+
+/// Keep physical placement and persisted identity details behind the
+/// graph-level Blob surface. Selector/auth/not-found failures retain their
+/// typed client disposition; every pre-header internal failure is redacted.
+fn map_blob_read_error(error: OmniError) -> ApiError {
+    redact_blob_api_error(ApiError::from_omni(error))
+}
+
+fn redact_blob_api_error(mapped: ApiError) -> ApiError {
+    if mapped.status == StatusCode::INTERNAL_SERVER_ERROR {
+        error!(
+            error_kind = "blob_pre_header_internal",
+            "Blob delivery failed before response headers"
+        );
+        ApiError::internal("Blob delivery failed before response headers")
+    } else {
+        mapped
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/export",
@@ -862,33 +1068,7 @@ pub(crate) async fn run_query(
     ),
     ApiError,
 > {
-    if branch.is_some() && snapshot.is_some() {
-        return Err(ApiError::bad_request(
-            "request may specify branch or snapshot, not both",
-        ));
-    }
-
-    let target = read_target_from_request(branch, snapshot);
-    let policy_branch = match &target {
-        ReadTarget::Branch(branch) => Some(branch.clone()),
-        ReadTarget::Snapshot(_) if handle.policy.is_some() && actor.is_some() => {
-            let db = &handle.engine;
-            db.resolved_branch_of(target.clone())
-                .await
-                .map(|branch| branch.or_else(|| Some("main".to_string())))
-                .map_err(ApiError::from_omni)?
-        }
-        ReadTarget::Snapshot(_) => None,
-    };
-    authorize_request(
-        actor,
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::Read,
-            branch: policy_branch,
-            target_branch: None,
-        },
-    )?;
+    let target = resolve_authorized_read_target(&handle, actor, branch, snapshot).await?;
     let query_decl = select_named_query_decl(query, name)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     if reject_mutations && !query_decl.mutations.is_empty() {
@@ -908,6 +1088,44 @@ pub(crate) async fn run_query(
             .map_err(ApiError::from_omni)?
     };
     Ok((selected_name, target, result, graph_commit_id))
+}
+
+/// Resolve one branch-or-snapshot read target and apply the graph's Cedar
+/// `read` gate. Every HTTP carrier that accepts this target shape uses this
+/// helper so snapshot-to-policy-branch resolution cannot drift by route.
+pub(crate) async fn resolve_authorized_read_target(
+    handle: &GraphHandle,
+    actor: Option<&ResolvedActor>,
+    branch: Option<String>,
+    snapshot: Option<String>,
+) -> std::result::Result<ReadTarget, ApiError> {
+    if branch.is_some() && snapshot.is_some() {
+        return Err(ApiError::bad_request(
+            "request may specify branch or snapshot, not both",
+        ));
+    }
+
+    let target = read_target_from_request(branch, snapshot);
+    let policy_branch = match &target {
+        ReadTarget::Branch(branch) => Some(branch.clone()),
+        ReadTarget::Snapshot(_) if handle.policy.is_some() && actor.is_some() => handle
+            .engine
+            .resolved_branch_of(target.clone())
+            .await
+            .map(|branch| branch.or_else(|| Some("main".to_string())))
+            .map_err(ApiError::from_omni)?,
+        ReadTarget::Snapshot(_) => None,
+    };
+    authorize_request(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: policy_branch,
+            target_branch: None,
+        },
+    )?;
+    Ok(target)
 }
 
 #[utoipa::path(
@@ -2238,4 +2456,47 @@ pub(crate) fn query_params_from_json(
 ) -> Result<ParamMap> {
     json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)
         .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))
+}
+
+#[cfg(test)]
+mod blob_error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pre_header_internal_errors_do_not_expose_physical_storage_or_identity() {
+        for (error, secret) in [
+            (
+                OmniError::Lance(
+                    "GET s3://private-bucket/tenant-a/table.lance?token=secret".to_string(),
+                ),
+                "private-bucket",
+            ),
+            (
+                OmniError::BlobIntegrity {
+                    reason: "table_key node:Secret has stable table 42/incarnation 99".to_string(),
+                },
+                "node:Secret",
+            ),
+        ] {
+            let response = map_blob_read_error(error).into_response();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            assert_eq!(output.error, "Blob delivery failed before response headers");
+            assert!(!String::from_utf8_lossy(&body).contains(secret));
+        }
+
+        let response = redact_blob_api_error(ApiError::internal(
+            "snapshot manifest at s3://private-bucket/graph/__manifest",
+        ))
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(output.error, "Blob delivery failed before response headers");
+        assert!(!String::from_utf8_lossy(&body).contains("private-bucket"));
+    }
 }
