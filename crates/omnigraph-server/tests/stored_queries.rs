@@ -4,10 +4,31 @@
 use axum::body::Body;
 use axum::http::StatusCode;
 use omnigraph_server::AppState;
-use serde_json::json;
+use serde_json::{Value, json};
 
 mod support;
 use support::*;
+
+async fn assert_receipt_commit_matches_get(app: &axum::Router, output: &Value, token: &str) {
+    let receipt = output
+        .get("commit")
+        .filter(|commit| !commit.is_null())
+        .expect("successful effectful stored mutation must return a commit receipt");
+    let commit_id = receipt["graph_commit_id"]
+        .as_str()
+        .expect("commit receipt must carry graph_commit_id")
+        .to_string();
+    let (status, shown) = json_response(
+        app,
+        get_request(&g(&format!("/commits/{commit_id}")), token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {shown}");
+    assert_eq!(
+        &shown, receipt,
+        "receipt must be the exact published commit"
+    );
+}
 
 #[tokio::test]
 async fn server_boots_with_a_valid_stored_query_registry() {
@@ -276,6 +297,7 @@ async fn invoke_stored_mutation_double_gates_on_change() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["affected_nodes"], 1, "body: {body}");
+    assert_receipt_commit_matches_get(&app, &body, "t-full").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -617,4 +639,5 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["affected_nodes"], 1, "body: {body}");
+    assert_receipt_commit_matches_get(&app, &body, "t-full").await;
 }

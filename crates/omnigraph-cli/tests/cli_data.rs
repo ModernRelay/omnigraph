@@ -900,6 +900,16 @@ fn load_json_outputs_summary_for_main_branch() {
     assert_eq!(payload["edges_loaded"], 5);
     assert_eq!(payload["node_types_loaded"], 2);
     assert_eq!(payload["edge_types_loaded"], 2);
+    assert!(payload["commit"]["graph_commit_id"].is_string());
+    assert!(payload["commit"]["manifest_version"].is_number());
+
+    let commits = parse_stdout_json(&output_success(
+        cli().arg("commit").arg("list").arg(&graph).arg("--json"),
+    ));
+    assert_eq!(
+        payload["commit"], commits["commits"][0],
+        "load must return the exact commit that became the branch head"
+    );
 }
 
 #[test]
@@ -1331,6 +1341,8 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(payload["query_name"], "insert_person");
     assert_eq!(payload["affected_nodes"], 1);
     assert_eq!(payload["affected_edges"], 0);
+    assert!(payload["commit"]["graph_commit_id"].is_string());
+    assert!(payload["commit"]["manifest_version"].is_number());
 
     let verify = output_success(
         cli()
@@ -1347,6 +1359,27 @@ query insert_person($name: String, $age: I32) {
     let verify_payload: Value = serde_json::from_slice(&verify.stdout).unwrap();
     assert_eq!(verify_payload["row_count"], 1);
     assert_eq!(verify_payload["rows"][0]["p.name"], "Eve");
+    assert_eq!(
+        verify_payload["graph_commit_id"], payload["commit"]["graph_commit_id"],
+        "mutation receipt must identify the exact commit read back at branch head"
+    );
+
+    let no_op = parse_stdout_json(&output_success(
+        cli()
+            .arg("mutate")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg("query no_match() { update Person set { age: 99 } where name = \"Nobody\" }")
+            .arg("--json"),
+    ));
+    assert_eq!(no_op["affected_nodes"], 0);
+    assert_eq!(no_op["affected_edges"], 0);
+    assert_eq!(
+        no_op["commit"],
+        Value::Null,
+        "an effect-free mutation must not claim a graph commit"
+    );
 }
 
 /// GitHub #365: the embedded transport must preserve the typed stale-head

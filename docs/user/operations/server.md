@@ -154,7 +154,8 @@ request is rejected with HTTP 400 and an error pointing the caller at
 `POST /mutate` is the canonical mutation endpoint. It accepts the same clean
 field names (`query`, `name`); the legacy field names `query_source` and
 `query_name` continue to deserialize as serde aliases so existing clients keep
-working without changes.
+working without changes. Successful mutation and load responses carry the exact
+published `commit`; a mutation that changes no rows carries `commit: null`.
 
 ## Deprecated names (`/read`, `/change`)
 

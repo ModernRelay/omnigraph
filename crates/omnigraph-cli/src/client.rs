@@ -32,7 +32,7 @@ use omnigraph_api_types::{
     CommitOutput, ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphListResponse,
     IngestOutput, IngestRequest, InvokeStoredQueryRequest, QueryRequest, ReadOutput,
     SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
-    ingest_output, read_output, schema_apply_output, snapshot_payload,
+    ingest_receipt_output, read_output, schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::Method;
@@ -45,7 +45,7 @@ use crate::helpers::{
     remote_json_with_graph_commit_precondition, remote_url, resolve_cli_actor, resolve_cli_graph,
     resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
-use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_result};
+use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 
 pub(crate) enum GraphClient {
     /// Local engine at `uri`. Reads (`resolve()`) leave `actor` empty;
@@ -471,10 +471,21 @@ impl GraphClient {
             GraphClient::Embedded { uri, actor } => {
                 let db = Self::open_embedded(uri).await?;
                 let data = std::fs::read_to_string(data)?;
-                let result = db
-                    .load_graph_batch_as(branch, from, &data, mode.into(), actor.as_deref())
+                let receipt = db
+                    .load_graph_batch_as_with_receipt(
+                        branch,
+                        from,
+                        &data,
+                        mode.into(),
+                        actor.as_deref(),
+                    )
                     .await?;
-                Ok(load_output_from_result(uri, branch, mode.as_str(), &result))
+                Ok(load_output_from_receipt(
+                    uri,
+                    branch,
+                    mode.as_str(),
+                    &receipt,
+                ))
             }
         }
     }
@@ -483,7 +494,7 @@ impl GraphClient {
     /// `load`, it retains the historical permissive parser and JSON `/ingest`
     /// wire shape. The embedded arm echoes `actor_id: None` in the output
     /// exactly as the legacy arm did (the actor is still attributed on the
-    /// commit via `load_file_as`).
+    /// commit via `load_file_as_with_receipt`).
     pub(crate) async fn ingest(
         &self,
         branch: &str,
@@ -514,10 +525,16 @@ impl GraphClient {
             }
             GraphClient::Embedded { uri, actor } => {
                 let db = Self::open_embedded(uri).await?;
-                let result = db
-                    .load_file_as(branch, Some(from), data, mode.into(), actor.as_deref())
+                let receipt = db
+                    .load_file_as_with_receipt(
+                        branch,
+                        Some(from),
+                        data,
+                        mode.into(),
+                        actor.as_deref(),
+                    )
                     .await?;
-                Ok(ingest_output(uri, &result, mode.into(), None))
+                Ok(ingest_receipt_output(uri, &receipt, mode.into(), None))
             }
         }
     }
@@ -574,8 +591,8 @@ impl GraphClient {
                 let params = query_params_from_json(&query_params, params_json)?;
                 let db = Self::open_embedded(uri).await?;
                 let actor = actor.as_deref();
-                let result = db
-                    .mutate_as_with_expected_head(
+                let receipt = db
+                    .mutate_as_with_expected_head_receipt(
                         branch,
                         query_source,
                         &selected_name,
@@ -598,9 +615,10 @@ impl GraphClient {
                 Ok(ChangeOutput {
                     branch: branch.to_string(),
                     query_name: selected_name,
-                    affected_nodes: result.affected_nodes,
-                    affected_edges: result.affected_edges,
+                    affected_nodes: receipt.result.affected_nodes,
+                    affected_edges: receipt.result.affected_edges,
                     actor_id: actor.map(String::from),
+                    commit: receipt.commit.as_ref().map(commit_output),
                 })
             }
         }

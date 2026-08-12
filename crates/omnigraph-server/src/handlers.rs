@@ -1016,9 +1016,9 @@ pub(crate) async fn run_mutate(
     let params = query_params_from_json(&query_params, params_json)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    let result = {
+    let receipt = {
         let db = &handle.engine;
-        db.mutate_as_with_expected_head(
+        db.mutate_as_with_expected_head_receipt(
             &branch,
             query,
             &selected_name,
@@ -1032,9 +1032,10 @@ pub(crate) async fn run_mutate(
     Ok(ChangeOutput {
         branch,
         query_name: selected_name,
-        affected_nodes: result.affected_nodes,
-        affected_edges: result.affected_edges,
+        affected_nodes: receipt.result.affected_nodes,
+        affected_edges: receipt.result.affected_edges,
         actor_id: actor_id.map(str::to_string),
+        commit: receipt.commit.as_ref().map(api::commit_output),
     })
 }
 
@@ -1772,16 +1773,16 @@ async fn run_ingest(
         .try_admit(&actor_arc, est_bytes)
         .map_err(ApiError::from_workload_reject)?;
 
-    let result = {
+    let receipt = {
         let db = &handle.engine;
-        db.load_as(&branch, from.as_deref(), &request.data, mode, actor_id)
+        db.load_as_with_receipt(&branch, from.as_deref(), &request.data, mode, actor_id)
             .await
             .map_err(ApiError::from_omni)?
     };
 
-    Ok(ingest_output(
+    Ok(ingest_receipt_output(
         handle.uri.as_str(),
-        &result,
+        &receipt,
         mode,
         actor_id.map(str::to_string),
     ))
@@ -1951,13 +1952,13 @@ pub(crate) async fn server_load_ndjson(
         .try_admit(&actor_arc, data.len() as u64)
         .map_err(ApiError::from_workload_reject)?;
 
-    let result = handle
+    let receipt = handle
         .engine
-        .load_graph_batch_as(&branch, from.as_deref(), data, mode, actor_id)
+        .load_graph_batch_as_with_receipt(&branch, from.as_deref(), data, mode, actor_id)
         .await
         .map_err(ApiError::from_omni)?;
-    Ok(Json(graph_batch_load_output(
-        &result,
+    Ok(Json(graph_batch_load_receipt_output(
+        &receipt,
         mode,
         actor_id.map(str::to_string),
     )))

@@ -156,6 +156,8 @@ query insert_person($name: String, $age: I32) {
             .arg("--json"),
     ));
     assert_eq!(change_payload["affected_nodes"], 1);
+    assert!(change_payload["commit"]["graph_commit_id"].is_string());
+    assert!(change_payload["commit"]["manifest_version"].is_number());
 
     let query_source = fs::read_to_string(fixture("test.gq")).unwrap();
     let http_read = client
@@ -776,6 +778,8 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
     assert_eq!(ingest_payload["branch"], "feature-ingest");
     assert_eq!(ingest_payload["base_branch"], "main");
     assert_eq!(ingest_payload["branch_created"], true);
+    assert!(ingest_payload["commit"]["graph_commit_id"].is_string());
+    assert!(ingest_payload["commit"]["manifest_version"].is_number());
     assert_eq!(ingest_payload["mode"], "merge");
     assert_eq!(ingest_payload["tables"][0]["table_key"], "node:Person");
     assert_eq!(ingest_payload["tables"][0]["rows_loaded"], 2);
@@ -871,6 +875,8 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
     assert_eq!(payload["base_branch"], "main");
     assert_eq!(payload["branch_created"], true);
     assert_eq!(payload["nodes_loaded"], 1);
+    assert!(payload["commit"]["graph_commit_id"].is_string());
+    assert!(payload["commit"]["manifest_version"].is_number());
 
     let snapshot = parse_stdout_json(&output_success(
         cli()

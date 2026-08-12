@@ -31,6 +31,12 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `profile list \| show [<name>]` | read-only inspection of `~/.omnigraph/config.yaml` profiles. `list` shows each profile's binding (server/cluster/store) + default graph and marks the `$OMNIGRAPH_PROFILE`-active one; JSON keeps `binding` and adds `scope_kind`, `target`, `valid`, and `error`; `show` resolves one profile's scope (endpoint + default graph), defaulting to the active profile, else the flat operator defaults |
 | `version` / `-v` | print the OmniGraph release and served internal-schema version |
 
+Effectful `load`, `ingest`, and `mutate` commands include a `commit` object in
+their `--json` output. It is the exact graph commit published by that write,
+with `graph_commit_id`, manifest branch/version, parent ids, actor, and creation
+time—not a later lookup of the branch head. A successful mutation that matches
+no rows publishes nothing and returns `"commit": null`.
+
 ## Command capabilities
 
 Every command declares the **capability** it needs — what it requires to reach a graph — which determines the addressing flags that apply:
