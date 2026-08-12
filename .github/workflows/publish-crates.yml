@@ -1,13 +1,16 @@
 name: Publish to crates.io
 
-# Publishes the publishable workspace crates to crates.io in dependency order.
+# Dormant crates.io publication workflow. Registry publication is paused while
+# the project recovers ownership of the historical `omnigraph-*` crate names;
+# the first step below fail-closes every invocation until that policy and
+# `docs/dev/versioning.md` are deliberately changed together.
 #
 # Triggers:
 #   - push of any v* tag (future releases auto-publish alongside release.yml)
 #   - workflow_dispatch with an explicit tag input (catch-up runs for past tags)
 #
-# Idempotent: each crate's current crates.io version is checked before publish,
-# so a partial failure can be re-run without "crate version already exists" errors.
+# Once publication is restored, each crate's current crates.io version is
+# checked before publish so a partial failure can be rerun idempotently.
 #
 # Prerequisite: repo secret CARGO_REGISTRY_TOKEN. The job exits cleanly if absent.
 
@@ -30,8 +33,13 @@ jobs:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       CARGO_TERM_COLOR: always
     steps:
+      - name: Enforce registry publication pause
+        run: |
+          echo "crates.io publication is paused while historical package ownership is unavailable."
+          echo "CARGO_PUBLISH_SKIP=1" >> "$GITHUB_ENV"
+
       - name: Skip if CARGO_REGISTRY_TOKEN is not configured
-        if: env.CARGO_REGISTRY_TOKEN == ''
+        if: env.CARGO_PUBLISH_SKIP != '1' && env.CARGO_REGISTRY_TOKEN == ''
         run: |
           echo "CARGO_REGISTRY_TOKEN is not set; skipping crates.io publish."
           echo "CARGO_PUBLISH_SKIP=1" >> "$GITHUB_ENV"
@@ -51,12 +59,8 @@ jobs:
         with:
           ref: ${{ steps.ref.outputs.ref }}
 
-      # crates.io rejects git dependencies, so while the storage substrate is
-      # rev-pinned to a Lance pre-release (git dep in the workspace manifest)
-      # registry publication is deliberately deferred — binaries/Homebrew still
-      # ship from release.yml. This self-heals: the step stops matching the
-      # moment the dependency returns to a crates.io version (Lance 9 stable),
-      # and a workflow_dispatch catch-up run can then publish the skipped tag.
+      # Defense in depth for a future publication restart: crates.io rejects git
+      # dependencies, so a rev-pinned substrate must still defer that release.
       - name: Skip while the storage substrate is git-pinned
         if: env.CARGO_PUBLISH_SKIP != '1'
         run: |

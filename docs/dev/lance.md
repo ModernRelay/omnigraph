@@ -296,9 +296,8 @@ feature-superset workspace test passes; both default and failpoint-superset
 all-target clippy gates pass with warnings denied; and the generated OpenAPI
 version is 0.10.0 with its drift test green. Bucket-gated
 RustFS/S3 cells had no configured bucket in this local run and remain CI's
-responsibility. The documentation-index check is separately blocked by
-pre-existing untracked developer notes in the working tree; the tracked diff
-and formatting checks pass.
+responsibility. The documentation-index, tracked-diff, and formatting checks
+pass.
 
 ### Prior alignment audit: 2026-07-25 (Lance 9.0.0 stable; crates.io)
 

@@ -3026,8 +3026,8 @@ async fn camelcase_index_equality_routes_to_scalar_index() {
 }
 
 // --- Guard: filtered scans tolerate merge_insert's overlapping row-id ranges
-//     (lance#7444, fixed by lance#7480; consumed via the vendored lance-table
-//     patch) -------------------------------------------------------------
+//     (lance#7444, fixed upstream by lance#7480 and shipped since Lance 9)
+//     --------------------------------------------------------------------
 //
 // An update-style merge_insert over a fragment that was itself merge-written
 // reuses the updated rows' stable row ids in its rewritten fragments (row-id
@@ -3039,8 +3039,7 @@ async fn camelcase_index_equality_routes_to_scalar_index() {
 // debug assert, "all columns in a record batch must have the same length" (or
 // a silently-wrong batch) in release. Faithful transcription of lance#7444's
 // minimal repro: merge-seed → merge-update → delete → filter + with_row_id.
-// This guard turns red if a Lance bump regresses the fix, or if the vendored
-// patch is dropped before the pinned lance-table ships lance#7480.
+// This guard turns red if a future Lance bump regresses the upstream fix.
 #[tokio::test]
 async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
     use futures::TryStreamExt;
