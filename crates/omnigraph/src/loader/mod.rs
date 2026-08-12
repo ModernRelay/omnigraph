@@ -41,6 +41,12 @@ pub struct LoadResult {
     pub edges_loaded: HashMap<String, usize>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LoadReceipt {
+    pub result: LoadResult,
+    pub commit: crate::db::GraphCommit,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestTableResult {
     pub table_key: String,
@@ -179,6 +185,16 @@ impl Omnigraph {
         self.load_as(branch, None, data, mode, None).await
     }
 
+    pub async fn load_with_receipt(
+        &self,
+        branch: &str,
+        data: &str,
+        mode: LoadMode,
+    ) -> Result<LoadReceipt> {
+        self.load_as_with_receipt(branch, None, data, mode, None)
+            .await
+    }
+
     /// Load JSONL data onto `branch`.
     ///
     /// `base` selects the branch-creation behavior: with `Some(base)`, a
@@ -194,6 +210,20 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<LoadResult> {
+        Ok(self
+            .load_as_with_receipt(branch, base, data, mode, actor_id)
+            .await?
+            .result)
+    }
+
+    pub async fn load_as_with_receipt(
+        &self,
+        branch: &str,
+        base: Option<&str>,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadReceipt> {
         self.load_input_as(
             branch,
             base,
@@ -222,6 +252,20 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<LoadResult> {
+        Ok(self
+            .load_graph_batch_as_with_receipt(branch, base, data, mode, actor_id)
+            .await?
+            .result)
+    }
+
+    pub async fn load_graph_batch_as_with_receipt(
+        &self,
+        branch: &str,
+        base: Option<&str>,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadReceipt> {
         self.load_input_as(
             branch,
             base,
@@ -253,7 +297,7 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
         input_shape: LoadInputShape,
-    ) -> Result<LoadResult> {
+    ) -> Result<LoadReceipt> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `Branch(branch)` to match the HTTP-layer Change convention.
         // When a fork happens below, `branch_create_from_as` additionally
@@ -278,7 +322,7 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
         input_shape: LoadInputShape,
-    ) -> Result<LoadResult> {
+    ) -> Result<LoadReceipt> {
         // Stage A precedes both an implicit target-branch fork and data staging.
         // The target branch and an explicit base are read/write authority for the
         // operation, so an unresolved intent on either closes the barrier. The
@@ -318,13 +362,13 @@ impl Omnigraph {
         // Direct-to-target writes: no Run state machine, no `__run__` staging
         // branch. Cross-table OCC is enforced by the publisher's
         // `expected_table_versions` CAS inside the load attempt.
-        let mut result = self
+        let mut receipt = self
             .load_direct_on_branch(requested.as_deref(), data, mode, actor_id, input_shape)
             .await?;
-        result.branch = requested.unwrap_or_else(|| "main".to_string());
-        result.base_branch = base_branch;
-        result.branch_created = branch_created;
-        Ok(result)
+        receipt.result.branch = requested.unwrap_or_else(|| "main".to_string());
+        receipt.result.base_branch = base_branch;
+        receipt.result.branch_created = branch_created;
+        Ok(receipt)
     }
 
     pub async fn load_file(&self, branch: &str, path: &str, mode: LoadMode) -> Result<LoadResult> {
@@ -346,6 +390,19 @@ impl Omnigraph {
         self.load_as(branch, base, &data, mode, actor_id).await
     }
 
+    pub async fn load_file_as_with_receipt(
+        &self,
+        branch: &str,
+        base: Option<&str>,
+        path: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadReceipt> {
+        let data = std::fs::read_to_string(path).map_err(OmniError::Io)?;
+        self.load_as_with_receipt(branch, base, &data, mode, actor_id)
+            .await
+    }
+
     async fn load_direct_on_branch(
         &self,
         branch: Option<&str>,
@@ -353,7 +410,7 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
         input_shape: LoadInputShape,
-    ) -> Result<LoadResult> {
+    ) -> Result<LoadReceipt> {
         load_jsonl_data(self, branch, data, mode, actor_id, input_shape).await
     }
 }
@@ -409,7 +466,7 @@ async fn load_jsonl_data(
     mode: LoadMode,
     actor_id: Option<&str>,
     input_shape: LoadInputShape,
-) -> Result<LoadResult> {
+) -> Result<LoadReceipt> {
     const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
     // Every public load entry point already owns a stable `&str` payload
@@ -445,7 +502,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     mode: LoadMode,
     actor_id: Option<&str>,
     input_shape: LoadInputShape,
-) -> Result<LoadResult> {
+) -> Result<LoadReceipt> {
     // Capture the manifest/schema authority before interpreting any input. The
     // catalog rides the WriteTxn and was built from the exact accepted IR named
     // by its schema token; a long-lived handle's global catalog may legitimately
@@ -780,18 +837,21 @@ async fn load_jsonl_reader_once<R: BufRead>(
             lineage_intent,
         )
         .await;
-    if let Err(err) = publish_result {
-        // Empty loads can still publish lineage but have no table effect and
-        // therefore no recovery sidecar. Preserve that publish error instead
-        // of manufacturing an "unknown" recovery operation.
-        return match sidecar_handle.as_ref() {
-            Some(handle) => Err(OmniError::recovery_required(
-                handle.operation_id.clone(),
-                err.to_string(),
-            )),
-            None => Err(err),
-        };
-    }
+    let commit = match publish_result {
+        Ok(commit) => commit,
+        Err(err) => {
+            // Empty loads can still publish lineage but have no table effect and
+            // therefore no recovery sidecar. Preserve that publish error instead
+            // of manufacturing an "unknown" recovery operation.
+            return match sidecar_handle.as_ref() {
+                Some(handle) => Err(OmniError::recovery_required(
+                    handle.operation_id.clone(),
+                    err.to_string(),
+                )),
+                None => Err(err),
+            };
+        }
+    };
     // The v3 recovery sidecar protects every independently durable table effect
     // through the one manifest visibility point. Phase C succeeded — clean up
     // best-effort: failing the user here would error out a write that already
@@ -806,7 +866,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         }
     }
 
-    Ok(result)
+    Ok(LoadReceipt { result, commit })
 }
 
 #[derive(Default)]

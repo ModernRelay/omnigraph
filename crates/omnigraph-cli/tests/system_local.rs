@@ -210,6 +210,8 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     ));
     assert_eq!(change_payload["branch"], "main");
     assert_eq!(change_payload["affected_nodes"], 1);
+    assert!(change_payload["commit"]["graph_commit_id"].is_string());
+    assert!(change_payload["commit"]["manifest_version"].is_number());
 
     let read_after = parse_stdout_json(&output_success(
         cli()
@@ -291,6 +293,7 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
     ));
     assert_eq!(change_payload["branch"], "feature");
     assert_eq!(change_payload["affected_nodes"], 1);
+    assert!(change_payload["commit"]["graph_commit_id"].is_string());
 
     let feature_read = parse_stdout_json(&output_success(
         cli()
@@ -376,6 +379,8 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     assert_eq!(ingest_payload["branch"], "feature-ingest");
     assert_eq!(ingest_payload["base_branch"], "main");
     assert_eq!(ingest_payload["branch_created"], true);
+    assert!(ingest_payload["commit"]["graph_commit_id"].is_string());
+    assert!(ingest_payload["commit"]["manifest_version"].is_number());
     assert_eq!(ingest_payload["mode"], "merge");
     assert_eq!(ingest_payload["tables"][0]["table_key"], "node:Person");
     assert_eq!(ingest_payload["tables"][0]["rows_loaded"], 2);
@@ -472,6 +477,8 @@ fn local_cli_load_from_forks_branch_and_missing_branch_errors_without_from() {
     assert_eq!(payload["branch_created"], true);
     assert_eq!(payload["mode"], "merge");
     assert_eq!(payload["nodes_loaded"], 1);
+    assert!(payload["commit"]["graph_commit_id"].is_string());
+    assert!(payload["commit"]["manifest_version"].is_number());
 
     let snapshot = parse_stdout_json(&output_success(
         cli()

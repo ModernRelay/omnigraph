@@ -1536,8 +1536,7 @@ async fn commit_prepared_updates(
     actor_id: Option<&str>,
 ) -> Result<u64> {
     let PublishedSnapshot {
-        manifest_version,
-        _snapshot_id: _,
+        manifest_version, ..
     } = db
         .coordinator
         .write()
@@ -1555,8 +1554,7 @@ async fn commit_prepared_updates_with_expected(
     actor_id: Option<&str>,
 ) -> Result<u64> {
     let PublishedSnapshot {
-        manifest_version,
-        _snapshot_id: _,
+        manifest_version, ..
     } = db
         .coordinator
         .write()
@@ -1611,8 +1609,7 @@ pub(super) async fn commit_prepared_updates_on_branch_with_expected(
         }
     };
     let PublishedSnapshot {
-        manifest_version,
-        _snapshot_id: _,
+        manifest_version, ..
     } = coordinator
         .commit_updates_with_actor_with_expected(updates, expected_table_versions, actor_id)
         .await?;
@@ -1648,7 +1645,7 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     actor_id: Option<&str>,
     txn: &crate::db::WriteTxn,
     lineage_intent: crate::db::manifest::LineageIntent,
-) -> Result<u64> {
+) -> Result<crate::db::GraphCommit> {
     db.ensure_schema_apply_not_locked("write commit").await?;
     let prepared = prepare_updates_for_commit(db, branch, updates, Some(txn)).await?;
 
@@ -1712,7 +1709,7 @@ pub(super) async fn commit_updates_on_branch_with_expected(
             )
             .await?
     };
-    Ok(published.manifest_version)
+    Ok(published.commit)
 }
 
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {

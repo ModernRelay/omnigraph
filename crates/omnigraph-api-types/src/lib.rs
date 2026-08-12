@@ -5,7 +5,7 @@
 
 use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot};
 use omnigraph::error::{MergeConflict, MergeConflictKind};
-use omnigraph::loader::{LoadMode, LoadResult};
+use omnigraph::loader::{LoadMode, LoadReceipt, LoadResult};
 use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::query::ast::Param;
 use omnigraph_compiler::result::QueryResult;
@@ -256,6 +256,7 @@ pub struct ChangeOutput {
     pub affected_nodes: usize,
     pub affected_edges: usize,
     pub actor_id: Option<String>,
+    pub commit: Option<CommitOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -276,6 +277,7 @@ pub struct IngestOutput {
     pub mode: LoadMode,
     pub tables: Vec<IngestTableOutput>,
     pub actor_id: Option<String>,
+    pub commit: Option<CommitOutput>,
 }
 
 /// One logical declaration touched by a graph-batch load.
@@ -304,6 +306,7 @@ pub struct GraphBatchLoadOutput {
     pub edges: Vec<GraphBatchDeclarationOutput>,
     pub total_rows: usize,
     pub actor_id: Option<String>,
+    pub commit: Option<CommitOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -905,7 +908,19 @@ pub fn ingest_output(
             })
             .collect(),
         actor_id,
+        commit: None,
     }
+}
+
+pub fn ingest_receipt_output(
+    uri: &str,
+    receipt: &LoadReceipt,
+    mode: LoadMode,
+    actor_id: Option<String>,
+) -> IngestOutput {
+    let mut output = ingest_output(uri, &receipt.result, mode, actor_id);
+    output.commit = Some(commit_output(&receipt.commit));
+    output
 }
 
 pub fn graph_batch_load_output(
@@ -947,7 +962,18 @@ pub fn graph_batch_load_output(
         edges,
         total_rows,
         actor_id,
+        commit: None,
     }
+}
+
+pub fn graph_batch_load_receipt_output(
+    receipt: &LoadReceipt,
+    mode: LoadMode,
+    actor_id: Option<String>,
+) -> GraphBatchLoadOutput {
+    let mut output = graph_batch_load_output(&receipt.result, mode, actor_id);
+    output.commit = Some(commit_output(&receipt.commit));
+    output
 }
 
 pub fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {

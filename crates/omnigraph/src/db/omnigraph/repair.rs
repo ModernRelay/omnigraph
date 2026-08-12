@@ -280,8 +280,7 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
             Some("omnigraph:repair")
         };
         let PublishedSnapshot {
-            manifest_version,
-            _snapshot_id: _,
+            manifest_version, ..
         } = db
             .coordinator
             .write()

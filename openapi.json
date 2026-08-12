@@ -3202,6 +3202,16 @@
           "branch": {
             "type": "string"
           },
+          "commit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CommitOutput"
+              }
+            ]
+          },
           "query_name": {
             "type": "string"
           }
@@ -3519,6 +3529,16 @@
           "branch_created": {
             "type": "boolean"
           },
+          "commit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CommitOutput"
+              }
+            ]
+          },
           "edges": {
             "type": "array",
             "items": {
@@ -3629,6 +3649,16 @@
           },
           "branch_created": {
             "type": "boolean"
+          },
+          "commit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CommitOutput"
+              }
+            ]
           },
           "mode": {
             "$ref": "#/components/schemas/LoadMode"

@@ -70,6 +70,31 @@ fn repeated_zero_blob_input(length: usize) -> String {
     format!("base64:{}{tail}", "AAAA".repeat(full_triples))
 }
 
+async fn assert_receipt_commit_matches_get(app: &axum::Router, output: &Value) {
+    let receipt = output
+        .get("commit")
+        .filter(|commit| !commit.is_null())
+        .expect("successful effectful mutation must return a commit receipt");
+    let commit_id = receipt["graph_commit_id"]
+        .as_str()
+        .expect("commit receipt must carry graph_commit_id")
+        .to_string();
+    let (status, shown) = json_response(
+        app,
+        Request::builder()
+            .uri(g(&format!("/commits/{commit_id}")))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        &shown, receipt,
+        "receipt must be the exact published commit"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
     let (_temp, app) = app_for_blob_http_data(BLOB_HTTP_DATA).await;
@@ -931,6 +956,10 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     assert_eq!(body["actor_id"], "act-andrew");
     assert_eq!(body["tables"][0]["table_key"], "node:Person");
     assert_eq!(body["tables"][0]["rows_loaded"], 2);
+    let receipt_commit_id = body["commit"]["graph_commit_id"]
+        .as_str()
+        .expect("effectful ingest must return a commit receipt")
+        .to_string();
 
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let snapshot = db
@@ -946,6 +975,7 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
         .into_iter()
         .next()
         .unwrap();
+    assert_eq!(head.graph_commit_id, receipt_commit_id);
     assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
 }
 
@@ -1360,6 +1390,29 @@ async fn mutate_endpoint_runs_inline_mutation() {
     assert_eq!(body["affected_nodes"], 1);
     assert_eq!(body["query_name"], "insert_person");
     assert_eq!(body["branch"], "main");
+    assert_receipt_commit_matches_get(&app, &body).await;
+
+    let (status, no_op) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/mutate"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "query": MUTATION_QUERIES,
+                    "name": "set_age",
+                    "params": { "name": "Missing", "age": 99 },
+                    "branch": "main",
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(no_op["affected_nodes"], 0);
+    assert!(no_op["commit"].is_null());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1438,6 +1491,9 @@ async fn load_endpoint_loads_into_existing_branch() {
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(body["branch"], "main");
     assert_eq!(body["tables"][0]["table_key"], "node:Person");
+    body["commit"]["graph_commit_id"]
+        .as_str()
+        .expect("effectful JSON load must return a commit receipt");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1482,6 +1538,14 @@ async fn raw_graph_batch_load_publishes_mixed_declarations_in_one_commit() {
     let output: GraphBatchLoadOutput = serde_json::from_slice(&body).unwrap();
     assert_eq!(output.branch, "main");
     assert_eq!(output.total_rows, 3);
+    let receipt = output
+        .commit
+        .as_ref()
+        .expect("effectful NDJSON load must return a commit receipt");
+    assert!(
+        receipt.manifest_branch.is_none(),
+        "main is represented by the absence of a native manifest branch"
+    );
     assert_eq!(
         output
             .nodes
@@ -3021,6 +3085,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
         StatusCode::OK,
         "graph-commit precondition naming the current head must pass: {body}"
     );
+    assert_receipt_commit_matches_get(&app, &body).await;
     assert_eq!(alice_age(&app).await, 33);
 
     // A newly forked branch has no branch-owned graph-head row yet. Its read

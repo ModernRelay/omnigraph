@@ -16,6 +16,7 @@ pub(crate) struct LoadOutput {
     pub(crate) edges_loaded: usize,
     pub(crate) node_types_loaded: usize,
     pub(crate) edge_types_loaded: usize,
+    pub(crate) commit: Option<CommitOutput>,
 }
 
 pub(crate) fn load_output_from_graph_batch(
@@ -33,6 +34,7 @@ pub(crate) fn load_output_from_graph_batch(
         edges_loaded: output.edges.iter().map(|entry| entry.rows_loaded).sum(),
         node_types_loaded: output.nodes.len(),
         edge_types_loaded: output.edges.len(),
+        commit: output.commit.clone(),
     }
 }
 
@@ -42,12 +44,13 @@ pub(crate) fn load_output_from_graph_batch(
 /// mappings live here, next to the struct — RFC-009
 /// Phase 2's "one place" for the `-> LoadOutput` mapping that used to fork
 /// between this file and main.rs's inline construction.
-pub(crate) fn load_output_from_result(
+pub(crate) fn load_output_from_receipt(
     uri: &str,
     branch: &str,
     mode: &'static str,
-    result: &omnigraph::loader::LoadResult,
+    receipt: &omnigraph::loader::LoadReceipt,
 ) -> LoadOutput {
+    let result = &receipt.result;
     LoadOutput {
         uri: uri.to_string(),
         branch: branch.to_string(),
@@ -58,6 +61,7 @@ pub(crate) fn load_output_from_result(
         edges_loaded: result.edges_loaded.values().sum(),
         node_types_loaded: result.nodes_loaded.len(),
         edge_types_loaded: result.edges_loaded.len(),
+        commit: Some(omnigraph_api_types::commit_output(&receipt.commit)),
     }
 }
 

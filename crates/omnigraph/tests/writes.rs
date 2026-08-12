@@ -2395,18 +2395,45 @@ async fn mutate_expected_head_precondition_issue_365() {
         "rejected precondition must not produce a commit"
     );
 
-    // An expectation naming the current head passes and commits.
-    db.mutate_as_with_expected_head(
-        "main",
-        MUTATION_QUERIES,
-        "set_age",
-        &mixed_params(&[("$name", "Alice")], &[("$age", 33)]),
-        None,
-        Some(&current_head),
-    )
-    .await
-    .unwrap();
-    assert_ne!(head_commit_id(&uri).await, current_head);
+    // An expectation naming the current head passes and returns the exact
+    // commit produced by that same manifest publication.
+    let receipt = db
+        .mutate_as_with_expected_head_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 33)]),
+            None,
+            Some(&current_head),
+        )
+        .await
+        .unwrap();
+    let commit = receipt
+        .commit
+        .expect("an effectful conditional mutation publishes once");
+    assert_eq!(
+        commit.parent_commit_id.as_deref(),
+        Some(current_head.as_str())
+    );
+    assert_eq!(head_commit_id(&uri).await, commit.graph_commit_id);
+
+    // A successful conditional no-op has a fresh linearization check but no
+    // table or manifest publication, so its receipt carries no commit.
+    let current_head = commit.graph_commit_id;
+    let no_op = db
+        .mutate_as_with_expected_head_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Missing")], &[("$age", 99)]),
+            None,
+            Some(&current_head),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_op.result.affected_nodes, 0);
+    assert!(no_op.commit.is_none());
+    assert_eq!(head_commit_id(&uri).await, current_head);
 
     // A fresh named branch has no materialized `graph_head:feature` row, but
     // it inherits main's exact lineage head. The read token must expose that

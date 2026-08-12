@@ -32,7 +32,8 @@ use api::{
     GraphBatchLoadQuery, GraphInfo, GraphListResponse, HealthOutput, IngestOutput, IngestRequest,
     InvokeStoredQueryRequest, InvokeStoredQueryResponse, LegacyReadOutput, QueriesCatalogOutput,
     QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput,
-    SnapshotQuery, graph_batch_load_output, ingest_output, schema_apply_output, snapshot_payload,
+    SnapshotQuery, graph_batch_load_receipt_output, ingest_receipt_output, schema_apply_output,
+    snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};

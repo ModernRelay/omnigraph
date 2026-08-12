@@ -78,6 +78,27 @@ fn openapi_json() -> Value {
     serde_json::to_value(openapi_doc()).unwrap()
 }
 
+fn assert_optional_commit_field(doc: &Value, schema_name: &str) {
+    let schema = &doc["components"]["schemas"][schema_name];
+    let properties = schema["properties"].as_object().unwrap();
+    let commit = properties
+        .get("commit")
+        .unwrap_or_else(|| panic!("{schema_name} must expose a commit receipt"));
+    let required = schema["required"].as_array().unwrap();
+    assert!(
+        required
+            .iter()
+            .all(|field| field.as_str() != Some("commit")),
+        "{schema_name}.commit must remain optional for successful no-op mutations"
+    );
+    let commit_ref = commit["$ref"].as_str().or_else(|| {
+        commit["oneOf"]
+            .as_array()
+            .and_then(|schemas| schemas.iter().find_map(|schema| schema["$ref"].as_str()))
+    });
+    assert_eq!(commit_ref, Some("#/components/schemas/CommitOutput"));
+}
+
 // ---------------------------------------------------------------------------
 // Endpoint integration tests
 // ---------------------------------------------------------------------------
@@ -554,6 +575,7 @@ fn openapi_raw_graph_batch_has_ndjson_body_and_logical_result() {
     for field in ["branch", "nodes", "edges", "total_rows"] {
         assert!(props.contains_key(field));
     }
+    assert_optional_commit_field(&doc, "GraphBatchLoadOutput");
     assert!(!props.contains_key("tables"));
     assert!(!props.contains_key("table_key"));
 }
@@ -784,6 +806,7 @@ fn change_output_schema_has_expected_fields() {
     assert!(props.contains_key("query_name"));
     assert!(props.contains_key("affected_nodes"));
     assert!(props.contains_key("affected_edges"));
+    assert_optional_commit_field(&doc, "ChangeOutput");
 }
 
 #[test]
@@ -808,6 +831,7 @@ fn ingest_output_schema_has_expected_fields() {
     assert!(props.contains_key("branch_created"));
     assert!(props.contains_key("mode"));
     assert!(props.contains_key("tables"));
+    assert_optional_commit_field(&doc, "IngestOutput");
 }
 
 #[test]

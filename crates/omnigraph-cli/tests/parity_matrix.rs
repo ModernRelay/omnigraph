@@ -76,6 +76,56 @@ fn assert_parity(verb: &str, local: &std::process::Output, remote: &std::process
     }
 }
 
+/// Write receipts name the exact commit produced by each independently-run
+/// arm, so their commit identities and manifest lineage cannot match. Assert
+/// that both real outputs carry a complete receipt, then normalize only those
+/// receipt-local values before applying the ordinary parity comparison.
+fn assert_write_parity(verb: &str, local: &std::process::Output, remote: &std::process::Output) {
+    assert_eq!(
+        local.status.code(),
+        remote.status.code(),
+        "{verb}: exit codes diverge\nlocal: {local:?}\nremote: {remote:?}"
+    );
+    assert!(
+        local.status.success(),
+        "{verb}: local write failed: {local:?}"
+    );
+
+    let normalize_receipt = |arm: &str, output: &std::process::Output| {
+        let mut payload = parse_stdout_json(output);
+        let commit = payload["commit"]
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("{verb}: {arm} output must carry a commit receipt"));
+        assert!(
+            commit["graph_commit_id"].as_str().is_some(),
+            "{verb}: {arm} receipt must carry graph_commit_id"
+        );
+        assert!(
+            commit["manifest_version"].as_u64().is_some(),
+            "{verb}: {arm} receipt must carry manifest_version"
+        );
+        for key in [
+            "graph_commit_id",
+            "parent_commit_id",
+            "merged_parent_commit_id",
+        ] {
+            if let Some(value) = commit.get_mut(key)
+                && !value.is_null()
+            {
+                *value = serde_json::Value::String(format!("<volatile:{key}>"));
+            }
+        }
+        scrub_volatile(&mut payload);
+        payload
+    };
+
+    assert_eq!(
+        normalize_receipt("local", local),
+        normalize_receipt("remote", remote),
+        "{verb}: normalized write JSON diverges (left=local, right=remote)"
+    );
+}
+
 #[test]
 fn parity_query() {
     let p = parity();
@@ -140,7 +190,24 @@ fn parity_mutate() {
         r#"{"name":"Parity","age":7}"#,
         "--json",
     ]);
-    assert_parity("mutate", &l, &r);
+    assert_write_parity("mutate", &l, &r);
+
+    let (l, r) = p.run(&[
+        "mutate",
+        "-e",
+        "query no_match() { update Person set { age: 99 } where name = \"Nobody\" }",
+        "--json",
+    ]);
+    assert_parity("no-op mutate", &l, &r);
+    for (arm, output) in [("local", &l), ("remote", &r)] {
+        let payload = parse_stdout_json(output);
+        assert_eq!(payload["affected_nodes"], 0, "{arm} no-op affected rows");
+        assert_eq!(
+            payload["commit"],
+            serde_json::Value::Null,
+            "{arm} no-op mutation must not invent a commit"
+        );
+    }
 }
 
 #[test]
@@ -205,7 +272,7 @@ fn parity_load() {
         data.to_str().unwrap(),
         "--json",
     ]);
-    assert_parity("load", &l, &r);
+    assert_write_parity("load", &l, &r);
 
     // Canonical load is strict graph-batch syntax, but Overwrite uses Lance's
     // replacement transaction rather than RFC-023's keyed Append/Merge adapter.
@@ -238,7 +305,7 @@ fn parity_load() {
         r.status.success(),
         "bulk Overwrite remote arm failed: {r:?}"
     );
-    assert_parity("load --mode overwrite above keyed limit", &l, &r);
+    assert_write_parity("load --mode overwrite above keyed limit", &l, &r);
 }
 
 #[test]

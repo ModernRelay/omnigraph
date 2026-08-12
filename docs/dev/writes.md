@@ -570,6 +570,13 @@ calls the ordinary actor-aware load transaction. One request therefore has one
 validation cut, one ordinary recovery-v9 intent, one graph commit, and one
 terminal acknowledgement after manifest visibility.
 
+The receipt-bearing Mutation and Load entry points return the exact
+`GraphCommit` produced by that same manifest publication CAS. Result-only
+entry points are compatibility wrappers that discard the receipt; no caller
+rereads branch HEAD to reconstruct it. An effectful mutation returns
+`Some(commit)`, a zero-row mutation returns `None` and creates no commit, and a
+successful Load returns its single published commit.
+
 The surface accepts no physical dataset, table key, lane, generation, or WAL
 selector. It has no MemWAL, token ledger, hidden row metadata, or asynchronous
 fold. A producer sends successive bounded requests when it needs continuous
