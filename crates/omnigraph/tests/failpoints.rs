@@ -11,8 +11,8 @@ use arrow_schema::Schema;
 use fail::FailScenario;
 use lance::Dataset;
 use lance::dataset::{CommitBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched};
-use omnigraph::db::Omnigraph;
-use omnigraph::error::OmniError;
+use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::failpoints::ScopedFailPoint;
 use omnigraph::failpoints::names;
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
@@ -25,7 +25,7 @@ use helpers::recovery::{
 };
 use helpers::{
     MUTATION_QUERIES, TEST_QUERIES, collect_column_strings, count_rows, mixed_params, mutate_main,
-    params, read_table, version_main,
+    node_blob_cell, params, read_managed_blob_bytes, read_table, version_main,
 };
 
 const SCHEMA_V1: &str = "node Person { name: String @key }\n";
@@ -10611,6 +10611,108 @@ async fn branch_delete_orphans_sidecar_armed_after_initial_barrier() {
             .count(),
         0,
         "orphan-discard recovery must retire the late sidecar"
+    );
+}
+
+/// A live named-branch Blob read captures graph and table authority before it
+/// opens the table. Deleting and recreating that branch can reuse the physical
+/// path and numeric table version, so the post-open current-head proof must
+/// reject the stale capture instead of returning the replacement bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn blob_live_branch_read_refuses_delete_recreate_aba_after_capture() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let schema = r#"
+node Document {
+    title: String @key
+    content: Blob
+}
+"#;
+    let setup = Omnigraph::init(&uri, schema).await.unwrap();
+    load_jsonl(
+        &setup,
+        r#"{"type":"Document","data":{"title":"aba","content":"base64:QmFzZQ=="}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    setup.branch_create("feature").await.unwrap();
+    setup
+        .load(
+            "feature",
+            r#"{"type":"Document","data":{"title":"aba","content":"base64:T2xk"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    drop(setup);
+
+    let reader = Omnigraph::open(&uri).await.unwrap();
+    let control = Omnigraph::open(&uri).await.unwrap();
+    let old_entry = control
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap()
+        .entry("node:Document")
+        .unwrap()
+        .clone();
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(names::BLOB_READ_POST_CAPTURE);
+    let cell = node_blob_cell("Document", "aba", "content");
+    let read_cell = cell.clone();
+    let read_task = tokio::spawn(async move {
+        reader
+            .read_blob_at(ReadTarget::branch("feature"), read_cell)
+            .await
+    });
+    rendezvous.wait_until_reached().await;
+
+    // Keep the parked reader releasable even if one control-plane operation
+    // fails: collect the replacement result first, then release before any
+    // assertion or unwrap.
+    let replacement = async {
+        control.branch_delete("feature").await?;
+        control.branch_create("feature").await?;
+        control
+            .load(
+                "feature",
+                r#"{"type":"Document","data":{"title":"aba","content":"base64:TmV3"}}"#,
+                LoadMode::Merge,
+            )
+            .await?;
+        control.snapshot_of(ReadTarget::branch("feature")).await
+    }
+    .await;
+    rendezvous.release();
+
+    let new_snapshot = replacement.expect("delete/recreate replacement must complete");
+    let new_entry = new_snapshot.entry("node:Document").unwrap();
+    assert_eq!(new_entry.table_path, old_entry.table_path);
+    assert_eq!(new_entry.table_branch, old_entry.table_branch);
+    assert_eq!(
+        new_entry.table_version, old_entry.table_version,
+        "the regression must exercise same-path/same-version branch ABA"
+    );
+
+    let error = read_task
+        .await
+        .unwrap()
+        .expect_err("the stale live-branch capture must never return replacement bytes");
+    assert!(
+        matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == ManifestErrorKind::BadRequest
+                    && manifest.message
+                        == "Blob property 'Document.content' has no persisted native-branch incarnation witness at the selected target"
+        ),
+        "live branch ABA must fail with the exact incarnation refusal, got {error:?}"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(&control, ReadTarget::branch("feature"), cell).await,
+        b"New",
+        "the replacement branch must contain different readable bytes"
     );
 }
 

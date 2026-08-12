@@ -5103,6 +5103,7 @@ dependencies = [
  "arrow-string",
  "async-trait",
  "base64",
+ "bytes",
  "chrono",
  "datafusion",
  "fail",

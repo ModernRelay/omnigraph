@@ -1762,11 +1762,13 @@ query insert_then_replace_blob(
         "one insert plus one pending-row update"
     );
 
-    let blob = db
-        .read_blob("Document", "letter", "content")
-        .await
-        .expect("inserted blob must remain readable after the update");
-    assert_eq!(&blob.read().await.unwrap()[..], &[4, 5, 6]);
+    let blob = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "letter", "content"),
+    )
+    .await;
+    assert_eq!(&blob[..], &[4, 5, 6]);
 
     let qr = db
         .query(
@@ -1813,12 +1815,13 @@ query insert_then_replace_blob(
     assert_eq!(probes.external_blob_probe_inputs(), 1);
     assert_eq!(probes.external_blob_probe_calls(), 1);
     assert_eq!(probes.blob_payload_read_calls(), 1);
-    let blob = db
-        .read_blob("Document", "last-wins", "content")
-        .await
-        .unwrap();
-    assert_eq!(blob.uri(), None);
-    assert_eq!(&blob.read().await.unwrap()[..], b"last write wins");
+    let blob = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "last-wins", "content"),
+    )
+    .await;
+    assert_eq!(&blob[..], b"last write wins");
 }
 
 /// MR-920 regression: two sequential `update T set {f:v} where x=y`

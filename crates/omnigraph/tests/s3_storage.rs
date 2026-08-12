@@ -226,12 +226,13 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
     adapter.delete(&external_uri).await.unwrap();
     let reopened = Omnigraph::open(&graph_uri).await.unwrap();
     for title in ["remote-a", "remote-b"] {
-        let blob = reopened
-            .read_blob("Document", title, "content")
-            .await
-            .unwrap();
-        assert_eq!(blob.uri(), None, "keyed S3 ingestion must own its bytes");
-        assert_eq!(&blob.read().await.unwrap()[..], b"RustFS external Blob");
+        let blob = read_managed_blob_bytes(
+            &reopened,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", title, "content"),
+        )
+        .await;
+        assert_eq!(&blob[..], b"RustFS external Blob");
     }
 }
 

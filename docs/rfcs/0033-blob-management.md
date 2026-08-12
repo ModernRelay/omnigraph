@@ -231,11 +231,52 @@ pub struct BlobCell {
 }
 ```
 
-`type_name` and `property` are resolved through the accepted catalog captured
-with the target snapshot. The engine then carries stable table identity,
-incarnation identity, and stable property identity internally. A rename keeps
-those identities; drop/re-add mints a new lifetime. `table_key`, alias, physical
-path, field position, and Lance version are not identity substitutes.
+`type_name` and `property` are resolved through the handle's current accepted
+catalog, captured coherently with the read view. The engine then carries stable
+table identity, incarnation identity, and stable property identity internally.
+A rename keeps those identities; drop/re-add mints a new lifetime. `table_key`,
+alias, physical path, field position, and Lance version are not identity
+substitutes.
+
+Phase 1 resolves selector aliases against the handle's **current accepted
+catalog**, even when the requested target is historical. After a pure type
+rename, the current type alias can still select pre-rename table history because
+the engine binds that alias to the selected snapshot by stable
+table/incarnation identity. The previous type alias is not retained as a
+compatibility alias and returns typed `BadRequest`. This is the table-identity
+resolution rule; the property-name, property-lifetime, and native-branch
+incarnation fences below still apply independently.
+
+Phase 1 does **not** bridge the current property alias to a differently named
+physical field in a pre-rename table version. The supplied property must be a
+Blob in the current catalog and must exist under that spelling in the selected
+physical schema. A target from before that property rename therefore returns
+typed `BadRequest`; supplying the previous property alias is also rejected by
+the current catalog. A future slice may add explicit stable-property-ID
+crossing, but Phase 1 never guesses from field position or silently substitutes
+the other spelling.
+
+Physical user fields newly initialized, added, or schema-rebuilt by 0.10
+persist their authoritative graph property lifetime as decimal metadata under
+`omnigraph.stable_property_id`. A Blob read compares that value with the stable
+property ID from the current accepted catalog. A mismatch is typed `BadRequest`:
+an identically spelled field from a soft-drop/same-name-re-add is a different
+property lifetime. A malformed marker is `BlobIntegrity`. Lance field IDs,
+positions, and names are never graph identity.
+
+Pre-0.10 v6 fields have no marker and are not rewritten in place. A
+schema-preserving `LoadMode::Append`, `LoadMode::Merge`, or mutation write after
+upgrade retains that unmarked schema. A full-table `LoadMode::Overwrite`
+instead carries the 0.10 catalog schema and adopts the marker on its replacement
+physical fields; it does not rewrite older versions. The compatibility exception
+is deliberately narrow: a missing-marker read is allowed only when the selected
+snapshot points at the exact current physical table entry. An older snapshot
+fails `BadRequest` with `no persisted property-lifetime witness`, even when the
+spelling matches, because it cannot prove that the property did not cross a
+drop/re-add lifetime. The refusal also applies when no rename occurred. This
+restriction needs no manifest-format bump or graph rebuild; a later 0.10 field
+initialization, addition, schema rebuild, or full-table Overwrite carries the
+marker for that new physical version.
 
 All OmniGraph physical entity IDs are exact non-null Utf8. Lookup uses a typed
 `col("id").eq(lit(id))` expression and the stable row ID selected from that
@@ -246,36 +287,84 @@ snapshot. Caller text is never flattened into SQL.
 `read_blob_at` takes the same `ReadTarget` as query/export: exactly one branch or
 snapshot, with the normal default to `main` at transport boundaries. It resolves
 one manifest view and one exact table version. Catalog validation, row lookup,
-descriptor classification, and payload access all use that view. The call does
-not re-read branch head after resolution.
+descriptor classification, and payload access all use that immutable selected
+view. Compatibility admission may read current branch authority only as a
+comparison witness for the two fail-closed cases below; it never sources data
+from that live view or retargets the selected table.
+
+The exact physical manifest incarnation must also be provable. Resolving an
+explicit snapshot reopens its persisted `(manifest branch, version)`; because a
+deleted branch can reuse both, the reopened manifest's exact graph-head row must
+still name the resolved graph commit. This first fence applies independently of
+where the selected table is stored, so a named graph snapshot cannot retarget
+through an inherited-main table. Genuine inherited-main history remains
+eligible when that graph-snapshot proof succeeds.
+
+A persisted object-store table-manifest e-tag is also compared at open, but it
+is a coherence check, not a native table-branch-incarnation witness. V6
+historical entries do not carry Lance's native `BranchIdentifier`. Phase 1
+therefore bypasses the held table-handle cache for a named-native-branch table,
+then cold-proves that the selected graph ref's effective current head still
+equals the captured graph commit. The effective head is exact after the branch
+owns a commit and inherited on a fresh fork. The comparison uses the zero-cache
+control session rather than trusting the handle's warm read coordinator. A
+concurrent ordinary advance may therefore make a branch-owned read fail loudly
+rather than retarget, and an older explicit snapshot of a branch-owned table
+fails typed `BadRequest` (`no persisted native-branch incarnation witness`).
+Main table versions remain eligible after the independent graph-snapshot proof;
+the property and schema fences still apply.
 
 A returned reader keeps the snapshot/table handle needed to finish the read.
-Advancing or deleting a branch after the reader is opened does not switch the
-payload under that reader. Normal cleanup floors must keep live readers safe in
-the same way as other snapshot-pinned reads.
+Advancing a branch after the reader is opened does not switch the payload under
+that reader. Branch deletion and its physical tree reclamation are destructive
+boundaries, just like `cleanup`: Phase 1 adds no durable reader lease or
+cross-process live-reader registry. Callers that require an opened reader to
+finish must quiesce it before deleting that branch or running version GC. A
+reader never retargets, but if reclamation removes an immutable object it has not
+yet cached, a later range read may fail loudly with a storage/integrity error. It
+never switches to branch HEAD, another table version, or plausible partial
+bytes.
 
 ### 3.4 Managed validator
 
 Managed content receives a strong quoted ETag derived in the engine from:
 
 ```text
-stable_table_id
-table_incarnation_id
-stable_property_id
-exact_table_version
-stable_row_id
+stable_table_id: u64_be
+table_incarnation_id: u64_be
+stable_property_id: u64_be
+exact_table_version: u64_be
+stable_row_id: u64_be
+manifest_transaction_file_utf8_byte_length: u64_be
+manifest_transaction_file_utf8: [u8; manifest_transaction_file_utf8_byte_length]
 ```
 
-The encoded token is the lowercase hex of the first 16 bytes of SHA-256 over a
-domain-separated, fixed-width encoding of that tuple, wrapped in quotes. The
-domain separator is `omnigraph/blob-etag/v1\0`. A single engine function owns
-the encoding; server and CLI delegate to it.
+The hash input is exactly the ASCII domain separator
+`omnigraph/blob-etag/v1\0`, followed without delimiters by the five identity and
+version values above in that order, each encoded as one unsigned 64-bit
+**big-endian** integer. Those five fixed-width values are followed by one more
+big-endian `u64`: the UTF-8 byte length of the exact non-empty
+`transaction_file` identity stored in the immutable opened Lance manifest. The
+identity's exact UTF-8 bytes follow with no normalization, terminator, or
+delimiter. The token is the lowercase hex of the first 16 bytes of SHA-256 over
+that complete byte sequence, wrapped in double quotes. A single engine function
+owns the encoding and a literal golden vector pins it; later server and CLI
+phases delegate to that function rather than reconstructing it.
+
+The normative golden vector is the five-`u64` tuple `(1, 2, 3, 4, 5)` plus the
+exact transaction-file string `6-00000000000000000000000000000007.txn`. Its
+UTF-8 byte length is 38 and its token is
+`"f0e89bc86388accc9a7877df658a1f1c"`.
 
 This validator is deliberately table-version-granular. An unrelated write to
 the same table may invalidate a client's token even when the selected bytes did
 not change. It is still a strong validator: equal tokens identify the same
-immutable cell representation at an exact table version. The coarser behavior
-is documented rather than hidden.
+immutable cell representation at an exact table version and immutable manifest
+incarnation. The exact numeric table version plus the manifest's
+transaction-file identity prevents a token from surviving native-branch
+delete/recreate ABA without widening it to graph-snapshot granularity. A missing
+or empty identity is `BlobIntegrity { reason }`; the engine never emits a weaker
+token. The coarser table-granular behavior is documented rather than hidden.
 
 External references receive no ETag. A stored URI descriptor does not prove the
 current bytes of a mutable external object, and calling it a strong payload
@@ -287,9 +376,11 @@ The exact Rust names may move during implementation, but this capability split
 and ownership boundary are normative:
 
 ```rust
+pub const BLOB_READ_RANGE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 pub struct BlobRead {
     pub cell: BlobCell,
-    pub resolved_target: ResolvedReadTarget,
+    pub resolved_target: ResolvedTarget,
     pub content: BlobContent,
 }
 
@@ -311,7 +402,7 @@ pub struct ExternalBlobRef {
 impl Omnigraph {
     pub async fn read_blob_at(
         &self,
-        target: ReadTarget,
+        target: impl Into<ReadTarget>,
         cell: BlobCell,
     ) -> Result<BlobRead>;
 
@@ -334,16 +425,30 @@ impl Omnigraph {
 }
 ```
 
+Phase 1 implements the read types and `read_blob_at` only. The PUT/clear types
+and methods shown above remain the normative Phase 3 shape; they are not exposed
+early merely to reserve names.
+
 `BlobReader` is an engine-owned `Send + Sync` abstraction with `len()` and
-bounded `read_range(Range<u64>)`. An implementation may wrap Lance
-`read_blob_ranges`, `read_blobs`, or `take_blobs`, but Lance types do not appear
-in public signatures. Complete-payload internal work uses Lance's batched
-`read_blobs` API. It and `read_blob_ranges` already shipped in Lance 9.0.0 with
-row-id, row-index, and row-address selectors; Lance 10.0.0 is required for their
-null-preserving, request-cardinality behavior. The hard rule is the
-anti-pattern: it must not build a thread pool around one `BlobFile::read()`
-per row. Range work prefers `read_blob_ranges` when it supports the needed
-selector.
+bounded `read_range(Range<u64>)`. Ranges are half-open and valid exactly when
+`start <= end <= len`. Empty ranges are valid at every in-bounds position,
+including `len..len`, and return empty bytes without payload I/O. A reversed or
+out-of-bounds range returns typed
+`BlobRangeNotSatisfiable { start, end, length }`. One successful call returns at
+most `BLOB_READ_RANGE_MAX_BYTES` (4 MiB); a wider otherwise-valid range returns
+`ResourceLimitExceeded` for resource `Blob read range bytes`, limit
+`BLOB_READ_RANGE_MAX_BYTES`, before payload I/O. Callers read a larger managed
+value through consecutive bounded ranges; there is no unbounded `read_all`
+escape hatch.
+
+An implementation may wrap Lance `read_blob_ranges`, `read_blobs`, or
+`take_blobs`, but Lance types do not appear in public signatures.
+Complete-payload internal work uses Lance's batched `read_blobs` API. It and
+`read_blob_ranges` already shipped in Lance 9.0.0 with row-id, row-index, and
+row-address selectors; Lance 10.0.0 is required for their null-preserving,
+request-cardinality behavior. The hard rule is the anti-pattern: it must not
+build a thread pool around one `BlobFile::read()` per row. Range work prefers
+`read_blob_ranges` when it supports the needed selector.
 
 ### 4.1 Descriptor-first classification
 
@@ -357,18 +462,35 @@ Descriptor decoding is one internal module used by read, export, mutation
 rewrite, merge, schema apply, and maintenance tests. Duplicate
 `blob_description_is_null` functions are removed. Unknown descriptor versions,
 invalid child types, illegal base-relative references, arithmetic overflow, and
-out-of-bounds ranges fail loudly as integrity/substrate errors.
+out-of-bounds descriptor ranges fail as typed `BlobIntegrity { reason }`, never
+as `NotFound`, null, or an opaque Lance display string.
 
 ### 4.2 Read errors
 
-- Unknown type, entity ID, or null cell: typed `NotFound`.
-- Known non-Blob property: typed `BadRequest`.
-- A Blob property whose descriptor is malformed: typed integrity error, never
-  `NotFound` and never a null substitute.
-- A range whose start is at or beyond a non-empty managed payload, or whose
-  arithmetic overflows: typed range error carrying the logical length.
-- An empty range on a non-null managed Blob returns empty bytes without payload
-  I/O. Reading the full zero-length Blob succeeds with an empty body.
+- Unknown type/property or known non-Blob property: typed `BadRequest`.
+- Unknown entity ID or null cell: typed `NotFound`.
+- A persisted stable-property marker that names another lifetime, or a
+  pre-0.10 historical field with no authoritative marker: typed `BadRequest`.
+- An explicit snapshot whose reopened named manifest no longer carries the
+  resolved graph commit: typed `BadRequest`, even when its selected table is
+  inherited from main.
+- A named-native-branch table whose selected graph ref no longer has the
+  captured effective head when the post-open proof runs: typed `BadRequest`,
+  even when a manifest e-tag exists. Genuine inherited-main table history
+  remains eligible after the graph-snapshot proof; other property/schema checks
+  may still refuse the read.
+- A malformed persisted stable-property marker: `BlobIntegrity { reason }`.
+- A Blob property whose descriptor is malformed:
+  `BlobIntegrity { reason }`, never `NotFound` and never a null substitute.
+- A managed table version whose immutable manifest has no non-empty
+  `transaction_file` identity: `BlobIntegrity { reason }`; no validator or
+  managed reader is returned.
+- A range that violates `start <= end <= length`:
+  `BlobRangeNotSatisfiable { start, end, length }`.
+- An otherwise-valid range wider than 4 MiB: `ResourceLimitExceeded` for
+  `Blob read range bytes`, before payload I/O.
+- An empty in-bounds range, including `length..length`, returns empty bytes
+  without payload I/O. Reading the full zero-length Blob as `0..0` succeeds.
 
 ### 4.3 Write semantics
 
@@ -407,8 +529,9 @@ cannot match a tag. `PreconditionFailed { current_etag: Option<BlobEtag> }` is a
 typed successful decision, mapped to HTTP 412, rather than a substrate failure.
 
 After publication, a successful managed write derives the validator from the
-published table version and resulting row ID. The result is the same ETag a
-subsequent GET at that head returns.
+published table version, its exact immutable-manifest `transaction_file`
+identity, and the resulting row ID. The result is the same ETag a subsequent
+GET at that head returns.
 
 ### 4.4 Publication and recovery
 
@@ -818,8 +941,9 @@ Physical row addresses never become public stable identity.
 | Oversize upload | Route and engine 32 MiB inclusive limits; refusal before effect |
 | Rewrite amplification | New logical input and row-writing branch merge pre-size all carried Blob payloads under one 32 MiB operation budget before read; predicate mutation carry applies the same cumulative byte ceiling while materializing bounded scan batches |
 | External-source planning | Row-writing branch merge admits at most 8,192 external-reference cells and 32 MiB of retained URI metadata before HEAD; probes are bounded and normalized aliases deduplicate within the applicable operation or scan-batch envelope |
-| Download memory | ≤4 MiB chunks, two-chunk queue, backpressure, prompt cancellation |
-| Range arithmetic | Checked `u64` addition and exact logical-size bounds |
+| Engine read memory | `BlobReader::read_range` returns at most `BLOB_READ_RANGE_MAX_BYTES` (4 MiB); larger values require consecutive calls and there is no unbounded full-read method |
+| Delivery memory | Phase 2 adds a two-chunk queue, backpressure, and prompt cancellation without weakening the engine's 4 MiB per-call bound |
+| Range arithmetic | Half-open `start <= end <= length`; empty-at-end is valid; reversed/out-of-bounds ranges are typed and carry the logical length |
 | Stale overwrite | Optional strong `If-Match`, evaluated at each freshly pinned attempt |
 | Actor spoofing | Existing server-resolved actor and engine-wide Cedar enforcement |
 | Partial graph visibility | Existing Mutation sidecar and one manifest publication door |
@@ -845,10 +969,11 @@ depends on typed code and fields, not an opaque Lance string.
 | Disallowed or malformed external URI | `bad_request` with policy reason | 400 |
 | External source missing/unreadable | typed external source error | 424 Failed Dependency; never generic 500 |
 | Upload/rewrite budget exceeded | `resource_limit` with limit/observed | 413 |
-| Unsatisfiable range | `range_not_satisfiable` with length | 416 |
+| Managed read range exceeds 4 MiB | `resource_limit` for `Blob read range bytes` | existing server mapping is 413; no HTTP Blob route in Phase 1 |
+| Reversed or out-of-bounds range | `BlobRangeNotSatisfiable { start, end, length }` | exhaustive server mapping is 416; no HTTP Blob route in Phase 1 |
 | If-Match failed | `PreconditionFailed` outcome | 412 |
 | Recovery intent armed but completion uncertain | `recovery_required` | existing mapping |
-| Malformed persisted descriptor | integrity/substrate error | existing 5xx integrity mapping |
+| Persisted table/Blob integrity contradiction | `BlobIntegrity { reason }` | exhaustive server mapping is 5xx; no HTTP Blob route in Phase 1 |
 
 Instrumentation records operation, entity kind, managed/external/null
 classification, requested and served byte count, range/full mode, precondition
@@ -872,11 +997,55 @@ The implementation extends existing owners before creating new fixtures, per
 
 ### 12.2 Engine
 
-- `end_to_end.rs`: managed node and edge full/range reads; branch and snapshot
-  pinning; null versus empty versus non-empty; update-only PUT; nullable clear;
-  returned ETag equals a follow-up read; missing/non-Blob errors; fresh/stale/`*`
-  preconditions, including `If-Match: *` failing for a null cell; external
-  descriptor classification after the target object is made unavailable.
+- Phase 1 extends `end_to_end.rs`'s existing Blob fixture rather than creating a
+  second graph: managed node and edge reads; null versus valid-empty versus
+  non-empty; exact-ID metacharacters; full, sub-, empty, reversed, out-of-bounds,
+  exact-4-MiB, and one-over range requests; typed missing/non-Blob,
+  `BlobRangeNotSatisfiable`, and exact-resource limit errors; current-branch
+  freshness; and external descriptor classification after the target object is
+  unavailable.
+- `blob_read_on_upgraded_unmarked_v6_table_fails_closed_for_old_snapshots`
+  pins the compatibility transition: schema-preserving Append retains the
+  unmarked schema and makes the prior entry ineligible, while full-table
+  Overwrite adopts the 0.10 catalog marker on its replacement fields.
+- The `src/blob.rs` owner pins the ETag byte grammar with a literal golden vector,
+  `BlobReader: Send + Sync`, typed `BlobIntegrity` for a missing/empty immutable
+  manifest transaction-file witness, and the existing malformed-descriptor
+  matrix.
+  Integration coverage proves repeating the same exact table-manifest/cell read
+  means the same token, an unrelated write to that table changes it, and a
+  historical exact manifest admitted by the independent fences keeps its
+  original token; range coverage owns the inclusive 4 MiB boundary.
+- Phase 1 extends `branching.rs` for explicit named-branch/snapshot reads and a
+  reader that stays on its captured bytes after branch advance or logical row
+  deletion. Branch deletion/reclamation remains a destructive boundary: no test
+  or API promise requires an uncached later range to survive it. The same owner
+  pins the v6 boundary: a warm-bound fresh child is admitted through its
+  inherited effective head; a recreated named-native table cannot reuse a held
+  local handle; an older branch-owned snapshot fails `BadRequest`; and genuine
+  inherited-main history survives ordinary advance while a same-version graph
+  ref recreation is refused during snapshot authentication. A manifest e-tag is
+  not an exception. The failpoint suite parks a live branch read after graph
+  capture, replaces the branch, and proves the same refusal.
+  `schema_apply.rs` proves a current renamed type/property selector on the
+  current target and the Phase 1 `BadRequest` boundary at its pre-property-
+  rename snapshot. Its existing soft-drop fixture additionally drops and
+  re-adds the same Blob property name, then proves the old snapshot is refused
+  as a different stable-property lifetime.
+- Phase 1 migrates `export.rs`'s four-way null/empty/non-empty/external fixture to
+  the facade. External classification stays descriptor-first while the target is
+  unavailable; bulk export itself retains its batched reader and must not loop
+  over the single-cell API.
+- `forbidden_apis.rs` removes the old `read_blob -> BlobFile` surface, classifies
+  `read_blob_at` as read-only, and proves no durable call site was added.
+- Destructive-reclamation acceptance is explicit: branch/ref retention remains
+  covered by `maintenance.rs`, but Phase 1 introduces no cross-process
+  live-reader lease. The reader never retargets; operators quiesce readers before
+  cleanup or deletion of their branch, and an uncached read raced with physical
+  reclamation may only fail loudly.
+- Phase 3 extends the same `end_to_end.rs` fixture with update-only PUT, nullable
+  clear, returned-ETag equality, and fresh/stale/`*` preconditions, including
+  `If-Match: *` failing for a null cell.
 - `writes.rs`: inclusive and +1-byte PUT bounds; aggregate carried-row bound;
   target old payload is not read; every refusal proves table HEAD, manifest,
   lineage, and sidecar state unchanged.
@@ -885,11 +1054,10 @@ The implementation extends existing owners before creating new fixtures, per
   publish a competing replacement, then resume. The first request must
   re-evaluate against the fresh base and return 412 with the winner's ETag,
   without a lost update or an extra table, manifest, lineage, or sidecar effect.
-- `branching.rs`: edge and node Blob reads on branches, merge preservation of
+- Later merge/mutation work in `branching.rs` retains merge preservation of
   empty bytes, operation-wide managed-plus-exact-range accounting, the 8,192
   external-cell and 32 MiB URI-metadata admission bounds, normalized probe
   deduplication, chunk-bounded payload reuse, and pointer-only no-I/O adoption.
-- `export.rs`: four-way null/empty/non-empty/external round trip.
 - Existing schema-apply coverage gains an empty Blob and a neighboring non-empty
   Blob rather than adding a duplicate initialization fixture.
 - `failpoints.rs`: extend the existing Mutation recovery matrix with Blob PUT and
@@ -898,8 +1066,8 @@ The implementation extends existing owners before creating new fixtures, per
   record with no unresolved sidecar. PUT proves exact bytes and an ETag equal to
   a fresh read. Clear proves null/NotFound with no ETag and proves the old ETag is
   stale; the injected call itself returns no successful write outcome.
-- `forbidden_apis.rs`: the old public `read_blob -> BlobFile` surface is removed;
-  new writes are registered under Mutation; no new durable call site appears.
+- Phase 3 registers new writes under Mutation in `forbidden_apis.rs`; no new
+  durable call site appears.
 
 ### 12.3 Lance and maintenance guards
 
@@ -918,7 +1086,10 @@ The implementation extends existing owners before creating new fixtures, per
   one atomic graph publication for the Blob and plain tables; row count alone is
   insufficient.
 - `cleanup` retains a managed sidecar reachable from a snapshot/ref and never
-  attempts deletion of an external URI.
+  attempts deletion of an external URI. A process-local `BlobReader` is not a
+  durable ref and does not widen cleanup's cross-process contract: readers must
+  be quiesced before destructive GC; a raced read may return its captured bytes
+  or fail loudly, but never switch versions.
 
 ### 12.4 Server, CLI, parity, and cost
 
@@ -941,9 +1112,15 @@ The implementation extends existing owners before creating new fixtures, per
   These deterministic counters, rather than a platform-noisy RSS number, are the
   acceptance gate.
 
-Acceptance requires the canonical workspace test graph, the relevant focused
-suites from a clean baseline, `scripts/check-agents-md.sh`, OpenAPI drift, and a
-live raw PUT → ranged GET → stale If-Match exercise against the cluster server.
+Every phase requires the canonical workspace test graph, its relevant focused
+suites from a clean baseline, and `scripts/check-agents-md.sh`. Phase 1 adds no
+HTTP route, CLI verb, HTTP wire DTO, or OpenAPI schema: the existing drift test proves
+that product-surface absence. Mechanical integration changes are still required:
+the server's exhaustive `OmniError` mapping handles the new variants, and
+server/CLI fixtures migrate from the removed embedded method to `read_blob_at`.
+The live raw PUT → ranged GET → stale If-Match exercise against the cluster
+server becomes an acceptance gate only when Phases 2 and 3 expose those
+transports.
 The object-store cost evidence is explicitly on-demand and is not implied by the
 canonical local test graph. Follow
 [`deployment.md` → Testing against S3 locally](../user/deployment.md#testing-against-s3-locally),
@@ -970,10 +1147,48 @@ correctness gate.
 ### Phase 1 — engine read facade
 
 - Add typed node/edge selector, snapshot-aware descriptor-first read, managed
-  reader, external reference, and validator.
-- Deprecate then remove the public Lance-returning `read_blob`; internal callers
-  migrate in the same release. Because the crate is pre-1.0, no permanent
-  compatibility wrapper may continue leaking Lance.
+  reader, external reference, and validator. Range calls are half-open,
+  `start <= end <= length`, accept empty-at-end, and return at most
+  `BLOB_READ_RANGE_MAX_BYTES` (4 MiB).
+- Pin the validator as SHA-256 over the domain, five ordered big-endian `u64`s,
+  one big-endian byte length, and the exact non-empty UTF-8 bytes of the opened
+  immutable Lance manifest's `transaction_file` identity. Missing identity is
+  `BlobIntegrity`; invalid ranges are `BlobRangeNotSatisfiable`.
+- Remove the public Lance-returning `read_blob`; internal callers migrate in the
+  same release. Because the crate is pre-1.0, no permanent compatibility wrapper
+  may continue leaking Lance.
+- Resolve selectors through the current accepted catalog. The current type alias
+  binds across pure type-rename history by stable table/incarnation identity,
+  subject to the independent property and branch fences; the old alias is not
+  retained. Defer crossing a historical property rename to its old physical
+  field; both a pre-rename target under the current property alias and the
+  retired alias fail loudly rather than falling back to field position.
+- Persist `omnigraph.stable_property_id` on every physical user field newly
+  initialized, added, or schema-rebuilt by 0.10 and compare it on Blob reads.
+  Schema-preserving Append, Merge, and mutation writes retain an upgraded
+  table's unmarked schema; a full-table Overwrite adopts the current 0.10
+  catalog schema and marker on the replacement fields without rewriting older
+  versions. Never substitute Lance field ID. For a pre-0.10 v6 field without
+  the marker, admit only a snapshot whose table entry is exactly the current
+  physical entry; refuse older snapshots as lacking a property-lifetime
+  witness. Soft-drop/same-name re-add must refuse the retired lifetime.
+- Authenticate every explicit snapshot by requiring its reopened manifest's
+  exact graph-head row to name the resolved commit; this closes named graph-ref
+  ABA even when the selected table is inherited from main. For a table stored
+  on a named native branch, bypass the held-handle cache and cold-recheck the
+  selected graph ref's effective head after opening it because v6 persists no
+  native `BranchIdentifier`; a table-manifest e-tag is not a substitute.
+  Genuine inherited-main history remains eligible after the first proof, while
+  older branch-owned snapshots and raced live captures fail loudly. Independent
+  property/schema checks still apply. Never infer branch incarnation from name
+  and numeric version.
+- Preserve the exact captured version across branch advance. Do not add a
+  durable live-reader lease: branch deletion/reclamation and destructive cleanup
+  require quiesced readers when completion is required. An uncached later range
+  may fail loudly after reclamation, but it never returns different bytes.
+- Keep the product capability engine-only. Mechanical server error-mapping and
+  integration-fixture migrations are allowed, but no HTTP route, CLI verb, HTTP
+  wire DTO, or OpenAPI schema is added.
 
 ### Phase 2 — delivery
 
@@ -1010,7 +1225,8 @@ No architectural invariant is weakened.
 - **One publication door / mutation once:** PUT and clear enter the existing
   Mutation transaction and one manifest CAS.
 - **One coherent accepted view:** every read resolves catalog, table version,
-  row, descriptor, and bytes from one `ReadTarget`.
+  exact immutable-manifest identity, row, descriptor, and bytes from one
+  `ReadTarget`.
 - **Ordinary writes are recoverable:** no Blob-specific direct commit or recovery
   protocol is introduced.
 - **Strong consistency:** validators and preconditions are evaluated against the
@@ -1020,7 +1236,9 @@ No architectural invariant is weakened.
   may introduce a tested typed skip for unsafe physical work, without failing
   logical reads or writes.
 - **Stable schema identity:** ETags and internal selectors use stable table,
-  incarnation, and property IDs rather than aliases or paths.
+  incarnation, and property IDs rather than aliases or paths. ETags additionally
+  bind the exact opened Lance manifest's non-empty `transaction_file` identity
+  so same-version branch deletion/recreation ABA cannot reuse a token.
 - **Loud integrity:** false-null projection is removed, malformed descriptors
   error, and external failures are typed.
 - **Typed IR and pushdown:** Blob stays a first-class type, and exact ID lookup is
@@ -1044,8 +1262,10 @@ bump itself must add and test that typed behavior before it can land.
 ### 15.1 Storage format
 
 No manifest, accepted SchemaIR, table path, Blob descriptor, or file-format
-change is required. Current V2_2 Blob values remain readable. This part is highly
-reversible because the new facade derives from existing state.
+change is required. Current V2_2 Blob values need no rewrite; the new
+single-cell historical facade applies the conservative incarnation and property-
+lifetime witness boundaries in §15.2. This part is highly reversible because
+the facade derives from existing state.
 
 ### 15.2 Public behavior
 
@@ -1053,6 +1273,53 @@ GET/HEAD/PUT/DELETE and CLI verbs are additive, but once released their routes,
 range rules, validator format, redirect behavior, error codes, and table-version
 granularity become observable contracts. The `v1` ETag domain separator permits
 a future token format without ambiguous comparison.
+
+The Phase 1 Rust facade is observable too. It removes the pre-1.0
+`Omnigraph::read_blob` method that returned Lance's `BlobFile` and replaces it
+with engine-owned `read_blob_at`, `BlobRead`, `BlobContent`, and `BlobReader`.
+There is no compatibility wrapper: retaining one would keep Lance placement and
+reader behavior in OmniGraph's public contract. This is a source-incompatible
+break for embedded callers but requires no graph rebuild. The exact ETag byte
+grammar, half-open range rules, 4 MiB per-call ceiling, and typed error variants
+become public contracts in the same release.
+
+Phase 1 accepts selector aliases from the handle's current accepted catalog. A
+current type alias remains able to read pre-rename table history because stable
+table/incarnation identity crosses the rename; the retired type alias is not a
+compatibility spelling. This structural binding remains subject to the
+independent property-lifetime, physical-name, and branch-incarnation checks.
+Automatic property-field crossing through a historical rename is deferred: a
+pre-rename target lacks the current physical field, while
+the retired property alias is absent from the current catalog, so both return
+`BadRequest` rather than inferring a column. That limitation is reversible and
+changes no stored state.
+
+The property-lifetime marker is additive field metadata on physical user fields
+newly initialized, added, or schema-rebuilt by 0.10, not a manifest-schema bump.
+Schema-preserving Append, Merge, and mutation writes retain an upgraded table's
+unmarked schema. A full-table Overwrite adopts the current 0.10 catalog schema
+and marker on its replacement physical fields without rewriting older versions.
+Pre-0.10 v6 fields remain readable at their exact current physical table entry.
+An older selected entry without the marker returns `BadRequest` (`no persisted
+property-lifetime witness`) even when no rename occurred, and a marker from a
+soft-dropped/re-added same-name property returns `BadRequest` as a different
+lifetime. This fail-closed compatibility boundary never treats Lance field IDs
+as graph identity.
+
+Named-branch read eligibility has a separate conservative compatibility
+boundary. V6 historical entries do not persist Lance's native
+`BranchIdentifier`, and a manifest e-tag is not a sufficient substitute. An
+explicit snapshot first requires its reopened manifest's exact graph-head row
+to name the resolved commit, closing named graph-ref ABA even for an
+inherited-main table. A table stored on a named native branch then bypasses the
+held-handle cache and is cold-rechecked against the selected graph ref's
+effective current head after the open. A live capture whose branch moved before
+that proof and an older branch-owned snapshot are refused with `BadRequest`
+(`no persisted native-branch incarnation witness`) rather than trusting a
+branch name and numeric version that deletion/recreation can reuse. Genuine
+main/inherited-main table history remains eligible after the graph-snapshot
+proof; the independent property/schema checks still apply. This narrows a read
+case without a manifest-format change.
 
 Three deliberate behavior tightenings are not backward-compatible in the loose
 sense:

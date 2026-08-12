@@ -70,6 +70,7 @@ tempfile = "3"
 ahash = "0.8"
 arc-swap = "1"
 base64 = "0.22"
+bytes = "1"
 ariadne = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -26,6 +26,9 @@ pub(crate) mod table_store;
 pub(crate) mod validate;
 
 pub use blob::{
+    BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, BlobEtag, BlobRead, BlobReader,
     EXTERNAL_BLOB_URI_MAX_BYTES, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy,
+    ExternalBlobRef,
 };
+pub use changes::EntityKind;
 pub use table_store::IndexCoverage;

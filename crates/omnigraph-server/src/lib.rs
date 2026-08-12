@@ -741,6 +741,22 @@ impl ApiError {
         }
     }
 
+    fn range_not_satisfiable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::RANGE_NOT_SATISFIABLE,
+            code: Some(ErrorCode::BadRequest),
+            message: message.into(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1011,6 +1027,10 @@ impl ApiError {
             OmniError::ExternalBlobSource { uri, reason } => {
                 Self::external_blob_source(uri, reason)
             }
+            err @ OmniError::BlobRangeNotSatisfiable { .. } => {
+                Self::range_not_satisfiable(err.to_string())
+            }
+            err @ OmniError::BlobIntegrity { .. } => Self::internal(err.to_string()),
             OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
             OmniError::RetryableCommitConflict(message) => {
                 Self::conflict(format!("retryable storage commit conflict: {message}"))
@@ -1160,6 +1180,33 @@ mod api_error_tests {
         assert_eq!(details.limit, 8192);
         assert_eq!(details.actual, 8193);
         assert!(error.recovery_required.is_none());
+    }
+
+    #[tokio::test]
+    async fn blob_reader_errors_keep_the_exhaustive_http_mapping() {
+        let response = ApiError::from_omni(OmniError::BlobRangeNotSatisfiable {
+            start: 4,
+            end: 9,
+            length: 8,
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::BadRequest));
+
+        let response = ApiError::from_omni(OmniError::BlobIntegrity {
+            reason: "malformed descriptor".to_string(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::Internal));
     }
 
     #[tokio::test]

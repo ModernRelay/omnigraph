@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::{BlobCell, BlobContent, EntityKind};
 use support::{HERMETIC_OPERATOR_HOME, cli, fixture, output_failure, output_success};
 use tempfile::tempdir;
 
@@ -214,11 +215,26 @@ fn assert_v6_blob_bytes(graph: &Path, expected: &[u8]) {
             .await
             .expect("open rebuilt v6 graph for blob read");
         let blob = db
-            .read_blob("BinaryAsset", "blob-sentinel", "payload")
+            .read_blob_at(
+                ReadTarget::branch("main"),
+                BlobCell {
+                    entity: EntityKind::Node,
+                    type_name: "BinaryAsset".to_string(),
+                    id: "blob-sentinel".to_string(),
+                    property: "payload".to_string(),
+                },
+            )
             .await
             .expect("open rebuilt blob");
+        let BlobContent::Managed { reader, .. } = blob.content else {
+            panic!("v5 → v6 rebuild must produce managed Blob content");
+        };
+        let bytes = reader
+            .read_range(0..reader.len())
+            .await
+            .expect("small cross-version fixture fits one bounded range");
         assert_eq!(
-            &blob.read().await.expect("read rebuilt blob")[..],
+            &bytes[..],
             expected,
             "v5 → v6 rebuild must preserve exact blob bytes",
         );

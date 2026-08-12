@@ -118,6 +118,7 @@ async fn init_creates_graph() {
             dataset.schema().field("__omnigraph_stream_v1$").is_none(),
             "fresh v6 table {table_key} must not carry abandoned stream metadata"
         );
+        assert_stable_property_markers(&db, table_key).await;
     }
 
     assert!(

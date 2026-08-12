@@ -5,14 +5,44 @@ use std::fs;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use omnigraph::db::Omnigraph;
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{BlobCell, BlobContent, EntityKind};
 use omnigraph_server::api::{IngestRequest, ReadRequest};
 use omnigraph_server::{AppState, build_app};
 use serde_json::json;
 
 mod support;
 use support::*;
+
+async fn read_managed_blob_bytes(
+    db: &Omnigraph,
+    type_name: &str,
+    id: &str,
+    property: &str,
+) -> Vec<u8> {
+    let read = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            BlobCell {
+                entity: EntityKind::Node,
+                type_name: type_name.to_string(),
+                id: id.to_string(),
+                property: property.to_string(),
+            },
+        )
+        .await
+        .expect("read managed Blob");
+    let BlobContent::Managed { reader, .. } = read.content else {
+        panic!("expected managed Blob content, got external reference");
+    };
+
+    reader
+        .read_range(0..reader.len())
+        .await
+        .expect("small S3 test Blob fits one bounded range")
+        .to_vec()
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn server_opens_s3_graph_directly_and_serves_snapshot_and_read() {
@@ -198,19 +228,8 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
 
     let graph_uri = format!("{root}/graphs/knowledge.omni");
     let reopened = Omnigraph::open(&graph_uri).await.unwrap();
-    let copied = reopened
-        .read_blob("Person", "Grace", "avatar")
-        .await
-        .unwrap();
-    assert_eq!(
-        copied.uri(),
-        None,
-        "keyed HTTP load must copy the external source into managed storage"
-    );
-    assert_eq!(
-        copied.read().await.unwrap(),
-        external_blob_payload.as_bytes()
-    );
+    let copied = read_managed_blob_bytes(&reopened, "Person", "Grace", "avatar").await;
+    assert_eq!(copied, external_blob_payload.as_bytes());
 
     // A missing object beneath that same admitted base is a dependency
     // failure, not a policy refusal or generic server error. The response

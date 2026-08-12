@@ -8,7 +8,7 @@ use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
+use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
 
@@ -1018,32 +1018,48 @@ node Document {
         .await
         .unwrap();
 
-    let blob = imported
-        .read_blob("Document", "readme", "content")
-        .await
-        .unwrap();
-    let bytes = blob.read().await.unwrap();
+    let bytes = read_managed_blob_bytes(
+        &imported,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "readme", "content"),
+    )
+    .await;
     assert_eq!(&bytes[..], b"Hello");
 
-    let empty = imported
-        .read_blob("Document", "valid-empty", "content")
-        .await
-        .unwrap();
-    assert_eq!(empty.size(), 0);
-    assert!(empty.read().await.unwrap().is_empty());
+    let empty = read_managed_blob_bytes(
+        &imported,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "valid-empty", "content"),
+    )
+    .await;
+    assert!(empty.is_empty());
     assert!(
         imported
-            .read_blob("Document", "null", "content")
+            .read_blob_at(
+                ReadTarget::branch("main"),
+                node_blob_cell("Document", "null", "content"),
+            )
             .await
             .is_err(),
         "a null Blob must stay null across export/import"
     );
     let external = imported
-        .read_blob("Document", "external", "content")
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "external", "content"),
+        )
         .await
         .unwrap();
-    assert_eq!(external.uri(), Some(canonical_external_uri.as_str()));
-    assert_eq!(&external.read().await.unwrap()[..], b"External");
+    match external.content {
+        BlobContent::External(reference) => {
+            assert_eq!(reference.uri, canonical_external_uri);
+            assert_eq!(reference.offset, 0);
+            assert_eq!(reference.length, None);
+        }
+        BlobContent::Managed { .. } => {
+            panic!("export/import must preserve the external Blob descriptor")
+        }
+    }
 
     // A later import into the already-populated v6 table must retain both the
     // physical PK contract and blob-v2 fidelity.
@@ -1055,9 +1071,11 @@ node Document {
     .await
     .unwrap();
     assert_exact_id_primary_key(&imported, "node:Document").await;
-    let later = imported
-        .read_blob("Document", "later", "content")
-        .await
-        .unwrap();
-    assert_eq!(&later.read().await.unwrap()[..], &[0, 1, 2, 3, 255]);
+    let later = read_managed_blob_bytes(
+        &imported,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "later", "content"),
+    )
+    .await;
+    assert_eq!(&later[..], &[0, 1, 2, 3, 255]);
 }

@@ -50,9 +50,11 @@ Param types reuse all schema scalars; trailing `?` makes a param optional. The c
 Blob-valued properties and parameters are not `.gq` read values: they cannot be
 projected, ordered, or passed to aggregates. Those read-value uses return `T24`;
 Blob match/filter and mutation-predicate uses are also rejected by their
-context-specific diagnostics. The current embedded `Omnigraph::read_blob`
-accessor covers current node values only; edge and historical Blob reads await
-the graph-level Blob API. Blob parameters remain valid for mutation assignment.
+context-specific diagnostics. Embedded callers read a node or edge Blob cell
+through the dedicated `Omnigraph::read_blob_at` facade with an explicit branch
+or snapshot target; it returns managed bytes through a bounded reader or an
+external descriptor without exposing Lance types. This does not make Blob an
+ordinary `.gq` value. Blob parameters remain valid for mutation assignment.
 
 ## ORDER & LIMIT
 
