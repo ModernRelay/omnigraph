@@ -1746,7 +1746,7 @@ impl TableStore {
             &mut transaction,
             expected_read_version,
             id_field_id,
-            &expected_schema_preorder_ids,
+            expected_schema_preorder_ids,
             &source_ids,
             context,
         )?;
