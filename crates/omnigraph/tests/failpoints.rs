@@ -11496,3 +11496,133 @@ async fn full_recovery_rereads_sidecar_body_after_discovery() {
         "fresh unconfirmed sidecar must roll the interrupted merge back; stale discovery would expose six rows"
     );
 }
+
+/// A failed `refresh()` must publish nothing.
+///
+/// `refresh` recovers, re-opens the selected branch, and builds a prospective
+/// schema view before touching live state, then swaps the coordinator and the
+/// view together with no fallible work after the first replacement. Previously
+/// the coordinator was published first and the schema reload ran afterwards, so
+/// a reload failure left the handle carrying a new coordinator beside a stale
+/// catalog — data on one contract, catalog on another.
+///
+/// Scope note: the coordinator half is not observable through the public API,
+/// because every read self-refreshes through its own freshness probe. What this
+/// pins is the published *view* half — a failure anywhere in preparation leaves
+/// the handle's schema projection untouched and the handle usable, and a later
+/// refresh still converges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn failed_refresh_publishes_nothing_and_still_converges() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    let source_before = db.schema_source();
+
+    // Change the durable contract from a second handle, so a *successful*
+    // refresh would visibly move this one's projection.
+    let peer = Omnigraph::open(&uri).await.unwrap();
+    let extended = format!(
+        "{}\nnode Widget {{\n    label: String @key\n}}\n",
+        helpers::TEST_SCHEMA
+    );
+    peer.apply_schema(&extended).await.unwrap();
+    assert_ne!(
+        *peer.schema_source(),
+        *source_before,
+        "the peer apply must change the durable contract"
+    );
+
+    fail::cfg("schema_reload.before_contract_read", "return").unwrap();
+    let failed = db.refresh().await;
+    fail::remove("schema_reload.before_contract_read");
+    assert!(failed.is_err(), "the injected failure must surface");
+    assert_eq!(
+        *db.schema_source(),
+        *source_before,
+        "a failed refresh must not publish the view it prepared"
+    );
+    assert!(
+        !db.catalog().node_types.contains_key("Widget"),
+        "a failed refresh must not half-adopt the peer's schema"
+    );
+
+    // The handle is not poisoned: the next refresh converges.
+    db.refresh().await.unwrap();
+    assert_eq!(
+        *db.schema_source(),
+        *peer.schema_source(),
+        "a later refresh must still adopt the peer's contract"
+    );
+    assert!(
+        db.catalog().node_types.contains_key("Widget"),
+        "the adopted view must carry the new type"
+    );
+}
+
+/// A read-only handle must never perform the destructive half of recovery.
+///
+/// `open_read_only` skips the open-time sweep because its caller did not
+/// consent to `Dataset` restores, sidecar deletion, or schema-staging
+/// promotion — and its storage credentials may not even permit them. That
+/// consent does not appear later just because `refresh()` was called: the
+/// cluster crate opens read-only handles purely to probe graphs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn read_only_refresh_never_runs_recovery() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &db,
+        r#"{"type":"Person","data":{"name":"alice","age":30}}
+"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    drop(db);
+
+    // A rollback-eligible sidecar: the class a read-write refresh compensates
+    // by restoring a table and deleting the sidecar.
+    let recovery_dir = dir.path().join("__recovery");
+    std::fs::create_dir_all(&recovery_dir).unwrap();
+    let sidecar = recovery_dir.join("01H0000000000000000000RDON.json");
+    let body = r#"{
+        "schema_version": 1,
+        "operation_id": "01H0000000000000000000RDON",
+        "started_at": "0",
+        "branch": null,
+        "actor_id": "act-read-only",
+        "writer_kind": "Mutation",
+        "tables": []
+    }"#;
+    std::fs::write(&sidecar, body).unwrap();
+
+    let reader = Omnigraph::open_read_only(&uri).await.unwrap();
+    reader
+        .refresh()
+        .await
+        .expect("a read-only refresh must still re-read state");
+    assert!(
+        sidecar.exists(),
+        "a read-only refresh must not consume a recovery sidecar"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).unwrap(),
+        body,
+        "a read-only refresh must not rewrite recovery state"
+    );
+
+    // The same sidecar is still there for a writer to resolve.
+    let writer = Omnigraph::open(&uri).await.unwrap();
+    writer.refresh().await.unwrap();
+    assert!(
+        !sidecar.exists(),
+        "a read-write refresh must still consume it"
+    );
+}

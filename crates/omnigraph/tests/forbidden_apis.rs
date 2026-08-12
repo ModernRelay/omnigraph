@@ -2447,3 +2447,48 @@ fn engine_code_does_not_call_forbidden_lance_apis() {
         );
     }
 }
+
+/// Ordinary write entry points must not invoke the Full recovery sweep.
+///
+/// `mutate` and `load` reprepare from fresh authority when a pre-effect read
+/// set changes. That needs a current manifest, nothing more. Calling the
+/// public `refresh()` there instead pulls in rollback-capable recovery —
+/// `Dataset` restores and sidecar deletion — on the contended write path, and
+/// the loader's reprepare loop runs up to 32 times.
+///
+/// This is a source guard rather than a behavioral test because the regression
+/// is invisible: `refresh()` gained Full-recovery semantics in a change that
+/// touched neither of these files, so both silently changed meaning. An
+/// unresolved rollback-eligible sidecar is already surfaced to these callers by
+/// the write-entry roll-forward barrier as `RecoveryRequired`; the server
+/// resolves it by scheduling an explicit refresh.
+#[test]
+fn write_reprepare_paths_do_not_run_full_recovery() {
+    for relative in ["exec/mutation.rs", "loader/mod.rs"] {
+        let file = engine_src_root().join(relative);
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, relative);
+        let mut block = syn::Block {
+            brace_token: Default::default(),
+            stmts: Vec::new(),
+        };
+        for item in &ast.items {
+            block.stmts.push(syn::Stmt::Item(item.clone()));
+        }
+        // Non-vacuity: the scanner must actually be seeing the reprepare site
+        // it is guarding, so a parse or traversal change cannot turn this into
+        // an assertion about nothing.
+        assert_eq!(
+            method_call_count(&block, "refresh_coordinator_only"),
+            1,
+            "{relative} must still reprepare from fresh authority exactly once"
+        );
+        assert_eq!(
+            method_call_count(&block, "refresh"),
+            0,
+            "{relative} must reprepare with `refresh_coordinator_only`, not the \
+             rollback-capable `refresh()` sweep"
+        );
+    }
+}

@@ -175,6 +175,12 @@ struct HandleSchemaView {
 /// through a Lance manifest table.
 pub struct Omnigraph {
     root_uri: String,
+    /// How this handle was opened. `refresh()` consults it so a read-only
+    /// handle can never perform the destructive half of recovery: a caller
+    /// that asked to skip the open-time sweep did not consent to `Dataset`
+    /// restores, sidecar deletion, or schema-staging promotion later, and its
+    /// storage credentials may not even permit them.
+    open_mode: OpenMode,
     storage: Arc<dyn StorageAdapter>,
     /// Split Lance access context: data tables receive a graph-scoped cached
     /// session, while mutable control metadata uses a zero-cache session. Both
@@ -447,6 +453,8 @@ impl Omnigraph {
         let session = lance_access.data_session();
         Ok(Self {
             root_uri: root.clone(),
+            // `init` always produces a writable handle.
+            open_mode: OpenMode::ReadWrite,
             storage,
             lance_access,
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
@@ -557,6 +565,9 @@ impl Omnigraph {
                 Arc::clone(&storage),
                 &mut coordinator,
                 write_queue.as_ref(),
+                // `coordinator` was built before this gate was awaited, so a
+                // live handle may have published in the meantime.
+                CoordinatorFreshness::NeedsRefresh,
             )
             .await?;
         } else {
@@ -583,6 +594,7 @@ impl Omnigraph {
         let session = lance_access.data_session();
         let db = Self {
             root_uri: root.clone(),
+            open_mode: mode,
             storage,
             lance_access,
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
@@ -635,6 +647,22 @@ impl Omnigraph {
         schema_source: String,
         accepted_ir: &SchemaIR,
     ) -> Result<()> {
+        let view = Self::build_schema_view(catalog, schema_source, accepted_ir)?;
+        self.schema_view.store(Arc::new(view));
+        Ok(())
+    }
+
+    /// Build the projection without publishing it.
+    ///
+    /// Separated from [`Self::store_schema_view`] so a caller can complete
+    /// every fallible step — hashing, identity binding, coherence checks —
+    /// *before* it touches live handle state, then publish infallibly. A
+    /// failure here leaves the handle exactly as it was.
+    fn build_schema_view(
+        catalog: Catalog,
+        schema_source: String,
+        accepted_ir: &SchemaIR,
+    ) -> Result<HandleSchemaView> {
         let schema_ir_hash = omnigraph_compiler::schema_ir_hash(accepted_ir)
             .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
         let catalog_ir = catalog.bound_schema_ir().ok_or_else(|| {
@@ -650,13 +678,12 @@ impl Omnigraph {
                     .to_string(),
             ));
         }
-        self.schema_view.store(Arc::new(HandleSchemaView {
+        Ok(HandleSchemaView {
             catalog: Arc::new(catalog),
             source: Arc::new(schema_source),
             schema_ir_hash,
             schema_identity_domain: accepted_ir.schema_identity_domain.as_str().to_string(),
-        }));
-        Ok(())
+        })
     }
 
     pub fn uri(&self) -> &str {
@@ -1550,25 +1577,43 @@ impl Omnigraph {
     /// gates. It remains unsupported beside a foreign writer process. Each
     /// step:
     ///
+    /// The shape is **prepare, then publish**: every fallible step completes
+    /// against local state, and the live handle changes in one transition with
+    /// no fallible or awaited work after it. A failure anywhere leaves the
+    /// coordinator, schema view, and caches exactly as they were — the handle
+    /// is never left holding a new coordinator beside a stale schema view.
+    ///
+    /// Prepare:
+    ///
     /// 1. Open a temporary main coordinator under the shared schema gate.
-    /// 2. `recover_schema_state_files` — complete an in-flight
-    ///    schema_apply's staging→final rename if a SchemaApply sidecar
-    ///    is on disk; idempotent + early-returns when no staging files
-    ///    exist. Required BEFORE manifest-drift recovery so a
-    ///    SchemaApply roll-forward doesn't publish the manifest while
-    ///    the staging files remain unrenamed (which would corrupt the
-    ///    graph: data on new schema, catalog on old).
+    /// 2. `recover_schema_state_files` — complete an in-flight schema_apply's
+    ///    staging→final rename if a SchemaApply sidecar is on disk; idempotent
+    ///    and early-returns when no staging files exist. Required BEFORE
+    ///    manifest-drift recovery so a SchemaApply roll-forward doesn't publish
+    ///    the manifest while the staging files remain unrenamed (which would
+    ///    corrupt the graph: data on new schema, catalog on old).
     /// 3. Run Full sidecar recovery. Each sidecar is re-read after its branch
     ///    and sorted table gates are acquired, so a writer that finished while
     ///    recovery waited is never restored from under its own commit.
-    /// 4. Replace this handle's coordinator with a fresh view of its previously
-    ///    selected branch, reload the coherent schema view, and invalidate
-    ///    derived caches.
+    /// 4. Re-open the previously selected branch, if any, and build the
+    ///    prospective schema view against that exact coordinator.
+    ///
+    /// Publish: take the coordinator write lock, drop derived caches, swap the
+    /// coordinator and the ArcSwap schema view.
+    ///
+    /// The schema gate is held across all of it, so a concurrent apply cannot
+    /// interleave. That is why the schema view is built through
+    /// [`Self::prepare_schema_view`] rather than
+    /// [`Self::reload_schema_if_source_changed`], which acquires the gate
+    /// itself — the write queue is not reentrant.
     ///
     /// The recovery coordinator is deliberately local until the sweep succeeds:
     /// taking this handle's coordinator write lock before the recovery helper
     /// acquired branch/table gates would invert the global queue-before-
     /// coordinator lock order.
+    ///
+    /// A handle opened with [`OpenMode::ReadOnly`] performs no recovery here.
+    /// It gets the coordinator-only refresh its callers actually want.
     ///
     /// The staged-write entry points (`load_as`, `mutate_as`) run the
     /// same heal via
@@ -1579,6 +1624,12 @@ impl Omnigraph {
     /// [`refresh_coordinator_only`](Self::refresh_coordinator_only) to
     /// avoid the recovery sweep racing their own sidecar.
     pub async fn refresh(&self) -> Result<()> {
+        // A read-only handle asked to skip the open-time sweep. Honour that for
+        // its whole lifetime: give it the fresh view it wants and none of the
+        // destructive half. Its credentials may not even permit the writes.
+        if matches!(self.open_mode, OpenMode::ReadOnly) {
+            return self.refresh_coordinator_only().await;
+        }
         let schema_guard = self
             .write_queue
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -1589,27 +1640,45 @@ impl Omnigraph {
             .await
             .current_branch()
             .map(str::to_string);
+
+        // ---- Prepare. Nothing below touches live handle state. ----
         let mut recovery_coordinator = GraphCoordinator::open_with_session(
             self.uri(),
             Arc::clone(&self.storage),
             &self.control_session(),
         )
         .await?;
+        // The coordinator was opened *after* the gate, so it is already current;
+        // the shared helper skips the re-read that read-write open needs.
         recover_full_manifest_drift(
             &self.root_uri,
             Arc::clone(&self.storage),
             &mut recovery_coordinator,
             self.write_queue.as_ref(),
+            CoordinatorFreshness::AlreadyFresh,
         )
         .await?;
         let refreshed = match selected_branch.as_deref() {
+            // Recovery ran against main; a branch-bound handle needs its own
+            // view of the branch it had selected.
             Some(branch) => self.open_coordinator_for_branch(Some(branch)).await?,
             None => recovery_coordinator,
         };
-        *self.coordinator.write().await = refreshed;
-        drop(schema_guard);
-        self.reload_schema_if_source_changed().await?;
+        let prospective_view = self.prepare_schema_view(&refreshed.snapshot()).await?;
+
+        // ---- Publish. One live-state transition, no fallible work after it. ----
+        // Caches are dropped before the swap so no reader can observe the new
+        // coordinator beside entries derived from the old one. Both are keyed by
+        // version, so this is hygiene rather than correctness — but the ordering
+        // costs nothing and removes the question.
+        let mut coordinator = self.coordinator.write().await;
         self.invalidate_read_caches().await;
+        *coordinator = refreshed;
+        if let Some(view) = prospective_view {
+            self.schema_view.store(Arc::new(view));
+        }
+        drop(coordinator);
+        drop(schema_guard);
         Ok(())
     }
 
@@ -1861,6 +1930,35 @@ impl Omnigraph {
             .write_queue
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
+        let live_snapshot = self.coordinator.read().await.snapshot();
+        if let Some(view) = self.prepare_schema_view(&live_snapshot).await? {
+            self.schema_view.store(Arc::new(view));
+        }
+        Ok(())
+    }
+
+    /// Build the handle's schema projection from the durable contract and
+    /// validate it against `live_snapshot`. `None` means the live view is
+    /// already coherent and needs no replacement.
+    ///
+    /// Two contracts, both load-bearing:
+    ///
+    /// 1. **The caller holds the root schema gate for the complete call**, so a
+    ///    concurrent apply cannot interleave its sequential file promotions
+    ///    with this read. This function does not acquire it — the write queue
+    ///    is not reentrant, and `refresh` needs to hold it across recovery and
+    ///    this preparation as one span.
+    /// 2. **The snapshot is a parameter, never read from `self.coordinator`.**
+    ///    `refresh` calls this while it is about to take the coordinator write
+    ///    lock; reading the lock here would deadlock, which is exactly the
+    ///    regression pinned by
+    ///    `composite_flow::composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh`.
+    ///
+    /// Nothing here mutates live handle state, so a failure is a clean no-op.
+    async fn prepare_schema_view(
+        &self,
+        live_snapshot: &Snapshot,
+    ) -> Result<Option<HandleSchemaView>> {
         crate::failpoints::maybe_fail(
             crate::failpoints::names::SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
         )?;
@@ -1872,15 +1970,14 @@ impl Omnigraph {
             &schema_source,
         )
         .await?;
-        let live_snapshot = self.coordinator.read().await.snapshot();
-        validate_schema_ir_against_snapshot(&accepted_ir, &live_snapshot)?;
+        validate_schema_ir_against_snapshot(&accepted_ir, live_snapshot)?;
         let accepted_domain = accepted_ir.schema_identity_domain.as_str().to_string();
         let current = self.schema_view.load_full();
         if accepted_state.schema_ir_hash == current.schema_ir_hash
             && accepted_domain == current.schema_identity_domain
             && schema_source == *current.source
         {
-            return Ok(());
+            return Ok(None);
         }
         let catalog = if accepted_state.schema_ir_hash == current.schema_ir_hash
             && accepted_domain == current.schema_identity_domain
@@ -1892,8 +1989,7 @@ impl Omnigraph {
             catalog
         };
         drop(current);
-        self.store_schema_view(catalog, schema_source, &accepted_ir)?;
-        Ok(())
+        Self::build_schema_view(catalog, schema_source, &accepted_ir).map(Some)
     }
 
     /// Refresh coordinator state and invalidate the runtime cache WITHOUT
@@ -2993,6 +3089,23 @@ impl Omnigraph {
     }
 }
 
+/// Whether the caller's coordinator is already current with respect to the
+/// schema gate it holds.
+///
+/// Read-write open constructs its coordinator *before* awaiting the gate, so a
+/// live handle may have published while the open blocked — it must re-read.
+/// `refresh` constructs its coordinator *after* acquiring the gate, so a
+/// re-read is a second full `__manifest` open and scan for no new information.
+/// On an uncompacted graph that scan grows with commit depth, and `refresh` is
+/// on the supervised-recovery path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordinatorFreshness {
+    /// Opened before the gate was held; re-read under the gate.
+    NeedsRefresh,
+    /// Opened under the held gate; nothing can have intervened.
+    AlreadyFresh,
+}
+
 /// Run the one Full recovery sequence shared by read-write open and live
 /// [`Omnigraph::refresh`]. The caller must hold the root-scoped schema gate for
 /// the complete call. Recovery acquires branch and sorted table gates per
@@ -3003,8 +3116,11 @@ async fn recover_full_manifest_drift(
     storage: Arc<dyn StorageAdapter>,
     coordinator: &mut GraphCoordinator,
     write_queue: &crate::db::write_queue::WriteQueueManager,
+    freshness: CoordinatorFreshness,
 ) -> Result<()> {
-    coordinator.refresh().await?;
+    if freshness == CoordinatorFreshness::NeedsRefresh {
+        coordinator.refresh().await?;
+    }
     let schema_state_recovery =
         recover_schema_state_files(root_uri, Arc::clone(&storage), &coordinator.snapshot()).await?;
     crate::db::manifest::recover_manifest_drift(

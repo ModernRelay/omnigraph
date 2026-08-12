@@ -430,7 +430,10 @@ async fn load_jsonl_data(
                     branch = branch.unwrap_or("main"),
                     "prepared load authority changed before effects; repreparing"
                 );
-                db.refresh().await?;
+                // Re-read authority only — see the matching note on the
+                // mutation reprepare. This loop can run up to 32 times under
+                // contention; Full recovery does not belong in it.
+                db.refresh_coordinator_only().await?;
             }
             result => return result,
         }

@@ -3308,6 +3308,7 @@ pub(crate) async fn recover_manifest_drift(
     }
     crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_POST_LIST_PRE_GATES)?;
 
+    let mut changed_durable_state = false;
     // For each sidecar, classify against a FRESH snapshot AT THE
     // SIDECAR'S BRANCH. Two reasons:
     // 1. Per-sidecar refresh: sidecar N's roll-forward writes manifest
@@ -3369,7 +3370,7 @@ pub(crate) async fn recover_manifest_drift(
                 coordinator.snapshot()
             }
         };
-        process_sidecar(
+        changed_durable_state |= process_sidecar(
             root_uri,
             &storage,
             &branch_snapshot,
@@ -3379,8 +3380,13 @@ pub(crate) async fn recover_manifest_drift(
         )
         .await?;
     }
-    // Final refresh so the caller sees the post-sweep state.
-    coordinator.refresh().await?;
+    // Final refresh so the caller sees the post-sweep state — but only if the
+    // sweep produced any. A pass that deferred every sidecar (the common
+    // RollForwardOnly outcome) changed nothing, and this refresh is a full
+    // `__manifest` open and scan whose cost grows with commit depth.
+    if changed_durable_state {
+        coordinator.refresh().await?;
+    }
     Ok(())
 }
 

@@ -759,12 +759,18 @@ Triggers for the residual: transient Lance write errors during finalize
 contention exceeding `PUBLISHER_RETRY_BUDGET = 5` retries.
 
 **Long-running servers**: the write entry points (`load_as`,
-`mutate_as`, `apply_schema_as`, `branch_merge_as`), the explicit
-`ensure_indices{,_on}` reconciler, and `Omnigraph::refresh` run
-roll-forward-only recovery in-process
+`mutate_as`, `apply_schema_as`, `branch_merge_as`) and the explicit
+`ensure_indices{,_on}` reconciler run roll-forward-only recovery in-process
 (`recovery::heal_pending_sidecars_roll_forward`) — the common
 Phase B → Phase C residual closes on the next enrolled entry, without a
-restart and without an explicit refresh. The heal lists `__recovery/`
+restart and without an explicit refresh. That is the whole of what an ordinary
+write does about recovery: `mutate` and `load` reprepare through
+`refresh_coordinator_only` when a pre-effect read set changes, so the
+rollback-capable sweep never runs on the contended write path — the loader's
+reprepare loop can run 32 times. Pinned by
+`forbidden_apis.rs::write_reprepare_paths_do_not_run_full_recovery`, a source
+guard because the regression is invisible: `refresh()` can gain semantics in a
+change that touches neither file. The heal lists `__recovery/`
 (one `list_dir`; empty in the steady state) and, per sidecar, acquires
 schema → branch → sorted-table gates that overlap the writer's guarded
 sidecar lifetime. RFC-022 mutation/load writers hold the complete order. Branch
@@ -829,19 +835,41 @@ apply re-plans rewrites from the manifest pin and orphans the drifted
 Phase-B commit (dropping its rows), and a branch merge publishes the
 drift as an unattributed side effect — both while the stale sidecar
 lingers to misclassify later.
-Sidecars that would require a `Dataset::restore` (mixed / unexpected
-state) are deferred to the next `OpenMode::ReadWrite` open. Full open-time
-recovery uses the same root-scoped ordered gates and post-wait optional body reread,
+Sidecars that would require a `Dataset::restore` (mixed / unexpected state) are
+deferred by the write-entry healer to the next read-write open **or an explicit
+`Omnigraph::refresh()`** — the served-graph recovery primitive, so a
+long-running server heals them without a restart.
+
+`refresh()` runs the same Full sequence as read-write open, through the one
+shared helper, and is structured **prepare-then-publish**: under the root schema
+gate it opens a temporary coordinator, recovers, re-opens the selected branch,
+and builds the prospective schema view — then takes the coordinator write lock
+and swaps coordinator and view together with no fallible work after the first
+replacement. A failure anywhere leaves the handle exactly as it was, never
+carrying a new coordinator beside a stale catalog. Because that coordinator is
+opened *after* the gate is held, the shared helper skips the re-read that open
+needs (`CoordinatorFreshness`), and a sweep that changed nothing skips the
+trailing re-read too: a steady-state `refresh()` costs one `__manifest` open and
+one scan, pinned by
+`warm_read_cost.rs::refresh_without_sidecars_uses_one_manifest_open`.
+
+A handle opened with `OpenMode::ReadOnly` performs no recovery in `refresh()`.
+It re-reads coordinator state and stops. A caller that asked to skip the
+open-time sweep did not consent to restores, sidecar deletion, or schema-staging
+promotion later, and its credentials may not permit them
+(`failpoints.rs::read_only_refresh_never_runs_recovery`).
+
+Full recovery uses the same root-scoped ordered gates and post-wait optional body reread,
 so it cannot Restore/delete under a live writer owned by another handle in the
 same process. Restore remains unsafe across processes because Lance's
 `check_restore_txn` accepts
 the restore against in-flight Append/Update/Delete commits and
 silently orphans them (pinned by
 `src/table_store/staged_tests.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
-When such a deferred sidecar blocks a write, the commit-time drift
-guard says so explicitly ("a pending recovery sidecar requires
-rollback — reopen the graph read-write") instead of pointing at
-`omnigraph repair`, which refuses while a sidecar is pending.
+When such a deferred sidecar blocks a write, the commit-time drift guard says so
+explicitly ("a pending recovery sidecar requires rollback — run a Full graph
+refresh") instead of pointing at `omnigraph repair`, which refuses while a
+sidecar is pending.
 `cleanup` refuses pending sidecars at entry as well, before orphan reconciliation
 or version GC: v3/v4 ownership and compensation recovery may need the retained
 Lance transaction/version history, so garbage collection cannot outrun the

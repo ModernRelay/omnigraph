@@ -984,3 +984,39 @@ async fn single_edge_query_builds_only_referenced_edge() {
         "a query referencing only `knows` must build only that edge, not all catalog edges"
     );
 }
+
+/// A `refresh()` with no recovery sidecars on disk must cost exactly one
+/// `__manifest` open and one row scan.
+///
+/// The supervised-recovery path calls `refresh()`, and on an uncompacted graph
+/// each manifest scan grows with commit depth. Before the freshness split this
+/// paid two: the coordinator was opened under the schema gate and then
+/// immediately re-read by the shared recovery helper, which needs that re-read
+/// only because read-write *open* builds its coordinator before awaiting the
+/// gate. The sweep itself short-circuits on an empty `__recovery/`, so a steady
+/// -state refresh does no manifest work beyond the one open it needs.
+#[tokio::test]
+async fn refresh_without_sidecars_uses_one_manifest_open() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = init_and_load(&dir).await;
+        // Realistic commit-history depth: the cost must not follow it.
+        commit_many(&mut db, 12).await;
+
+        let (result, io) = measure(db.refresh()).await;
+        result.unwrap();
+        eprintln!(
+            "no-sidecar refresh: internal_open_count={} manifest_scan_count={} manifest_reads={}",
+            io.internal_open_count, io.manifest_scan_count, io.manifest_reads,
+        );
+        assert_eq!(
+            io.internal_open_count, 1,
+            "a no-sidecar refresh must open `__manifest` exactly once"
+        );
+        assert_eq!(
+            io.manifest_scan_count, 1,
+            "a no-sidecar refresh must scan `__manifest` exactly once"
+        );
+    })
+    .await;
+}

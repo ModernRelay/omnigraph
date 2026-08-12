@@ -734,7 +734,12 @@ impl Omnigraph {
                         branch,
                         "prepared mutation authority changed before effects; repreparing"
                     );
-                    self.refresh().await?;
+                    // Re-read authority only. A reprepare needs a current
+                    // manifest, not the destructive half of recovery: this is
+                    // the contended write path, and an unresolved rollback-
+                    // eligible sidecar is already surfaced by Stage A's
+                    // roll-forward barrier as `RecoveryRequired`.
+                    self.refresh_coordinator_only().await?;
                 }
                 result => return result,
             }
