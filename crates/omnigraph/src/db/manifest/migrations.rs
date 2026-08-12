@@ -139,14 +139,15 @@ pub(crate) fn read_stamp(dataset: &Dataset) -> Option<u32> {
 /// - A stamp key whose value is not a version number — refused naming the
 ///   raw value. Never classified as absent: a corrupt stamp must not flow
 ///   into the delete-and-re-init advice below.
-/// - No stamp key on a manifest with the modern layout — a torn init: the
-///   RFC-028 identity columns arrived at v5, after stamping began, so no
-///   genuine pre-stamp (v1) manifest can carry them. The only writer of
-///   unstamped-modern manifests is a pre-atomic-stamp binary whose init died
-///   between the `__manifest` Create commit and the stamp commit. Refused
-///   with the real remedy (delete and re-init), not the "ancient store"
-///   export advice, which is impossible to follow for a store no binary
-///   opens.
+/// - No stamp key on a manifest with the modern layout — not a genuine
+///   pre-stamp (v1) manifest, because the RFC-028 identity columns arrived at
+///   v5, after stamping began. This can be an older binary's init interrupted
+///   between the `__manifest` Create commit and its separate stamp commit, or
+///   damaged/externally modified metadata on a graph that progressed further.
+///   Those cases are indistinguishable from the remaining metadata, so the
+///   guard fails closed. Delete-and-re-init is advised only when the operator
+///   independently knows initialization never completed; otherwise the root
+///   must be preserved for investigation or recovery.
 /// - No stamp key on a pre-modern layout — the genuine pre-stamp world:
 ///   treated as v1 and refused through the ordinary sub-floor message naming
 ///   the 0.3.1 export path.
@@ -164,11 +165,14 @@ pub(crate) fn guard_stamp(dataset: &Dataset) -> Result<u32> {
             ))),
         },
         None if manifest_layout_is_modern(dataset) => Err(OmniError::manifest(
-            "__manifest has the current manifest layout but no internal-schema stamp: \
-             an `omnigraph init` on this root crashed before completing (older \
-             omnigraph binaries stamped `__manifest` in a separate commit after \
-             creating it). The graph was never fully initialized and holds no \
-             committed data. Delete the graph root and run `omnigraph init` again.",
+            "__manifest has the current manifest layout but no internal-schema stamp. \
+             This may be an interrupted `omnigraph init` from an older binary, which \
+             stamped `__manifest` in a separate commit, or damaged or externally \
+             modified metadata. OmniGraph cannot safely distinguish those cases and \
+             will not open the graph. If you know initialization never completed, \
+             delete the graph root and run `omnigraph init` again. Otherwise preserve \
+             the root and investigate or restore from a known-good backup; do not \
+             reinitialize it in place.",
         )),
         None => {
             refuse_if_stamp_unsupported(1)?;
@@ -178,9 +182,9 @@ pub(crate) fn guard_stamp(dataset: &Dataset) -> Result<u32> {
 }
 
 /// Whether `__manifest`'s schema carries the RFC-028 stable-identity columns
-/// (v5+). Distinguishes a torn init (unstamped but modern) from a genuine
-/// pre-stamp v1 store — free, since the schema is already in memory when the
-/// stamp is read.
+/// (v5+). Distinguishes an unstamped modern manifest (possible interrupted init
+/// or metadata damage) from a genuine pre-stamp v1 store — free, since the
+/// schema is already in memory when the stamp is read.
 fn manifest_layout_is_modern(dataset: &Dataset) -> bool {
     dataset.schema().field("stable_table_id").is_some()
         && dataset.schema().field("table_incarnation_id").is_some()

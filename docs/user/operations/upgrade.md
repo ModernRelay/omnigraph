@@ -52,11 +52,16 @@ If the graph's stamp is **higher** than the binary's, the binary is too old —
 upgrade omnigraph rather than rebuilding the graph.
 
 If the refusal says `__manifest` has the current manifest layout but **no
-internal-schema stamp at all**, the graph is not old: an `omnigraph init` on
-that root crashed before completing (older binaries wrote the stamp in a
-separate commit after creating `__manifest`). The store was never fully
-initialized and holds no committed data — delete the graph root and run
-`omnigraph init` again. No export or rebuild is involved.
+internal-schema stamp at all**, the graph is not a genuine pre-stamp store. It
+may be an `omnigraph init` from an older binary interrupted between creating
+`__manifest` and writing its separate stamp commit, or the stamp metadata may
+have been damaged or externally modified later. OmniGraph cannot safely tell
+which happened and refuses to open the graph.
+
+Delete the root and run `omnigraph init` again **only if you independently know
+that initialization never completed**. Otherwise preserve the root, do not
+reinitialize it in place, and investigate the metadata or restore from a
+known-good backup.
 
 ## What is preserved (and what is not)
 

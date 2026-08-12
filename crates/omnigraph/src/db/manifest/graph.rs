@@ -55,8 +55,8 @@ pub(super) async fn init_manifest_graph(
     // `__manifest` durable but unstamped. The Create commit is the manifest's
     // entire birth — entries, genesis lineage, and the stamp in one commit,
     // with nothing failable after it. (A `table_version_management` config
-    // key is deliberately not written: nothing in Lance 9 or this crate
-    // reads it.)
+    // key is deliberately not written: neither the pinned Lance substrate nor
+    // this crate reads it.)
     let (stamp_key, stamp_value) = current_stamp_entry();
     let schema: SchemaRef = Arc::new(
         manifest_schema()

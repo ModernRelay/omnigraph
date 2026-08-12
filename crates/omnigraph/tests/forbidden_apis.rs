@@ -617,7 +617,7 @@ durable_calls! {
     // genesis lineage, and the internal-schema stamp all ride the one commit,
     // so the stamp is atomic with birth and no bootstrap write follows it.
     // (A `table_version_management` config key is deliberately not written:
-    // nothing in Lance 9 or this crate reads it.)
+    // neither the pinned Lance substrate nor this crate reads it.)
     ("db/manifest/graph.rs", "Dataset::write(", 2, WriteProtocol::Bootstrap),
     ("db/manifest/publisher.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/manifest/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),

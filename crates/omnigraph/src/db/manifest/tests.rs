@@ -1716,6 +1716,11 @@ async fn test_init_stamps_internal_schema_version() {
 
     let ds = open_manifest_dataset(uri, None).await.unwrap();
     assert_eq!(
+        ds.version().version,
+        1,
+        "fresh __manifest HEAD must be its Create commit; init must not append config or stamp commits",
+    );
+    assert_eq!(
         super::migrations::read_stamp(&ds),
         Some(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION),
         "init should stamp the manifest at the current internal schema version",
@@ -1734,13 +1739,13 @@ async fn test_init_stamps_internal_schema_version() {
 }
 
 // The absent-stamp arm of the open guard. An unstamped manifest that carries
-// the modern (v5+) identity columns cannot be a genuine pre-stamp v1 store —
-// only an init torn by a pre-atomic-stamp binary produces that shape — so the
-// guard must name the torn init and its real remedy, never the "created by
-// omnigraph 0.3.1 or earlier, rebuild via export" misdiagnosis (whose remedy
-// is impossible: no binary opens the store to export it).
+// the modern (v5+) identity columns cannot be a genuine pre-stamp v1 store,
+// but the remaining metadata cannot distinguish an init interrupted under a
+// pre-atomic-stamp binary from later metadata damage. The guard must name both
+// possibilities, fail closed, and make delete-and-re-init conditional on the
+// operator independently knowing that initialization never completed.
 #[tokio::test]
-async fn unstamped_modern_manifest_is_diagnosed_as_torn_init() {
+async fn unstamped_modern_manifest_is_refused_as_interrupted_init_or_corruption() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
@@ -1757,23 +1762,26 @@ async fn unstamped_modern_manifest_is_diagnosed_as_torn_init() {
         .expect_err("an unstamped manifest must be refused")
         .to_string();
     assert!(
-        err.contains("crashed before completing"),
-        "the refusal must name the torn init: {err}"
+        err.contains("interrupted `omnigraph init`")
+            && err.contains("damaged or externally modified metadata"),
+        "the refusal must name both possible causes: {err}"
     );
     assert!(
-        err.contains("Delete the graph root"),
-        "the refusal must carry the real remedy: {err}"
+        err.contains("cannot safely distinguish those cases")
+            && err.contains("If you know initialization never completed")
+            && err.contains("Otherwise preserve the root"),
+        "the refusal must fail closed and make deletion conditional: {err}"
     );
     assert!(
-        !err.contains("0.3.1"),
-        "an unstamped-modern manifest must not be misdiagnosed as ancient: {err}"
+        !err.contains("holds no committed data") && !err.contains("0.3.1"),
+        "the refusal must neither assume an empty graph nor misdiagnose it as ancient: {err}"
     );
 }
 
 // The unreadable-stamp arm: a stamp key that is present but not a version
 // number must be refused naming the raw value — never classified as absent,
-// because the absent-modern arm advises deleting the root, and corrupt
-// metadata must not flow into destructive advice.
+// because an explicitly corrupt value should not flow even into the modern
+// absent-stamp arm's conditional delete advice.
 #[tokio::test]
 async fn unreadable_stamp_is_refused_without_delete_advice() {
     let dir = tempfile::tempdir().unwrap();
