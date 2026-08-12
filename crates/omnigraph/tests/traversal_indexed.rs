@@ -369,8 +369,9 @@ async fn variable_hops_terminate_and_dedup_on_cycle() {
     assert_eq!(got, vec!["b", "c"]);
 }
 
-// A self-loop a->a plus a->b. Variable-length traversal must not loop forever and
-// must not re-emit the seeded source.
+// Self-loop a->a plus a->b: the self-edge is a genuine length-1 walk, so the
+// reach set is {a, b} (walk semantics); traversal must terminate. Cycle
+// pruning: see variable_hops_terminate_and_dedup_on_cycle.
 #[tokio::test]
 async fn variable_hops_handle_self_loop() {
     let dir = tempfile::tempdir().unwrap();
@@ -383,6 +384,70 @@ async fn variable_hops_handle_self_loop() {
     load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let got = both_modes(&mut db, REACH_5, "reach", &params(&[("$name", "a")])).await;
-    // a->a hits the seeded source (pruned); only b is reached.
-    assert_eq!(got, vec!["b"]);
+    // a via its own self-edge (1 hop), b (1 hop). No infinite loop.
+    assert_eq!(got, vec!["a", "b"]);
+}
+
+// A stored self-loop must appear in every single-hop spelling — directed,
+// undirected (docs/user/queries/index.md: "a self-loop, appears once"), and
+// bound-edge — and all three must agree.
+#[tokio::test]
+async fn single_hop_self_loop_is_emitted_by_all_spellings() {
+    const QUERIES: &str = r#"
+query friends($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $f
+    }
+    return { $f.name }
+}
+query friends_undirected($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows> $f
+    }
+    return { $f.name }
+}
+query friends_bound($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+    }
+    return { $f.name }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let data = r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"edge":"Knows","from":"a","to":"a"}
+{"edge":"Knows","from":"a","to":"b"}"#;
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+
+    let p = params(&[("$name", "a")]);
+    let directed = both_modes(&mut db, QUERIES, "friends", &p).await;
+    assert_eq!(
+        directed,
+        vec!["a", "b"],
+        "directed single hop emits the self-loop"
+    );
+
+    let undirected = both_modes(&mut db, QUERIES, "friends_undirected", &p).await;
+    // The self-loop row is reachable through both the out and in probes; set
+    // semantics emit it once.
+    assert_eq!(
+        undirected,
+        vec!["a", "b"],
+        "undirected emits the self-loop once"
+    );
+
+    // Auto mode only: an edge binding dispatches to execute_expand_bound
+    // before any mode logic, so forcing csr/indexed does not apply.
+    let bound = sorted_names(&mut db, QUERIES, "friends_bound", &p).await;
+    assert_eq!(
+        bound,
+        vec!["a", "b"],
+        "bound-edge agrees with the other spellings"
+    );
 }
