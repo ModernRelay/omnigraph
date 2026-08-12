@@ -18,7 +18,14 @@
     fails if that exact test skips or if a broad filter matches another cell.
 - **AWS feature build job**: `cargo build/test -p omnigraph-server --features aws` on ubuntu-latest.
 - **Windows binary build job**: `cargo build --release --locked -p omnigraph-cli -p omnigraph-server` on windows-latest with smoke checks for `omnigraph.exe version`, `omnigraph-server.exe --help`, and PowerShell installer syntax.
-- **RustFS S3 integration**: starts RustFS and runs the configured bucket-gated engine/server/cluster/CLI correctness suites, including ordinary recovery failpoints. Cost/benchmark instruments remain on demand and are not promoted into correctness CI.
+- **RustFS S3 integration**: starts RustFS, requires a successful readiness
+  probe and bucket creation, and runs the configured bucket-gated
+  engine/server/cluster/CLI correctness suites, including ordinary recovery
+  failpoints. The default shard serializes only the outer libtest scenarios
+  (`--test-threads=1`); their internal Tokio work remains concurrent. Failures
+  capture `docker inspect`, container stdout/stderr, and RustFS's service logs
+  from `/logs`. Cost/benchmark instruments remain on demand and are not
+  promoted into correctness CI.
 - **release-edge.yml**: on every push to main, retags `edge`, builds Linux x86_64 / Linux arm64 / macOS arm64 archives and Windows x86_64 zip + sha256, publishes a rolling prerelease, then smoke-tests the Windows PowerShell installer against `edge`. The macOS arm64 matrix entry uses Rust's large code model because the release binary's text exceeds the architecture's +/-128 MiB direct-branch range; other platforms keep the workspace release profile unchanged.
 - **release.yml**: on `v*` tags, builds the Linux x86_64 / Linux arm64 / macOS arm64 archives and Windows x86_64 zip release matrix, updates the Homebrew tap (`scripts/update-homebrew-formula.sh`) by pushing the regenerated formula to `ModernRelay/homebrew-tap`, and smoke-tests the Windows PowerShell installer against the tag. It carries the same macOS-only large-code-model setting as the edge workflow so tagged and rolling artifacts cannot diverge at this linker boundary.
 - **package.yml**: manual ECR image build; emits two image tags per commit (`<sha>`, `<sha>-aws`) via CodeBuild.

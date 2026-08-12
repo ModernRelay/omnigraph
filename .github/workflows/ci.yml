@@ -474,15 +474,25 @@ jobs:
 
       - name: Create RustFS test bucket
         run: |
-          for _ in $(seq 1 30); do
+          set -euo pipefail
+          rustfs_ready=false
+          for attempt in $(seq 1 30); do
             if aws --endpoint-url "${AWS_ENDPOINT_URL_S3}" s3api list-buckets >/dev/null 2>&1; then
+              rustfs_ready=true
               break
             fi
+            echo "RustFS readiness check ${attempt}/30 failed; retrying"
             sleep 2
           done
+
+          if [ "$rustfs_ready" != true ]; then
+            echo "::error::RustFS did not become ready after 30 attempts"
+            exit 1
+          fi
+
           aws --endpoint-url "${AWS_ENDPOINT_URL_S3}" \
             s3api create-bucket \
-            --bucket "${OMNIGRAPH_S3_TEST_BUCKET}" >/dev/null 2>&1 || true
+            --bucket "${OMNIGRAPH_S3_TEST_BUCKET}"
 
       # Compile and execute the selected default targets in one Cargo resolve.
       # A superset prebuild followed by narrower commands would still rebuild
@@ -502,7 +512,7 @@ jobs:
             --test s3 \
             --test s3_cluster \
             --test system_local \
-            -- --nocapture 2>&1 | tee "$test_log"
+            -- --nocapture --test-threads=1 2>&1 | tee "$test_log"
 
           if grep -Eiq \
             "SKIP public_physical_ref_token_rejects_s3_same_version_aba|skipping s3 " \
@@ -553,6 +563,30 @@ jobs:
           echo "$output" | grep -Eq "test result: ok\. [1-9][0-9]* passed" \
             || { echo "::error::filter 's3_' matched no tests — vacuous pass"; exit 1; }
 
-      - name: Dump RustFS logs on failure
+      - name: Dump RustFS diagnostics on failure
         if: failure()
-        run: docker logs rustfs
+        run: |
+          set +e
+          echo "::group::docker inspect rustfs"
+          # Limit inspection to runtime state: full inspect output includes the
+          # container environment and would disclose the test credentials.
+          docker inspect --format 'State={{json .State}} Image={{.Image}}' rustfs
+          echo "::endgroup::"
+
+          echo "::group::docker logs rustfs"
+          docker logs rustfs
+          echo "::endgroup::"
+
+          diagnostics_dir=$(mktemp -d "${RUNNER_TEMP}/rustfs-logs.XXXXXX")
+          echo "::group::RustFS /logs"
+          if docker cp rustfs:/logs "$diagnostics_dir"; then
+            find "$diagnostics_dir" -type f -exec sh -c '
+              for log_file do
+                echo "===== ${log_file} ====="
+                tail -n 2000 "$log_file"
+              done
+            ' sh {} +
+          else
+            echo "Unable to copy /logs from the RustFS container"
+          fi
+          echo "::endgroup::"
