@@ -359,6 +359,16 @@ impl CursorRow {
     fn compute_signature(&self) -> Result<String> {
         row_signature(&self.batch, self.row_index)
     }
+
+    /// Classify this exact persisted row without opening an external target.
+    /// Branch-merge planning uses it to build one operation-wide preflight
+    /// before the bounded spill writer reads any selected payload.
+    fn include_blob_selection(
+        &self,
+        selection: &mut crate::table_store::PersistedBlobSelection,
+    ) -> Result<()> {
+        selection.include_batch(&self.batch.slice(self.row_index, 1))
+    }
 }
 
 struct OrderedTableCursor {
@@ -484,6 +494,7 @@ impl OrderedTableCursor {
 
 struct StagedTableWriter {
     schema: SchemaRef,
+    materialize_blobs: bool,
     dataset_uri: String,
     dir: TempDir,
     dataset: Option<Dataset>,
@@ -492,14 +503,17 @@ struct StagedTableWriter {
     row_count: u64,
     chunk_rows: Vec<usize>,
     batches: Vec<RecordBatch>,
+    external_payloads: crate::table_store::ExternalBlobPayloadCache,
 }
 
 impl StagedTableWriter {
     fn new(table_key: &str, schema: SchemaRef) -> Result<Self> {
         let dir = merge_stage_tempdir(table_key)?;
         let dataset_uri = dir.path().join("table.lance").to_string_lossy().to_string();
+        let materialize_blobs = schema_has_blob(&schema)?;
         Ok(Self {
             schema,
+            materialize_blobs,
             dataset_uri,
             dir,
             dataset: None,
@@ -508,11 +522,54 @@ impl StagedTableWriter {
             row_count: 0,
             chunk_rows: Vec::new(),
             batches: Vec::new(),
+            external_payloads: crate::table_store::ExternalBlobPayloadCache::new(),
         })
     }
 
-    async fn push_row(&mut self, row: &CursorRow) -> Result<()> {
-        let batch = self.row_batch(row).await?;
+    async fn push_row(
+        &mut self,
+        row: &CursorRow,
+        materializer: &crate::table_store::TableStore,
+        external_preflight: &crate::table_store::ExternalBlobPreflight,
+    ) -> Result<()> {
+        // `RecordBatch::slice` would retain the complete scanner buffers.
+        // Copy exactly one row before sizing or buffering it.
+        let indices = UInt64Array::from(vec![row.row_index as u64]);
+        let input = arrow_select::take::take_record_batch(&row.batch, &indices)
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let predicted_row_bytes = if self.materialize_blobs {
+            materializer.predicted_materialized_blob_batch_bytes(
+                &row.dataset,
+                &input,
+                external_preflight,
+                KEYED_WRITE_MAX_BYTES,
+            )?
+        } else {
+            u64::try_from(input.get_array_memory_size()).map_err(|_| {
+                OmniError::manifest_internal("branch merge row memory size exceeds u64")
+            })?
+        };
+        if predicted_row_bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                "branch-merge fenced row bytes",
+                KEYED_WRITE_MAX_BYTES,
+                predicted_row_bytes,
+            ));
+        }
+        let predicted_overflow = self
+            .buffered_bytes
+            .checked_add(predicted_row_bytes)
+            .is_none_or(|bytes| bytes > KEYED_WRITE_MAX_BYTES);
+        if self.buffered_rows > 0
+            && (self.buffered_rows >= KEYED_WRITE_MAX_ROWS || predicted_overflow)
+        {
+            // Flush before payload I/O, not after. Otherwise two individually
+            // valid rows can transiently retain more than the chunk ceiling.
+            self.flush().await?;
+        }
+        let batch = self
+            .row_batch(row, input, materializer, external_preflight)
+            .await?;
         let row_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
             OmniError::manifest_internal("branch merge row memory size exceeds u64")
         })?;
@@ -550,26 +607,23 @@ impl StagedTableWriter {
         Ok(())
     }
 
-    async fn row_batch(&self, row: &CursorRow) -> Result<RecordBatch> {
-        // `RecordBatch::slice` retains the complete scanner buffers. Counting
-        // that slice would charge one logical row for the whole input batch,
-        // and buffering many slices would retain those backing buffers. Take
-        // copies exactly one row so the byte ceiling measures owned payload.
-        let indices = UInt64Array::from(vec![row.row_index as u64]);
-        let batch = arrow_select::take::take_record_batch(&row.batch, &indices)
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
-        let has_blob_columns = row
-            .dataset
-            .schema()
-            .fields_pre_order()
-            .any(|field| field.is_blob());
-        if has_blob_columns {
-            return crate::table_store::TableStore::materialize_blob_batch_bounded(
-                &row.dataset,
-                batch,
-                KEYED_WRITE_MAX_BYTES,
-            )
-            .await;
+    async fn row_batch(
+        &mut self,
+        row: &CursorRow,
+        batch: RecordBatch,
+        materializer: &crate::table_store::TableStore,
+        external_preflight: &crate::table_store::ExternalBlobPreflight,
+    ) -> Result<RecordBatch> {
+        if self.materialize_blobs {
+            return materializer
+                .materialize_blob_batch_bounded_with_preflight_cache(
+                    &row.dataset,
+                    batch,
+                    KEYED_WRITE_MAX_BYTES,
+                    external_preflight,
+                    &mut self.external_payloads,
+                )
+                .await;
         }
         let columns = self
             .schema
@@ -636,6 +690,7 @@ impl StagedTableWriter {
         )
         .await?;
         self.dataset = Some(ds);
+        self.external_payloads.clear();
         Ok(())
     }
 }
@@ -674,9 +729,11 @@ fn sanitize_table_key(table_key: &str) -> String {
 /// Missing/cleaned transaction files and every unfamiliar operation are a
 /// normal miss: the caller falls back to the general ordered row diff.  Once a
 /// proof is returned, however, later scan/count mismatches fail closed rather
-/// than silently changing routes after recovery planning.
-async fn try_proven_pure_insert_adopt(
-    db: &Omnigraph,
+/// than silently changing routes after recovery planning. Chunk planning is a
+/// separate pass: Blob tables must first add only this proven interval's
+/// descriptors to the operation-wide admission plan, then materialize rows
+/// with that shared preflight rather than opening external sources here.
+async fn try_proven_pure_insert_history(
     table_key: &str,
     base_snapshot: &Snapshot,
     source_snapshot: &Snapshot,
@@ -834,19 +891,6 @@ async fn try_proven_pure_insert_adopt(
         history_start.elapsed(),
     );
 
-    let Some(chunk_rows) = plan_proven_pure_insert_chunks(
-        db,
-        table_key,
-        &source,
-        base_entry.table_version,
-        source_entry.table_version,
-        inserted_rows,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-
     Ok(Some(ProvenPureInsertAdopt {
         source,
         source_identity: source_entry.identity,
@@ -857,8 +901,46 @@ async fn try_proven_pure_insert_adopt(
         base_version: base_entry.table_version,
         source_version: source_entry.table_version,
         inserted_rows,
-        chunk_rows,
+        chunk_rows: Vec::new(),
     }))
+}
+
+async fn finalize_proven_pure_insert_adopt(
+    db: &Omnigraph,
+    table_key: &str,
+    mut proven: ProvenPureInsertAdopt,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
+) -> Result<Option<ProvenPureInsertAdopt>> {
+    let Some(chunk_rows) = plan_proven_pure_insert_chunks(
+        db,
+        table_key,
+        &proven.source,
+        proven.base_version,
+        proven.source_version,
+        proven.inserted_rows,
+        external_preflight,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    proven.chunk_rows = chunk_rows;
+    Ok(Some(proven))
+}
+
+async fn try_proven_pure_insert_adopt(
+    db: &Omnigraph,
+    table_key: &str,
+    base_snapshot: &Snapshot,
+    source_snapshot: &Snapshot,
+) -> Result<Option<ProvenPureInsertAdopt>> {
+    let Some(proven) =
+        try_proven_pure_insert_history(table_key, base_snapshot, source_snapshot).await?
+    else {
+        return Ok(None);
+    };
+    let empty_external_preflight = crate::table_store::ExternalBlobPreflight::default();
+    finalize_proven_pure_insert_adopt(db, table_key, proven, &empty_external_preflight).await
 }
 
 #[cfg(test)]
@@ -1010,12 +1092,19 @@ async fn plan_proven_pure_insert_chunks(
     begin_version: u64,
     end_version: u64,
     expected_rows: u64,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
 ) -> Result<Option<Vec<usize>>> {
     let scan_start = std::time::Instant::now();
     let source = SnapshotHandle::new(source.clone());
     let mut stream = db
         .storage()
-        .scan_proven_insert_delta_bounded(&source, table_key, begin_version, end_version)
+        .scan_proven_insert_delta_bounded(
+            &source,
+            table_key,
+            begin_version,
+            end_version,
+            external_preflight,
+        )
         .await?;
     let mut chunk_rows = Vec::new();
     let mut observed_rows = 0_u64;
@@ -1152,12 +1241,21 @@ async fn revalidate_proven_pure_insert_target_incarnation(
 /// fragment graft adopts the source's fragments by reference, so there is no
 /// row-level delta to compute.
 async fn compute_adopt_delta(
+    target_db: &Omnigraph,
     table_key: &str,
     catalog: &Catalog,
     base_snapshot: &Snapshot,
     source_snapshot: &Snapshot,
+    materialize_blobs: bool,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
 ) -> Result<Option<AdoptDelta>> {
-    let schema = schema_for_table_key(catalog, table_key)?;
+    let full_schema = schema_for_table_key(catalog, table_key)?;
+    let schema = if materialize_blobs {
+        full_schema
+    } else {
+        validation_schema(catalog, table_key, &full_schema)?
+    };
+    let materializer = target_db.blob_materializer();
     let mut append_writer =
         StagedTableWriter::new(&format!("{}_adopt_append", table_key), schema.clone())?;
     let mut upsert_writer = StagedTableWriter::new(&format!("{}_adopt_upsert", table_key), schema)?;
@@ -1198,7 +1296,9 @@ async fn compute_adopt_delta(
             (None, Some(src)) => {
                 // New on source → strict fenced insert. No signature
                 // needed — a new id is absent from base by construction.
-                append_writer.push_row(src).await?;
+                append_writer
+                    .push_row(src, &materializer, external_preflight)
+                    .await?;
                 needs_update = true;
             }
             (Some(base), Some(src)) => {
@@ -1207,7 +1307,9 @@ async fn compute_adopt_delta(
                 // New/deleted rows above skip the embedding stringify entirely.
                 if src.compute_signature()? != base.compute_signature()? {
                     // Changed on source → upsert.
-                    upsert_writer.push_row(src).await?;
+                    upsert_writer
+                        .push_row(src, &materializer, external_preflight)
+                        .await?;
                     needs_update = true;
                 }
                 // else unchanged — already on the target's base lineage; drop.
@@ -1238,6 +1340,57 @@ async fn compute_adopt_delta(
     }))
 }
 
+/// First pass for a Blob-bearing adopt. It selects exactly the rows the
+/// bounded delta writer will copy, collecting only their external descriptors.
+/// The second pass can then share one normalized HEAD proof across every
+/// spill chunk without retaining an unbounded set of source rows in memory.
+async fn collect_adopt_blob_selection(
+    table_key: &str,
+    base_snapshot: &Snapshot,
+    source_snapshot: &Snapshot,
+    blob_selection: &mut crate::table_store::PersistedBlobSelection,
+) -> Result<()> {
+    let mut base = OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key).await?;
+    let mut source = OrderedTableCursor::from_snapshot_lazy(source_snapshot, table_key).await?;
+
+    loop {
+        let base_row = base.peek_cloned().await?;
+        let source_row = source.peek_cloned().await?;
+        let next_id = [base_row.as_ref(), source_row.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|row| row.id.clone())
+            .min();
+        let Some(next_id) = next_id else { break };
+
+        let base_row = if base_row.as_ref().map(|row| row.id.as_str()) == Some(next_id.as_str()) {
+            base.pop().await?
+        } else {
+            None
+        };
+        let source_row = if source_row.as_ref().map(|row| row.id.as_str()) == Some(next_id.as_str())
+        {
+            source.pop().await?
+        } else {
+            None
+        };
+
+        match (&base_row, &source_row) {
+            (Some(_), None) => {}
+            (None, Some(source)) => {
+                source.include_blob_selection(blob_selection)?;
+            }
+            (Some(base), Some(source)) => {
+                if source.compute_signature()? != base.compute_signature()? {
+                    source.include_blob_selection(blob_selection)?;
+                }
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
 fn min_cursor_id(
     base_row: &Option<CursorRow>,
     source_row: &Option<CursorRow>,
@@ -1251,21 +1404,24 @@ fn min_cursor_id(
 }
 
 async fn stage_streaming_table_merge(
+    target_db: &Omnigraph,
     table_key: &str,
     catalog: &Catalog,
     base_snapshot: &Snapshot,
     source_snapshot: &Snapshot,
     target_snapshot: &Snapshot,
     conflicts: &mut Vec<MergeConflict>,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
 ) -> Result<Option<StagedMergeResult>> {
     let schema = schema_for_table_key(catalog, table_key)?;
+    let prior_conflict_count = conflicts.len();
+    let materializer = target_db.blob_materializer();
     let mut delta_writer = StagedTableWriter::new(&format!("{}_delta", table_key), schema)?;
     let mut deleted_ids = DeleteIdChunks::default();
     let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
     let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
     let mut target = OrderedTableCursor::from_snapshot(target_snapshot, table_key).await?;
 
-    let prior_conflict_count = conflicts.len();
     let mut needs_update = false;
 
     loop {
@@ -1330,7 +1486,9 @@ async fn stage_streaming_table_merge(
             // table is no longer staged — validation works off this delta plus
             // the committed target via index lookups, not a full re-scan.
             if selection.signature.as_str() != target_sig.unwrap_or("") {
-                delta_writer.push_row(selection).await?;
+                delta_writer
+                    .push_row(selection, &materializer, external_preflight)
+                    .await?;
                 needs_update = true;
             }
         }
@@ -1355,6 +1513,78 @@ async fn stage_streaming_table_merge(
     }))
 }
 
+/// First pass for a Blob-bearing three-way merge. It repeats the immutable
+/// row decision without spilling data, collecting descriptors only for rows
+/// that differ from the target and will be copied into the merge delta.
+async fn collect_three_way_blob_selection(
+    table_key: &str,
+    base_snapshot: &Snapshot,
+    source_snapshot: &Snapshot,
+    target_snapshot: &Snapshot,
+    conflicts: &mut Vec<MergeConflict>,
+    blob_selection: &mut crate::table_store::PersistedBlobSelection,
+) -> Result<()> {
+    let prior_conflict_count = conflicts.len();
+    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
+    let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
+    let mut target = OrderedTableCursor::from_snapshot(target_snapshot, table_key).await?;
+
+    loop {
+        let base_row = base.peek_cloned().await?;
+        let source_row = source.peek_cloned().await?;
+        let target_row = target.peek_cloned().await?;
+        let Some(next_id) = min_cursor_id(&base_row, &source_row, &target_row) else {
+            break;
+        };
+        let base_row = if base_row.as_ref().map(|row| row.id.as_str()) == Some(next_id.as_str()) {
+            base.pop().await?
+        } else {
+            None
+        };
+        let source_row = if source_row.as_ref().map(|row| row.id.as_str()) == Some(next_id.as_str())
+        {
+            source.pop().await?
+        } else {
+            None
+        };
+        let target_row = if target_row.as_ref().map(|row| row.id.as_str()) == Some(next_id.as_str())
+        {
+            target.pop().await?
+        } else {
+            None
+        };
+
+        let base_sig = base_row.as_ref().map(|row| row.signature.as_str());
+        let source_sig = source_row.as_ref().map(|row| row.signature.as_str());
+        let target_sig = target_row.as_ref().map(|row| row.signature.as_str());
+        let source_changed = source_sig != base_sig;
+        let target_changed = target_sig != base_sig;
+        let selection = if !source_changed {
+            target_row.as_ref()
+        } else if !target_changed {
+            source_row.as_ref()
+        } else if source_sig == target_sig {
+            target_row.as_ref()
+        } else {
+            conflicts.push(classify_merge_conflict(
+                table_key, &next_id, base_sig, source_sig, target_sig,
+            ));
+            None
+        };
+
+        if conflicts.len() > prior_conflict_count {
+            continue;
+        }
+        if let Some(selection) = selection
+            && selection.signature.as_str() != target_sig.unwrap_or("")
+        {
+            selection.include_blob_selection(blob_selection)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<SchemaRef> {
     if let Some(name) = table_key.strip_prefix("node:") {
         return catalog
@@ -1374,6 +1604,43 @@ fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<SchemaRef>
         "invalid table key '{}'",
         table_key
     )))
+}
+
+fn schema_has_blob(schema: &SchemaRef) -> Result<bool> {
+    for field in schema.fields() {
+        if matches!(field.data_type(), arrow_schema::DataType::LargeBinary) {
+            // The compiler deliberately uses LargeBinary as its dependency-free
+            // logical Blob placeholder.
+            return Ok(true);
+        }
+        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if lance_field.is_blob() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Pointer-only adoption needs scalar rows solely for graph constraint
+/// validation. It must not dereference or rewrite heavy values because the
+/// publication preserves the source table pointer exactly.
+fn validation_schema(
+    catalog: &Catalog,
+    table_key: &str,
+    full_schema: &SchemaRef,
+) -> Result<SchemaRef> {
+    let fields = validation_projection(catalog, table_key)
+        .into_iter()
+        .map(|name| {
+            full_schema.field_with_name(&name).cloned().map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "branch merge validation schema for '{table_key}' is missing '{name}': {error}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(arrow_schema::Schema::new(fields)))
 }
 
 fn same_manifest_state(
@@ -1893,6 +2160,23 @@ fn row_id_at(batch: &RecordBatch, row: usize) -> Result<String> {
     Ok(ids.value(row).to_string())
 }
 
+fn adopt_advances_head(
+    target_active: Option<&str>,
+    source_entry: &crate::db::SubTableEntry,
+    target_entry: Option<&crate::db::SubTableEntry>,
+) -> bool {
+    match (target_active, source_entry.table_branch.as_deref()) {
+        // Source on a branch, target on main — delta applied onto main's lineage.
+        (None, Some(_)) => true,
+        // Both on branches, target owns this table — delta applied onto it.
+        (Some(target_branch), Some(_)) => {
+            target_entry.and_then(|entry| entry.table_branch.as_deref()) == Some(target_branch)
+        }
+        // Source on main (pointer switch) or target doesn't own (fork): no advance.
+        _ => false,
+    }
+}
+
 /// Classify a table whose target state equals base (the adopt / fast-forward
 /// case). A proven insertion-only descendant becomes
 /// [`CandidateTableState::AdoptPureInserts`]; every other non-empty delta that
@@ -1912,6 +2196,8 @@ async fn classify_adopt(
     source_snapshot: &Snapshot,
     target_snapshot: &Snapshot,
     table_key: &str,
+    target_active: Option<&str>,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
 ) -> Result<CandidateTableState> {
     let Some(source_entry) = source_snapshot.entry(table_key) else {
         // Source has no such table — nothing to adopt or validate.
@@ -1926,20 +2212,7 @@ async fn classify_adopt(
         Some(source_entry.identity),
         target_entry.map(|entry| entry.identity),
     )?;
-    let target_active = target_db.active_branch().await;
-    let advances_head = match (
-        target_active.as_deref(),
-        source_entry.table_branch.as_deref(),
-    ) {
-        // Source on a branch, target on main — delta applied onto main's lineage.
-        (None, Some(_)) => true,
-        // Both on branches, target owns this table — delta applied onto it.
-        (Some(target_branch), Some(_)) => {
-            target_entry.and_then(|e| e.table_branch.as_deref()) == Some(target_branch)
-        }
-        // Source on main (pointer switch) or target doesn't own (fork): no advance.
-        _ => false,
-    };
+    let advances_head = adopt_advances_head(target_active, source_entry, target_entry);
     // A complete Lance transaction interval can prove the common all-new-row
     // case without re-scanning and sorting base + source.  The proof is accepted
     // only for a HEAD-advancing publish; pointer/fork adoption still uses the
@@ -1952,6 +2225,31 @@ async fn classify_adopt(
         return Ok(CandidateTableState::AdoptPureInserts(proven));
     }
 
+    classify_general_adopt(
+        target_db,
+        catalog,
+        base_snapshot,
+        source_snapshot,
+        table_key,
+        advances_head,
+        external_preflight,
+    )
+    .await
+}
+
+/// Classify the general adopt route after the pure-insert proof was either
+/// unavailable or exceeded its recovery-plan ceiling. The caller has already
+/// established table identity and whether publication advances the target
+/// data HEAD.
+async fn classify_general_adopt(
+    target_db: &Omnigraph,
+    catalog: &Catalog,
+    base_snapshot: &Snapshot,
+    source_snapshot: &Snapshot,
+    table_key: &str,
+    advances_head: bool,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
+) -> Result<CandidateTableState> {
     // Compute the source-vs-target delta for the general route — it is the validation
     // input the evaluator needs, independent of how the table is published.
     // (`classify_adopt` is only reached when base == target, so the
@@ -1960,8 +2258,16 @@ async fn classify_adopt(
     // publish ignores it and only validates it (`AdoptSourceState`), so a
     // pointer-adopt whose source diverged is still checked for
     // RI/uniqueness/cardinality against the merged state.
-    let validation_delta =
-        compute_adopt_delta(table_key, catalog, base_snapshot, source_snapshot).await?;
+    let validation_delta = compute_adopt_delta(
+        target_db,
+        table_key,
+        catalog,
+        base_snapshot,
+        source_snapshot,
+        advances_head,
+        external_preflight,
+    )
+    .await?;
     match (advances_head, validation_delta) {
         (true, Some(delta)) => Ok(CandidateTableState::AdoptWithDelta(delta)),
         (_, validation_delta) => Ok(CandidateTableState::AdoptSourceState { validation_delta }),
@@ -2694,6 +3000,7 @@ async fn publish_proven_pure_insert_adopt(
     table_key: &str,
     identity: crate::db::manifest::TableIdentity,
     proven: &ProvenPureInsertAdopt,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
     prepared_target: PreparedExistingMergeTarget,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
 ) -> Result<crate::db::SubTableUpdate> {
@@ -2707,6 +3014,7 @@ async fn publish_proven_pure_insert_adopt(
             table_key,
             proven.base_version,
             proven.source_version,
+            external_preflight,
         )
         .await?;
     let schema: SchemaRef = Arc::new(proven.source.schema().into());
@@ -3166,9 +3474,149 @@ impl Omnigraph {
         ordered_table_keys.sort();
 
         let mut conflicts = Vec::new();
+        let target_active = self.active_branch().await;
         let mut candidates: HashMap<String, CandidateTableState> = HashMap::new();
+        let empty_external_preflight = crate::table_store::ExternalBlobPreflight::default();
+        let mut blob_table_keys = HashSet::new();
+        let mut blob_selection = crate::table_store::PersistedBlobSelection::default();
+        let mut blob_adopt_proof_attempted = HashSet::new();
+        let mut blob_pure_insert_histories: HashMap<String, ProvenPureInsertAdopt> = HashMap::new();
+        let materializer = self.blob_materializer();
+
+        // Classify scalar tables once before any external source I/O. Blob
+        // tables get a descriptor-only first pass so every row-writing managed
+        // value and exact external range shares one operation budget. Pointer
+        // and fork adoption write no row, so their descriptors require neither
+        // policy approval nor source I/O.
+        for table_key in &ordered_table_keys {
+            let base_entry = base_snapshot.entry(table_key);
+            let source_entry = source_snapshot.entry(table_key);
+            let target_entry = target_snapshot.entry(table_key);
+            if same_manifest_state(source_entry, target_entry)
+                || same_manifest_state(base_entry, source_entry)
+            {
+                continue;
+            }
+            ensure_merge_identity_compatible(
+                table_key,
+                base_entry.map(|entry| entry.identity),
+                source_entry.map(|entry| entry.identity),
+                target_entry.map(|entry| entry.identity),
+            )?;
+            let has_blob = schema_has_blob(&schema_for_table_key(catalog, table_key)?)?;
+            if !has_blob {
+                if same_manifest_state(base_entry, target_entry) {
+                    let candidate = classify_adopt(
+                        self,
+                        catalog,
+                        base_snapshot,
+                        source_snapshot,
+                        target_snapshot,
+                        table_key,
+                        target_active.as_deref(),
+                        &empty_external_preflight,
+                    )
+                    .await?;
+                    candidates.insert(table_key.clone(), candidate);
+                } else if let Some(staged) = stage_streaming_table_merge(
+                    self,
+                    table_key,
+                    catalog,
+                    base_snapshot,
+                    source_snapshot,
+                    target_snapshot,
+                    &mut conflicts,
+                    &empty_external_preflight,
+                )
+                .await?
+                {
+                    candidates.insert(
+                        table_key.clone(),
+                        CandidateTableState::RewriteMerged(staged),
+                    );
+                }
+                continue;
+            }
+            blob_table_keys.insert(table_key.clone());
+            if same_manifest_state(base_entry, target_entry) {
+                let Some(source_entry) = source_entry else {
+                    continue;
+                };
+                if !adopt_advances_head(target_active.as_deref(), source_entry, target_entry) {
+                    continue;
+                }
+                blob_adopt_proof_attempted.insert(table_key.clone());
+                if let Some(proven) =
+                    try_proven_pure_insert_history(table_key, base_snapshot, source_snapshot)
+                        .await?
+                {
+                    let external_cells_before = blob_selection.external_cell_count();
+                    materializer
+                        .include_proven_insert_blob_selection(
+                            &proven.source,
+                            table_key,
+                            proven.base_version,
+                            proven.source_version,
+                            proven.inserted_rows,
+                            &mut blob_selection,
+                        )
+                        .await?;
+                    if blob_selection.external_cell_count() == external_cells_before {
+                        blob_pure_insert_histories.insert(table_key.clone(), proven);
+                    } else {
+                        // Supported insertion-capable writers materialize URI
+                        // inputs, so a retained external descriptor here is a
+                        // forged/legacy interval. Keep it on the general adopt
+                        // writer: its bounded chunk cache reads each normalized
+                        // range once. The certified planner intentionally scans
+                        // its source twice (pre-arm chunk sizing + post-arm
+                        // publish), which would duplicate external object GETs.
+                        tracing::debug!(
+                            table_key,
+                            "pure-insert history retained external Blob descriptors; using the general cached adopt path"
+                        );
+                    }
+                } else {
+                    collect_adopt_blob_selection(
+                        table_key,
+                        base_snapshot,
+                        source_snapshot,
+                        &mut blob_selection,
+                    )
+                    .await?;
+                }
+            } else {
+                collect_three_way_blob_selection(
+                    table_key,
+                    base_snapshot,
+                    source_snapshot,
+                    target_snapshot,
+                    &mut conflicts,
+                    &mut blob_selection,
+                )
+                .await?;
+            }
+        }
+        if !conflicts.is_empty() {
+            return Err(OmniError::MergeConflicts(conflicts));
+        }
+
+        let external_preflight = materializer
+            .preflight_persisted_blob_selection(&blob_selection)
+            .await?;
+        let carried_blob_bytes = blob_selection.materialized_payload_bytes(&external_preflight)?;
+        if carried_blob_bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                "materialized blob payload bytes",
+                KEYED_WRITE_MAX_BYTES,
+                carried_blob_bytes,
+            ));
+        }
 
         for table_key in &ordered_table_keys {
+            if !blob_table_keys.contains(table_key) {
+                continue;
+            }
             let base_entry = base_snapshot.entry(table_key);
             let source_entry = source_snapshot.entry(table_key);
             let target_entry = target_snapshot.entry(table_key);
@@ -3190,26 +3638,77 @@ impl Omnigraph {
                 target_entry.map(|entry| entry.identity),
             )?;
             if same_manifest_state(base_entry, target_entry) {
-                let candidate = classify_adopt(
-                    self,
-                    catalog,
-                    base_snapshot,
-                    source_snapshot,
-                    target_snapshot,
-                    table_key,
-                )
-                .await?;
+                let candidate = if blob_adopt_proof_attempted.contains(table_key) {
+                    let advances_head = source_entry.is_some_and(|source_entry| {
+                        adopt_advances_head(target_active.as_deref(), source_entry, target_entry)
+                    });
+                    if !advances_head {
+                        return Err(OmniError::manifest_internal(format!(
+                            "branch merge Blob proof for '{table_key}' lost its HEAD-advancing classification"
+                        )));
+                    }
+                    match blob_pure_insert_histories.remove(table_key) {
+                        Some(proven) => match finalize_proven_pure_insert_adopt(
+                            self,
+                            table_key,
+                            proven,
+                            &external_preflight,
+                        )
+                        .await?
+                        {
+                            Some(proven) => CandidateTableState::AdoptPureInserts(proven),
+                            None => {
+                                classify_general_adopt(
+                                    self,
+                                    catalog,
+                                    base_snapshot,
+                                    source_snapshot,
+                                    table_key,
+                                    true,
+                                    &external_preflight,
+                                )
+                                .await?
+                            }
+                        },
+                        None => {
+                            classify_general_adopt(
+                                self,
+                                catalog,
+                                base_snapshot,
+                                source_snapshot,
+                                table_key,
+                                true,
+                                &external_preflight,
+                            )
+                            .await?
+                        }
+                    }
+                } else {
+                    classify_adopt(
+                        self,
+                        catalog,
+                        base_snapshot,
+                        source_snapshot,
+                        target_snapshot,
+                        table_key,
+                        target_active.as_deref(),
+                        &external_preflight,
+                    )
+                    .await?
+                };
                 candidates.insert(table_key.clone(), candidate);
                 continue;
             }
 
             if let Some(staged) = stage_streaming_table_merge(
+                self,
                 table_key,
                 catalog,
                 base_snapshot,
                 source_snapshot,
                 target_snapshot,
                 &mut conflicts,
+                &external_preflight,
             )
             .await?
             {
@@ -3701,6 +4200,7 @@ impl Omnigraph {
                             table_key,
                             identity,
                             proven,
+                            &external_preflight,
                             prepared_target,
                             planned,
                         )

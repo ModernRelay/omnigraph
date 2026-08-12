@@ -89,18 +89,22 @@ pub(crate) async fn sweep_graph_create_sidecar(
                         applies_to: None,
                         embedding_provider: None,
                         embedding_profile: None,
+                        external_blob_policy: None,
                     },
                 );
                 let query_digests = state_query_digests_for_graph(state, &sidecar.graph_id);
                 let embedding_provider = state_graph_embedding_provider(state, &sidecar.graph_id);
                 let embedding_provider_digest =
                     state_embedding_provider_digest(state, embedding_provider.as_deref());
-                let composite = graph_digest(
+                let external_blob_policy =
+                    state_graph_external_blob_policy(state, &sidecar.graph_id);
+                let composite = graph_digest_with_external_blob_policy(
                     &sidecar.graph_id,
                     Some(&live_digest),
                     Some(&query_digests),
                     embedding_provider.as_deref(),
                     embedding_provider_digest.as_ref(),
+                    &external_blob_policy,
                 );
                 state.applied_revision.resources.insert(
                     graph_address.clone(),
@@ -109,6 +113,7 @@ pub(crate) async fn sweep_graph_create_sidecar(
                         applies_to: None,
                         embedding_provider,
                         embedding_profile: None,
+                        external_blob_policy: persisted_external_blob_policy(&external_blob_policy),
                     },
                 );
                 set_resource_status_applied(state, &graph_address);
@@ -233,18 +238,21 @@ pub(crate) async fn sweep_schema_apply_sidecar(
                 applies_to: None,
                 embedding_provider: None,
                 embedding_profile: None,
+                external_blob_policy: None,
             },
         );
         let query_digests = state_query_digests_for_graph(state, &sidecar.graph_id);
         let embedding_provider = state_graph_embedding_provider(state, &sidecar.graph_id);
         let embedding_provider_digest =
             state_embedding_provider_digest(state, embedding_provider.as_deref());
-        let composite = graph_digest(
+        let external_blob_policy = state_graph_external_blob_policy(state, &sidecar.graph_id);
+        let composite = graph_digest_with_external_blob_policy(
             &sidecar.graph_id,
             Some(&live_digest),
             Some(&query_digests),
             embedding_provider.as_deref(),
             embedding_provider_digest.as_ref(),
+            &external_blob_policy,
         );
         state.applied_revision.resources.insert(
             graph_address.clone(),
@@ -253,6 +261,7 @@ pub(crate) async fn sweep_schema_apply_sidecar(
                 applies_to: None,
                 embedding_provider,
                 embedding_profile: None,
+                external_blob_policy: persisted_external_blob_policy(&external_blob_policy),
             },
         );
         set_resource_status_applied(state, &graph_address);

@@ -24,7 +24,7 @@ Param types reuse all schema scalars; trailing `?` makes a param optional. The c
 - **Binding**: `$x: NodeType { prop: <literal | $param | now()>, … }`
 - **Traversal**: `$src EDGE_NAME { min, max? } $dst` — variable-length reachability via hop bounds; default 1..1 if bounds omitted. Unbound traversal reports any destination at most once per source instead of enumerating every possible walk. Once a node has been visited, it is not added to the search frontier again. A stored self-loop still counts as one edge and can produce its node at the current hop when that hop is within bounds, but the node is not searched again; other returns to visited nodes are pruned.
 - **Undirected traversal**: `$src <EDGE_NAME> $dst` — matches the edge in *either* direction with set semantics (a pair connected both ways, or a self-loop, appears once). Only valid on same-endpoint-type edges (e.g. `Related: Issue -> Issue`); an asymmetric edge is rejected at typecheck (`T22`) since it is well-typed in at most one orientation — use the directional form there. Composes with hop bounds (`$a <knows>{1,3} $b`) and `not { }` ("no edge in either direction").
-- **Edge binding**: `$src $w:EDGE_NAME $dst` — an optional `$var:` prefix on the edge word binds the matched edge *row* so its declared properties become addressable anywhere a node field is: filters (`$w.confidence = "asserted"`), projections (`return { $w.role }`), ordering. Composes with the undirected form (`$a $w:<related> $b`) and inside `not { }` (usable within the block, never in `return`). Semantics change with a binding present: the traversal emits **one row per matching edge row**, so parallel edges between the same endpoints appear individually (unbound traversals keep their set-of-pairs semantics). Rejected with `T23` on multi-hop bounds (a `{min,max}` path matches many edges — no single row to bind), on a name already bound, and on bare use (`return { $w }` — project a property instead).
+- **Edge binding**: `$src $w:EDGE_NAME $dst` — an optional `$var:` prefix on the edge word binds the matched edge *row* so its non-Blob declared properties become addressable anywhere a node field is: filters (`$w.confidence = "asserted"`), projections (`return { $w.role }`), ordering. Composes with the undirected form (`$a $w:<related> $b`) and inside `not { }` (usable within the block, never in `return`). Semantics change with a binding present: the traversal emits **one row per matching edge row**, so parallel edges between the same endpoints appear individually (unbound traversals keep their set-of-pairs semantics). Rejected with `T23` on multi-hop bounds (a `{min,max}` path matches many edges — no single row to bind), on a name already bound, and on bare use (`return { $w }` — project a property instead).
 - **Filter**: `<expr> <op> <expr>` with operators `>=`, `<=`, `!=`, `>`, `<`, `=`, plus the string predicates `contains` and `starts_with`.
 - **Negation**: `not { clause+ }` — desugars to anti-join over the inner pipeline.
 
@@ -46,6 +46,13 @@ Param types reuse all schema scalars; trailing `?` makes a param optional. The c
 - Aggregates: `count`, `sum`, `avg`, `min`, `max`
 - [Search functions](../search/index.md) (so you can return a score column)
 - `AliasRef` — re-use a previous projection alias
+
+Blob-valued properties and parameters are not `.gq` read values: they cannot be
+projected, ordered, or passed to aggregates. Those read-value uses return `T24`;
+Blob match/filter and mutation-predicate uses are also rejected by their
+context-specific diagnostics. The current embedded `Omnigraph::read_blob`
+accessor covers current node values only; edge and historical Blob reads await
+the graph-level Blob API. Blob parameters remain valid for mutation assignment.
 
 ## ORDER & LIMIT
 

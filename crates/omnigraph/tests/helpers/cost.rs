@@ -269,6 +269,9 @@ pub struct StagedCounts {
     pub stage_known_present_update: u64,
     pub stage_vector_index: u64,
     pub scan_staged_combined: u64,
+    /// Ordered table cursors opened by branch-merge row selection. A scalar
+    /// three-way merge needs exactly base/source/target once each.
+    pub ordered_cursor_scan: u64,
 }
 
 // ── Path-classifying data-table read counter ──
@@ -587,6 +590,7 @@ pub async fn measure_with_staged<F: Future>(op: F) -> (F::Output, IoCounts, Stag
         stage_known_present_update: merge.stage_known_present_update_calls(),
         stage_vector_index: merge.stage_vector_index_calls(),
         scan_staged_combined: merge.scan_staged_combined_calls(),
+        ordered_cursor_scan: merge.ordered_cursor_scan_calls(),
     };
     (out, handles.counts(), staged)
 }

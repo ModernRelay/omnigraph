@@ -1,9 +1,10 @@
 mod helpers;
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 
-use arrow_array::{Array, Int32Array, UInt64Array};
+use arrow_array::{Array, Int32Array, StringArray, StructArray, UInt64Array};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance_index::is_system_index;
@@ -11,7 +12,9 @@ use lance_index::is_system_index;
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::error::{MergeConflictKind, OmniError};
+use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
 use helpers::*;
 
@@ -90,6 +93,19 @@ node Document {
 }
 "#;
 
+const MULTI_TABLE_EXTERNAL_BLOB_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+
+node Asset {
+    name: String @key
+    payload: Blob?
+}
+"#;
+
 const BLOB_MUTATIONS: &str = r#"
 query insert_doc($title: String, $content: Blob, $note: String) {
     insert Document { title: $title, content: $content, note: $note }
@@ -105,6 +121,11 @@ node Document {
     title: String @key
     first: Blob?
     second: Blob?
+}
+
+node Asset {
+    name: String @key
+    payload: Blob?
 }
 "#;
 
@@ -406,7 +427,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     load_jsonl(
         &main,
         concat!(
-            "{\"type\":\"Document\",\"data\":{\"title\":\"seed\",\"content\":\"base64:U2VlZA==\",\"note\":\"original\"}}\n",
+            "{\"type\":\"Document\",\"data\":{\"title\":\"seed\",\"content\":\"base64:\",\"note\":\"original\"}}\n",
             "{\"type\":\"Document\",\"data\":{\"title\":\"main-doc\",\"content\":\"base64:TWFpbg==\",\"note\":\"main\"}}",
         ),
         LoadMode::Overwrite,
@@ -477,7 +498,10 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
 
     let seed = main.read_blob("Document", "seed", "content").await.unwrap();
     let seed_bytes = seed.read().await.unwrap();
-    assert_eq!(&seed_bytes[..], b"Seed");
+    assert!(
+        seed_bytes.is_empty(),
+        "a valid empty Blob must survive branch rewrite and merge"
+    );
 
     let main_doc = main
         .read_blob("Document", "main-doc", "content")
@@ -492,46 +516,325 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let external_dir = tempfile::tempdir().unwrap();
-    let external_path = external_dir.path().join("external.txt");
+    let external_path = external_dir.path().join("external~source.txt");
     fs::write(&external_path, b"External").unwrap();
-    let external_uri = format!("file://{}", external_path.display());
-
-    let main = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
-    load_jsonl(&main, "", LoadMode::Overwrite).await.unwrap();
-    main.branch_create("feature").await.unwrap();
-
-    let feature = Omnigraph::open(uri).await.unwrap();
-    load_jsonl(
-        &main,
-        "{\"type\":\"Document\",\"data\":{\"title\":\"main-doc\",\"content\":\"base64:TWFpbg==\",\"note\":\"main\"}}",
-        LoadMode::Append,
-    )
-    .await
+    let external_uri = url::Url::from_file_path(&external_path)
+        .expect("external blob path is absolute")
+        .to_string();
+    let canonical_external_uri =
+        url::Url::from_file_path(fs::canonicalize(&external_path).unwrap())
+            .expect("canonical external blob path is absolute")
+            .to_string();
+    let base_uri = url::Url::from_directory_path(external_dir.path())
+        .expect("external blob base is absolute")
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
     .unwrap();
+    let encoded_alias = external_uri.replace("~source", "%7Esource");
+    assert_ne!(encoded_alias, external_uri);
 
-    let external_data = serde_json::json!({
+    let setup = Omnigraph::init(uri, MULTI_TABLE_EXTERNAL_BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy.clone())
+        .unwrap();
+    let converged_base = serde_json::json!({
         "type": "Document",
         "data": {
-            "title": "external",
-            "content": external_uri,
-            "note": "branch insert",
+            "title": "converged",
+            "content": external_uri.clone(),
+            "note": "base",
         }
     })
     .to_string();
+    setup
+        .load("main", &converged_base, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    setup.branch_create("feature").await.unwrap();
+
+    let feature = Omnigraph::open(uri)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy.clone())
+        .unwrap();
+    let configured_main = Omnigraph::open(uri)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy.clone())
+        .unwrap();
+    let target_data = format!(
+        "{}\n{}",
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "main-doc",
+                "content": "base64:TWFpbg==",
+                "note": "main",
+            }
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "converged",
+                "content": external_uri.clone(),
+                "note": "same on both",
+            }
+        })
+    );
+    configured_main
+        .load("main", &target_data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let main = Omnigraph::open(uri).await.unwrap();
+
+    let external_data = format!(
+        "{}\n{}\n{}\n{}",
+        serde_json::json!({
+            "type": "Asset",
+            "data": {
+                "name": "external-asset",
+                "payload": external_uri.clone(),
+            }
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "external",
+                "content": encoded_alias.clone(),
+                "note": "branch insert",
+            }
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "external-two",
+                "content": external_uri.clone(),
+                "note": "same-table normalized alias",
+            }
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "converged",
+                "content": external_uri.clone(),
+                "note": "same on both",
+            }
+        })
+    );
     feature
-        .load("feature", &external_data, LoadMode::Append)
+        .load("feature", &external_data, LoadMode::Overwrite)
         .await
         .unwrap();
 
-    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    let source_snapshot = snapshot_branch(&feature, "feature").await.unwrap();
+    let source_dataset = source_snapshot.open("node:Document").await.unwrap();
+    let mut source_scan = source_dataset.scan();
+    source_scan.blob_handling(lance::datatypes::BlobHandling::BlobsDescriptions);
+    let source_batches: Vec<arrow_array::RecordBatch> = source_scan
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let source_descriptors = source_batches[0]
+        .column_by_name("content")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let source_uris = source_descriptors
+        .column_by_name("blob_uri")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        source_uris.value(0),
+        canonical_external_uri,
+        "precondition: source branch must retain the normalized external descriptor"
+    );
+
+    let before = snapshot_main(&main).await.unwrap();
+    let before_manifest = before.version();
+    let entry = before.entry("node:Document").unwrap();
+    let before_table = entry.table_version;
+    let table_uri = format!(
+        "{}/{}",
+        main.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
+    let before_commits = main.list_commits(Some("main")).await.unwrap().len();
+    let before_source_table = snapshot_branch(&main, "feature")
+        .await
+        .unwrap()
+        .entry("node:Document")
+        .unwrap()
+        .table_version;
+
+    let error = main.branch_merge("feature", "main").await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::ExternalBlobPolicy { ref uri, .. } if uri == &canonical_external_uri
+        ),
+        "default-deny merge must return typed ExternalBlobPolicy, got {error:?}"
+    );
+    let after = snapshot_main(&main).await.unwrap();
+    assert_eq!(
+        after.version(),
+        before_manifest,
+        "denied merge moved manifest"
+    );
+    assert_eq!(
+        after.entry("node:Document").unwrap().table_version,
+        before_table,
+        "denied merge moved the target table pointer"
+    );
+    assert_eq!(
+        Dataset::open(&table_uri).await.unwrap().version().version,
+        before_head,
+        "denied merge moved target Lance HEAD"
+    );
+    assert_eq!(
+        main.list_commits(Some("main")).await.unwrap().len(),
+        before_commits,
+        "denied merge moved target lineage"
+    );
+    assert_eq!(
+        snapshot_branch(&main, "feature")
+            .await
+            .unwrap()
+            .entry("node:Document")
+            .unwrap()
+            .table_version,
+        before_source_table,
+        "denied merge moved the source table pointer"
+    );
+    let recovery_dir = dir.path().join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "denied merge must fail before recovery is armed"
+    );
+
+    let main = main.with_external_blob_policy(policy.clone()).unwrap();
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+        .await
+        .unwrap();
     assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(
+        probes.external_blob_probe_inputs(),
+        3,
+        "every selected URI cell across both tables must join the merge-wide external preflight"
+    );
+    assert_eq!(
+        probes.external_blob_probe_calls(),
+        1,
+        "normalized-equivalent URIs across tables must cause one HEAD"
+    );
+    assert_eq!(
+        probes.external_blob_payload_read_calls(),
+        2,
+        "equivalent aliases must share one payload GET in the Document chunk; the separate Asset chunk owns one bounded GET"
+    );
 
     let external = main
         .read_blob("Document", "external", "content")
         .await
         .unwrap();
+    assert_eq!(
+        external.uri(),
+        None,
+        "branch merge must materialize an authorized source descriptor"
+    );
     let external_bytes = external.read().await.unwrap();
     assert_eq!(&external_bytes[..], b"External");
+    let asset = main
+        .read_blob("Asset", "external-asset", "payload")
+        .await
+        .unwrap();
+    assert_eq!(
+        asset.uri(),
+        None,
+        "every row-writing table must materialize its authorized descriptor"
+    );
+    assert_eq!(&asset.read().await.unwrap()[..], b"External");
+    let external_two = main
+        .read_blob("Document", "external-two", "content")
+        .await
+        .unwrap();
+    assert_eq!(external_two.uri(), None);
+    assert_eq!(&external_two.read().await.unwrap()[..], b"External");
+    let converged = main
+        .read_blob("Document", "converged", "content")
+        .await
+        .unwrap();
+    assert_eq!(
+        converged.uri(),
+        Some(canonical_external_uri.as_str()),
+        "the descriptor-only decision walk and row-staging walk must both keep the identical target row out of the delta"
+    );
+
+    // A pointer-only main -> named-branch adoption is not new ingress and does
+    // not write a row. It must preserve the already-stored descriptor without
+    // policy approval or source I/O, even when the caller-owned target has
+    // disappeared.
+    main.branch_create("pointer-target").await.unwrap();
+    let pointer_path = external_dir.path().join("pointer-only.txt");
+    fs::write(&pointer_path, b"Pointer only").unwrap();
+    let pointer_uri = url::Url::from_file_path(&pointer_path)
+        .expect("pointer-only external blob path is absolute")
+        .to_string();
+    let canonical_pointer_uri = url::Url::from_file_path(fs::canonicalize(&pointer_path).unwrap())
+        .expect("canonical pointer-only external blob path is absolute")
+        .to_string();
+    let pointer_data = serde_json::json!({
+        "type": "Document",
+        "data": {
+            "title": "pointer-only",
+            "content": pointer_uri.clone(),
+            "note": "main source",
+        }
+    })
+    .to_string();
+    main.load("main", &pointer_data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let source_entry = snapshot_main(&main)
+        .await
+        .unwrap()
+        .entry("node:Document")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        main.read_blob("Document", "pointer-only", "content")
+            .await
+            .unwrap()
+            .uri(),
+        Some(canonical_pointer_uri.as_str())
+    );
+    fs::remove_file(&pointer_path).unwrap();
+
+    let deny = Omnigraph::open(uri).await.unwrap();
+    let outcome = deny.branch_merge("main", "pointer-target").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
+    let target_entry = snapshot_branch(&deny, "pointer-target")
+        .await
+        .unwrap()
+        .entry("node:Document")
+        .unwrap()
+        .clone();
+    // `table_path` is identity-derived, so an exact path/version/branch match
+    // proves this was pointer adoption rather than a rewritten table effect.
+    assert_eq!(target_entry.table_key, source_entry.table_key);
+    assert_eq!(target_entry.table_path, source_entry.table_path);
+    assert_eq!(target_entry.table_version, source_entry.table_version);
+    assert_eq!(target_entry.table_branch, source_entry.table_branch);
 }
 
 /// Blob descriptors are tiny even when their referenced payload is not. The
@@ -542,9 +845,22 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
 async fn branch_merge_rejects_oversized_blob_payloads_pre_effect() {
     const LIMIT: u64 = 32 * 1024 * 1024;
 
-    for (case, first_bytes, second_bytes, expected_actual) in [
-        ("single", LIMIT + 1, None, LIMIT + 1),
-        ("cumulative", LIMIT / 2 + 1, Some(LIMIT / 2 + 1), LIMIT + 2),
+    for (case, first_bytes, second_bytes, split_across_tables, expected_actual) in [
+        ("single", LIMIT + 1, None, false, LIMIT + 1),
+        (
+            "cumulative",
+            LIMIT / 2 + 1,
+            Some(LIMIT / 2 + 1),
+            false,
+            LIMIT + 2,
+        ),
+        (
+            "cross-table",
+            LIMIT / 2 + 1,
+            Some(LIMIT / 2 + 1),
+            true,
+            LIMIT + 2,
+        ),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let graph_path = dir.path().join("graph");
@@ -559,27 +875,55 @@ async fn branch_merge_rejects_oversized_blob_payloads_pre_effect() {
             serde_json::Value::String(format!("wide-{case}")),
         );
         wide_data.insert("first".to_string(), serde_json::Value::String(first_uri));
-        if let Some(second_bytes) = second_bytes {
+        let second_uri = if let Some(second_bytes) = second_bytes {
             let second_path = dir.path().join("second.blob");
             write_sized_external_blob(&second_path, second_bytes);
-            wide_data.insert(
-                "second".to_string(),
-                serde_json::Value::String(format!("file://{}", second_path.display())),
-            );
-        }
-        let wide_row = serde_json::json!({
+            let uri = format!("file://{}", second_path.display());
+            if !split_across_tables {
+                wide_data.insert("second".to_string(), serde_json::Value::String(uri.clone()));
+            }
+            Some(uri)
+        } else {
+            None
+        };
+        let document_row = serde_json::json!({
             "type": "Document",
             "data": serde_json::Value::Object(wide_data),
         })
         .to_string();
+        let selected_rows = if split_across_tables {
+            format!(
+                "{document_row}\n{}",
+                serde_json::json!({
+                    "type": "Asset",
+                    "data": {
+                        "name": "wide-asset",
+                        "payload": second_uri.expect("cross-table case has second payload"),
+                    }
+                })
+            )
+        } else {
+            document_row
+        };
 
-        let db = Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA).await.unwrap();
+        let base_uri = url::Url::from_directory_path(dir.path())
+            .expect("external blob base is absolute")
+            .to_string();
+        let policy = ExternalBlobPolicy::allow(vec![
+            ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+        ])
+        .unwrap();
+        let db = Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap();
         let base = r#"{"type":"Document","data":{"title":"base"}}"#;
         load_jsonl(&db, base, LoadMode::Overwrite).await.unwrap();
         db.branch_create("feature").await.unwrap();
         db.load(
             "feature",
-            &format!("{base}\n{wide_row}"),
+            &format!("{base}\n{selected_rows}"),
             LoadMode::Overwrite,
         )
         .await
@@ -587,17 +931,27 @@ async fn branch_merge_rejects_oversized_blob_payloads_pre_effect() {
 
         let before = snapshot_main(&db).await.unwrap();
         let before_manifest = before.version();
-        let entry = before.entry("node:Document").unwrap();
-        let before_table = entry.table_version;
-        let table_uri = format!(
-            "{}/{}",
-            db.uri().trim_end_matches('/'),
-            entry.table_path.trim_start_matches('/')
-        );
-        let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
+        let mut before_tables = Vec::new();
+        for table_key in ["node:Document", "node:Asset"] {
+            let entry = before.entry(table_key).unwrap();
+            let table_uri = format!(
+                "{}/{}",
+                db.uri().trim_end_matches('/'),
+                entry.table_path.trim_start_matches('/')
+            );
+            before_tables.push((
+                table_key,
+                entry.table_version,
+                Dataset::open(&table_uri).await.unwrap().version().version,
+                table_uri,
+            ));
+        }
         let before_commits = db.list_commits(Some("main")).await.unwrap().len();
 
-        let error = db.branch_merge("feature", "main").await.unwrap_err();
+        let probes = MergeWriteProbes::default();
+        let error = with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 error,
@@ -610,19 +964,32 @@ async fn branch_merge_rejects_oversized_blob_payloads_pre_effect() {
             ),
             "{case}: oversized blob merge must return the typed pre-read limit, got {error:?}"
         );
+        assert_eq!(
+            probes.external_blob_payload_read_calls(),
+            0,
+            "{case}: external overflow must be rejected before payload GET"
+        );
+        assert_eq!(
+            probes.blob_payload_read_calls(),
+            0,
+            "{case}: overflow must be rejected before any Blob payload read"
+        );
         let after = snapshot_main(&db).await.unwrap();
         assert_eq!(after.version(), before_manifest, "{case}: manifest moved");
-        assert_eq!(
-            after.entry("node:Document").unwrap().table_version,
-            before_table,
-            "{case}: main table pointer moved"
-        );
-        assert_eq!(
-            Dataset::open(&table_uri).await.unwrap().version().version,
-            before_head,
-            "{case}: main Lance HEAD moved"
-        );
+        for (table_key, before_table, before_head, table_uri) in before_tables {
+            assert_eq!(
+                after.entry(table_key).unwrap().table_version,
+                before_table,
+                "{case}: {table_key} main table pointer moved"
+            );
+            assert_eq!(
+                Dataset::open(&table_uri).await.unwrap().version().version,
+                before_head,
+                "{case}: {table_key} main Lance HEAD moved"
+            );
+        }
         assert_eq!(count_rows(&db, "node:Document").await, 1);
+        assert_eq!(count_rows(&db, "node:Asset").await, 0);
         assert_eq!(
             db.list_commits(Some("main")).await.unwrap().len(),
             before_commits,
@@ -634,6 +1001,227 @@ async fn branch_merge_rejects_oversized_blob_payloads_pre_effect() {
             "{case}: pre-effect rejection must not leave a recovery sidecar"
         );
     }
+
+    // Managed descriptors need no external HEAD, but their carried payload is
+    // still one operation-wide merge budget. Load each row in its own valid
+    // source operation so only the merge's aggregate can exceed the ceiling.
+    let dir = tempfile::tempdir().unwrap();
+    let graph_path = dir.path().join("managed-aggregate-graph");
+    let graph_uri = graph_path.to_str().unwrap();
+    let db = Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA).await.unwrap();
+    let base = r#"{"type":"Document","data":{"title":"base"}}"#;
+    load_jsonl(&db, base, LoadMode::Overwrite).await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    let payload_bytes = LIMIT / 2 + 1;
+    for index in 0..2 {
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            vec![0x5a_u8; payload_bytes as usize],
+        );
+        let row = serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": format!("managed-{index}"),
+                "first": format!("base64:{encoded}"),
+            }
+        })
+        .to_string();
+        db.load("feature", &row, LoadMode::Append).await.unwrap();
+    }
+
+    let before = snapshot_main(&db).await.unwrap();
+    let before_manifest = before.version();
+    let entry = before.entry("node:Document").unwrap();
+    let before_table = entry.table_version;
+    let table_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
+    let before_commits = db.list_commits(Some("main")).await.unwrap().len();
+    let probes = MergeWriteProbes::default();
+    let error = with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: LIMIT,
+                actual,
+            } if resource == "materialized blob payload bytes" && actual == LIMIT + 2
+        ),
+        "managed aggregate must return the typed pre-read operation limit, got {error:?}"
+    );
+    assert_eq!(probes.external_blob_probe_calls(), 0);
+    assert_eq!(
+        probes.external_blob_payload_read_calls(),
+        0,
+        "managed aggregate refusal must not perform an external payload GET"
+    );
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        0,
+        "managed aggregate refusal must happen from descriptor lengths before payload reads"
+    );
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.version(), before_manifest);
+    assert_eq!(
+        after.entry("node:Document").unwrap().table_version,
+        before_table
+    );
+    assert_eq!(
+        Dataset::open(&table_uri).await.unwrap().version().version,
+        before_head
+    );
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        before_commits
+    );
+    let recovery_dir = graph_path.join("__recovery");
+    assert!(!recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none());
+
+    // The descriptor pass owns one operation-wide cell bound. Assemble a
+    // source image with two separate Overwrites that are each legal on their
+    // own, then prove the merge refuses their 8,193 selected external cells
+    // before the first external HEAD, payload GET, recovery arm, or target
+    // effect.
+    const REFERENCE_LIMIT: usize = 8192;
+    let dir = tempfile::tempdir().unwrap();
+    let graph_path = dir.path().join("external-cell-aggregate-graph");
+    let external_path = dir.path().join("shared-external.blob");
+    fs::write(&external_path, b"x").unwrap();
+    let external_uri = url::Url::from_file_path(&external_path)
+        .expect("external source path is absolute")
+        .to_string();
+    let base_uri = url::Url::from_directory_path(dir.path())
+        .expect("external source base is absolute")
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
+    let db = Omnigraph::init(graph_path.to_str().unwrap(), WIDE_BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
+    db.branch_create("feature").await.unwrap();
+
+    let external_rows = |table: &str, key: &str, blob: &str, rows: usize, prefix: &str| {
+        let mut data = String::with_capacity(rows * (external_uri.len() + 96));
+        for row in 0..rows {
+            let mut values = serde_json::Map::new();
+            values.insert(
+                key.to_string(),
+                serde_json::Value::String(format!("{prefix}-{row}")),
+            );
+            values.insert(
+                blob.to_string(),
+                serde_json::Value::String(external_uri.clone()),
+            );
+            writeln!(
+                data,
+                "{}",
+                serde_json::json!({"type": table, "data": values})
+            )
+            .unwrap();
+        }
+        data
+    };
+    for (table, key, blob, rows, prefix) in [
+        (
+            "Document",
+            "title",
+            "first",
+            REFERENCE_LIMIT / 2,
+            "document",
+        ),
+        ("Asset", "name", "payload", REFERENCE_LIMIT / 2 + 1, "asset"),
+    ] {
+        let input = external_rows(table, key, blob, rows, prefix);
+        let source_probes = MergeWriteProbes::default();
+        with_merge_write_probes(
+            source_probes.clone(),
+            db.load("feature", &input, LoadMode::Overwrite),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{table} source Overwrite must be legal: {error:?}"));
+        assert_eq!(source_probes.external_blob_probe_inputs(), rows as u64);
+        assert_eq!(source_probes.external_blob_probe_calls(), 1);
+        assert_eq!(source_probes.external_blob_payload_read_calls(), 0);
+    }
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:Document").await,
+        REFERENCE_LIMIT / 2
+    );
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:Asset").await,
+        REFERENCE_LIMIT / 2 + 1
+    );
+
+    let before = snapshot_main(&db).await.unwrap();
+    let before_manifest = before.version();
+    let source_before = snapshot_branch(&db, "feature").await.unwrap();
+    let mut before_tables = Vec::new();
+    for table_key in ["node:Document", "node:Asset"] {
+        let entry = before.entry(table_key).unwrap();
+        let table_uri = format!(
+            "{}/{}",
+            db.uri().trim_end_matches('/'),
+            entry.table_path.trim_start_matches('/')
+        );
+        before_tables.push((
+            table_key,
+            entry.table_version,
+            Dataset::open(&table_uri).await.unwrap().version().version,
+            source_before.entry(table_key).unwrap().table_version,
+            table_uri,
+        ));
+    }
+    let before_commits = db.list_commits(Some("main")).await.unwrap().len();
+    let merge_probes = MergeWriteProbes::default();
+    let error = with_merge_write_probes(merge_probes.clone(), db.branch_merge("feature", "main"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OmniError::ResourceLimitExceeded {
+            ref resource,
+            limit,
+            actual,
+        } if resource == "external Blob reference cells"
+            && limit == REFERENCE_LIMIT as u64
+            && actual == REFERENCE_LIMIT as u64 + 1
+    ));
+    assert_eq!(merge_probes.external_blob_probe_inputs(), 0);
+    assert_eq!(merge_probes.external_blob_probe_calls(), 0);
+    assert_eq!(merge_probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(merge_probes.blob_payload_read_calls(), 0);
+
+    let after = snapshot_main(&db).await.unwrap();
+    let source_after = snapshot_branch(&db, "feature").await.unwrap();
+    assert_eq!(after.version(), before_manifest);
+    for (table_key, before_table, before_head, before_source, table_uri) in before_tables {
+        assert_eq!(after.entry(table_key).unwrap().table_version, before_table);
+        assert_eq!(
+            Dataset::open(&table_uri).await.unwrap().version().version,
+            before_head
+        );
+        assert_eq!(
+            source_after.entry(table_key).unwrap().table_version,
+            before_source,
+            "refused merge must not move the source table pointer"
+        );
+    }
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        before_commits
+    );
+    let recovery_dir = graph_path.join("__recovery");
+    assert!(!recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none());
 }
 
 #[tokio::test]

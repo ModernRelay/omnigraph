@@ -247,7 +247,7 @@ fails.
 ## Error model
 
 Uniform
-`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, key_conflict?, read_set_conflict?, recovery_required?, resource_limit?, precondition_failure? }`
+`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, key_conflict?, read_set_conflict?, resource_limit?, external_blob_source?, recovery_required?, precondition_failure? }`
 with
 `code ∈ unauthorized | forbidden | bad_request | not_found | method_not_allowed | conflict | too_many_requests | internal`.
 Merge conflicts attach structured
@@ -265,6 +265,16 @@ effect because its branch authority changed. The HTTP status is 409 and
 authority member. The engine already performs a bounded full-attempt retry for
 mutation inserts and load `append`/`merge`. Strict mutation updates/deletes and
 load `overwrite` return the 409 to the caller instead of being replayed.
+
+`external_blob_source` is set when a URI passed the graph's external-Blob
+admission policy but its source could not be probed or read. The HTTP status is
+424 and `ExternalBlobSourceOutput { uri, reason }` carries the normalized,
+credential-free URI (or redacted placeholder) plus a human-readable diagnosis.
+Clients identify this failure from the presence of `external_blob_source`; they
+must not parse `reason`. The optional `code` field is omitted because adding a
+new value to the closed error-code enum would break older clients, while the
+optional structured field is additive and rolling-safe. Policy or URI-shape
+refusals remain HTTP 400 with `code: bad_request`.
 
 `recovery_required` is set when an overlapping durable recovery intent remains
 unresolved; its table effects may or may not have started. The HTTP status is 503 and
@@ -302,7 +312,7 @@ losing request may already own durable table effects and therefore returns
 `recovery_required` (503) for recovery instead of 412.
 
 HTTP status codes used include 200, 400, 401, 403, 404, 405, 409, 412, 413,
-415, 429, 500, and 503.
+415, 424, 429, 500, and 503.
 
 ## Per-actor admission control
 

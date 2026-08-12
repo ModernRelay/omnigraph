@@ -975,8 +975,15 @@ async fn proven_insert_rejects_prepared_blob_descriptors_before_staging() {
         .await
         .unwrap_err();
     assert!(
-        error.to_string().contains("retained a prepared descriptor"),
-        "prepared source descriptors must fail before fragment staging, got {error:?}"
+        matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == crate::error::ManifestErrorKind::BadRequest
+                    && manifest
+                        .message
+                        .contains("prepared storage descriptors are not accepted")
+        ),
+        "prepared source descriptors must fail with typed bad-request admission before fragment staging, got {error:?}"
     );
 
     let latest = Dataset::open(&target_uri).await.unwrap();
@@ -1191,6 +1198,7 @@ async fn proven_insert_delta_scan_is_interval_exact_and_batch_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let source_uri = format!("{root}/source.lance");
+    let store = TableStore::new(root, test_session());
     let mut source = TableStore::write_dataset(&source_uri, person_pk_batch(&[("base", Some(30))]))
         .await
         .unwrap();
@@ -1198,10 +1206,17 @@ async fn proven_insert_delta_scan_is_interval_exact_and_batch_bounded() {
     lance_append_inline_local(&mut source, numbered_person_pk_batch(0..10_000)).await;
     let end_version = source.version().version;
 
-    let mut stream =
-        TableStore::scan_proven_insert_delta_bounded(&source, "Person", begin_version, end_version)
-            .await
-            .unwrap();
+    let external_preflight = super::ExternalBlobPreflight::default();
+    let mut stream = store
+        .scan_proven_insert_delta_bounded(
+            &source,
+            "Person",
+            begin_version,
+            end_version,
+            &external_preflight,
+        )
+        .await
+        .unwrap();
     let mut rows = 0_usize;
     let mut batches = 0_usize;
     while let Some(batch) = stream.try_next().await.unwrap() {
@@ -1234,6 +1249,7 @@ async fn proven_insert_delta_scan_normalizes_oversized_raw_emission() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let source_uri = format!("{root}/source.lance");
+    let store = TableStore::new(root, test_session());
     let mut source = TableStore::write_dataset(&source_uri, person_pk_batch(&[("base", Some(0))]))
         .await
         .unwrap();
@@ -1258,14 +1274,17 @@ async fn proven_insert_delta_scan_normalizes_oversized_raw_emission() {
 
     let probes = MergeWriteProbes::default();
     let (rows, normalized_batches) = with_merge_write_probes(probes.clone(), async {
-        let mut stream = TableStore::scan_proven_insert_delta_bounded(
-            &source,
-            "Person",
-            begin_version,
-            end_version,
-        )
-        .await
-        .unwrap();
+        let external_preflight = super::ExternalBlobPreflight::default();
+        let mut stream = store
+            .scan_proven_insert_delta_bounded(
+                &source,
+                "Person",
+                begin_version,
+                end_version,
+                &external_preflight,
+            )
+            .await
+            .unwrap();
         let mut rows = 0_usize;
         let mut batches = 0_usize;
         while let Some(batch) = stream.try_next().await.unwrap() {

@@ -39,6 +39,7 @@ use crate::db::manifest::{
 };
 use crate::db::{MutationOpKind, SubTableUpdate};
 use crate::error::{OmniError, Result};
+use crate::table_store::ExternalBlobUriCollector;
 
 /// Logical semantics for one accumulated table write.
 ///
@@ -391,15 +392,25 @@ impl MutationStaging {
         self.pending.get(table_key).map(|p| p.schema.clone())
     }
 
-    /// Arrow resources already retained for one keyed table before a later
-    /// pending-aware update scan allocates its matched full-row batch.
+    /// Arrow resources already retained before a later pending-aware update
+    /// scan allocates its matched full-row batch. Rows remain a per-table
+    /// keyed-write fence, while bytes include every pending table so one graph
+    /// mutation cannot multiply the 32 MiB retained-memory budget by touching
+    /// several tables.
     pub(crate) fn pending_resource_usage(&self, table_key: &str) -> Result<(u64, u64)> {
-        let Some(pending) = self.pending.get(table_key) else {
-            return Ok((0, 0));
-        };
-        let rows = u64::try_from(pending.total_rows())
-            .map_err(|_| OmniError::manifest_internal("pending keyed row count exceeds u64"))?;
-        Ok((rows, pending.total_bytes()?))
+        let rows = u64::try_from(
+            self.pending
+                .get(table_key)
+                .map(PendingTable::total_rows)
+                .unwrap_or(0),
+        )
+        .map_err(|_| OmniError::manifest_internal("pending keyed row count exceeds u64"))?;
+        let bytes = self.pending.values().try_fold(0_u64, |total, pending| {
+            total
+                .checked_add(pending.total_bytes()?)
+                .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))
+        })?;
+        Ok((rows, bytes))
     }
 
     /// `true` if neither pending writes nor delete predicates have any state —
@@ -458,7 +469,7 @@ impl MutationStaging {
             .map(|(table_key, path)| (table_key.clone(), path.identity))
             .collect();
 
-        let mut stage_inputs: Vec<(String, PendingTable, StagedTablePath, u64)> =
+        let mut stage_inputs: Vec<(String, PreparedPendingTable, StagedTablePath, u64)> =
             Vec::with_capacity(pending.len());
         for (table_key, table) in pending {
             let path = paths.get(&table_key).cloned().ok_or_else(|| {
@@ -473,7 +484,67 @@ impl MutationStaging {
                     table_key
                 ))
             })?;
+            let table = prepare_pending_table(&table_key, table)?;
+            // Finish the per-table last-write-wins fold before looking at URI
+            // inputs. A superseded row is not part of the graph operation and
+            // must not trigger policy checks, source probes, or byte charges.
+            db.storage()
+                .validate_keyed_write_batch(&table_key, &table.batch)?;
             stage_inputs.push((table_key, table, path, expected));
+        }
+
+        // External sources are a graph-operation input, not a per-table
+        // staging detail. Discover every surviving URI after folding, then
+        // authorize and probe the complete set before reading any payload or
+        // letting a participant future write an uncommitted Lance file.
+        let mut external_blob_uris = ExternalBlobUriCollector::default();
+        let mut copied_external_blob_uri_indices = Vec::new();
+        for (_, table, _, _) in &stage_inputs {
+            let added = external_blob_uris.include_batch(&table.batch)?;
+            if matches!(table.mode, PendingMode::StrictInsert | PendingMode::Upsert) {
+                copied_external_blob_uri_indices.extend(added);
+            }
+        }
+        let external_blob_preflight = db
+            .storage()
+            .preflight_external_blob_uris(external_blob_uris.as_slice())
+            .await?;
+        let copied_external_blob_uris = copied_external_blob_uri_indices
+            .iter()
+            .map(|index| external_blob_uris.as_slice()[*index].as_str())
+            .collect::<Vec<_>>();
+        let copied_external_blob_bytes =
+            external_blob_preflight.materialized_payload_bytes(&copied_external_blob_uris)?;
+        if copied_external_blob_bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                "materialized external blob payload bytes",
+                KEYED_WRITE_MAX_BYTES,
+                copied_external_blob_bytes,
+            ));
+        }
+
+        // Only after the complete operation has passed policy, source, and
+        // aggregate-copy admission do we read payload bytes. Reuse remains
+        // batch-bounded so this vector cannot retain an operation-sized cache.
+        for (table_key, table, _, _) in &mut stage_inputs {
+            table.batch = match table.mode {
+                PendingMode::StrictInsert | PendingMode::Upsert => {
+                    db.storage()
+                        .prepare_keyed_write_batch_with_preflight(
+                            table_key,
+                            table.batch.clone(),
+                            &external_blob_preflight,
+                        )
+                        .await?
+                }
+                PendingMode::Overwrite => db
+                    .storage()
+                    .prepare_overwrite_blob_references_with_preflight(
+                        table_key,
+                        table.batch.clone(),
+                        &external_blob_preflight,
+                    )?,
+            };
         }
         let concurrency = concurrency.min(stage_inputs.len()).max(1);
         let mut staged_entries: Vec<StagedTableEntry> =
@@ -537,41 +608,19 @@ impl MutationStaging {
     }
 }
 
-async fn stage_pending_table(
-    db: &crate::db::Omnigraph,
-    table_key: String,
-    table: PendingTable,
-    path: StagedTablePath,
-    expected: u64,
-) -> Result<Option<StagedTableEntry>> {
-    // Reopen the pinned dataset. Existing-table effects stage on this handle
-    // now. A deferred first-touch effect uses it only as the inherited source
-    // pin; its files stage on the target handle after sidecar + fork.
-    let stage_kind = match table.mode {
-        PendingMode::StrictInsert => crate::db::MutationOpKind::Insert,
-        PendingMode::Upsert => crate::db::MutationOpKind::Merge,
-        PendingMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
-    };
-    let ds = match path.deferred_fork.as_ref() {
-        Some(fork) => {
-            db.storage()
-                .open_snapshot_at_entry(&fork.source_entry)
-                .await?
-        }
-        None => {
-            db.reopen_for_mutation(
-                &table_key,
-                &path.full_path,
-                path.table_branch.as_deref(),
-                expected,
-                stage_kind,
-            )
-            .await?
-        }
-    };
+struct PreparedPendingTable {
+    mode: PendingMode,
+    batch: RecordBatch,
+}
 
+/// Enforce raw accumulated keyed ceilings, then collapse one table to the
+/// single input its Lance writer consumes. Upsert's repeated ids are folded
+/// last-write-wins before external payload accounting or reads.
+fn prepare_pending_table(table_key: &str, table: PendingTable) -> Result<PreparedPendingTable> {
     if table.batches.is_empty() {
-        return Ok(None);
+        return Err(OmniError::manifest_internal(format!(
+            "pending table '{table_key}' has no batches"
+        )));
     }
 
     if matches!(table.mode, PendingMode::StrictInsert | PendingMode::Upsert) {
@@ -611,38 +660,57 @@ async fn stage_pending_table(
         }
     }
 
-    let mut combined = match table.mode {
+    let mode = table.mode;
+    let batch = match mode {
         PendingMode::Upsert => dedupe_merge_batches_by_id(&table.schema, table.batches)?,
         PendingMode::StrictInsert | PendingMode::Overwrite => {
             if table.batches.len() == 1 {
                 table.batches.into_iter().next().unwrap()
             } else {
                 arrow_select::concat::concat_batches(&table.schema, &table.batches)
-                    .map_err(|e| OmniError::Lance(e.to_string()))?
+                    .map_err(|error| OmniError::Lance(error.to_string()))?
             }
         }
     };
+    Ok(PreparedPendingTable { mode, batch })
+}
 
-    // Every v6 graph-table mutation has the same physical key contract,
-    // including Overwrite (even when the user schema declares no @key).
-    // Validate on this common preparation path before a deferred first-touch
-    // plan can arm recovery/create its native ref, and before an existing
-    // table Overwrite can stage or advance HEAD. `stage_keyed_write` retains
-    // the same check as defense in depth for direct storage-layer callers.
-    db.storage()
-        .validate_keyed_write_batch(&table_key, &combined)?;
+async fn stage_pending_table(
+    db: &crate::db::Omnigraph,
+    table_key: String,
+    table: PreparedPendingTable,
+    path: StagedTablePath,
+    expected: u64,
+) -> Result<Option<StagedTableEntry>> {
+    // Reopen the pinned dataset. Existing-table effects stage on this handle
+    // now. A deferred first-touch effect uses it only as the inherited source
+    // pin; its files stage on the target handle after sidecar + fork.
+    let stage_kind = match table.mode {
+        PendingMode::StrictInsert => crate::db::MutationOpKind::Insert,
+        PendingMode::Upsert => crate::db::MutationOpKind::Merge,
+        PendingMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
+    };
+    let ds = match path.deferred_fork.as_ref() {
+        Some(fork) => {
+            db.storage()
+                .open_snapshot_at_entry(&fork.source_entry)
+                .await?
+        }
+        None => {
+            db.reopen_for_mutation(
+                &table_key,
+                &path.full_path,
+                path.table_branch.as_deref(),
+                expected,
+                stage_kind,
+            )
+            .await?
+        }
+    };
+
+    let combined = table.batch;
 
     if path.deferred_fork.is_some() {
-        if matches!(table.mode, PendingMode::StrictInsert | PendingMode::Upsert) {
-            // The target ref does not exist until after recovery is armed.
-            // Resolve any external blob payload now so a size/read failure is
-            // still a typed, effect-free resource/input error rather than a
-            // sticky post-arm RecoveryRequired outcome.
-            combined = db
-                .storage()
-                .prepare_keyed_write_batch(&table_key, combined)
-                .await?;
-        }
         // The recovery identity is minted before the fork; the actual Lance
         // transaction is staged on the new target ref after the sidecar is
         // durable, then bound to this UUID. Its read version remains Lance's

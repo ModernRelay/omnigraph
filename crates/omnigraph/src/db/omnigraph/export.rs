@@ -508,32 +508,40 @@ async fn export_blob_column_values(
     descriptions: &StructArray,
     row_ids: &[u64],
 ) -> Result<Vec<Option<String>>> {
-    let mut non_null_row_ids = Vec::new();
-    let mut non_null_positions = Vec::new();
+    let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
+    let mut managed_row_ids = Vec::new();
+    let mut managed_positions = Vec::new();
     let mut values = vec![None; row_ids.len()];
 
     for (row, row_id) in row_ids.iter().enumerate() {
-        if blob_description_is_null(descriptions, row)? {
-            continue;
+        match decoder.classify(row)? {
+            crate::blob::BlobDescriptor::Null => {}
+            crate::blob::BlobDescriptor::Managed { .. } => {
+                managed_row_ids.push(*row_id);
+                managed_positions.push(row);
+            }
+            crate::blob::BlobDescriptor::External { uri, .. } => {
+                // Export is descriptor-preserving. It must not open or probe a
+                // caller-owned object merely to reproduce the stored URI.
+                values[row] = Some(uri);
+            }
         }
-        non_null_row_ids.push(*row_id);
-        non_null_positions.push(row);
     }
 
-    if non_null_row_ids.is_empty() {
+    if managed_row_ids.is_empty() {
         return Ok(values);
     }
 
-    let mut perm: Vec<usize> = (0..non_null_row_ids.len()).collect();
-    perm.sort_by_key(|&i| non_null_row_ids[i]);
-    let sorted_ids: Vec<u64> = perm.iter().map(|&i| non_null_row_ids[i]).collect();
+    let mut perm: Vec<usize> = (0..managed_row_ids.len()).collect();
+    perm.sort_by_key(|&i| managed_row_ids[i]);
+    let sorted_ids: Vec<u64> = perm.iter().map(|&i| managed_row_ids[i]).collect();
 
     let sorted_blobs = Arc::new(source_ds.clone())
         .take_blobs(&sorted_ids, column_name)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
-    if sorted_blobs.len() != non_null_positions.len() {
+    if sorted_blobs.len() != managed_positions.len() {
         return Err(OmniError::Lance(format!(
             "blob export for '{}' lost alignment with selected rows",
             column_name
@@ -545,25 +553,27 @@ async fn export_blob_column_values(
         inverse_perm[orig_pos] = sorted_pos;
     }
 
-    for (idx, position) in non_null_positions.into_iter().enumerate() {
+    for (idx, position) in managed_positions.into_iter().enumerate() {
         let blob = sorted_blobs[inverse_perm[idx]].as_ref().ok_or_else(|| {
             OmniError::Lance(format!(
-                "blob export for '{}' returned a null accessor for a non-null description",
+                "blob export for '{}' returned a null accessor for a managed description",
                 column_name
             ))
         })?;
-        let value = if let Some(uri) = blob.uri() {
-            uri.to_string()
-        } else {
-            let bytes = blob
-                .read()
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-            format!(
-                "base64:{}",
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
-            )
-        };
+        if blob.uri().is_some() {
+            return Err(OmniError::Lance(format!(
+                "blob export for '{}' resolved a managed description as external",
+                column_name
+            )));
+        }
+        let bytes = blob
+            .read()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let value = format!(
+            "base64:{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+        );
         values[position] = Some(value);
     }
 

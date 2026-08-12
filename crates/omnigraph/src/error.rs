@@ -122,6 +122,18 @@ pub enum OmniError {
         limit: u64,
         actual: u64,
     },
+    /// A caller attempted to admit an external Blob URI that is malformed or
+    /// outside this graph handle's immutable base allowlist. The URI must be a
+    /// normalized, credential-free spelling (or a redacted placeholder): this
+    /// error crosses HTTP/CLI boundaries and must never echo URI credentials.
+    #[error("external blob URI '{uri}' is not allowed: {reason}")]
+    ExternalBlobPolicy { uri: String, reason: String },
+    /// An allowed external Blob source could not be probed or read before the
+    /// write's first durable effect. Kept distinct from input-policy failures
+    /// so transports can report a dependency failure instead of an opaque 500
+    /// or a misleading malformed-request response.
+    #[error("external blob source '{uri}' is unavailable: {reason}")]
+    ExternalBlobSource { uri: String, reason: String },
     /// A durable recovery intent overlaps this write. Its physical effects may
     /// already have landed, or it may still be armed before its first effect;
     /// either way the sidecar named by `operation_id` must be resolved before
@@ -202,6 +214,20 @@ impl OmniError {
             resource: resource.into(),
             limit,
             actual,
+        }
+    }
+
+    pub(crate) fn external_blob_policy(uri: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::ExternalBlobPolicy {
+            uri: uri.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn external_blob_source(uri: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::ExternalBlobSource {
+            uri: uri.into(),
+            reason: reason.into(),
         }
     }
 

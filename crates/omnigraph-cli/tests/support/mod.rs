@@ -634,6 +634,20 @@ pub fn write_cluster_applyable_state(root: &std::path::Path) -> serde_json::Valu
         .as_str()
         .unwrap()
         .to_string();
+    // The fabricated state predates external Blob policy metadata and has no
+    // applied query child yet. Its graph resource must therefore bind exactly
+    // the historical graph + schema + default-Deny composite; a placeholder
+    // digest is not a valid old or current ledger shape.
+    let graph_digest = {
+        use sha2::{Digest, Sha256};
+
+        let input = format!("graph\0knowledge\0schema\0{schema_digest}\0");
+        let digest = Sha256::digest(input.as_bytes());
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
     let state_dir = root.join("__cluster");
     fs::create_dir_all(&state_dir).unwrap();
     fs::write(
@@ -644,7 +658,7 @@ pub fn write_cluster_applyable_state(root: &std::path::Path) -> serde_json::Valu
   "state_revision": 1,
   "applied_revision": {{
     "resources": {{
-      "graph.knowledge": {{ "digest": "seed" }},
+      "graph.knowledge": {{ "digest": "{graph_digest}" }},
       "schema.knowledge": {{ "digest": "{schema_digest}" }}
     }}
   }}

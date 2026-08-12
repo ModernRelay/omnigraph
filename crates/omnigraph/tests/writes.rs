@@ -24,6 +24,7 @@ use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
 use helpers::*;
 
@@ -722,10 +723,20 @@ query update_note($note: String) {
     file.set_len(LIMIT + 1).unwrap();
     drop(file);
     let external_uri = format!("file://{}", external_path.display());
+    let external_policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).expect("external blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
 
     let graph_path = dir.path().join("graph");
     let db = Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
         .await
+        .unwrap()
+        .with_external_blob_policy(external_policy)
         .unwrap();
     let row = serde_json::json!({
         "type": "Document",
@@ -1692,11 +1703,35 @@ query insert_then_update_note(
     insert Document { title: $title, content: $blob }
     update Document set { note: $note } where title = $title
 }
+
+query insert_then_replace_blob(
+    $title: String, $first: String, $second: String
+) {
+    insert Document { title: $title, content: $first }
+    update Document set { content: $second } where title = $title
+}
 "#;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let allowed_path = dir.path().join("allowed-source.bin");
+    std::fs::write(&allowed_path, b"last write wins").unwrap();
+    let allowed_uri = url::Url::from_file_path(&allowed_path)
+        .expect("allowed external source is absolute")
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).expect("external Blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
 
     // Keep one committed blob row as well as the just-inserted pending row so
     // the table has the real blob-v2 physical representation while this query
@@ -1750,6 +1785,40 @@ query insert_then_update_note(
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "letter");
     assert_eq!(row["d.note"], "draft 1");
+
+    // Mutation coalescing is last-write-wins before URI admission. The first
+    // pending value is deliberately outside the allow base; because the
+    // update replaces it in the same query, it must cause no policy check,
+    // HEAD, or payload read. Only the surviving URI is copied.
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            BLOB_QUERIES,
+            "insert_then_replace_blob",
+            &params(&[
+                ("$title", "last-wins"),
+                (
+                    "$first",
+                    "file:///definitely-outside-the-allowed-base/ignored",
+                ),
+                ("$second", &allowed_uri),
+            ]),
+        ),
+    )
+    .await
+    .expect("superseded external URI must not participate in admission");
+    assert_eq!(result.affected_nodes, 2);
+    assert_eq!(probes.external_blob_probe_inputs(), 1);
+    assert_eq!(probes.external_blob_probe_calls(), 1);
+    assert_eq!(probes.blob_payload_read_calls(), 1);
+    let blob = db
+        .read_blob("Document", "last-wins", "content")
+        .await
+        .unwrap();
+    assert_eq!(blob.uri(), None);
+    assert_eq!(&blob.read().await.unwrap()[..], b"last write wins");
 }
 
 /// MR-920 regression: two sequential `update T set {f:v} where x=y`

@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_server::api::ReadRequest;
+use omnigraph_server::api::{IngestRequest, ReadRequest};
 use omnigraph_server::{AppState, build_app};
 use serde_json::json;
 
@@ -94,6 +94,16 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
             .as_nanos()
     );
     let root = format!("s3://{bucket}/cluster-serve/{unique}");
+    let external_blob_base = format!("s3://{bucket}/cluster-serve/{unique}-external");
+    let external_blob_uri = format!("{external_blob_base}/available~asset.bin");
+    let external_blob_input_uri = external_blob_uri.replace("~asset", "%7Easset");
+    let external_blob_payload = "server-safe external Blob payload";
+
+    omnigraph::storage::storage_for_uri(&external_blob_uri)
+        .unwrap()
+        .write_text(&external_blob_uri, external_blob_payload)
+        .await
+        .unwrap();
 
     // Apply a one-graph cluster onto the bucket, seed it, then DROP the
     // config dir — the boot below must need nothing local.
@@ -101,7 +111,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("people.pg"),
-            "node Person {\n  name: String @key\n}\n",
+            "node Person {\n  name: String @key\n  avatar: Blob?\n}\n",
         )
         .unwrap();
         fs::write(
@@ -112,7 +122,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
         fs::write(
             dir.path().join("cluster.yaml"),
             format!(
-                "version: 1\nstorage: {root}\ngraphs:\n  knowledge:\n    schema: people.pg\n    queries:\n      find_person:\n        file: people.gq\n"
+                "version: 1\nstorage: {root}\ngraphs:\n  knowledge:\n    schema: people.pg\n    external_blobs:\n      allow:\n        - base: {external_blob_base}\n          scope: server_safe\n    queries:\n      find_person:\n        file: people.gq\n"
             ),
         )
         .unwrap();
@@ -155,6 +165,101 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     .await
     .unwrap();
     let app = build_app(state);
+
+    // The applied server-safe policy must reach the live graph handle. An
+    // encoded spelling of an allowed S3 source is normalized, read through the
+    // server's shared object-store registry, and copied into managed Blob
+    // storage by keyed Append.
+    let load = IngestRequest {
+        branch: None,
+        from: None,
+        mode: Some(LoadMode::Append),
+        data: json!({
+            "type": "Person",
+            "data": {
+                "name": "Grace",
+                "avatar": external_blob_input_uri,
+            },
+        })
+        .to_string(),
+    };
+    let (load_status, load_body) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/graphs/knowledge/load")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&load).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(load_status, StatusCode::OK, "{load_body}");
+    assert_eq!(load_body["tables"][0]["rows_loaded"], 1, "{load_body}");
+
+    let graph_uri = format!("{root}/graphs/knowledge.omni");
+    let reopened = Omnigraph::open(&graph_uri).await.unwrap();
+    let copied = reopened
+        .read_blob("Person", "Grace", "avatar")
+        .await
+        .unwrap();
+    assert_eq!(
+        copied.uri(),
+        None,
+        "keyed HTTP load must copy the external source into managed storage"
+    );
+    assert_eq!(
+        copied.read().await.unwrap(),
+        external_blob_payload.as_bytes()
+    );
+
+    // A missing object beneath that same admitted base is a dependency
+    // failure, not a policy refusal or generic server error. The response
+    // carries the normalized, credential-free URI without extending the
+    // closed ErrorCode enum.
+    let missing_input_uri = format!("{external_blob_base}/missing%7Easset.bin");
+    let normalized_missing_uri = format!("{external_blob_base}/missing~asset.bin");
+    let missing = IngestRequest {
+        branch: None,
+        from: None,
+        mode: Some(LoadMode::Append),
+        data: json!({
+            "type": "Person",
+            "data": {
+                "name": "Missing",
+                "avatar": missing_input_uri,
+            },
+        })
+        .to_string(),
+    };
+    let (missing_status, missing_body) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/graphs/knowledge/load")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&missing).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        missing_status,
+        StatusCode::FAILED_DEPENDENCY,
+        "missing allowed source must be HTTP 424, not a generic 500: {missing_body}"
+    );
+    assert!(
+        missing_body.get("code").is_none(),
+        "the closed ErrorCode enum must remain absent: {missing_body}"
+    );
+    assert_eq!(
+        missing_body["external_blob_source"]["uri"], normalized_missing_uri,
+        "{missing_body}"
+    );
+    assert!(
+        missing_body["external_blob_source"]["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.trim().is_empty()),
+        "source diagnosis must be present: {missing_body}"
+    );
 
     let response = tower::ServiceExt::oneshot(
         app,

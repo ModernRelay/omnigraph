@@ -8,6 +8,7 @@ use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
 
@@ -923,30 +924,96 @@ node Document {
 }
 "#;
 
-    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
-    let data = concat!(
-        "{\"type\": \"Document\", \"data\": {\"title\": \"readme\", \"content\": \"base64:SGVsbG8=\"}}\n",
-        "{\"type\": \"Document\", \"data\": {\"title\": \"empty\"}}\n",
-    );
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_path = external_dir.path().join("external.bin");
+    std::fs::write(&external_path, b"External").unwrap();
+    let external_uri = format!("file://{}", external_path.display());
+    let canonical_external_uri =
+        url::Url::from_file_path(std::fs::canonicalize(&external_path).unwrap())
+            .expect("canonical external Blob path is absolute")
+            .to_string();
+    let external_policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(external_dir.path())
+                .expect("external blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
 
-    // Export should succeed
+    let db = Omnigraph::init(uri, BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(external_policy.clone())
+        .unwrap();
+    let first_fragment = [
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "readme", "content": "base64:SGVsbG8="},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "null"},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "external", "content": external_uri},
+        }),
+    ]
+    .into_iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    load_jsonl(&db, &first_fragment, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    // Make valid-empty the first Blob in a later fragment. Lance encodes that
+    // cell as a valid Inline 0/0 descriptor, the exact shape OmniGraph's old
+    // field-value heuristic mistook for null.
+    load_jsonl(
+        &db,
+        concat!(
+            "{\"type\":\"Document\",\"data\":{\"title\":\"valid-empty\",\"content\":\"base64:\"}}\n",
+            "{\"type\":\"Document\",\"data\":{\"title\":\"neighbor\",\"content\":\"base64:TmVpZ2hib3I=\"}}",
+        ),
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    // Export is descriptor-first for external references: reproducing the
+    // stored URI must not depend on the caller-owned target still existing.
+    std::fs::remove_file(&external_path).unwrap();
     let exported = db.export_jsonl("main", &[], &[]).await.unwrap();
-    assert!(
-        exported.contains("readme"),
-        "export should contain readme doc"
-    );
+    let rows = exported
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let document = |title: &str| {
+        &rows
+            .iter()
+            .find(|row| row["data"]["title"] == title)
+            .unwrap()["data"]
+    };
+    assert_eq!(document("readme")["content"], "base64:SGVsbG8=");
+    assert_eq!(document("valid-empty")["content"], "base64:");
+    assert_eq!(document("neighbor")["content"], "base64:TmVpZ2hib3I=");
+    assert!(document("null")["content"].is_null());
+    assert_eq!(document("external")["content"], canonical_external_uri);
 
-    // Verify blob value is in the export
-    assert!(
-        exported.contains("base64:") || exported.contains("SGVsbG8"),
-        "export should contain blob data as base64"
-    );
+    // Rebuild ingress is policy-aware. Restore the caller-owned source and
+    // explicitly authorize the import rather than relying on ambient file
+    // access.
+    std::fs::write(&external_path, b"External").unwrap();
 
     // Round-trip: re-import and verify blob data survives
     let imported_dir = tempfile::tempdir().unwrap();
     let imported_uri = imported_dir.path().to_str().unwrap();
-    let imported = Omnigraph::init(imported_uri, BLOB_SCHEMA).await.unwrap();
+    let imported = Omnigraph::init(imported_uri, BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(external_policy)
+        .unwrap();
     load_jsonl(&imported, &exported, LoadMode::Overwrite)
         .await
         .unwrap();
@@ -957,6 +1024,26 @@ node Document {
         .unwrap();
     let bytes = blob.read().await.unwrap();
     assert_eq!(&bytes[..], b"Hello");
+
+    let empty = imported
+        .read_blob("Document", "valid-empty", "content")
+        .await
+        .unwrap();
+    assert_eq!(empty.size(), 0);
+    assert!(empty.read().await.unwrap().is_empty());
+    assert!(
+        imported
+            .read_blob("Document", "null", "content")
+            .await
+            .is_err(),
+        "a null Blob must stay null across export/import"
+    );
+    let external = imported
+        .read_blob("Document", "external", "content")
+        .await
+        .unwrap();
+    assert_eq!(external.uri(), Some(canonical_external_uri.as_str()));
+    assert_eq!(&external.read().await.unwrap()[..], b"External");
 
     // A later import into the already-populated v6 table must retain both the
     // physical PK contract and blob-v2 fidelity.

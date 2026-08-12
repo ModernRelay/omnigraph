@@ -1,4 +1,8 @@
 use super::*;
+use futures::TryStreamExt;
+
+const SCHEMA_BLOB_DESCRIPTOR_SCAN_ROWS: usize = 1024;
+const SCHEMA_BLOB_DESCRIPTOR_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Operator-supplied options that gate schema-apply behavior.
 ///
@@ -777,6 +781,33 @@ where
         }
     }
 
+    // Lance's logical Blob rewrite input cannot represent an existing
+    // external offset/length range. Discover that unsupported persisted state
+    // across the complete rewrite set before recovery is armed or any added /
+    // lexically earlier table can move. The builder repeats this check as a
+    // defensive invariant after arm.
+    for table_key in &rewritten_tables {
+        if added_tables.contains(table_key) {
+            continue;
+        }
+        let source_table_key = renamed_tables.get(table_key).unwrap_or(table_key);
+        let source_ds = existing_heads.get(source_table_key).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "missing preflighted source table '{}' for schema Blob range validation",
+                source_table_key
+            ))
+        })?;
+        validate_schema_rewrite_external_ranges(
+            source_ds,
+            source_table_key,
+            accepted_catalog.as_ref(),
+            table_key,
+            &desired_catalog,
+            property_renames.get(table_key),
+        )
+        .await?;
+    }
+
     // Every non-empty migration writes a sidecar, including table-effect-free
     // index/enum/metadata changes. Their empty table-pin set is intentional:
     // schema staging is the durable threshold that lets recovery deterministically
@@ -1372,6 +1403,81 @@ pub(super) async fn batch_for_schema_apply_rewrite(
     RecordBatch::try_new(target_schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
 }
 
+/// Descriptor-only pre-arm validation for external Blob cells that a schema
+/// rewrite will carry. Project only the source Blob columns that survive in
+/// the target schema; this performs no external-object lookup or payload read.
+async fn validate_schema_rewrite_external_ranges(
+    source_ds: &SnapshotHandle,
+    source_table_key: &str,
+    source_catalog: &Catalog,
+    target_table_key: &str,
+    target_catalog: &Catalog,
+    property_renames: Option<&HashMap<String, String>>,
+) -> Result<()> {
+    let source_blob_properties = blob_properties_for_table_key(source_catalog, source_table_key)?;
+    let target_blob_properties = blob_properties_for_table_key(target_catalog, target_table_key)?;
+    let mut source_columns = target_blob_properties
+        .iter()
+        .filter_map(|target_name| {
+            let source_name = property_renames
+                .and_then(|renames| renames.get(target_name))
+                .unwrap_or(target_name);
+            source_blob_properties
+                .contains(source_name)
+                .then(|| source_name.clone())
+        })
+        .collect::<Vec<_>>();
+    source_columns.sort();
+    source_columns.dedup();
+    if source_columns.is_empty() {
+        return Ok(());
+    }
+
+    let projection = source_columns
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut batches = crate::table_store::TableStore::scan_stream_bounded(
+        source_ds.dataset(),
+        Some(&projection),
+        None,
+        None,
+        false,
+        SCHEMA_BLOB_DESCRIPTOR_SCAN_ROWS,
+        SCHEMA_BLOB_DESCRIPTOR_SCAN_BYTES,
+    )
+    .await?;
+    while let Some(batch) = batches
+        .try_next()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?
+    {
+        for source_name in &source_columns {
+            let descriptions = batch
+                .column_by_name(source_name)
+                .and_then(|column| column.as_any().downcast_ref::<StructArray>())
+                .ok_or_else(|| {
+                    OmniError::Lance(format!(
+                        "expected blob descriptions for '{}.{}' during pre-arm schema validation",
+                        source_table_key, source_name
+                    ))
+                })?;
+            let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
+            for row in 0..descriptions.len() {
+                if let crate::blob::BlobDescriptor::External {
+                    uri,
+                    offset,
+                    length,
+                } = decoder.classify(row)?
+                {
+                    whole_external_uri_for_schema_rewrite(uri, offset, length)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn rebuild_blob_column(
     _db: &Omnigraph,
     source_ds: &SnapshotHandle,
@@ -1379,62 +1485,73 @@ async fn rebuild_blob_column(
     descriptions: &StructArray,
     row_ids: &[u64],
 ) -> Result<Arc<dyn Array>> {
+    let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
     let mut builder = BlobArrayBuilder::new(row_ids.len());
-    let mut non_null_row_ids = Vec::new();
-    let mut row_has_blob = Vec::with_capacity(row_ids.len());
+    let mut managed_row_ids = Vec::new();
+    let mut row_descriptors = Vec::with_capacity(row_ids.len());
 
     for (row, row_id) in row_ids.iter().enumerate() {
-        let is_null = blob_description_is_null(descriptions, row)?;
-        row_has_blob.push(!is_null);
-        if !is_null {
-            non_null_row_ids.push(*row_id);
+        let descriptor = decoder.classify(row)?;
+        if matches!(descriptor, crate::blob::BlobDescriptor::Managed { .. }) {
+            managed_row_ids.push(*row_id);
         }
+        row_descriptors.push(descriptor);
     }
 
-    let blob_files = if non_null_row_ids.is_empty() {
+    let blob_files = if managed_row_ids.is_empty() {
         Vec::new()
     } else {
         Arc::new(source_ds.dataset().clone())
-            .take_blobs(&non_null_row_ids, column_name)
+            .take_blobs(&managed_row_ids, column_name)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?
     };
 
     let mut files = blob_files.into_iter();
-    for has_blob in row_has_blob {
-        if !has_blob {
-            builder
+    for descriptor in row_descriptors {
+        match descriptor {
+            crate::blob::BlobDescriptor::Null => builder
                 .push_null()
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-            continue;
-        }
-
-        let blob = files
-            .next()
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "blob rewrite for '{}' lost alignment with source rows",
-                    column_name
-                ))
-            })?
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "blob rewrite for '{}' returned a null accessor for a non-null description",
-                    column_name
-                ))
-            })?;
-        if let Some(uri) = blob.uri() {
-            builder
-                .push_uri(uri)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-        } else {
-            builder
-                .push_bytes(
-                    blob.read()
-                        .await
-                        .map_err(|e| OmniError::Lance(e.to_string()))?,
-                )
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+                .map_err(|e| OmniError::Lance(e.to_string()))?,
+            crate::blob::BlobDescriptor::External {
+                uri,
+                offset,
+                length,
+            } => {
+                let uri = whole_external_uri_for_schema_rewrite(uri, offset, length)?;
+                builder
+                    .push_uri(uri)
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            }
+            crate::blob::BlobDescriptor::Managed { .. } => {
+                let blob = files
+                    .next()
+                    .ok_or_else(|| {
+                        OmniError::Lance(format!(
+                            "blob rewrite for '{}' lost alignment with managed source rows",
+                            column_name
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        OmniError::Lance(format!(
+                            "blob rewrite for '{}' returned a null accessor for a managed description",
+                            column_name
+                        ))
+                    })?;
+                if blob.uri().is_some() {
+                    return Err(OmniError::Lance(format!(
+                        "blob rewrite for '{}' resolved a managed description as external",
+                        column_name
+                    )));
+                }
+                builder
+                    .push_bytes(
+                        blob.read()
+                            .await
+                            .map_err(|e| OmniError::Lance(e.to_string()))?,
+                    )
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            }
         }
     }
 
@@ -1448,4 +1565,52 @@ async fn rebuild_blob_column(
     builder
         .finish()
         .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+/// Lance's logical Blob input can retain a whole-object URI but cannot encode
+/// a descriptor range. Refuse a valid ranged descriptor before schema staging
+/// instead of silently widening it to the entire target object.
+fn whole_external_uri_for_schema_rewrite(
+    uri: String,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<String> {
+    if offset != 0 || length.is_some() {
+        return Err(OmniError::manifest(format!(
+            "schema rewrite cannot preserve ranged external Blob descriptor (offset {offset}, length {length:?})"
+        )));
+    }
+    Ok(uri)
+}
+
+#[cfg(test)]
+mod blob_rewrite_tests {
+    use super::whole_external_uri_for_schema_rewrite;
+    use crate::error::OmniError;
+
+    #[test]
+    fn schema_rewrite_never_widens_an_external_blob_range() {
+        assert_eq!(
+            whole_external_uri_for_schema_rewrite("s3://bucket/base/object".to_string(), 0, None,)
+                .unwrap(),
+            "s3://bucket/base/object"
+        );
+        for (offset, length) in [(1, None), (0, Some(1)), (7, Some(0))] {
+            let error = whole_external_uri_for_schema_rewrite(
+                "s3://user:secret@bucket/base/object?signature=private".to_string(),
+                offset,
+                length,
+            )
+            .unwrap_err();
+            assert!(matches!(error, OmniError::Manifest(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot preserve ranged external Blob descriptor")
+            );
+            assert!(!error.to_string().contains("secret"));
+            assert!(!error.to_string().contains("signature"));
+            assert!(!error.to_string().contains("private"));
+        }
+    }
 }

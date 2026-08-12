@@ -31,11 +31,13 @@
   staged Arrow memory (with an earlier conservative parsed-value/base64 guard
   to bound the load spool, and a streamed remaining-budget guard on mutation
   update matches); keyed external-URI or stored-update blob payloads exceeded
-  the remaining 32 MiB table budget before their bytes were read; a BranchMerge
-  materialized row, escaped delete filter, complete retained delete plan, or
-  operation-wide projected scalar validation delta exceeded 32 MiB; or its
-  logical data chain would exceed 1,024 transactions. This is detected before
-  recovery arm and has no durable effect.
+  the remaining 32 MiB operation budget before their bytes were read; a
+  BranchMerge materialized row, aggregate managed-plus-external carried payload,
+  retained external-URI metadata, escaped delete filter, complete retained
+  delete plan, or operation-wide projected scalar validation delta exceeded
+  32 MiB; a row-writing BranchMerge selected more than 8,192 external-reference
+  cells; or its logical data chain would exceed 1,024 transactions. This is
+  detected before recovery arm and has no durable effect.
   HTTP returns **413** with `resource_limit.{resource,limit,actual}`.
   Reshape the input; it is not partial success. Served streaming export also
   uses this typed response before `200`: `stream_export_slots` means another
@@ -44,13 +46,45 @@
   budget did not become available within 250 ms. Those export limits are
   transient; finish or disconnect the earlier response and retry rather than
   changing graph data.
-  The full set of `resource_limit.resource` names a client can receive:
+  The full set of `resource_limit.resource` names a client can receive is:
   `strict_input_arrow_bytes` (a strict load's projected Arrow allocation
   exceeded 32 MiB — this preflight applies to **every** load mode, Overwrite
   included), `graph_batch_request_bytes`, `graph_batch_line_bytes`,
-  `graph_batch_json_structural_slots`, `stream_export_slots`, and
-  `stream_export_transport_bytes`, plus the keyed row/byte ceilings described
-  above.
+  `graph_batch_json_structural_slots`, `stream_export_slots`,
+  `stream_export_transport_bytes`, `external Blob URI bytes`, `external Blob
+  reference cells`, `external Blob URI metadata bytes`, `external Blob object
+  bytes`, `decoded blob input bytes`, `materialized blob payload bytes`,
+  `materialized external blob payload bytes`, `branch-merge delete filter
+  bytes`, `branch-merge retained delete plan bytes`, `branch-merge fenced row
+  bytes`, `branch-merge recovery transaction chain`, and `branch-merge retained
+  validation delta bytes`. Table-specific instances use these enumerable
+  patterns: `keyed rows for {table_key}`, `keyed parsed value bytes for
+  {table_key}`, `decoded blob input bytes for {table_key}`, `keyed write rows
+  for {table_key}`, `keyed write bytes for {table_key}`, `keyed bytes for
+  {table_key}`, `branch-merge pure-insert validation batch rows for
+  {table_key}`, `branch-merge pure-insert validation batch bytes for
+  {table_key}`, `branch-merge recovery transactions for {table_key}`, `proven
+  insert delta rows for {table_key}`, and `proven insert delta bytes for
+  {table_key}`. Treat `resource` as a typed discriminator, including its
+  documented table-key suffix; do not infer one ceiling from another.
+- `ExternalBlobPolicy { uri, reason }` — new external-URI ingress is malformed,
+  uses a disallowed execution scope, or falls outside the graph's normalized
+  allow bases. The URI field is normalized and credential-free (or redacted);
+  raw credentials are never echoed. HTTP returns **400**. This failure happens
+  before external payload reads, recovery arm, target HEAD/ref movement, or a
+  graph-visible effect. Scalar-only input preparation may already have created
+  reclaimable temporary staging.
+- `ExternalBlobSource { uri, reason }` — an allowed external source could not
+  be probed or read. HTTP returns **424 Failed Dependency**; it is not collapsed
+  into a generic storage 500. The response carries
+  `external_blob_source: { uri, reason }`; `uri` is normalized and
+  credential-free (or redacted), while `reason` is human-readable and must not
+  be parsed. Its optional top-level `code` is omitted: the structured field is
+  the rolling-safe discriminator because extending the closed `ErrorCode` enum
+  would break older clients. Source metadata or payload I/O may already have
+  begun—that is what this error reports—but the operation fails before recovery
+  is armed, a target HEAD/ref moves, or graph-visible state changes. Scalar-only
+  input preparation may already have created reclaimable temporary staging.
 - `Policy(String)` — a Cedar policy denied the action for the resolved actor.
   HTTP returns **403**.
 - `AlreadyInitialized { uri }` — `init` targeted a root that already holds a

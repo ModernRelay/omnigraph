@@ -4,7 +4,9 @@ use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::{LoadMode, load_jsonl, load_jsonl_file};
+use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::ir::ParamMap;
 
 use helpers::*;
@@ -903,18 +905,18 @@ node Document {
 const BLOB_QUERIES: &str = r#"
 query all_docs() {
     match { $d: Document }
-    return { $d.title, $d.content }
+    return { $d.title }
 }
 
 query get_doc($title: String) {
     match { $d: Document { title: $title } }
-    return { $d.title, $d.content }
+    return { $d.title }
 }
 
 query get_doc_clause($title: String) {
     match { $d: Document
         $d.title = $title }
-    return { $d.title, $d.content }
+    return { $d.title }
 }
 "#;
 
@@ -960,7 +962,7 @@ async fn blob_load_base64_inline() {
 }
 
 #[tokio::test]
-async fn blob_query_returns_metadata() {
+async fn blob_bearing_query_filters_without_projecting_blob() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
@@ -986,17 +988,15 @@ async fn blob_query_returns_metadata() {
         let json = result.to_sdk_json();
         let row = json.as_array().unwrap().first().unwrap();
         assert_eq!(row["d.title"], "readme", "{query_name}");
-        // Blob columns return null in query projections — data is accessed via take_blobs API.
-        // (Lance bug: BlobsDescriptions + filter triggers assertion, so blobs are excluded from scan)
         assert!(
-            row["d.content"].is_null(),
-            "{query_name}: blob column should return null in query projection"
+            row.get("d.content").is_none(),
+            "{query_name}: Blob values are accessed through the dedicated Blob API"
         );
     }
 }
 
 #[tokio::test]
-async fn blob_null_returns_null_in_query() {
+async fn blob_null_does_not_break_non_blob_projection() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
@@ -1017,11 +1017,9 @@ async fn blob_null_returns_null_in_query() {
     let json = result.to_sdk_json();
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "empty");
-    // Nullable blob with no value should return null
     assert!(
-        row["d.content"].is_null(),
-        "null blob should return null, got: {}",
-        row["d.content"]
+        row.get("d.content").is_none(),
+        "Blob values must not leak through ordinary query projection"
     );
 }
 
@@ -1055,11 +1053,17 @@ async fn blob_insert_mutation() {
     let json = qr.to_sdk_json();
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "new-doc");
-    // Blob column present but null in query projection (data accessed via take_blobs)
+    // Blob columns are not part of ordinary query projection.
     assert!(
-        row.get("d.content").is_some(),
-        "content column should be present"
+        row.get("d.content").is_none(),
+        "content column should be absent"
     );
+
+    let blob = db
+        .read_blob("Document", "new-doc", "content")
+        .await
+        .unwrap();
+    assert_eq!(&blob.read().await.unwrap()[..], &[1, 2, 3]);
 }
 
 #[tokio::test]
@@ -1562,8 +1566,8 @@ node Article {
 }
 "#;
     let mutations = r#"
-query insert_article($slug: String, $summary: String, $rating: I32) {
-    insert Article { slug: $slug, summary: $summary, rating: $rating }
+query insert_article($slug: String, $attachment: Blob, $summary: String, $rating: I32) {
+    insert Article { slug: $slug, attachment: $attachment, summary: $summary, rating: $rating }
 }
 query update_summary($slug: String, $summary: String) {
     update Article set { summary: $summary } where slug = $slug
@@ -1582,7 +1586,11 @@ query get_article($slug: String) {
         mutations,
         "insert_article",
         &mixed_params(
-            &[("$slug", "a1"), ("$summary", "hello")],
+            &[
+                ("$slug", "a1"),
+                ("$attachment", "base64:"),
+                ("$summary", "hello"),
+            ],
             &[("$rating", 42)],
         ),
     )
@@ -1610,6 +1618,10 @@ query get_article($slug: String) {
     .await
     .unwrap();
     assert_eq!(qr.num_rows(), 1);
+
+    let attachment = db.read_blob("Article", "a1", "attachment").await.unwrap();
+    assert_eq!(attachment.size(), 0);
+    assert!(attachment.read().await.unwrap().is_empty());
 }
 
 // ─── Regression: blob update null → non-null ─────────────────────────────────
@@ -1649,33 +1661,163 @@ async fn blob_update_null_to_non_null() {
 
 #[tokio::test]
 async fn blob_load_external_file_uri() {
-    // Regression: loading blobs with external file:// URIs was rejected with
-    // "External blob URI '...' is outside registered external bases" because
-    // allow_external_blob_outside_bases was not set on data table write paths.
+    // Overwrite is the one write mode that intentionally retains an authorized
+    // URI descriptor. Keyed modes consume the URI as a source and materialize
+    // managed bytes instead.
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    // Create a temp file to reference
+    // Create a temp file beneath one exact embedded-only base.
     let blob_dir = tempfile::tempdir().unwrap();
-    let blob_path = blob_dir.path().join("test.txt");
+    let blob_path = blob_dir.path().join("shared~source.txt");
     std::fs::write(&blob_path, b"Hello from file").unwrap();
-    let file_uri = format!("file://{}", blob_path.display());
+    let file_uri = url::Url::from_file_path(&blob_path)
+        .expect("external blob path is absolute")
+        .to_string();
+    let canonical_file_uri = url::Url::from_file_path(std::fs::canonicalize(&blob_path).unwrap())
+        .expect("canonical external blob path is absolute")
+        .to_string();
+    let base_uri = url::Url::from_directory_path(blob_dir.path())
+        .expect("external blob base is absolute")
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
 
-    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
-    let data = format!(
-        r#"{{"type": "Document", "data": {{"title": "from-file", "content": "{}"}}}}"#,
-        file_uri
-    );
+    let db = Omnigraph::init(uri, BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
+    let mut overwrite_rows = vec![
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "from-file", "content": file_uri.clone()},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "null"},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "valid-empty", "content": "base64:"},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "inline", "content": "base64:SW5saW5l"},
+        }),
+    ];
+    #[cfg(unix)]
+    let symlink_path = {
+        use std::os::unix::fs::symlink;
 
-    // Load with external URI
+        let path = blob_dir.path().join("admitted-link");
+        symlink(&blob_path, &path).unwrap();
+        overwrite_rows.push(serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "from-symlink",
+                "content": url::Url::from_file_path(&path).unwrap().to_string(),
+            },
+        }));
+        path
+    };
+    let data = overwrite_rows
+        .into_iter()
+        .map(|row| row.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Overwrite preserves the canonical admitted reference rather than
+    // silently copying it into managed storage or retaining a mutable symlink
+    // spelling.
     load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
 
-    // Verify the blob is accessible
     let blob = db
         .read_blob("Document", "from-file", "content")
         .await
         .unwrap();
-    assert!(blob.uri().is_some(), "external blob should have a URI");
+    assert_eq!(blob.uri(), Some(canonical_file_uri.as_str()));
+    assert_eq!(&blob.read().await.unwrap()[..], b"Hello from file");
+    assert!(
+        db.read_blob("Document", "null", "content").await.is_err(),
+        "canonicalizing a sibling external URI must preserve parent-null validity"
+    );
+    let empty = db
+        .read_blob("Document", "valid-empty", "content")
+        .await
+        .unwrap();
+    assert_eq!(empty.size(), 0);
+    assert!(empty.read().await.unwrap().is_empty());
+    let inline = db.read_blob("Document", "inline", "content").await.unwrap();
+    assert_eq!(&inline.read().await.unwrap()[..], b"Inline");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.txt");
+        std::fs::write(&outside, b"Outside configured base").unwrap();
+        std::fs::remove_file(&symlink_path).unwrap();
+        symlink(&outside, &symlink_path).unwrap();
+
+        let pinned = db
+            .read_blob("Document", "from-symlink", "content")
+            .await
+            .unwrap();
+        assert_eq!(pinned.uri(), Some(canonical_file_uri.as_str()));
+        assert_eq!(&pinned.read().await.unwrap()[..], b"Hello from file");
+    }
+
+    // Two raw spellings normalize to the same URI. The operation-wide
+    // preflight must share one source entry (and therefore one payload read)
+    // before either strict-insert row is staged.
+    let encoded_alias = file_uri.replace("~source", "%7Esource");
+    assert_ne!(encoded_alias, file_uri);
+    let duplicate_source_rows = format!(
+        "{}\n{}",
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "copy-a", "content": file_uri},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "copy-b", "content": encoded_alias},
+        })
+    );
+    let probes = MergeWriteProbes::default();
+    with_merge_write_probes(
+        probes.clone(),
+        load_jsonl(&db, &duplicate_source_rows, LoadMode::Append),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        probes.external_blob_probe_inputs(),
+        2,
+        "both URI-bearing cells must participate in operation-wide preflight"
+    );
+    assert_eq!(
+        probes.external_blob_probe_calls(),
+        1,
+        "normalized-equivalent URI inputs must cause one metadata probe"
+    );
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        1,
+        "normalized-equivalent URI inputs must share one preflighted payload"
+    );
+    for title in ["copy-a", "copy-b"] {
+        let copied = db.read_blob("Document", title, "content").await.unwrap();
+        assert_eq!(
+            copied.uri(),
+            None,
+            "keyed append must materialize the source URI"
+        );
+        assert_eq!(&copied.read().await.unwrap()[..], b"Hello from file");
+    }
 }
 
 // ─── Regression: execute_update on edge type ─────────────────────────────────

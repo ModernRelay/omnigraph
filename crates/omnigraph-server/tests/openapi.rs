@@ -458,6 +458,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "CommitOutput",
     "ErrorCode",
     "ErrorOutput",
+    "ExternalBlobSourceOutput",
     "ExportRequest",
     "HealthOutput",
     "IngestOutput",
@@ -831,6 +832,45 @@ fn error_code_schema_has_expected_variants() {
         "ErrorCode is a rolling wire contract: new meanings belong in optional \
          structured fields, not new closed-enum values",
     );
+}
+
+#[test]
+fn external_blob_source_error_is_structured_and_declared_on_write_routes() {
+    let doc = openapi_json();
+    let detail = &doc["components"]["schemas"]["ExternalBlobSourceOutput"];
+    let required: HashSet<&str> = detail["required"]
+        .as_array()
+        .expect("external Blob source details must declare required fields")
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    assert_eq!(required, HashSet::from(["uri", "reason"]));
+    let output_field =
+        &doc["components"]["schemas"]["ErrorOutput"]["properties"]["external_blob_source"];
+    let output_ref = output_field["oneOf"]
+        .as_array()
+        .and_then(|schemas| schemas.iter().find_map(|schema| schema["$ref"].as_str()))
+        .expect("external_blob_source must reference its structured details");
+    assert_eq!(output_ref, "#/components/schemas/ExternalBlobSourceOutput");
+
+    for path in [
+        "/graphs/{graph_id}/change",
+        "/graphs/{graph_id}/mutate",
+        "/graphs/{graph_id}/mutate/if-graph-commit",
+        "/graphs/{graph_id}/queries/{name}",
+        "/graphs/{graph_id}/queries/{name}/if-graph-commit",
+        "/graphs/{graph_id}/load",
+        "/graphs/{graph_id}/load/ndjson",
+        "/graphs/{graph_id}/ingest",
+        "/graphs/{graph_id}/branches/merge",
+    ] {
+        assert_eq!(
+            doc["paths"][path]["post"]["responses"]["424"]["content"]["application/json"]["schema"]
+                ["$ref"],
+            "#/components/schemas/ErrorOutput",
+            "{path} must advertise the external Blob source failure contract",
+        );
+    }
 }
 
 #[test]

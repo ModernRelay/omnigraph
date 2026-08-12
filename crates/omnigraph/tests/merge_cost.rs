@@ -139,6 +139,38 @@ fn merge_validation_is_delta_scoped() {
              {COMMON_MERGE_MANIFEST_SCAN_CEILING}",
             io.manifest_scan_count,
         );
+
+        // True three-way scalar merge: source and target both advance from the
+        // same base on disjoint rows. The Blob descriptor preflight must not
+        // add a second full base/source/target scan to an ordinary table.
+        db.branch_create("scalar-three-way").await.unwrap();
+        db.mutate(
+            "scalar-three-way",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "source-only")], &[("$age", 42)]),
+        )
+        .await
+        .unwrap();
+        db.mutate(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "target-only")], &[("$age", 43)]),
+        )
+        .await
+        .unwrap();
+        let (res, three_way_io, three_way_staged) =
+            measure_with_staged(db.branch_merge("scalar-three-way", "main")).await;
+        res.unwrap();
+        assert_eq!(
+            three_way_staged.ordered_cursor_scan, 3,
+            "a scalar three-way merge must scan base/source/target once each, not repeat them for Blob selection"
+        );
+        eprintln!(
+            "MERGE    scalar three-way      : data_reads={} ordered_cursors={}",
+            three_way_io.data_reads, three_way_staged.ordered_cursor_scan,
+        );
     });
 }
 

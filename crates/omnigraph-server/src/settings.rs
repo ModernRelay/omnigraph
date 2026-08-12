@@ -166,6 +166,7 @@ pub(crate) async fn load_cluster_settings(
             uri: graph.root.to_string_lossy().to_string(),
             policy: graph_policies.get(&graph.graph_id).cloned(),
             embedding,
+            external_blob_policy: graph.external_blob_policy.clone(),
             queries: registry,
         });
     }
@@ -641,6 +642,7 @@ mod tests {
                         .into_owned(),
                     policy: None,
                     embedding: None,
+                    external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
                     queries: crate::queries::QueryRegistry::default(),
                 }],
                 config_path: temp.path().join("omnigraph.yaml"),
@@ -694,6 +696,7 @@ mod tests {
                         .into_owned(),
                     policy: None,
                     embedding: None,
+                    external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
                     queries: crate::queries::QueryRegistry::default(),
                 }],
                 config_path: temp.path().join("cluster"),

@@ -18,10 +18,10 @@ properties. Similar names such as `_row_id` remain valid.
 
 ## Built-in scalar types
 
-| Scalar | Arrow type |
+| Scalar | Logical / physical representation |
 |---|---|
 | `String` | Utf8 |
-| `Blob` | LargeBinary |
+| `Blob` | Compiler placeholder: LargeBinary; persisted graph column: Lance Blob-v2 (`lance.blob.v2`) on file format V2_2 |
 | `Bool` | Boolean |
 | `I32` / `I64` | Int32 / Int64 |
 | `U32` / `U64` | UInt32 / UInt64 |
@@ -38,13 +38,21 @@ properties. Similar names such as `_row_id` remain valid.
 | Constraint | On | Effect |
 |---|---|---|
 | `@key(p, …)` | node | Primary key; the complete ordered tuple identifies the node and implies indexes on its columns |
-| `@unique(p, …)` | node, edge | Uniqueness across listed columns |
+| `@unique(p, …)` | node, edge | Uniqueness across listed non-Blob columns |
 | `@index(p, …)` | node, edge | Build a scalar (BTREE) index on the columns |
 | `@range(p, min..max)` | node | Numeric range validation (open ranges allowed) |
 | `@check(p, "regex")` | node | Regex pattern validation |
 | `@card(min..max?)` | edge | Edge multiplicity — default `0..*`; `0..1`, `1..1`, `1..*`, etc. |
 
-Edge bodies only allow `@unique` and `@index`.
+Edge bodies only allow `@unique` and `@index`. Blob properties are not eligible
+for `@key`, `@unique`, `@index`, or `@embed`, whether the constraint is written
+on the property or in the type body.
+
+Compatibility note: a v6 graph whose persisted accepted schema predates v0.10
+and contains the formerly accepted body-level `@unique(BlobProperty)` shape can
+still be opened for inspection and export. New init and schema-apply input
+reject that shape; the compatibility reader does not make the constraint
+enforceable. Rebuild the graph with the invalid constraint removed.
 
 ## Annotations
 
@@ -56,8 +64,44 @@ Edge bodies only allow `@unique` and `@index`.
 
 ## Table layout
 
-- Each node type compiles to a table with an `id: Utf8` column plus all declared properties (blob columns are stored as `LargeBinary`); `implements` clauses expand the interface's properties into the node.
+- Each node type compiles to a table with an `id: Utf8` column plus all declared properties; `implements` clauses expand the interface's properties into the node.
 - Each edge type compiles to a table with `id: Utf8, src: Utf8, dst: Utf8` plus the edge's own properties. Edge endpoint types (`from`/`to`) must exist, and edge names are matched case-insensitively.
+
+The compiler uses LargeBinary only as its dependency-free logical placeholder
+for `Blob`. When the engine creates a physical node or edge table, it replaces
+that placeholder with Lance Blob-v2 on explicit file format V2_2. Blob-v2 is a
+descriptor-backed extension column: null is the Arrow parent validity, while a
+non-null zero-length value is a valid empty Blob. Physical placement is
+Lance-owned and is not part of the `.pg` schema contract.
+
+Blob input keeps one JSON spelling across nodes and edges:
+
+- `base64:<payload>` supplies managed bytes owned by the graph;
+- any other string requests an external URI reference.
+
+New external URI ingress is denied by default. Embedded callers must install a
+graph-level `ExternalBlobPolicy` with an exact allowed base; cluster-served
+graphs declare the equivalent per-graph policy in `cluster.yaml`. The policy is
+an additional resource boundary, not a per-request option. It compares
+normalized URI components rather than string prefixes, never permits
+`file://` in server execution, and probes each distinct approved source before
+the write's first durable effect.
+
+The direct-store CLI has no allow-policy source in this phase, so a bare
+`--store`/positional graph open admits managed `base64:` Blob input only. To
+write a new external reference from the CLI, target a cluster server whose
+graph has configured bases; an embedded application can instead install the
+same graph-level policy on its engine builder. There is no command flag that
+weakens the policy for one request.
+
+Write mode determines ownership. Overwrite preserves an approved external URI
+as a caller-owned reference. Strict insert, upsert, append/merge load,
+mutation-update carry, and a HEAD-advancing branch merge that writes rows copy
+approved source bytes into managed Blob storage under the existing 32 MiB
+keyed-write ceiling. A pointer-only branch fast-forward preserves the existing
+descriptor without policy approval or source I/O. Existing stored external
+references remain readable and exportable when new ingress is denied;
+OmniGraph never deletes their target objects.
 
 For a keyed node, `id` is derived from the complete typed `@key` tuple. A
 single-column key keeps its canonical scalar spelling. A composite key is an
