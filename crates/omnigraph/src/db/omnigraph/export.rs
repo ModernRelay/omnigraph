@@ -546,7 +546,12 @@ async fn export_blob_column_values(
     }
 
     for (idx, position) in non_null_positions.into_iter().enumerate() {
-        let blob = &sorted_blobs[inverse_perm[idx]];
+        let blob = sorted_blobs[inverse_perm[idx]].as_ref().ok_or_else(|| {
+            OmniError::Lance(format!(
+                "blob export for '{}' returned a null accessor for a non-null description",
+                column_name
+            ))
+        })?;
         let value = if let Some(uri) = blob.uri() {
             uri.to_string()
         } else {

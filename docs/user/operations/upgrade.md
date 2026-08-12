@@ -37,7 +37,7 @@ from that line (the latest is safest):
 | internal schema v3 | omnigraph 0.6.2–0.7.2 | the latest 0.7.x (e.g. 0.7.2) |
 | internal schema v4 | omnigraph 0.8.x | the latest 0.8.x (e.g. 0.8.1) |
 | internal schema v5 | unreleased development builds | the exact source build that wrote the graph |
-| internal schema v6 | omnigraph 0.9.x | — current format; no rebuild needed |
+| internal schema v6 | omnigraph 0.9.x–0.10.x | — current format; no rebuild needed |
 
 Internal schemas v7-v19 were unreleased development formats from the rejected
 MemWAL experiment. They are not an upgrade ladder and the current binary does
@@ -253,7 +253,7 @@ This format cannot be obtained by adding metadata to a live v4 or development
 v5 root. Lance's filtered/unfiltered conflict behavior is directional, so every
 table image and every writer must cross the boundary together. For a released
 v4 graph, quiesce writers, export with the latest 0.8.x binary, initialize a
-**different** root with the current 0.9.x binary, load the export, verify the v6
+**different** root with the current 0.10.x binary, load the export, verify the v6
 stamp and data, then cut the whole fleet over. A development v5 root must be
 exported with the exact source build that wrote it. The current binary refuses
 both older roots, and the old binary must never write the new v6 root.

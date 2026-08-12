@@ -233,14 +233,18 @@ them explicit.
   release exposure: binaries ≤ v0.8.0 predate even the pin — the rebuild-free
   remedy for fleets is upgrading the binary (see the 2026-07-05 stanza in
   [lance.md](lance.md)).
-- **Blob-column compaction — CLOSED (9.0.0-beta.15 bump):** Lance 8.0.0+
-  compacts blob-v2 correctly (upstream #7017, hardened by #7618). The
-  `LANCE_SUPPORTS_BLOB_COMPACTION` gate, the optimize skip branch, and
-  `SkipReason::BlobColumnsUnsupportedByLance` were removed;
-  `lance_surface_guards.rs::compact_files_succeeds_on_blob_columns` and
-  `maintenance.rs::optimize_compacts_blob_table_alongside_plain_table` pin the
-  positive behavior (a red there means blob compaction regressed — restore the
-  skip machinery from git history).
+- **Blob-column compaction — CLOSED (Lance 10.0.0 bump):** Lance 8 restored
+  structural Blob-v2 compaction (#7017, hardened by #7618), but Lance 9 still
+  misclassified a valid empty Blob as null while compacting (#7965, with
+  follow-up descriptor hardening in #8070). Lance 10 closes that reachable
+  gap. `lance_surface_guards.rs::compact_files_succeeds_on_blob_columns` pins
+  stable-row-ID selection cardinality plus exact non-empty/null/valid-empty/
+  neighbouring bytes across raw compaction;
+  `maintenance.rs::optimize_compacts_blob_table_alongside_plain_table` pins the
+  same distinction through graph-level `optimize` and its one publication. A
+  future Lance bump may not land while either guard is red: the same change
+  must carry an upstream fix or introduce a current, typed, per-table skip with
+  its own regression test. Deleted skip code is not a fallback contract.
 - **Recovery is serialized against live writers in-process only:** every
   `Omnigraph` handle for one canonical local root identity (lexically absolute,
   with existing symlink ancestors resolved) shares a root-scoped queue manager;

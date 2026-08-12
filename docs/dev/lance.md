@@ -167,7 +167,139 @@ When Lance ships a major release that changes any of the above (file format bump
 > contracts. Current ingestion reuses ordinary commit-visible graph Load and
 > current storage format is manifest v6. See [wal-removal.md](wal-removal.md).
 
-### Last alignment audit: 2026-07-25 (Lance 9.0.0 stable; crates.io)
+### Last alignment audit: 2026-08-10 (Lance 10.0.0 stable; crates.io)
+
+OmniGraph moved the complete Lance package family from 9.0.0 to 10.0.0 and
+opened the OmniGraph 0.10.0 development line. The release branches diverged:
+the exact tag graph contains 36 v9-only and 142 v10-only commits. Patch
+normalization leaves 113 v10-side unique patches; PR-identity normalization
+removes 32 shared cherry-picked PRs and leaves **110 v10-side commits** (90 new
+numbered PRs plus 20 release/chore commits). Backport wrapper #8146 packages
+three underlying PR changes, so no single normalized number should be mistaken
+for the raw tag delta. The audit reviewed that semantic delta and the complete
+matching format, transaction, row-lineage, Blob, maintenance, index,
+performance, and object-store pages.
+
+This is **not an OmniGraph storage-format event**. Lance 10 introduces exact
+`ConcreteFileVersion` APIs and an unstable V2_3 sparse-structural-page format,
+but OmniGraph continues to request explicit stable V2_2 at every write site.
+Internal manifest schema remains v6 and ordinary recovery remains v9. The
+declared dependency floors are also unchanged: Rust 1.91, Arrow 58,
+DataFusion 54, `object_store` 0.13.2, Prost 0.14.1, and roaring 0.11.4. The
+actual lock adds Lance's `quick_cache` backend (and its `hashbrown` dependency)
+without moving those substrate floors.
+
+**Why 10.0.0 instead of a 9.0.1 patch release:** Lance 9.0.1 backported the
+two decoder fixes below, so 10 is not the only secure/hardened line. OmniGraph
+chose 10 for the broader set of reachable correctness fixes and therefore did
+not cut OmniGraph 0.9.1.
+
+Reachable fixes and the one compatibility residual:
+
+- **Stable-row-ID index maintenance (#7704).** `filter_deleted_ids` could
+  misalign IDs and row addresses while splitting/joining IVF partitions after
+  deletes. OmniGraph enables stable row IDs on every table and runs
+  `optimize_indices`, so the IVF maintenance shape was live. The fix keeps both
+  arrays aligned.
+- **Flat parallel KNN ordering (#7868), partially closed upstream.** Lance 10
+  preserves global order when the final plan still advertises the sorted KNN
+  candidate stream. OmniGraph's actual stable-row-ID shape then late-hydrates
+  ordinary node payload through a `LanceRead` that drops that ordering metadata;
+  a parallel final coalesce can still put row 8,192 before row 0. This affects
+  both flat fallback and indexed/refined candidates, and it would also corrupt
+  RRF rank because OmniGraph deliberately trusts search-source order. The 0.10
+  adapter therefore requests one DataFusion output partition for `nearest`
+  until Lance preserves/remaps row-stream ordering. Lance still performs
+  concurrent reads and decodes inside that partition. A raw plan tripwire pins
+  the residual and a >8,192-result graph query pins the compatibility fence.
+  Ordinary `.gq ORDER BY` remains separate and is sorted by OmniGraph after
+  collection.
+- **Blob null/empty correctness (#7965, #8070).** Valid zero-length Blob-v2
+  values could become null during compaction; the Blob-v1 zero-length range
+  path could also damage a neighbouring payload. The exact positive guard now
+  pins non-empty + null in fragment one, a valid empty leading fragment two,
+  neighbouring bytes, stable row IDs, and a 3→1 rewrite through both raw Lance
+  compaction and graph-level `optimize`.
+- **Blob selection totality (#7903, #8003).** `take_blobs` now returns
+  `Vec<Option<BlobFile>>`; `read_blobs` and `read_blob_ranges` preserve one
+  ordered slot per selector/request, including duplicates, with `None` for
+  null and a non-null empty result for valid empty. Unknown or deleted stable
+  row IDs reject the whole operation with typed `InvalidInput`. All four
+  production `take_blobs` consumers were adapted to reject a null accessor for
+  a descriptor OmniGraph already classified non-null.
+- **Stale CreateIndex coverage (#8011).** Rebase now prunes coverage for
+  fragments whose indexed column was rewritten after an index build started.
+  This is valuable defense in depth for OmniGraph's staged index shape and for
+  unsupported foreign writers; supported writers already pin/revalidate their
+  baseline and reject non-exact commit versions, so the audit does not claim a
+  demonstrated supported-path corruption.
+- **Decoder hardening (#8138, #8144 via #8146).** Lance now bounds-checks a
+  variable-full-zip length prefix and rejects out-of-bounds variable-width
+  offsets before constructing Arrow arrays. Upstream labels these Critical
+  Fixes, but published no CVE/GHSA and did not establish a crafted-file exploit;
+  OmniGraph records them as security-relevant decoder hardening rather than
+  overstating that evidence.
+
+Other v10 improvements inherited without OmniGraph-specific code include
+same-column scalar-index predicate normalization (#6782), rebinding cached
+vector-v3 readers to the current object store (#7944), segment-native vector
+incremental append (#8047), stable wrapper identity in the object-store cache
+(#8068), parallel cold FTS document-length loading (#8119), and overflow-safe
+bounded slot backoff (#7883). The #7883 bound is proportional to observed
+latency, not an absolute commit deadline. Retry-safe FTS metadata load (#7838),
+the hierarchical-k-means typed error (#7869), and fragment-reuse trimming
+(#7870) appear in the v10 release notes but were already cherry-picked into
+released v9.0.0; they remain useful inherited behavior, not gains from this
+bump.
+
+One non-blocking performance follow-up remains: zone-map seed plumbing (#7427)
+calls `load_indices()` for every existing V2 Append before discovering that
+OmniGraph has no ZoneMap. The local write-cost gates stay green, but the
+bucket-gated S3 cost cell did not run and does not isolate a cold indexed
+Append. Measure that exact RustFS/object-trip shape before claiming the bump has
+zero ingestion-latency effect; if it regresses, the right fix is an upstream
+index-type/config short-circuit, not a parallel OmniGraph write path.
+
+Breaking/API adaptations were narrow:
+
+- Blob selectors gained the explicit `Option` contract above.
+- Transaction protobuf field 5 keeps its wire meaning while the Rust field was
+  renamed from `Operation::Update::merged_generations` to
+  `compacted_sstables`. OmniGraph's pure-insert certificate follows the new
+  vocabulary and still requires the field empty.
+- Fixed-size BLAKE3 cache keys (#7878) remove metadata-key enumeration from the
+  public cache surface. OmniGraph has no custom cache backend; its session
+  isolation guard now uses `metadata_cache_stats()`.
+- Compaction's row-address remapper became optional/async (#7778). OmniGraph
+  uses high-level `compact_files` and implements no remapper, so no production
+  adaptation was required.
+
+Important non-claims:
+
+- `read_blobs` and `read_blob_ranges` already existed in Lance 9; Lance 10 makes
+  their null/cardinality behavior coherent rather than introducing them.
+- Merge sources may now omit Blob columns (#7615), but Lance still materializes
+  and rewrites unchanged Blob-v2 values when rows move fragments. This is not a
+  zero-copy sibling-Blob update primitive.
+- The generic Arrow all-null-struct merge fix (#8049) plausibly protects Blob-v2
+  descriptor reconstruction, but upstream has no Blob-specific reproducer; the
+  audit does not relabel it as a proven Blob fix.
+- Exact v10 source still uses 64 KiB inline, 4 MiB dedicated, and 1 GiB packed
+  Blob thresholds. The contemporaneous guide's 16 KiB/2 MiB prose is stale and
+  must not be copied into OmniGraph's runtime contract.
+
+Evidence run for this bump: locked Cargo metadata/tree inspection resolves the
+complete Lance family to 10.0.0 with no v9 member; `cargo check --workspace
+--locked` and the all-targets form pass; all 31 `lance_surface_guards`, all 31
+`search` tests, and all 33 `maintenance` tests pass; the canonical
+feature-superset workspace test passes; both default and failpoint-superset
+all-target clippy gates pass with warnings denied; and the generated OpenAPI
+version is 0.10.0 with its drift test green. Bucket-gated
+RustFS/S3 cells had no configured bucket in this local run and remain CI's
+responsibility. The documentation-index, tracked-diff, and formatting checks
+pass.
+
+### Prior alignment audit: 2026-07-25 (Lance 9.0.0 stable; crates.io)
 
 > **Post-#449 note (2026-08-06):** the RFC-026 MemWAL/streaming machinery and
 > its test suites (`memwal_stream*`, `memwal_enrollment_gate`, the two B2b

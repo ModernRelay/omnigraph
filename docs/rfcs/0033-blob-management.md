@@ -14,16 +14,17 @@ owner: OmniGraph maintainers
 **Date:** 2026-08-09
 **Author track:** Maintainer design series
 **Depends on:** RFC-022 unified writes, RFC-023 exact `id` fencing,
-RFC-028 stable schema identity, internal manifest schema v6, and Lance 9.0.0
+RFC-028 stable schema identity, internal manifest schema v6, and Lance 10.0.0
 blob-v2 (`lance.blob.v2`) on file format V2_2.
-**Surveyed:** OmniGraph `e53f3c9509d0` and Lance 9.0.0.
+**Surveyed:** OmniGraph `8d12b66703ac`; Lance 9.0.0 as the defect baseline;
+and Lance 10.0.0 as the required implementation substrate.
 **Audience:** engine, compiler, server, CLI, security, storage, maintenance,
 and documentation maintainers.
 
-This RFC is the required successor to the reverted blob-delivery work recorded
-in [`docs/internal/blob-api.md`](../internal/blob-api.md). It takes the useful
-parts of that experiment as evidence, not as an accepted contract. Nothing in
-that internal note is restored merely by accepting this RFC.
+This RFC is the required successor to an earlier reverted blob-delivery
+experiment. The relevant evidence and decisions are restated here; no untracked
+internal note is part of the contract, and nothing from the experiment is
+restored merely by accepting this RFC.
 
 ---
 
@@ -59,10 +60,12 @@ This RFC makes the following decisions:
 7. Reject Blob projection in `.gq` until the query result model has a real Blob
    descriptor value. The current behavior that substitutes null is silent data
    corruption at the API boundary and is removed.
-8. Fix all OmniGraph empty-vs-null classification to use Arrow validity, and
-   temporarily re-gate compaction of blob-bearing tables until the pinned Lance
-   empty-blob compaction reproducer is green. Correctness takes precedence over
-   compaction throughput.
+8. Fix all OmniGraph empty-vs-null classification to use Arrow validity. The
+   Lance 10.0.0 migration must land with an exact positive compaction guard for
+   null, empty, non-empty, and neighboring payloads before this RFC is
+   implemented. No production compaction skip ships. A future Lance bump whose
+   guard is red is blocked unless that same change carries a fix or a tested,
+   typed per-table skip. Correctness takes precedence over compaction throughput.
 9. Do not add schema annotations for inline, packed, or dedicated thresholds.
    Those are physical derived state and the current Lance defaults are not an
    OmniGraph compatibility promise.
@@ -96,7 +99,7 @@ At the surveyed commit:
 | `.gq` edge projection | Blob properties are excluded and typechecking rejects their use. |
 | Export | Internal bytes are materialized and emitted as base64; external references are emitted as URIs. One row's full Blob set is indivisible scratch. |
 | HTTP / CLI | There is no Blob delivery, stat, upload, or clear surface. |
-| Maintenance | `optimize` compacts blob-bearing tables on the pinned Lance version. |
+| Maintenance | On the pre-migration Lance 9.0.0 baseline, `optimize` compacted Blob-v2 tables through the reachable empty-Blob defect described in §8.5. The OmniGraph 0.10 development line now pins Lance 10.0.0 and the exact fixed behavior. |
 
 The public schema documentation also calls Blob storage `LargeBinary`. That is
 only the compiler's logical placeholder. OmniGraph-created data tables use the
@@ -173,7 +176,7 @@ maintenance consume the same meanings.
   query projection.
 - User control over Lance's inline, packed-sidecar, dedicated-file, or pack-file
   thresholds.
-- A public batch-Blob endpoint. Engine internals may use Lance's planned batch
+- A public batch-Blob endpoint. Engine internals may use Lance's batched read
   APIs where doing so preserves the facade.
 - Creating a missing node or edge as a side effect of uploading bytes.
 
@@ -334,10 +337,13 @@ impl Omnigraph {
 `BlobReader` is an engine-owned `Send + Sync` abstraction with `len()` and
 bounded `read_range(Range<u64>)`. An implementation may wrap Lance
 `read_blob_ranges`, `read_blobs`, or `take_blobs`, but Lance types do not appear
-in public signatures. Complete-payload internal work uses Lance's planned
-`read_blobs` API; it must not build a thread pool around one `BlobFile::read()`
-per row. Range work prefers `read_blob_ranges` when the pinned Rust API supports
-the needed selector.
+in public signatures. Complete-payload internal work uses Lance's batched
+`read_blobs` API. It and `read_blob_ranges` already shipped in Lance 9.0.0 with
+row-id, row-index, and row-address selectors; Lance 10.0.0 is required for their
+null-preserving, request-cardinality behavior. The hard rule is the
+anti-pattern: it must not build a thread pool around one `BlobFile::read()`
+per row. Range work prefers `read_blob_ranges` when it supports the needed
+selector.
 
 ### 4.1 Descriptor-first classification
 
@@ -393,11 +399,12 @@ pub enum BlobPrecondition {
 }
 ```
 
-`AnyExisting` means that the target entity row exists, including when the Blob
-cell is null. `Tags` uses strong comparison and matches only the managed token at
-the pinned write base. A null or external cell has no token and cannot match a
-tag. `PreconditionFailed { current_etag: Option<BlobEtag> }` is a typed successful
-decision, mapped to HTTP 412, rather than a substrate failure.
+`AnyExisting` means that a non-null Blob representation exists at the pinned
+write base; either managed or external satisfies it. An existing entity row with
+a null Blob cell does not. `Tags` uses strong comparison and matches only the
+managed token at the pinned write base. A null or external cell has no token and
+cannot match a tag. `PreconditionFailed { current_etag: Option<BlobEtag> }` is a
+typed successful decision, mapped to HTTP 412, rather than a substrate failure.
 
 After publication, a successful managed write derives the validator from the
 published table version and resulting row ID. The result is the same ETag a
@@ -680,24 +687,41 @@ not as an ideal physical plan. A future optimization may carry immutable
 prepared descriptors for unchanged cells only after a Lance surface guard proves
 that references cannot escape their source dataset/incarnation and recovery can
 account for every file. Correctness and ownership proof come before avoiding the
-copy.
+copy. Lance 10's `merge_insert` support for sources that omit Blob columns
+(upstream #7615) removes a schema-level blocker for that shape but does not by
+itself avoid the rewrite: Lance's merge path still materializes and re-writes
+target Blob values when rows move, so the unchanged-cell optimization still
+requires a descriptor-preserving or column-patching proof.
 
 ### 8.5 Optimize and cleanup
 
-The pinned Lance 9.0.0 survey contains a reachable empty-Blob compaction gap.
-Implementation of this RFC restores a Blob compaction capability gate and a
-reported skip reason for every blob-bearing table. It also adds an upstream
-surface reproducer containing, in order, non-empty bytes, a valid empty Blob,
-another non-empty Blob, and null. The guard must verify value, nullness, and
-neighbor payloads before and after compaction.
+The Lance 9.0.0 line contains a reachable empty-Blob compaction gap
+(lance#7965): `is_inline_null_blob` classifies a prepared inline descriptor
+with `position = 0, size = 0` as null, which is also the valid descriptor of a
+zero-length managed Blob that leads its fragment. The exact reproducer —
+non-empty bytes and null in one fragment, then a valid empty Blob *leading* a
+second fragment followed by non-empty bytes; compact; verify value, nullness
+(via Arrow validity, since the 9.0.0 selection APIs omit null selections rather
+than returning one result per request), and neighbor payloads — was run as
+scratch decision evidence on 2026-08-10: **red on Lance 9.0.0** (the empty Blob
+is nullified; non-null count drops 3 → 2) and **green on Lance 10.0.0**. This
+dated scratch result is not acceptance evidence; the checked-in guard required
+below is authoritative. The nullifying shape is reachable through
+`omnigraph optimize` when a Blob-v2 table contains that valid-empty fragment
+layout and those fragments are compacted.
 
-Until that reproducer is green on the pinned Lance release, `optimize` performs
-no `compact_files` call for blob-bearing tables and reports
-`PinnedLanceEmptyBlobCompactionUnsafe`. Index reconciliation that does not route
-through the unsafe rewrite may still run only if its transaction/publication
-envelope can remain coherent without compaction. Once an upstream fix is pinned,
-the gate flips, the positive maintenance test is restored for empty and
-non-empty values together, and the skip branch may be removed.
+The OmniGraph 0.10 development line implements the Lance 10.0.0 prerequisite.
+The migration promotes the exact reproducer into
+`lance_surface_guards.rs::compact_files_succeeds_on_blob_columns` as the
+positive pin for empty/non-empty/null/neighbor preservation through
+`compact_files`; no production compaction skip ships. A future Lance bump that
+turns the guard red must not land until that same change either carries a
+proven fix or introduces a tested per-table skip that leaves the Blob table
+HEAD unchanged and reports a typed reason. The v10 fix covers Lance's
+compaction and zero-length read implementation, not OmniGraph's independently
+duplicated descriptor heuristics. Those still misclassify inline
+`0/0/empty-uri` as null, so the §4.1 central Arrow-validity decoder work remains
+required in full.
 
 Cleanup remains Lance-owned version GC under OmniGraph's manifest/ref/recovery
 floors. It can remove managed Blob sidecars only when Lance proves they are no
@@ -710,10 +734,10 @@ OmniGraph uses Blob-v2 fields only on V2_2 datasets. The canonical logical input
 and prepared physical descriptor are distinct contracts. Append/schema evolution
 must retain the exact extension metadata Lance assigned at table creation.
 
-At Lance 9.0.0, the Rust implementation's defaults are 64 KiB inline, 4 MiB
-dedicated, and 1 GiB per packed sidecar. Upstream documentation and later
-versions may use different defaults. OmniGraph does not expose or restate these
-as user promises. A graph stores the chosen field metadata, and Lance rejects
+In the surveyed Lance 9.0.0 and 10.0.0 Rust implementations, the defaults are
+64 KiB inline, 4 MiB dedicated, and 1 GiB per packed sidecar. Later versions may
+use different defaults. OmniGraph does not expose or restate these as user
+promises. A graph stores the chosen field metadata, and Lance rejects
 incompatible metadata on later appends.
 
 No `.pg` annotation is added for these thresholds. Exposing them now would turn
@@ -723,7 +747,7 @@ evidence that users need the control. If production metrics later show placement
 as a material cost term, a follow-up RFC can propose an annotation with migration
 semantics and a comparative benchmark.
 
-Planned complete reads use `Dataset::read_blobs`; planned range reads use
+Batch complete reads use `Dataset::read_blobs`; batch range reads use
 `Dataset::read_blob_ranges`; lazy single-cell reads may use `take_blobs` behind
 the engine facade. Logical row IDs are preferred within an exact snapshot.
 Physical row addresses never become public stable identity.
@@ -793,27 +817,46 @@ The implementation extends existing owners before creating new fixtures, per
 - `end_to_end.rs`: managed node and edge full/range reads; branch and snapshot
   pinning; null versus empty versus non-empty; update-only PUT; nullable clear;
   returned ETag equals a follow-up read; missing/non-Blob errors; fresh/stale/`*`
-  preconditions; external descriptor classification after the target object is
-  made unavailable.
+  preconditions, including `If-Match: *` failing for a null cell; external
+  descriptor classification after the target object is made unavailable.
 - `writes.rs`: inclusive and +1-byte PUT bounds; aggregate carried-row bound;
   target old payload is not read; every refusal proves table HEAD, manifest,
   lineage, and sidecar state unchanged.
+- Add a deterministic retry race using the existing Mutation rendezvous: pause a
+  conditional PUT after its first precondition evaluation but before effect,
+  publish a competing replacement, then resume. The first request must
+  re-evaluate against the fresh base and return 412 with the winner's ETag,
+  without a lost update or an extra table, manifest, lineage, or sidecar effect.
 - `branching.rs`: edge and node Blob reads on branches, merge preservation of
   empty bytes, and external-source accounting.
 - `export.rs`: four-way null/empty/non-empty/external round trip.
 - Existing schema-apply coverage gains an empty Blob and a neighboring non-empty
   Blob rather than adding a duplicate initialization fixture.
+- `failpoints.rs`: extend the existing Mutation recovery matrix with Blob PUT and
+  clear cells that stop after the table effect but before manifest publication;
+  reopen and prove graph visibility and the expected completed-recovery audit
+  record with no unresolved sidecar. PUT proves exact bytes and an ETag equal to
+  a fresh read. Clear proves null/NotFound with no ETag and proves the old ETag is
+  stale; the injected call itself returns no successful write outcome.
 - `forbidden_apis.rs`: the old public `read_blob -> BlobFile` surface is removed;
   new writes are registered under Mutation; no new durable call site appears.
 
 ### 12.3 Lance and maintenance guards
 
-- `lance_surface_guards.rs`: descriptor validity/cardinality and planned range
-  reads preserve null versus empty; the compaction reproducer covers neighboring
-  payload integrity.
-- `maintenance.rs`: the pinned unsafe version reports the explicit skip with no
-  Blob-table HEAD movement while plain tables still optimize in the same graph;
-  when the pin is fixed, flip the expected cell to atomic compaction of both.
+- The Lance 10.0.0 migration owns an exact `lance_surface_guards.rs` reproducer:
+  non-empty and null in one fragment; valid empty leading the next fragment and
+  followed by a non-empty neighbor; `compact_files`; then exact Arrow validity,
+  bytes, cardinality, and neighbor integrity. The dependency bump may not land
+  without this green guard.
+- For every Lance selection API the implementation actually uses (`take_blobs`,
+  `read_blobs`, or `read_blob_ranges`), surface guards pin request order and
+  duplicates, one logical result per request, null as `None`, valid empty as a
+  non-null empty result, and typed failure for an unknown or deleted stable row
+  ID. An unused API need not become part of OmniGraph's contract.
+- Extend the existing `maintenance.rs` Blob optimize test with the same
+  empty-leading-fragment layout. Assert exact payloads and Arrow validity plus
+  one atomic graph publication for the Blob and plain tables; row count alone is
+  insufficient.
 - `cleanup` retains a managed sidecar reachable from a snapshot/ref and never
   attempts deletion of an external URI.
 
@@ -821,7 +864,8 @@ The implementation extends existing owners before creating new fixtures, per
 
 - `data_routes.rs`: GET/HEAD headers; empty 200; ranges and conditionals; external
   302 with zero external I/O; branch/snapshot validation; PUT/DELETE; 412/413;
-  node and edge selectors; authorization and actor attribution.
+  node and edge selectors; authorization and actor attribution. A payload-read
+  probe must remain at zero for managed HEAD on both empty and near-limit values.
 - `openapi.rs`: regenerate and compare the binary request/response surface.
 - `cli_data.rs`: stdin/file PUT, stdout/file GET, stat, clear, ranges, snapshots,
   external no-follow behavior, JSON output, and stable failure text.
@@ -829,23 +873,34 @@ The implementation extends existing owners before creating new fixtures, per
   the failures listed in §6.
 - `write_cost.rs` and its S3 owner: fixed external-reference counts prove shared
   registry reuse, URI deduplication, bounded probes, and no per-row cold setup.
-- Add a served streaming memory/RSS scenario for a near-limit managed payload;
-  integration tests own bounds and cancellation, not wall-clock thresholds.
+- Extend the bounded transport/backpressure owner with a paused-client test that
+  records at most two retained chunks and at most 8 MiB of retained payload for a
+  near-limit managed Blob. Disconnect must drop the reader and snapshot pin.
+  These deterministic counters, rather than a platform-noisy RSS number, are the
+  acceptance gate.
 
 Acceptance requires the canonical workspace test graph, the relevant focused
 suites from a clean baseline, `scripts/check-agents-md.sh`, OpenAPI drift, and a
 live raw PUT → ranged GET → stale If-Match exercise against the cluster server.
+The object-store cost evidence is explicitly on-demand and is not implied by the
+canonical local test graph. Follow
+[`deployment.md` → Testing against S3 locally](../user/deployment.md#testing-against-s3-locally),
+run `cargo test -p omnigraph-engine --test write_cost_s3` with the documented
+bucket, endpoint, and credential environment, and attach the untruncated test log
+plus the non-secret endpoint configuration to the implementation PR.
 
 ## 13. Rollout
 
 Implementation lands in ordered phases; a later phase may not weaken an earlier
 correctness gate.
 
-### Phase 0 — correctness and containment
+### Phase 0 — substrate, correctness, and containment
 
+- Land the Lance 10.0.0 migration with the exact positive compaction surface
+  guard from §12.3. This is a prerequisite for every following phase; no Blob
+  compaction skip is introduced.
 - Centralize descriptor decoding and fix empty/null behavior everywhere.
 - Reject Blob query projection and body-level unique constraints.
-- Restore the compaction safety gate and surface the skip.
 - Add the external-base policy, default deny, and route all existing URI ingress
   through it.
 - Correct public docs that describe the physical Blob field as LargeBinary.
@@ -871,10 +926,11 @@ correctness gate.
 
 ### Phase 4 — measured optimization
 
-- Use Lance planned batch/range reads in export and materializing rewrites where
-  measurements prove fewer requests/bytes without changing contracts.
-- Remove the compaction gate only after the exact empty/neighbor guard is green
-  on the pinned Lance version.
+- Benchmark and tune the already-required batched complete/range reads in export
+  and materializing rewrites. Tuning is optional and may not weaken the batched
+  contract or change logical behavior.
+- Retain the exact empty/null/neighbor compaction guard across every future Lance
+  dependency bump.
 - Consider descriptor-preserving unchanged-cell updates only with an ownership
   proof and recovery guard.
 
@@ -887,7 +943,7 @@ them. This intentional secure-default change is called out in release notes and
 
 No architectural invariant is weakened.
 
-- **Respect the substrate:** Lance remains the Blob-v2 store and planned reader.
+- **Respect the substrate:** Lance remains the Blob-v2 store and batched reader.
   OmniGraph adds coordination and transport, not a competing object layer.
 - **One publication door / mutation once:** PUT and clear enter the existing
   Mutation transaction and one manifest CAS.
@@ -898,7 +954,9 @@ No architectural invariant is weakened.
 - **Strong consistency:** validators and preconditions are evaluated against the
   captured base; success is returned only after graph publication.
 - **Physical state is derived:** placement kind and thresholds remain Lance-owned;
-  optimize may skip unsafe physical work without failing logical reads/writes.
+  the positive guard protects current optimize. Only a future dependency bump
+  may introduce a tested typed skip for unsafe physical work, without failing
+  logical reads or writes.
 - **Stable schema identity:** ETags and internal selectors use stable table,
   incarnation, and property IDs rather than aliases or paths.
 - **Loud integrity:** false-null projection is removed, malformed descriptors
@@ -914,9 +972,10 @@ No architectural invariant is weakened.
 
 The proposal explicitly avoids the relevant deny-list items: no custom WAL,
 job queue, alternate writer, maintained side table, string-flattened filter,
-silent fallback, cloud-only fix, or public substrate type. Temporarily skipping
-unsafe Blob compaction is an application of logical-contract-over-physical-state,
-not a loss of logical Blob capability.
+silent fallback, cloud-only fix, or public substrate type. The permanent
+positive compaction guard prevents a known physical rewrite defect from becoming
+logical byte corruption. If a later dependency bump needs a temporary skip, the
+bump itself must add and test that typed behavior before it can land.
 
 ## 15. Compatibility and reversibility
 
@@ -947,10 +1006,11 @@ readable, which keeps rollback and staged policy rollout possible.
 
 ### 15.3 Substrate dependency
 
-The compaction skip is reversible through one capability gate backed by an exact
-surface guard. No upstream fix is assumed by version number alone. A future
-Lance bump must run `lance_surface_guards` and the full workspace graph before
-the gate changes.
+The exact positive compaction surface guard is a permanent dependency-bump gate;
+the initial implementation contains no skip. No upstream fix is assumed by
+version number alone. A future Lance bump must run `lance_surface_guards` and the
+full workspace graph and cannot land while the guard is red unless that same
+change carries a proven fix or a tested, typed per-table skip.
 
 ## 16. Drawbacks and rejected alternatives
 
@@ -981,8 +1041,8 @@ normalized bases are the smallest reviewable unit.
 
 Rejected as a universal rule. It removes the reason external references exist,
 can make overwrite unbounded, and would silently alter export/rebuild behavior.
-Keyed modes retain their current bounded copy only because the pinned Lance
-builder cannot preserve the reference.
+Keyed modes retain their current bounded copy because the current Lance merge
+path cannot preserve the reference.
 
 ### Add a graph-level content-addressed Blob store
 
@@ -1000,8 +1060,10 @@ optimization remain the lower-liability choice.
 ### Compact blob-bearing tables and merely document the empty bug
 
 Rejected. A known reachable corruption case cannot be converted into an
-operator caveat. Skipping derived maintenance work is cheaper than risking
-logical bytes.
+operator caveat. This RFC requires Lance 10.0.0 plus the positive guard before
+implementation. A future regression blocks its dependency bump unless that same
+change supplies a proven fix or a tested skip; logical bytes are never put at
+risk merely to retain compaction throughput.
 
 ## 17. Unresolved questions
 

@@ -87,7 +87,7 @@ pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_
 /// stamped each version (verify with
 /// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
 /// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5 was
-/// unreleased (final source commit pinned below), and v6 is 0.9.x.
+/// unreleased (final source commit pinned below), and v6 is 0.9.x–0.10.x.
 pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
     match stamp {
         1 => "0.3.1 or earlier",
@@ -97,7 +97,7 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         5 => {
             "built from unreleased final-v5 source commit 46b6d9084fb629b88d4ac9e8c546e0a30d213d19"
         }
-        6 => "0.9.x",
+        6 => "0.9.x or 0.10.x",
         // Unreachable today (1–6 are mapped; > CURRENT is caught by the ceiling
         // guard before this is consulted). Worded to read naturally after
         // "created by omnigraph " if a future bump ever leaves a gap.
@@ -310,7 +310,7 @@ mod tests {
         assert_eq!(release_for_internal_schema_version(4), "0.8.x");
         assert!(release_for_internal_schema_version(5).contains("unreleased final-v5"));
         assert!(release_for_internal_schema_version(5).contains("46b6d908"));
-        assert_eq!(release_for_internal_schema_version(6), "0.9.x");
+        assert_eq!(release_for_internal_schema_version(6), "0.9.x or 0.10.x");
         assert_eq!(
             release_for_internal_schema_version(99),
             "an unrecognized older release"

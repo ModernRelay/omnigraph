@@ -1409,12 +1409,20 @@ async fn rebuild_blob_column(
             continue;
         }
 
-        let blob = files.next().ok_or_else(|| {
-            OmniError::Lance(format!(
-                "blob rewrite for '{}' lost alignment with source rows",
-                column_name
-            ))
-        })?;
+        let blob = files
+            .next()
+            .ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "blob rewrite for '{}' lost alignment with source rows",
+                    column_name
+                ))
+            })?
+            .ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "blob rewrite for '{}' returned a null accessor for a non-null description",
+                    column_name
+                ))
+            })?;
         if let Some(uri) = blob.uri() {
             builder
                 .push_uri(uri)

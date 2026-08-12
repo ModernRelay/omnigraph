@@ -2161,7 +2161,7 @@ query find_person($name: String) {
 /// Lance 7.0.0 `RowIdIndex::new` then fails any filtered scan that needs
 /// the id→address map ("all columns in a record batch must have the same
 /// length" in release, a "Wrong range" debug assert). Fixed upstream by
-/// lance#7480; consumed here via the vendored `lance-table` patch.
+/// lance#7480 and shipped in the pinned crates.io Lance release.
 #[tokio::test]
 async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() {
     let dir = tempfile::tempdir().unwrap();
@@ -2214,7 +2214,8 @@ async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() 
 
 /// Isolation control for the regression above: the same load/delete/filtered
 /// read walk WITHOUT same-key updates (append-only merges, disjoint keys)
-/// never produces overlapping row-id ranges and passes on unpatched Lance.
+/// never produces overlapping row-id ranges and passed on the historical
+/// unpatched substrate as well.
 /// If this one fails alongside the merge-update case, the defect is not the
 /// lance#7444 overlap shape.
 #[tokio::test]

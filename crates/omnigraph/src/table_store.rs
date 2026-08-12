@@ -82,7 +82,7 @@ pub(crate) fn certified_insert_absence_rows(
         updated_fragments,
         new_fragments,
         fields_modified,
-        merged_generations,
+        compacted_sstables,
         fields_for_preserving_frag_bitmap,
         update_mode,
         inserted_rows_filter,
@@ -95,7 +95,7 @@ pub(crate) fn certified_insert_absence_rows(
         || !updated_fragments.is_empty()
         || new_fragments.is_empty()
         || !fields_modified.is_empty()
-        || !merged_generations.is_empty()
+        || !compacted_sstables.is_empty()
         || fields_for_preserving_frag_bitmap != expected_schema_preorder_ids
         || update_mode != &Some(UpdateMode::RewriteRows)
         || updated_fragment_offsets.is_some()
@@ -799,12 +799,20 @@ impl TableStore {
                 continue;
             }
 
-            let blob = files.next().ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "blob rewrite for '{}' lost alignment with source rows",
-                    column_name
-                ))
-            })?;
+            let blob = files
+                .next()
+                .ok_or_else(|| {
+                    OmniError::Lance(format!(
+                        "blob rewrite for '{}' lost alignment with source rows",
+                        column_name
+                    ))
+                })?
+                .ok_or_else(|| {
+                    OmniError::Lance(format!(
+                        "blob rewrite for '{}' returned a null accessor for a non-null description",
+                        column_name
+                    ))
+                })?;
             let next_blob_bytes = materialized_blob_bytes
                 .checked_add(blob.size())
                 .ok_or_else(|| OmniError::manifest_internal("blob byte count overflow"))?;
@@ -1706,7 +1714,7 @@ impl TableStore {
             updated_fragments: Vec::new(),
             new_fragments: transaction_fragments.clone(),
             fields_modified: Vec::new(),
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap,
             update_mode: Some(UpdateMode::RewriteRows),
             inserted_rows_filter: Some(inserted_rows_filter),
@@ -3914,7 +3922,7 @@ fn certify_insert_absence(
             updated_fragments,
             new_fragments,
             fields_modified,
-            merged_generations,
+            compacted_sstables,
             fields_for_preserving_frag_bitmap,
             update_mode,
             inserted_rows_filter,
@@ -3924,7 +3932,7 @@ fn certify_insert_absence(
             && updated_fragments.is_empty()
             && !new_fragments.is_empty()
             && fields_modified.is_empty()
-            && merged_generations.is_empty()
+            && compacted_sstables.is_empty()
             && fields_for_preserving_frag_bitmap == expected_schema_preorder_ids
             && update_mode == &Some(UpdateMode::RewriteRows)
             && updated_fragment_offsets.is_none() =>
