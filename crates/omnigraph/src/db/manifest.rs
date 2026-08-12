@@ -147,6 +147,12 @@ pub struct Snapshot {
     root_uri: String,
     version: u64,
     entries: HashMap<String, SubTableEntry>,
+    /// Exact materialized `graph_head:<branch>` commit ids from this SAME
+    /// pinned manifest version (see `ManifestState::graph_heads`). Carried so
+    /// a read can report the commit id of the world it was served from —
+    /// resolving the head separately (e.g. via `CommitGraph`) could pair this
+    /// snapshot's tables with a different version's head.
+    graph_heads: HashMap<String, String>,
     /// Per-graph read caches (shared `Session` + held-handle cache), injected by
     /// `Omnigraph::resolved_target` for live Branch reads so table opens reuse
     /// handles (0 IO on a warm repeat) and one `Session`. `None` for write-prelude
@@ -317,6 +323,17 @@ impl SnapshotTable {
 }
 
 impl Snapshot {
+    /// Exact `graph_head:<branch>` commit id from this snapshot's own pinned
+    /// manifest version (`None` = main). Absent on a branch with no commits.
+    ///
+    /// This exact row is write authority when present. A fresh named branch has
+    /// no materialized row yet; callers that need its effective inherited
+    /// lineage head must resolve it through `GraphCoordinator`.
+    pub fn graph_head(&self, branch: Option<&str>) -> Option<&str> {
+        let branch_key = branch.unwrap_or(MAIN_BRANCH_HEAD_KEY);
+        self.graph_heads.get(branch_key).map(String::as_str)
+    }
+
     /// Bind the current accepted catalog's aliases onto a historical snapshot
     /// by immutable table identity for query execution.
     ///
@@ -749,6 +766,7 @@ impl ManifestCoordinator {
                 .into_iter()
                 .map(|entry| (entry.table_key.clone(), entry))
                 .collect(),
+            graph_heads: state.graph_heads,
             read_caches: None,
         }
     }
@@ -884,19 +902,6 @@ impl ManifestCoordinator {
         }
     }
 
-    /// Re-read manifest from storage to see other writers' commits.
-    pub async fn refresh(&mut self) -> Result<()> {
-        let control_session = self.dataset.session();
-        self.dataset = open_manifest_dataset_with_session(
-            &self.root_uri,
-            self.active_branch.as_deref(),
-            &control_session,
-        )
-        .await?;
-        self.known_state = read_manifest_state(&self.dataset).await?;
-        Ok(())
-    }
-
     pub(crate) async fn refresh_with_lineage(&mut self) -> Result<Vec<GraphLineageRow>> {
         let control_session = self.dataset.session();
         let (dataset, known_state, lineage_rows) = open_manifest_graph_with_lineage(
@@ -905,6 +910,40 @@ impl ManifestCoordinator {
             &control_session,
         )
         .await?;
+        self.dataset = dataset;
+        self.known_state = known_state;
+        Ok(lineage_rows)
+    }
+
+    /// Refresh one live-read view without ever installing a manifest state
+    /// whose inherited lineage projection has not also been refreshed.
+    ///
+    /// Branches with an exact `graph_head` row keep the cheap state-only path.
+    /// A fresh named branch has no such row and needs the lineage fallback;
+    /// every fallible read completes before either field is replaced so a
+    /// transient lineage failure leaves the previous coordinator coherent.
+    pub(crate) async fn refresh_for_live_read(&mut self) -> Result<Option<Vec<GraphLineageRow>>> {
+        let control_session = self.dataset.session();
+        let dataset = open_manifest_dataset_with_session(
+            &self.root_uri,
+            self.active_branch.as_deref(),
+            &control_session,
+        )
+        .await?;
+        let known_state = read_manifest_state(&dataset).await?;
+        let branch_key = self
+            .active_branch
+            .as_deref()
+            .unwrap_or(MAIN_BRANCH_HEAD_KEY);
+        let lineage_rows = if known_state.graph_heads.contains_key(branch_key) {
+            None
+        } else {
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::READ_REFRESH_POST_STATE_PRE_LINEAGE,
+            )?;
+            Some(read_graph_lineage(&dataset).await?.0)
+        };
+
         self.dataset = dataset;
         self.known_state = known_state;
         Ok(lineage_rows)

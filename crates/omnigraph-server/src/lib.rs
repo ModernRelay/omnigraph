@@ -29,9 +29,9 @@ use api::{
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
     GraphBatchLoadQuery, GraphInfo, GraphListResponse, HealthOutput, IngestOutput, IngestRequest,
-    InvokeStoredQueryRequest, InvokeStoredQueryResponse, QueriesCatalogOutput, QueryRequest,
-    ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery,
-    graph_batch_load_output, ingest_output, schema_apply_output, snapshot_payload,
+    InvokeStoredQueryRequest, InvokeStoredQueryResponse, LegacyReadOutput, QueriesCatalogOutput,
+    QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput,
+    SnapshotQuery, graph_batch_load_output, ingest_output, schema_apply_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
@@ -100,8 +100,10 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_export,
         #[allow(deprecated)] handlers::server_change,
         handlers::server_mutate,
+        handlers::server_mutate_if_graph_commit,
         handlers::server_list_queries,
         handlers::server_invoke_query,
+        handlers::server_invoke_query_if_graph_commit,
         handlers::server_schema_apply,
         handlers::server_schema_get,
         handlers::server_load,
@@ -292,6 +294,7 @@ pub struct ApiError {
     key_conflict: Option<Box<api::KeyConflictOutput>>,
     resource_limit: Option<Box<api::ResourceLimitOutput>>,
     recovery_required: Option<Box<api::RecoveryRequiredOutput>>,
+    precondition_failure: Option<Box<api::PreconditionFailureOutput>>,
 }
 
 impl AppState {
@@ -629,6 +632,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -643,6 +647,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -657,6 +662,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -671,6 +677,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -689,6 +696,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -703,6 +711,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -717,6 +726,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -731,6 +741,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -749,6 +760,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -774,6 +786,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -788,6 +801,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -802,6 +816,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -816,6 +831,7 @@ impl ApiError {
             key_conflict: Some(Box::new(details)),
             resource_limit: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -830,6 +846,7 @@ impl ApiError {
             key_conflict: None,
             resource_limit: Some(Box::new(details)),
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -847,6 +864,26 @@ impl ApiError {
             key_conflict: None,
             resource_limit: None,
             recovery_required: Some(Box::new(api::RecoveryRequiredOutput { operation_id })),
+            precondition_failure: None,
+        }
+    }
+
+    /// HTTP 412 Precondition Failed — an
+    /// `Omnigraph-If-Graph-Commit` graph-head precondition no longer holds.
+    /// `code` is omitted for the same closed-wire-contract reason as
+    /// [`Self::recovery_required`].
+    fn precondition_failed(message: String, details: api::PreconditionFailureOutput) -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_FAILED,
+            code: None,
+            message,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            recovery_required: None,
+            precondition_failure: Some(Box::new(details)),
         }
     }
 
@@ -917,6 +954,17 @@ impl ApiError {
             } => Self::recovery_required(
                 format!("recovery required for operation {operation_id}: {reason}"),
                 operation_id,
+            ),
+            OmniError::PreconditionFailed {
+                branch,
+                expected,
+                actual,
+            } => Self::precondition_failed(
+                format!(
+                    "precondition failed on branch '{branch}': expected head '{expected}' but current is {}",
+                    actual.as_deref().unwrap_or("<absent>")
+                ),
+                api::PreconditionFailureOutput { expected, actual },
             ),
             OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
             OmniError::RetryableCommitConflict(message) => {
@@ -990,6 +1038,7 @@ impl IntoResponse for ApiError {
                 key_conflict: self.key_conflict.map(|d| *d),
                 resource_limit: self.resource_limit.map(|d| *d),
                 recovery_required: self.recovery_required.map(|d| *d),
+                precondition_failure: self.precondition_failure.map(|d| *d),
             }),
         )
             .into_response()
@@ -1146,8 +1195,16 @@ pub fn build_app(state: AppState) -> Router {
             }),
         )
         .route("/mutate", post(server_mutate))
+        .route(
+            "/mutate/if-graph-commit",
+            post(server_mutate_if_graph_commit),
+        )
         .route("/queries", get(server_list_queries))
         .route("/queries/{name}", post(server_invoke_query))
+        .route(
+            "/queries/{name}/if-graph-commit",
+            post(server_invoke_query_if_graph_commit),
+        )
         .route("/schema", get(server_schema_get))
         .route("/schema/apply", post(server_schema_apply))
         .route(

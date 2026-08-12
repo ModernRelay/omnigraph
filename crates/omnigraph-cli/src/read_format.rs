@@ -311,6 +311,7 @@ mod tests {
             row_count: 1,
             columns: vec!["name".to_string(), "age".to_string()],
             rows: serde_json::json!([{ "name": "Alice", "age": 30 }]),
+            graph_commit_id: None,
         }
     }
 

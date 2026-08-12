@@ -28,11 +28,11 @@ use color_eyre::eyre::bail;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
-    BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
-    ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphListResponse, IngestOutput,
-    IngestRequest, InvokeStoredQueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
-    SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output, ingest_output, read_output,
-    schema_apply_output, snapshot_payload,
+    BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
+    CommitOutput, ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphListResponse,
+    IngestOutput, IngestRequest, InvokeStoredQueryRequest, QueryRequest, ReadOutput,
+    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
+    ingest_output, read_output, schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::Method;
@@ -41,8 +41,9 @@ use serde_json::Value;
 use crate::cli::CliLoadMode;
 use crate::helpers::{
     apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
-    legacy_change_request_body, query_params_from_json, remote_json, remote_url, resolve_cli_actor,
-    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
+    legacy_change_request_body, precondition_failed_cli, query_params_from_json, remote_json,
+    remote_json_with_graph_commit_precondition, remote_url, resolve_cli_actor, resolve_cli_graph,
+    resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_result};
 
@@ -523,12 +524,18 @@ impl GraphClient {
 
     /// `mutate` — run a change query against `branch`. Folds
     /// `execute_change` / `execute_change_remote` + the legacy request body.
+    ///
+    /// `expected_head` is the `--if-commit` compare-and-swap precondition:
+    /// the write runs only if the branch head commit still equals it. A
+    /// mismatch surfaces as the typed [`PreconditionFailedCli`] on both
+    /// transports so the verb can exit with `EXIT_PRECONDITION_FAILED` (4).
     pub(crate) async fn mutate(
         &self,
         branch: &str,
         query_source: &str,
         query_name: Option<&str>,
         params_json: Option<&Value>,
+        expected_head: Option<&str>,
     ) -> Result<ChangeOutput> {
         match self {
             GraphClient::Remote {
@@ -536,17 +543,29 @@ impl GraphClient {
                 base_url,
                 token,
             } => {
-                remote_json(
+                let (url, body) = if expected_head.is_some() {
+                    (
+                        remote_url(base_url, &["mutate", "if-graph-commit"], &[])?,
+                        serde_json::to_value(ChangeRequest {
+                            query: query_source.to_string(),
+                            name: query_name.map(ToOwned::to_owned),
+                            params: params_json.cloned(),
+                            branch: Some(branch.to_string()),
+                        })?,
+                    )
+                } else {
+                    (
+                        remote_url(base_url, &["change"], &[])?,
+                        legacy_change_request_body(query_source, query_name, branch, params_json),
+                    )
+                };
+                remote_json_with_graph_commit_precondition(
                     http,
                     Method::POST,
-                    remote_url(base_url, &["change"], &[])?,
-                    Some(legacy_change_request_body(
-                        query_source,
-                        query_name,
-                        branch,
-                        params_json,
-                    )),
+                    url,
+                    Some(body),
                     token.as_deref(),
+                    expected_head,
                 )
                 .await
             }
@@ -556,8 +575,26 @@ impl GraphClient {
                 let db = Self::open_embedded(uri).await?;
                 let actor = actor.as_deref();
                 let result = db
-                    .mutate_as(branch, query_source, &selected_name, &params, actor)
-                    .await?;
+                    .mutate_as_with_expected_head(
+                        branch,
+                        query_source,
+                        &selected_name,
+                        &params,
+                        actor,
+                        expected_head,
+                    )
+                    .await
+                    .map_err(|err| {
+                        let message = err.to_string();
+                        match err {
+                            omnigraph::error::OmniError::PreconditionFailed {
+                                branch: _,
+                                expected,
+                                actual,
+                            } => precondition_failed_cli(message, expected, actual).into(),
+                            other => color_eyre::eyre::Report::from(other),
+                        }
+                    })?;
                 Ok(ChangeOutput {
                     branch: branch.to_string(),
                     query_name: selected_name,
@@ -592,10 +629,10 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::POST,
-                    remote_url(base_url, &["read"], &[])?,
-                    Some(serde_json::to_value(ReadRequest {
-                        query_source: query_source.to_string(),
-                        query_name: query_name.map(ToOwned::to_owned),
+                    remote_url(base_url, &["query"], &[])?,
+                    Some(serde_json::to_value(QueryRequest {
+                        query: query_source.to_string(),
+                        name: query_name.map(ToOwned::to_owned),
                         params: params_json.cloned(),
                         branch,
                         snapshot,
@@ -608,10 +645,10 @@ impl GraphClient {
                 let (selected_name, query_params) = select_named_query(query_source, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
                 let db = Self::open_embedded(uri).await?;
-                let result = db
-                    .query(target.clone(), query_source, &selected_name, &params)
+                let (result, graph_commit_id) = db
+                    .query_with_head(target.clone(), query_source, &selected_name, &params)
                     .await?;
-                Ok(read_output(selected_name, &target, result))
+                Ok(read_output(selected_name, &target, result, graph_commit_id))
             }
         }
     }
@@ -630,6 +667,7 @@ impl GraphClient {
         params_json: Option<&Value>,
         branch: Option<String>,
         snapshot: Option<String>,
+        expected_head: Option<&str>,
     ) -> Result<T> {
         match self {
             GraphClient::Remote {
@@ -643,12 +681,17 @@ impl GraphClient {
                     snapshot,
                     expect_mutation: Some(expect_mutation),
                 };
-                remote_json(
+                remote_json_with_graph_commit_precondition(
                     http,
                     Method::POST,
-                    remote_url(base_url, &["queries", name], &[])?,
+                    if expected_head.is_some() {
+                        remote_url(base_url, &["queries", name, "if-graph-commit"], &[])?
+                    } else {
+                        remote_url(base_url, &["queries", name], &[])?
+                    },
                     Some(serde_json::to_value(body)?),
                     token.as_deref(),
+                    expected_head,
                 )
                 .await
             }

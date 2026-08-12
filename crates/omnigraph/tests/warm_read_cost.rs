@@ -399,6 +399,7 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
     )
     .await
     .unwrap();
+    let replacement_inherited_head = writer.resolve_snapshot("main").await.unwrap();
     writer.branch_create("feature").await.unwrap();
     let new_version = writer
         .version_of(ReadTarget::branch("feature"))
@@ -409,14 +410,14 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
         "test setup must exercise branch incarnation reuse at one Lance version"
     );
 
-    let (new_feature, io) = measure(reader.query(
+    let (new_feature, io) = measure(reader.query_with_head(
         ReadTarget::branch("feature"),
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "MainOnly")]),
     ))
     .await;
-    let new_feature = new_feature.unwrap();
+    let (new_feature, served_head) = new_feature.unwrap();
 
     assert_eq!(
         new_feature.num_rows(),
@@ -430,6 +431,16 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
     assert_eq!(
         io.version_probes, 2,
         "the stale branch probes once under each read and write lock"
+    );
+    assert_eq!(
+        served_head.as_deref(),
+        Some(replacement_inherited_head.as_str()),
+        "replacement-branch rows and their effective inherited head must come from one refresh"
+    );
+    assert_ne!(
+        served_head.as_deref(),
+        Some(old_feature_head.as_str()),
+        "the deleted branch's private head must not be paired with replacement rows"
     );
 
     let new_feature_head = reader.resolve_snapshot("feature").await.unwrap();
@@ -688,12 +699,12 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
     .await;
 }
 
-/// When an external writer advances the manifest, the reader's next query takes
-/// the STALE path: it re-reads the manifest (read_iops > 0) but never scans the
-/// commit graph (`refresh_manifest_only`), unlike a full coordinator refresh.
-/// Pins Fix 1's manifest-only refresh.
+/// When an external writer advances a branch with an exact head row, the
+/// reader's next query takes the cheap STALE path: it re-reads the manifest but
+/// does not need the lineage fallback. Fresh branches without an exact row use
+/// the coherent fallback covered by the branch-recreation test above.
 #[tokio::test]
-async fn stale_read_refreshes_manifest_only() {
+async fn stale_read_refreshes_manifest_only_when_exact_head_exists() {
     let dir = tempfile::tempdir().unwrap();
     let mut writer = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();

@@ -813,9 +813,10 @@ async fn same_branch_insert_after_external_commit_is_linear() {
     );
 }
 
-/// Strict update after a read: Fix 1's `refresh_manifest_only` makes the read
-/// freshen the read-time pin, defeating the strict 409 that used to force a
-/// coherent refresh — so the same stale-head append forks strict ops too.
+/// Strict update after a read: the stale read refreshes the manifest but leaves
+/// the derived lineage cache warm. The following write must prefer the exact
+/// head from that refreshed manifest, or it can parent its commit on the old
+/// cached head even though it planned from fresh rows.
 #[tokio::test]
 async fn same_branch_update_after_external_commit_and_read_is_linear() {
     let dir = tempfile::tempdir().unwrap();
@@ -862,9 +863,8 @@ async fn same_branch_update_after_external_commit_and_read_is_linear() {
         Some(ca.graph_commit_id.as_str())
     );
 
-    // A reads main: the stale-probe path refreshes A's MANIFEST (via
-    // refresh_manifest_only) but not its commit-graph head, freshening the
-    // read-time pin so the strict update below skips its 409.
+    // A reads main: the stale-probe path refreshes A's exact manifest head and
+    // table pins while deliberately leaving the derived lineage cache warm.
     query_main(&mut a, TEST_QUERIES, "total_people", &params(&[]))
         .await
         .unwrap();
