@@ -181,10 +181,12 @@ Pure identity-key fast-forward with only `@key` can skip validation entirely
 
 #### `publish_adopted_delta` / `publish_rewritten_merge_table` (expensive publish)
 
-For each insert/upsert chunk:
+For each chunk:
 
-1. `stage_keyed_write` → Lance `MergeInsertBuilder` with **`use_index(false)`**
-2. Commit with transparent retries disabled (exact identity)
+1. StrictInsert exact-probes the pinned parent, then stages the shared
+   join-free insertion-only `Update`.
+2. Upsert uses Lance `MergeInsertBuilder` with **`use_index(false)`**.
+3. Commit uses transparent retries disabled (exact identity).
 
 ```1914:1917:crates/omnigraph/src/table_store.rs
         // Beta.21's scalar-index v1 route omits the key filter.  Force v2 and
@@ -193,25 +195,26 @@ For each insert/upsert chunk:
         builder.use_index(false);
 ```
 
-Lance `create_joined_stream` with `use_index(false)` takes
+For Upsert, Lance `create_joined_stream` with `use_index(false)` takes
 `create_full_table_joined_stream`: DataFusion **full (or left) hash join of the
 entire target table** against the source chunk
 (`merge_insert.rs` ~1006–1036). Indexed path is available upstream but OmniGraph
 **deliberately disables it** so the transaction carries the exact-`id`
 `KeyExistenceFilter` (RFC-023). Consequence:
 
-> **Per keyed chunk cost ≈ O(N_target + chunk)** join/scan work, not O(chunk).**
-> With `C = ceil(Δ/8192)` chunks, publish pays roughly **C × O(N_target)**.**
+> **Per Upsert chunk cost ≈ O(N_target + chunk)** join/scan work, not O(chunk).**
+> With `C = ceil(Δ/8192)` changed-row chunks, publish pays roughly
+> **C × O(N_target)**.**
 
-StrictInsert also runs an exact `id IN (...)` preflight per insert chunk
-(**O(indexed lookup)** when BTREE covers `id`; else scan).
+StrictInsert runs an exact `id IN (...)` preflight per insert chunk
+(**O(indexed lookup)** when BTREE covers `id`; else scan), then writes only the
+new fragment — it no longer pays a redundant target join.
 
 Deletes: one `DeleteBuilder` per chunk with `id IN (...)`. Best case indexed
 lookup O(q + A + Fa); without usable scalar index, **O(N)** filter scan +
 O(F) fragment walk for deletion vectors.
 
-`RewriteMerged` additionally builds missing indexes inline after data effects
-— can add **O(N log N)** BTree / **O(N·dim)** vector work on that table.
+All merge routes defer missing-index work to `ensure_indices` / `optimize`.
 
 ### F. Manifest CAS + cleanup
 
@@ -237,7 +240,8 @@ Surveyed from `/tmp/lance-src/lance` at `v9.0.0` and full docs under
 | Sorted `id` scan | `scan().order_by(id).batch_size(8192).batch_size_bytes(32MiB)` | **O(N log N)** `SortExec`; TTFP after full sort input | Data page GETs for all projected columns |
 | Tx history `(base, source]` | `read_transaction_by_version` loop | **O(K)** | ≈ K manifest + ≤ K `_transactions` GETs |
 | Stage append | `InsertBuilder::execute_uncommitted` | O(M) rows | Data file PUTs |
-| Keyed StrictInsert/Upsert | `MergeInsertBuilder` **`use_index(false)`** | **Full-table join O(N+M)** per execute | Full target scan GETs + write PUTs + deletion PUTs |
+| Keyed StrictInsert | exact preflight + `InsertBuilder` fragments converted to filtered `Update` | indexed preflight O(M·lookup), worst O(N), then O(M) write | preflight index/scan GETs + data PUTs |
+| Keyed Upsert | `MergeInsertBuilder` **`use_index(false)`** | **Full-table join O(N+M)** per execute | Full target scan GETs + write PUTs + deletion PUTs |
 | Indexed MergeInsert (unused) | `use_index(true)` when every ON col indexed | O(M + lookups + candidates); but **v1 omits key filter** | Index page GETs |
 | Source replay in indexed path | `ReplayExec(Capacity::Unbounded)` | Holds **entire source** in memory | — |
 | Delete `id IN (...)` | `DeleteBuilder` | Indexed O(q·lookup+A+Fa); else **O(N+F)** | Scan/index GETs; deletion GET/PUT |
@@ -261,8 +265,8 @@ every open/commit/plan.
 1. `stage_streaming_table_merge` sorts+scans base, source, **and** target
    (`3 × O(N log N)` TTFP + I/O).
 2. Eager `row_signature` stringifies embeddings for all three sides.
-3. Publish runs `C` full-table `merge_insert` joins against growing target.
-4. Optional inline index rebuild.
+3. Publish runs one full-table `merge_insert` join per changed-row Upsert
+   chunk against the growing target.
 
 **Symptom:** merge stuck with high CPU / S3 GET volume before sidecar confirms;
 timeouts common when `N` is millions and embeddings are wide.
@@ -270,12 +274,12 @@ timeouts common when `N` is millions and embeddings are wide.
 ### 2. Fast-forward that **misses** the pure-insert proof
 
 Missing/cleaned `_transactions`, schema-preorder mismatch, or `K > 1024`
-falls to `compute_adopt_delta` + `AdoptWithDelta`. Then each insert chunk still
-pays **full-table MergeInsert** (and StrictInsert preflight), even though the
-logical change was “all new rows.”
+falls to `compute_adopt_delta` + `AdoptWithDelta`. Insert chunks exact-probe
+the target and stage join-free, but classification still pays the full sorted
+base/source scans.
 
 **Symptom:** “simple” branch with only inserts is slow; instrumentation shows
-`ordered_cursor_scan_calls > 0`, `stage_merge_insert_calls == C`,
+`ordered_cursor_scan_calls > 0`, `stage_fenced_insert_calls == C`,
 `strict_insert_preflight_calls == C`.
 
 ### 3. Uncompacted `__manifest` / deep history
@@ -314,8 +318,8 @@ Structural probes to classify the route of a timed-out merge:
 | Probe | Proven path | Expensive path |
 |---|---|---|
 | `ordered_cursor_scan_calls` | 0 | ≥ 2 (adopt) or ≥ 3 (three-way) |
-| `stage_fenced_insert_calls` | C | 0 |
-| `stage_merge_insert_calls` | 0 | C_insert + C_upsert |
+| `stage_fenced_insert_calls` | C | C_insert |
+| `stage_merge_insert_calls` | 0 | C_upsert |
 | `strict_insert_preflight_calls` | 0 | C_insert |
 | validation projected bytes | often 0 (identity-only FF) | ≤ 32 MiB |
 
@@ -339,11 +343,11 @@ Structural probes to classify the route of a timed-out merge:
 | `validate_merge_candidates` | `exec/merge.rs` + `validate.rs` | O(Δ + probes) | index-backed filtered scans |
 | `plan_merge_transactions` | `exec/merge.rs` | O(C) | none |
 | `publish_proven_pure_insert_adopt` | `exec/merge.rs` | O(Δ+C·commit) | C fragment PUTs + C CAS |
-| `publish_adopted_delta` | `exec/merge.rs` | **≈ C·O(N_target)** joins | C full-table MergeInsert + deletes |
-| `publish_rewritten_merge_table` | `exec/merge.rs` | same + optional index | + index PUTs |
+| `publish_adopted_delta` | `exec/merge.rs` | insert preflights + **≈ C_upsert·O(N_target)** joins | join-free insert writes + Upserts + deletes |
+| `publish_rewritten_merge_table` | `exec/merge.rs` | **≈ C_upsert·O(N_target)** joins | Upserts + deletes; indexes deferred |
 | `commit_keyed_stream_chunks` | `exec/merge.rs` | O(Δ+C·stage/commit) | as above |
 | `commit_staged_delete_chunks` | `exec/merge.rs` | O(C_del·delete) | DeleteBuilder each |
-| `stage_keyed_write` | `table_store.rs` | **O(N+chunk)** join | full target scan GETs |
+| `stage_keyed_write` | `table_store.rs` | StrictInsert: preflight + O(chunk); Upsert: **O(N+chunk)** join | filtered preflight or full target scan GETs |
 | `stage_proven_strict_insert` | `table_store.rs` | O(chunk) | fragment PUTs only |
 | `preflight_strict_insert_ids` | `table_store.rs` | O(lookup) | 1 filtered scan |
 | `scan_stream_bounded` | `table_store.rs` | scan+sort | page GETs |
@@ -362,7 +366,7 @@ OmniGraph main, RFC-023 / RFC-0001 / RFC-027, and Lance 9.0.0 (`v9.0.0`; tip
 of `origin/main` still has `inserted_rows_filter: None // not implemented for v1`
 on the indexed MergeInsert route).
 
-### L1 — After absence is proven, drop the MergeInsert join (StrictInsert)
+### L1 — After absence is proven, drop the MergeInsert join (StrictInsert) — implemented
 
 **Fix.** Once `preflight_strict_insert_ids` (or equivalent) has proven the
 chunk's keys absent at the pinned parent, stage with the existing
@@ -452,7 +456,7 @@ gated only on landing the checked-in surface-guard cell (fixture must include a
 list-typed property). Details and the full assumption-by-assumption review
 ledger: [merge-l1-l3-plan.md](merge-l1-l3-plan.md) → "Review ledger".
 
-### L3 — Defer `RewriteMerged` inline index build (align with adopt + deny-list)
+### L3 — Defer `RewriteMerged` inline index build (align with adopt + deny-list) — implemented
 
 **Fix.** Stop calling `build_indices_on_dataset` on the three-way publish path;
 leave coverage to `ensure_indices` / `optimize`, exactly as `publish_adopted_delta`

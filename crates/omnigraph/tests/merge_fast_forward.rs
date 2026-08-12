@@ -519,6 +519,13 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
         "missing provenance must enter the ordered base/source fallback"
     );
     assert_eq!(probes.stage_append_calls(), 0);
+    assert_eq!(probes.strict_insert_preflight_calls(), 1);
+    assert_eq!(probes.stage_fenced_insert_calls(), 1);
+    assert_eq!(
+        probes.stage_merge_insert_calls(),
+        0,
+        "ordered-diff insert fallback must reuse the join-free StrictInsert adapter"
+    );
     assert_eq!(count_rows(&main, "node:Person").await, base_count + 2);
 
     let recovery_dir = dir.path().join("__recovery");

@@ -111,8 +111,10 @@ The general route remains an ordered, row-by-row cursor merge:
   copy is required because Lance's merge-insert builder has no `WriteParams`
   hook for `allow_external_blob_outside_bases`; staged Overwrite retains external
   references because it does accept `WriteParams`.
-- New-row chunks use exact-`id` `StrictInsert`; changed-row chunks use exact-`id`
-  `Upsert`. The complete ordered chain is pre-minted under one `protocol_v4`
+- New-row chunks use exact-`id` `StrictInsert`: after one pinned-target
+  preflight they stage the same join-free filtered insertion-only `Update` as
+  the proven route. Changed-row chunks use exact-`id` `Upsert`. The complete
+  ordered chain is pre-minted under one `protocol_v4`
   recovery sidecar, with at most **1,024 logical data transactions per table**.
   A larger row or plan returns typed `ResourceLimitExceeded` before sidecar arm.
 - Exact recovery scans at most **1,026 versions**: the 1,024 logical data
