@@ -395,15 +395,12 @@ pub(crate) struct SupervisorSet {
 }
 
 impl SupervisorSet {
-    pub fn idle() -> Arc<Self> {
-        let (shutdown, _) = watch::channel(false);
-        Arc::new(Self {
-            shutdown,
-            tasks: Mutex::new(Vec::new()),
-            attempts: TaskTracker::new(),
-        })
-    }
-
+    /// Start supervising every configured graph.
+    ///
+    /// There is no idle variant. An `AppState` owns a write executor that can
+    /// mark a graph recovering, so a set with no per-graph task would leave
+    /// that graph write-blocked forever with no consumer for the wake-up. The
+    /// combination is simply not constructible.
     pub fn start(registry: Arc<GraphRegistry>) -> Arc<Self> {
         let (shutdown, _) = watch::channel(false);
         let set = Arc::new(Self {

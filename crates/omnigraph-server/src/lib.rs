@@ -542,6 +542,7 @@ impl AppState {
             GraphRegistry::from_handles(vec![handle])
                 .expect("a single handle never collides on graph id"),
         );
+        let supervisors = supervisor::SupervisorSet::start(Arc::clone(&registry));
         Self {
             routing: GraphRouting {
                 registry,
@@ -551,7 +552,7 @@ impl AppState {
             bearer_tokens,
             server_policy: None,
             export_transport: export_transport::ExportTransport::with_defaults(),
-            supervisors: supervisor::SupervisorSet::idle(),
+            supervisors,
         }
     }
 
@@ -570,6 +571,7 @@ impl AppState {
     ) -> std::result::Result<Self, InsertError> {
         let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let registry = Arc::new(GraphRegistry::from_handles(handles)?);
+        let supervisors = supervisor::SupervisorSet::start(Arc::clone(&registry));
         Ok(Self {
             routing: GraphRouting {
                 registry,
@@ -579,7 +581,7 @@ impl AppState {
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
             export_transport: export_transport::ExportTransport::with_defaults(),
-            supervisors: supervisor::SupervisorSet::idle(),
+            supervisors,
         })
     }
 
