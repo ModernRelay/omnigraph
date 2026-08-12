@@ -2991,14 +2991,6 @@ impl Omnigraph {
         .await
     }
 
-    pub(crate) async fn build_indices_on_dataset(
-        &self,
-        table_key: &str,
-        ds: &mut SnapshotHandle,
-    ) -> Result<Vec<PendingIndex>> {
-        table_ops::build_indices_on_dataset(self, table_key, ds).await
-    }
-
     // Used only by in-tree tests (`#[cfg(test)]`); the runtime path now
     // uses `commit_updates_on_branch_with_expected` exclusively.
     #[cfg(test)]

@@ -2791,6 +2791,224 @@ async fn unenforced_pk_filter_shape_is_route_dependent() {
     );
 }
 
+/// The indexed v1 matched-only route is safe for OmniGraph's update-only merge
+/// adapter only if it leaves rewritten fragments outside every stale index's
+/// coverage. A future Lance change that over-claims those fragments could
+/// silently return stale indexed values.
+#[tokio::test]
+async fn indexed_update_only_route_leaves_rewritten_fragments_uncovered() {
+    use arrow_array::types::Int32Type;
+    use arrow_array::{FixedSizeListArray, Float32Array, ListArray};
+    use lance::index::vector::VectorIndexParams;
+    use lance_index::scalar::InvertedIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("indexed-update-coverage.lance");
+    let vector_item = Arc::new(Field::new("item", DataType::Float32, true));
+    let list_item = Arc::new(Field::new("item", DataType::Int32, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        Field::new("text", DataType::Utf8, false),
+        Field::new("score", DataType::Int32, false),
+        Field::new("tags", DataType::List(list_item), true),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(vector_item.clone(), 8),
+            false,
+        ),
+    ]));
+    let row_count = 256_usize;
+    let ids = (0..row_count)
+        .map(|row| {
+            if row == 0 {
+                "alice".to_string()
+            } else {
+                format!("row-{row}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let texts = (0..row_count)
+        .map(|row| format!("searchable document {row}"))
+        .collect::<Vec<_>>();
+    let tags = ListArray::from_iter_primitive::<Int32Type, _, _>(
+        (0..row_count).map(|row| Some(vec![Some(row as i32), Some(row as i32 + 1)])),
+    );
+    let vectors = FixedSizeListArray::try_new(
+        vector_item.clone(),
+        8,
+        Arc::new(Float32Array::from(
+            (0..row_count * 8)
+                .map(|value| value as f32)
+                .collect::<Vec<_>>(),
+        )),
+        None,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(StringArray::from(texts)),
+            Arc::new(Int32Array::from((0..row_count as i32).collect::<Vec<_>>())),
+            Arc::new(tags),
+            Arc::new(vectors),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+    dataset
+        .create_index_builder(
+            &["text"],
+            IndexType::Inverted,
+            &InvertedIndexParams::default(),
+        )
+        .replace(true)
+        .await
+        .unwrap();
+    dataset
+        .create_index_builder(
+            &["embedding"],
+            IndexType::Vector,
+            &VectorIndexParams::ivf_flat(1, MetricType::L2),
+        )
+        .replace(true)
+        .await
+        .unwrap();
+    let dataset = Arc::new(dataset);
+    let top_level_fields = dataset
+        .schema()
+        .fields
+        .iter()
+        .map(|field| field.id as u32)
+        .collect::<Vec<_>>();
+    assert!(
+        dataset.schema().fields_pre_order().count() > top_level_fields.len(),
+        "list property must contribute a nested field id"
+    );
+    let indices_before = dataset.load_indices().await.unwrap();
+    assert_eq!(indices_before.len(), 3);
+    for index in indices_before.iter() {
+        assert!(
+            index
+                .fields
+                .iter()
+                .all(|field_id| top_level_fields.contains(&(*field_id as u32))),
+            "index '{}' unexpectedly targets nested fields {:?}",
+            index.name,
+            index.fields
+        );
+    }
+    let old_fragments = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u64)
+        .collect::<HashSet<_>>();
+
+    let update_tags =
+        ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![Some(7), Some(8)])]);
+    let update_vectors = FixedSizeListArray::try_new(
+        vector_item,
+        8,
+        Arc::new(Float32Array::from(
+            (0..8)
+                .map(|value| 10_000.0 + value as f32)
+                .collect::<Vec<_>>(),
+        )),
+        None,
+    )
+    .unwrap();
+    let update_batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["alice"])),
+            Arc::new(StringArray::from(vec!["updated searchable document"])),
+            Arc::new(Int32Array::from(vec![999])),
+            Arc::new(update_tags),
+            Arc::new(update_vectors),
+        ],
+    )
+    .unwrap();
+    let staged = stage_pk_merge(
+        dataset.clone(),
+        update_batch,
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::DoNothing,
+        None,
+    )
+    .await;
+    assert_eq!(staged.stats.num_inserted_rows, 0);
+    assert_eq!(staged.stats.num_updated_rows, 1);
+    assert!(staged.inserted_rows_filter.is_none(), "fixture must use v1");
+    assert!(staged.affected_rows.is_some());
+    let Operation::Update {
+        fields_for_preserving_frag_bitmap,
+        update_mode,
+        ..
+    } = &staged.transaction.operation
+    else {
+        panic!("indexed update-only route must stage Operation::Update");
+    };
+    assert_eq!(fields_for_preserving_frag_bitmap, &top_level_fields);
+    assert_eq!(
+        update_mode,
+        &Some(lance::dataset::transaction::UpdateMode::RewriteRows)
+    );
+
+    let mut commit = CommitBuilder::new(dataset.clone());
+    if let Some(affected_rows) = staged.affected_rows {
+        commit = commit.with_affected_rows(affected_rows);
+    }
+    let committed = commit.execute(staged.transaction).await.unwrap();
+    let new_fragments = committed
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u64)
+        .filter(|fragment_id| !old_fragments.contains(fragment_id))
+        .collect::<Vec<_>>();
+    assert!(!new_fragments.is_empty());
+    let indices = committed.load_indices().await.unwrap();
+    assert_eq!(
+        indices.len(),
+        3,
+        "fixture must exercise BTREE, FTS, and vector index coverage together"
+    );
+    for index in indices.iter() {
+        assert!(
+            index
+                .fragment_bitmap
+                .as_ref()
+                .is_none_or(|bitmap| new_fragments
+                    .iter()
+                    .all(|fragment_id| !bitmap.contains(*fragment_id as u32))),
+            "index '{}' falsely claimed rewritten fragments {new_fragments:?}",
+            index.name
+        );
+    }
+}
+
 // --- Guard 19c: pinned Lance key-filter conflicts are directional ----------
 //
 // Lance evaluates compatibility from the transaction currently being rebased

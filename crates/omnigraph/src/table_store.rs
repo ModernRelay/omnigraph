@@ -1487,9 +1487,11 @@ impl TableStore {
     /// Stage one RFC-023 keyed write from an in-memory batch.
     ///
     /// Unlike the legacy generic merge primitive below, this adapter fixes the
-    /// join key to `id`, derives Lance actions from a closed logical enum, and
-    /// forces the non-index v2 route that emits `inserted_rows_filter`. This is
-    /// the only production insertion-bearing route for keyed graph tables.
+    /// join key to `id` and derives Lance actions from a closed logical enum.
+    /// StrictInsert exact-probes its pinned parent, then stages the shared
+    /// join-free filter-bearing insertion-only `Update`; Upsert keeps Lance's
+    /// forced-v2 MergeInsert route. These are the only production
+    /// insertion-bearing routes for keyed graph tables.
     pub async fn stage_keyed_write(
         &self,
         ds: Dataset,
@@ -1524,6 +1526,17 @@ impl TableStore {
         let source_ids = validate_keyed_write_batch_ids(&batch, table_key, "stage_keyed_write")?;
         if semantics == KeyedWriteSemantics::StrictInsert {
             Self::preflight_strict_insert_ids(&ds, table_key, &source_ids).await?;
+            return self
+                .stage_absence_proven_strict_insert(
+                    ds,
+                    table_key,
+                    batch,
+                    source_ids,
+                    id_field_id,
+                    &expected_schema_preorder_ids,
+                    "stage_keyed_write",
+                )
+                .await;
         }
 
         // MergeInsertBuilder does not expose WriteParams and therefore cannot
@@ -1548,16 +1561,7 @@ impl TableStore {
                 "stage_keyed_write",
             )
             .await?;
-        if semantics == KeyedWriteSemantics::StrictInsert {
-            certify_insert_absence(
-                &mut staged.transaction,
-                expected_read_version,
-                id_field_id,
-                &expected_schema_preorder_ids,
-                &source_ids,
-                "stage_keyed_write",
-            )?;
-        } else if merge_stats_prove_pure_insert(&stats, merged_rows)
+        if merge_stats_prove_pure_insert(&stats, merged_rows)
             && let Err(error) = certify_insert_absence(
                 &mut staged.transaction,
                 expected_read_version,
@@ -1578,9 +1582,6 @@ impl TableStore {
                 error = %error,
                 "all-new upsert is not eligible for the insertion-absence certificate"
             );
-        }
-        if semantics == KeyedWriteSemantics::StrictInsert {
-            staged.set_strict_source_ids(source_ids);
         }
         Ok(staged)
     }
@@ -1623,13 +1624,45 @@ impl TableStore {
                 "stage_proven_strict_insert requires stable target row ids for {table_key} chunk {chunk_index}"
             )));
         }
+        let id_field_id = exact_id_primary_key_field_id(&ds, "stage_proven_strict_insert")?;
+        let source_ids =
+            validate_keyed_write_batch_ids(&batch, table_key, "stage_proven_strict_insert")?;
+        self.stage_absence_proven_strict_insert(
+            ds,
+            table_key,
+            batch,
+            source_ids,
+            id_field_id,
+            &expected_schema_preorder_ids,
+            "stage_proven_strict_insert",
+        )
+        .await
+    }
+
+    /// Stage one strict insertion whose caller has already proved every source
+    /// id absent from this exact pinned parent.
+    ///
+    /// The proof authority stays outside this helper: ordinary StrictInsert
+    /// supplies an exact target preflight, while BranchMerge supplies an opaque
+    /// complete-history capability. Both authorities intentionally converge on
+    /// one filter-bearing insertion-only Lance transaction shape.
+    async fn stage_absence_proven_strict_insert(
+        &self,
+        ds: Dataset,
+        table_key: &str,
+        batch: RecordBatch,
+        source_ids: Vec<String>,
+        id_field_id: i32,
+        expected_schema_preorder_ids: &[u32],
+        context: &'static str,
+    ) -> Result<StagedWrite> {
         if batch.num_rows() == 0 {
-            return Err(OmniError::manifest_internal(
-                "stage_proven_strict_insert called with empty batch",
-            ));
+            return Err(OmniError::manifest_internal(format!(
+                "{context} called with empty batch"
+            )));
         }
         let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("proven strict insert batch bytes exceed u64")
+            OmniError::manifest_internal(format!("{context} batch bytes exceed u64"))
         })?;
         if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
             return Err(OmniError::resource_limit(
@@ -1646,9 +1679,6 @@ impl TableStore {
             ));
         }
 
-        let id_field_id = exact_id_primary_key_field_id(&ds, "stage_proven_strict_insert")?;
-        let source_ids =
-            validate_keyed_write_batch_ids(&batch, table_key, "stage_proven_strict_insert")?;
         let batch = self.prepare_keyed_write_batch(table_key, batch).await?;
         ensure_proven_insert_blobs_are_materialized(&batch, table_key)?;
 
@@ -1663,9 +1693,9 @@ impl TableStore {
                 .iter()
                 .any(|id| !filter_builder.contains(&KeyValue::String(id.clone())))
         {
-            return Err(OmniError::manifest_internal(
-                "stage_proven_strict_insert did not encode every source id in Lance's key filter",
-            ));
+            return Err(OmniError::manifest_internal(format!(
+                "{context} did not encode every source id in Lance's key filter"
+            )));
         }
         let inserted_rows_filter = filter_builder.build();
 
@@ -1673,11 +1703,10 @@ impl TableStore {
         // manifest builder uses it to keep every existing user index from
         // claiming coverage of these newly written, not-yet-indexed fragments.
         // An empty or top-level-only list can cause silent missing query rows.
-        let fields_for_preserving_frag_bitmap =
-            schema_preorder_field_ids(&ds, "stage_proven_strict_insert")?;
+        let fields_for_preserving_frag_bitmap = schema_preorder_field_ids(&ds, context)?;
         if fields_for_preserving_frag_bitmap != expected_schema_preorder_ids {
             return Err(OmniError::manifest_internal(format!(
-                "stage_proven_strict_insert target schema changed for {table_key} chunk {chunk_index}"
+                "{context} target schema changed for {table_key}"
             )));
         }
         let expected_read_version = ds.version().version;
@@ -1696,7 +1725,7 @@ impl TableStore {
             .map_err(|error| OmniError::Lance(error.to_string()))?;
         if transaction.read_version != expected_read_version {
             return Err(OmniError::manifest_internal(format!(
-                "stage_proven_strict_insert wrote against version {}, expected {expected_read_version}",
+                "{context} wrote against version {}, expected {expected_read_version}",
                 transaction.read_version
             )));
         }
@@ -1704,7 +1733,7 @@ impl TableStore {
             Operation::Append { fragments } => fragments.clone(),
             other => {
                 return Err(OmniError::manifest_internal(format!(
-                    "stage_proven_strict_insert: expected Lance Append staging operation, got {:?}",
+                    "{context}: expected Lance Append staging operation, got {:?}",
                     std::mem::discriminant(other)
                 )));
             }
@@ -1720,18 +1749,14 @@ impl TableStore {
             inserted_rows_filter: Some(inserted_rows_filter),
             updated_fragment_offsets: None,
         };
-        validate_transaction_exact_id_filter(
-            &transaction,
-            id_field_id,
-            "stage_proven_strict_insert",
-        )?;
+        validate_transaction_exact_id_filter(&transaction, id_field_id, context)?;
         certify_insert_absence(
             &mut transaction,
             expected_read_version,
             id_field_id,
-            &expected_schema_preorder_ids,
+            expected_schema_preorder_ids,
             &source_ids,
-            "stage_proven_strict_insert",
+            context,
         )?;
 
         // The transaction keeps Lance's temporary fragment ids and lets commit
@@ -1916,13 +1941,23 @@ impl TableStore {
             .map_err(|error| OmniError::Lance(error.to_string()))?;
         builder.when_matched(match semantics {
             KeyedWriteSemantics::StrictInsert => WhenMatched::Fail,
-            KeyedWriteSemantics::Upsert => WhenMatched::UpdateAll,
+            KeyedWriteSemantics::Upsert | KeyedWriteSemantics::KnownPresentUpdate => {
+                WhenMatched::UpdateAll
+            }
         });
-        builder.when_not_matched(WhenNotMatched::InsertAll);
-        // Beta.21's scalar-index v1 route omits the key filter.  Force v2 and
-        // assert the resulting transaction shape below so a future Lance
-        // routing change fails closed.
-        builder.use_index(false);
+        builder.when_not_matched(match semantics {
+            KeyedWriteSemantics::KnownPresentUpdate => WhenNotMatched::DoNothing,
+            KeyedWriteSemantics::StrictInsert | KeyedWriteSemantics::Upsert => {
+                WhenNotMatched::InsertAll
+            }
+        });
+        if semantics != KeyedWriteSemantics::KnownPresentUpdate {
+            // Lance's scalar-index v1 route omits the inserted-row key filter.
+            // Every insertion-capable path therefore forces v2 and validates
+            // the exact-id filter below. Update-only staging may use v1 because
+            // DoNothing closes the insertion action and affected_rows owns OCC.
+            builder.use_index(false);
+        }
         builder.conflict_retries(0);
         // FirstSeen works around Lance #6877.  The batch entry point proves
         // source-id uniqueness; the streaming entry point accepts only a
@@ -1936,12 +1971,24 @@ impl TableStore {
             .await
             .map_err(|error| OmniError::Lance(error.to_string()))?;
 
-        validate_exact_id_filter(&uncommitted, id_field_id, context)?;
-        if semantics == KeyedWriteSemantics::StrictInsert {
-            validate_strict_insert_merge_stats(&uncommitted, merged_rows, context)?;
+        match semantics {
+            KeyedWriteSemantics::StrictInsert => {
+                validate_exact_id_filter(&uncommitted, id_field_id, context)?;
+                validate_strict_insert_merge_stats(&uncommitted, merged_rows, context)?;
+            }
+            KeyedWriteSemantics::Upsert => {
+                validate_exact_id_filter(&uncommitted, id_field_id, context)?;
+            }
+            KeyedWriteSemantics::KnownPresentUpdate => {
+                validate_known_present_update(&uncommitted, id_field_id, merged_rows, context)?;
+            }
         }
         let stats = uncommitted.stats.clone();
-        crate::instrumentation::record_stage_merge_insert(merged_rows);
+        if semantics == KeyedWriteSemantics::KnownPresentUpdate {
+            crate::instrumentation::record_stage_known_present_update(merged_rows);
+        } else {
+            crate::instrumentation::record_stage_merge_insert(merged_rows);
+        }
         Ok((staged_keyed_merge_result(uncommitted, context)?, stats))
     }
 
@@ -3866,6 +3913,63 @@ fn validate_strict_insert_merge_stats(
             stats.num_skipped_duplicates,
             stats.num_attempts,
         )));
+    }
+    Ok(())
+}
+
+fn validate_known_present_update(
+    uncommitted: &UncommittedMergeInsert,
+    id_field_id: i32,
+    expected_rows: u64,
+    context: &'static str,
+) -> Result<()> {
+    let stats = &uncommitted.stats;
+    if stats.num_inserted_rows != 0
+        || stats.num_updated_rows != expected_rows
+        || stats.num_deleted_rows != 0
+        || stats.num_skipped_duplicates != 0
+    {
+        return Err(OmniError::manifest_read_set_changed(
+            format!("{context}:known_present_ids"),
+            Some(format!(
+                "updated={expected_rows}, inserted=0, deleted=0, skipped=0"
+            )),
+            Some(format!(
+                "updated={}, inserted={}, deleted={}, skipped={}",
+                stats.num_updated_rows,
+                stats.num_inserted_rows,
+                stats.num_deleted_rows,
+                stats.num_skipped_duplicates
+            )),
+        ));
+    }
+    if uncommitted.affected_rows.is_none() {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: known-present update omitted affected-row conflict metadata"
+        )));
+    }
+    let Operation::Update {
+        update_mode,
+        inserted_rows_filter,
+        ..
+    } = &uncommitted.transaction.operation
+    else {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: known-present update did not stage Lance Operation::Update"
+        )));
+    };
+    if update_mode != &Some(UpdateMode::RewriteRows) {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: known-present update used {update_mode:?}, expected RewriteRows"
+        )));
+    }
+    if let Some(filter) = inserted_rows_filter {
+        let empty_filter = KeyExistenceFilterBuilder::new(vec![id_field_id]).build();
+        if filter != &empty_filter {
+            return Err(OmniError::manifest_internal(format!(
+                "{context}: update-only transaction carried a non-empty inserted-row filter"
+            )));
+        }
     }
     Ok(())
 }

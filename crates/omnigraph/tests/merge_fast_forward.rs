@@ -519,6 +519,13 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
         "missing provenance must enter the ordered base/source fallback"
     );
     assert_eq!(probes.stage_append_calls(), 0);
+    assert_eq!(probes.strict_insert_preflight_calls(), 1);
+    assert_eq!(probes.stage_fenced_insert_calls(), 1);
+    assert_eq!(
+        probes.stage_merge_insert_calls(),
+        0,
+        "ordered-diff insert fallback must reuse the join-free StrictInsert adapter"
+    );
     assert_eq!(count_rows(&main, "node:Person").await, base_count + 2);
 
     let recovery_dir = dir.path().join("__recovery");
@@ -526,6 +533,39 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
         !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
         "successful fallback merge must remove its recovery sidecar"
     );
+}
+
+/// When the target still equals the merge base, the ordered adopt classifier
+/// already knows a changed id is present. Publication must use an
+/// update-only keyed stage rather than the insertion-capable general Upsert.
+#[tokio::test]
+async fn changed_only_adopt_uses_known_present_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+    let feature = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    feature
+        .mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+        )
+        .await
+        .unwrap();
+
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+        .await
+        .unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(
+        probes.stage_merge_insert_calls(),
+        0,
+        "known-present adopt updates must not use the insertion-capable general Upsert stage"
+    );
+    assert_eq!(probes.stage_known_present_update_calls(), 1);
+    assert_eq!(probes.stage_known_present_update_rows(), 1);
 }
 
 const WIDE_VALIDATION_SCHEMA: &str = r#"
@@ -724,6 +764,50 @@ async fn fast_forward_merge_defers_vector_index_to_reconciler() {
     );
     // Correctness: the rows landed on main (reads brute-force until optimize).
     assert_eq!(count_rows(&main, "node:Chunk").await, 24);
+}
+
+/// A true three-way merge must follow the same derived-index contract as the
+/// fast-forward path: publish logical rows first and leave physical coverage to
+/// `ensure_indices` / `optimize`.
+#[tokio::test]
+async fn merged_outcome_defers_vector_index_to_reconciler() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = Omnigraph::init(uri, VEC_SCHEMA).await.unwrap();
+    main.branch_create("feature").await.unwrap();
+
+    let mut source_rows = String::new();
+    for i in 0..24 {
+        let vector: Vec<String> = (0..8).map(|j| format!("{}.0", (i + j) % 5)).collect();
+        source_rows.push_str(&format!(
+            "{{\"type\":\"Chunk\",\"data\":{{\"slug\":\"source-{i}\",\"embedding\":[{}]}}}}\n",
+            vector.join(",")
+        ));
+    }
+    let feature = Omnigraph::open(uri).await.unwrap();
+    feature
+        .load("feature", &source_rows, LoadMode::Merge)
+        .await
+        .unwrap();
+    main.load(
+        "main",
+        r#"{"type":"Chunk","data":{"slug":"target-only","embedding":[0,1,2,3,4,5,6,7]}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+        .await
+        .unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(
+        probes.stage_vector_index_calls(),
+        0,
+        "three-way merge must not stage derived vector-index work inline"
+    );
+    assert_eq!(count_rows(&main, "node:Chunk").await, 25);
 }
 
 const BLOB_SCHEMA: &str =

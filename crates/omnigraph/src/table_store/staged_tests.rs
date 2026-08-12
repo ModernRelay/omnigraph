@@ -31,7 +31,8 @@ use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray, UInt
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
-use lance::dataset::transaction::Operation;
+use lance::dataset::transaction::{Operation, UpdateMode};
+use lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilterBuilder;
 use lance::dataset::{DeleteBuilder, WhenMatched, WhenNotMatched};
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance_table::format::Fragment;
@@ -415,6 +416,105 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
 }
 
 #[tokio::test]
+async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let staged_index = store
+        .stage_create_indices(
+            &ds,
+            &[IndexBuildSpec::BTree {
+                column: "id".to_string(),
+                name: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let ds = store
+        .commit_staged(Arc::new(ds), staged_index)
+        .await
+        .unwrap();
+    let base_version = ds.version().version;
+
+    let probes = MergeWriteProbes::default();
+    let staged = with_merge_write_probes(
+        probes.clone(),
+        store.stage_keyed_write(
+            ds.clone(),
+            "Person",
+            person_pk_batch(&[("alice", Some(99))]),
+            KeyedWriteSemantics::KnownPresentUpdate,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(probes.stage_known_present_update_calls(), 1);
+    assert_eq!(probes.stage_known_present_update_rows(), 1);
+    assert_eq!(probes.stage_merge_insert_calls(), 0);
+    assert!(staged.commit_metadata.affected_rows.is_some());
+    match &staged.transaction.operation {
+        Operation::Update {
+            update_mode,
+            inserted_rows_filter,
+            ..
+        } => {
+            assert_eq!(update_mode, &Some(UpdateMode::RewriteRows));
+            assert!(
+                inserted_rows_filter.is_none(),
+                "covered id BTREE must select Lance's indexed v1 update route"
+            );
+        }
+        other => panic!("expected update-only Lance Update, got {other:?}"),
+    }
+
+    let error = store
+        .stage_keyed_write(
+            ds,
+            "Person",
+            person_pk_batch(&[("bob", Some(25))]),
+            KeyedWriteSemantics::KnownPresentUpdate,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.is_read_set_changed(), "unexpected error: {error}");
+    assert_eq!(
+        Dataset::open(&uri).await.unwrap().version().version,
+        base_version,
+        "staging a missing known-present id must not advance HEAD"
+    );
+
+    let uncovered_uri = format!("{}/uncovered-people.lance", dir.path().to_str().unwrap());
+    let uncovered =
+        TableStore::write_dataset(&uncovered_uri, person_pk_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+    let uncovered_id_field = uncovered.schema().field("id").unwrap().id;
+    let uncovered_stage = store
+        .stage_keyed_write(
+            uncovered,
+            "Person",
+            person_pk_batch(&[("alice", Some(31))]),
+            KeyedWriteSemantics::KnownPresentUpdate,
+        )
+        .await
+        .unwrap();
+    match uncovered_stage.transaction.operation {
+        Operation::Update {
+            inserted_rows_filter: Some(filter),
+            ..
+        } => assert_eq!(
+            filter,
+            KeyExistenceFilterBuilder::new(vec![uncovered_id_field]).build(),
+            "known-present v2 fallback must carry Some(empty exact-id filter)"
+        ),
+        other => panic!("uncovered known-present update lost empty v2 filter: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn all_new_upsert_certifies_insert_absence_and_persists_it_in_history() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
@@ -557,6 +657,16 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
         probes.strict_insert_preflight_calls(),
         1,
         "general strict insert must exact-probe the pinned target once"
+    );
+    assert_eq!(
+        probes.stage_fenced_insert_calls(),
+        1,
+        "absence-proven strict insert must stage one join-free fenced insert"
+    );
+    assert_eq!(
+        probes.stage_merge_insert_calls(),
+        0,
+        "absence-proven strict insert must not pay a redundant target merge join"
     );
     assert!(
         super::has_insert_absence_certificate(&staged.transaction),

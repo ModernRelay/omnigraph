@@ -2,6 +2,10 @@
 
 `exec/merge.rs`.
 
+For asymptotic cost, object-store request patterns, and timeout diagnosis
+(including Lance upstream `SortExec` / `use_index(false)` full-table
+`merge_insert` joins), see [merge-complexity.md](merge-complexity.md).
+
 ## Strategy
 
 The fast-forward all-new case first attempts an inductive substrate proof before
@@ -107,14 +111,22 @@ The general route remains an ordered, row-by-row cursor merge:
   copy is required because Lance's merge-insert builder has no `WriteParams`
   hook for `allow_external_blob_outside_bases`; staged Overwrite retains external
   references because it does accept `WriteParams`.
-- New-row chunks use exact-`id` `StrictInsert`; changed-row chunks use exact-`id`
-  `Upsert`. The complete ordered chain is pre-minted under one `protocol_v4`
+- New-row chunks use exact-`id` `StrictInsert`: after one pinned-target
+  preflight they stage the same join-free filtered insertion-only `Update` as
+  the proven route. On target-equals-base adoption, changed-row chunks use the
+  sealed known-present update-only arm (`UpdateAll` + `DoNothing`) and fail
+  closed unless every classified id updates; true three-way rewrites still use
+  exact-`id` Upsert pending L2b. The complete ordered chain is pre-minted under
+  one `protocol_v4`
   recovery sidecar, with at most **1,024 logical data transactions per table**.
   A larger row or plan returns typed `ResourceLimitExceeded` before sidecar arm.
 - Exact recovery scans at most **1,026 versions**: the 1,024 logical data
-  transactions plus headroom for one allowed derived `CreateIndex` tail and one
-  compensating `Restore`. The restore headroom is required because recovery can
-  crash after restoring the table but before publishing the manifest outcome.
+  transactions plus backward-compatible headroom for one legacy
+  `CreateIndex` tail and one compensating `Restore`. Current branch-merge
+  writers build no indexes inline; the legacy allowance keeps v9 sidecars from
+  older binaries recoverable. Restore headroom remains required because
+  recovery can crash after restoring the table but before publishing the
+  manifest outcome.
 - The merge runs per sub-table, but all chunks become graph-visible through one
   atomic manifest update. Once the sidecar is armed, any chunk conflict retains
   recovery ownership and returns `RecoveryRequired`; the merge never retries

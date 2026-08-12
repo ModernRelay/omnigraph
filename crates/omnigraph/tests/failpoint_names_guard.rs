@@ -85,6 +85,18 @@ fn failpoint_names_use_the_compile_checked_catalog() {
                 from = after_open;
             }
         }
+        if file == engine_failpoints_test() {
+            let mut from = 0;
+            while let Some(rel) = contents[from..].find("\"branch_merge.") {
+                let offset = from + rel;
+                violations.push(format!(
+                    "{}:{}: literal branch-merge failpoint name — use a typed selector backed by `names::` constants",
+                    file.display(),
+                    line_of(&contents, offset),
+                ));
+                from = offset + 1;
+            }
+        }
     }
     assert!(
         violations.is_empty(),
@@ -93,4 +105,8 @@ fn failpoint_names_use_the_compile_checked_catalog() {
          constants, not string literals — a literal typo would silently never fire:\n{}",
         violations.join("\n")
     );
+}
+
+fn engine_failpoints_test() -> PathBuf {
+    manifest_dir().join("tests/failpoints.rs")
 }

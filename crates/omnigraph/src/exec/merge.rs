@@ -2464,33 +2464,19 @@ async fn publish_rewritten_merge_table(
         )));
     }
 
-    // Failpoint: crash after the Phase 2 delete commit, before the index build.
+    // Failpoint: crash after the Phase 2 delete commit, before confirmation.
     // Models a partial Phase B on the three-way path — constructive rows +
     // deletes are on Lance HEAD but the achieved-version intent has not been
-    // recorded, so recovery must roll BACK (the index is reconciler-owned derived
-    // state, but the merge itself never reached its commit boundary). See
+    // recorded, so recovery must roll BACK. See
     // tests/failpoints.rs::branch_merge_rewrite_partial_after_delete_rolls_back.
     crate::failpoints::maybe_fail(
-        crate::failpoints::names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_INDEX,
+        crate::failpoints::names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM,
     )?;
 
-    // Phase 3: rebuild indices.
-    //
-    // `build_indices_on_dataset` stages every missing BTREE/FTS/vector artifact
-    // into one table-level `CreateIndex` tail transaction. This rebuildable
-    // derived-state tail is not part of the merge's logical pre-minted data
-    // chain; Armed v9 recovery accepts it only after that complete exact chain
-    // and discards it with a rollback.
-    let row_count = target_db
-        .storage()
-        .table_state(&full_path, &current_ds)
-        .await?
-        .row_count;
-    if row_count > 0 {
-        target_db
-            .build_indices_on_dataset(table_key, &mut current_ds)
-            .await?;
-    }
+    // Index coverage is reconciler-owned derived state. As on the adopt path,
+    // publish the logical merge without waiting for BTREE / FTS / vector work;
+    // `ensure_indices` / `optimize` converges coverage later while reads remain
+    // correct over uncovered fragments.
     let final_state = target_db
         .storage()
         .table_state(&full_path, &current_ds)
@@ -2825,19 +2811,19 @@ async fn publish_adopted_delta(
         crate::failpoints::names::BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT,
     )?;
 
-    // Phase 1b: upsert the CHANGED rows. The fenced merge join is
-    // bounded to the genuinely-changed set, not the whole delta. It runs against
-    // the committed view that already includes the inserts; the changed ids are
-    // disjoint from the inserted ids (each id is classified into exactly one of
-    // new / changed / deleted / unchanged in the single ordered walk), so the
-    // join never collides with an appended row. Every logical data step uses
-    // the next identity in the exact transaction chain armed before Phase B.
+    // Phase 1b: update the CHANGED rows. Classification proved these ids present
+    // in the target-equals-base image; the sealed update-only adapter forbids
+    // insertion and fails closed if final staging cannot update every id. The
+    // changed ids are disjoint from the inserted ids (each id is classified into
+    // exactly one of new / changed / deleted / unchanged in the single ordered
+    // walk). Every logical data step uses the next identity in the exact
+    // transaction chain armed before Phase B.
     if let Some(upsert_table) = &delta.upserts {
         current_ds = commit_staged_keyed_chunks(
             target_db,
             table_key,
             upsert_table,
-            KeyedWriteSemantics::Upsert,
+            KeyedWriteSemantics::KnownPresentUpdate,
             current_ds,
             planned_transactions,
             &mut planned_index,
