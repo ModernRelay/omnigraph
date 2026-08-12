@@ -2811,19 +2811,19 @@ async fn publish_adopted_delta(
         crate::failpoints::names::BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT,
     )?;
 
-    // Phase 1b: upsert the CHANGED rows. The fenced merge join is
-    // bounded to the genuinely-changed set, not the whole delta. It runs against
-    // the committed view that already includes the inserts; the changed ids are
-    // disjoint from the inserted ids (each id is classified into exactly one of
-    // new / changed / deleted / unchanged in the single ordered walk), so the
-    // join never collides with an appended row. Every logical data step uses
-    // the next identity in the exact transaction chain armed before Phase B.
+    // Phase 1b: update the CHANGED rows. Classification proved these ids present
+    // in the target-equals-base image; the sealed update-only adapter forbids
+    // insertion and fails closed if final staging cannot update every id. The
+    // changed ids are disjoint from the inserted ids (each id is classified into
+    // exactly one of new / changed / deleted / unchanged in the single ordered
+    // walk). Every logical data step uses the next identity in the exact
+    // transaction chain armed before Phase B.
     if let Some(upsert_table) = &delta.upserts {
         current_ds = commit_staged_keyed_chunks(
             target_db,
             table_key,
             upsert_table,
-            KeyedWriteSemantics::Upsert,
+            KeyedWriteSemantics::KnownPresentUpdate,
             current_ds,
             planned_transactions,
             &mut planned_index,

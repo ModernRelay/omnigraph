@@ -348,6 +348,7 @@ Structural probes to classify the route of a timed-out merge:
 | `commit_keyed_stream_chunks` | `exec/merge.rs` | O(Δ+C·stage/commit) | as above |
 | `commit_staged_delete_chunks` | `exec/merge.rs` | O(C_del·delete) | DeleteBuilder each |
 | `stage_keyed_write` | `table_store.rs` | StrictInsert: preflight + O(chunk); Upsert: **O(N+chunk)** join | filtered preflight or full target scan GETs |
+| `KnownPresentUpdate` arm | `table_store.rs` | indexed v1: O(chunk + id lookups); v2 fallback: O(N+chunk) | index candidate GETs or full target scan; never inserts |
 | `stage_proven_strict_insert` | `table_store.rs` | O(chunk) | fragment PUTs only |
 | `preflight_strict_insert_ids` | `table_store.rs` | O(lookup) | 1 filtered scan |
 | `scan_stream_bounded` | `table_store.rs` | scan+sort | page GETs |
@@ -401,18 +402,18 @@ filters differently from MergeInsert-emitted ones (surface guards must keep
 pinning equality). Bloom false positives stay typed read-set / internal, never
 silent duplicates (already RFC-023).
 
-### L2 — Partition adopt/three-way publish by classification disposition
+### L2a — Partition adopt publish by classification disposition — implemented
 
 **Fix.** On `AdoptWithDelta` the ordered walk already partitions ids into
 **new / changed / deleted**. Drive physical ops from that partition:
 
-| Disposition | Today | Design-correct cheaper op |
+| Disposition | Before | Implemented op |
 |---|---|---|
 | New | StrictInsert → full-table MergeInsert | L1 join-free filtered insert |
-| Changed | Upsert → full-table MergeInsert | Filtered `UpdateBuilder` / rewrite of those ids (presence known) |
+| Changed | insertion-capable forced-v2 Upsert | update-only MergeInsert (`UpdateAll` + `DoNothing`), indexed v1 when `id` coverage exists, v2 fallback otherwise |
 | Deleted | `DeleteBuilder` | unchanged |
 
-Optionally extend to `RewriteMerged` by splitting the three-way selection the
+L2b may extend `RewriteMerged` by splitting the three-way selection the
 same way (target absent → insert; target present → update) instead of one
 undifferentiated Upsert stream.
 
@@ -429,15 +430,14 @@ two.
    classification baseline before sidecar arm (`ReadSetChanged` otherwise).
 2. Changed-id sets are **disjoint** from insert sets (true today by the single
    ordered walk).
-3. Filtered update uses **full-row rewrite** of the staged image (merge already
-   stages full rows); `inserted_rows_filter` is correctly `None` because the
-   txn inserts nothing — conflict coverage is `affected_rows`.
-4. **Indexes are derived:** `id IN (...)` may fall back to a table scan when
-   BTREE coverage is pending. Worst case remains O(N) I/O **per chunk**, but
-   avoids DataFusion's full hash-join + `ReplayExec(Capacity::Unbounded)`
-   memory profile. Must not require index presence for correctness (invariant 7).
-5. Sealed adapters + `forbidden_apis` / recovery identity planning must grow
-   exact new shapes; no raw `UpdateBuilder` from call sites.
+3. The update uses a **full-row rewrite** of the staged image (merge already
+   stages full rows). Indexed v1 carries no inserted-row filter; v2 fallback
+   carries `Some(empty)`. A non-empty filter is rejected because the
+   transaction must insert nothing. Conflict coverage is `affected_rows`.
+4. Missing `id` index coverage falls back to v2's full join, so correctness
+   never depends on physical index state (invariant 7).
+5. The sealed `KeyedWriteSemantics::KnownPresentUpdate` enum arm reuses the
+   existing staged gateway; callers cannot express Lance actions directly.
 
 **Invalidates if:** a future classifier emits "changed" without proving the id
 exists on the publish baseline, or partial-column updates are introduced
@@ -450,11 +450,11 @@ an index on a nested field id silently claim rewritten fragments.
 **Empirically verified on Lance 9.0.0:** the hazard does not materialize for
 OmniGraph-shaped schemas — BTREE/FTS/vector index metadata all reference
 top-level field ids (a FixedSizeList child has no field id), and a direct
-v1-route UpdateAll test showed zero new-fragment claims across all three index
-types. L2's first slice remains forced-v2 update-only; the indexed follow-up is
-gated only on landing the checked-in surface-guard cell (fixture must include a
-list-typed property). Details and the full assumption-by-assumption review
-ledger: [merge-l1-l3-plan.md](merge-l1-l3-plan.md) → "Review ledger".
+v1-route UpdateAll test showed zero new-fragment claims. The checked-in
+`indexed_update_only_route_leaves_rewritten_fragments_uncovered` Lance guard
+now pins that contract before the production arm enables the indexed route.
+Details and the full assumption-by-assumption review ledger:
+[merge-l1-l3-plan.md](merge-l1-l3-plan.md) → "Review ledger".
 
 ### L3 — Defer `RewriteMerged` inline index build (align with adopt + deny-list) — implemented
 

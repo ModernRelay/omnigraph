@@ -543,9 +543,7 @@ async fn changed_only_adopt_uses_known_present_update() {
     let dir = tempfile::tempdir().unwrap();
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
-    let feature = Omnigraph::open(dir.path().to_str().unwrap())
-        .await
-        .unwrap();
+    let feature = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
     feature
         .mutate(
             "feature",
@@ -566,6 +564,8 @@ async fn changed_only_adopt_uses_known_present_update() {
         0,
         "known-present adopt updates must not use the insertion-capable general Upsert stage"
     );
+    assert_eq!(probes.stage_known_present_update_calls(), 1);
+    assert_eq!(probes.stage_known_present_update_rows(), 1);
 }
 
 const WIDE_VALIDATION_SCHEMA: &str = r#"

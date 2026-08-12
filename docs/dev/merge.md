@@ -113,8 +113,11 @@ The general route remains an ordered, row-by-row cursor merge:
   references because it does accept `WriteParams`.
 - New-row chunks use exact-`id` `StrictInsert`: after one pinned-target
   preflight they stage the same join-free filtered insertion-only `Update` as
-  the proven route. Changed-row chunks use exact-`id` `Upsert`. The complete
-  ordered chain is pre-minted under one `protocol_v4`
+  the proven route. On target-equals-base adoption, changed-row chunks use the
+  sealed known-present update-only arm (`UpdateAll` + `DoNothing`) and fail
+  closed unless every classified id updates; true three-way rewrites still use
+  exact-`id` Upsert pending L2b. The complete ordered chain is pre-minted under
+  one `protocol_v4`
   recovery sidecar, with at most **1,024 logical data transactions per table**.
   A larger row or plan returns typed `ResourceLimitExceeded` before sidecar arm.
 - Exact recovery scans at most **1,026 versions**: the 1,024 logical data

@@ -143,6 +143,10 @@ pub enum KeyedWriteSemantics {
     StrictInsert,
     /// Insert new ids and replace the full row for ids already present.
     Upsert,
+    /// Replace full rows only for ids already proven present by a coherent
+    /// merge classification. Missing ids are an internal read-set change,
+    /// never inserts.
+    KnownPresentUpdate,
 }
 
 /// One exact chunk admitted to the join-free strict-insert adapter by the
@@ -607,9 +611,11 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// Stage one RFC-023 fenced keyed write from an in-memory batch.
     ///
-    /// This production adapter accepts only the graph `id` key, checks
-    /// that the target dataset declares exactly that unenforced primary key,
-    /// and forces Lance's filter-bearing non-index merge route.
+    /// This production adapter accepts only the graph `id` key and checks that
+    /// the target dataset declares exactly that unenforced primary key.
+    /// Insertion-capable Upsert forces Lance's filter-bearing non-index route;
+    /// known-present update-only staging may use the indexed route because
+    /// `DoNothing` makes insertion structurally unreachable.
     async fn stage_keyed_write(
         &self,
         snapshot: SnapshotHandle,

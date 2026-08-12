@@ -2369,6 +2369,86 @@ async fn unenforced_pk_filter_shape_is_route_dependent() {
     );
 }
 
+/// The indexed v1 matched-only route is safe for OmniGraph's update-only merge
+/// adapter only if it leaves rewritten fragments outside every stale index's
+/// coverage. A future Lance change that over-claims those fragments could
+/// silently return stale indexed values.
+#[tokio::test]
+async fn indexed_update_only_route_leaves_rewritten_fragments_uncovered() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("indexed-update-coverage.lance");
+    let mut dataset = fresh_pk_dataset(uri.to_str().unwrap()).await;
+    dataset
+        .create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+    let dataset = Arc::new(dataset);
+    let old_fragments = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u64)
+        .collect::<HashSet<_>>();
+
+    let staged = stage_pk_merge(
+        dataset.clone(),
+        pk_full_row(dataset.as_ref(), "alice", 42),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::DoNothing,
+        None,
+    )
+    .await;
+    assert_eq!(staged.stats.num_inserted_rows, 0);
+    assert_eq!(staged.stats.num_updated_rows, 1);
+    assert!(staged.inserted_rows_filter.is_none(), "fixture must use v1");
+    assert!(staged.affected_rows.is_some());
+    let Operation::Update {
+        fields_for_preserving_frag_bitmap,
+        update_mode,
+        ..
+    } = &staged.transaction.operation
+    else {
+        panic!("indexed update-only route must stage Operation::Update");
+    };
+    let top_level_fields = dataset
+        .schema()
+        .fields
+        .iter()
+        .map(|field| field.id as u32)
+        .collect::<Vec<_>>();
+    assert_eq!(fields_for_preserving_frag_bitmap, &top_level_fields);
+    assert_eq!(
+        update_mode,
+        &Some(lance::dataset::transaction::UpdateMode::RewriteRows)
+    );
+
+    let mut commit = CommitBuilder::new(dataset.clone());
+    if let Some(affected_rows) = staged.affected_rows {
+        commit = commit.with_affected_rows(affected_rows);
+    }
+    let committed = commit.execute(staged.transaction).await.unwrap();
+    let new_fragments = committed
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u64)
+        .filter(|fragment_id| !old_fragments.contains(fragment_id))
+        .collect::<Vec<_>>();
+    assert!(!new_fragments.is_empty());
+    for index in committed.load_indices().await.unwrap().iter() {
+        assert!(
+            index
+                .fragment_bitmap
+                .as_ref()
+                .is_none_or(|bitmap| new_fragments
+                    .iter()
+                    .all(|fragment_id| !bitmap.contains(*fragment_id as u32))),
+            "index '{}' falsely claimed rewritten fragments {new_fragments:?}",
+            index.name
+        );
+    }
+}
+
 // --- Guard 19c: pinned Lance key-filter conflicts are directional ----------
 //
 // Lance evaluates compatibility from the transaction currently being rebased

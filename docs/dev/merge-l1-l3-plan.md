@@ -1,12 +1,24 @@
 # Plan: Merge latency L1–L3
 
-**Status:** implementation plan (not authorized as an RFC)
+**Status:** L1 / L2a / L3 implemented; L2b deferred (not an RFC)
 **Depends on:** [merge-complexity.md](merge-complexity.md) ranking
 **Out of scope here:** L4 cleaned-history admission, L5 Lance indexed key filter,
 L6 fragment adopt (RFC-0001)
 
 This plan turns the validated L1–L3 fixes into shippable PRs: what changes,
 what must not change, how to test, and which assumptions gate each step.
+
+**Implementation outcome (2026-08-12).** L3 and L1 landed as specified. L2a
+uses a closed `KeyedWriteSemantics::KnownPresentUpdate` arm on the existing
+staged gateway instead of adding another trait method; this is a narrower
+surface than the proposed sealed method. Its Lance indexed-v1 coverage guard
+passed locally, so the implementation enables the indexed update-only route
+in the same change rather than shipping the planned forced-v2 intermediate.
+Missing coverage still falls back to v2, and the shared validator accepts only
+v1 `None` / v2 `Some(empty)` filters, `RewriteRows`, exact updated-row stats,
+and present affected-row metadata. L2b (splitting true three-way rewrite
+output) remains deferred. Detailed “PR-C/C4” steps below are retained as
+planning provenance and are superseded by this outcome where they differ.
 
 ## Goals
 

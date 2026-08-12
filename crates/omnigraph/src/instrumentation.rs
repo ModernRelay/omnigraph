@@ -239,6 +239,10 @@ pub struct MergeWriteProbes {
     pub stage_append_rows: Arc<AtomicU64>,
     pub stage_merge_insert_calls: Arc<AtomicU64>,
     pub stage_merge_insert_rows: Arc<AtomicU64>,
+    /// Update-only keyed stages whose ids were proven present by merge
+    /// classification. Kept separate from insertion-capable Upsert.
+    pub stage_known_present_update_calls: Arc<AtomicU64>,
+    pub stage_known_present_update_rows: Arc<AtomicU64>,
     /// Strict-insert transactions that write new fragments directly and carry
     /// Lance's inserted-row key filter without running a target merge join.
     pub stage_fenced_insert_calls: Arc<AtomicU64>,
@@ -294,6 +298,13 @@ impl MergeWriteProbes {
     }
     pub fn stage_merge_insert_rows(&self) -> u64 {
         self.stage_merge_insert_rows.load(Ordering::Relaxed)
+    }
+    pub fn stage_known_present_update_calls(&self) -> u64 {
+        self.stage_known_present_update_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn stage_known_present_update_rows(&self) -> u64 {
+        self.stage_known_present_update_rows.load(Ordering::Relaxed)
     }
     pub fn stage_fenced_insert_calls(&self) -> u64 {
         self.stage_fenced_insert_calls.load(Ordering::Relaxed)
@@ -417,6 +428,17 @@ pub(crate) fn record_stage_merge_insert(rows: u64) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.stage_merge_insert_calls.fetch_add(1, Ordering::Relaxed);
         p.stage_merge_insert_rows.fetch_add(rows, Ordering::Relaxed);
+    });
+}
+
+/// Record one update-only keyed stage whose ids were proven present by merge
+/// classification. No-op when no test or benchmark probe is installed.
+pub(crate) fn record_stage_known_present_update(rows: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.stage_known_present_update_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.stage_known_present_update_rows
+            .fetch_add(rows, Ordering::Relaxed);
     });
 }
 
