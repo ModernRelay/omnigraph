@@ -439,6 +439,15 @@ two.
 exists on the publish baseline, or partial-column updates are introduced
 without updating conflict metadata.
 
+**Review addendum (2026-08-12):** the indexed (v1) update route is additionally
+gated on a frag-bitmap proof — Lance's v1 full-schema update arm emits
+top-level-only `fields_for_preserving_frag_bitmap`, which can let an index on a
+nested field id silently claim rewritten fragments. Until a surface-guard cell
+(or upstream fix) closes that, L2's first slice is forced-v2 update-only
+(correctness narrowing, not yet a join win). Details and the full
+assumption-by-assumption review ledger:
+[merge-l1-l3-plan.md](merge-l1-l3-plan.md) → "Review ledger".
+
 ### L3 — Defer `RewriteMerged` inline index build (align with adopt + deny-list)
 
 **Fix.** Stop calling `build_indices_on_dataset` on the three-way publish path;
