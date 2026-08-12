@@ -15,7 +15,7 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[command(after_help = "\
 COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
-URI): query, mutate, load, branch, snapshot, export, commit, schema show/apply.\n  \
+URI): query, mutate, load, blob, branch, snapshot, export, commit, schema show/apply.\n  \
 served — require a server: graphs (registry scope).\n  \
 direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
 schema plan, lint).\n  \
@@ -238,6 +238,11 @@ pub(crate) enum Command {
         #[arg(long = "table")]
         table_keys: Vec<String>,
     },
+    /// Read one logical node or edge Blob cell.
+    Blob {
+        #[command(subcommand)]
+        command: BlobCommand,
+    },
     /// Commit history operations
     Commit {
         #[command(subcommand)]
@@ -389,6 +394,79 @@ pub(crate) enum ProfileCommand {
     Show {
         /// Profile name (optional).
         name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum BlobEntityArg {
+    Node,
+    Edge,
+}
+
+impl From<BlobEntityArg> for omnigraph_api_types::BlobEntityKind {
+    fn from(entity: BlobEntityArg) -> Self {
+        match entity {
+            BlobEntityArg::Node => Self::Node,
+            BlobEntityArg::Edge => Self::Edge,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum BlobCommand {
+    /// Stream one managed Blob to stdout or a file.
+    Get {
+        /// Logical entity namespace.
+        #[arg(value_name = "ENTITY")]
+        entity: BlobEntityArg,
+        /// Accepted-schema node or edge type.
+        #[arg(value_name = "TYPE")]
+        type_name: String,
+        /// Logical entity id.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Blob property name.
+        #[arg(value_name = "PROPERTY")]
+        property: String,
+        /// Read a named branch (defaults to main).
+        #[arg(long, conflicts_with = "snapshot")]
+        branch: Option<String>,
+        /// Read an immutable graph snapshot.
+        #[arg(long, conflicts_with = "branch")]
+        snapshot: Option<String>,
+        /// First byte to return.
+        #[arg(long)]
+        offset: Option<u64>,
+        /// Number of bytes to return; must be greater than zero.
+        #[arg(long)]
+        length: Option<u64>,
+        /// Write bytes to a file instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+    /// Inspect one Blob descriptor without reading payload bytes.
+    Stat {
+        /// Logical entity namespace.
+        #[arg(value_name = "ENTITY")]
+        entity: BlobEntityArg,
+        /// Accepted-schema node or edge type.
+        #[arg(value_name = "TYPE")]
+        type_name: String,
+        /// Logical entity id.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Blob property name.
+        #[arg(value_name = "PROPERTY")]
+        property: String,
+        /// Read a named branch (defaults to main).
+        #[arg(long, conflicts_with = "snapshot")]
+        branch: Option<String>,
+        /// Read an immutable graph snapshot.
+        #[arg(long, conflicts_with = "branch")]
+        snapshot: Option<String>,
+        /// Emit stable JSON metadata.
         #[arg(long)]
         json: bool,
     },

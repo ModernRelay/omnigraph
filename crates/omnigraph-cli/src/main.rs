@@ -5,8 +5,8 @@ use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
-    ChangeOutput, CommitOutput, ErrorOutput, GraphBatchLoadOutput, IngestOutput, ReadOutput,
-    SchemaApplyOutput, SnapshotTableOutput,
+    BlobContentKindOutput, BlobStatOutput, ChangeOutput, CommitOutput, ErrorOutput,
+    GraphBatchLoadOutput, IngestOutput, ReadOutput, SchemaApplyOutput, SnapshotTableOutput,
 };
 use omnigraph_cluster::{
     ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput,
@@ -42,6 +42,7 @@ mod read_format;
 use embed::{EmbedArgs, EmbedOutput, execute_embed};
 use read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
 
+mod blob_cli;
 mod cli;
 mod client;
 mod helpers;
@@ -683,6 +684,72 @@ async fn main() -> Result<()> {
                 .export(&branch, &type_names, &table_keys, &mut stdout)
                 .await?;
         }
+        Command::Blob { command } => match command {
+            BlobCommand::Get {
+                entity,
+                type_name,
+                id,
+                property,
+                branch,
+                snapshot,
+                offset,
+                length,
+                out,
+            } => {
+                // Invalid range arithmetic is rejected before scope resolution
+                // can probe a server or open a graph.
+                let range = blob_cli::BlobRangeRequest::new(offset, length)?;
+                let query =
+                    blob_cli::blob_query(entity.into(), type_name, id, property, branch, snapshot);
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    None,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                match out {
+                    Some(path) => {
+                        let mut file = blob_cli::DeferredOutputFile::new(path);
+                        client.blob_get(&query, range, &mut file).await?;
+                    }
+                    None => {
+                        let stdout = io::stdout();
+                        let mut stdout = stdout.lock();
+                        client.blob_get(&query, range, &mut stdout).await?;
+                    }
+                }
+            }
+            BlobCommand::Stat {
+                entity,
+                type_name,
+                id,
+                property,
+                branch,
+                snapshot,
+                json,
+            } => {
+                let query =
+                    blob_cli::blob_query(entity.into(), type_name, id, property, branch, snapshot);
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    None,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let output = client.blob_stat(&query).await?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print_blob_stat_human(&output);
+                }
+            }
+        },
         Command::Query {
             name,
             query,

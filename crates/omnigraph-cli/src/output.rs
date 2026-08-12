@@ -769,6 +769,41 @@ pub(crate) fn print_snapshot_human(
     }
 }
 
+pub(crate) fn print_blob_stat_human(output: &BlobStatOutput) {
+    let entity = match output.selector.entity {
+        omnigraph_api_types::BlobEntityKind::Node => "node",
+        omnigraph_api_types::BlobEntityKind::Edge => "edge",
+    };
+    println!("entity: {entity}");
+    println!("type: {}", output.selector.r#type);
+    println!("id: {}", output.selector.id);
+    println!("property: {}", output.selector.property);
+    match output.kind {
+        BlobContentKindOutput::Managed => {
+            println!("kind: managed");
+            if let Some(size) = output.size {
+                println!("size: {size}");
+            }
+            if let Some(etag) = output.etag.as_deref() {
+                println!("etag: {etag}");
+            }
+        }
+        BlobContentKindOutput::External => {
+            println!("kind: external");
+            if let Some(uri) = output.uri.as_deref() {
+                println!("uri: {uri}");
+            }
+        }
+    }
+    if let Some(branch) = output.target.branch.as_deref() {
+        println!("branch: {branch}");
+    }
+    if let Some(snapshot) = output.target.snapshot.as_deref() {
+        println!("snapshot: {snapshot}");
+    }
+    println!("resolved_snapshot: {}", output.target.resolved_snapshot);
+}
+
 pub(crate) fn print_read_output(output: &ReadOutput, format: ReadOutputFormat) -> Result<()> {
     println!(
         "{}",

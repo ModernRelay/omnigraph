@@ -26,24 +26,30 @@ use std::io::Write;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent};
 use omnigraph_api_types::{
-    BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
-    BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitOutput, ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphListResponse,
-    IngestOutput, IngestRequest, InvokeStoredQueryRequest, QueryRequest, ReadOutput,
-    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
+    BlobReadQuery, BlobStatOutput, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput,
+    BranchListOutput, BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest,
+    CommitListOutput, CommitOutput, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
+    GraphListResponse, IngestOutput, IngestRequest, InvokeStoredQueryRequest, QueryRequest,
+    ReadOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
     ingest_receipt_output, read_output, schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
-use reqwest::Method;
+use reqwest::header::{CONTENT_RANGE, RANGE};
+use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
+use crate::blob_cli::{
+    BlobRangeRequest, blob_cell, blob_read_target, blob_url, external_response_headers,
+    managed_response_headers, map_embedded_blob_error, remote_blob_error, whole_external_uri,
+};
 use crate::cli::CliLoadMode;
 use crate::helpers::{
-    apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
-    legacy_change_request_body, precondition_failed_cli, query_params_from_json, remote_json,
-    remote_json_with_graph_commit_precondition, remote_url, resolve_cli_actor, resolve_cli_graph,
-    resolve_remote_bearer_token, resolve_server_flag, select_named_query,
+    apply_bearer_token, apply_server_flag, build_blob_http_client, build_http_client,
+    is_remote_uri, legacy_change_request_body, precondition_failed_cli, query_params_from_json,
+    remote_json, remote_json_with_graph_commit_precondition, remote_url, resolve_cli_actor,
+    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 
@@ -946,6 +952,170 @@ impl GraphClient {
         }
     }
 
+    /// Stream one managed Blob without buffering the whole value. External
+    /// descriptors are reported but never followed or dereferenced.
+    pub(crate) async fn blob_get<W: Write + ?Sized>(
+        &self,
+        query: &BlobReadQuery,
+        range: Option<BlobRangeRequest>,
+        writer: &mut W,
+    ) -> Result<()> {
+        match self {
+            GraphClient::Embedded { uri, .. } => {
+                let db = Self::open_embedded(uri).await?;
+                let read = db
+                    .read_blob_at(blob_read_target(query), blob_cell(query))
+                    .await
+                    .map_err(map_embedded_blob_error)?;
+                match read.content {
+                    BlobContent::Managed { length, reader, .. } => {
+                        let selected = match range {
+                            Some(range) => range.resolve(length)?,
+                            None => 0..length,
+                        };
+                        let mut cursor = selected.start;
+                        while cursor < selected.end {
+                            let end = selected
+                                .end
+                                .min(cursor.saturating_add(BLOB_READ_RANGE_MAX_BYTES));
+                            let bytes = reader
+                                .read_range(cursor..end)
+                                .await
+                                .map_err(map_embedded_blob_error)?;
+                            let expected = usize::try_from(end - cursor)
+                                .map_err(|_| color_eyre::eyre::eyre!("Blob delivery failed"))?;
+                            if bytes.len() != expected {
+                                bail!("Blob delivery failed: managed range length mismatch");
+                            }
+                            writer.write_all(&bytes)?;
+                            cursor = end;
+                        }
+                        writer.flush()?;
+                        Ok(())
+                    }
+                    BlobContent::External(reference) => {
+                        let uri = whole_external_uri(&reference)?;
+                        bail!(
+                            "external Blob is not downloaded; URI: {uri}; use `blob stat --json` \
+                             to inspect the descriptor"
+                        )
+                    }
+                }
+            }
+            GraphClient::Remote {
+                base_url, token, ..
+            } => {
+                let http = build_blob_http_client()?;
+                let mut request = apply_bearer_token(
+                    http.request(Method::GET, blob_url(base_url, query)?),
+                    token.as_deref(),
+                );
+                if let Some(range) = range {
+                    request = request.header(RANGE, range.header_value());
+                }
+                let mut response = request
+                    .send()
+                    .await
+                    .map_err(|_| color_eyre::eyre::eyre!("Blob server request failed"))?;
+                let status = response.status();
+                if status == StatusCode::FOUND {
+                    let (uri, _snapshot_id) = external_response_headers(response.headers())?;
+                    bail!(
+                        "external Blob is not downloaded; URI: {uri}; use `blob stat --json` \
+                         to inspect the descriptor"
+                    );
+                }
+                let expected_status = if range.is_some() {
+                    StatusCode::PARTIAL_CONTENT
+                } else {
+                    StatusCode::OK
+                };
+                if status != expected_status {
+                    return Err(remote_blob_error(status));
+                }
+                let headers = managed_response_headers(response.headers())?;
+                if let Some(range) = range {
+                    validate_content_range(response.headers(), range, headers.length)?;
+                }
+                let mut written = 0_u64;
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|_| color_eyre::eyre::eyre!("Blob delivery stream failed"))?
+                {
+                    writer.write_all(&chunk)?;
+                    written = written
+                        .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+                        .ok_or_else(|| color_eyre::eyre::eyre!("Blob delivery failed"))?;
+                }
+                if written != headers.length {
+                    bail!(
+                        "Blob delivery stream ended after {written} bytes; expected {}",
+                        headers.length
+                    );
+                }
+                writer.flush()?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Inspect one Blob descriptor. Neither arm reads managed payload bytes;
+    /// external references are classified without probing their target.
+    pub(crate) async fn blob_stat(&self, query: &BlobReadQuery) -> Result<BlobStatOutput> {
+        match self {
+            GraphClient::Embedded { uri, .. } => {
+                let db = Self::open_embedded(uri).await?;
+                let read = db
+                    .read_blob_at(blob_read_target(query), blob_cell(query))
+                    .await
+                    .map_err(map_embedded_blob_error)?;
+                let resolved_snapshot = read.resolved_target.snapshot_id.to_string();
+                match read.content {
+                    BlobContent::Managed { length, etag, .. } => Ok(BlobStatOutput::managed(
+                        query,
+                        resolved_snapshot,
+                        length,
+                        etag.into_string(),
+                    )),
+                    BlobContent::External(reference) => Ok(BlobStatOutput::external(
+                        query,
+                        resolved_snapshot,
+                        whole_external_uri(&reference)?.to_string(),
+                    )),
+                }
+            }
+            GraphClient::Remote {
+                base_url, token, ..
+            } => {
+                let http = build_blob_http_client()?;
+                let response = apply_bearer_token(
+                    http.request(Method::HEAD, blob_url(base_url, query)?),
+                    token.as_deref(),
+                )
+                .send()
+                .await
+                .map_err(|_| color_eyre::eyre::eyre!("Blob server request failed"))?;
+                match response.status() {
+                    StatusCode::OK => {
+                        let headers = managed_response_headers(response.headers())?;
+                        Ok(BlobStatOutput::managed(
+                            query,
+                            headers.snapshot_id,
+                            headers.length,
+                            headers.etag,
+                        ))
+                    }
+                    StatusCode::FOUND => {
+                        let (uri, snapshot_id) = external_response_headers(response.headers())?;
+                        Ok(BlobStatOutput::external(query, snapshot_id, uri))
+                    }
+                    status => Err(remote_blob_error(status)),
+                }
+            }
+        }
+    }
+
     /// `graphs list` — enumerate the graphs a multi-graph server serves
     /// (`GET /graphs`). Reached only through registry-addressed clients
     /// (`resolve_registry` / the D7 probe's `registry_client`), which always
@@ -975,9 +1145,59 @@ impl GraphClient {
     }
 }
 
+fn validate_content_range(
+    headers: &reqwest::header::HeaderMap,
+    requested: BlobRangeRequest,
+    served_length: u64,
+) -> Result<()> {
+    let raw = headers
+        .get(CONTENT_RANGE)
+        .ok_or_else(|| color_eyre::eyre::eyre!("Blob server response omitted Content-Range"))?
+        .to_str()
+        .map_err(|_| color_eyre::eyre::eyre!("Blob server returned an invalid Content-Range"))?;
+    let Some(spec) = raw.strip_prefix("bytes ") else {
+        bail!("Blob server returned an invalid Content-Range");
+    };
+    let Some((bounds, total)) = spec.split_once('/') else {
+        bail!("Blob server returned an invalid Content-Range");
+    };
+    let Some((start, end)) = bounds.split_once('-') else {
+        bail!("Blob server returned an invalid Content-Range");
+    };
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| color_eyre::eyre::eyre!("Blob server returned an invalid Content-Range"))?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| color_eyre::eyre::eyre!("Blob server returned an invalid Content-Range"))?;
+    let total = total
+        .parse::<u64>()
+        .map_err(|_| color_eyre::eyre::eyre!("Blob server returned an invalid Content-Range"))?;
+    let actual = end
+        .checked_sub(start)
+        .and_then(|length| length.checked_add(1))
+        .ok_or_else(|| color_eyre::eyre::eyre!("Blob server returned an invalid Content-Range"))?;
+    let available = total.checked_sub(requested.start()).ok_or_else(|| {
+        color_eyre::eyre::eyre!("Blob server returned an inconsistent Content-Range")
+    })?;
+    let expected = requested
+        .requested_length()
+        .map_or(available, |length| length.min(available));
+    if start != requested.start() || actual != served_length || actual != expected || end >= total {
+        bail!("Blob server returned an inconsistent Content-Range");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn content_range_headers(value: &'static str) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(CONTENT_RANGE, value.parse().unwrap());
+        headers
+    }
 
     #[test]
     fn resolve_registry_is_sync_and_yields_the_bare_base_url() {
@@ -991,5 +1211,21 @@ mod tests {
         let client = GraphClient::resolve_registry(Some("http://server.invalid:9/"), None).unwrap();
         assert_eq!(client.uri(), "http://server.invalid:9");
         assert!(client.is_remote());
+    }
+
+    #[test]
+    fn content_range_must_cover_the_exact_requested_or_eof_clamped_length() {
+        let exact = BlobRangeRequest::new(Some(0), Some(6)).unwrap().unwrap();
+        validate_content_range(&content_range_headers("bytes 0-5/100"), exact, 6).unwrap();
+        assert!(
+            validate_content_range(&content_range_headers("bytes 0-2/100"), exact, 3).is_err(),
+            "a self-consistent but truncated 206 must not be accepted as the requested range"
+        );
+
+        let clamped = BlobRangeRequest::new(Some(98), Some(6)).unwrap().unwrap();
+        validate_content_range(&content_range_headers("bytes 98-99/100"), clamped, 2).unwrap();
+
+        let open = BlobRangeRequest::new(Some(97), None).unwrap().unwrap();
+        validate_content_range(&content_range_headers("bytes 97-99/100"), open, 3).unwrap();
     }
 }

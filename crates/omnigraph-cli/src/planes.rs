@@ -12,7 +12,9 @@
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
-use crate::cli::{Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand, SchemaCommand};
+use crate::cli::{
+    BlobCommand, Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand, SchemaCommand,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Plane {
@@ -167,14 +169,15 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             Direct => !matches!(cmd, Command::Init { .. }),
             Served | Control | Local => false,
         },
-        // The actor rides direct-engine (`any` via --store) and cluster
-        // writes; served writes resolve the actor from the bearer token
+        // The actor rides direct-engine writes (`any` via --store) and cluster
+        // writes; Blob get/stat are reads and never consume it. Served writes
+        // resolve the actor from the bearer token
         // (rejected downstream with its own message), and `direct`
         // maintenance verbs record no actor. `control` refines per command:
         // `cluster apply`/`approve` attribute an actor — the other read-only
         // control verbs (status/plan/validate, policy, queries) never read it.
         ScopeFlag::As => match capability {
-            Any => true,
+            Any => !matches!(cmd, Command::Blob { .. }),
             Control => matches!(
                 cmd,
                 Command::Cluster {
@@ -232,6 +235,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Branch { .. }
         | Command::Snapshot { .. }
         | Command::Export { .. }
+        | Command::Blob { .. }
         | Command::Commit { .. }
         | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
@@ -285,6 +289,10 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         },
         Command::Snapshot { .. } => "snapshot",
         Command::Export { .. } => "export",
+        Command::Blob { command } => match command {
+            BlobCommand::Get { .. } => "blob get",
+            BlobCommand::Stat { .. } => "blob stat",
+        },
         Command::Commit { .. } => "commit",
         Command::Query { .. } => "query",
         Command::Mutate { .. } => "mutate",
@@ -429,6 +437,18 @@ mod tests {
                 [true, false, true, true, true, true],
             ),
             (
+                parse(&[
+                    "omnigraph",
+                    "blob",
+                    "stat",
+                    "node",
+                    "Document",
+                    "readme",
+                    "content",
+                ]),
+                [true, false, true, true, false, true],
+            ),
+            (
                 parse(&["omnigraph", "graphs", "list"]),
                 [true, false, false, false, false, true],
             ),
@@ -481,6 +501,18 @@ mod tests {
         let cap = |args: &[&str]| command_capability(&Cli::try_parse_from(args).unwrap().command);
         // The one Data→Served refinement: the registry-scoped `graphs` family.
         assert_eq!(cap(&["omnigraph", "graphs", "list"]), Capability::Served);
+        assert_eq!(
+            cap(&[
+                "omnigraph",
+                "blob",
+                "get",
+                "node",
+                "Document",
+                "readme",
+                "content",
+            ]),
+            Capability::Any
+        );
         assert_eq!(cap(&["omnigraph", "alias", "who"]), Capability::Local);
         assert_eq!(
             cap(&["omnigraph", "optimize", "graph.omni"]),

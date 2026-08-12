@@ -192,9 +192,9 @@ boundaries, like `cleanup`: Phase 1 adds no durable or cross-process live-reader
 lease. A reader never redirects to newer bytes, but an uncached later range may
 fail loudly after reclamation. Quiesce readers before deleting their branch or
 running version GC when they must finish. HTTP Blob delivery and CLI
-`blob get`/`blob stat` are later phases and are not exposed by this engine-only
-slice. The pre-1.0 Lance-returning `Omnigraph::read_blob` method has been removed;
-there is no compatibility wrapper that leaks `BlobFile`.
+`blob get`/`blob stat` now expose this bounded facade without leaking physical
+placement. The pre-1.0 Lance-returning `Omnigraph::read_blob` method has been
+removed; there is no compatibility wrapper that leaks `BlobFile`.
 
 For a keyed node, `id` is derived from the complete typed `@key` tuple. A
 single-column key keeps its canonical scalar spelling. A composite key is an
