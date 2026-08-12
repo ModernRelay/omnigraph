@@ -2435,7 +2435,13 @@ async fn indexed_update_only_route_leaves_rewritten_fragments_uncovered() {
         .filter(|fragment_id| !old_fragments.contains(fragment_id))
         .collect::<Vec<_>>();
     assert!(!new_fragments.is_empty());
-    for index in committed.load_indices().await.unwrap().iter() {
+    let indices = committed.load_indices().await.unwrap();
+    assert_eq!(
+        indices.len(),
+        3,
+        "fixture must exercise BTREE, FTS, and vector index coverage together"
+    );
+    for index in indices.iter() {
         assert!(
             index
                 .fragment_bitmap

@@ -21,6 +21,8 @@ const CALL_PREFIXES: &[&str] = &[
     "ScopedFailPoint::new(",
     "ScopedFailPoint::with_callback(",
     "park_first(",
+    // Test helper that forwards its argument into ScopedFailPoint::new.
+    "assert_partial_merge_rolls_back(",
 ];
 
 /// 1-based line number of `byte_off` within `contents`.
