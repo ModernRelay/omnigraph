@@ -116,9 +116,12 @@ The general route remains an ordered, row-by-row cursor merge:
   recovery sidecar, with at most **1,024 logical data transactions per table**.
   A larger row or plan returns typed `ResourceLimitExceeded` before sidecar arm.
 - Exact recovery scans at most **1,026 versions**: the 1,024 logical data
-  transactions plus headroom for one allowed derived `CreateIndex` tail and one
-  compensating `Restore`. The restore headroom is required because recovery can
-  crash after restoring the table but before publishing the manifest outcome.
+  transactions plus backward-compatible headroom for one legacy
+  `CreateIndex` tail and one compensating `Restore`. Current branch-merge
+  writers build no indexes inline; the legacy allowance keeps v9 sidecars from
+  older binaries recoverable. Restore headroom remains required because
+  recovery can crash after restoring the table but before publishing the
+  manifest outcome.
 - The merge runs per sub-table, but all chunks become graph-visible through one
   atomic manifest update. Once the sidecar is armed, any chunk conflict retains
   recovery ownership and returns `RecoveryRequired`; the merge never retries

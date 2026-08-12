@@ -2464,33 +2464,19 @@ async fn publish_rewritten_merge_table(
         )));
     }
 
-    // Failpoint: crash after the Phase 2 delete commit, before the index build.
+    // Failpoint: crash after the Phase 2 delete commit, before confirmation.
     // Models a partial Phase B on the three-way path — constructive rows +
     // deletes are on Lance HEAD but the achieved-version intent has not been
-    // recorded, so recovery must roll BACK (the index is reconciler-owned derived
-    // state, but the merge itself never reached its commit boundary). See
+    // recorded, so recovery must roll BACK. See
     // tests/failpoints.rs::branch_merge_rewrite_partial_after_delete_rolls_back.
     crate::failpoints::maybe_fail(
-        crate::failpoints::names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_INDEX,
+        crate::failpoints::names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM,
     )?;
 
-    // Phase 3: rebuild indices.
-    //
-    // `build_indices_on_dataset` stages every missing BTREE/FTS/vector artifact
-    // into one table-level `CreateIndex` tail transaction. This rebuildable
-    // derived-state tail is not part of the merge's logical pre-minted data
-    // chain; Armed v9 recovery accepts it only after that complete exact chain
-    // and discards it with a rollback.
-    let row_count = target_db
-        .storage()
-        .table_state(&full_path, &current_ds)
-        .await?
-        .row_count;
-    if row_count > 0 {
-        target_db
-            .build_indices_on_dataset(table_key, &mut current_ds)
-            .await?;
-    }
+    // Index coverage is reconciler-owned derived state. As on the adopt path,
+    // publish the logical merge without waiting for BTREE / FTS / vector work;
+    // `ensure_indices` / `optimize` converges coverage later while reads remain
+    // correct over uncovered fragments.
     let final_state = target_db
         .storage()
         .table_state(&full_path, &current_ds)

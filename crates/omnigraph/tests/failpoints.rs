@@ -8790,125 +8790,19 @@ async fn branch_merge_confirmed_ref_only_effect_rolls_forward() {
     assert!(names.iter().any(|name| name == "confirmed-ref-row"));
 }
 
-/// RewriteMerged can append reconciler-owned CreateIndex commits after its
-/// pre-minted logical data transactions. An Armed crash in that derived tail is
-/// still rollback-only, but recovery must prove the exact planned transaction
-/// prefix and accept only the contiguous CreateIndex suffix rather than treating
-/// its larger numeric HEAD as foreign movement.
-#[tokio::test]
-#[serial]
-#[serial(branch_merge_phase_b)]
-async fn branch_merge_armed_index_tail_rolls_back_after_exact_transaction_prefix() {
-    use lance::index::DatasetIndexExt;
-
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let (uri, main_rows) = setup_diverged_merge_branches(&dir).await;
-    let mut db = Omnigraph::open(&uri).await.unwrap();
-    let person_uri = node_table_uri(&db, "Person").await;
-
-    // Make the rewrite rebuild `id_idx` after its logical data transaction.
-    // Publish the dropped-index HEAD first so the merge's expected version and
-    // planned transaction chain are anchored to a fully consistent target.
-    let mut target_person = helpers::open_dataset_head(&person_uri, Some("target")).await;
-    target_person.drop_index("id_idx").await.unwrap();
-    let dropped_index_head = target_person.version().version;
-    db.failpoint_publish_table_head_without_index_rebuild_for_test(
-        "target",
-        "node:Person",
-        Some("target"),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        db.snapshot_of(omnigraph::db::ReadTarget::branch("target"))
-            .await
-            .unwrap()
-            .entry("node:Person")
-            .unwrap()
-            .table_version,
-        dropped_index_head
-    );
-
-    let operation_id = {
-        let _failpoint =
-            ScopedFailPoint::new(names::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM, "return");
-        match db.branch_merge("source", "target").await.unwrap_err() {
-            OmniError::RecoveryRequired { operation_id, .. } => operation_id,
-            other => panic!("Armed derived-tail failure must retain recovery ownership: {other}"),
-        }
-    };
-    let sidecar_path = dir
-        .path()
-        .join("__recovery")
-        .join(format!("{operation_id}.json"));
-    let sidecar: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
-    assert_eq!(sidecar["protocol_v4"]["effect_phase"], "Armed");
-    let person_pin = sidecar["tables"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|pin| pin["table_key"] == "node:Person")
-        .unwrap();
-    let expected_version = person_pin["expected_version"].as_u64().unwrap();
-    let person_effect = sidecar["protocol_v4"]["effects"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|effect| effect["table_key"] == "node:Person")
-        .unwrap();
-    let planned_transaction_count = person_effect["kind"]["planned_transactions"]
-        .as_array()
-        .unwrap()
-        .len();
-    assert!(
-        planned_transaction_count > 0,
-        "fixture must plan at least one logical Person transaction"
-    );
-    let raw_head_with_index_tail = helpers::open_dataset_head(&person_uri, Some("target"))
-        .await
-        .version()
-        .version;
-    assert!(
-        raw_head_with_index_tail > expected_version + planned_transaction_count as u64,
-        "raw HEAD {raw_head_with_index_tail} must include at least one CreateIndex tail after \
-         expected {expected_version} + {planned_transaction_count} planned transactions"
-    );
-    drop(db);
-
-    let recovered = Omnigraph::open(&uri)
-        .await
-        .expect("Full recovery must roll an exact Armed transaction+index tail back");
-    assert!(!sidecar_path.exists());
-    assert_eq!(
-        helpers::count_rows_branch(&recovered, "target", "node:Person").await,
-        main_rows + 1
-    );
-    let names = collect_column_strings(
-        &helpers::read_table_branch(&recovered, "target", "node:Person").await,
-        "name",
-    );
-    assert!(names.iter().any(|name| name == "old-target-only"));
-    assert!(!names.iter().any(|name| name == "source-only"));
-}
-
 /// Phase-B confirmation is an ownership proof, not a numeric HEAD stamp. A
-/// foreign logical Append can land after the merge's exact data transaction and
-/// before its retrying CreateIndex tail; Lance may validly rebase that index
-/// build over the Append, but the merge must not confirm or recover the foreign
-/// row as its own output.
+/// foreign logical Append can land after the merge's exact data transaction,
+/// but the merge must not confirm or recover the foreign row as its own output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 #[serial(branch_merge_phase_b)]
-async fn branch_merge_confirmation_rejects_foreign_append_before_index_tail() {
+async fn branch_merge_confirmation_rejects_foreign_append_after_data_effects() {
     use futures::TryStreamExt;
-    use lance::index::DatasetIndexExt;
 
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let (uri, _) = setup_diverged_merge_branches(&dir).await;
-    let mut db = Omnigraph::open(&uri).await.unwrap();
+    let db = Omnigraph::open(&uri).await.unwrap();
 
     // Prepare one schema-exact row on an unrelated branch. Its RecordBatch can
     // then be appended directly to target Lance HEAD without invoking any
@@ -8936,33 +8830,28 @@ async fn branch_merge_confirmation_rejects_foreign_append_before_index_tail() {
         })
         .expect("foreign seed row must be readable as one append batch");
 
-    // Force RewriteMerged to execute a CreateIndex tail after its exact data
-    // transaction, while keeping the target manifest consistent before merge.
     let person_uri = node_table_uri(&db, "Person").await;
-    let mut target_person = helpers::open_dataset_head(&person_uri, Some("target")).await;
-    target_person.drop_index("id_idx").await.unwrap();
-    let dropped_index_head = target_person.version().version;
-    db.failpoint_publish_table_head_without_index_rebuild_for_test(
-        "target",
-        "node:Person",
-        Some("target"),
-    )
-    .await
-    .unwrap();
+    let target_table_version_before_merge = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("target"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
     let target_head_before_merge = branch_head_commit_id(dir.path(), "target").await.unwrap();
 
     let merge_db = std::sync::Arc::new(db);
     let merge_rv = helpers::failpoint::Rendezvous::park_first(
-        names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_INDEX,
+        names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM,
     );
     let merge_handle = std::sync::Arc::clone(&merge_db);
     let merge_task =
         tokio::spawn(async move { merge_handle.branch_merge("source", "target").await });
     merge_rv.wait_until_reached().await;
 
-    // The merge's logical data transaction is now at HEAD, but its index build
-    // has not started. Append a real logical row without publishing target
-    // manifest authority, then let CreateIndex rebase over that foreign commit.
+    // The merge's logical data transaction is now at HEAD. Append a real
+    // logical row without publishing target manifest authority, then let
+    // confirmation classify that unowned tail.
     let mut raw_target = helpers::open_dataset_head(&person_uri, Some("target")).await;
     helpers::lance_append_inline(&mut raw_target, foreign_batch).await;
     let foreign_append_head = raw_target.version().version;
@@ -8982,14 +8871,11 @@ async fn branch_merge_confirmation_rejects_foreign_append_before_index_tail() {
         sidecar["protocol_v4"]["effect_phase"], "Armed",
         "confirmation must reject before persisting EffectsConfirmed"
     );
-    let raw_head_after_index_rebase = helpers::open_dataset_head(&person_uri, Some("target"))
+    let raw_head_after_foreign_append = helpers::open_dataset_head(&person_uri, Some("target"))
         .await
         .version()
         .version;
-    assert!(
-        raw_head_after_index_rebase > foreign_append_head,
-        "fixture must place at least one rebased CreateIndex commit after the foreign Append"
-    );
+    assert_eq!(raw_head_after_foreign_append, foreign_append_head);
     assert_eq!(
         branch_head_commit_id(dir.path(), "target").await.unwrap(),
         target_head_before_merge,
@@ -8998,13 +8884,12 @@ async fn branch_merge_confirmation_rejects_foreign_append_before_index_tail() {
     drop(merge_db);
 
     let open_error = match Omnigraph::open(&uri).await {
-        Ok(_) => panic!("Full recovery must fail closed on a non-CreateIndex foreign tail"),
+        Ok(_) => panic!("Full recovery must fail closed on the foreign tail"),
         Err(error) => error,
     };
     assert!(
         open_error.to_string().contains("foreign")
-            || open_error.to_string().contains("unverifiable")
-            || open_error.to_string().contains("CreateIndex"),
+            || open_error.to_string().contains("unverifiable"),
         "unexpected fail-closed error: {open_error}"
     );
     assert!(sidecar_path.exists());
@@ -9022,13 +8907,13 @@ async fn branch_merge_confirmation_rejects_foreign_append_before_index_tail() {
             .entry("node:Person")
             .unwrap()
             .table_version,
-        dropped_index_head,
+        target_table_version_before_merge,
         "target manifest must remain at its pre-merge Person pin"
     );
     let raw_after_failed_recovery = helpers::open_dataset_head(&person_uri, Some("target")).await;
     assert_eq!(
         raw_after_failed_recovery.version().version,
-        raw_head_after_index_rebase,
+        raw_head_after_foreign_append,
         "fail-closed recovery must not restore through the foreign Append"
     );
     let raw_batches: Vec<arrow_array::RecordBatch> = raw_after_failed_recovery
@@ -9478,8 +9363,8 @@ async fn sorted_person_names(db: &Omnigraph) -> Vec<String> {
 }
 
 /// THE recovery-atomicity regression gate. A branch merge whose per-table publish
-/// is a multi-commit sequence (append → upsert → delete, or merge_insert → delete
-/// → index) advances Lance HEAD step by step before the manifest publish. If the
+/// is a multi-commit sequence (append → upsert → delete, or merge_insert →
+/// delete) advances Lance HEAD step by step before the manifest publish. If the
 /// process dies *mid*-sequence — after some planned commits but while the v4
 /// sidecar remains Armed — recovery must roll the whole merge **back**, not
 /// publish the partial and record the merge as complete.
@@ -9623,7 +9508,7 @@ async fn branch_merge_rewrite_partial_after_merge_rolls_back() {
 async fn branch_merge_rewrite_partial_after_delete_rolls_back() {
     assert_partial_merge_rolls_back(
         MergeScenario::Rewrite,
-        "branch_merge.rewrite_after_delete_pre_index",
+        "branch_merge.rewrite_after_delete_pre_confirm",
     )
     .await;
 }
