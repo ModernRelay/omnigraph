@@ -558,6 +558,16 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
         1,
         "general strict insert must exact-probe the pinned target once"
     );
+    assert_eq!(
+        probes.stage_fenced_insert_calls(),
+        1,
+        "absence-proven strict insert must stage one join-free fenced insert"
+    );
+    assert_eq!(
+        probes.stage_merge_insert_calls(),
+        0,
+        "absence-proven strict insert must not pay a redundant target merge join"
+    );
     assert!(
         super::has_insert_absence_certificate(&staged.transaction),
         "verified general strict insert must carry the durable absence certificate"
