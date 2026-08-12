@@ -1318,7 +1318,7 @@ pub(super) async fn batch_for_schema_apply_rewrite(
                 .column_by_name("_rowid")
                 .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
                 .ok_or_else(|| {
-                    OmniError::Lance(format!(
+                    OmniError::manifest_internal(format!(
                         "expected _rowid column when rewriting '{}'",
                         source_table_key
                     ))
@@ -1347,7 +1347,7 @@ pub(super) async fn batch_for_schema_apply_rewrite(
                         .as_any()
                         .downcast_ref::<StructArray>()
                         .ok_or_else(|| {
-                            OmniError::Lance(format!(
+                            OmniError::manifest_internal(format!(
                                 "expected blob descriptions for '{}.{}'",
                                 source_table_key, source_name
                             ))
@@ -1410,7 +1410,7 @@ async fn rebuild_blob_column(
         }
 
         let blob = files.next().ok_or_else(|| {
-            OmniError::Lance(format!(
+            OmniError::manifest_internal(format!(
                 "blob rewrite for '{}' lost alignment with source rows",
                 column_name
             ))
@@ -1431,7 +1431,7 @@ async fn rebuild_blob_column(
     }
 
     if files.next().is_some() {
-        return Err(OmniError::Lance(format!(
+        return Err(OmniError::manifest_internal(format!(
             "blob rewrite for '{}' produced extra source blobs",
             column_name
         )));

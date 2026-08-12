@@ -690,7 +690,7 @@ impl TableStore {
             .column_by_name("_rowid")
             .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| {
-                OmniError::Lance("expected _rowid column when materializing blobs".to_string())
+                OmniError::manifest_internal("expected _rowid column when materializing blobs".to_string())
             })?
             .values()
             .iter()
@@ -715,7 +715,7 @@ impl TableStore {
         max_blob_bytes: Option<u64>,
     ) -> Result<RecordBatch> {
         if batch.num_rows() != row_ids.len() {
-            return Err(OmniError::Lance(format!(
+            return Err(OmniError::manifest_internal(format!(
                 "blob materialization row count {} does not match {} row ids",
                 batch.num_rows(),
                 row_ids.len()
@@ -729,7 +729,7 @@ impl TableStore {
             let lance_field = lance::datatypes::Field::try_from(field.as_ref())
                 .map_err(|e| OmniError::Lance(e.to_string()))?;
             let column = batch.column_by_name(field.name()).ok_or_else(|| {
-                OmniError::Lance(format!("batch missing column '{}'", field.name()))
+                OmniError::manifest_internal(format!("batch missing column '{}'", field.name()))
             })?;
             if lance_field.is_blob() {
                 let descriptions =
@@ -737,7 +737,7 @@ impl TableStore {
                         .as_any()
                         .downcast_ref::<StructArray>()
                         .ok_or_else(|| {
-                            OmniError::Lance(format!(
+                            OmniError::manifest_internal(format!(
                                 "expected blob descriptions for '{}'",
                                 field.name()
                             ))
@@ -800,7 +800,7 @@ impl TableStore {
             }
 
             let blob = files.next().ok_or_else(|| {
-                OmniError::Lance(format!(
+                OmniError::manifest_internal(format!(
                     "blob rewrite for '{}' lost alignment with source rows",
                     column_name
                 ))
@@ -829,7 +829,7 @@ impl TableStore {
         }
 
         if files.next().is_some() {
-            return Err(OmniError::Lance(format!(
+            return Err(OmniError::manifest_internal(format!(
                 "blob rewrite for '{}' produced extra source blobs",
                 column_name
             )));
@@ -849,7 +849,7 @@ impl TableStore {
             .column_by_name("position")
             .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| {
-                OmniError::Lance(format!(
+                OmniError::manifest_internal(format!(
                     "unrecognized blob description schema {:?}: missing UInt64 position field",
                     descriptions.fields()
                 ))
@@ -858,7 +858,7 @@ impl TableStore {
             .column_by_name("size")
             .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| {
-                OmniError::Lance(format!(
+                OmniError::manifest_internal(format!(
                     "unrecognized blob description schema {:?}: missing UInt64 size field",
                     descriptions.fields()
                 ))
@@ -878,7 +878,7 @@ impl TableStore {
             }
             kind.value(row) as u8
         } else {
-            return Err(OmniError::Lance(format!(
+            return Err(OmniError::manifest_internal(format!(
                 "unrecognized blob description schema {:?}: kind field must be UInt8 or UInt32",
                 descriptions.fields()
             )));
@@ -2710,7 +2710,7 @@ impl TableStore {
         // `key_column` if union is what they wanted.
         if let (Some(key_col), Some(cols)) = (key_column, projection) {
             if !cols.contains(&key_col) {
-                return Err(OmniError::Lance(format!(
+                return Err(OmniError::manifest_internal(format!(
                     "scan_with_pending: key_column '{}' must appear in projection \
                      when merge-shadow semantics are requested (got projection = {:?})",
                     key_col, cols
@@ -2902,7 +2902,7 @@ impl TableStore {
                 .column_by_name("_rowid")
                 .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
                 .ok_or_else(|| {
-                    OmniError::Lance("expected _rowid in predicate-matched blob scan".to_string())
+                    OmniError::manifest_internal("expected _rowid in predicate-matched blob scan".to_string())
                 })?
                 .values()
                 .to_vec();
@@ -3321,7 +3321,7 @@ fn non_blob_column_bytes(ds: &Dataset, batch: &RecordBatch) -> Result<u64> {
         .filter(|field| !field.is_blob())
         .try_fold(0_u64, |total, field| {
             let column = batch.column_by_name(&field.name).ok_or_else(|| {
-                OmniError::Lance(format!("batch missing column '{}'", field.name))
+                OmniError::manifest_internal(format!("batch missing column '{}'", field.name))
             })?;
             let bytes = u64::try_from(column.get_array_memory_size()).map_err(|_| {
                 OmniError::manifest_internal("non-blob pending scan bytes exceed u64")
@@ -3344,13 +3344,13 @@ fn collect_string_column_values(
     let mut out = std::collections::HashSet::new();
     for batch in batches {
         let Some(col) = batch.column_by_name(column) else {
-            return Err(OmniError::Lance(format!(
+            return Err(OmniError::manifest_internal(format!(
                 "scan_with_pending: pending batch missing key column '{}'",
                 column
             )));
         };
         let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            OmniError::Lance(format!(
+            OmniError::manifest_internal(format!(
                 "scan_with_pending: key column '{}' is not Utf8",
                 column
             ))
@@ -3392,7 +3392,7 @@ fn filter_out_rows_where_string_in(
             ))
         })?;
         let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            OmniError::Lance(format!(
+            OmniError::manifest_internal(format!(
                 "scan_with_pending: committed column '{}' is not Utf8",
                 column
             ))
@@ -3517,7 +3517,7 @@ async fn materialize_external_blob_inputs(
             .as_any()
             .downcast_ref::<StructArray>()
             .ok_or_else(|| {
-                OmniError::Lance(format!("expected blob struct input for '{}'", field.name()))
+                OmniError::manifest_internal(format!("expected blob struct input for '{}'", field.name()))
             })?;
         // Dataset scans can already yield prepared descriptors. Those are
         // handled by the branch-merge materializer before this adapter.
@@ -3529,7 +3529,7 @@ async fn materialize_external_blob_inputs(
             .column_by_name("uri")
             .and_then(|array| array.as_any().downcast_ref::<StringArray>())
             .ok_or_else(|| {
-                OmniError::Lance(format!(
+                OmniError::manifest_internal(format!(
                     "logical blob input '{}' is missing Utf8 child 'uri'",
                     field.name()
                 ))
@@ -3544,7 +3544,7 @@ async fn materialize_external_blob_inputs(
             .column_by_name("data")
             .and_then(|array| array.as_any().downcast_ref::<LargeBinaryArray>())
             .ok_or_else(|| {
-                OmniError::Lance(format!(
+                OmniError::manifest_internal(format!(
                     "logical blob input '{}' is missing LargeBinary child 'data'",
                     field.name()
                 ))
@@ -3553,7 +3553,7 @@ async fn materialize_external_blob_inputs(
             .column_by_name("position")
             .map(|array| {
                 array.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
-                    OmniError::Lance(format!(
+                    OmniError::manifest_internal(format!(
                         "logical blob input '{}' has non-UInt64 child 'position'",
                         field.name()
                     ))
@@ -3564,7 +3564,7 @@ async fn materialize_external_blob_inputs(
             .column_by_name("size")
             .map(|array| {
                 array.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
-                    OmniError::Lance(format!(
+                    OmniError::manifest_internal(format!(
                         "logical blob input '{}' has non-UInt64 child 'size'",
                         field.name()
                     ))

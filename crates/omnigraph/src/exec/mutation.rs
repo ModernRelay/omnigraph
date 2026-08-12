@@ -473,7 +473,7 @@ fn apply_assignments(
                 // schema, so copying it preserves both bytes and full-schema
                 // merge compatibility.
                 let col = batch.column_by_name(field.name()).ok_or_else(|| {
-                    OmniError::Lance(format!(
+                    OmniError::manifest_internal(format!(
                         "blob column '{}' not found in full-schema mutation scan",
                         field.name()
                     ))
@@ -488,7 +488,7 @@ fn apply_assignments(
             )?);
         } else {
             let col = batch.column_by_name(field.name()).ok_or_else(|| {
-                OmniError::Lance(format!(
+                OmniError::manifest_internal(format!(
                     "column '{}' not found in scan result",
                     field.name()
                 ))
@@ -1495,7 +1495,7 @@ fn concat_match_batches_to_schema(
             .map_err(|e| OmniError::Lance(e.to_string()));
     }
     arrow_select::concat::concat_batches(schema, &batches).map_err(|e| {
-        OmniError::Lance(format!(
+        OmniError::manifest_internal(format!(
             "mutation scan returned batches that violate the full logical schema \
              across the committed/pending boundary ({})",
             e

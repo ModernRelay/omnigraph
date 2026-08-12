@@ -345,7 +345,7 @@ where
                 .column_by_name("_rowid")
                 .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
                 .ok_or_else(|| {
-                    OmniError::Lance(format!(
+                    OmniError::manifest_internal(format!(
                         "expected _rowid column when exporting '{}'",
                         table_key
                     ))
@@ -376,7 +376,7 @@ async fn export_blob_values(
             .column_by_name(property)
             .and_then(|col| col.as_any().downcast_ref::<StructArray>())
             .ok_or_else(|| {
-                OmniError::Lance(format!(
+                OmniError::manifest_internal(format!(
                     "expected blob descriptions for export column '{}'",
                     property
                 ))
@@ -534,7 +534,7 @@ async fn export_blob_column_values(
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
     if sorted_blobs.len() != non_null_positions.len() {
-        return Err(OmniError::Lance(format!(
+        return Err(OmniError::manifest_internal(format!(
             "blob export for '{}' lost alignment with selected rows",
             column_name
         )));
@@ -587,21 +587,21 @@ fn json_value_from_named_column(
     row: usize,
 ) -> Result<serde_json::Value> {
     let column = batch.column_by_name(field_name).ok_or_else(|| {
-        OmniError::Lance(format!("missing column '{}' in export batch", field_name))
+        OmniError::manifest_internal(format!("missing column '{}' in export batch", field_name))
     })?;
     json_value_from_array(column.as_ref(), row)
 }
 
 fn named_string_value(batch: &RecordBatch, field_name: &str, row: usize) -> Result<String> {
     let column = batch.column_by_name(field_name).ok_or_else(|| {
-        OmniError::Lance(format!("missing column '{}' in export batch", field_name))
+        OmniError::manifest_internal(format!("missing column '{}' in export batch", field_name))
     })?;
     let array = column
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::Lance(format!("expected Utf8 column '{}'", field_name)))?;
+        .ok_or_else(|| OmniError::manifest_internal(format!("expected Utf8 column '{}'", field_name)))?;
     if array.is_null(row) {
-        return Err(OmniError::Lance(format!(
+        return Err(OmniError::manifest_internal(format!(
             "unexpected null in export column '{}'",
             field_name
         )));

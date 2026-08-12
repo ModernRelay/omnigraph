@@ -577,7 +577,7 @@ impl StagedTableWriter {
             .iter()
             .map(|field| {
                 batch.column_by_name(field.name()).cloned().ok_or_else(|| {
-                    OmniError::Lance(format!("batch missing column '{}'", field.name()))
+                    OmniError::manifest_internal(format!("batch missing column '{}'", field.name()))
                 })
             })
             .collect::<Result<Vec<_>>>()?;
