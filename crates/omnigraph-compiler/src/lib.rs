@@ -30,10 +30,13 @@ pub use ir::ParamMap;
 pub use ir::lower::{lower_mutation_query, lower_query};
 pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};
 pub use query::ast::Literal;
+pub use query::descriptor::{
+    QueryGraphFact, QueryGraphFactKind, QueryOperationDescriptor, QueryResultFieldDescriptor,
+    QueryValueKind, describe_query_operation,
+};
 pub use query::lint::{
-    QueryLintFinding, QueryLintGraphFact, QueryLintGraphFactKind, QueryLintOperation,
-    QueryLintOutput, QueryLintQueryKind, QueryLintQueryResult, QueryLintSchemaSource,
-    QueryLintSchemaSourceKind, QueryLintSeverity, QueryLintStatus, QueryLintValue,
+    QueryLintFinding, QueryLintOutput, QueryLintQueryKind, QueryLintQueryResult,
+    QueryLintSchemaSource, QueryLintSchemaSourceKind, QueryLintSeverity, QueryLintStatus,
     lint_query_file,
 };
 pub use query_input::{

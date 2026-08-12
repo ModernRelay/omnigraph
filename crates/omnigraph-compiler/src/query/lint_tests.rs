@@ -1,5 +1,8 @@
 use super::*;
 use crate::build_catalog;
+use crate::query::descriptor::{
+    QueryGraphFact, QueryGraphFactKind, QueryResultFieldDescriptor, QueryValueKind,
+};
 use crate::schema::parser::parse_schema;
 
 fn catalog(schema: &str) -> Catalog {
@@ -55,25 +58,19 @@ update Person set { missing: "nope" } where slug = $slug
     assert_eq!(output.results[0].status, QueryLintStatus::Ok);
     let operation = output.results[0].operation.as_ref().unwrap();
     assert_eq!(
-        operation.params,
-        vec![QueryLintValue {
-            name: "slug".to_string(),
-            type_name: "String".to_string(),
-            nullable: false,
-        }]
-    );
-    assert_eq!(
         operation.result,
-        vec![QueryLintValue {
+        vec![QueryResultFieldDescriptor {
             name: "name".to_string(),
-            type_name: "String".to_string(),
+            kind: QueryValueKind::String,
+            item_kind: None,
+            vector_dim: None,
             nullable: true,
         }]
     );
     assert_eq!(
         operation.reads,
-        vec![QueryLintGraphFact {
-            kind: QueryLintGraphFactKind::Node,
+        vec![QueryGraphFact {
+            kind: QueryGraphFactKind::Node,
             type_name: "Person".to_string(),
         }]
     );
@@ -87,6 +84,11 @@ update Person set { missing: "nope" } where slug = $slug
             .as_deref()
             .unwrap_or_default()
             .contains("has no property")
+    );
+    let serialized = serde_json::to_value(&output).unwrap();
+    assert!(
+        serialized["results"][1].get("operation").is_none(),
+        "failed queries must omit the descriptor rather than serialize a partial value"
     );
 }
 
@@ -127,13 +129,18 @@ insert Knows { from: $from, to: $to }
     );
     assert_eq!(output.warnings, 1);
     let mutation = output.results[1].operation.as_ref().unwrap();
-    assert!(mutation.params.is_empty());
     assert!(mutation.result.is_empty());
-    assert!(mutation.reads.is_empty());
+    assert_eq!(
+        mutation.reads,
+        vec![QueryGraphFact {
+            kind: QueryGraphFactKind::Node,
+            type_name: "Person".to_string(),
+        }]
+    );
     assert_eq!(
         mutation.writes,
-        vec![QueryLintGraphFact {
-            kind: QueryLintGraphFactKind::Node,
+        vec![QueryGraphFact {
+            kind: QueryGraphFactKind::Node,
             type_name: "Person".to_string(),
         }]
     );
@@ -141,20 +148,20 @@ insert Knows { from: $from, to: $to }
     assert_eq!(
         constrained_edge.reads,
         vec![
-            QueryLintGraphFact {
-                kind: QueryLintGraphFactKind::Node,
+            QueryGraphFact {
+                kind: QueryGraphFactKind::Node,
                 type_name: "Person".to_string(),
             },
-            QueryLintGraphFact {
-                kind: QueryLintGraphFactKind::Edge,
+            QueryGraphFact {
+                kind: QueryGraphFactKind::Edge,
                 type_name: "Knows".to_string(),
             },
         ]
     );
     assert_eq!(
         constrained_edge.writes,
-        vec![QueryLintGraphFact {
-            kind: QueryLintGraphFactKind::Edge,
+        vec![QueryGraphFact {
+            kind: QueryGraphFactKind::Edge,
             type_name: "Knows".to_string(),
         }]
     );
@@ -308,4 +315,202 @@ update Policy set { a_field: "x" } where slug = $slug
     assert_eq!(output.findings[1].property.as_deref(), Some("c_field"));
     assert_eq!(output.findings[0].query_names, vec!["update_a", "update_b"]);
     assert_eq!(output.findings[1].query_names, vec!["update_a", "update_b"]);
+}
+
+#[test]
+fn negated_subplans_contribute_recursive_read_facts() {
+    let output = lint_query_file(
+        &catalog(
+            r#"
+node Person { name: String }
+node Company { name: String }
+edge WorksAt: Person -> Company
+"#,
+        ),
+        r#"
+query unemployed() {
+match {
+    $p: Person
+    not { $p worksAt $_ }
+}
+return { $p.name }
+}
+"#,
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+
+    assert_eq!(
+        output.results[0].operation.as_ref().unwrap().reads,
+        vec![
+            QueryGraphFact {
+                kind: QueryGraphFactKind::Node,
+                type_name: "Company".to_string(),
+            },
+            QueryGraphFact {
+                kind: QueryGraphFactKind::Node,
+                type_name: "Person".to_string(),
+            },
+            QueryGraphFact {
+                kind: QueryGraphFactKind::Edge,
+                type_name: "WorksAt".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn node_delete_reports_every_incident_edge_as_read_and_possible_write() {
+    let output = lint_query_file(
+        &catalog(
+            r#"
+node Person { slug: String @key }
+node Company { slug: String @key }
+edge Knows: Person -> Person
+edge WorksAt: Person -> Company
+edge Partners: Company -> Company
+"#,
+        ),
+        r#"
+query delete_person($slug: String) {
+delete Person where slug = $slug
+}
+"#,
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+
+    let operation = output.results[0].operation.as_ref().unwrap();
+    let expected = vec![
+        QueryGraphFact {
+            kind: QueryGraphFactKind::Node,
+            type_name: "Person".to_string(),
+        },
+        QueryGraphFact {
+            kind: QueryGraphFactKind::Edge,
+            type_name: "Knows".to_string(),
+        },
+        QueryGraphFact {
+            kind: QueryGraphFactKind::Edge,
+            type_name: "WorksAt".to_string(),
+        },
+    ];
+    assert_eq!(operation.reads, expected);
+    assert_eq!(operation.writes, expected);
+}
+
+#[test]
+fn same_named_node_and_edge_mutation_keeps_the_typechecked_namespace() {
+    let output = lint_query_file(
+        &catalog(
+            r#"
+node Shared { slug: String @key }
+edge Shared: Shared -> Shared
+"#,
+        ),
+        r#"
+query insert_shared($slug: String) {
+insert Shared { slug: $slug }
+}
+"#,
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+
+    let operation = output.results[0].operation.as_ref().unwrap();
+    let node = QueryGraphFact {
+        kind: QueryGraphFactKind::Node,
+        type_name: "Shared".to_string(),
+    };
+    assert_eq!(operation.reads, vec![node.clone()]);
+    assert_eq!(operation.writes, vec![node]);
+}
+
+#[test]
+fn result_descriptor_uses_closed_structured_kinds() {
+    let output = lint_query_file(
+        &catalog(
+            r#"
+node Doc {
+slug: String @key
+count: I32
+total: I64
+score: F64
+tags: [Date]?
+embedding: Vector(3)
+createdAt: DateTime?
+}
+"#,
+        ),
+        r#"
+query describe_doc() {
+match { $d: Doc }
+return {
+    $d.slug
+    $d.count
+    $d.total
+    $d.score
+    $d.tags
+    $d.embedding
+    $d.createdAt
+    $d
+}
+}
+"#,
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+
+    let result = &output.results[0].operation.as_ref().unwrap().result;
+    let shapes = result
+        .iter()
+        .map(|field| {
+            (
+                field.name.as_str(),
+                field.kind,
+                field.item_kind,
+                field.vector_dim,
+                field.nullable,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shapes,
+        vec![
+            ("slug", QueryValueKind::String, None, None, false),
+            ("count", QueryValueKind::Int, None, None, false),
+            ("total", QueryValueKind::BigInt, None, None, false),
+            ("score", QueryValueKind::Float, None, None, false),
+            (
+                "tags",
+                QueryValueKind::List,
+                Some(QueryValueKind::Date),
+                None,
+                true,
+            ),
+            ("embedding", QueryValueKind::Vector, None, Some(3), false,),
+            ("createdAt", QueryValueKind::DateTime, None, None, true,),
+            ("d", QueryValueKind::Object, None, None, false),
+        ]
+    );
+
+    let serialized = serde_json::to_value(&output).unwrap();
+    assert_eq!(
+        serialized["results"][0]["operation"]["result"][4],
+        serde_json::json!({
+            "name": "tags",
+            "kind": "list",
+            "item_kind": "date",
+            "nullable": true
+        })
+    );
+    assert_eq!(
+        serialized["results"][0]["operation"]["result"][5],
+        serde_json::json!({
+            "name": "embedding",
+            "kind": "vector",
+            "vector_dim": 3,
+            "nullable": false
+        })
+    );
 }
