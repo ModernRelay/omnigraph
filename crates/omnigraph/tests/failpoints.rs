@@ -1998,11 +1998,21 @@ async fn rfc023_effect_free_conflict_is_typed_or_fully_reprepared() {
             outcome.expect("upsert must fully reprepare and publish after the winner");
         }
 
-        assert_eq!(
-            probes.stage_merge_insert_calls(),
-            expected_attempts,
-            "{case}: strict must not retry; upsert must stage a fresh second attempt"
-        );
+        if mode == LoadMode::Append {
+            assert_eq!(probes.stage_merge_insert_calls(), 0);
+            assert_eq!(
+                probes.stage_fenced_insert_calls(),
+                expected_attempts,
+                "{case}: strict must stage exactly one join-free fenced attempt"
+            );
+        } else {
+            assert_eq!(
+                probes.stage_merge_insert_calls(),
+                expected_attempts,
+                "{case}: upsert must stage a fresh second attempt"
+            );
+            assert_eq!(probes.stage_fenced_insert_calls(), 0);
+        }
         assert!(
             helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
             "{case}: an exact effect-free conflict must retire its Armed sidecar"
@@ -2084,10 +2094,11 @@ async fn rfc023_disjoint_retryable_strict_conflict_reprepares_without_key_confli
         "a disjoint retryable substrate conflict must reprepare instead of becoming KeyConflict",
     );
     assert_eq!(
-        probes.stage_merge_insert_calls(),
+        probes.stage_fenced_insert_calls(),
         2,
         "the stale strict attempt must be abandoned and staged again from fresh authority"
     );
+    assert_eq!(probes.stage_merge_insert_calls(), 0);
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
 
     let observer = Omnigraph::open(&uri).await.unwrap();
