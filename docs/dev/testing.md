@@ -110,9 +110,14 @@ CI runs these S3-backed **correctness** tests against a containerized RustFS
 server (`.github/workflows/ci.yml` → `rustfs_integration` job) in two
 feature-graph shards. The default shard selects its five test binaries in one
 Cargo invocation so dependency features and large test links compile once,
-then checks the captured log for every required S3 cell and explicit skip. The
-failpoints shard runs the `s3_`-prefixed feature-gated cells in one
-invocation. These remain the focused local equivalents:
+then runs the outer libtest harness with `--test-threads=1` and checks the
+captured log for every required S3 cell and explicit skip. This serializes only
+the top-level scenarios sharing one RustFS container; each scenario keeps its
+ordinary internal Tokio concurrency. RustFS readiness and bucket creation are
+hard gates. A failed shard records container state, stdout/stderr, and the
+service files under `/logs`. The failpoints shard runs the `s3_`-prefixed
+feature-gated cells in one invocation. These remain the focused local
+equivalents:
 
 - `cargo test -p omnigraph-engine --test s3_storage` (lifecycle/branching, allowed external-S3 copy with 2 inputs/1 HEAD/1 GET and post-source-deletion ownership, plus the e_tag-present CSR topology cache-key reuse test — the path local FS can't reach since its e_tag is `None`)
 - `cargo test -p omnigraph-engine --test lance_surface_guards public_physical_ref_token_rejects_s3_same_version_aba -- --exact` (RFC-024's public current-HEAD witness across unchanged reopen plus main/named same-version ABA; the workflow additionally rejects a zero-test/vacuous match)
