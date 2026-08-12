@@ -698,6 +698,16 @@ fn cluster_apply_json_applies_query_and_policy() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     let validate = write_cluster_applyable_state(temp.path());
+    let seeded_state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp.path().join("__cluster/state.json")).unwrap(),
+    )
+    .unwrap();
+    let seeded_graph = &seeded_state["applied_revision"]["resources"]["graph.knowledge"];
+    assert_eq!(seeded_graph["digest"].as_str().unwrap().len(), 64);
+    assert!(
+        seeded_graph.get("external_blob_policy").is_none(),
+        "the fixture must exercise the valid historical missing-policy => Deny shape"
+    );
 
     let json = parse_stdout_json(&output_success(
         cli()

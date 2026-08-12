@@ -83,11 +83,15 @@ pub mod names {
     /// Every merge table effect is complete, but the sidecar is still in its
     /// pre-confirmation shape.
     pub const BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM: &str = "branch_merge.post_effects_pre_confirm";
-    pub const BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_INDEX: &str =
-        "branch_merge.rewrite_after_delete_pre_index";
+    pub const BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM: &str =
+        "branch_merge.rewrite_after_delete_pre_confirm";
     pub const BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE: &str =
         "branch_merge.rewrite_after_merge_pre_delete";
     pub const CLASSIFY_FRESH_READ: &str = "classify.fresh_read";
+    /// A Blob read has captured one exact graph snapshot and table authority,
+    /// but has not opened the selected Lance table version yet. Tests replace
+    /// a named branch here to prove a live read fails rather than retargeting.
+    pub const BLOB_READ_POST_CAPTURE: &str = "blob_read.post_capture";
     pub const CLEANUP_RECONCILE_FORK: &str = "cleanup.reconcile_fork";
     /// After cleanup's fast empty-sidecar probe, before it acquires the closed
     /// schema/branch/table GC gate set and performs the authoritative recheck.
@@ -116,6 +120,16 @@ pub mod names {
     pub const INIT_AFTER_COORDINATOR_INIT: &str = "init.after_coordinator_init";
     pub const INIT_AFTER_SCHEMA_CONTRACT_WRITTEN: &str = "init.after_schema_contract_written";
     pub const INIT_AFTER_SCHEMA_PG_WRITTEN: &str = "init.after_schema_pg_written";
+    /// Inside `init_manifest_graph`, immediately after the `__manifest`
+    /// Create commit — the manifest's entire birth (entries, genesis lineage,
+    /// and the internal-schema stamp all ride that one commit). A crash here
+    /// must leave an openable store.
+    pub const INIT_POST_MANIFEST_CREATE: &str = "init.post_manifest_create";
+    /// A read-write bind of a local graph root, before the create-if-absent
+    /// probe writes its probe object. Injecting here simulates a filesystem
+    /// without hard-link support (issue #453) for both `init` and
+    /// read-write `open`.
+    pub const LOCAL_CREATE_IF_ABSENT_PROBE: &str = "storage.local_create_if_absent_probe";
     pub const MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE: &str =
         "mutation.delete_node_pre_primary_delete";
     /// After every deferred first-touch table ref is created under a durable
@@ -135,7 +149,15 @@ pub mod names {
     /// first writer here, commit a conflicting second writer, then prove the
     /// first attempt is discarded and validation is rerun from a fresh token.
     pub const MUTATION_POST_STAGE_PRE_EFFECT_GATE: &str = "mutation.post_stage_pre_effect_gate";
+    /// After a conditional mutation has executed to a zero-effect result, but
+    /// before it acquires the branch gate and revalidates the caller's graph
+    /// head. This pins the linearization point for successful no-op CAS calls.
+    pub const MUTATION_POST_NO_EFFECT_PRE_GATE: &str = "mutation.post_no_effect_pre_gate";
     pub const MUTATION_POST_FINALIZE_PRE_PUBLISHER: &str = "mutation.post_finalize_pre_publisher";
+    /// A stale live read has opened and decoded a replacement manifest whose
+    /// exact branch-head row is absent, but has not yet decoded the inherited
+    /// lineage fallback. Failure here must leave the old coordinator coherent.
+    pub const READ_REFRESH_POST_STATE_PRE_LINEAGE: &str = "read.refresh_post_state_pre_lineage";
     /// Open owns the schema gate and is about to read source/IR/state as one
     /// catalog view.
     pub const OPEN_BEFORE_SCHEMA_CONTRACT_READ: &str = "open.before_schema_contract_read";

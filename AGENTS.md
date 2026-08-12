@@ -16,9 +16,9 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
-**Version surveyed:** 0.9.0
+**Version surveyed:** 0.10.0
 **Workspace crates:** `omnigraph-compiler`, `omnigraph-storage` (shared control-object storage), `omnigraph` (engine), `omnigraph-policy`, `omnigraph-api-types` (shared HTTP wire DTOs), `omnigraph-cluster`, `omnigraph-cli`, `omnigraph-server`
-**Storage substrate:** Lance 9.0.0 (columnar, versioned, branchable; crates.io release — the 9.x git-rev pin era ended 2026-07-25)
+**Storage substrate:** Lance 10.0.0 (columnar, versioned, branchable; crates.io release)
 **License:** MIT
 **Toolchain:** Rust stable, edition 2024
 
@@ -64,10 +64,10 @@ CLI (omnigraph)        HTTP Server (omnigraph-server, Axum)
            omnigraph-compiler  ── Pest grammars, catalog, IR, lowering, lint, migration plan
                       │
                       ▼
-           omnigraph (engine)  ── ManifestCoordinator, CommitGraph, RunRegistry, GraphIndex (CSR/CSC), exec
+           omnigraph (engine)  ── ManifestCoordinator, CommitGraph, GraphIndex (CSR/CSC), exec
                       │
                       ▼
-              Lance 9.x         ── columnar Arrow, fragments, per-dataset versions/branches, indexes
+              Lance 10.x        ── columnar Arrow, fragments, per-dataset versions/branches, indexes
                       │
                       ▼
         Object store (file / s3 / RustFS / MinIO / S3-compat)
@@ -104,6 +104,8 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | Transactions and atomicity (per-query atomic; branches as multi-query transactions) | [docs/user/branching/transactions.md](docs/user/branching/transactions.md) |
 | Direct-publish write path (staging, D2, recovery sidecars; the former Run state machine) | [docs/dev/writes.md](docs/dev/writes.md) |
 | Three-way merge and conflict kinds | [docs/dev/merge.md](docs/dev/merge.md) |
+| Branch-merge complexity / timeout diagnosis (OmniGraph + Lance) | [docs/dev/merge-complexity.md](docs/dev/merge-complexity.md) |
+| Merge latency L1–L3 implementation plan | [docs/dev/merge-l1-l3-plan.md](docs/dev/merge-l1-l3-plan.md) |
 | Diff / change feed (`diff_between`, `diff_commits`) | [docs/user/branching/changes.md](docs/user/branching/changes.md) |
 | Query execution, mutation execution, bulk loader, `load` vs `ingest` | [docs/dev/execution.md](docs/dev/execution.md) |
 | `optimize` (compaction) and `cleanup` (version GC) | [docs/user/operations/maintenance.md](docs/user/operations/maintenance.md) |
@@ -216,7 +218,7 @@ cargo test -p omnigraph-server --features aws    # AWS Secrets Manager bearer-to
 
 S3-backed tests (`s3_storage`, and the S3 paths in server/CLI system tests) **skip** unless `OMNIGRAPH_S3_TEST_BUCKET` + `AWS_*` (incl. `AWS_ENDPOINT_URL_S3` for non-AWS) are set; CI runs them against containerized RustFS. To run RustFS/MinIO yourself, see [docs/user/deployment.md](docs/user/deployment.md) → *Testing against S3 locally*.
 
-CI does **not** run `clippy` or `rustfmt` as gates. Its canonical test graph is `cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints`, which compiles the current tree once with failpoint hooks present but inert unless a test configures one; run it before pushing. The immediate-predecessor format fence and the default/failpoint configured-RustFS graphs are separate parallel jobs. Two non-test CI checks are `scripts/check-agents-md.sh` (doc cross-link integrity — run it after moving/renaming docs) and OpenAPI drift (`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json`; set `OMNIGRAPH_UPDATE_OPENAPI=1` to update the checked-in copy when a server/API change is intentional).
+CI runs `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_macro` (default features, then the failpoints superset) as PR-time gates (`Format (rustfmt)` and `Lint (clippy)`); run both before pushing. Lint levels stay `warn` in the workspace table and only CI denies; toolchain-pin and cache mechanics are commented in `.github/workflows/ci.yml`. The workspace allows `collapsible_if` and `too_many_arguments` (root `Cargo.toml`). CI's canonical test graph is `cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints`, which compiles the current tree once with failpoint hooks present but inert unless a test configures one; run it before pushing. The immediate-predecessor storage-format fence and the default/failpoint configured-RustFS graphs are separate parallel jobs. Two non-test CI checks are `scripts/check-agents-md.sh` (doc cross-link integrity — run it after moving/renaming docs) and OpenAPI drift (`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json`; set `OMNIGRAPH_UPDATE_OPENAPI=1` to update the checked-in copy when a server/API change is intentional).
 
 ## Quick-reference flows
 
@@ -266,14 +268,15 @@ omnigraph policy explain --cluster ./company-brain --graph knowledge --actor act
 |---|---|---|
 | Columnar storage on object store | ✅ Arrow/Lance | URI normalization, S3 env-var plumbing |
 | Per-dataset versioning + time travel | ✅ | `snapshot_at_version`, `entity_at`, snapshot-pinned reads across many tables |
+| Blob-v2 cell access | ✅ Blob-v2 descriptors and range readers | `read_blob_at` selects one logical node/edge Blob cell at an exact branch or snapshot without exposing Lance placement. Managed readers are bounded and snapshot-pinned; HTTP GET/explicit HEAD adds ranges, conditionals, and a two-chunk backpressure envelope, while whole-object external values redirect without target-object I/O. Identity ambiguity, ranged external delivery, and malformed state fail closed. See [RFC-033](docs/rfcs/0033-blob-management.md) and [execution internals](docs/dev/execution.md). |
 | Stable schema + table identity | — | Persisted accepted SchemaIR v2 owns one graph identity domain and a shared monotonic no-reuse allocator for nonzero type, property, and table-incarnation IDs. Internal manifest schema v5 introduced identity-keyed registration, version, tombstone, OCC, recovery ownership, and identity-derived node/edge paths; v6 preserves that contract and adds exact non-null `id` fencing. `table_key` is a mutable alias: rename preserves identity/path/history, while drop/re-add mints a new lifetime. This binary serves exactly v6; released v4 graphs rebuild by export/init/load, and abandoned unreleased v7-v19 roots are refused as future formats. |
 | Per-dataset branches | ✅ | **Graph-level** refs are logically atomic through authoritative `__manifest` `BranchContents`; native create/delete crash gaps are classified and reclaimed under a single-writer-process boundary; live names are path-prefix-disjoint; data-table forks are lazy; system branches are filtered |
 | Atomic single-dataset commits | ✅ | **Multi-table publication has three layers:** each participant's Lance effect, one identity-aware `__manifest` CAS for graph visibility, and ordinary recovery-v9 for the gap. Mutation/Load, SchemaApply, BranchMerge, EnsureIndices, and Optimize arm identity-bearing sidecars before their first durable effect. Every pin, effect, registration, rename, tombstone, and output carries stable table/incarnation identity. Writers pre-mint exact Lance transactions where available, confirm complete outcomes before publication, and fail closed on ambiguous or foreign effects. Completed recovery is audited in `_graph_commit_recoveries.lance`. |
 | Compaction (`compact_files`) + reindex (`optimize_indices`) | ✅ | `omnigraph optimize` orchestrates over all node/edge tables with bounded physical concurrency and one graph visibility envelope. Under schema → main → every accepted-catalog table gate it loads one identity-bound catalog/snapshot, skips uncovered HEAD drift, and plans only productive tables. One identity-bearing recovery-v9 `SidecarKind::Optimize` envelope pins the complete set before any table HEAD movement; each productive task runs `compact_files`, Lance `optimize_indices` (incremental coverage merge, not retrain), and declared-missing index materialization, but no task publishes independently. After all tasks settle, one maintenance-class monotonic manifest CAS publishes every still-needed identity pointer plus one graph lineage commit; a pointer already at or beyond the achieved version is converged and omitted. Thus two changed tables become visible together, a no-work run creates no sidecar/lineage, and any post-arm error returns `RecoveryRequired`. Full v9 recovery rolls the complete set forward in one batch or compensates a partial set before visibility. Main remains held through final physical-only `__manifest` compaction. Optimize's bounded maintenance classifier carries stable table identity but has no exact caller-minted transaction/authority/fixed-lineage proof, so destructive recovery retains the documented single-writer-process boundary until Lance exposes a stable maintenance transaction API and OmniGraph has distributed fencing. It **commits even with no compaction work if index coverage is stale**; reports untrainable vector-only work as pending without pinning it; **refuses on an unrecovered graph**; **skips uncovered HEAD > manifest drift** with `DriftNeedsRepair`; and **compacts blob-bearing tables**. |
 | Repair uncovered drift | — | `omnigraph repair` explicitly classifies uncovered table `HEAD > manifest` drift: verified maintenance drift (`ReserveFragments`/`Rewrite`) can be published with `--confirm`; suspicious or unverifiable drift requires `--force --confirm`. Sidecar-covered crash residuals still recover automatically on open. |
-| Cleanup (`cleanup_old_versions`) | ✅ | `omnigraph cleanup` derives requested `--keep` / `--older-than` cutoffs from each table's available versions; Lance refs plus OmniGraph's live-lazy-branch and recovery floors may retain additional versions. It fails closed on unopenable pins, recovery intent, or uncovered main-table HEAD drift |
+| Cleanup (`cleanup_old_versions`) | ✅ | `omnigraph cleanup` derives requested `--keep` / `--older-than` cutoffs from each table's available versions; Lance refs plus OmniGraph's live-lazy-branch and recovery floors may retain additional versions. It fails closed on unopenable pins, recovery intent, or uncovered main-table HEAD drift. A process-local Blob reader is not a durable ref: operators quiesce readers before destructive GC; a raced read may return its captured bytes or fail loudly, but never retarget. |
 | BTREE / inverted (FTS) / vector indexes | ✅ | `@index`/`@key` declares intent; physical indexes are derived state and never fail a logical operation. One type-dispatched chokepoint builds BTREE, FTS, or vector indexes idempotently and lazily across branches. Schema apply and mutation/load publish only logical effects. `ensure_indices` first runs the roll-forward-only recovery barrier, then materializes declared-but-missing artifacts through one staged mixed CreateIndex transaction under ordinary recovery-v9 authority; untrainable vector columns remain pending. |
-| Strict insert / upsert ingestion | ✅ transaction conflict filters + uncommitted fragment staging | Internal schema v6 owns the explicit logical mode. Strict insert and upsert use the sealed exact-`id`, forced-v2 MergeInsert adapter; Mutation/Load remains one transaction per table, capped before arm at 8,192 rows / 32 MiB. BranchMerge's proven all-new route accepts only a complete certificate chain plus final source/target native-incarnation checks; missing or malformed proof falls back to the general ordered diff. Raw Lance writers are outside the supported graph-writer topology. |
+| Strict insert / upsert ingestion | ✅ transaction conflict filters + uncommitted fragment staging | Internal schema v6 owns the explicit logical mode. Strict insert exact-probes its pinned parent, then stages a join-free exact-`id` filtered insertion-only Update; upsert uses the sealed exact-`id`, forced-v2 MergeInsert adapter. Mutation/Load remains one transaction per table, capped before arm at 8,192 rows / 32 MiB. BranchMerge's proven all-new route accepts only a complete certificate chain plus final source/target native-incarnation checks; ordered adopt fallback routes new rows through join-free StrictInsert and changed rows through a sealed update-only (`UpdateAll` + `DoNothing`) arm that fails closed unless every classified id updates. Raw Lance writers are outside the supported graph-writer topology. |
 | Bounded graph-batch ingestion | — | Raw graph-level NDJSON is parsed at a strict logical envelope and committed through the shared ordinary Load transaction. One request produces one graph commit and is acknowledged only after manifest visibility. The public shape names logical node/edge declarations, never physical datasets. There is no MemWAL, token ledger, lifecycle, hidden stream metadata, or stream-specific recovery path. |
 | Vector search | ✅ | `nearest()` query op; embedding pipeline (Gemini / OpenAI clients); `@embed` in schema |
 | Full-text search | ✅ | `search/fuzzy/match_text/bm25` query ops |
@@ -296,7 +299,10 @@ omnigraph policy explain --cluster ./company-brain --graph knowledge --actor act
 The supported SDK graph-write set is closed primarily by Rust visibility: the
 raw storage, handle-cache, and coordinator modules are crate-private, while a
 public snapshot opens tables through a read-only facade whose scan builder
-executes reads without exposing Lance's raw `Scanner` or physical plan. The defense-in-depth registry in
+executes reads without exposing Lance's raw `Scanner` or physical plan. The
+single-cell Blob facade follows the same rule: `BlobReader` is engine-owned and
+bounded; the retired `read_blob -> BlobFile` method has no compatibility shim.
+The defense-in-depth registry in
 `crates/omnigraph/tests/forbidden_apis.rs` classifies every public async inherent
 `Omnigraph` method and loader convenience, every crate-visible async coordinator
 method, and exact per-file occurrences of the registered durable-call shapes,

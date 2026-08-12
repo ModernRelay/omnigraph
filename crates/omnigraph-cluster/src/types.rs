@@ -355,6 +355,7 @@ pub(crate) struct DesiredGraph {
     pub(crate) id: String,
     pub(crate) schema_digest: String,
     pub(crate) embedding_provider: Option<String>,
+    pub(crate) external_blob_policy: omnigraph::ExternalBlobPolicy,
 }
 
 #[derive(Debug)]
@@ -430,6 +431,50 @@ pub(crate) struct GraphConfig {
     /// Optional reference to a top-level `providers.embedding.<name>` profile.
     #[serde(default)]
     pub(crate) embedding_provider: Option<String>,
+    /// Bases from which new external Blob references may be admitted.
+    /// Missing or an empty allow-list is the secure default: deny.
+    #[serde(default, skip_serializing_if = "ExternalBlobsConfig::is_deny")]
+    pub(crate) external_blobs: ExternalBlobsConfig,
+}
+
+/// Raw `cluster.yaml` spelling for one graph's external-Blob admission policy.
+/// The applied ledger never stores this unchecked DTO; configuration loading
+/// converts it once through the engine's URI normalizer and persists the
+/// resulting [`omnigraph::ExternalBlobPolicy`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExternalBlobsConfig {
+    #[serde(default)]
+    pub(crate) allow: Vec<ExternalBlobBaseConfig>,
+}
+
+impl ExternalBlobsConfig {
+    fn is_deny(&self) -> bool {
+        self.allow.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExternalBlobBaseConfig {
+    pub(crate) base: String,
+    pub(crate) scope: ExternalBlobScopeConfig,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExternalBlobScopeConfig {
+    ServerSafe,
+    EmbeddedOnly,
+}
+
+impl From<ExternalBlobScopeConfig> for omnigraph::ExternalBlobExecutionScope {
+    fn from(scope: ExternalBlobScopeConfig) -> Self {
+        match scope {
+            ExternalBlobScopeConfig::ServerSafe => Self::ServerSafe,
+            ExternalBlobScopeConfig::EmbeddedOnly => Self::EmbeddedOnly,
+        }
+    }
 }
 
 /// A named cluster embedding provider profile (RFC-012 Phase 5). `kind`/`base_url`/
@@ -601,6 +646,11 @@ pub(crate) struct StateResource {
     /// once at boot and injects the resulting engine config into the graph.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) embedding_profile: Option<EmbeddingProviderConfig>,
+    /// Graph resources only: the normalized policy for admitting new external
+    /// Blob references. Missing on older ledgers means the secure default,
+    /// [`omnigraph::ExternalBlobPolicy::Deny`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
 }
 
 /// Recovery-intent record for a graph-moving apply operation (RFC-004 §D2).

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.9.0"
+    "version": "0.10.0"
   },
   "paths": {
     "/graphs": {
@@ -58,6 +58,623 @@
                 }
               }
             }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/blob": {
+      "get": {
+        "tags": [
+          "blobs"
+        ],
+        "summary": "Deliver one logical node or edge Blob cell.",
+        "description": "Managed content is streamed through the bounded transport. External\ndescriptors redirect without target-store I/O. Authorization and target\nresolution share the exact helper used by `/query`.",
+        "operationId": "cluster_getBlob",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "entity",
+            "in": "query",
+            "description": "Select a logical node or edge cell.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/BlobEntityKind"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Accepted-schema node or edge type name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "query",
+            "description": "Logical entity id within the selected type.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "property",
+            "in": "query",
+            "description": "Accepted-schema Blob property name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "Branch to read. Mutually exclusive with `snapshot`; defaults to `main`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "snapshot",
+            "in": "query",
+            "description": "Immutable graph snapshot id. Mutually exclusive with `branch`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "Strong entity-tag-list precondition, including `*`, evaluated before If-None-Match and Range.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "description": "One `bytes` range. Malformed, unknown-unit, and multiple ranges are ignored in V1.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Weak entity-tag-list comparison, including `*`, evaluated before Range.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-Range",
+            "in": "header",
+            "description": "One strong entity tag. A mismatch causes the complete representation to be served.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Complete managed Blob",
+            "headers": {
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The literal value `bytes` for managed content"
+              },
+              "Content-Length": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Exact served payload length"
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong validator for the selected managed Blob"
+              },
+              "Omnigraph-Snapshot-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Exact resolved graph snapshot"
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary",
+                  "description": "OpenAPI-only marker for an unstructured octet-stream response body."
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "One satisfiable managed byte range",
+            "headers": {
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Length": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              },
+              "Content-Range": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Omnigraph-Snapshot-Id": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary",
+                  "description": "OpenAPI-only marker for an unstructured octet-stream response body."
+                }
+              }
+            }
+          },
+          "302": {
+            "description": "External Blob descriptor; the server does not dereference it",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The literal value `no-store`"
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Exact stored absolute URI"
+              },
+              "Omnigraph-Snapshot-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Exact resolved graph snapshot"
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched the managed Blob validator",
+            "headers": {
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Length": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Complete managed Blob length, as required for a valid 304 Content-Length"
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Omnigraph-Snapshot-Id": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid selector, target, or non-Blob property",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown entity or null Blob cell",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "If-Match did not strongly match the selected managed Blob validator",
+            "headers": {
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Omnigraph-Snapshot-Id": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "Requested managed byte range is unsatisfiable",
+            "headers": {
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Range": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Unsatisfied range in the form `bytes */N`"
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Omnigraph-Snapshot-Id": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "blobs"
+        ],
+        "summary": "Return the status and representation headers for one Blob cell.",
+        "description": "This is a distinct handler rather than Axum's automatic GET-to-HEAD\nfallback. It never calls `BlobReader::read_range`; Range and If-Range are\ndeliberately ignored while If-None-Match is still evaluated.",
+        "operationId": "cluster_headBlob",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "entity",
+            "in": "query",
+            "description": "Select a logical node or edge cell.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/BlobEntityKind"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Accepted-schema node or edge type name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "query",
+            "description": "Logical entity id within the selected type.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "property",
+            "in": "query",
+            "description": "Accepted-schema Blob property name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "Branch to read. Mutually exclusive with `snapshot`; defaults to `main`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "snapshot",
+            "in": "query",
+            "description": "Immutable graph snapshot id. Mutually exclusive with `branch`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "Strong entity-tag-list precondition, including `*`, evaluated before If-None-Match.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Weak entity-tag-list comparison, including `*`. Range and If-Range are ignored for HEAD.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "description": "Accepted but ignored for HEAD; metadata always describes the complete selected Blob.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-Range",
+            "in": "header",
+            "description": "Accepted but ignored for HEAD together with Range.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Managed Blob metadata with no response body",
+            "headers": {
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The literal value `bytes`"
+              },
+              "Content-Length": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Complete managed Blob length"
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong validator for the selected managed Blob"
+              },
+              "Omnigraph-Snapshot-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Exact resolved graph snapshot"
+              }
+            }
+          },
+          "302": {
+            "description": "External Blob descriptor; the server does not dereference it",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The literal value `no-store`"
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Exact stored absolute URI"
+              },
+              "Omnigraph-Snapshot-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Exact resolved graph snapshot"
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched the managed Blob validator",
+            "headers": {
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Length": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Complete managed Blob length, as required for a valid 304 Content-Length"
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Omnigraph-Snapshot-Id": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid selector, target, or non-Blob property; HEAD responses have no body"
+          },
+          "401": {
+            "description": "Unauthorized; HEAD responses have no body"
+          },
+          "403": {
+            "description": "Forbidden; HEAD responses have no body"
+          },
+          "404": {
+            "description": "Unknown entity or null Blob cell; HEAD responses have no body"
+          },
+          "412": {
+            "description": "If-Match did not strongly match the selected managed Blob validator; HEAD responses have no body",
+            "headers": {
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Omnigraph-Snapshot-Id": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected; HEAD responses have no body"
           }
         },
         "security": [
@@ -321,6 +938,16 @@
               }
             }
           },
+          "424": {
+            "description": "A merge could not probe or read an allowed external Blob source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "429": {
             "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
             "content": {
@@ -528,6 +1155,16 @@
           },
           "413": {
             "description": "Keyed write exceeds the per-commit row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "An allowed external Blob source could not be probed or read",
             "content": {
               "application/json": {
                 "schema": {
@@ -906,7 +1543,17 @@
             }
           },
           "413": {
-            "description": "Keyed load exceeds the per-commit row or byte ceiling",
+            "description": "Load input or external Blob admission exceeds a bounded per-operation row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "An allowed external Blob source could not be probed or read",
             "content": {
               "application/json": {
                 "schema": {
@@ -1025,7 +1672,17 @@
             }
           },
           "413": {
-            "description": "Keyed load exceeds the per-commit row or byte ceiling",
+            "description": "Load input or external Blob admission exceeds a bounded per-operation row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "An allowed external Blob source could not be probed or read",
             "content": {
               "application/json": {
                 "schema": {
@@ -1194,7 +1851,7 @@
             }
           },
           "413": {
-            "description": "Request or keyed load exceeds a bounded ceiling",
+            "description": "Request, load, or external Blob admission exceeds a bounded ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -1205,6 +1862,16 @@
           },
           "415": {
             "description": "Content-Type must be application/x-ndjson",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "An allowed external Blob source could not be probed or read",
             "content": {
               "application/json": {
                 "schema": {
@@ -1247,7 +1914,7 @@
           "mutations"
         ],
         "summary": "Apply a GQ mutation to a branch (canonical mutation endpoint).",
-        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.",
+        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nConditional callers use `POST /mutate/if-graph-commit`. Keeping that\ncapability on a distinct path makes rolling upgrades fail closed: an older\nserver returns 404 instead of ignoring an unknown optional header and\nmutating unconditionally.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.",
         "operationId": "cluster_mutate",
         "parameters": [
           {
@@ -1323,6 +1990,163 @@
           },
           "413": {
             "description": "Keyed write exceeds the per-commit row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "An allowed external Blob source could not be probed or read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/mutate/if-graph-commit": {
+      "post": {
+        "tags": [
+          "mutations"
+        ],
+        "summary": "Apply a mutation only while the branch still has the required graph head.",
+        "description": "The dedicated path is the rolling-safe capability signal. Clients must not\nsend this header to `/mutate`: an older server could ignore an unknown\noptional header after executing the write.",
+        "operationId": "cluster_mutate_if_graph_commit",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Omnigraph-If-Graph-Commit",
+            "in": "header",
+            "description": "Required raw graph-head commit id. The mutation runs only while the branch's effective head still equals it.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Conditional mutation results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing, duplicate, malformed, or invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Write-authority conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Graph-commit precondition failed; the write had no effect",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Keyed write exceeds the per-commit row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "An allowed external Blob source could not be probed or read",
             "content": {
               "application/json": {
                 "schema": {
@@ -1532,6 +2356,198 @@
               }
             }
           },
+          "424": {
+            "description": "A stored mutation could not probe or read an allowed external Blob source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Policy evaluation error (a denial is reported as 404, not 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A stored mutation is blocked by a durable recovery intent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/queries/{name}/if-graph-commit": {
+      "post": {
+        "tags": [
+          "queries"
+        ],
+        "summary": "Invoke one stored mutation with a required graph-head precondition.",
+        "description": "A distinct path makes support observable before any mutation runs; older\nservers return 404 instead of ignoring an unknown conditional header.",
+        "operationId": "cluster_invoke_query_if_graph_commit",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Stored mutation name (the registry key)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Omnigraph-If-Graph-Commit",
+            "in": "header",
+            "description": "Required raw graph-head commit id. The stored mutation runs only while the branch's effective head still equals it.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/InvokeStoredQueryRequest"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Stored conditional mutation result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing, duplicate, malformed, read-only, or invalid invocation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden (the inner `change` gate)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown stored mutation, or `invoke_query` denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stored mutation write-authority conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Stored mutation graph-commit precondition failed; the write had no effect",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Stored keyed mutation exceeds the per-commit row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "A stored mutation could not probe or read an allowed external Blob source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "429": {
             "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
             "content": {
@@ -1576,7 +2592,7 @@
           "queries"
         ],
         "summary": "Execute an inline read query (friendlier-named alternative to `POST /read`).",
-        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. Otherwise behaves identically to `POST /read`: same\ntarget semantics (branch xor snapshot), same Cedar action (Read),\nsame response shape.",
+        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. It shares `POST /read` target semantics (branch xor\nsnapshot) and the same Cedar action (Read), while its canonical response\nadditionally carries the pinned graph-commit token.",
         "operationId": "cluster_query",
         "parameters": [
           {
@@ -1679,11 +2695,11 @@
         },
         "responses": {
           "200": {
-            "description": "Query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)",
+            "description": "Legacy token-free query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ReadOutput"
+                  "$ref": "#/components/schemas/LegacyReadOutput"
                 }
               }
             }
@@ -1977,6 +2993,40 @@
   },
   "components": {
     "schemas": {
+      "BlobEntityKind": {
+        "type": "string",
+        "description": "Logical graph entity selected by the Blob delivery surface.\n\nThis is intentionally graph vocabulary. The wire contract never exposes a\nLance dataset, table key, stable row id, or per-table lane.",
+        "enum": [
+          "node",
+          "edge"
+        ]
+      },
+      "BlobRangeOutput": {
+        "type": "object",
+        "description": "Normalized half-open range details for an unsatisfiable managed Blob read.\n\nHTTP also returns `Content-Range: bytes */N`; these fields let SDKs inspect\nthe failure without parsing either that header or the human-readable text.",
+        "required": [
+          "start",
+          "end",
+          "length"
+        ],
+        "properties": {
+          "end": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "length": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "start": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "BranchCreateOutput": {
         "type": "object",
         "required": [
@@ -2268,6 +3318,17 @@
           "error"
         ],
         "properties": {
+          "blob_range": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BlobRangeOutput",
+                "description": "Set with HTTP 416 for a valid but unsatisfiable managed Blob byte range.\n`start..end` is half-open and `length` is the selected Blob length."
+              }
+            ]
+          },
           "code": {
             "oneOf": [
               {
@@ -2280,6 +3341,17 @@
           },
           "error": {
             "type": "string"
+          },
+          "external_blob_source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExternalBlobSourceOutput",
+                "description": "Set with HTTP 424 when an external Blob URI passed admission policy but\nits source could not be probed or read. This optional detail is the\nrolling-safe machine-readable discriminator; `code` is omitted because\n[`ErrorCode`] is a closed compatibility contract."
+              }
+            ]
           },
           "key_conflict": {
             "oneOf": [
@@ -2308,6 +3380,17 @@
             "items": {
               "$ref": "#/components/schemas/MergeConflictOutput"
             }
+          },
+          "precondition_failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PreconditionFailureOutput",
+                "description": "Set when a mutation's graph-commit precondition failed\n(HTTP 412). Like `recovery_required`, the meaning rides this additive\nfield — `ErrorCode` is a closed rolling wire contract."
+              }
+            ]
           },
           "read_set_conflict": {
             "oneOf": [
@@ -2367,6 +3450,24 @@
               "type": "string"
             },
             "description": "Restrict the export to these node/edge type names. Empty exports all types."
+          }
+        }
+      },
+      "ExternalBlobSourceOutput": {
+        "type": "object",
+        "description": "Structured details for an allowed external Blob source that could not be\nprobed or read. The top-level `code` remains optional so this additive\ndetail can roll out without extending the closed [`ErrorCode`] enum.",
+        "required": [
+          "uri",
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "Source-side failure diagnosis. Clients should branch on the presence of\n`external_blob_source`, not parse this human-readable text."
+          },
+          "uri": {
+            "type": "string",
+            "description": "Normalized, credential-free URI spelling (or a redacted placeholder)."
           }
         }
       },
@@ -2656,6 +3757,35 @@
           }
         }
       },
+      "LegacyReadOutput": {
+        "type": "object",
+        "description": "Indefinitely byte-stable response shape for the deprecated `POST /read`\nroute. The canonical [`ReadOutput`] may grow additive fields; this legacy\nenvelope deliberately cannot carry them.",
+        "required": [
+          "query_name",
+          "target",
+          "row_count",
+          "rows"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "query_name": {
+            "type": "string"
+          },
+          "row_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rows": {},
+          "target": {
+            "$ref": "#/components/schemas/ReadTargetOutput"
+          }
+        }
+      },
       "LoadMode": {
         "type": "string",
         "description": "Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.",
@@ -2783,6 +3913,24 @@
           "list"
         ]
       },
+      "PreconditionFailureOutput": {
+        "type": "object",
+        "description": "Structured details for a caller write-precondition failure: HTTP 412, a\nmutation carried `Omnigraph-If-Graph-Commit: <commit_id>`, and the branch\nhead no longer matches that id. The write had no effect; the caller re-reads\nthe branch and decides again. `actual` is `None` on a branch with no commits.",
+        "required": [
+          "expected"
+        ],
+        "properties": {
+          "actual": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected": {
+            "type": "string"
+          }
+        }
+      },
       "QueriesCatalogOutput": {
         "type": "object",
         "description": "Response for `GET /queries`: every stored query in a graph's\nregistry, each with typed parameters.",
@@ -2892,6 +4040,13 @@
             "items": {
               "type": "string"
             }
+          },
+          "graph_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Effective graph head commit id of the exact snapshot this read was\nserved from. On a fresh named branch this is the inherited source head,\nso it is immediately usable as `Omnigraph-If-Graph-Commit` (CLI:\n`--if-commit`) for the branch's first conditional write. The id and rows\ncome from one pinned version, so no separate id fetch is needed."
           },
           "query_name": {
             "type": "string"

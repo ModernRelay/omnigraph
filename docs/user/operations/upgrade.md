@@ -37,7 +37,7 @@ from that line (the latest is safest):
 | internal schema v3 | omnigraph 0.6.2–0.7.2 | the latest 0.7.x (e.g. 0.7.2) |
 | internal schema v4 | omnigraph 0.8.x | the latest 0.8.x (e.g. 0.8.1) |
 | internal schema v5 | unreleased development builds | the exact source build that wrote the graph |
-| internal schema v6 | omnigraph 0.9.x | — current format; no rebuild needed |
+| internal schema v6 | omnigraph 0.9.x–0.10.x | — current format; no rebuild needed |
 
 Internal schemas v7-v19 were unreleased development formats from the rejected
 MemWAL experiment. They are not an upgrade ladder and the current binary does
@@ -50,6 +50,18 @@ You can also check versions before you hit a refusal:
 
 If the graph's stamp is **higher** than the binary's, the binary is too old —
 upgrade omnigraph rather than rebuilding the graph.
+
+If the refusal says `__manifest` has the current manifest layout but **no
+internal-schema stamp at all**, the graph is not a genuine pre-stamp store. It
+may be an `omnigraph init` from an older binary interrupted between creating
+`__manifest` and writing its separate stamp commit, or the stamp metadata may
+have been damaged or externally modified later. OmniGraph cannot safely tell
+which happened and refuses to open the graph.
+
+Delete the root and run `omnigraph init` again **only if you independently know
+that initialization never completed**. Otherwise preserve the root, do not
+reinitialize it in place, and investigate the metadata or restore from a
+known-good backup.
 
 ## What is preserved (and what is not)
 
@@ -92,6 +104,13 @@ columns including vectors and blobs) of the chosen branch (default `main`; pass
 `--branch` for another) to stdout. `omnigraph load --mode overwrite` replaces the
 target graph's contents with that snapshot.
 
+The direct-store recipe above can import managed Blob values only. In v0.10 a
+bare direct CLI open has no allow-policy source and rejects every new external
+URI reference. If the export contains external Blob URIs, initialize the target
+as a cluster graph, configure exact `external_blobs` bases, and load through its
+server, or write the export through an embedded `Omnigraph` handle with an
+`ExternalBlobPolicy` installed. There is deliberately no per-load escape flag.
+
 Once you have verified the rebuilt graph, retire the old one. If you rebuilt
 through a storage-format boundary, the target must be a different URI: keep the
 source root intact until row/vector/blob verification and fleet cutover are
@@ -105,12 +124,18 @@ complete. Do not use force-init to turn the old root into the new format.
 - **Embeddings are not recomputed.** Export carries the stored vectors verbatim, so
   a load does not re-run the embedding pipeline. If you changed the embedding model,
   re-embed after loading.
-- **External Blob URIs remain references during rebuild.** Export preserves the
-  URI and the documented rebuild uses `--mode overwrite`, so verify that the new
-  fleet can still read the referenced object before cutover. Later keyed
-  `append`/`merge` writes copy external payloads instead, as described below.
-- **Server deployments**: take the graph out of the serving set, rebuild it offline
-  with the CLI, then point the cluster at the rebuilt graph (`cluster apply`).
+- **External Blob URIs remain references only through a policy-aware rebuild.**
+  Export preserves the URI and an allowed `--mode overwrite` retains it, so
+  verify that the new fleet can still read the referenced object before
+  cutover. The direct-store CLI recipe cannot admit the URI in v0.10; use the
+  configured cluster-server or embedded-policy route described above. Later
+  allowed keyed `append`/`merge` writes copy external payloads instead.
+- **Server deployments**: for a managed-Blob-only export, take the graph out of
+  the serving set, rebuild it offline with the direct CLI, then point the
+  cluster at the rebuilt graph (`cluster apply`). If the export contains
+  external references, rebuild through a staging cluster server with the exact
+  allow bases configured, or through an embedded handle with the graph policy
+  installed; the direct-store CLI cannot admit those references.
 
 ## Migrating to v0.8.0
 
@@ -232,16 +257,18 @@ The user-visible load modes are now deliberately distinct:
 - `--mode overwrite` replaces the target image as before; the replacement
   dataset still carries the exact-`id` PK metadata.
 
-For Blob values supplied as external URIs, `append` and `merge` copy referenced
-payload bytes after enforcing a 32 MiB aggregate pre-read ceiling. `overwrite`
-retains Lance's external-reference behavior. This is intentional: Lance's
-merge-insert builder has no `WriteParams` hook, while Overwrite does.
+For Blob values admitted by the graph's external-Blob policy, `append` and
+`merge` copy referenced payload bytes after enforcing a 32 MiB aggregate
+pre-read ceiling. `overwrite` retains Lance's external-reference behavior. This
+is intentional: Lance's merge-insert builder has no `WriteParams` hook, while
+Overwrite does. A direct-store CLI open has no allow-policy source in this
+phase; use a configured cluster server or an embedded handle for such an import.
 
 This format cannot be obtained by adding metadata to a live v4 or development
 v5 root. Lance's filtered/unfiltered conflict behavior is directional, so every
 table image and every writer must cross the boundary together. For a released
 v4 graph, quiesce writers, export with the latest 0.8.x binary, initialize a
-**different** root with the current 0.9.x binary, load the export, verify the v6
+**different** root with the current 0.10.x binary, load the export, verify the v6
 stamp and data, then cut the whole fleet over. A development v5 root must be
 exported with the exact source build that wrote it. The current binary refuses
 both older roots, and the old binary must never write the new v6 root.

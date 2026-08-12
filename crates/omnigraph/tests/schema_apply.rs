@@ -5,7 +5,9 @@ use std::fs;
 use std::sync::Arc;
 
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
 
 use helpers::*;
@@ -162,6 +164,8 @@ async fn long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token() {
     // newly created table incarnation. Neither may drop the immutable v6 PK.
     assert_exact_id_primary_key(&schema_owner, "node:Person").await;
     assert_exact_id_primary_key(&schema_owner, "node:Project").await;
+    assert_stable_property_markers(&schema_owner, "node:Person").await;
+    assert_stable_property_markers(&schema_owner, "node:Project").await;
 
     let projects = stale_handle
         .query(
@@ -583,21 +587,86 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_path = external_dir.path().join("external.bin");
+    std::fs::write(&external_path, b"External").unwrap();
+    let external_uri = format!("file://{}", external_path.display());
+    let canonical_external_uri =
+        url::Url::from_file_path(std::fs::canonicalize(&external_path).unwrap())
+            .expect("canonical external Blob path is absolute")
+            .to_string();
+    let external_policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(external_dir.path())
+                .expect("external blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let initial = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+    let db = Omnigraph::init(uri, initial)
+        .await
+        .unwrap()
+        .with_external_blob_policy(external_policy)
+        .unwrap();
+    let data = [
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "valid-empty",
+                "content": "base64:",
+                "note": "drop me",
+            },
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "neighbor",
+                "content": "base64:TmVpZ2hib3I=",
+                "note": "drop me too",
+            },
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "external",
+                "content": external_uri,
+                "note": "drop me three",
+            },
+        }),
+    ]
+    .into_iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
 
-    let people_before = count_rows(&db, "node:Person").await;
+    // Admission policy is not durable graph data. Reopen with the default
+    // deny policy so the rewrite proves that a historical descriptor is
+    // carried without re-authorizing or probing its caller-owned target.
+    let db = Omnigraph::open(uri).await.unwrap();
+
+    let documents_before = count_rows(&db, "node:Document").await;
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
         .version();
 
-    // Drop `age` from Person. v1 + chassis commit #3 emit
+    // Drop `note` from Document. v1 + chassis commit #3 emit
     // `DropProperty { Soft }`; the rewrite path projects to the
-    // target schema (no `age`), commits via stage_overwrite. Row
+    // target schema (no `note`), commits via stage_overwrite. Row
     // counts are unchanged — only the column is dropped from the
     // current schema view.
-    let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
+    let desired = initial.replace("    note: String?\n", "");
 
     // Confirm the plan emits DropProperty { Soft } (not UnsupportedChange).
     let plan = db.plan_schema(&desired).await.unwrap();
@@ -611,15 +680,19 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
                 property_name,
                 mode: omnigraph_compiler::DropMode::Soft,
                 ..
-            } if type_name == "Person" && property_name == "age"
+            } if type_name == "Document" && property_name == "note"
         )),
-        "expected DropProperty {{ type=Person, property=age, mode=Soft }} in plan; got {plan:?}",
+        "expected DropProperty {{ type=Document, property=note, mode=Soft }} in plan; got {plan:?}",
     );
 
+    // An unrelated schema rewrite carries the descriptor, not the external
+    // payload. The caller-owned target may be unavailable without blocking
+    // schema evolution.
+    std::fs::remove_file(&external_path).unwrap();
     let result = db.apply_schema(&desired).await.unwrap();
     assert!(result.supported);
     assert!(result.applied);
-    assert_exact_id_primary_key(&db, "node:Person").await;
+    assert_exact_id_primary_key(&db, "node:Document").await;
 
     // Manifest advanced; row count unchanged.
     let after_version = db
@@ -631,11 +704,43 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
         after_version > before_version,
         "manifest version should advance after soft drop; before={before_version}, after={after_version}",
     );
-    assert_eq!(count_rows(&db, "node:Person").await, people_before);
+    assert_eq!(count_rows(&db, "node:Document").await, documents_before);
 
-    // (a) Current snapshot: `age` is gone from the dataset schema.
+    let empty = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "valid-empty", "content"),
+    )
+    .await;
+    assert!(empty.is_empty());
+    let neighbor = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "neighbor", "content"),
+    )
+    .await;
+    assert_eq!(&neighbor[..], b"Neighbor");
+    let external = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "external", "content"),
+        )
+        .await
+        .unwrap();
+    match external.content {
+        BlobContent::External(reference) => {
+            assert_eq!(reference.uri, canonical_external_uri);
+            assert_eq!(reference.offset, 0);
+            assert_eq!(reference.length, None);
+        }
+        BlobContent::Managed { .. } => {
+            panic!("schema rewrite must preserve the external Blob descriptor")
+        }
+    }
+
+    // (a) Current snapshot: `note` is gone from the dataset schema.
     let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let current_ds = current_snapshot.open("node:Person").await.unwrap();
+    let current_ds = current_snapshot.open("node:Document").await.unwrap();
     let current_fields = current_ds
         .schema()
         .fields
@@ -643,15 +748,15 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
         .map(|f| f.name.clone())
         .collect::<Vec<_>>();
     assert!(
-        !current_fields.iter().any(|f| f == "age"),
-        "current Person dataset schema must not include 'age' after soft drop; got fields {current_fields:?}",
+        !current_fields.iter().any(|f| f == "note"),
+        "current Document dataset schema must not include 'note' after soft drop; got fields {current_fields:?}",
     );
 
     // (b) Time travel: at the pre-drop manifest version, the prior
-    // Person dataset version still has `age`. Soft drop is reversible
+    // Document dataset version still has `note`. Soft drop is reversible
     // via Lance's version graph until `omnigraph cleanup` runs.
     let pre_drop_snapshot = db.snapshot_at_version(before_version).await.unwrap();
-    let pre_drop_ds = pre_drop_snapshot.open("node:Person").await.unwrap();
+    let pre_drop_ds = pre_drop_snapshot.open("node:Document").await.unwrap();
     let pre_drop_fields = pre_drop_ds
         .schema()
         .fields
@@ -659,21 +764,21 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
         .map(|f| f.name.clone())
         .collect::<Vec<_>>();
     assert!(
-        pre_drop_fields.iter().any(|f| f == "age"),
-        "pre-drop Person dataset schema must still include 'age' (time-travel reversibility); got fields {pre_drop_fields:?}",
+        pre_drop_fields.iter().any(|f| f == "note"),
+        "pre-drop Document dataset schema must still include 'note' (time-travel reversibility); got fields {pre_drop_fields:?}",
     );
 
     // (c) Reopen consistency: close the engine, reopen, verify the
     // drop is preserved (column still absent from current schema).
-    let uri = dir.path().to_str().unwrap().to_string();
+    let uri = uri.to_string();
     drop(db);
     let reopened = Omnigraph::open(&uri).await.unwrap();
-    assert_exact_id_primary_key(&reopened, "node:Person").await;
+    assert_exact_id_primary_key(&reopened, "node:Document").await;
     let reopened_snapshot = reopened
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap();
-    let reopened_ds = reopened_snapshot.open("node:Person").await.unwrap();
+    let reopened_ds = reopened_snapshot.open("node:Document").await.unwrap();
     let reopened_fields = reopened_ds
         .schema()
         .fields
@@ -681,8 +786,154 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
         .map(|f| f.name.clone())
         .collect::<Vec<_>>();
     assert!(
-        !reopened_fields.iter().any(|f| f == "age"),
-        "after reopen, Person dataset schema must still lack 'age'; got fields {reopened_fields:?}",
+        !reopened_fields.iter().any(|f| f == "note"),
+        "after reopen, Document dataset schema must still lack 'note'; got fields {reopened_fields:?}",
+    );
+
+    // A soft drop followed by a same-name add mints a new stable property and
+    // a new Lance field id.  The current selector must not reinterpret the old
+    // snapshot's identically-spelled Blob as that new property lifetime.
+    let retired_content_snapshot = reopened.resolve_snapshot("main").await.unwrap();
+    let without_content = desired.replace("    content: Blob?\n", "");
+    reopened.apply_schema(&without_content).await.unwrap();
+    reopened.apply_schema(&desired).await.unwrap();
+    let lifetime_error = reopened
+        .read_blob_at(
+            ReadTarget::snapshot(retired_content_snapshot),
+            node_blob_cell("Document", "valid-empty", "content"),
+        )
+        .await
+        .expect_err("same-name Blob re-add must not adopt the retired property lifetime");
+    assert!(
+        matches!(
+            lifetime_error,
+            OmniError::Manifest(ref error)
+                if error.kind == ManifestErrorKind::BadRequest
+                    && error.message
+                        == "Blob property 'Document.content' belongs to a different property lifetime at the selected target"
+        ),
+        "retired Blob property lifetime must fail closed; got {lifetime_error:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "failpoints")]
+#[serial_test::parallel]
+async fn schema_apply_rejects_ranged_external_blob_before_arm_or_effects() {
+    use arrow_array::{ArrayRef, RecordBatch, StringArray};
+    use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
+    use lance::blob::{BlobDescriptorArrayBuilder, BlobRange};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let initial = r#"
+node Document {
+    title: String @key
+    content: Blob?
+}
+"#;
+    let desired = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+    let mut db = Omnigraph::init(uri, initial).await.unwrap();
+    let entry = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Document")
+        .unwrap()
+        .clone();
+    let table_uri = format!("{uri}/{}", entry.table_path);
+    let mut raw = lance::Dataset::open(&table_uri).await.unwrap();
+    let logical_schema = arrow_schema::Schema::from(raw.schema());
+    let mut descriptor_builder = BlobDescriptorArrayBuilder::new("content");
+    descriptor_builder
+        .push_external("s3://bucket/object", Some(BlobRange { offset: 4, size: 8 }))
+        .unwrap();
+    let (descriptor_field, descriptor) = descriptor_builder.finish().unwrap().into_parts();
+    let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        logical_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == "content" {
+                    Arc::new(descriptor_field.clone())
+                } else {
+                    field.clone()
+                }
+            })
+            .collect::<Vec<_>>(),
+        logical_schema.metadata().clone(),
+    ));
+    let mut field_names = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    field_names.sort_unstable();
+    assert_eq!(
+        field_names,
+        ["content", "id", "title"],
+        "ranged-descriptor fixture is physical-schema specific"
+    );
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "id" | "title" => Arc::new(StringArray::from(vec!["ranged"])) as ArrayRef,
+            "content" => descriptor.clone(),
+            other => panic!("unexpected ranged-descriptor fixture field {other}"),
+        })
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(schema, columns).unwrap();
+    helpers::lance_append_inline(&mut raw, batch).await;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Document", None)
+        .await
+        .unwrap();
+
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let manifest_before = before.version();
+    let table_before = before.entry("node:Document").unwrap().table_version;
+    let physical_head_before = lance::Dataset::open(&table_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let lineage_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    assert!(sidecar_operation_ids(dir.path()).is_empty());
+
+    let error = db.apply_schema(desired).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot preserve ranged external Blob descriptor"),
+        "unexpected schema-apply refusal: {error}"
+    );
+    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(after.version(), manifest_before);
+    assert_eq!(
+        after.entry("node:Document").unwrap().table_version,
+        table_before
+    );
+    assert_eq!(
+        lance::Dataset::open(&table_uri)
+            .await
+            .unwrap()
+            .version()
+            .version,
+        physical_head_before
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "main").await.unwrap(),
+        lineage_before
+    );
+    assert!(
+        sidecar_operation_ids(dir.path()).is_empty(),
+        "ranged descriptor refusal must occur before recovery arm"
     );
 }
 
@@ -919,8 +1170,16 @@ async fn plan_schema_for_property_type_narrowing_is_not_supported() {
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_pure_type_rename_preserves_identity_path_and_version() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let initial = TEST_SCHEMA.replace("    age: I32?", "    age: I32?\n    avatar: Blob?");
+    let data = TEST_DATA.replace(
+        r#"{"name": "Alice", "age": 30}"#,
+        r#"{"name": "Alice", "age": 30, "avatar": "base64:QXZhdGFy"}"#,
+    );
+    let db = Omnigraph::init(uri, &initial).await.unwrap();
+    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
+    let before_snapshot_id = db.resolve_snapshot("main").await.unwrap();
     let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let before_version = before_snapshot.version();
     let before = before_snapshot.entry("node:Person").unwrap().clone();
@@ -928,11 +1187,26 @@ async fn apply_schema_pure_type_rename_preserves_identity_path_and_version() {
     let before_incarnation = db.catalog().table_incarnation_id("Person").unwrap();
     let before_name_property_id = db.catalog().property_id("Person", "name").unwrap();
     let people_before = count_rows(&db, "node:Person").await;
+    let before_avatar = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Person", "Alice", "avatar"),
+        )
+        .await
+        .unwrap();
+    let BlobContent::Managed {
+        etag: before_avatar_etag,
+        ..
+    } = before_avatar.content
+    else {
+        panic!("fixture avatar must be managed")
+    };
 
     let desired = r#"
 node Human @rename_from("Person") {
     name: String @key
     age: I32?
+    avatar: Blob?
 }
 
 node Company {
@@ -982,6 +1256,54 @@ edge WorksAt: Human -> Company
     );
     assert_eq!(count_rows(&db, "node:Human").await, people_before);
     assert!(after_snapshot.entry("node:Person").is_none());
+
+    let current_avatar = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Human", "Alice", "avatar"),
+    )
+    .await;
+    assert_eq!(&current_avatar[..], b"Avatar");
+    let renamed_avatar = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Human", "Alice", "avatar"),
+        )
+        .await
+        .unwrap();
+    let BlobContent::Managed {
+        etag: renamed_avatar_etag,
+        ..
+    } = renamed_avatar.content
+    else {
+        panic!("renamed avatar must remain managed")
+    };
+    assert_eq!(
+        renamed_avatar_etag, before_avatar_etag,
+        "a pure type alias rename over the same exact table version must preserve the Blob ETag"
+    );
+    let historical_avatar = read_managed_blob_bytes(
+        &db,
+        ReadTarget::snapshot(before_snapshot_id),
+        node_blob_cell("Human", "Alice", "avatar"),
+    )
+    .await;
+    assert_eq!(
+        &historical_avatar[..],
+        b"Avatar",
+        "the current type alias must bind the same stable table identity in a pre-rename snapshot"
+    );
+    let retired_type_error = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Person", "Alice", "avatar"),
+        )
+        .await
+        .expect_err("the retired type alias must not remain addressable");
+    assert!(matches!(
+        retired_type_error,
+        OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::BadRequest
+    ));
 
     let historical_snapshot = db.snapshot_at_version(before_version).await.unwrap();
     let historical = historical_snapshot.entry("node:Person").unwrap();
@@ -1059,7 +1381,15 @@ async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
     // "supported" half of the destructive-vs-supported boundary that the
     // rejections above cover.
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let initial = TEST_SCHEMA.replace("    age: I32?", "    age: I32?\n    avatar: Blob?");
+    let data = TEST_DATA.replace(
+        r#"{"name": "Alice", "age": 30}"#,
+        r#"{"name": "Alice", "age": 30, "avatar": "base64:QXZhdGFy"}"#,
+    );
+    let db = Omnigraph::init(uri, &initial).await.unwrap();
+    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
+    let before_snapshot_id = db.resolve_snapshot("main").await.unwrap();
     let before = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -1070,18 +1400,21 @@ async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
     let before_type_id = db.catalog().type_id("Person").unwrap();
     let before_incarnation = db.catalog().table_incarnation_id("Person").unwrap();
     let before_name_property_id = db.catalog().property_id("Person", "name").unwrap();
+    let before_avatar_property_id = db.catalog().property_id("Person", "avatar").unwrap();
     let people_before = count_rows(&db, "node:Person").await;
     assert!(
         people_before > 0,
         "fixture should seed Person rows for this test to be meaningful"
     );
 
-    // Rename Person -> Human (and the keying property name -> full_name).
+    // Rename Person -> Human, the keying property name -> full_name, and the
+    // Blob property avatar -> portrait.
     // Edges that referenced Person must update to Human in the same migration.
     let desired = r#"
 node Human @rename_from("Person") {
     full_name: String @key @rename_from("name")
     age: I32?
+    portrait: Blob? @rename_from("avatar")
 }
 
 node Company {
@@ -1144,11 +1477,55 @@ edge WorksAt: Human -> Company
         db.catalog().property_id("Human", "full_name"),
         Some(before_name_property_id)
     );
+    assert_eq!(
+        db.catalog().property_id("Human", "portrait"),
+        Some(before_avatar_property_id)
+    );
     assert_eq!(count_rows(&db, "node:Human").await, people_before);
     assert!(
         after_snapshot.entry("node:Person").is_none(),
         "old node:Person table key should be unmapped after rename"
     );
+
+    let current_portrait = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Human", "Alice", "portrait"),
+    )
+    .await;
+    assert_eq!(&current_portrait[..], b"Avatar");
+
+    let historical_error = db
+        .read_blob_at(
+            ReadTarget::snapshot(before_snapshot_id),
+            node_blob_cell("Human", "Alice", "portrait"),
+        )
+        .await
+        .expect_err("the current property alias must not guess across a v6 historical rewrite");
+    assert!(
+        matches!(
+            historical_error,
+            OmniError::Manifest(ref error)
+                if error.kind == ManifestErrorKind::BadRequest
+                    && error.message
+                        == "Blob property 'Human.portrait' is unavailable at the selected target"
+        ),
+        "the current type alias must bind the pre-rename table, then the unavailable current property alias must be BadRequest; got {historical_error:?}"
+    );
+    for retired_cell in [
+        node_blob_cell("Person", "Alice", "avatar"),
+        node_blob_cell("Human", "Alice", "avatar"),
+    ] {
+        let error = db
+            .read_blob_at(ReadTarget::branch("main"), retired_cell)
+            .await
+            .expect_err("retired type/property aliases must not remain addressable");
+        assert!(matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == ManifestErrorKind::BadRequest
+        ));
+    }
 }
 
 #[tokio::test]

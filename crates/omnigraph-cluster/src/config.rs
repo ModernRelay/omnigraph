@@ -366,18 +366,21 @@ pub(crate) async fn observe_declared_graphs(
                         applies_to: None,
                         embedding_provider: None,
                         embedding_profile: None,
+                        external_blob_policy: None,
                     },
                 );
                 let query_digests = state_query_digests_for_graph(state, &graph.id);
                 let embedding_provider = state_graph_embedding_provider(state, &graph.id);
                 let embedding_provider_digest =
                     state_embedding_provider_digest(state, embedding_provider.as_deref());
-                let graph_digest_value = graph_digest(
+                let external_blob_policy = state_graph_external_blob_policy(state, &graph.id);
+                let graph_digest_value = graph_digest_with_external_blob_policy(
                     &graph.id,
                     Some(&observation.schema_digest),
                     Some(&query_digests),
                     embedding_provider.as_deref(),
                     embedding_provider_digest.as_ref(),
+                    &external_blob_policy,
                 );
                 state.applied_revision.resources.insert(
                     graph_address.clone(),
@@ -386,6 +389,7 @@ pub(crate) async fn observe_declared_graphs(
                         applies_to: None,
                         embedding_provider,
                         embedding_profile: None,
+                        external_blob_policy: persisted_external_blob_policy(&external_blob_policy),
                     },
                 );
                 state.observations.insert(
@@ -542,6 +546,8 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
     let mut graph_query_digests: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut graph_schema_digests: BTreeMap<String, String> = BTreeMap::new();
     let mut graph_embedding_providers: BTreeMap<String, String> = BTreeMap::new();
+    let mut graph_external_blob_policies: BTreeMap<String, omnigraph::ExternalBlobPolicy> =
+        BTreeMap::new();
     let mut embedding_provider_digests: BTreeMap<String, String> = BTreeMap::new();
     let mut embedding_providers: BTreeMap<String, EmbeddingProviderConfig> = BTreeMap::new();
 
@@ -580,6 +586,10 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         );
         let graph_address = graph_address(graph_id);
         let schema_address = schema_address(graph_id);
+        graph_external_blob_policies.insert(
+            graph_id.clone(),
+            validate_external_blob_policy(graph_id, &graph.external_blobs, &mut diagnostics),
+        );
         dependencies.insert(Dependency {
             from: schema_address.clone(),
             to: graph_address.clone(),
@@ -729,12 +739,15 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         let embedding_provider = graph_embedding_providers.get(graph_id);
         let embedding_provider_digest =
             embedding_provider.and_then(|address| embedding_provider_digests.get(address));
-        let digest = graph_digest(
+        let digest = graph_digest_with_external_blob_policy(
             graph_id,
             graph_schema_digests.get(graph_id),
             graph_query_digests.get(graph_id),
             embedding_provider.map(String::as_str),
             embedding_provider_digest,
+            graph_external_blob_policies
+                .get(graph_id)
+                .expect("every graph has a validated external Blob policy"),
         );
         resources.insert(
             graph_address(graph_id),
@@ -897,6 +910,10 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                 .cloned()
                 .unwrap_or_default(),
             embedding_provider: graph_embedding_providers.get(graph_id).cloned(),
+            external_blob_policy: graph_external_blob_policies
+                .get(graph_id)
+                .cloned()
+                .expect("every graph has a validated external Blob policy"),
         })
         .collect();
     let config_digest = desired_config_digest(&raw, &resource_digests);
@@ -917,6 +934,47 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         diagnostics,
         config_dir,
         config_file,
+    }
+}
+
+fn validate_external_blob_policy(
+    graph_id: &str,
+    config: &ExternalBlobsConfig,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> omnigraph::ExternalBlobPolicy {
+    if config.allow.is_empty() {
+        return omnigraph::ExternalBlobPolicy::Deny;
+    }
+
+    let mut bases = Vec::with_capacity(config.allow.len());
+    let mut invalid = false;
+    for (index, configured) in config.allow.iter().enumerate() {
+        match omnigraph::ExternalBlobBase::new(&configured.base, configured.scope.into()) {
+            Ok(base) => bases.push(base),
+            Err(error) => {
+                invalid = true;
+                diagnostics.push(Diagnostic::error(
+                    "invalid_external_blob_base",
+                    format!("graphs.{graph_id}.external_blobs.allow[{index}].base"),
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+    if invalid {
+        return omnigraph::ExternalBlobPolicy::Deny;
+    }
+
+    match omnigraph::ExternalBlobPolicy::allow(bases) {
+        Ok(policy) => policy,
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                "invalid_external_blob_policy",
+                format!("graphs.{graph_id}.external_blobs.allow"),
+                error.to_string(),
+            ));
+            omnigraph::ExternalBlobPolicy::Deny
+        }
     }
 }
 

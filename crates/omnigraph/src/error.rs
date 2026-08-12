@@ -122,6 +122,27 @@ pub enum OmniError {
         limit: u64,
         actual: u64,
     },
+    /// A caller attempted to admit an external Blob URI that is malformed or
+    /// outside this graph handle's immutable base allowlist. The URI must be a
+    /// normalized, credential-free spelling (or a redacted placeholder): this
+    /// error crosses HTTP/CLI boundaries and must never echo URI credentials.
+    #[error("external blob URI '{uri}' is not allowed: {reason}")]
+    ExternalBlobPolicy { uri: String, reason: String },
+    /// An allowed external Blob source could not be probed or read before the
+    /// write's first durable effect. Kept distinct from input-policy failures
+    /// so transports can report a dependency failure instead of an opaque 500
+    /// or a misleading malformed-request response.
+    #[error("external blob source '{uri}' is unavailable: {reason}")]
+    ExternalBlobSource { uri: String, reason: String },
+    /// Persisted table or Blob state contradicted the logical Blob contract.
+    /// This is a typed integrity failure rather than a generic storage string so
+    /// callers never reinterpret corrupt identity, metadata, or descriptors as
+    /// null or ordinary absence.
+    #[error("blob integrity violation: {reason}")]
+    BlobIntegrity { reason: String },
+    /// A managed Blob range used reversed or out-of-bounds coordinates.
+    #[error("blob range [{start}, {end}) is not satisfiable for a value of length {length}")]
+    BlobRangeNotSatisfiable { start: u64, end: u64, length: u64 },
     /// A durable recovery intent overlaps this write. Its physical effects may
     /// already have landed, or it may still be armed before its first effect;
     /// either way the sidecar named by `operation_id` must be resolved before
@@ -131,6 +152,22 @@ pub enum OmniError {
     RecoveryRequired {
         operation_id: String,
         reason: String,
+    },
+    /// A caller-supplied write precondition named a branch head commit that
+    /// is no longer (or never was) the branch's current head. The write had
+    /// no effect. Distinct from `ReadSetChanged`: that is the engine's own
+    /// authority check and may be reprepared, while this is the caller's
+    /// compare-and-swap token, so it is terminal — retrying against a newer
+    /// head would silently discard the condition the caller asked for.
+    /// `actual` is `None` on a branch with no commits.
+    #[error(
+        "precondition failed on branch '{branch}': expected head '{expected}' but current is {}",
+        actual.as_deref().unwrap_or("<absent>")
+    )]
+    PreconditionFailed {
+        branch: String,
+        expected: String,
+        actual: Option<String>,
     },
     /// Engine-layer policy enforcement (MR-722). Wraps either a policy
     /// denial ("you can't do that") or a policy-evaluation failure
@@ -164,6 +201,11 @@ impl From<omnigraph_storage::StorageError> for OmniError {
                 limit,
                 actual,
             },
+            // The display already carries the full diagnosis; engine
+            // consumers surface the message rather than match the variant.
+            err @ omnigraph_storage::StorageError::CreateIfAbsentUnsupported { .. } => {
+                Self::manifest_internal(err.to_string())
+            }
         }
     }
 }
@@ -181,6 +223,26 @@ impl OmniError {
             resource: resource.into(),
             limit,
             actual,
+        }
+    }
+
+    pub(crate) fn external_blob_policy(uri: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::ExternalBlobPolicy {
+            uri: uri.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn external_blob_source(uri: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::ExternalBlobSource {
+            uri: uri.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn blob_integrity(reason: impl Into<String>) -> Self {
+        Self::BlobIntegrity {
+            reason: reason.into(),
         }
     }
 
@@ -263,6 +325,18 @@ impl OmniError {
                 },
             ),
         )
+    }
+
+    pub fn precondition_failed(
+        branch: impl Into<String>,
+        expected: impl Into<String>,
+        actual: Option<String>,
+    ) -> Self {
+        Self::PreconditionFailed {
+            branch: branch.into(),
+            expected: expected.into(),
+            actual,
+        }
     }
 
     pub fn recovery_required(operation_id: impl Into<String>, reason: impl Into<String>) -> Self {

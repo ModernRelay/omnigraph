@@ -7,6 +7,7 @@
 // future Lance bumps stop needing this.
 #![recursion_limit = "256"]
 
+pub(crate) mod blob;
 mod branch_control;
 pub mod changes;
 pub mod db;
@@ -24,4 +25,10 @@ pub(crate) mod storage_layer;
 pub(crate) mod table_store;
 pub(crate) mod validate;
 
+pub use blob::{
+    BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, BlobEtag, BlobRead, BlobReader,
+    EXTERNAL_BLOB_URI_MAX_BYTES, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy,
+    ExternalBlobRef,
+};
+pub use changes::EntityKind;
 pub use table_store::IndexCoverage;

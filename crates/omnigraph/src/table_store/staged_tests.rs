@@ -31,7 +31,8 @@ use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray, UInt
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
-use lance::dataset::transaction::Operation;
+use lance::dataset::transaction::{Operation, UpdateMode};
+use lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilterBuilder;
 use lance::dataset::{DeleteBuilder, WhenMatched, WhenNotMatched};
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance_table::format::Fragment;
@@ -415,6 +416,105 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
 }
 
 #[tokio::test]
+async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let staged_index = store
+        .stage_create_indices(
+            &ds,
+            &[IndexBuildSpec::BTree {
+                column: "id".to_string(),
+                name: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let ds = store
+        .commit_staged(Arc::new(ds), staged_index)
+        .await
+        .unwrap();
+    let base_version = ds.version().version;
+
+    let probes = MergeWriteProbes::default();
+    let staged = with_merge_write_probes(
+        probes.clone(),
+        store.stage_keyed_write(
+            ds.clone(),
+            "Person",
+            person_pk_batch(&[("alice", Some(99))]),
+            KeyedWriteSemantics::KnownPresentUpdate,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(probes.stage_known_present_update_calls(), 1);
+    assert_eq!(probes.stage_known_present_update_rows(), 1);
+    assert_eq!(probes.stage_merge_insert_calls(), 0);
+    assert!(staged.commit_metadata.affected_rows.is_some());
+    match &staged.transaction.operation {
+        Operation::Update {
+            update_mode,
+            inserted_rows_filter,
+            ..
+        } => {
+            assert_eq!(update_mode, &Some(UpdateMode::RewriteRows));
+            assert!(
+                inserted_rows_filter.is_none(),
+                "covered id BTREE must select Lance's indexed v1 update route"
+            );
+        }
+        other => panic!("expected update-only Lance Update, got {other:?}"),
+    }
+
+    let error = store
+        .stage_keyed_write(
+            ds,
+            "Person",
+            person_pk_batch(&[("bob", Some(25))]),
+            KeyedWriteSemantics::KnownPresentUpdate,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.is_read_set_changed(), "unexpected error: {error}");
+    assert_eq!(
+        Dataset::open(&uri).await.unwrap().version().version,
+        base_version,
+        "staging a missing known-present id must not advance HEAD"
+    );
+
+    let uncovered_uri = format!("{}/uncovered-people.lance", dir.path().to_str().unwrap());
+    let uncovered =
+        TableStore::write_dataset(&uncovered_uri, person_pk_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+    let uncovered_id_field = uncovered.schema().field("id").unwrap().id;
+    let uncovered_stage = store
+        .stage_keyed_write(
+            uncovered,
+            "Person",
+            person_pk_batch(&[("alice", Some(31))]),
+            KeyedWriteSemantics::KnownPresentUpdate,
+        )
+        .await
+        .unwrap();
+    match uncovered_stage.transaction.operation {
+        Operation::Update {
+            inserted_rows_filter: Some(filter),
+            ..
+        } => assert_eq!(
+            filter,
+            KeyExistenceFilterBuilder::new(vec![uncovered_id_field]).build(),
+            "known-present v2 fallback must carry Some(empty exact-id filter)"
+        ),
+        other => panic!("uncovered known-present update lost empty v2 filter: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn all_new_upsert_certifies_insert_absence_and_persists_it_in_history() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
@@ -558,6 +658,16 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
         1,
         "general strict insert must exact-probe the pinned target once"
     );
+    assert_eq!(
+        probes.stage_fenced_insert_calls(),
+        1,
+        "absence-proven strict insert must stage one join-free fenced insert"
+    );
+    assert_eq!(
+        probes.stage_merge_insert_calls(),
+        0,
+        "absence-proven strict insert must not pay a redundant target merge join"
+    );
     assert!(
         super::has_insert_absence_certificate(&staged.transaction),
         "verified general strict insert must carry the durable absence certificate"
@@ -642,7 +752,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
             updated_fragments,
             new_fragments,
             fields_modified,
-            merged_generations,
+            compacted_sstables,
             fields_for_preserving_frag_bitmap,
             update_mode,
             inserted_rows_filter,
@@ -652,7 +762,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
             assert!(updated_fragments.is_empty());
             assert!(!new_fragments.is_empty());
             assert!(fields_modified.is_empty());
-            assert!(merged_generations.is_empty());
+            assert!(compacted_sstables.is_empty());
             assert_eq!(fields_for_preserving_frag_bitmap, &expected_field_ids);
             assert_eq!(
                 update_mode,
@@ -865,8 +975,15 @@ async fn proven_insert_rejects_prepared_blob_descriptors_before_staging() {
         .await
         .unwrap_err();
     assert!(
-        error.to_string().contains("retained a prepared descriptor"),
-        "prepared source descriptors must fail before fragment staging, got {error:?}"
+        matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == crate::error::ManifestErrorKind::BadRequest
+                    && manifest
+                        .message
+                        .contains("prepared storage descriptors are not accepted")
+        ),
+        "prepared source descriptors must fail with typed bad-request admission before fragment staging, got {error:?}"
     );
 
     let latest = Dataset::open(&target_uri).await.unwrap();
@@ -1081,6 +1198,7 @@ async fn proven_insert_delta_scan_is_interval_exact_and_batch_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let source_uri = format!("{root}/source.lance");
+    let store = TableStore::new(root, test_session());
     let mut source = TableStore::write_dataset(&source_uri, person_pk_batch(&[("base", Some(30))]))
         .await
         .unwrap();
@@ -1088,10 +1206,17 @@ async fn proven_insert_delta_scan_is_interval_exact_and_batch_bounded() {
     lance_append_inline_local(&mut source, numbered_person_pk_batch(0..10_000)).await;
     let end_version = source.version().version;
 
-    let mut stream =
-        TableStore::scan_proven_insert_delta_bounded(&source, "Person", begin_version, end_version)
-            .await
-            .unwrap();
+    let external_preflight = super::ExternalBlobPreflight::default();
+    let mut stream = store
+        .scan_proven_insert_delta_bounded(
+            &source,
+            "Person",
+            begin_version,
+            end_version,
+            &external_preflight,
+        )
+        .await
+        .unwrap();
     let mut rows = 0_usize;
     let mut batches = 0_usize;
     while let Some(batch) = stream.try_next().await.unwrap() {
@@ -1124,6 +1249,7 @@ async fn proven_insert_delta_scan_normalizes_oversized_raw_emission() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let source_uri = format!("{root}/source.lance");
+    let store = TableStore::new(root, test_session());
     let mut source = TableStore::write_dataset(&source_uri, person_pk_batch(&[("base", Some(0))]))
         .await
         .unwrap();
@@ -1148,14 +1274,17 @@ async fn proven_insert_delta_scan_normalizes_oversized_raw_emission() {
 
     let probes = MergeWriteProbes::default();
     let (rows, normalized_batches) = with_merge_write_probes(probes.clone(), async {
-        let mut stream = TableStore::scan_proven_insert_delta_bounded(
-            &source,
-            "Person",
-            begin_version,
-            end_version,
-        )
-        .await
-        .unwrap();
+        let external_preflight = super::ExternalBlobPreflight::default();
+        let mut stream = store
+            .scan_proven_insert_delta_bounded(
+                &source,
+                "Person",
+                begin_version,
+                end_version,
+                &external_preflight,
+            )
+            .await
+            .unwrap();
         let mut rows = 0_usize;
         let mut batches = 0_usize;
         while let Some(batch) = stream.try_next().await.unwrap() {

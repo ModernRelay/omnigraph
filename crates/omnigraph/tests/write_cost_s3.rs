@@ -31,8 +31,12 @@
 
 mod helpers;
 
-use helpers::commit_many;
 use helpers::cost::{IoCounts, assert_flat, measure_insert, s3_graph};
+use helpers::{commit_many, s3_test_graph_uri};
+use omnigraph::db::Omnigraph;
+use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+use omnigraph::loader::LoadMode;
+use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
 /// After step 3a the data-table opener term is flat across depth on a real object
 /// store (the measured win). RED on the pre-3a namespace-builder opener (O(depth)
@@ -67,4 +71,77 @@ async fn data_table_opener_is_flat_in_history_on_s3() {
     // isolated from the scan by the PrefixCounter. Slack absorbs object-store variance;
     // the pre-3a builder grew this ~+12/depth (RFC §2.4 [M]).
     assert_flat(&curve, |c| c.data_opener_reads, 8, "S3 data-table opener");
+}
+
+/// RFC-033's external-source cost gate runs against the real S3-compatible
+/// provider. A fixed batch of normalized aliases must cause one source metadata
+/// request and one payload read, not one cold setup/HEAD/GET per row.
+#[tokio::test]
+async fn external_blob_source_cost_is_deduplicated_on_s3() {
+    const REFERENCES: u64 = 64;
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob
+}
+"#;
+
+    let Some(uri) = s3_test_graph_uri("external-blob-cost") else {
+        eprintln!(
+            "SKIP external_blob_source_cost_is_deduplicated_on_s3: \
+             OMNIGRAPH_S3_TEST_BUCKET is unset"
+        );
+        return;
+    };
+    let external_base = format!("{uri}/external/");
+    let external_uri = format!("{external_base}shared~source.bin");
+    omnigraph::storage::storage_for_uri(&uri)
+        .unwrap()
+        .write_text(&external_uri, "x")
+        .await
+        .expect("configured S3 source write must succeed");
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(&external_base, ExternalBlobExecutionScope::ServerSafe).unwrap(),
+    ])
+    .unwrap();
+    let graph_uri = format!("{uri}/graph");
+    let db = Omnigraph::init(&graph_uri, SCHEMA)
+        .await
+        .expect("configured S3 graph init must succeed")
+        .with_external_blob_policy(policy)
+        .unwrap();
+    let encoded_alias = external_uri.replace("~source", "%7Esource");
+    let rows = (0..REFERENCES)
+        .map(|index| {
+            serde_json::json!({
+                "type": "Document",
+                "data": {
+                    "title": format!("doc-{index}"),
+                    "content": if index % 2 == 0 {
+                        external_uri.as_str()
+                    } else {
+                        encoded_alias.as_str()
+                    },
+                },
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let probes = MergeWriteProbes::default();
+    with_merge_write_probes(probes.clone(), db.load("main", &rows, LoadMode::Append))
+        .await
+        .expect("deduplicated external S3 load must succeed");
+    assert_eq!(probes.external_blob_probe_inputs(), REFERENCES);
+    assert_eq!(
+        probes.external_blob_probe_calls(),
+        1,
+        "normalized aliases must share one explicit S3 metadata request"
+    );
+    assert_eq!(
+        probes.external_blob_payload_read_calls(),
+        1,
+        "one bounded prepared batch must not GET the same S3 object per row"
+    );
 }

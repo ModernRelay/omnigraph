@@ -45,6 +45,10 @@ pub fn reserve_export_root_exclusion(graph_uri: &str) -> Result<ExportRootExclus
 }
 
 pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
+/// Persisted graph-level property identity carried by each user property's
+/// physical Lance field.  Historical consumers compare this authority rather
+/// than inferring property lifetime from a Lance field id or field position.
+pub(crate) const STABLE_PROPERTY_ID_METADATA_KEY: &str = "omnigraph.stable_property_id";
 
 /// Mutation kind, threaded through the early table-version checks so the
 /// engine can apply an op-kind-aware staging policy. This check is not the

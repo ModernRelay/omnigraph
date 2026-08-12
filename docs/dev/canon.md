@@ -3,7 +3,7 @@
 **Audience:** maintainers, contributors, and coding agents — internal
 **Type:** narrative reference ("the book"), read top-to-bottom
 **Status:** living document
-**Surveyed:** OmniGraph 0.9.0 development (`main`); Lance 9.0.0; internal manifest schema v6
+**Surveyed:** OmniGraph 0.10.0 development (`main`); Lance 10.0.0; internal manifest schema v6
 
 ---
 
@@ -216,7 +216,7 @@ CLI (omnigraph)        HTTP Server (omnigraph-server: Axum + Cedar + admission)
            storage boundary     sealed TableStorage (staged writes only) +
                       │         read-only snapshot facade
                       ▼
-           Lance 9.x            columnar Arrow, per-dataset versions/branches,
+           Lance 10.x           columnar Arrow, per-dataset versions/branches,
                       │         BTREE/FTS/vector indexes, merge_insert, compaction
                       ▼
            object store         local FS · S3 · RustFS · MinIO · S3-compatible
@@ -250,7 +250,7 @@ them:
 OmniGraph's relationship with Lance is a *contract*, managed like one:
 
 - **Pinned, audited versions.** The engine pins one Lance version
-  (currently 9.0.0-rc.1 via git rev, until 9.0.0 stable reaches crates.io).
+  (currently 10.0.0 stable from crates.io).
   Every bump gets a full alignment audit — all intervening upstream commits
   reviewed, findings recorded in [lance.md](lance.md)'s dated audit stanzas.
   History has justified the paranoia: audits have caught a default flip that
@@ -481,7 +481,7 @@ writer describes its physical effects to the shared coordinator:
 | Writer | Sidecar schema | Physical shape |
 |---|---|---|
 | Mutation / Load | v9 (`protocol_v3` payload) | one exact staged transaction per touched table |
-| Branch merge | v9 (`protocol_v4` payload) | new and changed keyed rows use actual chunks capped at 8,192 rows / 32 MiB in a pre-minted exact-`id` strict-insert/upsert chain, capped at 1,024 logical data transactions per table; deletes and pointer-only deltas are recorded too. Exact recovery scans at most 1,026 versions so one allowed index tail and one compensating restore remain classifiable |
+| Branch merge | v9 (`protocol_v4` payload) | new and changed keyed rows use actual chunks capped at 8,192 rows / 32 MiB in a pre-minted exact-`id` strict-insert/upsert chain, capped at 1,024 logical data transactions per table; deletes and pointer-only deltas are recorded too. Exact recovery scans at most 1,026 versions so one legacy index tail and one compensating restore remain classifiable; current merges build no indexes inline |
 | Schema apply | v9 (`protocol_v7` payload) | exact `Overwrite` per rewritten table + strict read-version-zero `Create` per new type; a pure rename retains its existing identity/path/version. The payload also carries the schema registration/rename/tombstone delta (a metadata-only apply has an empty effect set but still arms — schema staging is durable state) |
 | EnsureIndices | v9 (`protocol_v8` payload) | one pre-minted *mixed* CreateIndex transaction per table (every missing BTREE + FTS + full-table vector together) |
 | Optimize | v9 (bounded payload) | compaction + index folds have **no** public caller-controlled Lance transaction identity, so Optimize keeps looser, bounded provenance inside the identity-bearing envelope: one graph-wide sidecar pinning the complete productive set, one monotonic batch CAS for visibility. Exact provenance is trigger-gated on upstream API + distributed fencing |
@@ -979,8 +979,11 @@ Live design questions, each owned by an RFC or a known gap — not a wishlist:
 6. **How does the background reconciler arrive without violating the recovery
    model?** It must serialize with writers through the same gates and stay
    roll-forward-only until the fence exists.
-7. **When Lance 9.0.0 stabilizes**, what does the beta→stable alignment audit
-   surface, and does crates.io publishing (v0.9.0) unblock cleanly?
+7. *(Answered 2026-08.)* Lance 9.0.0 stabilized 2026-07-24; the alignment
+   audit was cheap (35 commits, no format movement) and removed the
+   substrate-side publication blocker. crates.io publishing did **not**
+   unblock cleanly, for an unrelated reason — see the registry-publication
+   status in [versioning.md](versioning.md).
 
 ---
 
@@ -1004,8 +1007,9 @@ Deliberately split, not one mega-format: identity, key fencing, head rows,
 retention, and merge deltas are separate irreversible decisions with
 different substrate gates and rollout barriers ("reversibility shapes evidence
 demand").
-Release-wise: v0.8.1 ships as binaries only (the Lance git pin blocks
-crates.io); v0.9.0 is gated on Lance 9.0.0 stable.
+Release-wise: v0.9.0 shipped 2026-08-08 (binaries, Homebrew, container
+images, and the npm SDK/MCP pair); crates.io publication remains paused —
+see the registry-publication status in [versioning.md](versioning.md).
 
 ---
 

@@ -52,6 +52,11 @@ use cli::*;
 use helpers::*;
 use output::*;
 
+/// Exit code for a lost `--if-commit` compare-and-swap (HTTP 412): distinct
+/// from the generic failure exit (1) so scripts can branch on "someone else
+/// wrote first — re-read and retry" without matching message text.
+const EXIT_PRECONDITION_FAILED: i32 = 4;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -720,7 +725,7 @@ async fn main() -> Result<()> {
                     ReadTarget::Snapshot(s) => (None, Some(s.as_str().to_string())),
                 };
                 client
-                    .invoke_named(&name, false, params_json.as_ref(), branch, snapshot)
+                    .invoke_named(&name, false, params_json.as_ref(), branch, snapshot, None)
                     .await?
             };
             let format = resolve_read_format(format, json, None);
@@ -732,6 +737,7 @@ async fn main() -> Result<()> {
             query_string,
             params,
             branch,
+            if_commit,
             json,
         } => {
             let client = client::GraphClient::resolve_with_policy(
@@ -746,7 +752,7 @@ async fn main() -> Result<()> {
             .await?;
             let params_json = load_params_json(&params)?;
             let branch = resolve_branch(branch, None, "main");
-            let output: ChangeOutput = if query.is_some() || query_string.is_some() {
+            let result: Result<ChangeOutput> = if query.is_some() || query_string.is_some() {
                 // Ad-hoc lane: run the source; positional `name` selects within it.
                 let query_source =
                     resolve_query_source(query.as_ref(), query_string.as_deref(), None)?;
@@ -756,8 +762,9 @@ async fn main() -> Result<()> {
                         &query_source,
                         name.as_deref(),
                         params_json.as_ref(),
+                        if_commit.as_deref(),
                     )
-                    .await?
+                    .await
             } else {
                 // Catalog lane (served-only): invoke the stored mutation by name.
                 let Some(name) = name else {
@@ -767,8 +774,33 @@ async fn main() -> Result<()> {
                     );
                 };
                 client
-                    .invoke_named(&name, true, params_json.as_ref(), Some(branch), None)
-                    .await?
+                    .invoke_named(
+                        &name,
+                        true,
+                        params_json.as_ref(),
+                        Some(branch),
+                        None,
+                        if_commit.as_deref(),
+                    )
+                    .await
+            };
+            let output = match result {
+                Ok(output) => output,
+                // A lost --if-commit CAS is an expected outcome, not a failure:
+                // emit the structured body or message, then exit
+                // EXIT_PRECONDITION_FAILED.
+                Err(err) => match err.downcast::<helpers::PreconditionFailedCli>() {
+                    Ok(precondition) => {
+                        if json {
+                            print_json(&precondition.output)?;
+                        } else {
+                            eprintln!("{precondition}");
+                        }
+                        std::io::stdout().flush()?;
+                        std::process::exit(EXIT_PRECONDITION_FAILED);
+                    }
+                    Err(err) => return Err(err),
+                },
             };
             if json {
                 print_json(&output)?;

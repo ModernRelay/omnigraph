@@ -1,7 +1,9 @@
 # User Docs Coherence Ledger
 
-**Last review:** 2026-06-20 (against 0.7.1)
-**Status:** all open findings resolved — living ledger for future audits.
+**Last review:** 2026-08-10 (against 0.9.0; three-agent sweep — user docs vs
+code, dev docs vs architecture, mechanical staleness)
+**Status:** the 2026-08-10 findings were fixed in the same change that
+refreshed this header; one internal-rustdoc item below remains open.
 
 This page tracks stale or incoherent user-doc claims found during broad docs
 reviews. Findings are validated against current **code/behavior**, not just
@@ -27,13 +29,16 @@ fixed. Branch `docs/user-coherence-0-7-1`.
 | — | `config.md` `deferred` disposition described as "graph/schema change, later phase" | → "an unsupported change (e.g. standalone schema delete)". |
 | — | Stale stage labels (`Stage 3A`, `Stage 2C`, `Stage 1`) in active reference docs | Removed / reworded to plain language; release notes keep history. |
 
-## Open — surfaced 2026-06-20, not yet fixed
+## Open — surfaced 2026-06-20, still open at the 2026-08-10 review
 
 - **Stale "config-only apply" / "Stage 3A" comments in `omnigraph-cluster`
   source** (internal rustdoc, not user docs — out of scope for the docs sweep
-  above): `src/types.rs:147` ("Applied changes execute (config-only query/policy
-  catalog writes)"), `src/types.rs:265` ("Output of config-only cluster apply"),
-  `src/diff.rs:256`, and `src/tests.rs:1129` ("config-only apply (Stage 3A)").
+  above): `src/types.rs:152` ("Applied changes execute (config-only query/policy
+  catalog writes)"), `src/types.rs:270` ("Output of config-only cluster apply"),
+  `src/diff.rs:256`, and `src/tests.rs:1310` ("config-only apply (Stage 3A)");
+  the 2026-08-10 re-check found two further instances, `src/lib.rs:253`
+  ("Config-only `cluster apply` (Stage 3A)") and `src/config.rs:254`
+  ("Stage 2C supports only omitted state.backend").
   Apply now also runs graph creates, schema applies, and approved deletes
   (`diff.rs:411` `GraphCreate` / `SchemaApply`; the Stage-4 create/schema/delete
   executors + tests `apply_creates_graph_and_unblocks_dependents`,
@@ -49,6 +54,16 @@ fixed. Branch `docs/user-coherence-0-7-1`.
     *after* the v0.7.1 tag — so it is in no tag yet and a hand-edit would be
     overwritten on the next sync. It flows in automatically when the SDK bumps
     to a tag containing the fix (v0.7.2+). Tracked, not actioned.
+  - `omnigraph-ts` SDK — OmniGraph v0.10 adds HTTP 424 plus the optional
+    `ErrorOutput.external_blob_source` detail for admitted-but-unavailable
+    external Blob sources. The generated SDK must not be hand-edited from an
+    unreleased core commit: its supported sync consumes a tagged OmniGraph
+    OpenAPI document and runs against that released binary. Treat the SDK 0.10
+    sync as a **release blocker immediately after the OmniGraph v0.10.0 tag**;
+    run the normal spec sync/generator, add a public 424
+    `FailedDependencyError` mapping and dispatcher coverage, and retain the
+    closed `ErrorCode` enum. Older 0.9 clients preserve the real HTTP status and
+    response body but expose the failure through their generic error fallback.
   - `omnigraph-cookbooks/docs/best-practices.md` `bearer_token_env` chain —
     **RESOLVED** by omnigraph-cookbooks PR #26 (2026-06-21), which deleted
     `docs/best-practices.md` as part of the 0.7 restructure; the stale chain

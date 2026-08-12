@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::{IntoParams, ToSchema};
 
+/// Lowercase wire name for the raw graph-head conditional-write token.
+/// Documentation presents the canonical spelling
+/// `Omnigraph-If-Graph-Commit`; HTTP header names are case-insensitive.
+pub const GRAPH_COMMIT_PRECONDITION_HEADER: &str = "omnigraph-if-graph-commit";
+
 /// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
 #[derive(ToSchema)]
 #[schema(as = LoadMode)]
@@ -210,6 +215,38 @@ pub struct ReadOutput {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>,
     pub rows: Value,
+    /// Effective graph head commit id of the exact snapshot this read was
+    /// served from. On a fresh named branch this is the inherited source head,
+    /// so it is immediately usable as `Omnigraph-If-Graph-Commit` (CLI:
+    /// `--if-commit`) for the branch's first conditional write. The id and rows
+    /// come from one pinned version, so no separate id fetch is needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_commit_id: Option<String>,
+}
+
+/// Indefinitely byte-stable response shape for the deprecated `POST /read`
+/// route. The canonical [`ReadOutput`] may grow additive fields; this legacy
+/// envelope deliberately cannot carry them.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LegacyReadOutput {
+    pub query_name: String,
+    pub target: ReadTargetOutput,
+    pub row_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
+    pub rows: Value,
+}
+
+impl From<ReadOutput> for LegacyReadOutput {
+    fn from(value: ReadOutput) -> Self {
+        Self {
+            query_name: value.query_name,
+            target: value.target,
+            row_count: value.row_count,
+            columns: value.columns,
+            rows: value.rows,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -331,6 +368,35 @@ pub struct QueryRequest {
     /// Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`.
     pub branch: Option<String>,
     /// Snapshot id to read from. Mutually exclusive with `branch`.
+    pub snapshot: Option<String>,
+}
+
+/// Logical graph entity selected by the Blob delivery surface.
+///
+/// This is intentionally graph vocabulary. The wire contract never exposes a
+/// Lance dataset, table key, stable row id, or per-table lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BlobEntityKind {
+    Node,
+    Edge,
+}
+
+/// Query parameters shared by `GET` and `HEAD /graphs/{graph_id}/blob`.
+#[derive(Debug, Clone, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct BlobReadQuery {
+    /// Select a logical node or edge cell.
+    pub entity: BlobEntityKind,
+    /// Accepted-schema node or edge type name.
+    pub r#type: String,
+    /// Logical entity id within the selected type.
+    pub id: String,
+    /// Accepted-schema Blob property name.
+    pub property: String,
+    /// Branch to read. Mutually exclusive with `snapshot`; defaults to `main`.
+    pub branch: Option<String>,
+    /// Immutable graph snapshot id. Mutually exclusive with `branch`.
     pub snapshot: Option<String>,
 }
 
@@ -663,9 +729,43 @@ pub struct ResourceLimitOutput {
     pub actual: u64,
 }
 
+/// Normalized half-open range details for an unsatisfiable managed Blob read.
+///
+/// HTTP also returns `Content-Range: bytes */N`; these fields let SDKs inspect
+/// the failure without parsing either that header or the human-readable text.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BlobRangeOutput {
+    pub start: u64,
+    pub end: u64,
+    pub length: u64,
+}
+
+/// Structured details for an allowed external Blob source that could not be
+/// probed or read. The top-level `code` remains optional so this additive
+/// detail can roll out without extending the closed [`ErrorCode`] enum.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ExternalBlobSourceOutput {
+    /// Normalized, credential-free URI spelling (or a redacted placeholder).
+    pub uri: String,
+    /// Source-side failure diagnosis. Clients should branch on the presence of
+    /// `external_blob_source`, not parse this human-readable text.
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RecoveryRequiredOutput {
     pub operation_id: String,
+}
+
+/// Structured details for a caller write-precondition failure: HTTP 412, a
+/// mutation carried `Omnigraph-If-Graph-Commit: <commit_id>`, and the branch
+/// head no longer matches that id. The write had no effect; the caller re-reads
+/// the branch and decides again. `actual` is `None` on a branch with no commits.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PreconditionFailureOutput {
+    pub expected: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -693,10 +793,25 @@ pub struct ErrorOutput {
     /// rejected attempt has no durable sidecar and no table effect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limit: Option<ResourceLimitOutput>,
+    /// Set with HTTP 416 for a valid but unsatisfiable managed Blob byte range.
+    /// `start..end` is half-open and `length` is the selected Blob length.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob_range: Option<BlobRangeOutput>,
+    /// Set with HTTP 424 when an external Blob URI passed admission policy but
+    /// its source could not be probed or read. This optional detail is the
+    /// rolling-safe machine-readable discriminator; `code` is omitted because
+    /// [`ErrorCode`] is a closed compatibility contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_blob_source: Option<ExternalBlobSourceOutput>,
     /// Set when an overlapping durable recovery intent must be resolved before
     /// retry. Its table effects may or may not have started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_required: Option<RecoveryRequiredOutput>,
+    /// Set when a mutation's graph-commit precondition failed
+    /// (HTTP 412). Like `recovery_required`, the meaning rides this additive
+    /// field — `ErrorCode` is a closed rolling wire contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precondition_failure: Option<PreconditionFailureOutput>,
 }
 
 pub fn snapshot_payload(
@@ -747,7 +862,12 @@ pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
     }
 }
 
-pub fn read_output(query_name: String, target: &ReadTarget, result: QueryResult) -> ReadOutput {
+pub fn read_output(
+    query_name: String,
+    target: &ReadTarget,
+    result: QueryResult,
+    graph_commit_id: Option<String>,
+) -> ReadOutput {
     let columns = result
         .schema()
         .fields()
@@ -760,6 +880,7 @@ pub fn read_output(query_name: String, target: &ReadTarget, result: QueryResult)
         row_count: result.num_rows(),
         columns,
         rows: result.to_rust_json(),
+        graph_commit_id,
     }
 }
 

@@ -508,7 +508,7 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
     operation_id = "read",
     request_body = ReadRequest,
     responses(
-        (status = 200, description = "Query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)", body = ReadOutput),
+        (status = 200, description = "Legacy token-free query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)", body = LegacyReadOutput),
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
@@ -531,8 +531,8 @@ pub(crate) async fn server_read(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<ReadRequest>,
-) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ReadOutput>), ApiError> {
-    let (selected_name, target, result) = run_query(
+) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<LegacyReadOutput>), ApiError> {
+    let (selected_name, target, result, _graph_commit_id) = run_query(
         handle,
         actor.as_ref().map(|Extension(actor)| actor),
         &request.query_source,
@@ -545,7 +545,10 @@ pub(crate) async fn server_read(
     .await?;
     Ok((
         deprecation_headers("<query>; rel=\"successor-version\""),
-        Json(api::read_output(selected_name, &target, result)),
+        // `/read` has an indefinite byte-stable response contract. The
+        // canonical `/query` route exposes the additive graph-commit token;
+        // omitting it here preserves the legacy JSON body exactly.
+        Json(api::read_output(selected_name, &target, result, None).into()),
     ))
 }
 
@@ -569,15 +572,15 @@ pub(crate) async fn server_read(
 /// names (`query`, `name`) match the CLI `-e` flag and the GQ `query`
 /// keyword. Mutations (`insert`/`update`/`delete`) are rejected with 400
 /// -- use `POST /mutate` (or its deprecated alias `POST /change`) for
-/// write queries. Otherwise behaves identically to `POST /read`: same
-/// target semantics (branch xor snapshot), same Cedar action (Read),
-/// same response shape.
+/// write queries. It shares `POST /read` target semantics (branch xor
+/// snapshot) and the same Cedar action (Read), while its canonical response
+/// additionally carries the pinned graph-commit token.
 pub(crate) async fn server_query(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<QueryRequest>,
 ) -> std::result::Result<Json<ReadOutput>, ApiError> {
-    let (selected_name, target, result) = run_query(
+    let (selected_name, target, result, graph_commit_id) = run_query(
         handle,
         actor.as_ref().map(|Extension(actor)| actor),
         &request.query,
@@ -588,7 +591,218 @@ pub(crate) async fn server_query(
         true, // /query is read-only; reject mutations
     )
     .await?;
-    Ok(Json(api::read_output(selected_name, &target, result)))
+    Ok(Json(api::read_output(
+        selected_name,
+        &target,
+        result,
+        graph_commit_id,
+    )))
+}
+
+/// OpenAPI-only marker for an unstructured octet-stream response body.
+#[derive(utoipa::ToSchema)]
+#[schema(value_type = String, format = Binary)]
+#[allow(dead_code)]
+struct BlobBinaryBody(Vec<u8>);
+
+#[utoipa::path(
+    get,
+    path = "/blob",
+    tag = "blobs",
+    operation_id = "getBlob",
+    params(
+        BlobReadQuery,
+        ("If-Match" = Option<String>, Header, description = "Strong entity-tag-list precondition, including `*`, evaluated before If-None-Match and Range."),
+        ("Range" = Option<String>, Header, description = "One `bytes` range. Malformed, unknown-unit, and multiple ranges are ignored in V1."),
+        ("If-None-Match" = Option<String>, Header, description = "Weak entity-tag-list comparison, including `*`, evaluated before Range."),
+        ("If-Range" = Option<String>, Header, description = "One strong entity tag. A mismatch causes the complete representation to be served."),
+    ),
+    responses(
+        (status = 200, description = "Complete managed Blob", body = inline(BlobBinaryBody), content_type = "application/octet-stream",
+            headers(
+                ("Accept-Ranges" = String, description = "The literal value `bytes` for managed content"),
+                ("Content-Length" = u64, description = "Exact served payload length"),
+                ("ETag" = String, description = "Strong validator for the selected managed Blob"),
+                ("Omnigraph-Snapshot-Id" = String, description = "Exact resolved graph snapshot"),
+            )),
+        (status = 206, description = "One satisfiable managed byte range", body = inline(BlobBinaryBody), content_type = "application/octet-stream",
+            headers(
+                ("Accept-Ranges" = String),
+                ("Content-Length" = u64),
+                ("Content-Range" = String),
+                ("ETag" = String),
+                ("Omnigraph-Snapshot-Id" = String),
+            )),
+        (status = 302, description = "External Blob descriptor; the server does not dereference it",
+            headers(
+                ("Location" = String, description = "Exact stored absolute URI"),
+                ("Cache-Control" = String, description = "The literal value `no-store`"),
+                ("Omnigraph-Snapshot-Id" = String, description = "Exact resolved graph snapshot"),
+            )),
+        (status = 304, description = "If-None-Match matched the managed Blob validator",
+            headers(
+                ("Accept-Ranges" = String),
+                ("Content-Length" = u64, description = "Complete managed Blob length, as required for a valid 304 Content-Length"),
+                ("ETag" = String),
+                ("Omnigraph-Snapshot-Id" = String),
+            )),
+        (status = 400, description = "Invalid selector, target, or non-Blob property", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Unknown entity or null Blob cell", body = ErrorOutput),
+        (status = 412, description = "If-Match did not strongly match the selected managed Blob validator", body = ErrorOutput,
+            headers(
+                ("Accept-Ranges" = String),
+                ("ETag" = String),
+                ("Omnigraph-Snapshot-Id" = String),
+            )),
+        (status = 416, description = "Requested managed byte range is unsatisfiable", body = ErrorOutput,
+            headers(
+                ("Accept-Ranges" = String),
+                ("Content-Range" = String, description = "Unsatisfied range in the form `bytes */N`"),
+                ("ETag" = String),
+                ("Omnigraph-Snapshot-Id" = String),
+            )),
+        (status = 500, description = "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Deliver one logical node or edge Blob cell.
+///
+/// Managed content is streamed through the bounded transport. External
+/// descriptors redirect without target-store I/O. Authorization and target
+/// resolution share the exact helper used by `/query`.
+pub(crate) async fn server_blob_get(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    headers: HeaderMap,
+    query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
+) -> std::result::Result<Response, ApiError> {
+    let query = parse_blob_read_query(query)?;
+    let read = read_blob_for_delivery(&handle, actor.as_ref().map(|Extension(actor)| actor), query)
+        .await?;
+    blob_transport::serve_blob_get(read, &headers)
+}
+
+#[utoipa::path(
+    head,
+    path = "/blob",
+    tag = "blobs",
+    operation_id = "headBlob",
+    params(
+        BlobReadQuery,
+        ("If-Match" = Option<String>, Header, description = "Strong entity-tag-list precondition, including `*`, evaluated before If-None-Match."),
+        ("If-None-Match" = Option<String>, Header, description = "Weak entity-tag-list comparison, including `*`. Range and If-Range are ignored for HEAD."),
+        ("Range" = Option<String>, Header, description = "Accepted but ignored for HEAD; metadata always describes the complete selected Blob."),
+        ("If-Range" = Option<String>, Header, description = "Accepted but ignored for HEAD together with Range."),
+    ),
+    responses(
+        (status = 200, description = "Managed Blob metadata with no response body",
+            headers(
+                ("Accept-Ranges" = String, description = "The literal value `bytes`"),
+                ("Content-Length" = u64, description = "Complete managed Blob length"),
+                ("ETag" = String, description = "Strong validator for the selected managed Blob"),
+                ("Omnigraph-Snapshot-Id" = String, description = "Exact resolved graph snapshot"),
+            )),
+        (status = 302, description = "External Blob descriptor; the server does not dereference it",
+            headers(
+                ("Location" = String, description = "Exact stored absolute URI"),
+                ("Cache-Control" = String, description = "The literal value `no-store`"),
+                ("Omnigraph-Snapshot-Id" = String, description = "Exact resolved graph snapshot"),
+            )),
+        (status = 304, description = "If-None-Match matched the managed Blob validator",
+            headers(
+                ("Accept-Ranges" = String),
+                ("Content-Length" = u64, description = "Complete managed Blob length, as required for a valid 304 Content-Length"),
+                ("ETag" = String),
+                ("Omnigraph-Snapshot-Id" = String),
+            )),
+        (status = 400, description = "Invalid selector, target, or non-Blob property; HEAD responses have no body"),
+        (status = 401, description = "Unauthorized; HEAD responses have no body"),
+        (status = 403, description = "Forbidden; HEAD responses have no body"),
+        (status = 404, description = "Unknown entity or null Blob cell; HEAD responses have no body"),
+        (status = 412, description = "If-Match did not strongly match the selected managed Blob validator; HEAD responses have no body",
+            headers(
+                ("Accept-Ranges" = String),
+                ("ETag" = String),
+                ("Omnigraph-Snapshot-Id" = String),
+            )),
+        (status = 500, description = "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected; HEAD responses have no body"),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Return the status and representation headers for one Blob cell.
+///
+/// This is a distinct handler rather than Axum's automatic GET-to-HEAD
+/// fallback. It never calls `BlobReader::read_range`; Range and If-Range are
+/// deliberately ignored while If-None-Match is still evaluated.
+pub(crate) async fn server_blob_head(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    headers: HeaderMap,
+    query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
+) -> std::result::Result<Response, ApiError> {
+    let query = parse_blob_read_query(query)?;
+    let read = read_blob_for_delivery(&handle, actor.as_ref().map(|Extension(actor)| actor), query)
+        .await?;
+    blob_transport::serve_blob_head(read, &headers)
+}
+
+fn parse_blob_read_query(
+    query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
+) -> std::result::Result<BlobReadQuery, ApiError> {
+    query.map(|Query(query)| query).map_err(|rejection| {
+        ApiError::bad_request(format!(
+            "invalid Blob selector query parameters: {}",
+            rejection.body_text()
+        ))
+    })
+}
+
+async fn read_blob_for_delivery(
+    handle: &GraphHandle,
+    actor: Option<&ResolvedActor>,
+    query: BlobReadQuery,
+) -> std::result::Result<omnigraph::BlobRead, ApiError> {
+    let target = resolve_authorized_read_target(handle, actor, query.branch, query.snapshot)
+        .await
+        .map_err(redact_blob_api_error)?;
+    let entity = match query.entity {
+        api::BlobEntityKind::Node => omnigraph::EntityKind::Node,
+        api::BlobEntityKind::Edge => omnigraph::EntityKind::Edge,
+    };
+    handle
+        .engine
+        .read_blob_at(
+            target,
+            omnigraph::BlobCell {
+                entity,
+                type_name: query.r#type,
+                id: query.id,
+                property: query.property,
+            },
+        )
+        .await
+        .map_err(map_blob_read_error)
+}
+
+/// Keep physical placement and persisted identity details behind the
+/// graph-level Blob surface. Selector/auth/not-found failures retain their
+/// typed client disposition; every pre-header internal failure is redacted.
+fn map_blob_read_error(error: OmniError) -> ApiError {
+    redact_blob_api_error(ApiError::from_omni(error))
+}
+
+fn redact_blob_api_error(mapped: ApiError) -> ApiError {
+    if mapped.status == StatusCode::INTERNAL_SERVER_ERROR {
+        error!(
+            error_kind = "blob_pre_header_internal",
+            "Blob delivery failed before response headers"
+        );
+        ApiError::internal("Blob delivery failed before response headers")
+    } else {
+        mapped
+    }
 }
 
 #[utoipa::path(
@@ -689,6 +903,71 @@ pub(crate) async fn server_export(
         .into_response())
 }
 
+/// Parse a mutation's graph-head precondition, if present.
+///
+/// `Omnigraph-If-Graph-Commit` deliberately carries one raw graph commit id,
+/// not an HTTP entity tag. Keeping this graph-level CAS off `If-Match`
+/// preserves the standard header for representation-specific strong ETags
+/// (including the blob-cell contract). Duplicate values and entity-tag syntax
+/// are rejected rather than silently reinterpreted.
+fn graph_commit_expected_head(
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<Option<String>, ApiError> {
+    let mut values = headers
+        .get_all(api::GRAPH_COMMIT_PRECONDITION_HEADER)
+        .iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ApiError::bad_request(
+            "Omnigraph-If-Graph-Commit must be sent exactly once",
+        ));
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::bad_request("Omnigraph-If-Graph-Commit is not valid UTF-8"))?
+        .trim();
+    if value.is_empty() {
+        return Err(ApiError::bad_request(
+            "Omnigraph-If-Graph-Commit must name a graph commit id",
+        ));
+    }
+    if value == "*"
+        || value.starts_with("W/")
+        || value.starts_with('"')
+        || value.ends_with('"')
+        || value.contains(',')
+    {
+        return Err(ApiError::bad_request(
+            "Omnigraph-If-Graph-Commit must contain one raw graph commit id, not entity-tag syntax",
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn require_graph_commit_expected_head(
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<String, ApiError> {
+    graph_commit_expected_head(headers)?.ok_or_else(|| {
+        ApiError::bad_request(
+            "Omnigraph-If-Graph-Commit is required on this conditional mutation route",
+        )
+    })
+}
+
+fn reject_graph_commit_expected_head(
+    headers: &axum::http::HeaderMap,
+    conditional_path: &str,
+) -> std::result::Result<(), ApiError> {
+    if headers.contains_key(api::GRAPH_COMMIT_PRECONDITION_HEADER) {
+        return Err(ApiError::bad_request(format!(
+            "Omnigraph-If-Graph-Commit requires the fail-closed conditional route {conditional_path}"
+        )));
+    }
+    Ok(())
+}
+
 /// Shared implementation behind `POST /mutate` (canonical) and
 /// `POST /change` (deprecated alias). Returns the bare `ChangeOutput`;
 /// each route handler wraps it (the alias also attaches Deprecation
@@ -707,6 +986,7 @@ pub(crate) async fn run_mutate(
     name: Option<&str>,
     params_json: Option<&Value>,
     branch: String,
+    expected_head: Option<&str>,
 ) -> std::result::Result<ChangeOutput, ApiError> {
     let actor_arc = actor
         .map(|a| Arc::clone(&a.actor_id))
@@ -738,9 +1018,16 @@ pub(crate) async fn run_mutate(
 
     let result = {
         let db = &handle.engine;
-        db.mutate_as(&branch, query, &selected_name, &params, actor_id)
-            .await
-            .map_err(ApiError::from_omni)?
+        db.mutate_as_with_expected_head(
+            &branch,
+            query,
+            &selected_name,
+            &params,
+            actor_id,
+            expected_head,
+        )
+        .await
+        .map_err(ApiError::from_omni)?
     };
     Ok(ChangeOutput {
         branch,
@@ -772,34 +1059,16 @@ pub(crate) async fn run_query(
     branch: Option<String>,
     snapshot: Option<String>,
     reject_mutations: bool,
-) -> std::result::Result<(String, ReadTarget, omnigraph_compiler::result::QueryResult), ApiError> {
-    if branch.is_some() && snapshot.is_some() {
-        return Err(ApiError::bad_request(
-            "request may specify branch or snapshot, not both",
-        ));
-    }
-
-    let target = read_target_from_request(branch, snapshot);
-    let policy_branch = match &target {
-        ReadTarget::Branch(branch) => Some(branch.clone()),
-        ReadTarget::Snapshot(_) if handle.policy.is_some() && actor.is_some() => {
-            let db = &handle.engine;
-            db.resolved_branch_of(target.clone())
-                .await
-                .map(|branch| branch.or_else(|| Some("main".to_string())))
-                .map_err(ApiError::from_omni)?
-        }
-        ReadTarget::Snapshot(_) => None,
-    };
-    authorize_request(
-        actor,
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::Read,
-            branch: policy_branch,
-            target_branch: None,
-        },
-    )?;
+) -> std::result::Result<
+    (
+        String,
+        ReadTarget,
+        omnigraph_compiler::result::QueryResult,
+        Option<String>,
+    ),
+    ApiError,
+> {
+    let target = resolve_authorized_read_target(&handle, actor, branch, snapshot).await?;
     let query_decl = select_named_query_decl(query, name)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     if reject_mutations && !query_decl.mutations.is_empty() {
@@ -812,13 +1081,51 @@ pub(crate) async fn run_query(
     let params = query_params_from_json(&query_decl.params, params_json)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    let result = {
+    let (result, graph_commit_id) = {
         let db = &handle.engine;
-        db.query(target.clone(), query, &selected_name, &params)
+        db.query_with_head(target.clone(), query, &selected_name, &params)
             .await
             .map_err(ApiError::from_omni)?
     };
-    Ok((selected_name, target, result))
+    Ok((selected_name, target, result, graph_commit_id))
+}
+
+/// Resolve one branch-or-snapshot read target and apply the graph's Cedar
+/// `read` gate. Every HTTP carrier that accepts this target shape uses this
+/// helper so snapshot-to-policy-branch resolution cannot drift by route.
+pub(crate) async fn resolve_authorized_read_target(
+    handle: &GraphHandle,
+    actor: Option<&ResolvedActor>,
+    branch: Option<String>,
+    snapshot: Option<String>,
+) -> std::result::Result<ReadTarget, ApiError> {
+    if branch.is_some() && snapshot.is_some() {
+        return Err(ApiError::bad_request(
+            "request may specify branch or snapshot, not both",
+        ));
+    }
+
+    let target = read_target_from_request(branch, snapshot);
+    let policy_branch = match &target {
+        ReadTarget::Branch(branch) => Some(branch.clone()),
+        ReadTarget::Snapshot(_) if handle.policy.is_some() && actor.is_some() => handle
+            .engine
+            .resolved_branch_of(target.clone())
+            .await
+            .map(|branch| branch.or_else(|| Some("main".to_string())))
+            .map_err(ApiError::from_omni)?,
+        ReadTarget::Snapshot(_) => None,
+    };
+    authorize_request(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: policy_branch,
+            target_branch: None,
+        },
+    )?;
+    Ok(target)
 }
 
 #[utoipa::path(
@@ -834,6 +1141,7 @@ pub(crate) async fn run_query(
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Write-authority conflict", body = ErrorOutput),
         (status = 413, description = "Keyed write exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
@@ -853,8 +1161,10 @@ pub(crate) async fn server_change(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ChangeOutput>), ApiError> {
+    reject_graph_commit_expected_head(&headers, "/mutate/if-graph-commit")?;
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     let output = run_mutate(
         state,
@@ -864,6 +1174,7 @@ pub(crate) async fn server_change(
         request.name.as_deref(),
         request.params.as_ref(),
         branch,
+        None,
     )
     .await?;
     Ok((
@@ -885,6 +1196,7 @@ pub(crate) async fn server_change(
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Write-authority conflict", body = ErrorOutput),
         (status = 413, description = "Keyed write exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
@@ -898,14 +1210,21 @@ pub(crate) async fn server_change(
 /// mutations may still acquire locks briefly. Returns 409 when the prepared
 /// write authority changes before effects.
 ///
+/// Conditional callers use `POST /mutate/if-graph-commit`. Keeping that
+/// capability on a distinct path makes rolling upgrades fail closed: an older
+/// server returns 404 instead of ignoring an unknown optional header and
+/// mutating unconditionally.
+///
 /// Pairs with `POST /query` (read-only). The legacy `POST /change` route
 /// has identical semantics and is kept as a deprecated alias.
 pub(crate) async fn server_mutate(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
+    reject_graph_commit_expected_head(&headers, "/mutate/if-graph-commit")?;
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     Ok(Json(
         run_mutate(
@@ -916,6 +1235,59 @@ pub(crate) async fn server_mutate(
             request.name.as_deref(),
             request.params.as_ref(),
             branch,
+            None,
+        )
+        .await?,
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/mutate/if-graph-commit",
+    tag = "mutations",
+    operation_id = "mutate_if_graph_commit",
+    request_body = ChangeRequest,
+    params(
+        ("Omnigraph-If-Graph-Commit" = String, Header, description = "Required raw graph-head commit id. The mutation runs only while the branch's effective head still equals it."),
+    ),
+    responses(
+        (status = 200, description = "Conditional mutation results", body = ChangeOutput),
+        (status = 400, description = "Missing, duplicate, malformed, or invalid request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict", body = ErrorOutput),
+        (status = 412, description = "Graph-commit precondition failed; the write had no effect", body = ErrorOutput),
+        (status = 413, description = "Keyed write exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Apply a mutation only while the branch still has the required graph head.
+///
+/// The dedicated path is the rolling-safe capability signal. Clients must not
+/// send this header to `/mutate`: an older server could ignore an unknown
+/// optional header after executing the write.
+pub(crate) async fn server_mutate_if_graph_commit(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<ChangeRequest>,
+) -> std::result::Result<Json<ChangeOutput>, ApiError> {
+    let expected_head = require_graph_commit_expected_head(&headers)?;
+    let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    Ok(Json(
+        run_mutate(
+            state,
+            handle,
+            actor.as_ref().map(|Extension(actor)| actor),
+            &request.query,
+            request.name.as_deref(),
+            request.params.as_ref(),
+            branch,
+            Some(&expected_head),
         )
         .await?,
     ))
@@ -945,7 +1317,9 @@ pub(crate) fn parse_optional_invoke_body(
     path = "/queries/{name}",
     tag = "queries",
     operation_id = "invoke_query",
-    params(("name" = String, Path, description = "Stored query name (the registry key)")),
+    params(
+        ("name" = String, Path, description = "Stored query name (the registry key)"),
+    ),
     request_body = Option<InvokeStoredQueryRequest>,
     responses(
         (status = 200, description = "Read envelope (ReadOutput) or mutation envelope (ChangeOutput), serialized untagged", body = InvokeStoredQueryResponse),
@@ -955,6 +1329,7 @@ pub(crate) fn parse_optional_invoke_body(
         (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
         (status = 409, description = "Stored mutation write-authority conflict", body = ErrorOutput),
         (status = 413, description = "Stored keyed mutation exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 424, description = "A stored mutation could not probe or read an allowed external Blob source", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
         (status = 503, description = "A stored mutation is blocked by a durable recovery intent", body = ErrorOutput),
@@ -977,7 +1352,62 @@ pub(crate) async fn server_invoke_query(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
+) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
+    reject_graph_commit_expected_head(&headers, &format!("/queries/{name}/if-graph-commit"))?;
+    invoke_stored_query(state, handle, actor, name, body, None).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/queries/{name}/if-graph-commit",
+    tag = "queries",
+    operation_id = "invoke_query_if_graph_commit",
+    params(
+        ("name" = String, Path, description = "Stored mutation name (the registry key)"),
+        ("Omnigraph-If-Graph-Commit" = String, Header, description = "Required raw graph-head commit id. The stored mutation runs only while the branch's effective head still equals it."),
+    ),
+    request_body = Option<InvokeStoredQueryRequest>,
+    responses(
+        (status = 200, description = "Stored conditional mutation result", body = ChangeOutput),
+        (status = 400, description = "Missing, duplicate, malformed, read-only, or invalid invocation", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden (the inner `change` gate)", body = ErrorOutput),
+        (status = 404, description = "Unknown stored mutation, or `invoke_query` denied", body = ErrorOutput),
+        (status = 409, description = "Stored mutation write-authority conflict", body = ErrorOutput),
+        (status = 412, description = "Stored mutation graph-commit precondition failed; the write had no effect", body = ErrorOutput),
+        (status = 413, description = "Stored keyed mutation exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 424, description = "A stored mutation could not probe or read an allowed external Blob source", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
+        (status = 503, description = "A stored mutation is blocked by a durable recovery intent", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Invoke one stored mutation with a required graph-head precondition.
+///
+/// A distinct path makes support observable before any mutation runs; older
+/// servers return 404 instead of ignoring an unknown conditional header.
+pub(crate) async fn server_invoke_query_if_graph_commit(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Path(QueryNamePath { name }): Path<QueryNamePath>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
+    let expected_head = require_graph_commit_expected_head(&headers)?;
+    invoke_stored_query(state, handle, actor, name, body, Some(expected_head)).await
+}
+
+async fn invoke_stored_query(
+    state: AppState,
+    handle: Arc<GraphHandle>,
+    actor: Option<Extension<ResolvedActor>>,
+    name: String,
+    body: Bytes,
+    expected_head: Option<String>,
 ) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
     let req = parse_optional_invoke_body(body)?;
     // A caller without `invoke_query` can't tell a denial from a missing
@@ -1061,11 +1491,17 @@ pub(crate) async fn server_invoke_query(
             Some(&query_name),
             req.params.as_ref(),
             branch,
+            expected_head.as_deref(),
         )
         .await?;
         Ok(Json(InvokeStoredQueryResponse::Change(output)))
     } else {
-        let (selected, target, result) = run_query(
+        if expected_head.is_some() {
+            return Err(ApiError::bad_request(
+                "the graph-commit conditional route applies only to stored mutations",
+            ));
+        }
+        let (selected, target, result, graph_commit_id) = run_query(
             handle,
             actor_ref,
             &source,
@@ -1077,7 +1513,10 @@ pub(crate) async fn server_invoke_query(
         )
         .await?;
         Ok(Json(InvokeStoredQueryResponse::Read(api::read_output(
-            selected, &target, result,
+            selected,
+            &target,
+            result,
+            graph_commit_id,
         ))))
     }
 }
@@ -1360,7 +1799,8 @@ async fn run_ingest(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
-        (status = 413, description = "Keyed load exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 413, description = "Load input or external Blob admission exceeds a bounded per-operation row or byte ceiling", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
@@ -1439,8 +1879,9 @@ async fn collect_graph_batch_body(body: Body) -> std::result::Result<Bytes, ApiE
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "Target branch missing without `from`", body = ErrorOutput),
         (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
-        (status = 413, description = "Request or keyed load exceeds a bounded ceiling", body = ErrorOutput),
+        (status = 413, description = "Request, load, or external Blob admission exceeds a bounded ceiling", body = ErrorOutput),
         (status = 415, description = "Content-Type must be application/x-ndjson", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
@@ -1534,7 +1975,8 @@ pub(crate) async fn server_load_ndjson(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
-        (status = 413, description = "Keyed load exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 413, description = "Load input or external Blob admission exceeds a bounded per-operation row or byte ceiling", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
@@ -1760,6 +2202,7 @@ pub(crate) async fn server_branch_delete(
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Merge conflict", body = ErrorOutput),
         (status = 413, description = "Merge row, byte, or recovery-chain ceiling exceeded before effects", body = ErrorOutput),
+        (status = 424, description = "A merge could not probe or read an allowed external Blob source", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
@@ -2013,4 +2456,47 @@ pub(crate) fn query_params_from_json(
 ) -> Result<ParamMap> {
     json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)
         .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))
+}
+
+#[cfg(test)]
+mod blob_error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pre_header_internal_errors_do_not_expose_physical_storage_or_identity() {
+        for (error, secret) in [
+            (
+                OmniError::Lance(
+                    "GET s3://private-bucket/tenant-a/table.lance?token=secret".to_string(),
+                ),
+                "private-bucket",
+            ),
+            (
+                OmniError::BlobIntegrity {
+                    reason: "table_key node:Secret has stable table 42/incarnation 99".to_string(),
+                },
+                "node:Secret",
+            ),
+        ] {
+            let response = map_blob_read_error(error).into_response();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            assert_eq!(output.error, "Blob delivery failed before response headers");
+            assert!(!String::from_utf8_lossy(&body).contains(secret));
+        }
+
+        let response = redact_blob_api_error(ApiError::internal(
+            "snapshot manifest at s3://private-bucket/graph/__manifest",
+        ))
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(output.error, "Blob delivery failed before response headers");
+        assert!(!String::from_utf8_lossy(&body).contains("private-bucket"));
+    }
 }

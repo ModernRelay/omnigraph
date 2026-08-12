@@ -24,6 +24,7 @@ use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
 use helpers::*;
 
@@ -722,10 +723,20 @@ query update_note($note: String) {
     file.set_len(LIMIT + 1).unwrap();
     drop(file);
     let external_uri = format!("file://{}", external_path.display());
+    let external_policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).expect("external blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
 
     let graph_path = dir.path().join("graph");
     let db = Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
         .await
+        .unwrap()
+        .with_external_blob_policy(external_policy)
         .unwrap();
     let row = serde_json::json!({
         "type": "Document",
@@ -1692,11 +1703,35 @@ query insert_then_update_note(
     insert Document { title: $title, content: $blob }
     update Document set { note: $note } where title = $title
 }
+
+query insert_then_replace_blob(
+    $title: String, $first: String, $second: String
+) {
+    insert Document { title: $title, content: $first }
+    update Document set { content: $second } where title = $title
+}
 "#;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let allowed_path = dir.path().join("allowed-source.bin");
+    std::fs::write(&allowed_path, b"last write wins").unwrap();
+    let allowed_uri = url::Url::from_file_path(&allowed_path)
+        .expect("allowed external source is absolute")
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).expect("external Blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
 
     // Keep one committed blob row as well as the just-inserted pending row so
     // the table has the real blob-v2 physical representation while this query
@@ -1727,11 +1762,13 @@ query insert_then_update_note(
         "one insert plus one pending-row update"
     );
 
-    let blob = db
-        .read_blob("Document", "letter", "content")
-        .await
-        .expect("inserted blob must remain readable after the update");
-    assert_eq!(&blob.read().await.unwrap()[..], &[4, 5, 6]);
+    let blob = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "letter", "content"),
+    )
+    .await;
+    assert_eq!(&blob[..], &[4, 5, 6]);
 
     let qr = db
         .query(
@@ -1750,6 +1787,41 @@ query insert_then_update_note(
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "letter");
     assert_eq!(row["d.note"], "draft 1");
+
+    // Mutation coalescing is last-write-wins before URI admission. The first
+    // pending value is deliberately outside the allow base; because the
+    // update replaces it in the same query, it must cause no policy check,
+    // HEAD, or payload read. Only the surviving URI is copied.
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            BLOB_QUERIES,
+            "insert_then_replace_blob",
+            &params(&[
+                ("$title", "last-wins"),
+                (
+                    "$first",
+                    "file:///definitely-outside-the-allowed-base/ignored",
+                ),
+                ("$second", &allowed_uri),
+            ]),
+        ),
+    )
+    .await
+    .expect("superseded external URI must not participate in admission");
+    assert_eq!(result.affected_nodes, 2);
+    assert_eq!(probes.external_blob_probe_inputs(), 1);
+    assert_eq!(probes.external_blob_probe_calls(), 1);
+    assert_eq!(probes.blob_payload_read_calls(), 1);
+    let blob = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "last-wins", "content"),
+    )
+    .await;
+    assert_eq!(&blob[..], b"last write wins");
 }
 
 /// MR-920 regression: two sequential `update T set {f:v} where x=y`
@@ -2161,7 +2233,7 @@ query find_person($name: String) {
 /// Lance 7.0.0 `RowIdIndex::new` then fails any filtered scan that needs
 /// the id→address map ("all columns in a record batch must have the same
 /// length" in release, a "Wrong range" debug assert). Fixed upstream by
-/// lance#7480; consumed here via the vendored `lance-table` patch.
+/// lance#7480 and shipped in the pinned crates.io Lance release.
 #[tokio::test]
 async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() {
     let dir = tempfile::tempdir().unwrap();
@@ -2214,7 +2286,8 @@ async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() 
 
 /// Isolation control for the regression above: the same load/delete/filtered
 /// read walk WITHOUT same-key updates (append-only merges, disjoint keys)
-/// never produces overlapping row-id ranges and passes on unpatched Lance.
+/// never produces overlapping row-id ranges and passed on the historical
+/// unpatched substrate as well.
 /// If this one fails alongside the merge-update case, the defect is not the
 /// lance#7444 overlap shape.
 #[tokio::test]
@@ -2255,4 +2328,239 @@ async fn filtered_read_after_append_and_delete_is_consistent() {
         let got = first_column_sorted(&result);
         assert_eq!(got, expected, "filtered read for {name}");
     }
+}
+
+async fn head_commit_id(uri: &str) -> String {
+    CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .expect("loaded graph has at least one commit")
+        .graph_commit_id
+}
+
+/// GitHub #365: `mutate_as_with_expected_head` is a caller-facing
+/// compare-and-swap on the branch head. A stale expectation is rejected with
+/// `PreconditionFailed` carrying the exact expected/actual commit ids and
+/// produces no commit; an expectation naming the current head passes.
+#[tokio::test]
+async fn mutate_expected_head_precondition_issue_365() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    let stale_head = head_commit_id(&uri).await;
+
+    // Writer A advances the head past the commit both writers read.
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+    let current_head = head_commit_id(&uri).await;
+    assert_ne!(stale_head, current_head);
+
+    // Writer B lost the race: its stale expectation must be rejected before
+    // any effect, with the ids the caller needs to re-read and decide again.
+    let err = db
+        .mutate_as_with_expected_head(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 52)]),
+            None,
+            Some(&stale_head),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        OmniError::PreconditionFailed {
+            branch,
+            expected,
+            actual,
+        } => {
+            assert_eq!(branch, "main");
+            assert_eq!(expected, stale_head);
+            assert_eq!(actual.as_deref(), Some(current_head.as_str()));
+        }
+        other => panic!("expected PreconditionFailed, got: {other}"),
+    }
+    assert_eq!(
+        head_commit_id(&uri).await,
+        current_head,
+        "rejected precondition must not produce a commit"
+    );
+
+    // An expectation naming the current head passes and commits.
+    db.mutate_as_with_expected_head(
+        "main",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 33)]),
+        None,
+        Some(&current_head),
+    )
+    .await
+    .unwrap();
+    assert_ne!(head_commit_id(&uri).await, current_head);
+
+    // A fresh named branch has no materialized `graph_head:feature` row, but
+    // it inherits main's exact lineage head. The read token must expose that
+    // effective head because this is the value the mutation gate compares.
+    let inherited_head = head_commit_id(&uri).await;
+    db.branch_create("feature").await.unwrap();
+    let (_, read_head) = db
+        .query_with_head(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_head.as_deref(), Some(inherited_head.as_str()));
+
+    // The token returned by the fresh-branch read is immediately usable for a
+    // conditional first write on that branch.
+    db.mutate_as_with_expected_head(
+        "feature",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 34)]),
+        None,
+        read_head.as_deref(),
+    )
+    .await
+    .unwrap();
+    let feature_head = CommitGraph::open_at_branch(&uri, "feature")
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .expect("feature first write creates a branch-owned head")
+        .graph_commit_id;
+    assert_ne!(feature_head, inherited_head);
+}
+
+/// A warm handle may refresh its manifest after another handle publishes.
+/// The read token and the following write capture must both prefer the exact
+/// graph-head row from that refreshed manifest over the handle's older derived
+/// lineage cache, or a token returned by the read falsely rejects immediately.
+#[tokio::test]
+async fn refreshed_warm_read_token_is_accepted_by_next_conditional_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let reader = init_and_load(&dir).await;
+    let writer = Omnigraph::open(&uri).await.unwrap();
+
+    let (_, before) = reader
+        .query_with_head(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+    writer
+        .mutate(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+        )
+        .await
+        .unwrap();
+
+    let (_, refreshed) = reader
+        .query_with_head(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        refreshed, before,
+        "the warm read must observe writer's commit"
+    );
+    let durable_head = head_commit_id(&uri).await;
+    assert_eq!(
+        refreshed.as_deref(),
+        Some(durable_head.as_str()),
+        "the token must come from the exact refreshed manifest snapshot"
+    );
+
+    reader
+        .mutate_as_with_expected_head(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 32)]),
+            None,
+            refreshed.as_deref(),
+        )
+        .await
+        .expect("a just-returned warm read token must be usable immediately");
+}
+
+/// Tripwire for the precondition/reprepare interaction (GitHub #365): the
+/// pre-effect retry loop replays insert-only mutations after an internal
+/// `ReadSetChanged`, and a caller precondition must never ride that replay —
+/// a retry against the fresh head would silently discard the compare-and-swap
+/// the caller asked for. `PreconditionFailed` is a distinct variant so the
+/// loop cannot classify it as retryable.
+#[tokio::test]
+async fn insert_only_mutation_stale_expected_head_is_terminal_issue_365() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+    let stale_head = head_commit_id(&uri).await;
+
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "WriterA")], &[("$age", 41)]),
+    )
+    .await
+    .unwrap();
+    let current_head = head_commit_id(&uri).await;
+
+    let err = db
+        .mutate_as_with_expected_head(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "WriterB")], &[("$age", 42)]),
+            None,
+            Some(&stale_head),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, OmniError::PreconditionFailed { .. }),
+        "insert-only mutation with a stale expectation must surface \
+         PreconditionFailed, got: {err}"
+    );
+    assert_eq!(
+        head_commit_id(&uri).await,
+        current_head,
+        "rejected insert must not produce a commit"
+    );
+    let absent = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "WriterB")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(absent.num_rows(), 0, "rejected insert must leave no row");
 }

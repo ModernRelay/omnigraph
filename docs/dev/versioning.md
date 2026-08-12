@@ -21,9 +21,11 @@ The current binary reads and writes exactly **internal manifest schema v6**.
 - **v5** is an unreleased development format that introduced SchemaIR v2,
   immutable stable-table/incarnation identity, identity-keyed manifest rows,
   and identity-derived table paths.
-- **v6** is the current format. It preserves v5 and makes every graph table's
-  exact non-null physical `id` field Lance's unenforced primary key; supported
-  strict insert/upsert writers use the exact-`id`, filter-bearing adapter.
+- **v6** is the current format. It shipped in OmniGraph 0.9.x and remains the
+  format written by 0.10.x. It preserves v5 and makes every graph table's exact
+  non-null physical `id` field Lance's unenforced primary key; supported strict
+  insert/upsert writers use the exact-`id`, filter-bearing adapter. The Lance
+  10 dependency bump is not a new OmniGraph format strand.
 - **v7-v19** were unreleased development formats belonging to the rejected
   RFC-026 MemWAL experiment. They are abandoned and are not compatibility
   obligations. The v6 binary refuses them as future formats before recovery or
@@ -48,7 +50,20 @@ The rationale and historical links are in
 state:
 
 - a stamp below v6 is refused with rebuild guidance;
-- a stamp above v6 is refused with an upgrade-binary message.
+- a stamp above v6 is refused with an upgrade-binary message;
+- an absent stamp on a manifest with the modern (v5+) column layout is refused
+  as either an interrupted older-binary init (those binaries stamped in a
+  separate commit after creating `__manifest`) or damaged/externally modified
+  metadata. The remaining metadata cannot distinguish those cases, so the
+  guard fails closed. It advises deletion and re-init only when the operator
+  independently knows initialization never completed; otherwise it says to
+  preserve the root for investigation or recovery. An absent stamp on a
+  pre-modern layout is the genuine pre-stamp world, treated as v1; a stamp
+  that is present but not a version number is refused naming the raw value.
+  Current binaries cannot produce the interrupted-init state: the `__manifest`
+  Create commit is the manifest's entire birth — entries, genesis lineage, and
+  the stamp ride that single commit, so the stamp is atomic with manifest
+  birth.
 
 There is no in-place migration dispatcher. A released v4 graph is exported with
 its v0.8.x binary, initialized as a fresh v6 graph, and loaded through the
@@ -76,6 +91,12 @@ additive. New fields are optional, old clients ignore unknown fields, and the
 OpenAPI drift test guards unintended breaking changes. Storage strictness does
 not justify a wire-version gate.
 
+An optional field or header is safe only when an older peer may ignore it
+without changing correctness. Behavior-bearing opt-ins use a fail-closed
+capability shape instead. For example, graph-head conditional mutations use a
+dedicated route: an older server returns 404 before execution rather than
+ignoring an unknown header and writing unconditionally.
+
 ## When changing an axis
 
 - **Storage format:** bump the manifest version, keep
@@ -85,5 +106,18 @@ not justify a wire-version gate.
 - **Recovery grammar:** bump the recovery-sidecar ceiling only when persisted
   recovery meaning changes. Never derive it from the manifest version.
 - **Wire:** keep changes additive and regenerate `openapi.json`.
-- **Lance:** follow the complete Lance-bump checklist in [lance.md](lance.md).
+- **Lance:** on a bump, run `lance_surface_guards.rs` first (see
+  [testing.md](testing.md)), review every intervening upstream commit, then
+  refresh [lance.md](lance.md)'s index and add a dated audit stanza in the
+  same change.
 - **Release:** update all published crates and generated metadata in lockstep.
+
+## Registry publication status
+
+crates.io publication is **paused** as of 2026-08. Access to the account
+owning the historical `omnigraph-*` crate names was lost, so those names are
+frozen at their 0.8.0 versions and no current release publishes to the
+registry; recovery of the account is being pursued. The name `omnigraph-db`
+is reserved (0.0.1) as a fallback. Binaries ship via the installer, Homebrew,
+Docker, and GitHub Releases; the TypeScript SDK ships via npm. Docs must not
+instruct users to `cargo install` until this paragraph is updated.

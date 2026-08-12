@@ -1,4 +1,5 @@
 pub mod api;
+mod blob_transport;
 mod export_transport;
 mod handlers;
 mod settings;
@@ -25,20 +26,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use api::{
-    BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
+    BlobReadQuery, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
     GraphBatchLoadQuery, GraphInfo, GraphListResponse, HealthOutput, IngestOutput, IngestRequest,
-    InvokeStoredQueryRequest, InvokeStoredQueryResponse, QueriesCatalogOutput, QueryRequest,
-    ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery,
-    graph_batch_load_output, ingest_output, schema_apply_output, snapshot_payload,
+    InvokeStoredQueryRequest, InvokeStoredQueryResponse, LegacyReadOutput, QueriesCatalogOutput,
+    QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput,
+    SnapshotQuery, graph_batch_load_output, ingest_output, schema_apply_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
-use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -93,6 +95,8 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_health,
         handlers::server_graphs_list,
         handlers::server_snapshot,
+        handlers::server_blob_get,
+        handlers::server_blob_head,
         // deprecated; the #[deprecated] attribute on the handler
         // surfaces as `deprecated: true` on the OpenAPI operation.
         #[allow(deprecated)] handlers::server_read,
@@ -100,8 +104,10 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_export,
         #[allow(deprecated)] handlers::server_change,
         handlers::server_mutate,
+        handlers::server_mutate_if_graph_commit,
         handlers::server_list_queries,
         handlers::server_invoke_query,
+        handlers::server_invoke_query_if_graph_commit,
         handlers::server_schema_apply,
         handlers::server_schema_get,
         handlers::server_load,
@@ -116,6 +122,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_commit_list,
         handlers::server_commit_show,
     ),
+    components(schemas(api::BlobEntityKind)),
     modifiers(&SecurityAddon),
 )]
 pub struct ApiDoc;
@@ -223,6 +230,9 @@ pub struct GraphStartupConfig {
     /// Pre-resolved embedding config from an applied cluster provider profile.
     /// Legacy config paths leave this unset and continue to use env resolution.
     pub embedding: Option<omnigraph::embedding::EmbeddingConfig>,
+    /// Full applied external Blob policy. `open_single_graph` projects it to
+    /// server-safe bases exactly once before engine injection.
+    pub external_blob_policy: omnigraph::ExternalBlobPolicy,
     /// Per-graph stored-query registry, loaded and identity-checked at
     /// settings-build time; type-checked against the schema when this
     /// graph's engine opens.
@@ -291,7 +301,10 @@ pub struct ApiError {
     read_set_conflict: Option<Box<api::ReadSetConflictOutput>>,
     key_conflict: Option<Box<api::KeyConflictOutput>>,
     resource_limit: Option<Box<api::ResourceLimitOutput>>,
+    blob_range: Option<Box<api::BlobRangeOutput>>,
+    external_blob_source: Option<Box<api::ExternalBlobSourceOutput>>,
     recovery_required: Option<Box<api::RecoveryRequiredOutput>>,
+    precondition_failure: Option<Box<api::PreconditionFailureOutput>>,
 }
 
 impl AppState {
@@ -628,7 +641,10 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -642,7 +658,10 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -656,7 +675,10 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -670,7 +692,10 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -688,7 +713,10 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -702,7 +730,10 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -716,7 +747,52 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
+    pub(crate) fn range_not_satisfiable(start: u64, end: u64, length: u64) -> Self {
+        Self {
+            status: StatusCode::RANGE_NOT_SATISFIABLE,
+            code: Some(ErrorCode::BadRequest),
+            // Keep the pre-existing `OmniError` display spelling stable while
+            // adding the structured wire fields below.
+            message: format!(
+                "blob range [{start}, {end}) is not satisfiable for a value of length {length}"
+            ),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            blob_range: Some(Box::new(api::BlobRangeOutput { start, end, length })),
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
+    /// HTTP 412 for a Blob representation validator mismatch. This is distinct
+    /// from the graph-commit write precondition below: it retains the existing
+    /// closed [`ErrorCode::Conflict`] signal and has no write-precondition
+    /// details because no mutation was attempted.
+    pub(crate) fn blob_precondition_failed(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_FAILED,
+            code: Some(ErrorCode::Conflict),
+            message: message.into(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -730,7 +806,32 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
+    /// HTTP 424 Failed Dependency for an external Blob source that passed the
+    /// graph's admission policy but could not be probed or read. `ErrorCode`
+    /// remains a closed rolling contract; the optional structured detail is
+    /// the additive machine-readable discriminator.
+    fn external_blob_source(uri: String, reason: String) -> Self {
+        let message = format!("external blob source '{uri}' is unavailable: {reason}");
+        Self {
+            status: StatusCode::FAILED_DEPENDENCY,
+            code: None,
+            message,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            blob_range: None,
+            external_blob_source: Some(Box::new(api::ExternalBlobSourceOutput { uri, reason })),
+            recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -748,7 +849,10 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -773,7 +877,10 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -787,7 +894,10 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -801,7 +911,10 @@ impl ApiError {
             read_set_conflict: Some(Box::new(details)),
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -815,7 +928,10 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: Some(Box::new(details)),
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -829,7 +945,10 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: Some(Box::new(details)),
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -846,7 +965,31 @@ impl ApiError {
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
             recovery_required: Some(Box::new(api::RecoveryRequiredOutput { operation_id })),
+            precondition_failure: None,
+        }
+    }
+
+    /// HTTP 412 Precondition Failed — an
+    /// `Omnigraph-If-Graph-Commit` graph-head precondition no longer holds.
+    /// `code` is omitted for the same closed-wire-contract reason as
+    /// [`Self::recovery_required`].
+    fn precondition_failed(message: String, details: api::PreconditionFailureOutput) -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_FAILED,
+            code: None,
+            message,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: Some(Box::new(details)),
         }
     }
 
@@ -918,6 +1061,25 @@ impl ApiError {
                 format!("recovery required for operation {operation_id}: {reason}"),
                 operation_id,
             ),
+            OmniError::PreconditionFailed {
+                branch,
+                expected,
+                actual,
+            } => Self::precondition_failed(
+                format!(
+                    "precondition failed on branch '{branch}': expected head '{expected}' but current is {}",
+                    actual.as_deref().unwrap_or("<absent>")
+                ),
+                api::PreconditionFailureOutput { expected, actual },
+            ),
+            err @ OmniError::ExternalBlobPolicy { .. } => Self::bad_request(err.to_string()),
+            OmniError::ExternalBlobSource { uri, reason } => {
+                Self::external_blob_source(uri, reason)
+            }
+            OmniError::BlobRangeNotSatisfiable { start, end, length } => {
+                Self::range_not_satisfiable(start, end, length)
+            }
+            err @ OmniError::BlobIntegrity { .. } => Self::internal(err.to_string()),
             OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
             OmniError::RetryableCommitConflict(message) => {
                 Self::conflict(format!("retryable storage commit conflict: {message}"))
@@ -989,7 +1151,10 @@ impl IntoResponse for ApiError {
                 read_set_conflict: self.read_set_conflict.map(|d| *d),
                 key_conflict: self.key_conflict.map(|d| *d),
                 resource_limit: self.resource_limit.map(|d| *d),
+                blob_range: self.blob_range.map(|d| *d),
+                external_blob_source: self.external_blob_source.map(|d| *d),
                 recovery_required: self.recovery_required.map(|d| *d),
+                precondition_failure: self.precondition_failure.map(|d| *d),
             }),
         )
             .into_response()
@@ -1066,6 +1231,178 @@ mod api_error_tests {
         assert_eq!(details.actual, 8193);
         assert!(error.recovery_required.is_none());
     }
+
+    #[tokio::test]
+    async fn blob_reader_errors_keep_the_exhaustive_http_mapping() {
+        let response = ApiError::from_omni(OmniError::BlobRangeNotSatisfiable {
+            start: 4,
+            end: 9,
+            length: 8,
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::BadRequest));
+        assert_eq!(
+            error.error,
+            "blob range [4, 9) is not satisfiable for a value of length 8"
+        );
+        let range = error.blob_range.expect("structured Blob range");
+        assert_eq!((range.start, range.end, range.length), (4, 9, 8));
+
+        let response = ApiError::from_omni(OmniError::BlobIntegrity {
+            reason: "malformed descriptor".to_string(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::Internal));
+    }
+
+    #[tokio::test]
+    async fn external_blob_policy_is_400_bad_request() {
+        let response = ApiError::from_omni(OmniError::ExternalBlobPolicy {
+            uri: "s3://denied/object".to_string(),
+            reason: "outside every configured base".to_string(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::BadRequest));
+        assert!(error.error.contains("outside every configured base"));
+    }
+
+    #[tokio::test]
+    async fn external_blob_source_is_424_with_rolling_safe_structured_details() {
+        let response = ApiError::from_omni(OmniError::ExternalBlobSource {
+            uri: "s3://allowed/missing".to_string(),
+            reason: "object does not exist".to_string(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, None);
+        let details = error
+            .external_blob_source
+            .expect("structured external Blob source details");
+        assert_eq!(details.uri, "s3://allowed/missing");
+        assert_eq!(details.reason, "object does not exist");
+        assert!(error.error.contains(&details.reason));
+    }
+}
+
+#[cfg(test)]
+mod external_blob_startup_tests {
+    use super::*;
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    #[tokio::test]
+    async fn server_open_drops_embedded_only_external_blob_bases() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("graph.omni");
+        Omnigraph::init(
+            graph.to_string_lossy().as_ref(),
+            "node Doc {\nslug: String @key\npayload: Blob\n}\n",
+        )
+        .await
+        .unwrap();
+
+        let external = temp.path().join("external");
+        std::fs::create_dir(&external).unwrap();
+        let payload = external.join("payload.bin");
+        std::fs::write(&payload, b"server must not read this").unwrap();
+        let base = omnigraph::ExternalBlobBase::new(
+            format!("file://{}", external.display()),
+            omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap();
+        let policy = omnigraph::ExternalBlobPolicy::allow(vec![base]).unwrap();
+
+        let opened = open_single_graph(GraphStartupConfig {
+            graph_id: "knowledge".to_string(),
+            uri: graph.to_string_lossy().into_owned(),
+            policy: None,
+            embedding: None,
+            external_blob_policy: policy,
+            queries: QueryRegistry::default(),
+        })
+        .await
+        .unwrap();
+        let data = format!(
+            "{{\"type\":\"Doc\",\"data\":{{\"slug\":\"one\",\"payload\":\"file://{}\"}}}}\n",
+            payload.display()
+        );
+        let error = load_jsonl(opened.handle.engine.as_ref(), &data, LoadMode::Overwrite)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OmniError::ExternalBlobPolicy { .. }),
+            "server projection must deny an embedded-only URI, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_open_refuses_forged_server_safe_file_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("graph.omni");
+        let schema = "node Doc {\nslug: String @key\npayload: Blob\n}\n";
+        Omnigraph::init(graph.to_string_lossy().as_ref(), schema)
+            .await
+            .unwrap();
+        // A read-write open normally removes this matching no-op staging
+        // residue. The invalid policy must be rejected before graph open, so
+        // startup cannot perform even that safe recovery mutation first.
+        let staging = graph.join("_schema.pg.staging");
+        std::fs::write(&staging, schema).unwrap();
+        assert!(staging.exists());
+        let policy: omnigraph::ExternalBlobPolicy = serde_json::from_value(serde_json::json!({
+            "mode": "allow",
+            "bases": [{
+                "uri": format!("file://{}", temp.path().display()),
+                "scope": "server_safe"
+            }]
+        }))
+        .unwrap();
+
+        let result = open_single_graph(GraphStartupConfig {
+            graph_id: "knowledge".to_string(),
+            uri: graph.to_string_lossy().into_owned(),
+            policy: None,
+            embedding: None,
+            external_blob_policy: policy,
+            queries: QueryRegistry::default(),
+        })
+        .await;
+        let error = match result {
+            Ok(_) => panic!("server must refuse a forged server-safe file base"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("server-safe external Blob base may not use file://"),
+            "unexpected refusal: {error:?}"
+        );
+        assert!(
+            staging.exists(),
+            "invalid server policy must be refused before read-write open recovery moves graph state"
+        );
+        assert_eq!(std::fs::read_to_string(staging).unwrap(), schema);
+    }
 }
 
 pub fn init_tracing() {
@@ -1124,6 +1461,10 @@ pub fn build_app(state: AppState) -> Router {
     //      `{graph_id}` in the URI path).
     let per_graph_protected = Router::new()
         .route("/snapshot", get(server_snapshot))
+        // Register HEAD explicitly. Axum's GET fallback would invoke the GET
+        // handler and could begin payload work before stripping the body; the
+        // dedicated handler makes the zero-payload-read contract structural.
+        .route("/blob", get(server_blob_get).head(server_blob_head))
         .route("/export", post(server_export))
         // /read and /change are kept indefinitely for back-compat;
         // their handlers carry #[deprecated] so the OpenAPI operation is
@@ -1146,8 +1487,16 @@ pub fn build_app(state: AppState) -> Router {
             }),
         )
         .route("/mutate", post(server_mutate))
+        .route(
+            "/mutate/if-graph-commit",
+            post(server_mutate_if_graph_commit),
+        )
         .route("/queries", get(server_list_queries))
         .route("/queries/{name}", post(server_invoke_query))
+        .route(
+            "/queries/{name}/if-graph-commit",
+            post(server_invoke_query_if_graph_commit),
+        )
         .route("/schema", get(server_schema_get))
         .route("/schema/apply", post(server_schema_apply))
         .route(
@@ -1381,9 +1730,27 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<OpenedGraph> {
     let uri = normalize_root_uri(&cfg.uri)
         .wrap_err_with(|| format!("normalize URI for graph '{}'", cfg.graph_id))?;
 
+    // Project and validate the applied resource boundary before a read-write
+    // graph open. `Omnigraph::open` may complete durable recovery, so an
+    // invalid control-plane policy must quarantine the graph before that first
+    // possible effect rather than after recovery has already moved state.
+    let external_blob_policy = cfg.external_blob_policy.server_safe_only().map_err(|err| {
+        color_eyre::eyre::eyre!(
+            "external Blob policy for graph '{}' is invalid: {err}",
+            graph_id
+        )
+    })?;
     let db = Omnigraph::open(&uri)
         .await
         .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, uri))?;
+    let db = db
+        .with_external_blob_policy(external_blob_policy)
+        .map_err(|err| {
+            color_eyre::eyre::eyre!(
+                "external Blob policy for graph '{}' is invalid: {err}",
+                graph_id
+            )
+        })?;
     let db = if let Some(embedding) = cfg.embedding {
         db.with_embedding_config(Arc::new(embedding))
     } else {

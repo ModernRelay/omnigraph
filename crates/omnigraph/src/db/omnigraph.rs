@@ -11,11 +11,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
-use lance::dataset::BlobFile;
 use lance::dataset::scanner::ColumnOrdering;
-use lance::datatypes::{
-    BlobKind, LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
-};
+use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::{PropType, ScalarType};
@@ -24,12 +21,14 @@ use omnigraph_compiler::{
     SchemaShape, SchemaTypeKind, build_catalog_from_ir, compile_schema_shape, initialize_schema_ir,
     plan_schema_migration,
 };
+use ulid::Ulid;
 
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot, ResolvedCommitRange};
 use crate::error::{OmniError, Result};
 use crate::runtime_cache::RuntimeCache;
 use crate::storage::{
-    StorageAdapter, join_uri, normalize_root_uri, storage_for_uri, write_queue_root_identity,
+    StorageAdapter, StorageKind, join_uri, normalize_root_uri, storage_for_uri,
+    storage_kind_for_uri, write_queue_root_identity,
 };
 use crate::storage_layer::SnapshotHandle;
 use crate::table_store::TableStore;
@@ -142,6 +141,12 @@ pub(crate) struct WriteTxn {
     /// forked named branch whose materialized `graph_head:<branch>` row is
     /// intentionally absent.
     pub(crate) effective_graph_head: Option<String>,
+    /// Optional caller compare-and-swap token for this mutation attempt.
+    /// Unlike the internal authority token, a mismatch is terminal and must
+    /// surface as `PreconditionFailed`; it is re-evaluated from fresh authority
+    /// under the pre-effect gates so update/delete behavior cannot depend on
+    /// the engine's internal reprepare policy.
+    pub(crate) caller_expected_graph_head: Option<String>,
     /// Catalog built from the exact accepted IR whose identity is recorded in
     /// `authority`. Mutation/load planning and validation must use this snapshot,
     /// never the handle-global catalog, which can lag a schema apply performed by
@@ -377,6 +382,11 @@ impl Omnigraph {
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_physical_schemas(&mut catalog)?;
 
+        // Every init write needs atomic create-if-absent (the `_schema.pg`
+        // claim, each Lance commit), so refuse an incapable local
+        // filesystem here, while the root holds nothing to strand.
+        verify_local_create_if_absent(&root, storage.as_ref()).await?;
+
         // Establish an atomic ownership claim on `_schema.pg` before
         // writing the remaining init artifacts. A check-then-write preflight
         // is not enough under concurrent `init` calls: two callers can both
@@ -505,6 +515,12 @@ impl Omnigraph {
         // Both open modes refuse: there is no in-place migration, and the check is
         // a stamp read with no object-store writes, so it is safe under ReadOnly.
         crate::db::manifest::refuse_if_internal_schema_unsupported(&root).await?;
+        // Read-write opens write before the first user mutation (recovery
+        // sweeps, schema-stamp migration), and every write needs atomic
+        // create-if-absent; read-only opens perform no writes.
+        if matches!(mode, OpenMode::ReadWrite) {
+            verify_local_create_if_absent(&root, storage.as_ref()).await?;
+        }
         // Open the coordinator first so the schema-staging recovery sweep can
         // compare its snapshot against any leftover staging files.
         let control_session = lance_access.control_session();
@@ -674,6 +690,25 @@ impl Omnigraph {
     pub fn with_policy(mut self, checker: Arc<dyn omnigraph_policy::PolicyChecker>) -> Self {
         self.policy = Some(checker);
         self
+    }
+
+    /// Install the immutable graph-level external Blob ingress policy.
+    ///
+    /// The default on every initialized or opened handle is deny. This
+    /// consuming builder validates deserialized configuration before replacing
+    /// that default, so no writer can observe a partially configured policy.
+    pub fn with_external_blob_policy(
+        mut self,
+        policy: crate::blob::ExternalBlobPolicy,
+    ) -> Result<Self> {
+        self.table_store = self.table_store.with_external_blob_policy(policy)?;
+        Ok(self)
+    }
+
+    /// Policy-aware Blob materializer for internal rewrite/merge paths that
+    /// must carry the graph policy and shared Lance object-store registry.
+    pub(crate) fn blob_materializer(&self) -> crate::table_store::TableStore {
+        self.table_store.clone()
     }
 
     /// The lazily-initialized, reused-across-queries embedding client cell
@@ -1009,6 +1044,7 @@ impl Omnigraph {
                     schema_identity_version: schema_state.schema_identity_version,
                 },
                 effective_graph_head,
+                caller_expected_graph_head: None,
                 catalog: Arc::new(catalog),
                 manifest_probe,
             });
@@ -1099,6 +1135,7 @@ impl Omnigraph {
                         schema_identity_version: schema_state.schema_identity_version,
                     },
                     effective_graph_head,
+                    caller_expected_graph_head: None,
                     catalog: Arc::clone(&catalog),
                     manifest_probe,
                 };
@@ -1247,17 +1284,22 @@ impl Omnigraph {
         let normalized = normalize_branch_name(branch.unwrap_or("main"))?;
         let coord = self.coordinator.read().await;
         if normalized.as_deref() == coord.current_branch() {
-            let snapshot_id = coord.head_commit_id().await?.unwrap_or_else(|| {
-                SnapshotId::synthetic(
-                    coord.current_branch(),
-                    coord.version(),
-                    coord.manifest_incarnation().e_tag.as_deref(),
-                )
-            });
+            let graph_commit_id = coord.effective_graph_head().await?;
+            let snapshot_id = graph_commit_id
+                .as_deref()
+                .map(SnapshotId::new)
+                .unwrap_or_else(|| {
+                    SnapshotId::synthetic(
+                        coord.current_branch(),
+                        coord.version(),
+                        coord.manifest_incarnation().e_tag.as_deref(),
+                    )
+                });
             return Ok(ResolvedTarget {
                 requested,
                 branch: coord.current_branch().map(str::to_string),
                 snapshot_id,
+                graph_commit_id,
                 snapshot: coord.snapshot(),
             });
         }
@@ -1291,10 +1333,7 @@ impl Omnigraph {
                     return Ok((
                         coord.branch_identifier().await?,
                         coord.exact_graph_head(),
-                        coord
-                            .head_commit_id()
-                            .await?
-                            .map(|head| head.as_str().to_string()),
+                        coord.effective_graph_head().await?,
                         coord.snapshot(),
                         coord.captured_manifest_probe(),
                     ));
@@ -1306,10 +1345,7 @@ impl Omnigraph {
         Ok((
             coord.branch_identifier().await?,
             coord.exact_graph_head(),
-            coord
-                .head_commit_id()
-                .await?
-                .map(|head| head.as_str().to_string()),
+            coord.effective_graph_head().await?,
             coord.snapshot(),
             coord.captured_manifest_probe(),
         ))
@@ -1371,13 +1407,22 @@ impl Omnigraph {
         // Recheck the durable sentinel inside that critical section so a schema
         // apply observed after preparation cannot be followed by a table effect.
         self.ensure_schema_apply_not_locked("write commit").await?;
-        let (branch_identifier, graph_head, _effective_graph_head, snapshot, _) = self
+        let (branch_identifier, graph_head, effective_graph_head, snapshot, _) = self
             .write_authority_for_known_branch(txn.branch.as_deref(), true)
             .await?;
         let (schema_ir, schema_state) =
             load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
         self.ensure_schema_apply_not_locked("write commit").await?;
         validate_schema_ir_against_snapshot(&schema_ir, &snapshot)?;
+        if let Some(expected) = txn.caller_expected_graph_head.as_deref()
+            && effective_graph_head.as_deref() != Some(expected)
+        {
+            return Err(OmniError::precondition_failed(
+                txn.branch.as_deref().unwrap_or("main"),
+                expected,
+                effective_graph_head,
+            ));
+        }
         if branch_identifier != txn.authority.branch_identifier {
             return Err(OmniError::manifest_read_set_changed(
                 format!(
@@ -1500,7 +1545,13 @@ impl Omnigraph {
     /// version this graph is stamped at). Surfaced via `omnigraph snapshot`.
     pub async fn internal_schema_version_of(&self, target: impl Into<ReadTarget>) -> Result<u32> {
         let branch = self.resolved_branch_of(target).await?;
-        crate::db::manifest::internal_schema_stamp_at(self.uri(), branch.as_deref()).await
+        crate::db::manifest::internal_schema_stamp_at(self.uri(), branch.as_deref())
+            .await?
+            .ok_or_else(|| {
+                // Unreachable through this handle: every open path runs the
+                // stamp guard, which refuses unstamped manifests.
+                OmniError::manifest_internal("opened graph has no internal-schema stamp")
+            })
     }
 
     pub async fn resolved_branch_of(
@@ -2057,9 +2108,11 @@ impl Omnigraph {
     /// Resolve a read target to its snapshot, without attaching read caches.
     /// Same-branch reads reuse the warm coordinator, gated by a cheap version
     /// probe (invariant 6: strong consistency, never a blind warm read). Reads do
-    /// not need the commit graph (the manifest version is the visibility
-    /// authority, invariant 2), so the id is synthetic and no commit-graph scan
-    /// happens on this path.
+    /// not need to reopen a separate commit store to pin visibility (the
+    /// manifest version is the authority, invariant 2). The cache id stays
+    /// synthetic. A stale refresh may remain manifest-only when that snapshot
+    /// carries an exact head row; an absent row triggers a coherent lineage
+    /// refresh before exposing the effective inherited head.
     async fn resolve_target_inner(&self, target: &ReadTarget) -> Result<ResolvedTarget> {
         if let ReadTarget::Branch(branch) = target {
             let normalized = normalize_branch_name(branch)?;
@@ -2071,7 +2124,7 @@ impl Omnigraph {
                 }
                 let held = coord.manifest_incarnation();
                 if coord.probe_latest_incarnation().await?.matches(&held) {
-                    return Ok(warm_resolved_target(&coord, target));
+                    return warm_resolved_target(&coord, target).await;
                 }
                 // Stale: refresh under the write lock below.
             }
@@ -2082,10 +2135,14 @@ impl Omnigraph {
                 let held = coord.manifest_incarnation();
                 let mut refreshed = false;
                 if !coord.probe_latest_incarnation().await?.matches(&held) {
-                    coord.refresh_manifest_only().await?;
+                    // An exact head row keeps this state-only; a fresh/recreated
+                    // branch atomically refreshes its inherited lineage too.
+                    // No fallible second phase can leave replacement rows
+                    // paired with the deleted branch's cached private head.
+                    coord.refresh_for_live_read().await?;
                     refreshed = true;
                 }
-                let resolved = warm_resolved_target(&coord, target);
+                let resolved = warm_resolved_target(&coord, target).await?;
                 drop(coord);
                 if refreshed {
                     self.invalidate_read_caches().await;
@@ -2291,60 +2348,6 @@ impl Omnigraph {
         options: optimize::CleanupPolicyOptions,
     ) -> Result<Vec<optimize::TableCleanupStats>> {
         optimize::cleanup_all_tables(self, options).await
-    }
-
-    /// Read a blob from a node by its string ID and property name.
-    ///
-    /// Returns a `BlobFile` handle with async `read()`, `seek()`, `tell()`,
-    /// and metadata accessors (`size()`, `kind()`, `uri()`).
-    ///
-    /// ```ignore
-    /// let blob = db.read_blob("Document", "readme", "content").await?;
-    /// let bytes = blob.read().await?;
-    /// ```
-    pub async fn read_blob(&self, type_name: &str, id: &str, property: &str) -> Result<BlobFile> {
-        let (resolved, catalog) = self.capture_current_read_view().await?;
-        let node_type = catalog
-            .node_types
-            .get(type_name)
-            .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
-        if !node_type.blob_properties.contains(property) {
-            return Err(OmniError::manifest(format!(
-                "property '{}' on type '{}' is not a Blob",
-                property, type_name
-            )));
-        }
-
-        let table_key = format!("node:{}", type_name);
-        let handle = self
-            .storage()
-            .open_snapshot_at_table(&resolved.snapshot, &table_key)
-            .await?;
-
-        let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
-        let row_id = self
-            .storage()
-            .first_row_id_for_filter(&handle, &filter_sql)
-            .await?
-            .ok_or_else(|| {
-                OmniError::manifest(format!("no {} with id '{}' found", type_name, id))
-            })?;
-
-        // `take_blobs` is a Lance-specific blob accessor not surfaced
-        // through the `TableStorage` trait — reach the inner `Arc<Dataset>`
-        // via the `pub(crate)` accessor for this read-only call.
-        let ds = handle.into_arc();
-        let mut blobs = ds
-            .take_blobs(&[row_id], property)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-        blobs.pop().ok_or_else(|| {
-            OmniError::manifest(format!(
-                "blob '{}' on {} '{}' returned no data",
-                property, type_name, id
-            ))
-        })
     }
 
     pub(crate) async fn active_branch(&self) -> Option<String> {
@@ -2950,14 +2953,6 @@ impl Omnigraph {
         .await
     }
 
-    pub(crate) async fn build_indices_on_dataset(
-        &self,
-        table_key: &str,
-        ds: &mut SnapshotHandle,
-    ) -> Result<Vec<PendingIndex>> {
-        table_ops::build_indices_on_dataset(self, table_key, ds).await
-    }
-
     // Used only by in-tree tests (`#[cfg(test)]`); the runtime path now
     // uses `commit_updates_on_branch_with_expected` exclusively.
     #[cfg(test)]
@@ -3035,11 +3030,14 @@ pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
 
 /// Build a `ResolvedTarget` from the warm coordinator without opening the commit
 /// graph. The live branch snapshot is pinned by the manifest incarnation, so the
-/// id is synthetic `(branch, version, e_tag when available)`; nothing on the read
-/// path needs a real commit ULID (only `RuntimeCache` keys on the id, where
-/// synthetic is consistent).
-fn warm_resolved_target(coord: &GraphCoordinator, requested: &ReadTarget) -> ResolvedTarget {
-    ResolvedTarget {
+/// cache id is synthetic `(branch, version, e_tag when available)`. The effective
+/// lineage head is derived separately from that same coordinator so a fresh fork
+/// exposes its inherited source commit as a conditional-write token.
+async fn warm_resolved_target(
+    coord: &GraphCoordinator,
+    requested: &ReadTarget,
+) -> Result<ResolvedTarget> {
+    Ok(ResolvedTarget {
         requested: requested.clone(),
         branch: coord.current_branch().map(str::to_string),
         snapshot_id: SnapshotId::synthetic(
@@ -3047,8 +3045,9 @@ fn warm_resolved_target(coord: &GraphCoordinator, requested: &ReadTarget) -> Res
             coord.version(),
             coord.manifest_incarnation().e_tag.as_deref(),
         ),
+        graph_commit_id: coord.effective_graph_head().await?,
         snapshot: coord.snapshot(),
-    }
+    })
 }
 
 pub(crate) fn ensure_public_branch_ref(branch: &str, operation: &str) -> Result<()> {
@@ -3097,45 +3096,6 @@ fn blob_properties_for_table_key<'a>(
     )))
 }
 
-fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bool> {
-    if descriptions.is_null(row) {
-        return Ok(true);
-    }
-
-    let kind = descriptions
-        .column_by_name("kind")
-        .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
-        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row) as u8))
-        .or_else(|| {
-            descriptions
-                .column_by_name("kind")
-                .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt8Array>())
-                .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)))
-        });
-    let position = descriptions
-        .column_by_name("position")
-        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
-    let size = descriptions
-        .column_by_name("size")
-        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
-    let blob_uri = descriptions
-        .column_by_name("blob_uri")
-        .and_then(|col| col.as_any().downcast_ref::<StringArray>())
-        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
-
-    let Some(kind) = kind else {
-        return Ok(true);
-    };
-    let kind = BlobKind::try_from(kind).map_err(|e| OmniError::Lance(e.to_string()))?;
-    if kind != BlobKind::Inline {
-        return Ok(false);
-    }
-
-    Ok(position.unwrap_or(0) == 0 && size.unwrap_or(0) == 0 && blob_uri.unwrap_or("").is_empty())
-}
-
 /// Convert compiler placeholders into the physical Lance schema contract.
 ///
 /// The compiler crate deliberately has no Lance dependency, so it cannot
@@ -3144,24 +3104,70 @@ fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bo
 /// it can create, overwrite, or rebuild a physical graph table:
 ///
 /// - `ScalarType::Blob`'s `LargeBinary` placeholder becomes a blob-v2 field;
+/// - every user property carries its authoritative stable-property ID;
 /// - exactly the injected, non-null top-level `id` field is the Lance PK; and
 /// - schema metadata and unrelated field metadata survive the reconstruction.
 ///
-/// RFC-023 makes this part of internal format v6. Older physical images are
-/// never annotated in place: the strict format floor rejects them before a v6
-/// catalog is allowed to write.
+/// V6's exact-`id` primary-key fence remains unchanged. Starting in 0.10, every
+/// newly initialized, added, or schema-rebuilt physical user field also carries
+/// its graph property lifetime. Schema-preserving Append, Merge, and mutation
+/// writes retain an earlier v6 image's unmarked schema; full-table Overwrite
+/// carries the 0.10 catalog schema and adopts the marker on its replacement
+/// fields. Blob reads admit a missing marker only at the exact current physical
+/// table entry and refuse every older snapshot rather than inferring identity
+/// from Lance field IDs or positions, even when no rename occurred.
 fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
-    for (name, node_type) in &mut catalog.node_types {
+    let node_names = catalog.node_types.keys().cloned().collect::<Vec<_>>();
+    for name in node_names {
+        let stable_property_ids = catalog.node_types[&name]
+            .properties
+            .keys()
+            .map(|property| {
+                catalog
+                    .node_property_id(&name, property)
+                    .map(|id| (property.clone(), id.get()))
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "node property '{name}.{property}' lacks stable identity"
+                        ))
+                    })
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let node_type = catalog
+            .node_types
+            .get_mut(&name)
+            .expect("node name came from catalog keys");
         node_type.arrow_schema = physical_table_schema(
             &node_type.arrow_schema,
             &node_type.blob_properties,
+            &stable_property_ids,
             &format!("node:{name}"),
         )?;
     }
-    for (name, edge_type) in &mut catalog.edge_types {
+    let edge_names = catalog.edge_types.keys().cloned().collect::<Vec<_>>();
+    for name in edge_names {
+        let stable_property_ids = catalog.edge_types[&name]
+            .properties
+            .keys()
+            .map(|property| {
+                catalog
+                    .edge_property_id(&name, property)
+                    .map(|id| (property.clone(), id.get()))
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "edge property '{name}.{property}' lacks stable identity"
+                        ))
+                    })
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let edge_type = catalog
+            .edge_types
+            .get_mut(&name)
+            .expect("edge name came from catalog keys");
         edge_type.arrow_schema = physical_table_schema(
             &edge_type.arrow_schema,
             &edge_type.blob_properties,
+            &stable_property_ids,
             &format!("edge:{name}"),
         )?;
     }
@@ -3171,6 +3177,7 @@ fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
 fn physical_table_schema(
     schema: &Arc<Schema>,
     blob_properties: &HashSet<String>,
+    stable_property_ids: &HashMap<String, u64>,
     table_key: &str,
 ) -> Result<Arc<Schema>> {
     let mut id_count = 0;
@@ -3200,11 +3207,25 @@ fn physical_table_schema(
                 metadata.insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string());
             } else {
                 metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY);
+                if let Some(stable_property_id) = stable_property_ids.get(physical.name()) {
+                    metadata.insert(
+                        crate::db::STABLE_PROPERTY_ID_METADATA_KEY.to_string(),
+                        stable_property_id.to_string(),
+                    );
+                } else if matches!(physical.name().as_str(), "src" | "dst") {
+                    metadata.remove(crate::db::STABLE_PROPERTY_ID_METADATA_KEY);
+                } else {
+                    return Err(OmniError::manifest_internal(format!(
+                        "physical property '{}.{}' lacks stable identity",
+                        table_key,
+                        physical.name()
+                    )));
+                }
             }
             physical.set_metadata(metadata);
-            physical
+            Ok(physical)
         })
-        .collect::<Vec<Field>>();
+        .collect::<Result<Vec<Field>>>()?;
 
     if id_count != 1 {
         return Err(OmniError::manifest_internal(format!(
@@ -3239,6 +3260,36 @@ fn validate_bound_catalog_against_snapshot(catalog: &Catalog, snapshot: &Snapsho
 fn read_schema_shape_from_source(schema_source: &str) -> Result<SchemaShape> {
     let schema_ast = parse_schema(schema_source)?;
     compile_schema_shape(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
+}
+
+/// Prefix for transient objects a read-write bind owns while proving that the
+/// local filesystem supports atomic create-if-absent.
+const CREATE_IF_ABSENT_PROBE_FILENAME_PREFIX: &str = "__create_if_absent_probe";
+const CREATE_IF_ABSENT_PROBE_CLAIM_ATTEMPTS: usize = 4;
+
+/// Refuse a local read-write bind (`init`, or `open` for read-write) whose
+/// filesystem cannot do atomic create-if-absent (no `hard_link(2)`: Android
+/// app storage, FAT/exFAT — issue #453). The `_schema.pg` claim and every
+/// Lance commit need it on every write, and it is a property of the mount
+/// behind the root (a store can be copied), so probe per root, per bind.
+async fn verify_local_create_if_absent(root: &str, storage: &dyn StorageAdapter) -> Result<()> {
+    if storage_kind_for_uri(root) != StorageKind::Local {
+        return Ok(());
+    }
+    crate::failpoints::maybe_fail(crate::failpoints::names::LOCAL_CREATE_IF_ABSENT_PROBE)?;
+    for _ in 0..CREATE_IF_ABSENT_PROBE_CLAIM_ATTEMPTS {
+        let probe_name = format!("{CREATE_IF_ABSENT_PROBE_FILENAME_PREFIX}_{}", Ulid::new());
+        let probe_uri = join_uri(root, &probe_name);
+        if !storage.write_text_if_absent(&probe_uri, "").await? {
+            // A prior or foreign writer owns this candidate. It proves
+            // nothing about this bind and must not be deleted by it.
+            continue;
+        }
+        return storage.delete(&probe_uri).await;
+    }
+    Err(OmniError::manifest_internal(format!(
+        "local create-if-absent capability probe at '{root}' could not claim a unique object name after {CREATE_IF_ABSENT_PROBE_CLAIM_ATTEMPTS} attempts; refusing read-write bind"
+    )))
 }
 
 /// `--force` may replace orphan schema files, but it must never mint a new

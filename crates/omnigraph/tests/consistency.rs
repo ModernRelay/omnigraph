@@ -1,5 +1,6 @@
 mod helpers;
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use arrow_array::{Array, Date32Array, Int32Array, StringArray};
@@ -10,6 +11,7 @@ use tokio::sync::Barrier;
 use omnigraph::db::Omnigraph;
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
 
@@ -294,18 +296,71 @@ node Thing {
     );
 }
 
-/// An external blob reference is small in the staged Arrow descriptor even
-/// when the referenced object is huge. The keyed Append adapter must charge
-/// the object's metadata size before fetching its payload and before arming
-/// recovery. Linux CI also watches the sparse source for `IN_ACCESS`, proving
-/// the rejected payload was never read after its metadata was resolved.
+async fn assert_lazy_external_blob_rejection_is_effect_free(
+    db: &Omnigraph,
+    graph_dir: &std::path::Path,
+    table_key: &str,
+    table_uri: &str,
+    before_manifest: u64,
+    before_table: u64,
+    before_head: u64,
+    case: &str,
+) {
+    let after = snapshot_branch(db, "feature").await.unwrap();
+    assert_eq!(after.version(), before_manifest, "{case}: manifest moved");
+    assert_eq!(
+        after.entry(table_key).unwrap().table_version,
+        before_table,
+        "{case}: feature table pointer moved"
+    );
+    assert_eq!(
+        after.entry(table_key).unwrap().table_branch,
+        None,
+        "{case}: rejection must not publish a deferred table fork"
+    );
+    let after_dataset = Dataset::open(table_uri).await.unwrap();
+    assert_eq!(
+        after_dataset.version().version,
+        before_head,
+        "{case}: rejection must precede a Lance table effect"
+    );
+    assert!(
+        !after_dataset
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "{case}: rejected first touch created the native feature ref"
+    );
+    assert_eq!(count_rows_branch(db, "feature", table_key).await, 0);
+    let recovery_dir = graph_dir.join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "{case}: rejection must precede the recovery sidecar"
+    );
+}
+
+/// External Blob admission is an operation-wide pre-effect gate: default deny
+/// is a typed policy failure, an allowed but missing source is a typed source
+/// failure, and an oversized source is rejected from metadata before its bytes
+/// are read. None may create a lazy branch ref, move Lance HEAD or graph
+/// visibility, or arm recovery. Linux CI also watches the sparse source for
+/// `IN_ACCESS`, proving the oversized payload was never read. The same owner
+/// pins the generic external-URI cell boundary independently of keyed rows:
+/// exact-limit Overwrite succeeds and a cross-table one-over Overwrite is
+/// typed and effect-free before HEAD.
 #[tokio::test]
-async fn load_append_rejects_oversized_external_blob_before_read_or_arm() {
+async fn external_blob_ingress_caps_are_operation_wide_and_pre_effect() {
     const LIMIT: u64 = 32 * 1024 * 1024;
     const SCHEMA: &str = r#"
 node Document {
     title: String @key
     content: Blob
+}
+
+node Attachment {
+    name: String @key
+    payload: Blob
 }
 "#;
 
@@ -374,12 +429,83 @@ node Document {
         "type": "Document",
         "data": {
             "title": "oversized",
-            "content": external_uri,
+            "content": external_uri.clone(),
         }
     })
     .to_string();
 
-    let result = db.load("feature", &input, LoadMode::Append).await;
+    let error = db
+        .load("feature", &input, LoadMode::Append)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::ExternalBlobPolicy { ref uri, .. } if uri == &external_uri
+        ),
+        "default deny must return typed ExternalBlobPolicy, got {error:?}"
+    );
+    assert_lazy_external_blob_rejection_is_effect_free(
+        &db,
+        graph_dir.path(),
+        "node:Document",
+        &table_uri,
+        before_manifest,
+        before_table,
+        before_head,
+        "default-deny external source",
+    )
+    .await;
+
+    let base_uri = url::Url::from_directory_path(external_dir.path())
+        .expect("external blob base is absolute")
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
+    let db = db.with_external_blob_policy(policy.clone()).unwrap();
+
+    let missing_uri = url::Url::from_file_path(external_dir.path().join("missing.blob"))
+        .expect("missing external blob path is absolute")
+        .to_string();
+    let missing_input = serde_json::json!({
+        "type": "Document",
+        "data": {
+            "title": "missing",
+            "content": missing_uri.clone(),
+        }
+    })
+    .to_string();
+    let error = db
+        .load("feature", &missing_input, LoadMode::Append)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::ExternalBlobSource { ref uri, .. } if uri == &missing_uri
+        ),
+        "an allowed missing object must return typed ExternalBlobSource, got {error:?}"
+    );
+    assert_lazy_external_blob_rejection_is_effect_free(
+        &db,
+        graph_dir.path(),
+        "node:Document",
+        &table_uri,
+        before_manifest,
+        before_table,
+        before_head,
+        "missing allowed external source",
+    )
+    .await;
+
+    let oversized_probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        oversized_probes.clone(),
+        db.load("feature", &input, LoadMode::Append),
+    )
+    .await;
     let error = result.unwrap_err();
     assert!(
         matches!(
@@ -391,6 +517,11 @@ node Document {
             } if resource == "materialized external blob payload bytes" && actual == LIMIT + 1
         ),
         "oversized external blob must be rejected from metadata before payload read, got {error:?}"
+    );
+    assert_eq!(
+        oversized_probes.external_blob_payload_read_calls(),
+        0,
+        "oversized external payload must not be read"
     );
 
     #[cfg(target_os = "linux")]
@@ -414,37 +545,245 @@ node Document {
         );
     }
 
-    let after = snapshot_branch(&db, "feature").await.unwrap();
-    assert_eq!(after.version(), before_manifest);
-    assert_eq!(
-        after.entry("node:Document").unwrap().table_version,
-        before_table
-    );
-    assert_eq!(
-        after.entry("node:Document").unwrap().table_branch,
-        None,
-        "rejection must not publish a deferred table fork"
-    );
-    let after_dataset = Dataset::open(&table_uri).await.unwrap();
-    assert_eq!(
-        after_dataset.version().version,
+    assert_lazy_external_blob_rejection_is_effect_free(
+        &db,
+        graph_dir.path(),
+        "node:Document",
+        &table_uri,
+        before_manifest,
+        before_table,
         before_head,
-        "oversized external blob must fail before a Lance table effect"
+        "oversized allowed external source",
+    )
+    .await;
+
+    // The copy ceiling belongs to the graph operation, not to each table.
+    // Two individually valid sources selected for different tables must be
+    // rejected from metadata before either payload is read or either lazy
+    // table ref is created.
+    let document_path = external_dir.path().join("document-half.blob");
+    let attachment_path = external_dir.path().join("attachment-half.blob");
+    for path in [&document_path, &attachment_path] {
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(LIMIT / 2 + 1).unwrap();
+    }
+    let document_uri = url::Url::from_file_path(&document_path)
+        .expect("external document path is absolute")
+        .to_string();
+    let attachment_uri = url::Url::from_file_path(&attachment_path)
+        .expect("external attachment path is absolute")
+        .to_string();
+    let cumulative_input = format!(
+        "{}\n{}",
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "half", "content": document_uri},
+        }),
+        serde_json::json!({
+            "type": "Attachment",
+            "data": {"name": "half", "payload": attachment_uri},
+        })
     );
+    let cumulative_before = snapshot_branch(&db, "feature").await.unwrap();
+    let attachment_entry = cumulative_before.entry("node:Attachment").unwrap();
+    let attachment_table = attachment_entry.table_version;
+    let attachment_table_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        attachment_entry.table_path.trim_start_matches('/')
+    );
+    let attachment_head = Dataset::open(&attachment_table_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let error = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.load("feature", &cumulative_input, LoadMode::Append),
+    )
+    .await
+    .unwrap_err();
     assert!(
-        !after_dataset
-            .list_branches()
-            .await
-            .unwrap()
-            .contains_key("feature"),
-        "oversized first touch must fail before creating the native feature ref"
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: LIMIT,
+                actual,
+            } if resource == "materialized external blob payload bytes" && actual == LIMIT + 2
+        ),
+        "cross-table external payloads must share one operation budget, got {error:?}"
     );
-    assert_eq!(count_rows_branch(&db, "feature", "node:Document").await, 0);
-    let recovery_dir = graph_dir.path().join("__recovery");
-    assert!(
-        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
-        "oversized external blob must fail before writing a recovery sidecar"
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        0,
+        "aggregate admission must finish before either payload read"
     );
+    assert_eq!(
+        probes.external_blob_payload_read_calls(),
+        0,
+        "aggregate admission must finish before either external payload read"
+    );
+    assert_lazy_external_blob_rejection_is_effect_free(
+        &db,
+        graph_dir.path(),
+        "node:Document",
+        &table_uri,
+        before_manifest,
+        before_table,
+        before_head,
+        "cross-table aggregate external source",
+    )
+    .await;
+    assert_lazy_external_blob_rejection_is_effect_free(
+        &db,
+        graph_dir.path(),
+        "node:Attachment",
+        &attachment_table_uri,
+        before_manifest,
+        attachment_table,
+        attachment_head,
+        "cross-table aggregate external source",
+    )
+    .await;
+
+    // The external-reference cell ceiling is an operation-wide source-ingress
+    // bound, not the keyed-row ceiling: it applies to Overwrite too. The exact
+    // 8,192-cell boundary remains legal even though Overwrite is not otherwise
+    // row-capped, while one extra cell split across two individually legal
+    // tables fails before the first HEAD or graph effect.
+    const REFERENCE_LIMIT: usize = 8192;
+    let external_overwrite_input = |document_rows: usize,
+                                    attachment_rows: usize,
+                                    key_prefix: &str| {
+        let mut data =
+            String::with_capacity((document_rows + attachment_rows) * (external_uri.len() + 96));
+        for row in 0..document_rows {
+            writeln!(
+                data,
+                "{}",
+                serde_json::json!({
+                    "type": "Document",
+                    "data": {
+                        "title": format!("{key_prefix}-document-{row}"),
+                        "content": external_uri,
+                    }
+                })
+            )
+            .unwrap();
+        }
+        for row in 0..attachment_rows {
+            writeln!(
+                data,
+                "{}",
+                serde_json::json!({
+                    "type": "Attachment",
+                    "data": {
+                        "name": format!("{key_prefix}-attachment-{row}"),
+                        "payload": external_uri,
+                    }
+                })
+            )
+            .unwrap();
+        }
+        data
+    };
+
+    let exact_graph = tempfile::tempdir().unwrap();
+    let exact = Omnigraph::init(exact_graph.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy.clone())
+        .unwrap();
+    let exact_input = external_overwrite_input(REFERENCE_LIMIT, 0, "exact");
+    let exact_probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    omnigraph::instrumentation::with_merge_write_probes(
+        exact_probes.clone(),
+        exact.load("main", &exact_input, LoadMode::Overwrite),
+    )
+    .await
+    .expect("Overwrite must admit exactly 8,192 external URI cells");
+    assert_eq!(
+        exact_probes.external_blob_probe_inputs(),
+        REFERENCE_LIMIT as u64
+    );
+    assert_eq!(
+        exact_probes.external_blob_probe_calls(),
+        1,
+        "normalized-equivalent exact-limit cells must share one HEAD"
+    );
+    assert_eq!(
+        exact_probes.external_blob_payload_read_calls(),
+        0,
+        "Overwrite retains admitted descriptors and must not copy payloads"
+    );
+    assert_eq!(count_rows(&exact, "node:Document").await, REFERENCE_LIMIT);
+
+    let overflow_graph = tempfile::tempdir().unwrap();
+    let overflow = Omnigraph::init(overflow_graph.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
+    overflow.branch_create("feature").await.unwrap();
+    let overflow_before = snapshot_branch(&overflow, "feature").await.unwrap();
+    let overflow_manifest = overflow_before.version();
+    let mut overflow_tables = Vec::new();
+    for table_key in ["node:Document", "node:Attachment"] {
+        let entry = overflow_before.entry(table_key).unwrap();
+        let table_uri = format!(
+            "{}/{}",
+            overflow.uri().trim_end_matches('/'),
+            entry.table_path.trim_start_matches('/')
+        );
+        overflow_tables.push((
+            table_key,
+            table_uri.clone(),
+            entry.table_version,
+            Dataset::open(&table_uri).await.unwrap().version().version,
+        ));
+    }
+    let overflow_input =
+        external_overwrite_input(REFERENCE_LIMIT / 2, REFERENCE_LIMIT / 2 + 1, "overflow");
+    let overflow_probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let error = omnigraph::instrumentation::with_merge_write_probes(
+        overflow_probes.clone(),
+        overflow.load("feature", &overflow_input, LoadMode::Overwrite),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        OmniError::ResourceLimitExceeded {
+            ref resource,
+            limit,
+            actual,
+        } if resource == "external Blob reference cells"
+            && limit == REFERENCE_LIMIT as u64
+            && actual == REFERENCE_LIMIT as u64 + 1
+    ));
+    assert_eq!(
+        overflow_probes.external_blob_probe_inputs(),
+        0,
+        "cell-count refusal must precede preflight admission"
+    );
+    assert_eq!(overflow_probes.external_blob_probe_calls(), 0);
+    assert_eq!(overflow_probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(overflow_probes.blob_payload_read_calls(), 0);
+    for (table_key, table_uri, before_table, before_head) in overflow_tables {
+        assert_lazy_external_blob_rejection_is_effect_free(
+            &overflow,
+            overflow_graph.path(),
+            table_key,
+            &table_uri,
+            overflow_manifest,
+            before_table,
+            before_head,
+            "cross-table Overwrite external-cell overflow",
+        )
+        .await;
+    }
 }
 
 /// N handles inserting the same id have exactly one winner and every loser is

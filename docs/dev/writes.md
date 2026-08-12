@@ -91,6 +91,22 @@ Mutation and load use a closed prepare → effect → publish attempt:
    earlier effect or ambiguous ownership leaves the sidecar authoritative and
    returns `RecoveryRequired`.
 
+Every new external Blob URI first passes the immutable graph-level
+`ExternalBlobPolicy`; the default is deny. New logical Mutation/Load input and
+every row-writing BranchMerge build one operation-wide admission plan. Scalar
+table preparation may already have produced temporary inputs; the promised
+boundary is that URI admission completes before any external payload read,
+recovery arm, target HEAD or branch-ref movement, or graph-visible effect.
+Admitted URIs are normalized, equivalent spellings share one metadata probe,
+and every logical cell is charged at full size. A predicate mutation that
+carries already-persisted external descriptors discovers them through its
+bounded materialization scan instead; aliases share one probe within each scan
+batch and may be probed again in a later batch, while the graph's object-store
+registry remains shared. Payload reuse is likewise bounded to one prepared
+table batch or merge chunk rather than cached for the operation's lifetime.
+Policy failures and missing or unreadable sources are typed and remain
+pre-arm/no-effect.
+
 Keyed StrictInsert/Upsert has one additional Phase-A blob rule. Lance's
 `MergeInsertBuilder` has no `WriteParams` hook, so it cannot set
 `allow_external_blob_outside_bases`. Before staging, the adapter sums external
@@ -118,7 +134,7 @@ filter are requested semantics.
 
 The minting check binds the certificate to the exact parent `read_version`,
 nonempty UUID, exact physical `id` field filter, `RewriteRows` mode, no removed
-or updated fragments, no modified fields, no merged generations, no updated
+or updated fragments, no modified fields, no `compacted_sstables`, no updated
 offsets, and at least one new fragment. It also requires
 `fields_for_preserving_frag_bitmap` to equal the table schema's complete nested
 preorder of field IDs and requires every new fragment's `physical_rows` total
@@ -426,23 +442,32 @@ Three writers have been migrated onto staged primitives:
   `optimize_indices` pass — an inline-commit residual, not a staged write (Lance
   exposes no uncommitted index-optimize), covered by the optimize recovery
   sidecar (see [maintenance.md](../user/operations/maintenance.md)).
-* **branch merge** (`exec/merge.rs`) — all keyed new and changed rows are
-  buffered into actual chunks capped at 8,192 rows and 32 MiB; strict new-row
-  chunks use `stage_keyed_write(StrictInsert)` and changed-row chunks use
-  `stage_keyed_write(Upsert)`, all in one pre-minted recovery chain. The narrow
-  complete-certificate route instead gives each source-interval chunk an
+* **branch merge** (`exec/merge.rs`) — the general adopt route buffers keyed new
+  and changed rows into separate actual chunks capped at 8,192 rows and 32 MiB.
+  New-row chunks use `stage_keyed_write(StrictInsert)`; changed-row chunks were
+  already proven present by the ordered classifier and use the insertion-closed
+  `stage_keyed_write(KnownPresentUpdate)`. A true three-way rewrite instead
+  combines its constructive new/changed rows through
+  `stage_keyed_write(Upsert)`. All of these run in one pre-minted recovery chain.
+  The narrow complete-certificate route gives each source-interval chunk an
   internal `ProvenInsertChunk` and calls `stage_proven_strict_insert`; that
-  adapter skips the target probe/join while still emitting the same filtered,
-  certified `Update`. A row above 32 MiB—including cumulative materialized blob
+  adapter skips the target probe/join while still emitting a filtered,
+  certified `Update`. Insertion-capable StrictInsert/Upsert and the proven
+  adapter carry exact-`id` filters. KnownPresentUpdate is update-only: Lance's
+  indexed v1 route may omit `inserted_rows_filter` and fences OCC with
+  `affected_rows`, while its uncovered v2 fallback carries the empty exact-`id`
+  insertion filter. A row above 32 MiB—including cumulative materialized blob
   payloads—or a per-table chain above 1,024 data transactions fails before arm.
   Deleted IDs form exact escaped-filter chunks capped at 8,192 IDs and 32 MiB
   of filter text; the whole retained delete plan is separately capped at 32
-  MiB, and every delete chunk consumes one of those 1,024 transactions.
-  Both modes produce exact-`id` filters and then use `commit_staged`; deletes
-  use `stage_delete` + `commit_staged` (MR-A). Bare Lance Append and the generic
-  merge-insert helper are test-only; the proven adapter's temporary
-  `InsertBuilder` Append descriptor is replaced before commit. The chunk chain
-  is physical only: it has one v9 sidecar and one final graph publish, so a
+  MiB, and every delete chunk consumes one of those 1,024 transactions. Every
+  keyed chunk then uses `commit_staged`; deletes use `stage_delete` +
+  `commit_staged` (MR-A). Bare Lance Append and the generic merge-insert helper
+  are test-only; the proven adapter's temporary `InsertBuilder` Append
+  descriptor is replaced before commit. Branch merge stages no BTREE, FTS, or
+  vector-index artifacts inline; `ensure_indices` / `optimize` reconcile that
+  derived coverage after logical publication. The physical chunk chain has one
+  v9 sidecar and one final graph publish, so a
   later-chunk failure is `RecoveryRequired`, never partial graph visibility.
 * **`schema_apply` rewritten_tables** (`db/omnigraph/schema_apply.rs`)
   — rewrites use `stage_overwrite` + `commit_staged`, including empty-table
@@ -521,7 +546,10 @@ touched table and fail before sidecar arm above 8,192 rows or 32 MiB. Operators
 split larger incremental inputs into separate graph commits; initial bulk
 replacement uses Overwrite. For Blob values supplied as external URIs, Append
 and Merge copy the referenced payload under the same 32 MiB aggregate pre-read
-ceiling; Overwrite retains the external URI cell as a reference.
+ceiling; Overwrite retains the external URI cell as a reference. Independently
+of those keyed row limits, every Mutation/Load mode—including Overwrite—admits
+at most 8,192 new external-URI cells across the complete multi-table graph
+operation, with a separate 32 MiB retained URI-planning budget before HEAD.
 
 `LoadMode::Overwrite` accumulates
 replacement batches in memory, validates node/edge constraints, referential

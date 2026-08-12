@@ -71,14 +71,39 @@ policies:
     dir
 }
 
-/// Seed a state.json where the graph/schema digests match desired, so query
-/// and policy changes are applicable. Digests are borrowed from the public
-/// validate output; the graph composite is a placeholder that apply converges
-/// as a Derived update.
+/// Historical graph resources omit the policy field, so their composite binds
+/// the default-Deny meaning without a policy marker.
+fn historical_graph_digest(
+    graph_id: &str,
+    schema_digest: Option<&str>,
+    query_digests: &[(&str, &str)],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut input = format!(
+        "graph\0{graph_id}\0schema\0{}\0",
+        schema_digest.unwrap_or_default()
+    );
+    for (name, digest) in query_digests {
+        input.push_str("query\0");
+        input.push_str(name);
+        input.push('\0');
+        input.push_str(digest);
+        input.push('\0');
+    }
+    let digest = Sha256::digest(input.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Seed a state.json where the graph/schema digests are internally consistent,
+/// so query and policy changes are applicable. Desired digests are borrowed
+/// from the public validation output; the graph composite binds the state as it
+/// actually exists before those child resources are applied.
 fn seed_applyable_state(config_dir: &Path) -> BTreeMap<String, String> {
     let validate = validate_config_dir(config_dir);
     assert!(validate.ok, "{:?}", validate.diagnostics);
     let schema_digest = validate.resource_digests["schema.knowledge"].clone();
+    let graph_digest = historical_graph_digest("knowledge", Some(&schema_digest), &[]);
     let state_dir = config_dir.join("__cluster");
     fs::create_dir_all(&state_dir).unwrap();
     fs::write(
@@ -89,7 +114,7 @@ fn seed_applyable_state(config_dir: &Path) -> BTreeMap<String, String> {
   "state_revision": 1,
   "applied_revision": {{
     "resources": {{
-      "graph.knowledge": {{ "digest": "seed" }},
+      "graph.knowledge": {{ "digest": "{graph_digest}" }},
       "schema.knowledge": {{ "digest": "{schema_digest}" }}
     }}
   }}
@@ -641,8 +666,9 @@ async fn seed_approved_delete(dir: &Path) -> String {
 /// the genuine root or its failpoint is never reached.
 async fn seed_approved_delete_with_root(dir: &Path, real_root: bool) -> String {
     let digests = seed_applyable_state(dir);
-    let graph_digest = digests["graph.knowledge"].clone();
     let schema_digest = digests["schema.knowledge"].clone();
+    let graph_digest = historical_graph_digest("knowledge", Some(&schema_digest), &[]);
+    let old_graph_digest = historical_graph_digest("old", Some("4444"), &[]);
     let state_dir = dir.join("__cluster");
     fs::write(
         state_dir.join("state.json"),
@@ -654,7 +680,7 @@ async fn seed_approved_delete_with_root(dir: &Path, real_root: bool) -> String {
     "resources": {{
       "graph.knowledge": {{ "digest": "{graph_digest}" }},
       "schema.knowledge": {{ "digest": "{schema_digest}" }},
-      "graph.old": {{ "digest": "3333" }},
+      "graph.old": {{ "digest": "{old_graph_digest}" }},
       "schema.old": {{ "digest": "4444" }}
     }}
   }}

@@ -419,6 +419,53 @@ pub(crate) fn apply_bearer_token(
     }
 }
 
+/// Typed marker for a 412 graph-commit precondition rejection, carried through
+/// `eyre` so the
+/// `mutate` verb can downcast it and exit with `EXIT_PRECONDITION_FAILED` (4)
+/// instead of the generic failure exit. Holds the full structured error body
+/// for `--json` passthrough.
+#[derive(Debug)]
+pub(crate) struct PreconditionFailedCli {
+    pub(crate) output: ErrorOutput,
+}
+
+impl std::fmt::Display for PreconditionFailedCli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.output.error)
+    }
+}
+
+impl std::error::Error for PreconditionFailedCli {}
+
+/// Build the typed CAS-lost error for the embedded transport, mirroring the
+/// structured body a server would have returned so `--json` output is
+/// transport-uniform. `message` is the engine error's own `Display` text, so
+/// the wording never drifts from the source variant.
+pub(crate) fn precondition_failed_cli(
+    message: String,
+    expected: String,
+    actual: Option<String>,
+) -> PreconditionFailedCli {
+    PreconditionFailedCli {
+        output: ErrorOutput {
+            error: message,
+            code: None,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: Some(omnigraph_api_types::PreconditionFailureOutput {
+                expected,
+                actual,
+            }),
+        },
+    }
+}
+
 pub(crate) async fn remote_json<T: DeserializeOwned>(
     client: &reqwest::Client,
     method: Method,
@@ -426,7 +473,29 @@ pub(crate) async fn remote_json<T: DeserializeOwned>(
     body: Option<Value>,
     bearer_token: Option<&str>,
 ) -> Result<T> {
+    remote_json_with_graph_commit_precondition(client, method, url, body, bearer_token, None).await
+}
+
+/// [`remote_json`] with an optional `Omnigraph-If-Graph-Commit` graph-head
+/// precondition (mutation routes only). A 412 whose body carries
+/// `precondition_failure` surfaces as the typed [`PreconditionFailedCli`].
+pub(crate) async fn remote_json_with_graph_commit_precondition<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    method: Method,
+    url: String,
+    body: Option<Value>,
+    bearer_token: Option<&str>,
+    expected_commit: Option<&str>,
+) -> Result<T> {
     let request = apply_bearer_token(client.request(method, url), bearer_token);
+    let request = if let Some(commit_id) = expected_commit {
+        request.header(
+            omnigraph_api_types::GRAPH_COMMIT_PRECONDITION_HEADER,
+            commit_id,
+        )
+    } else {
+        request
+    };
     let request = if let Some(body) = body {
         request.json(&body)
     } else {
@@ -437,6 +506,9 @@ pub(crate) async fn remote_json<T: DeserializeOwned>(
     let text = response.text().await?;
     if !status.is_success() {
         if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
+            if error.precondition_failure.is_some() {
+                return Err(PreconditionFailedCli { output: error }.into());
+            }
             bail!(error.error);
         }
         bail!("server returned {}: {}", status, text);

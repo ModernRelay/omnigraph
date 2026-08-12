@@ -18,10 +18,10 @@ properties. Similar names such as `_row_id` remain valid.
 
 ## Built-in scalar types
 
-| Scalar | Arrow type |
+| Scalar | Logical / physical representation |
 |---|---|
 | `String` | Utf8 |
-| `Blob` | LargeBinary |
+| `Blob` | Compiler placeholder: LargeBinary; persisted graph column: Lance Blob-v2 (`lance.blob.v2`) on file format V2_2 |
 | `Bool` | Boolean |
 | `I32` / `I64` | Int32 / Int64 |
 | `U32` / `U64` | UInt32 / UInt64 |
@@ -38,13 +38,21 @@ properties. Similar names such as `_row_id` remain valid.
 | Constraint | On | Effect |
 |---|---|---|
 | `@key(p, …)` | node | Primary key; the complete ordered tuple identifies the node and implies indexes on its columns |
-| `@unique(p, …)` | node, edge | Uniqueness across listed columns |
+| `@unique(p, …)` | node, edge | Uniqueness across listed non-Blob columns |
 | `@index(p, …)` | node, edge | Build a scalar (BTREE) index on the columns |
 | `@range(p, min..max)` | node | Numeric range validation (open ranges allowed) |
 | `@check(p, "regex")` | node | Regex pattern validation |
 | `@card(min..max?)` | edge | Edge multiplicity — default `0..*`; `0..1`, `1..1`, `1..*`, etc. |
 
-Edge bodies only allow `@unique` and `@index`.
+Edge bodies only allow `@unique` and `@index`. Blob properties are not eligible
+for `@key`, `@unique`, `@index`, or `@embed`, whether the constraint is written
+on the property or in the type body.
+
+Compatibility note: a v6 graph whose persisted accepted schema predates v0.10
+and contains the formerly accepted body-level `@unique(BlobProperty)` shape can
+still be opened for inspection and export. New init and schema-apply input
+reject that shape; the compatibility reader does not make the constraint
+enforceable. Rebuild the graph with the invalid constraint removed.
 
 ## Annotations
 
@@ -56,8 +64,137 @@ Edge bodies only allow `@unique` and `@index`.
 
 ## Table layout
 
-- Each node type compiles to a table with an `id: Utf8` column plus all declared properties (blob columns are stored as `LargeBinary`); `implements` clauses expand the interface's properties into the node.
+- Each node type compiles to a table with an `id: Utf8` column plus all declared properties; `implements` clauses expand the interface's properties into the node.
 - Each edge type compiles to a table with `id: Utf8, src: Utf8, dst: Utf8` plus the edge's own properties. Edge endpoint types (`from`/`to`) must exist, and edge names are matched case-insensitively.
+
+The compiler uses LargeBinary only as its dependency-free logical placeholder
+for `Blob`. When the engine creates a physical node or edge table, it replaces
+that placeholder with Lance Blob-v2 on explicit file format V2_2. Blob-v2 is a
+descriptor-backed extension column: null is the Arrow parent validity, while a
+non-null zero-length value is a valid empty Blob. Physical placement is
+Lance-owned and is not part of the `.pg` schema contract.
+
+Blob input keeps one JSON spelling across nodes and edges:
+
+- `base64:<payload>` supplies managed bytes owned by the graph;
+- any other string requests an external URI reference.
+
+New external URI ingress is denied by default. Embedded callers must install a
+graph-level `ExternalBlobPolicy` with an exact allowed base; cluster-served
+graphs declare the equivalent per-graph policy in `cluster.yaml`. The policy is
+an additional resource boundary, not a per-request option. It compares
+normalized URI components rather than string prefixes, never permits
+`file://` in server execution, and probes each distinct approved source before
+the write's first durable effect.
+
+The direct-store CLI has no allow-policy source in this phase, so a bare
+`--store`/positional graph open admits managed `base64:` Blob input only. To
+write a new external reference from the CLI, target a cluster server whose
+graph has configured bases; an embedded application can instead install the
+same graph-level policy on its engine builder. There is no command flag that
+weakens the policy for one request.
+
+Write mode determines ownership. Overwrite preserves an approved external URI
+as a caller-owned reference. Strict insert, upsert, append/merge load,
+mutation-update carry, and a HEAD-advancing branch merge that writes rows copy
+approved source bytes into managed Blob storage under the existing 32 MiB
+keyed-write ceiling. A pointer-only branch fast-forward preserves the existing
+descriptor without policy approval or source I/O. Existing stored external
+references remain readable and exportable when new ingress is denied;
+OmniGraph never deletes their target objects.
+
+## Embedded Blob reads
+
+Blob delivery is deliberately separate from `.gq` projection. Embedded Rust
+callers use `Omnigraph::read_blob_at(ReadTarget, BlobCell)` for either a node or
+an edge cell. The selector names the logical entity kind, current accepted type
+and property aliases, and exact logical entity `id`; caller text is matched
+through a typed exact-ID expression, never flattened into SQL. The engine
+resolves one branch or snapshot, the handle's current accepted catalog, and one
+exact table version for the complete call.
+
+For the fail-closed compatibility checks below, the engine may compare current
+branch authority, but only as an admission witness. Row, descriptor, ETag, and
+payload data remain on the immutable selected target and never retarget to live
+branch data.
+
+The result is one of two non-null states:
+
+- managed content exposes its logical length, a strong engine-owned ETag, and a
+  `Send + Sync` `BlobReader`; or
+- external content exposes the stored absolute URI, offset, and optional length
+  without opening, probing, signing, or reading that caller-owned object.
+
+A null cell is typed `NotFound`, not a zero-length payload. A valid empty managed
+Blob has length zero and `read_range(0..0)` succeeds with empty bytes. Managed
+reader ranges are half-open and valid exactly when
+`start <= end <= logical_length`; an empty `logical_length..logical_length` is
+valid. Reversed or out-of-bounds ranges return
+`BlobRangeNotSatisfiable { start, end, length }`. One read returns at most
+`BLOB_READ_RANGE_MAX_BYTES` (4 MiB). A wider in-bounds request returns typed
+`ResourceLimitExceeded` for `Blob read range bytes` before payload I/O, so larger
+values are consumed through consecutive bounded ranges. Malformed persisted
+descriptors return `BlobIntegrity { reason }`, never null or plausible bytes.
+
+Managed ETags are quoted lowercase hex over a stable identity tuple at the exact
+table version plus the exact non-empty `transaction_file` identity stored in
+that immutable opened Lance manifest. They are deliberately
+table-version-granular, so an unrelated write to the same table can change a
+token even when this cell's bytes do not. Exact numeric version plus immutable
+manifest identity prevents branch deletion/recreation from reusing a token
+without widening it to graph-snapshot granularity. A missing or empty witness
+is `BlobIntegrity { reason }`, never a weaker token. External references have no
+ETag because their current bytes are not owned by the graph.
+
+After a pure type rename, the current type alias can still address pre-rename
+table history because stable table/incarnation identity crosses the rename. The
+retired type alias is not accepted. This table-identity binding remains subject
+to the independent physical-name, property-lifetime, and branch-incarnation
+checks below. Property renames are deliberately narrower in Phase 1: a
+pre-rename table version does not expose the current property
+spelling, while the retired spelling is absent from the current catalog. Such a
+historical property read returns `BadRequest`; the engine does not infer by
+column position. Historical property-field crossing is deferred.
+
+Physical user fields newly initialized, added, or schema-rebuilt by 0.10 persist
+their authoritative graph property lifetime as `omnigraph.stable_property_id`
+metadata. Blob reads compare that marker with the current accepted catalog. A
+soft-dropped property re-added under the same name has a different stable ID,
+so its old snapshot is refused with `BadRequest`; Lance field IDs and positions
+are never identity. A
+malformed marker is `BlobIntegrity`.
+
+Existing pre-0.10 v6 fields lack the marker. Schema-preserving Append, Merge,
+and mutation writes retain that unmarked schema. Full-table Overwrite instead
+carries the 0.10 catalog schema and adopts the marker on its replacement fields;
+it does not rewrite older versions. An unmarked field remains readable when the
+selected snapshot points at the exact current physical table entry. An older
+snapshot without the marker fails `BadRequest` with `no persisted
+property-lifetime witness`, because OmniGraph cannot prove that the same
+spelling did not cross a drop/re-add lifetime. This refusal applies even when no
+rename occurred. This is additive field metadata, not a manifest-format bump.
+
+Named-branch reads have a separate incarnation fence. An explicit snapshot's
+reopened manifest must still carry the resolved graph commit, so deleting and
+recreating a named graph ref cannot retarget even an inherited-main table. V6
+entries do not persist Lance's native `BranchIdentifier`, and a manifest e-tag
+is not a sufficient substitute. After opening a table stored on a named native
+branch, OmniGraph cold-rechecks that the selected graph ref still has the
+captured effective head. A raced live read and an older branch-owned snapshot
+therefore return `BadRequest` with `no persisted native-branch incarnation
+witness` rather than retargeting. Genuine main/inherited-main table history
+remains eligible after the graph-snapshot proof; the independent property/schema
+checks still apply.
+
+The returned reader stays on its captured version if a branch advances.
+Deletion of that branch and physical tree reclamation are destructive
+boundaries, like `cleanup`: Phase 1 adds no durable or cross-process live-reader
+lease. A reader never redirects to newer bytes, but an uncached later range may
+fail loudly after reclamation. Quiesce readers before deleting their branch or
+running version GC when they must finish. HTTP Blob delivery and CLI
+`blob get`/`blob stat` are later phases and are not exposed by this engine-only
+slice. The pre-1.0 Lance-returning `Omnigraph::read_blob` method has been removed;
+there is no compatibility wrapper that leaks `BlobFile`.
 
 For a keyed node, `id` is derived from the complete typed `@key` tuple. A
 single-column key keeps its canonical scalar spelling. A composite key is an

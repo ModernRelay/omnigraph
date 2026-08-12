@@ -476,6 +476,7 @@ async fn served_export_process_queue_budget_refuses_then_releases() {
             uri: uri.to_string_lossy().to_string(),
             policy: None,
             embedding: None,
+            external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
             queries: stored_query_registry(&[]),
         });
     }
@@ -569,6 +570,7 @@ rules:
             uri: bad_uri.to_string_lossy().to_string(),
             policy: None,
             embedding: None,
+            external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
             queries: stored_query_registry(&[]),
         },
         omnigraph_server::GraphStartupConfig {
@@ -576,6 +578,7 @@ rules:
             uri: good_uri.to_string_lossy().to_string(),
             policy: None,
             embedding: None,
+            external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
             queries: stored_query_registry(&[]),
         },
     ];

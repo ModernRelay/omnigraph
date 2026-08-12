@@ -19,9 +19,10 @@ mod helpers;
 
 use lance::Dataset;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
-use omnigraph::error::OmniError;
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
+use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
 use helpers::*;
 
@@ -519,6 +520,13 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
         "missing provenance must enter the ordered base/source fallback"
     );
     assert_eq!(probes.stage_append_calls(), 0);
+    assert_eq!(probes.strict_insert_preflight_calls(), 1);
+    assert_eq!(probes.stage_fenced_insert_calls(), 1);
+    assert_eq!(
+        probes.stage_merge_insert_calls(),
+        0,
+        "ordered-diff insert fallback must reuse the join-free StrictInsert adapter"
+    );
     assert_eq!(count_rows(&main, "node:Person").await, base_count + 2);
 
     let recovery_dir = dir.path().join("__recovery");
@@ -526,6 +534,39 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
         !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
         "successful fallback merge must remove its recovery sidecar"
     );
+}
+
+/// When the target still equals the merge base, the ordered adopt classifier
+/// already knows a changed id is present. Publication must use an
+/// update-only keyed stage rather than the insertion-capable general Upsert.
+#[tokio::test]
+async fn changed_only_adopt_uses_known_present_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+    let feature = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    feature
+        .mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+        )
+        .await
+        .unwrap();
+
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+        .await
+        .unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(
+        probes.stage_merge_insert_calls(),
+        0,
+        "known-present adopt updates must not use the insertion-capable general Upsert stage"
+    );
+    assert_eq!(probes.stage_known_present_update_calls(), 1);
+    assert_eq!(probes.stage_known_present_update_rows(), 1);
 }
 
 const WIDE_VALIDATION_SCHEMA: &str = r#"
@@ -726,6 +767,50 @@ async fn fast_forward_merge_defers_vector_index_to_reconciler() {
     assert_eq!(count_rows(&main, "node:Chunk").await, 24);
 }
 
+/// A true three-way merge must follow the same derived-index contract as the
+/// fast-forward path: publish logical rows first and leave physical coverage to
+/// `ensure_indices` / `optimize`.
+#[tokio::test]
+async fn merged_outcome_defers_vector_index_to_reconciler() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = Omnigraph::init(uri, VEC_SCHEMA).await.unwrap();
+    main.branch_create("feature").await.unwrap();
+
+    let mut source_rows = String::new();
+    for i in 0..24 {
+        let vector: Vec<String> = (0..8).map(|j| format!("{}.0", (i + j) % 5)).collect();
+        source_rows.push_str(&format!(
+            "{{\"type\":\"Chunk\",\"data\":{{\"slug\":\"source-{i}\",\"embedding\":[{}]}}}}\n",
+            vector.join(",")
+        ));
+    }
+    let feature = Omnigraph::open(uri).await.unwrap();
+    feature
+        .load("feature", &source_rows, LoadMode::Merge)
+        .await
+        .unwrap();
+    main.load(
+        "main",
+        r#"{"type":"Chunk","data":{"slug":"target-only","embedding":[0,1,2,3,4,5,6,7]}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+        .await
+        .unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(
+        probes.stage_vector_index_calls(),
+        0,
+        "three-way merge must not stage derived vector-index work inline"
+    );
+    assert_eq!(count_rows(&main, "node:Chunk").await, 25);
+}
+
 const BLOB_SCHEMA: &str =
     "node Document {\n  title: String @key\n  content: Blob?\n  note: String?\n}\n";
 const BLOB_INSERT: &str = r#"
@@ -734,11 +819,11 @@ query insert_doc($title: String, $content: Blob, $note: String) {
 }
 "#;
 
-/// A fast-forward merge of a branch with a Blob column exercises the blob
-/// fallback in `scan_stream_for_rewrite` (materialize → re-stream) through the
-/// streaming fenced insert. main is NOT mutated, so Document is
-/// `AdoptWithDelta`, not `RewriteMerged`. The blob bytes must survive the
-/// materialize → stream → keyed-write round-trip.
+/// A provenance-proven fast-forward must keep the pure-insert route even when
+/// the table has a Blob column. Descriptor classification may inspect only the
+/// proven source interval; it must not restore the general base/source ordered
+/// diff that RFC-023's certificate discharged. The Blob bytes still have to
+/// survive the interval scan → streaming fenced-write round-trip.
 #[tokio::test]
 async fn fast_forward_merge_streams_blob_columns() {
     use omnigraph::loader::{LoadMode, load_jsonl};
@@ -771,15 +856,196 @@ async fn fast_forward_merge_streams_blob_columns() {
     .await
     .unwrap();
 
-    let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
-
-    // The new blob row's bytes survive the streaming keyed write; the base row stays intact.
-    let readme = main
-        .read_blob("Document", "readme", "content")
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(&readme.read().await.unwrap()[..], b"Hello");
-    let seed = main.read_blob("Document", "seed", "content").await.unwrap();
-    assert_eq!(&seed.read().await.unwrap()[..], b"Seed");
+    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(probes.stage_fenced_insert_calls(), 1);
+    assert_eq!(probes.stage_fenced_insert_rows(), 1);
+    assert_eq!(probes.stage_merge_insert_calls(), 0);
+    assert_eq!(probes.stage_known_present_update_calls(), 0);
+    assert_eq!(
+        probes.strict_insert_preflight_calls(),
+        0,
+        "the complete source certificate must discharge the target absence preflight"
+    );
+    assert_eq!(
+        probes.ordered_cursor_scan_calls(),
+        0,
+        "Blob descriptor classification must not pull a proven insert interval back through the general base/source diff"
+    );
+    assert_eq!(probes.stage_append_calls(), 0);
+    assert_eq!(
+        probes.stage_vector_index_calls(),
+        0,
+        "branch merge must leave derived index coverage to the reconciler"
+    );
+
+    // The new blob row's bytes survive the streaming keyed write; the base row stays intact.
+    let readme = read_managed_blob_bytes(
+        &main,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "readme", "content"),
+    )
+    .await;
+    assert_eq!(&readme[..], b"Hello");
+    let seed = read_managed_blob_bytes(
+        &main,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "seed", "content"),
+    )
+    .await;
+    assert_eq!(&seed[..], b"Seed");
+}
+
+/// A Blob-bearing general fast-forward classifies an existing id as changed,
+/// so publication must use the update-only keyed stage introduced by #481.
+/// Overwrite retains the admitted external descriptor on the source branch;
+/// merge owns the copied bytes while leaving unchanged valid-empty and null
+/// siblings distinct.
+#[tokio::test]
+async fn blob_changed_only_adopt_uses_known_present_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_path = external_dir.path().join("changed.txt");
+    std::fs::write(&external_path, b"Changed externally").unwrap();
+    let external_uri = url::Url::from_file_path(std::fs::canonicalize(&external_path).unwrap())
+        .expect("external Blob path is absolute")
+        .to_string();
+    let empty_path = external_dir.path().join("valid-empty.txt");
+    std::fs::write(&empty_path, b"").unwrap();
+    let empty_uri = url::Url::from_file_path(std::fs::canonicalize(&empty_path).unwrap())
+        .expect("empty external Blob path is absolute")
+        .to_string();
+    let external_base = url::Url::from_directory_path(external_dir.path())
+        .expect("external Blob base is absolute")
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(external_base, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
+
+    let main = Omnigraph::init(uri, BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy.clone())
+        .unwrap();
+    let base_data = [
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "changed", "content": "base64:QmFzZQ==", "note": "base"},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "valid-empty", "content": empty_uri.clone(), "note": "empty"},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "null", "content": null, "note": "null"},
+        }),
+    ]
+    .into_iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    main.load("main", &base_data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    main.branch_create("feature").await.unwrap();
+
+    let feature = Omnigraph::open(uri)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy.clone())
+        .unwrap();
+    let source_data = [
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "changed", "content": external_uri, "note": "source"},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "valid-empty", "content": empty_uri.clone(), "note": "empty"},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "null", "content": null, "note": "null"},
+        }),
+    ]
+    .into_iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    feature
+        .load("feature", &source_data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let merger = Omnigraph::open(uri)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), merger.branch_merge("feature", "main"))
+        .await
+        .unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(probes.stage_known_present_update_calls(), 1);
+    assert_eq!(probes.stage_known_present_update_rows(), 1);
+    assert_eq!(probes.stage_merge_insert_calls(), 0);
+    assert_eq!(probes.stage_fenced_insert_calls(), 0);
+    assert_eq!(probes.strict_insert_preflight_calls(), 0);
+    assert_eq!(
+        probes.stage_vector_index_calls(),
+        0,
+        "general Blob adoption must also defer derived index work"
+    );
+    assert_eq!(
+        probes.external_blob_probe_inputs(),
+        1,
+        "only the changed external descriptor belongs to the adopt delta"
+    );
+    assert_eq!(probes.external_blob_probe_calls(), 1);
+    assert_eq!(probes.external_blob_payload_read_calls(), 1);
+
+    assert_eq!(count_rows(&merger, "node:Document").await, 3);
+    let changed = read_managed_blob_bytes(
+        &merger,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "changed", "content"),
+    )
+    .await;
+    assert_eq!(&changed[..], b"Changed externally");
+
+    let empty = merger
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "valid-empty", "content"),
+        )
+        .await
+        .unwrap();
+    let BlobContent::External(empty) = empty.content else {
+        panic!("an unchanged retained descriptor must stay pointer-only");
+    };
+    assert_eq!(empty.uri, empty_uri);
+    assert_eq!(empty.offset, 0);
+    assert_eq!(empty.length, None);
+
+    let null = merger
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "null", "content"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            null,
+            OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::NotFound
+        ),
+        "an unchanged null Blob must remain null rather than becoming valid-empty: {null:?}"
+    );
 }

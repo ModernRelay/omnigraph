@@ -5,7 +5,7 @@ use std::env;
 use std::fs;
 use std::sync::Arc;
 
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
@@ -387,7 +387,15 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_uses_resolved_branch_for_snapshot_reads() {
-    let temp = init_loaded_graph().await;
+    let schema = fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("    age: I32?", "    age: I32?\n    avatar: Blob?");
+    let data = format!(
+        "{}\n{}",
+        fs::read_to_string(fixture("test.jsonl")).unwrap(),
+        r#"{"type":"Person","data":{"name":"Blob Reader","avatar":"base64:QXV0aG9yaXplZA=="}}"#
+    );
+    let temp = init_graph_with_schema_and_data(&schema, &data).await;
     let graph = graph_path(temp.path());
     let snapshot_id = {
         let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
@@ -397,7 +405,10 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
     fs::write(&policy_path, POLICY_PROTECTED_READ_YAML).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
         graph.to_string_lossy().to_string(),
-        vec![("act-bruno".to_string(), "team-token".to_string())],
+        vec![
+            ("act-bruno".to_string(), "team-token".to_string()),
+            ("act-denied".to_string(), "denied-token".to_string()),
+        ],
         Some(&policy_path),
     )
     .await
@@ -409,7 +420,7 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
         query_name: Some("get_person".to_string()),
         params: Some(json!({ "name": "Alice" })),
         branch: None,
-        snapshot: Some(snapshot_id),
+        snapshot: Some(snapshot_id.clone()),
     };
     let (status, body) = json_response(
         &app,
@@ -430,6 +441,59 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
         read.snapshot.as_deref()
     );
     assert_eq!(body["row_count"], 1);
+
+    let blob_uri = g(&format!(
+        "/blob?entity=node&type=Person&id=Blob%20Reader&property=avatar&snapshot={snapshot_id}"
+    ));
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&blob_uri)
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&blob_uri)
+                .method(Method::GET)
+                .header("authorization", "Bearer denied-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let allowed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&blob_uri)
+                .method(Method::GET)
+                .header("authorization", "Bearer team-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+    assert_eq!(
+        allowed.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+    assert_eq!(
+        &to_bytes(allowed.into_body(), usize::MAX).await.unwrap()[..],
+        b"Authorized"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -239,6 +239,10 @@ pub struct MergeWriteProbes {
     pub stage_append_rows: Arc<AtomicU64>,
     pub stage_merge_insert_calls: Arc<AtomicU64>,
     pub stage_merge_insert_rows: Arc<AtomicU64>,
+    /// Update-only keyed stages whose ids were proven present by merge
+    /// classification. Kept separate from insertion-capable Upsert.
+    pub stage_known_present_update_calls: Arc<AtomicU64>,
+    pub stage_known_present_update_rows: Arc<AtomicU64>,
     /// Strict-insert transactions that write new fragments directly and carry
     /// Lance's inserted-row key filter without running a target merge join.
     pub stage_fenced_insert_calls: Arc<AtomicU64>,
@@ -259,6 +263,16 @@ pub struct MergeWriteProbes {
     /// oversized descriptor is rejected from `BlobFile::size()` before the
     /// payload allocation/read begins.
     pub blob_payload_read_calls: Arc<AtomicU64>,
+    /// Payload reads issued against external sources specifically. Unlike the
+    /// aggregate Blob counter, this excludes managed Lance `BlobFile::read`
+    /// calls so normalized-alias GET deduplication is directly observable.
+    pub external_blob_payload_read_calls: Arc<AtomicU64>,
+    /// External Blob cells presented to one operation-wide preflight and the
+    /// distinct normalized object metadata probes that preflight performed.
+    /// Their difference is the observable de-duplication contract: repeated
+    /// cells and equivalent URI spellings must not create one HEAD per row.
+    pub external_blob_probe_inputs: Arc<AtomicU64>,
+    pub external_blob_probe_calls: Arc<AtomicU64>,
     /// Ordered branch-merge cursor scans and the exact per-batch limits they
     /// requested. These make the production row/byte scanner configuration a
     /// structural test assertion instead of an inferred memory claim.
@@ -295,6 +309,13 @@ impl MergeWriteProbes {
     pub fn stage_merge_insert_rows(&self) -> u64 {
         self.stage_merge_insert_rows.load(Ordering::Relaxed)
     }
+    pub fn stage_known_present_update_calls(&self) -> u64 {
+        self.stage_known_present_update_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn stage_known_present_update_rows(&self) -> u64 {
+        self.stage_known_present_update_rows.load(Ordering::Relaxed)
+    }
     pub fn stage_fenced_insert_calls(&self) -> u64 {
         self.stage_fenced_insert_calls.load(Ordering::Relaxed)
     }
@@ -312,6 +333,16 @@ impl MergeWriteProbes {
     }
     pub fn blob_payload_read_calls(&self) -> u64 {
         self.blob_payload_read_calls.load(Ordering::Relaxed)
+    }
+    pub fn external_blob_payload_read_calls(&self) -> u64 {
+        self.external_blob_payload_read_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn external_blob_probe_inputs(&self) -> u64 {
+        self.external_blob_probe_inputs.load(Ordering::Relaxed)
+    }
+    pub fn external_blob_probe_calls(&self) -> u64 {
+        self.external_blob_probe_calls.load(Ordering::Relaxed)
     }
     pub fn ordered_cursor_scan_calls(&self) -> u64 {
         self.ordered_cursor_scan_calls.load(Ordering::Relaxed)
@@ -420,6 +451,17 @@ pub(crate) fn record_stage_merge_insert(rows: u64) {
     });
 }
 
+/// Record one update-only keyed stage whose ids were proven present by merge
+/// classification. No-op when no test or benchmark probe is installed.
+pub(crate) fn record_stage_known_present_update(rows: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.stage_known_present_update_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.stage_known_present_update_rows
+            .fetch_add(rows, Ordering::Relaxed);
+    });
+}
+
 /// Record one join-free, filter-bearing strict insert of `rows` rows against
 /// the active probes. This is distinct from `stage_merge_insert`: both commit
 /// a fenced Lance `Operation::Update`, but only the latter runs a target join.
@@ -453,6 +495,33 @@ pub(crate) fn record_stage_vector_index() {
 pub(crate) fn record_blob_payload_read() {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.blob_payload_read_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one external object payload read. Call this alongside the aggregate
+/// Blob read probe at the exact object-store request site.
+pub(crate) fn record_external_blob_payload_read() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.external_blob_payload_read_calls
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record the URI-bearing cells accepted by one bounded external-Blob
+/// admission pass. No-op unless a focused test or benchmark installed probes.
+pub(crate) fn record_external_blob_preflight_inputs(inputs: usize) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.external_blob_probe_inputs
+            .fetch_add(inputs as u64, Ordering::Relaxed);
+    });
+}
+
+/// Record one metadata request actually issued for a normalized external Blob
+/// object. Counting at the request site keeps fail-fast concurrent preflights
+/// from reporting planned-but-never-polled probes.
+pub(crate) fn record_external_blob_probe() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.external_blob_probe_calls.fetch_add(1, Ordering::Relaxed);
     });
 }
 

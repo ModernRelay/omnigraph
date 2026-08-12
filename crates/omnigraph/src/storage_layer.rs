@@ -55,7 +55,9 @@ use lance::dataset::{WhenMatched, WhenNotMatched};
 
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::{OmniError, Result};
-use crate::table_store::{StagedTransactionIdentity, StagedWrite, TableState, TableStore};
+use crate::table_store::{
+    ExternalBlobPreflight, StagedTransactionIdentity, StagedWrite, TableState, TableStore,
+};
 
 /// One fenced merge chunk is bounded in both rows and materialized Arrow
 /// bytes. The byte ceiling bounds the staging adapter; the row ceiling
@@ -68,12 +70,14 @@ pub(crate) const KEYED_WRITE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Resource budget for a pending-aware keyed scan that will feed one mutation
 /// table transaction.
 ///
-/// `initial_*` accounts for batches the mutation has already accumulated on
-/// this table.  A later `update` allocates another full-row batch before the
+/// `initial_rows` accounts for batches already accumulated on this table;
+/// `initial_bytes` accounts for every table already retained by the graph
+/// mutation. A later `update` allocates another full-row batch before the
 /// end-of-query dedupe, so its matched committed/pending view must fit in the
-/// *remaining* table budget rather than receiving a fresh 8,192-row / 32-MiB
-/// allowance.  Keeping this value on the sealed storage boundary makes the
-/// bounded streaming scan part of the only production read-modify-write path.
+/// remaining operation byte budget rather than receiving a fresh 32-MiB
+/// allowance per table. Keeping this value on the sealed storage boundary
+/// makes the bounded streaming scan part of the only production
+/// read-modify-write path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingScanBudget {
     pub(crate) table_key: String,
@@ -143,6 +147,10 @@ pub enum KeyedWriteSemantics {
     StrictInsert,
     /// Insert new ids and replace the full row for ids already present.
     Upsert,
+    /// Replace full rows only for ids already proven present by a coherent
+    /// merge classification. Missing ids are an internal read-set change,
+    /// never inserts.
+    KnownPresentUpdate,
 }
 
 /// One exact chunk admitted to the join-free strict-insert adapter by the
@@ -581,6 +589,28 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         batch: RecordBatch,
     ) -> Result<RecordBatch>;
 
+    /// Authorize and probe the complete operation's distinct external Blob
+    /// sources before any participant writes staged files.
+    async fn preflight_external_blob_uris(&self, uris: &[String]) -> Result<ExternalBlobPreflight>;
+
+    /// Materialize one keyed source batch from an operation-wide preflight
+    /// proof without repeating source HEAD requests.
+    async fn prepare_keyed_write_batch_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch>;
+
+    /// Rewrite retained Overwrite URI cells to the exact normalized targets
+    /// admitted by an operation-wide preflight, without reading payloads.
+    fn prepare_overwrite_blob_references_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch>;
+
     /// Validate the physical key contract shared by every v6 graph-table
     /// write batch: exact Utf8 `id`, no nulls, and no duplicate ids within the
     /// batch. Callers preparing a deferred first-touch or Overwrite plan must
@@ -607,9 +637,11 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// Stage one RFC-023 fenced keyed write from an in-memory batch.
     ///
-    /// This production adapter accepts only the graph `id` key, checks
-    /// that the target dataset declares exactly that unenforced primary key,
-    /// and forces Lance's filter-bearing non-index merge route.
+    /// This production adapter accepts only the graph `id` key and checks that
+    /// the target dataset declares exactly that unenforced primary key.
+    /// Insertion-capable Upsert forces Lance's filter-bearing non-index route;
+    /// known-present update-only staging may use the indexed route because
+    /// `DoNothing` makes insertion structurally unreachable.
     async fn stage_keyed_write(
         &self,
         snapshot: SnapshotHandle,
@@ -660,13 +692,16 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// full-row batches for the existing per-chunk strict keyed writer.
     /// `source` must be pinned at `end_version`; only rows whose
     /// `_row_created_at_version` lies in `(begin_version, end_version]` are
-    /// emitted. This read-only primitive writes no files and advances no HEAD.
+    /// emitted. Blob materialization consumes the caller's operation-wide
+    /// external-source proof, so it never repeats policy checks or HEADs per
+    /// row. This read-only primitive writes no files and advances no HEAD.
     async fn scan_proven_insert_delta_bounded(
         &self,
         source: &SnapshotHandle,
         table_key: &str,
         begin_version: u64,
         end_version: u64,
+        external_preflight: &ExternalBlobPreflight,
     ) -> Result<SendableRecordBatchStream>;
 
     #[cfg(test)]
@@ -1024,6 +1059,31 @@ impl TableStorage for TableStore {
         TableStore::prepare_keyed_write_batch(self, table_key, batch).await
     }
 
+    async fn preflight_external_blob_uris(&self, uris: &[String]) -> Result<ExternalBlobPreflight> {
+        TableStore::preflight_external_blob_uris(self, uris).await
+    }
+
+    async fn prepare_keyed_write_batch_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch> {
+        TableStore::prepare_keyed_write_batch_with_preflight(self, table_key, batch, preflight)
+            .await
+    }
+
+    fn prepare_overwrite_blob_references_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch> {
+        TableStore::prepare_overwrite_blob_references_with_preflight(
+            self, table_key, batch, preflight,
+        )
+    }
+
     fn validate_keyed_write_batch(&self, table_key: &str, batch: &RecordBatch) -> Result<()> {
         TableStore::validate_keyed_write_batch(self, table_key, batch)
     }
@@ -1108,12 +1168,15 @@ impl TableStorage for TableStore {
         table_key: &str,
         begin_version: u64,
         end_version: u64,
+        external_preflight: &ExternalBlobPreflight,
     ) -> Result<SendableRecordBatchStream> {
         TableStore::scan_proven_insert_delta_bounded(
+            self,
             source.dataset(),
             table_key,
             begin_version,
             end_version,
+            external_preflight,
         )
         .await
     }

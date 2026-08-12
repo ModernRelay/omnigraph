@@ -292,7 +292,7 @@ retires the window entirely.** See §5.
 
 ### 1d. The second facet: the write base is a stale pin (no probe)
 The READ path resolves its base behind a freshness probe (`resolve_target_inner`
-omnigraph.rs:~1072 → `probe_latest_incarnation` → `refresh_manifest_only`); the WRITE path
+omnigraph.rs → `probe_latest_incarnation` → `refresh_for_live_read`); the WRITE path
 does NOT (`resolved_branch_target` omnigraph.rs:~778 returns the warm `coord.snapshot()` for
 the bound branch, no probe). So a long-lived server's write base lags the live manifest. That
 single staleness feeds **two distinct failure modes**, both surfaced this cycle:

@@ -12,6 +12,7 @@ use omnigraph::changes::{ChangeFilter, ChangeSet};
 use omnigraph::db::{Omnigraph, ReadTarget, Snapshot, SnapshotId};
 use omnigraph::error::Result;
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, EntityKind};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
 use omnigraph_compiler::result::{MutationResult, QueryResult};
@@ -46,6 +47,56 @@ query insert_person_and_friend($name: String, $age: I32, $friend: String) {
     insert Knows { from: $name, to: $friend }
 }
 "#;
+
+/// Build the graph-level selector used by the dedicated Blob read facade.
+pub fn node_blob_cell(
+    type_name: impl Into<String>,
+    id: impl Into<String>,
+    property: impl Into<String>,
+) -> BlobCell {
+    BlobCell {
+        entity: EntityKind::Node,
+        type_name: type_name.into(),
+        id: id.into(),
+        property: property.into(),
+    }
+}
+
+/// Collect a managed Blob through the public bounded-range reader.
+///
+/// Integration tests use this only for small fixtures, but keeping every read
+/// below the facade's per-call ceiling ensures callers do not accidentally
+/// reintroduce the removed Lance `BlobFile::read()` escape hatch.
+pub async fn read_managed_blob_bytes(
+    db: &Omnigraph,
+    target: impl Into<ReadTarget>,
+    cell: BlobCell,
+) -> Vec<u8> {
+    let read = db
+        .read_blob_at(target.into(), cell)
+        .await
+        .expect("read managed Blob");
+    let BlobContent::Managed { reader, .. } = read.content else {
+        panic!("expected managed Blob content, got external reference");
+    };
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(reader.len()).expect("test Blob length must fit in memory"),
+    );
+    let mut start = 0_u64;
+    while start < reader.len() {
+        let end = start
+            .saturating_add(BLOB_READ_RANGE_MAX_BYTES)
+            .min(reader.len());
+        let chunk = reader
+            .read_range(start..end)
+            .await
+            .expect("read managed Blob range");
+        bytes.extend_from_slice(&chunk);
+        start = end;
+    }
+    bytes
+}
 
 /// A standalone Lance `Session` for tests that construct a `TableStore`
 /// directly (production stores share the graph's per-connection session;
@@ -95,6 +146,44 @@ pub async fn read_table(db: &Omnigraph, table_key: &str) -> Vec<RecordBatch> {
         .try_collect()
         .await
         .unwrap()
+}
+
+/// Assert that physical user fields carry the accepted graph property
+/// lifetime, while Lance plumbing fields do not impersonate graph identity.
+pub async fn assert_stable_property_markers(db: &Omnigraph, table_key: &str) {
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let dataset = snapshot.open(table_key).await.unwrap();
+    let (entity_kind, type_name) = table_key.split_once(':').unwrap();
+    for field in &dataset.schema().fields {
+        let marker = field.metadata.get("omnigraph.stable_property_id");
+        if matches!(field.name.as_str(), "id" | "src" | "dst") {
+            assert!(
+                marker.is_none(),
+                "physical field {table_key}.{} must not carry graph property identity",
+                field.name
+            );
+            continue;
+        }
+
+        let property_id = match entity_kind {
+            "node" => db.catalog().node_property_id(type_name, &field.name),
+            "edge" => db.catalog().edge_property_id(type_name, &field.name),
+            other => panic!("unexpected graph table kind {other}"),
+        }
+        .unwrap_or_else(|| {
+            panic!(
+                "missing graph property identity for {table_key}.{}",
+                field.name
+            )
+        });
+        let expected = property_id.get().to_string();
+        assert_eq!(
+            marker.map(String::as_str),
+            Some(expected.as_str()),
+            "physical user field {table_key}.{} must persist its authoritative graph property lifetime",
+            field.name
+        );
+    }
 }
 
 /// Read all rows from a branch-local sub-table by table_key.

@@ -7,7 +7,7 @@ destructive changes, and recovering from crashes.
 
 It is a **how-to**. The reference for every `cluster.yaml` key, command flag,
 state-file field, and diagnostic code is
-[cluster-config.md](config.md); the HTTP surface is
+[config.md](config.md); the HTTP surface is
 [server.md](../operations/server.md).
 
 ## The model in one paragraph
@@ -238,6 +238,7 @@ applied revision is not safely servable. Each refusal names its remedy:
 | `cluster_recovery_pending` | graph was quarantined because an interrupted operation awaits sweep | run `cluster apply` (or any state-mutating command), restart |
 | `cluster_no_healthy_graphs` | every applied graph is quarantined or failed startup | sweep/fix the graph-specific failures, then restart |
 | `catalog_payload_missing` / `…_digest_mismatch` | catalog blob lost or tampered | `cluster refresh`, then `apply`, restart |
+| `external_blob_policy_digest_mismatch` | graph metadata no longer matches its digest-bound applied record | restore the cluster state ledger from a trusted copy, then retry; do not edit metadata or digests |
 | `policy_bindings_missing` | ledger predates binding metadata | re-run `cluster apply` (backfills), restart |
 | `cluster_empty` | applied revision has no graphs | apply a cluster with ≥1 graph |
 | multiple bundles bind one scope | legacy/tampered state violates the one-bundle-per-scope contract now enforced before apply | merge the rules into one bundle and re-run `cluster apply` |

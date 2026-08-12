@@ -79,6 +79,94 @@ Hybrid example: `order { rrf(nearest($d.embedding, $q), bm25($d.body, $q_text)) 
 - Snapshot isolation per query: all reads inside a query use the same `Snapshot`.
 - Readers and writers on different branches don't block each other.
 
+## Blob cell read facade (`blob.rs` / `db/omnigraph.rs`)
+
+`Omnigraph::read_blob_at` is the engine-owned single-cell read boundary. It
+accepts one `ReadTarget` and one logical node/edge `BlobCell`; the removed
+`Omnigraph::read_blob`/`lance::dataset::BlobFile` surface has no compatibility
+wrapper. Bulk export and row-rewrite paths keep their batched Lance readers and
+share the descriptor decoder—they must not loop over this single-cell facade.
+
+The read sequence is:
+
+1. Resolve the branch or snapshot, capture the handle's current accepted
+   catalog, and bind one exact manifest/table version.
+2. Resolve the current type/property aliases to stable table, incarnation, and
+   property identity. After a pure type rename, the current type alias binds to
+   pre-rename table history through stable table/incarnation identity; the old
+   alias is not retained. Phase 1 does not bridge the current property alias to
+   a differently named physical field in a pre-rename version. That historical
+   read and the retired alias are typed `BadRequest`, never a field-position
+   fallback. The type-alias binding is structural only; the following
+   incarnation and property-lifetime fences remain independent.
+3. Prove the selected physical manifest incarnation. An explicit snapshot's
+   reopened manifest must still carry the resolved commit in its exact
+   graph-head row; this closes same-name/same-version graph-ref ABA even when
+   the table is inherited from main. An entry with a persisted object-store
+   manifest e-tag must still open at that exact e-tag, but the e-tag is not a
+   sufficient table-branch-incarnation witness. V6 does not persist Lance's
+   native `BranchIdentifier` for historical entries, so a named-native-branch
+   table bypasses the held-handle cache and is followed by a cold proof that the
+   selected graph ref's effective head still equals the captured graph commit.
+   The zero-cache control session is used instead of the handle's warm read
+   coordinator. A concurrent branch advance may make a branch-owned read fail
+   loudly rather than retarget; an older branch-owned snapshot fails
+   `BadRequest` with `no persisted native-branch incarnation witness`. Genuine
+   inherited-main history remains eligible after the graph-snapshot proof. The
+   property/schema checks still apply independently.
+4. Validate physical property lifetime. Physical user fields newly initialized,
+   added, or schema-rebuilt by 0.10 carry decimal
+   `omnigraph.stable_property_id` metadata, which must equal the catalog
+   identity; a same-name drop/re-add mismatch is `BadRequest` and malformed
+   metadata is `BlobIntegrity`. Never infer graph identity from Lance field ID
+   or position. Schema-preserving `LoadMode::Append`, `LoadMode::Merge`, and
+   mutation writes retain an unmarked pre-0.10 v6 schema. Full-table
+   `LoadMode::Overwrite` carries the 0.10 catalog schema and adopts the marker
+   on its replacement fields without rewriting older versions. For an unmarked
+   field, an explicit snapshot is admitted only when its complete physical table
+   entry equals the current branch entry; older entries fail `BadRequest` with
+   `no persisted property-lifetime witness`, even when no rename occurred.
+5. Locate physical `id` through a typed `col("id").eq(lit(id))` expression and
+   retain the selected stable row ID. Caller text is never flattened into SQL.
+6. Fetch and centrally decode the persisted Blob-v2 descriptor. Parent Arrow
+   validity is the sole null witness. Malformed shape, kind, child validity, URI,
+   or range becomes `BlobIntegrity { reason }`, not `NotFound`, null, or an
+   opaque Lance string.
+7. Return an external descriptor immediately with zero source-object I/O, or a
+   managed reader bound to the captured table version and row ID.
+
+The current-head reads in steps 3 and 4 are admission witnesses only. Row,
+descriptor, ETag, and payload data always come from the immutable selected
+target; a compatibility check never retargets the read to live branch data.
+
+Managed ETags hash the exact bytes
+`omnigraph/blob-etag/v1\0 || stable_table_id_be || table_incarnation_id_be ||
+stable_property_id_be || table_version_be || stable_row_id_be ||
+manifest_transaction_file_utf8_len_be || manifest_transaction_file_utf8`.
+Every numeric value is a big-endian `u64`; the final bytes are the exact
+non-empty `transaction_file` identity stored in the immutable opened Lance
+manifest, without normalization or a terminator. The public token is the first
+16 SHA-256 bytes as lowercase hex wrapped in quotes. An unrelated write to the
+same table may therefore change the token even when the cell bytes are
+unchanged. Exact numeric version plus immutable manifest identity closes
+same-version branch delete/recreate ABA without widening the token to graph
+snapshot granularity. A missing or empty witness is `BlobIntegrity { reason }`,
+never a weaker token.
+
+`BlobReader::read_range` uses half-open ranges and accepts exactly
+`start <= end <= len`, including `len..len`. Reversed or out-of-bounds requests
+return `BlobRangeNotSatisfiable { start, end, length }`. Each successful call is
+bounded by `BLOB_READ_RANGE_MAX_BYTES` (4 MiB); a wider in-bounds request returns
+`ResourceLimitExceeded` for `Blob read range bytes` before payload I/O. Larger
+values are pulled through consecutive calls, so this public boundary has no
+unbounded `read_all` route.
+
+Branch advance cannot retarget an already-returned reader. Branch deletion and
+physical tree reclamation are destructive boundaries, like cleanup: Phase 1
+adds no durable/cross-process reader lease. The reader never retargets, but an
+uncached later range may fail loudly after reclamation. It can never produce
+newer or partial plausible bytes.
+
 ## Mutation execution (`exec/mutation.rs`)
 
 Resolves expression values to literals, converts to typed Arrow arrays (`literal_to_typed_array(lit, DataType, num_rows)`), then writes via Lance's two-phase distributed-write API at end-of-query. Before lowering/execution, one `WriteTxn` captures the target's Lance-native branch identity, exact optional graph head, accepted schema identity/catalog, and base table snapshot; every step in the attempt uses that immutable authority.
@@ -183,13 +271,13 @@ sequenceDiagram
 - Per-mutation orchestration: `mutate_with_current_actor` at `crates/omnigraph/src/exec/mutation.rs`
 - D₂ check: `enforce_no_mixed_destructive_constructive` (in the same file)
 - Per-op execution: `execute_insert`, `execute_update`, `execute_delete_node`, `execute_delete_edge`
-- Pending-aware reads: `TableStore::scan_with_pending` / `count_rows_with_pending` at `crates/omnigraph/src/table_store.rs`
-- Edge cardinality with pending: `validate_edge_cardinality_with_pending` at `crates/omnigraph/src/exec/mutation.rs`
+- Pending-aware reads: `TableStore::scan_with_pending` / `count_rows_with_staged` at `crates/omnigraph/src/table_store.rs`
+- Edge cardinality with pending: the unified evaluator in `crates/omnigraph/src/validate.rs` (`open_cardinality` / `evaluate_cardinality`), shared by mutation, load, and merge
 - Per-query accumulator and protocol adapter: `crates/omnigraph/src/exec/staging.rs` (`MutationStaging::stage_all`, `StagedMutation::commit_all`)
-- End-of-query Lance operations: `TableStore::stage_keyed_write`, `stage_overwrite`, `stage_delete`, and `commit_staged` at `crates/omnigraph/src/table_store.rs`. BranchMerge separately feeds actual new/changed chunks capped at 8,192 rows / 32 MiB through a pre-minted keyed chain of at most 1,024 logical data transactions per table; exact recovery scans at most 1,026 versions to reserve one index tail and one restore. When every link in a complete insertion-only source interval carries and structurally satisfies v1, its opaque `ProvenInsertChunk` route uses `stage_proven_strict_insert`: no target-ID preflight or target merge join. Public Lance `InsertBuilder` stages only fragment files; its uncommitted Append descriptor is replaced by another filtered, certified `Update`, so no Append is committed and a second branch generation remains provable. Source and existing-target native incarnations are revalidated under the final gates. A first-touch lazy target keeps the ref-only fork path; missing/unfamiliar history falls back to the ordered diff. Generic Append/merge-insert helpers are test-only.
+- End-of-query Lance operations: `TableStore::stage_keyed_write`, `stage_overwrite`, `stage_delete`, and `commit_staged` at `crates/omnigraph/src/table_store.rs`. BranchMerge separately feeds actual new/changed chunks capped at 8,192 rows / 32 MiB through a pre-minted keyed chain of at most 1,024 logical data transactions per table; exact recovery scans at most 1,026 versions to reserve backward-compatible headroom for one legacy index tail and one restore. Current merges build no indexes inline. When every link in a complete insertion-only source interval carries and structurally satisfies v1, its opaque `ProvenInsertChunk` route uses `stage_proven_strict_insert`: no target-ID preflight or target merge join. Public Lance `InsertBuilder` stages only fragment files; its uncommitted Append descriptor is replaced by another filtered, certified `Update`, so no Append is committed and a second branch generation remains provable. Source and existing-target native incarnations are revalidated under the final gates. A first-touch lazy target keeps the ref-only fork path; missing/unfamiliar history falls back to the ordered diff. Generic Append/merge-insert helpers are test-only.
 - Manifest commit primitive: `commit_updates_on_branch_with_expected` at `crates/omnigraph/src/db/omnigraph/table_ops.rs` (exact native-branch/head precondition plus expected table versions)
 
-Atomicity guarantee for multi-statement mutations: a mid-query failure leaves Lance HEAD untouched because no effect occurs during statement execution or staging. The RFC-023 adapter fixes the join key to physical `id`, forces pinned Lance's v2 route, and verifies that the emitted transaction filter covers exactly that field. Mutation/Load keeps one keyed transaction per touched table and rejects accumulated strict-insert or upsert input above 8,192 rows or 32 MiB before sidecar arm with typed `ResourceLimitExceeded`. Update predicate results stream into the remaining table budget after pending-key shadowing; blob sizes are checked before payload reads. Strict insertion first probes the pinned target: an existing ID is typed `KeyConflict`. A retryable commit conflict may be treated as effect-free only when every participant still has no owned Lance effect; the intent is then finalized and a fresh manifest-visible probe must find one of the attempted IDs before strict insert returns terminal `KeyConflict`. Without that exact match, the broad substrate conflict becomes internal `ReadSetChanged` and the strict operation fully reprepares without changing mode, never reporting a false duplicate. Upsert likewise discards the entire attempt for bounded reprepare and revalidation. An unrelated pre-effect authority movement may also cause a retryable writer to reprepare—including load `Append`—but its semantics remain `StrictInsert`; a detected key conflict is never retried or changed to upsert. If any earlier participant advanced, or absence is ambiguous, the fixed sidecar remains and the result is `RecoveryRequired`. See [docs/dev/invariants.md](invariants.md) and [docs/dev/writes.md](writes.md).
+Atomicity guarantee for multi-statement mutations: a mid-query failure leaves Lance HEAD untouched because no effect occurs during statement execution or staging. The RFC-023 keyed adapter fixes the physical key to `id`. StrictInsert exact-probes the target and stages a join-free, exact-`id`-filtered insertion-only `Update`; Upsert forces pinned Lance's v2 MergeInsert route. Each arm verifies its emitted operation and filter. Mutation/Load keeps one keyed transaction per touched table and rejects accumulated strict-insert or upsert input above 8,192 rows or 32 MiB before sidecar arm with typed `ResourceLimitExceeded`. Update predicate results stream into the remaining table budget after pending-key shadowing; blob sizes are checked before payload reads. Strict insertion first probes the pinned target: an existing ID is typed `KeyConflict`. A retryable commit conflict may be treated as effect-free only when every participant still has no owned Lance effect; the intent is then finalized and a fresh manifest-visible probe must find one of the attempted IDs before strict insert returns terminal `KeyConflict`. Without that exact match, the broad substrate conflict becomes internal `ReadSetChanged` and the strict operation fully reprepares without changing mode, never reporting a false duplicate. Upsert likewise discards the entire attempt for bounded reprepare and revalidation. An unrelated pre-effect authority movement may also cause a retryable writer to reprepare—including load `Append`—but its semantics remain `StrictInsert`; a detected key conflict is never retried or changed to upsert. If any earlier participant advanced, or absence is ambiguous, the fixed sidecar remains and the result is `RecoveryRequired`. See [docs/dev/invariants.md](invariants.md) and [docs/dev/writes.md](writes.md).
 
 ## Bulk loader (`loader/mod.rs`)
 

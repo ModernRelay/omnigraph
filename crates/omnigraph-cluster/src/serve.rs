@@ -9,6 +9,9 @@ pub struct ServingGraph {
     pub graph_id: String,
     pub root: PathBuf,
     pub embedding: Option<EmbeddingProviderConfig>,
+    /// Full normalized applied policy. The server projects this exactly once,
+    /// immediately before installing it on the engine handle.
+    pub external_blob_policy: omnigraph::ExternalBlobPolicy,
 }
 
 /// One stored query: its graph binding, registry name, and verified source.
@@ -344,11 +347,23 @@ async fn read_snapshot_with_store(
                     },
                     None => None,
                 };
+                let external_blob_policy = entry.external_blob_policy.clone().unwrap_or_default();
+                let expected_digest =
+                    expected_state_graph_resource_digest(&state, &graph_id, entry);
+                if expected_digest != entry.digest {
+                    diagnostics.push(Diagnostic::error(
+                        "external_blob_policy_digest_mismatch",
+                        address.clone(),
+                        "the applied graph resource metadata is not bound by its composite digest; restore the cluster state ledger from a trusted copy before retrying",
+                    ));
+                    continue;
+                }
                 let graph_root = backend.graph_root(&graph_id);
                 graphs.push(ServingGraph {
                     root: PathBuf::from(graph_root),
                     graph_id,
                     embedding,
+                    external_blob_policy,
                 });
             }
             ResourceKind::Schema(_) => {}

@@ -135,6 +135,10 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(read_payload, local_read);
     assert_eq!(read_payload["row_count"], 1);
     assert_eq!(read_payload["rows"][0]["p.name"], "Alice");
+    assert!(
+        read_payload["graph_commit_id"].as_str().is_some(),
+        "remote CLI reads must use canonical /query and retain its conditional-write token"
+    );
 
     // Served write: no `--as` (the server resolves the actor; here the server
     // is `--unauthenticated`, so the actor is the server default).
@@ -170,6 +174,10 @@ query insert_person($name: String, $age: I32) {
         .unwrap();
     assert_eq!(http_read["row_count"], 1);
     assert_eq!(http_read["rows"][0]["p.name"], "Mina");
+    assert!(
+        http_read.get("graph_commit_id").is_none(),
+        "deprecated /read must preserve its byte-stable legacy body"
+    );
 
     let local_verify = parse_stdout_json(&output_success(
         cli()
@@ -1204,6 +1212,106 @@ fn graphs_list_against_multi_graph_server() {
     assert!(
         stderr.contains("alpha") && stderr.contains("--graph <id>"),
         "expected a candidate-listing error naming alpha; got: {stderr}"
+    );
+
+    drop(server);
+}
+
+/// GitHub #365: a lost `--if-commit` compare-and-swap exits with code 4 and,
+/// under `--json`, emits the structured `precondition_failure` body on
+/// stdout. Guards the CLI's typed-error downcast seam: a wrapped error on
+/// that path degrades exit 4 to the generic 1.
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn mutate_if_commit_lost_cas_exits_4_issue_365() {
+    const FIND_ALICE: &str =
+        "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
+    const ADD_PERSON: &str =
+        "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }";
+    fn mutate_cmd(base_url: &str, name: &str, if_commit: Option<&str>) -> std::process::Output {
+        let mut cmd = cli();
+        cmd.arg("mutate")
+            .arg("--server")
+            .arg(base_url)
+            .arg("--graph")
+            .arg(GRAPH_ID)
+            .arg("-e")
+            .arg(ADD_PERSON)
+            .arg("--params")
+            .arg(format!(r#"{{"name":"{name}","age":40}}"#))
+            .arg("--json");
+        if let Some(id) = if_commit {
+            cmd.arg("--if-commit").arg(id);
+        }
+        cmd.output().unwrap()
+    }
+
+    let cluster = converged_loaded_cluster(GRAPH_ID, None);
+    let server = spawn_server_with_cluster(cluster.path());
+
+    // The read response itself carries the graph commit id of the snapshot
+    // the rows came from.
+    let read = parse_stdout_json(&output_success(
+        cli()
+            .arg("query")
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg(GRAPH_ID)
+            .arg("-e")
+            .arg(FIND_ALICE)
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    ));
+    let stale_id = read["graph_commit_id"]
+        .as_str()
+        .expect("read response must carry graph_commit_id")
+        .to_string();
+
+    // Another writer advances the head past the id this caller read.
+    let winner = mutate_cmd(&server.base_url, "CasWinner", None);
+    assert!(
+        winner.status.success(),
+        "plain mutate failed: {}",
+        String::from_utf8_lossy(&winner.stderr)
+    );
+
+    // Lost CAS: exit code 4, structured body on stdout.
+    let lost = mutate_cmd(&server.base_url, "CasLoser", Some(&stale_id));
+    assert_eq!(
+        lost.status.code(),
+        Some(4),
+        "lost --if-commit must exit 4; stderr: {}",
+        String::from_utf8_lossy(&lost.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&lost.stdout)
+        .expect("--json must emit the structured body on stdout");
+    assert_eq!(body["precondition_failure"]["expected"], json!(stale_id));
+
+    // An id from a fresh read passes with exit 0.
+    let read = parse_stdout_json(&output_success(
+        cli()
+            .arg("query")
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg(GRAPH_ID)
+            .arg("-e")
+            .arg(FIND_ALICE)
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    ));
+    let fresh_id = read["graph_commit_id"]
+        .as_str()
+        .expect("read response must carry graph_commit_id")
+        .to_string();
+    let won = mutate_cmd(&server.base_url, "CasLoser", Some(&fresh_id));
+    assert!(
+        won.status.success(),
+        "current --if-commit must pass; stderr: {}",
+        String::from_utf8_lossy(&won.stderr)
     );
 
     drop(server);

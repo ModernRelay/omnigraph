@@ -19,7 +19,32 @@ pub fn parse_schema(input: &str) -> Result<SchemaFile> {
     parse_schema_diagnostic(input).map_err(|e| CompilerError::Parse(e.to_string()))
 }
 
+/// Parse source that is already bound to a persisted accepted schema contract.
+///
+/// This compatibility seam permits exactly one historical admission bug:
+/// body-level `@unique(...)` could contain a Blob property before v0.10. New
+/// schema admission must always use [`parse_schema`], which rejects that shape.
+/// Property-level Blob annotations remain rejected in both modes.
+#[doc(hidden)]
+pub fn parse_persisted_schema_contract(input: &str) -> Result<SchemaFile> {
+    parse_schema_diagnostic_with_mode(input, ConstraintValidationMode::PersistedContract)
+        .map_err(|e| CompilerError::Parse(e.to_string()))
+}
+
 pub fn parse_schema_diagnostic(input: &str) -> std::result::Result<SchemaFile, ParseDiagnostic> {
+    parse_schema_diagnostic_with_mode(input, ConstraintValidationMode::Admission)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConstraintValidationMode {
+    Admission,
+    PersistedContract,
+}
+
+fn parse_schema_diagnostic_with_mode(
+    input: &str,
+    constraint_mode: ConstraintValidationMode,
+) -> std::result::Result<SchemaFile, ParseDiagnostic> {
     let pairs = SchemaParser::parse(Rule::schema_file, input).map_err(pest_error_to_diagnostic)?;
 
     let mut declarations = Vec::new();
@@ -53,7 +78,7 @@ pub fn parse_schema_diagnostic(input: &str) -> std::result::Result<SchemaFile, P
 
     let schema = SchemaFile { declarations };
     validate_schema_annotations(&schema).map_err(compiler_error_to_diagnostic)?;
-    validate_constraints(&schema).map_err(compiler_error_to_diagnostic)?;
+    validate_constraints(&schema, constraint_mode).map_err(compiler_error_to_diagnostic)?;
     Ok(schema)
 }
 
@@ -918,15 +943,27 @@ fn validate_property_annotations(
 
 // ─── Constraint Validation ───────────────────────────────────────────────────
 
-fn validate_constraints(schema: &SchemaFile) -> Result<()> {
+fn validate_constraints(schema: &SchemaFile, mode: ConstraintValidationMode) -> Result<()> {
     for decl in &schema.declarations {
         match decl {
             SchemaDecl::Interface(_) => {}
             SchemaDecl::Node(node) => {
-                validate_type_constraints(&node.constraints, &node.properties, &node.name, false)?;
+                validate_type_constraints(
+                    &node.constraints,
+                    &node.properties,
+                    &node.name,
+                    false,
+                    mode,
+                )?;
             }
             SchemaDecl::Edge(edge) => {
-                validate_type_constraints(&edge.constraints, &edge.properties, &edge.name, true)?;
+                validate_type_constraints(
+                    &edge.constraints,
+                    &edge.properties,
+                    &edge.name,
+                    true,
+                    mode,
+                )?;
             }
         }
     }
@@ -938,6 +975,7 @@ fn validate_type_constraints(
     properties: &[PropDecl],
     type_name: &str,
     is_edge: bool,
+    mode: ConstraintValidationMode,
 ) -> Result<()> {
     let prop_names: HashMap<&str, &PropDecl> =
         properties.iter().map(|p| (p.name.as_str(), p)).collect();
@@ -999,9 +1037,17 @@ fn validate_type_constraints(
                     if is_edge && (col == "src" || col == "dst") {
                         continue;
                     }
-                    if !prop_names.contains_key(col.as_str()) {
-                        return Err(CompilerError::Parse(format!(
+                    let prop = prop_names.get(col.as_str()).ok_or_else(|| {
+                        CompilerError::Parse(format!(
                             "@unique on {} references unknown property '{}'",
+                            type_name, col
+                        ))
+                    })?;
+                    if matches!(prop.prop_type.scalar, ScalarType::Blob)
+                        && mode == ConstraintValidationMode::Admission
+                    {
+                        return Err(CompilerError::Parse(format!(
+                            "@unique is not supported on blob property {}.{}",
                             type_name, col
                         )));
                     }

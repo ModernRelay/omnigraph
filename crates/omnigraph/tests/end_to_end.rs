@@ -1,13 +1,29 @@
 mod helpers;
 
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
+use base64::Engine as _;
 use futures::TryStreamExt;
 
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::{Omnigraph, ReadTarget, RepairOptions};
+use omnigraph::error::{ManifestErrorKind, OmniError};
+use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::{LoadMode, load_jsonl, load_jsonl_file};
+use omnigraph::{
+    BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, EntityKind, ExternalBlobBase,
+    ExternalBlobExecutionScope, ExternalBlobPolicy,
+};
 use omnigraph_compiler::ir::ParamMap;
 
 use helpers::*;
+
+fn edge_blob_cell(type_name: &str, id: &str, property: &str) -> BlobCell {
+    BlobCell {
+        entity: EntityKind::Edge,
+        type_name: type_name.to_owned(),
+        id: id.to_owned(),
+        property: property.to_owned(),
+    }
+}
 
 // ─── Init + Load ────────────────────────────────────────────────────────────
 
@@ -898,23 +914,27 @@ node Document {
     title: String @key
     content: Blob?
 }
+
+edge Attachment: Document -> Document {
+    payload: Blob?
+}
 "#;
 
 const BLOB_QUERIES: &str = r#"
 query all_docs() {
     match { $d: Document }
-    return { $d.title, $d.content }
+    return { $d.title }
 }
 
 query get_doc($title: String) {
     match { $d: Document { title: $title } }
-    return { $d.title, $d.content }
+    return { $d.title }
 }
 
 query get_doc_clause($title: String) {
     match { $d: Document
         $d.title = $title }
-    return { $d.title, $d.content }
+    return { $d.title }
 }
 "#;
 
@@ -960,7 +980,7 @@ async fn blob_load_base64_inline() {
 }
 
 #[tokio::test]
-async fn blob_query_returns_metadata() {
+async fn blob_bearing_query_filters_without_projecting_blob() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
@@ -986,17 +1006,15 @@ async fn blob_query_returns_metadata() {
         let json = result.to_sdk_json();
         let row = json.as_array().unwrap().first().unwrap();
         assert_eq!(row["d.title"], "readme", "{query_name}");
-        // Blob columns return null in query projections — data is accessed via take_blobs API.
-        // (Lance bug: BlobsDescriptions + filter triggers assertion, so blobs are excluded from scan)
         assert!(
-            row["d.content"].is_null(),
-            "{query_name}: blob column should return null in query projection"
+            row.get("d.content").is_none(),
+            "{query_name}: Blob values are accessed through the dedicated Blob API"
         );
     }
 }
 
 #[tokio::test]
-async fn blob_null_returns_null_in_query() {
+async fn blob_null_does_not_break_non_blob_projection() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
@@ -1017,11 +1035,9 @@ async fn blob_null_returns_null_in_query() {
     let json = result.to_sdk_json();
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "empty");
-    // Nullable blob with no value should return null
     assert!(
-        row["d.content"].is_null(),
-        "null blob should return null, got: {}",
-        row["d.content"]
+        row.get("d.content").is_none(),
+        "Blob values must not leak through ordinary query projection"
     );
 }
 
@@ -1055,11 +1071,19 @@ async fn blob_insert_mutation() {
     let json = qr.to_sdk_json();
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "new-doc");
-    // Blob column present but null in query projection (data accessed via take_blobs)
+    // Blob columns are not part of ordinary query projection.
     assert!(
-        row.get("d.content").is_some(),
-        "content column should be present"
+        row.get("d.content").is_none(),
+        "content column should be absent"
     );
+
+    let bytes = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "new-doc", "content"),
+    )
+    .await;
+    assert_eq!(&bytes[..], &[1, 2, 3]);
 }
 
 #[tokio::test]
@@ -1090,11 +1114,12 @@ async fn blob_update_mutation() {
 
     assert_eq!(result.affected_nodes, 1);
 
-    let blob = db
-        .read_blob("Document", "updatable", "content")
-        .await
-        .unwrap();
-    let bytes = blob.read().await.unwrap();
+    let bytes = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "updatable", "content"),
+    )
+    .await;
     assert_eq!(&bytes[..], &[4, 5, 6]);
 }
 
@@ -1106,15 +1131,382 @@ async fn blob_read_returns_bytes() {
     let uri = dir.path().to_str().unwrap();
     let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
-    // "Hello World" = base64 "SGVsbG8gV29ybGQ="
-    let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#;
+    // One graph-level load covers node and edge Blob cells, including the
+    // distinction between null, a valid empty value, and non-empty bytes.
+    let data = r#"{"type":"Document","data":{"title":"readme","content":"base64:SGVsbG8gV29ybGQ="}}
+{"type":"Document","data":{"title":"empty","content":"base64:"}}
+{"type":"Document","data":{"title":"null"}}
+{"type":"Document","data":{"title":"peer"}}
+{"edge":"Attachment","from":"readme","to":"peer","data":{"id":"attachment-1","payload":"base64:RWRnZQ=="}}"#;
     load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
-    let blob = db.read_blob("Document", "readme", "content").await.unwrap();
-    assert_eq!(blob.size(), 11); // "Hello World" = 11 bytes
+    let metacharacter_id = r"quote'\slash";
+    let metacharacter_row = serde_json::json!({
+        "type": "Document",
+        "data": {
+            "title": metacharacter_id,
+            "content": "base64:TWV0YQ==",
+        }
+    })
+    .to_string();
+    load_jsonl(&db, &metacharacter_row, LoadMode::Append)
+        .await
+        .unwrap();
 
-    let bytes = blob.read().await.unwrap();
-    assert_eq!(&bytes[..], b"Hello World");
+    // Keep one valid payload just over the public per-range ceiling so the
+    // acceptance test exercises the inclusive boundary and typed refusal.
+    let range_limit = BLOB_READ_RANGE_MAX_BYTES;
+    let large_payload = vec![b'x'; usize::try_from(range_limit + 1).unwrap()];
+    let large_row = serde_json::json!({
+        "type": "Document",
+        "data": {
+            "title": "large",
+            "content": format!(
+                "base64:{}",
+                base64::engine::general_purpose::STANDARD.encode(&large_payload)
+            ),
+        }
+    })
+    .to_string();
+    load_jsonl(&db, &large_row, LoadMode::Append).await.unwrap();
+
+    let readme_cell = node_blob_cell("Document", "readme", "content");
+    let readme = db
+        .read_blob_at(ReadTarget::branch("main"), readme_cell.clone())
+        .await
+        .unwrap();
+    assert_eq!(readme.cell, readme_cell);
+    assert_eq!(readme.resolved_target.requested, ReadTarget::branch("main"));
+    assert_eq!(
+        readme.resolved_target.branch, None,
+        "the native main branch is represented without a Lance branch name"
+    );
+    let (readme_etag, readme_reader) = match readme.content {
+        BlobContent::Managed {
+            length,
+            etag,
+            reader,
+        } => {
+            assert_eq!(length, 11);
+            assert_eq!(reader.len(), length);
+            assert!(!reader.is_empty());
+            (etag.to_string(), reader)
+        }
+        BlobContent::External(external) => {
+            panic!("expected managed Blob, got external descriptor {external:?}")
+        }
+    };
+
+    assert_eq!(&readme_reader.read_range(0..5).await.unwrap()[..], b"Hello");
+    assert!(readme_reader.read_range(5..5).await.unwrap().is_empty());
+    assert_eq!(
+        &readme_reader.read_range(6..11).await.unwrap()[..],
+        b"World"
+    );
+
+    for (expected_start, expected_end) in [(0, 12), (6, 5)] {
+        let error = readme_reader
+            .read_range(expected_start..expected_end)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OmniError::BlobRangeNotSatisfiable {
+                    start,
+                    end,
+                    length: 11,
+                } if start == expected_start && end == expected_end
+            ),
+            "invalid range must return typed BlobRangeNotSatisfiable, got {error:?}"
+        );
+    }
+
+    let empty = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "empty", "content"),
+        )
+        .await
+        .unwrap();
+    let BlobContent::Managed {
+        length,
+        reader: empty_reader,
+        ..
+    } = empty.content
+    else {
+        panic!("a base64: cell must be managed empty content")
+    };
+    assert_eq!(length, 0);
+    assert!(empty_reader.is_empty());
+    assert!(empty_reader.read_range(0..0).await.unwrap().is_empty());
+
+    let null_error = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "null", "content"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            null_error,
+            OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::NotFound
+        ),
+        "null Blob must remain distinct from empty content, got {null_error:?}"
+    );
+
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", metacharacter_id, "content"),
+        )
+        .await,
+        b"Meta",
+        "logical ids must be bound as structured literals, not interpolated SQL"
+    );
+
+    let edge_cell = edge_blob_cell("Attachment", "attachment-1", "payload");
+    let edge = db
+        .read_blob_at(ReadTarget::branch("main"), edge_cell.clone())
+        .await
+        .unwrap();
+    assert_eq!(edge.cell, edge_cell);
+    let edge_etag = match edge.content {
+        BlobContent::Managed {
+            length,
+            etag,
+            reader,
+        } => {
+            assert_eq!(length, 4);
+            assert_eq!(&reader.read_range(0..length).await.unwrap()[..], b"Edge");
+            etag.to_string()
+        }
+        BlobContent::External(external) => {
+            panic!("expected managed edge Blob, got external descriptor {external:?}")
+        }
+    };
+
+    let large = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "large", "content"),
+        )
+        .await
+        .unwrap();
+    let BlobContent::Managed { reader, .. } = large.content else {
+        panic!("base64 input must produce managed content")
+    };
+    assert_eq!(
+        reader.read_range(0..range_limit).await.unwrap().len(),
+        usize::try_from(range_limit).unwrap()
+    );
+    assert_eq!(
+        &reader
+            .read_range(range_limit..range_limit + 1)
+            .await
+            .unwrap()[..],
+        b"x",
+        "a value larger than one range remains readable through consecutive bounded calls"
+    );
+    let limit_error = reader.read_range(0..range_limit + 1).await.unwrap_err();
+    assert!(
+        matches!(
+            limit_error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit,
+                actual,
+            } if resource == "Blob read range bytes"
+                && limit == range_limit
+                && actual == range_limit + 1
+        ),
+        "one byte over the public range ceiling must be refused, got {limit_error:?}"
+    );
+
+    // ETags identify the exact table snapshot, not only the payload bytes:
+    // repeating the same read is stable; advancing this node table changes its
+    // tag; the untouched edge table retains its exact tag.
+    let repeated = db
+        .read_blob_at(ReadTarget::branch("main"), readme_cell.clone())
+        .await
+        .unwrap();
+    let BlobContent::Managed { etag, .. } = repeated.content else {
+        panic!("expected managed content")
+    };
+    assert_eq!(etag.to_string(), readme_etag);
+
+    load_jsonl(
+        &db,
+        r#"{"type":"Document","data":{"title":"etag-bump"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let advanced = db
+        .read_blob_at(ReadTarget::branch("main"), readme_cell)
+        .await
+        .unwrap();
+    let BlobContent::Managed { etag, reader, .. } = advanced.content else {
+        panic!("expected managed content")
+    };
+    assert_ne!(etag.to_string(), readme_etag);
+    assert_eq!(&reader.read_range(0..11).await.unwrap()[..], b"Hello World");
+
+    let unchanged_edge = db
+        .read_blob_at(ReadTarget::branch("main"), edge_cell)
+        .await
+        .unwrap();
+    let BlobContent::Managed { etag, .. } = unchanged_edge.content else {
+        panic!("expected managed edge content")
+    };
+    assert_eq!(etag.to_string(), edge_etag);
+}
+
+#[tokio::test]
+async fn blob_read_on_upgraded_unmarked_v6_table_fails_closed_for_old_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    load_jsonl(
+        &db,
+        r#"{"type":"Document","data":{"title":"legacy","content":"base64:T2xk"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    // Deliberately model a pre-0.10 v6 physical schema: retain every Lance
+    // extension/PK metadata entry, but remove the graph property-lifetime
+    // marker that this release starts writing on newly created/rebuilt fields.
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let table_path = snapshot.entry("node:Document").unwrap().table_path.clone();
+    let mut table = lance::Dataset::open(dir.path().join(table_path).to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    let replacements = ["title", "content"]
+        .into_iter()
+        .map(|name| {
+            let mut metadata = table.schema().field(name).unwrap().metadata.clone();
+            assert!(metadata.remove("omnigraph.stable_property_id").is_some());
+            (name, metadata)
+        })
+        .collect::<Vec<_>>();
+    let mut update = table.update_field_metadata();
+    for (name, metadata) in replacements {
+        update = update.replace(name, metadata).unwrap();
+    }
+    update.await.unwrap();
+    db.repair(RepairOptions {
+        confirm: true,
+        force: true,
+    })
+    .await
+    .unwrap();
+
+    let legacy_cell = node_blob_cell("Document", "legacy", "content");
+    let exact_current_snapshot = db.resolve_snapshot("main").await.unwrap();
+    assert_eq!(
+        read_managed_blob_bytes(&db, ReadTarget::branch("main"), legacy_cell.clone()).await,
+        b"Old"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::snapshot(exact_current_snapshot.clone()),
+            legacy_cell.clone(),
+        )
+        .await,
+        b"Old",
+        "an unmarked upgraded table remains readable at its exact current physical entry"
+    );
+
+    // A schema-preserving Append must not pretend to retrofit physical field
+    // identity. The new current entry remains readable, while the now-older
+    // unmarked snapshot cannot prove that the same spelling is the same
+    // property lifetime and therefore fails closed.
+    load_jsonl(
+        &db,
+        r#"{"type":"Document","data":{"title":"later"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let current = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let current_table = current.open("node:Document").await.unwrap();
+    assert!(
+        !current_table
+            .schema()
+            .field("content")
+            .unwrap()
+            .metadata
+            .contains_key("omnigraph.stable_property_id"),
+        "a schema-preserving Append must not claim to retrofit property-lifetime metadata"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(&db, ReadTarget::branch("main"), legacy_cell.clone()).await,
+        b"Old"
+    );
+    let current_snapshot = db.resolve_snapshot("main").await.unwrap();
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::snapshot(current_snapshot),
+            legacy_cell.clone(),
+        )
+        .await,
+        b"Old"
+    );
+
+    let error = db
+        .read_blob_at(
+            ReadTarget::snapshot(exact_current_snapshot),
+            legacy_cell.clone(),
+        )
+        .await
+        .expect_err("an older unmarked v6 table version has no property-lifetime proof");
+    assert!(
+        matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == ManifestErrorKind::BadRequest
+                    && manifest.message
+                        == "Blob property 'Document.content' has no persisted property-lifetime witness at the selected target"
+        ),
+        "older unmarked v6 snapshots must fail with the exact compatibility refusal, got {error:?}"
+    );
+
+    load_jsonl(
+        &db,
+        r#"{"type":"Document","data":{"title":"legacy","content":"base64:UmVidWlsdA=="}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let rebuilt = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let rebuilt_table = rebuilt.open("node:Document").await.unwrap();
+    let expected_property_id = db
+        .catalog()
+        .node_property_id("Document", "content")
+        .unwrap()
+        .get()
+        .to_string();
+    assert_eq!(
+        rebuilt_table
+            .schema()
+            .field("content")
+            .unwrap()
+            .metadata
+            .get("omnigraph.stable_property_id")
+            .map(String::as_str),
+        Some(expected_property_id.as_str()),
+        "full-table Overwrite rebuilds from the 0.10 catalog and adopts the property marker"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(&db, ReadTarget::branch("main"), legacy_cell).await,
+        b"Rebuilt"
+    );
 }
 
 #[tokio::test]
@@ -1127,12 +1519,45 @@ async fn blob_read_not_found_errors() {
     load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     // Non-existent ID
-    let err = db.read_blob("Document", "nonexistent", "content").await;
-    assert!(err.is_err());
+    let err = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "nonexistent", "content"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::NotFound
+    ));
 
     // Non-blob property
-    let err = db.read_blob("Document", "readme", "title").await;
-    assert!(err.is_err());
+    let err = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "readme", "title"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::BadRequest
+    ));
+
+    for cell in [
+        node_blob_cell("MissingType", "readme", "content"),
+        node_blob_cell("Document", "readme", "missing_property"),
+    ] {
+        let error = db
+            .read_blob_at(ReadTarget::branch("main"), cell)
+            .await
+            .expect_err("unknown type/property selectors must be BadRequest");
+        assert!(matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == ManifestErrorKind::BadRequest
+        ));
+    }
 }
 
 #[tokio::test]
@@ -1152,14 +1577,15 @@ async fn blob_read_after_mutation_insert() {
     .await
     .unwrap();
 
-    // The reader was opened before the other handle's commit. `read_blob`
+    // The reader was opened before the other handle's commit. `read_blob_at`
     // must freshness-probe its current branch instead of using its held
     // coordinator snapshot.
-    let blob = stale_reader
-        .read_blob("Document", "inserted", "content")
-        .await
-        .unwrap();
-    let bytes = blob.read().await.unwrap();
+    let bytes = read_managed_blob_bytes(
+        &stale_reader,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "inserted", "content"),
+    )
+    .await;
     assert_eq!(&bytes[..], &[1, 2, 3]);
 }
 
@@ -1562,8 +1988,8 @@ node Article {
 }
 "#;
     let mutations = r#"
-query insert_article($slug: String, $summary: String, $rating: I32) {
-    insert Article { slug: $slug, summary: $summary, rating: $rating }
+query insert_article($slug: String, $attachment: Blob, $summary: String, $rating: I32) {
+    insert Article { slug: $slug, attachment: $attachment, summary: $summary, rating: $rating }
 }
 query update_summary($slug: String, $summary: String) {
     update Article set { summary: $summary } where slug = $slug
@@ -1582,7 +2008,11 @@ query get_article($slug: String) {
         mutations,
         "insert_article",
         &mixed_params(
-            &[("$slug", "a1"), ("$summary", "hello")],
+            &[
+                ("$slug", "a1"),
+                ("$attachment", "base64:"),
+                ("$summary", "hello"),
+            ],
             &[("$rating", 42)],
         ),
     )
@@ -1610,6 +2040,14 @@ query get_article($slug: String) {
     .await
     .unwrap();
     assert_eq!(qr.num_rows(), 1);
+
+    let attachment = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Article", "a1", "attachment"),
+    )
+    .await;
+    assert!(attachment.is_empty());
 }
 
 // ─── Regression: blob update null → non-null ─────────────────────────────────
@@ -1640,8 +2078,12 @@ async fn blob_update_null_to_non_null() {
     .unwrap();
     assert_eq!(result.affected_nodes, 1);
 
-    let blob = db.read_blob("Document", "kid-a", "content").await.unwrap();
-    let bytes = blob.read().await.unwrap();
+    let bytes = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "kid-a", "content"),
+    )
+    .await;
     assert_eq!(&bytes[..], &[1, 2, 3]);
 }
 
@@ -1649,33 +2091,212 @@ async fn blob_update_null_to_non_null() {
 
 #[tokio::test]
 async fn blob_load_external_file_uri() {
-    // Regression: loading blobs with external file:// URIs was rejected with
-    // "External blob URI '...' is outside registered external bases" because
-    // allow_external_blob_outside_bases was not set on data table write paths.
+    // Overwrite is the one write mode that intentionally retains an authorized
+    // URI descriptor. Keyed modes consume the URI as a source and materialize
+    // managed bytes instead.
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    // Create a temp file to reference
+    // Create a temp file beneath one exact embedded-only base.
     let blob_dir = tempfile::tempdir().unwrap();
-    let blob_path = blob_dir.path().join("test.txt");
+    let blob_path = blob_dir.path().join("shared~source.txt");
     std::fs::write(&blob_path, b"Hello from file").unwrap();
-    let file_uri = format!("file://{}", blob_path.display());
+    let file_uri = url::Url::from_file_path(&blob_path)
+        .expect("external blob path is absolute")
+        .to_string();
+    let canonical_file_uri = url::Url::from_file_path(std::fs::canonicalize(&blob_path).unwrap())
+        .expect("canonical external blob path is absolute")
+        .to_string();
+    let base_uri = url::Url::from_directory_path(blob_dir.path())
+        .expect("external blob base is absolute")
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
 
-    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
-    let data = format!(
-        r#"{{"type": "Document", "data": {{"title": "from-file", "content": "{}"}}}}"#,
-        file_uri
-    );
+    let db = Omnigraph::init(uri, BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
+    let mut overwrite_rows = vec![
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "from-file", "content": file_uri.clone()},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "null"},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "valid-empty", "content": "base64:"},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "inline", "content": "base64:SW5saW5l"},
+        }),
+    ];
+    #[cfg(unix)]
+    let symlink_path = {
+        use std::os::unix::fs::symlink;
 
-    // Load with external URI
+        let path = blob_dir.path().join("admitted-link");
+        symlink(&blob_path, &path).unwrap();
+        overwrite_rows.push(serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "from-symlink",
+                "content": url::Url::from_file_path(&path).unwrap().to_string(),
+            },
+        }));
+        path
+    };
+    let data = overwrite_rows
+        .into_iter()
+        .map(|row| row.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Overwrite preserves the canonical admitted reference rather than
+    // silently copying it into managed storage or retaining a mutable symlink
+    // spelling.
     load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
 
-    // Verify the blob is accessible
-    let blob = db
-        .read_blob("Document", "from-file", "content")
+    let stored = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "from-file", "content"),
+        )
         .await
         .unwrap();
-    assert!(blob.uri().is_some(), "external blob should have a URI");
+    let BlobContent::External(external) = stored.content else {
+        panic!("overwrite must retain its authorized external descriptor")
+    };
+    assert_eq!(external.uri, canonical_file_uri);
+    assert_eq!(external.offset, 0);
+    assert_eq!(external.length, None);
+    assert!(
+        db.read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "null", "content"),
+        )
+        .await
+        .is_err(),
+        "canonicalizing a sibling external URI must preserve parent-null validity"
+    );
+    let empty = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "valid-empty", "content"),
+    )
+    .await;
+    assert!(empty.is_empty());
+    let inline = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "inline", "content"),
+    )
+    .await;
+    assert_eq!(&inline[..], b"Inline");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.txt");
+        std::fs::write(&outside, b"Outside configured base").unwrap();
+        std::fs::remove_file(&symlink_path).unwrap();
+        symlink(&outside, &symlink_path).unwrap();
+
+        let pinned = db
+            .read_blob_at(
+                ReadTarget::branch("main"),
+                node_blob_cell("Document", "from-symlink", "content"),
+            )
+            .await
+            .unwrap();
+        let BlobContent::External(pinned) = pinned.content else {
+            panic!("retargeting the admitted symlink must not alter the stored descriptor")
+        };
+        assert_eq!(pinned.uri, canonical_file_uri);
+        assert_eq!(pinned.offset, 0);
+        assert_eq!(pinned.length, None);
+    }
+
+    // Two raw spellings normalize to the same URI. The operation-wide
+    // preflight must share one source entry (and therefore one payload read)
+    // before either strict-insert row is staged.
+    let encoded_alias = file_uri.replace("~source", "%7Esource");
+    assert_ne!(encoded_alias, file_uri);
+    let duplicate_source_rows = format!(
+        "{}\n{}",
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "copy-a", "content": file_uri},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "copy-b", "content": encoded_alias},
+        })
+    );
+    let probes = MergeWriteProbes::default();
+    with_merge_write_probes(
+        probes.clone(),
+        load_jsonl(&db, &duplicate_source_rows, LoadMode::Append),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        probes.external_blob_probe_inputs(),
+        2,
+        "both URI-bearing cells must participate in operation-wide preflight"
+    );
+    assert_eq!(
+        probes.external_blob_probe_calls(),
+        1,
+        "normalized-equivalent URI inputs must cause one metadata probe"
+    );
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        1,
+        "normalized-equivalent URI inputs must share one preflighted payload"
+    );
+    for title in ["copy-a", "copy-b"] {
+        let copied = read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", title, "content"),
+        )
+        .await;
+        assert_eq!(&copied[..], b"Hello from file");
+    }
+
+    // A read of an external cell is descriptor-only. It remains available
+    // after the caller-owned source disappears and performs neither a source
+    // metadata probe nor a payload read.
+    std::fs::remove_file(&blob_path).unwrap();
+    let read_probes = MergeWriteProbes::default();
+    let stored = with_merge_write_probes(
+        read_probes.clone(),
+        db.read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "from-file", "content"),
+        ),
+    )
+    .await
+    .unwrap();
+    let BlobContent::External(external) = stored.content else {
+        panic!("external source removal must not change descriptor classification")
+    };
+    assert_eq!(external.uri, canonical_file_uri);
+    assert_eq!(external.offset, 0);
+    assert_eq!(external.length, None);
+    assert_eq!(read_probes.external_blob_probe_calls(), 0);
+    assert_eq!(read_probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(read_probes.blob_payload_read_calls(), 0);
 }
 
 // ─── Regression: execute_update on edge type ─────────────────────────────────

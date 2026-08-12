@@ -2,6 +2,9 @@
 //! Moved verbatim from tests/cli.rs in the modularization.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+use std::sync::mpsc;
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -1273,6 +1276,141 @@ query insert_person($name: String, $age: I32) {
     let verify_payload: Value = serde_json::from_slice(&verify.stdout).unwrap();
     assert_eq!(verify_payload["row_count"], 1);
     assert_eq!(verify_payload["rows"][0]["p.name"], "Eve");
+}
+
+/// GitHub #365: the embedded transport must preserve the typed stale-head
+/// outcome all the way through the CLI boundary. This is deliberately local
+/// and non-ignored so exit code 4 cannot depend on loopback/server coverage.
+#[test]
+fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
+    const FIND_PERSON: &str =
+        "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
+    const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
+
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+
+    let read = output_success(
+        cli()
+            .arg("query")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg(FIND_PERSON)
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    );
+    let stale_head = parse_stdout_json(&read)["graph_commit_id"]
+        .as_str()
+        .expect("embedded read must expose graph_commit_id")
+        .to_string();
+
+    output_success(
+        cli()
+            .arg("mutate")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg(SET_AGE)
+            .arg("--params")
+            .arg(r#"{"name":"Alice","age":31}"#)
+            .arg("--json"),
+    );
+
+    let lost = cli()
+        .arg("mutate")
+        .arg("--store")
+        .arg(&graph)
+        .arg("-e")
+        .arg(SET_AGE)
+        .arg("--params")
+        .arg(r#"{"name":"Alice","age":52}"#)
+        .arg("--if-commit")
+        .arg(&stale_head)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(
+        lost.status.code(),
+        Some(4),
+        "lost embedded --if-commit must exit 4; stderr: {}",
+        String::from_utf8_lossy(&lost.stderr)
+    );
+    let body: Value = serde_json::from_slice(&lost.stdout)
+        .expect("--json must emit structured precondition details on stdout");
+    assert_eq!(
+        body["precondition_failure"]["expected"],
+        Value::String(stale_head)
+    );
+
+    let verify = output_success(
+        cli()
+            .arg("query")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg(FIND_PERSON)
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    );
+    assert_eq!(parse_stdout_json(&verify)["rows"][0]["p.age"], 31);
+}
+
+/// A conditional remote mutation must advertise the capability in its path,
+/// not only in an optional header. An older server can ignore an unknown
+/// header after executing `/change` or `/mutate`; it cannot accidentally run a
+/// route it does not have, so the new CLI must receive 404 before any mutation
+/// handler is reachable.
+#[test]
+fn remote_if_commit_fails_closed_against_an_older_server() {
+    const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (line_tx, line_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        line_tx.send(request_line).unwrap();
+        let body = r#"{"error":"not found"}"#;
+        write!(
+            reader.get_mut(),
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+        reader.get_mut().flush().unwrap();
+    });
+
+    let output = cli()
+        .arg("mutate")
+        .arg("--server")
+        .arg(format!("http://{address}"))
+        .arg("--graph")
+        .arg("legacy")
+        .arg("-e")
+        .arg(SET_AGE)
+        .arg("--params")
+        .arg(r#"{"name":"Alice","age":52}"#)
+        .arg("--if-commit")
+        .arg("01HOLDHEAD")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "an old server must fail closed");
+    server.join().unwrap();
+    assert_eq!(
+        line_rx.recv().unwrap().trim_end(),
+        "POST /graphs/legacy/mutate/if-graph-commit HTTP/1.1",
+        "the CLI must not send a conditional write to an older server's ordinary mutation route"
+    );
 }
 
 #[test]

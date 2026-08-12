@@ -221,7 +221,7 @@ macro_rules! write_surfaces {
 write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options"],
     "db/omnigraph.rs" => WriteProtocol::RecoveryExecutor => ["open", "open_with_storage", "refresh"],
-    "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_as"],
+    "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_as", "mutate_as_with_expected_head"],
     "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_file", "load_graph_batch"],
     "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v9") => ["load_as", "load_file_as", "load_graph_batch_as"],
     "loader/mod.rs" => WriteProtocol::Composed("branch create when absent, then Load v9 alias") => ["ingest", "ingest_as", "ingest_file", "ingest_file_as"],
@@ -260,11 +260,12 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "export_jsonl"),
     ("db/omnigraph.rs", "export_jsonl_to_writer"),
     ("db/omnigraph.rs", "graph_index"),
-    ("db/omnigraph.rs", "read_blob"),
+    ("blob.rs", "read_blob_at"),
     ("db/omnigraph.rs", "branch_list"),
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "list_commits"),
     ("exec/query.rs", "query"),
+    ("exec/query.rs", "query_with_head"),
     ("exec/query.rs", "run_query_at"),
 ];
 
@@ -304,7 +305,12 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
-        "refresh_manifest_only",
+        "effective_graph_head",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "refresh_for_live_read",
     ),
     ("db/graph_coordinator.rs", "GraphCoordinator", "branch_list"),
     (
@@ -362,11 +368,15 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     ),
     ("db/manifest.rs", "ManifestCoordinator", "open_with_lineage"),
     ("db/manifest.rs", "ManifestCoordinator", "snapshot_at"),
-    ("db/manifest.rs", "ManifestCoordinator", "refresh"),
     (
         "db/manifest.rs",
         "ManifestCoordinator",
         "refresh_with_lineage",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "refresh_for_live_read",
     ),
     (
         "db/manifest.rs",
@@ -524,6 +534,8 @@ gateway_surfaces! {
         "has_fts_index", "has_vector_index", "root_uri", "dataset_uri", "scan_stream",
         "scan_stream_bounded", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded",
+        "preflight_external_blob_uris", "prepare_keyed_write_batch_with_preflight",
+        "prepare_overwrite_blob_references_with_preflight",
         "prepare_keyed_write_batch", "validate_keyed_write_batch", "first_existing_id",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::StageOnly => [
@@ -550,7 +562,7 @@ gateway_surfaces! {
         "open_dataset_head", "list_branches", "ensure_expected_version",
         "reopen_for_mutation", "scan_batches", "scan_batches_for_rewrite",
         "scan_stream_for_rewrite", "scan_stream_for_rewrite_bounded",
-        "scan_proven_insert_delta_bounded",
+        "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
         "materialize_blob_batch", "scan_stream", "scan_stream_bounded",
         "scan_stream_with", "scan", "scan_with", "scan_edges_by_endpoint",
         "scan_edges_by_endpoint_projected",
@@ -559,8 +571,12 @@ gateway_surfaces! {
         "scan_with_pending_materialized_blobs", "count_rows_with_staged",
         "has_btree_index", "has_btree_index_on", "has_fts_index", "has_fts_index_on",
         "has_vector_index", "has_vector_index_on", "first_row_id_for_filter",
+        "with_external_blob_policy", "preflight_external_blob_uris",
+        "preflight_persisted_blob_selection", "prepare_keyed_write_batch_with_preflight",
+        "prepare_overwrite_blob_references_with_preflight",
         "prepare_keyed_write_batch", "validate_keyed_write_batch", "first_existing_id",
-        "materialize_blob_batch_bounded",
+        "predicted_materialized_blob_batch_bytes",
+        "materialize_blob_batch_bounded_with_preflight_cache",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
@@ -613,14 +629,16 @@ macro_rules! durable_calls {
 // manifest implementations are included; only standalone test-only sources
 // whose parent cfg is invisible to this file walker are excluded.
 durable_calls! {
+    // The `__manifest` Create write is the manifest's entire birth: entries,
+    // genesis lineage, and the internal-schema stamp all ride the one commit,
+    // so the stamp is atomic with birth and no bootstrap write follows it.
+    // (A `table_version_management` config key is deliberately not written:
+    // neither the pinned Lance substrate nor this crate reads it.)
     ("db/manifest/graph.rs", "Dataset::write(", 2, WriteProtocol::Bootstrap),
-    ("db/manifest/graph.rs", ".update_config(", 1, WriteProtocol::Bootstrap),
-    ("db/manifest/graph.rs", "stamp_current_version(", 1, WriteProtocol::Bootstrap),
     ("db/manifest/publisher.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/manifest/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),
     ("db/manifest/publisher.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest/publisher.rs", ".execute_reader(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
-    ("db/manifest/migrations.rs", ".update_schema_metadata(", 1, WriteProtocol::Bootstrap),
     ("instrumentation.rs", ".write_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".write_text_if_absent(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".write_text_if_match(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
@@ -688,12 +706,12 @@ durable_calls! {
     ("db/graph_coordinator.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/omnigraph/table_ops.rs", ".commit_updates_with_actor_with_expected(", 2, WriteProtocol::TestOnly),
-    ("db/omnigraph.rs", ".write_text_if_absent(", 1, WriteProtocol::Bootstrap),
+    ("db/omnigraph.rs", ".write_text_if_absent(", 2, WriteProtocol::Composed("bootstrap `_schema.pg` claim + bind-time create-if-absent probe")),
     ("db/omnigraph.rs", ".write_text(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".write_text(", 2, WriteProtocol::Composed("schema state publication")),
     ("db/manifest/recovery.rs", ".write_text(", 6, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/schema_apply.rs", ".write_text(", 1, SCHEMA_V9),
-    ("db/omnigraph.rs", ".delete(", 1, WriteProtocol::Bootstrap),
+    ("db/omnigraph.rs", ".delete(", 2, WriteProtocol::Composed("bootstrap init cleanup + create-if-absent probe removal")),
     ("db/schema_state.rs", ".delete(", 3, WriteProtocol::Composed("schema staging cleanup")),
     ("db/schema_state.rs", ".rename_text(", 1, WriteProtocol::Composed("schema staging promotion")),
     ("db/manifest/recovery.rs", ".delete(", 2, WriteProtocol::RecoveryExecutor),
@@ -740,10 +758,9 @@ durable_calls! {
     ("exec/merge.rs", "TableStore::create_empty_dataset(", 1, WriteProtocol::EphemeralScratch),
     ("exec/merge.rs", "TableStore::append_or_create_batch(", 1, WriteProtocol::EphemeralScratch),
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph.rs", ".into_arc()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/table_ops.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V9),
+    ("db/omnigraph/schema_apply.rs", ".dataset()", 2, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     ("db/omnigraph/optimize.rs", ".dataset()", 5, WriteProtocol::Composed("Optimize v9 planning + physical cleanup")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
@@ -787,7 +804,6 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "cleanup_old_versions(",
     ".update_config(",
     ".update_schema_metadata(",
-    "stamp_current_version(",
     "write_schema_contract_staging(",
     "promote_exact_schema_staging(",
     "discard_exact_schema_staging(",
@@ -2182,6 +2198,70 @@ fn public_snapshot_and_storage_boundaries_do_not_leak_writable_datasets() {
             }
         }
     }
+
+    let blob_contents = std::fs::read_to_string(src.join("blob.rs")).unwrap();
+    let blob = parse_rust_source(&blob_contents, "blob.rs");
+    let reader = blob.items.iter().find_map(|item| match item {
+        Item::Struct(structure) if structure.ident == "BlobReader" => Some(structure),
+        _ => None,
+    });
+    let reader = reader.expect("missing public BlobReader");
+    assert!(matches!(reader.vis, Visibility::Public(_)));
+    assert!(
+        reader
+            .fields
+            .iter()
+            .all(|field| matches!(field.vis, Visibility::Inherited)),
+        "BlobReader fields must remain private so callers cannot recover BlobFile or Dataset"
+    );
+    for item in &blob.items {
+        let Item::Impl(implementation) = item else {
+            continue;
+        };
+        for item in &implementation.items {
+            let syn::ImplItem::Fn(function) = item else {
+                continue;
+            };
+            if !matches!(function.vis, Visibility::Public(_)) {
+                continue;
+            }
+            for forbidden in ["BlobFile", "Dataset"] {
+                assert!(
+                    !return_type_contains_identifier(&function.sig.output, forbidden),
+                    "public blob facade method {} must not return raw `{forbidden}`",
+                    function.sig.ident
+                );
+            }
+        }
+    }
+    let public_blob_reader_methods = blob
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Impl(implementation)
+                if implementation.trait_.is_none()
+                    && is_named_type(&implementation.self_ty, "BlobReader") =>
+            {
+                Some(implementation)
+            }
+            _ => None,
+        })
+        .flat_map(|implementation| implementation.items.iter())
+        .filter_map(|item| match item {
+            syn::ImplItem::Fn(function) if matches!(function.vis, Visibility::Public(_)) => {
+                Some(function.sig.ident.to_string())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        public_blob_reader_methods,
+        ["is_empty", "len", "read_range"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>(),
+        "BlobReader must remain a bounded range-only facade"
+    );
 }
 
 #[test]

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::query::ast::*;
-use crate::query::typecheck::TypeContext;
+use crate::query::typecheck::{BoundVariable, TypeContext};
 use crate::types::{Direction, PropType, ScalarType};
 
 use super::*;
@@ -403,31 +403,44 @@ fn lower_clauses(
     // resolve variables introduced inside `not { }`. Bindings declare their
     // type; traversal endpoints take the edge's declared endpoint types
     // (bindings win when both name a variable).
-    let mut local_var_types: HashMap<&str, &str> = HashMap::new();
+    let mut local_bindings: HashMap<&str, BoundVariable> = HashMap::new();
     for t in &traversals {
         if let Some(edge) = catalog.lookup_edge_by_name(&t.edge_name) {
-            local_var_types
+            local_bindings
                 .entry(t.src.as_str())
-                .or_insert(&edge.from_type);
-            local_var_types
+                .or_insert_with(|| BoundVariable::Node {
+                    type_name: edge.from_type.clone(),
+                });
+            local_bindings
                 .entry(t.dst.as_str())
-                .or_insert(&edge.to_type);
+                .or_insert_with(|| BoundVariable::Node {
+                    type_name: edge.to_type.clone(),
+                });
             // An edge binding (`$p $w:knows $f`) names the edge type, whose
             // String properties are addressable in filters (`$w.note contains …`).
             if let Some(eb) = &t.edge_binding {
-                local_var_types.entry(eb.as_str()).or_insert(&edge.name);
+                local_bindings
+                    .entry(eb.as_str())
+                    .or_insert_with(|| BoundVariable::Edge {
+                        type_name: edge.name.clone(),
+                    });
             }
         }
     }
     for b in &bindings {
-        local_var_types.insert(b.variable.as_str(), b.type_name.as_str());
+        local_bindings.insert(
+            b.variable.as_str(),
+            BoundVariable::Node {
+                type_name: b.type_name.clone(),
+            },
+        );
     }
 
     // Lower explicit filters
     for filter in &filters {
         pipeline.push(IROp::Filter(IRFilter {
             left: lower_expr(&filter.left, param_names),
-            op: resolve_filter_op(catalog, type_ctx, param_types, &local_var_types, filter),
+            op: resolve_filter_op(catalog, type_ctx, param_types, &local_bindings, filter),
             right: lower_expr(&filter.right, param_names),
         }));
     }
@@ -458,28 +471,27 @@ fn lower_clauses(
     Ok(())
 }
 
-/// Whether `type_name.property` is a non-list scalar String, resolving the
-/// type through node types first and then edge types (an edge-bound variable
-/// like `$w` in `$p $w:knows $f` names an edge type, whose properties are
-/// addressable in filters).
-fn is_scalar_string_property(catalog: &Catalog, type_name: &str, property: &str) -> bool {
-    catalog
-        .node_types
-        .get(type_name)
-        .and_then(|nt| nt.properties.get(property))
-        .or_else(|| {
-            catalog
-                .lookup_edge_by_name(type_name)
-                .and_then(|et| et.properties.get(property))
-        })
-        .is_some_and(|p| !p.list && matches!(p.scalar, ScalarType::String))
+/// Whether `binding.property` is a non-list scalar String. Node and edge type
+/// namespaces are independent, so the binding discriminant selects the one
+/// catalog namespace that may define the property.
+fn is_scalar_string_property(catalog: &Catalog, binding: &BoundVariable, property: &str) -> bool {
+    match binding {
+        BoundVariable::Node { type_name } => catalog
+            .node_types
+            .get(type_name)
+            .and_then(|nt| nt.properties.get(property)),
+        BoundVariable::Edge { type_name } => catalog
+            .lookup_edge_by_name(type_name)
+            .and_then(|et| et.properties.get(property)),
+    }
+    .is_some_and(|p| !p.list && matches!(p.scalar, ScalarType::String))
 }
 
 /// Resolve the overloaded `contains` keyword to its String-substring form
 /// (`StringContains`) when the left operand is a scalar String, so execution
 /// dispatches on the IR op alone and never re-derives operand types.
 ///
-/// Variable types come from `local_var_types` (this clause list's node and
+/// Variable bindings come from `local_bindings` (this clause list's node and
 /// edge bindings + traversal endpoints) first, then the outer `TypeContext`
 /// — negation inners never reach the outer context, while outer variables
 /// referenced inside a negation only exist there.
@@ -487,23 +499,17 @@ fn resolve_filter_op(
     catalog: &Catalog,
     type_ctx: &TypeContext,
     param_types: &HashMap<String, PropType>,
-    local_var_types: &HashMap<&str, &str>,
+    local_bindings: &HashMap<&str, BoundVariable>,
     filter: &Filter,
 ) -> CompOp {
     if filter.op != CompOp::Contains {
         return filter.op;
     }
     let left_is_scalar_string = match &filter.left {
-        Expr::PropAccess { variable, property } => local_var_types
+        Expr::PropAccess { variable, property } => local_bindings
             .get(variable.as_str())
-            .copied()
-            .or_else(|| {
-                type_ctx
-                    .bindings
-                    .get(variable)
-                    .map(|bv| bv.type_name.as_str())
-            })
-            .is_some_and(|type_name| is_scalar_string_property(catalog, type_name, property)),
+            .or_else(|| type_ctx.bindings.get(variable))
+            .is_some_and(|binding| is_scalar_string_property(catalog, binding, property)),
         Expr::Literal(Literal::String(_)) => true,
         Expr::Variable(v) => param_types
             .get(v)

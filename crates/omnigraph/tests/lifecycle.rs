@@ -3,7 +3,7 @@ mod helpers;
 use std::fs;
 
 use omnigraph::db::{InitOptions, Omnigraph, ReadTarget};
-use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph_compiler::schema::parser::{parse_persisted_schema_contract, parse_schema};
 use omnigraph_compiler::{
     SchemaIR, SchemaIdentityDomain, compile_schema_shape, resolve_schema_ir, schema_ir_hash,
     schema_ir_pretty_json, schema_shape_hash, schema_shape_hash_from_ir,
@@ -13,6 +13,10 @@ use helpers::*;
 
 fn compile_shape(source: &str) -> omnigraph_compiler::SchemaShape {
     compile_schema_shape(&parse_schema(source).unwrap()).unwrap()
+}
+
+fn compile_persisted_shape(source: &str) -> omnigraph_compiler::SchemaShape {
+    compile_schema_shape(&parse_persisted_schema_contract(source).unwrap()).unwrap()
 }
 
 fn schema_state_json(ir: &SchemaIR) -> serde_json::Value {
@@ -114,6 +118,7 @@ async fn init_creates_graph() {
             dataset.schema().field("__omnigraph_stream_v1$").is_none(),
             "fresh v6 table {table_key} must not carry abandoned stream metadata"
         );
+        assert_stable_property_markers(&db, table_key).await;
     }
 
     assert!(
@@ -141,6 +146,64 @@ async fn init_creates_graph() {
     assert_eq!(
         db.catalog().node_types["Person"].key_property(),
         Some("name")
+    );
+}
+
+#[tokio::test]
+async fn open_accepts_historical_body_unique_blob_but_init_rejects_it() {
+    const BASE_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+}
+"#;
+    const HISTORICAL_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    @unique(content)
+}
+"#;
+
+    let rejected_dir = tempfile::tempdir().unwrap();
+    let rejected_uri = rejected_dir.path().to_str().unwrap();
+    let error = match Omnigraph::init(rejected_uri, HISTORICAL_SCHEMA).await {
+        Ok(_) => panic!("new init must reject body-level @unique(Blob)"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("@unique is not supported on blob property Document.content")
+    );
+
+    // Build a normal v6 root, then replace its source/accepted identity
+    // artifacts with the exact shape the pre-v0.10 parser admitted. The table
+    // identity and physical schema are unchanged; only the logical constraint
+    // differs, so this models a historical root without weakening new init.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, BASE_SCHEMA).await.unwrap();
+    let accepted = db.catalog().bound_schema_ir().unwrap().clone();
+    drop(db);
+
+    let historical_ir = resolve_schema_ir(&accepted, &compile_persisted_shape(HISTORICAL_SCHEMA))
+        .unwrap()
+        .schema_ir;
+    fs::write(dir.path().join("_schema.pg"), HISTORICAL_SCHEMA).unwrap();
+    persist_schema_contract(dir.path(), &historical_ir);
+
+    let reopened = Omnigraph::open(uri)
+        .await
+        .expect("historically admitted v6 schema must remain openable");
+    assert_eq!(reopened.schema_source().as_str(), HISTORICAL_SCHEMA);
+    assert!(
+        reopened
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .entry("node:Document")
+            .is_some()
     );
 }
 
@@ -805,4 +868,212 @@ node Task {
         !dir.path().join("_schema.ir.json").exists(),
         "rejected init must not persist a schema IR"
     );
+}
+
+/// The local backend implements create-if-absent with `hard_link(2)`, which
+/// some filesystems refuse (Android app storage, FAT/exFAT — issue #453).
+/// Read-write binds probe the capability at the graph root before any claim,
+/// migration, or Lance commit can fail mid-flight on such a filesystem.
+mod local_create_if_absent_probe {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use omnigraph::db::Omnigraph;
+    use omnigraph::error::{OmniError, Result};
+    use omnigraph::storage::{ListDirBounds, StorageAdapter, storage_for_uri};
+
+    use super::helpers;
+
+    const PROBE_FILENAME_PREFIX: &str = "__create_if_absent_probe";
+    const SENTINEL: &str = "capability probe refused by test adapter";
+
+    /// Local-adapter decorator that refuses the create-if-absent capability
+    /// probe, simulating a filesystem without hard-link support.
+    #[derive(Debug)]
+    struct ProbeRefusingAdapter {
+        inner: Arc<dyn StorageAdapter>,
+        collide_once: bool,
+        probe_attempts: AtomicUsize,
+        deleted_probe: AtomicBool,
+    }
+
+    impl ProbeRefusingAdapter {
+        fn wrap(inner: Arc<dyn StorageAdapter>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                collide_once: false,
+                probe_attempts: AtomicUsize::new(0),
+                deleted_probe: AtomicBool::new(false),
+            })
+        }
+
+        fn wrap_with_collision(inner: Arc<dyn StorageAdapter>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                collide_once: true,
+                probe_attempts: AtomicUsize::new(0),
+                deleted_probe: AtomicBool::new(false),
+            })
+        }
+
+        fn is_probe(uri: &str) -> bool {
+            uri.rsplit('/')
+                .next()
+                .is_some_and(|name| name.starts_with(PROBE_FILENAME_PREFIX))
+        }
+    }
+
+    #[async_trait]
+    impl StorageAdapter for ProbeRefusingAdapter {
+        async fn read_text(&self, uri: &str) -> Result<String> {
+            self.inner.read_text(uri).await
+        }
+
+        async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>> {
+            self.inner.read_text_if_exists(uri).await
+        }
+
+        async fn read_text_if_exists_bounded(
+            &self,
+            uri: &str,
+            max_bytes: u64,
+        ) -> Result<Option<String>> {
+            self.inner.read_text_if_exists_bounded(uri, max_bytes).await
+        }
+
+        async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+            self.inner.write_text(uri, contents).await
+        }
+
+        async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
+            if Self::is_probe(uri) {
+                let attempt = self.probe_attempts.fetch_add(1, Ordering::Relaxed);
+                if self.collide_once && attempt == 0 {
+                    return Ok(false);
+                }
+                return Err(OmniError::manifest_internal(SENTINEL));
+            }
+            self.inner.write_text_if_absent(uri, contents).await
+        }
+
+        async fn exists(&self, uri: &str) -> Result<bool> {
+            self.inner.exists(uri).await
+        }
+
+        async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
+            self.inner.rename_text(from_uri, to_uri).await
+        }
+
+        async fn delete(&self, uri: &str) -> Result<()> {
+            if Self::is_probe(uri) {
+                self.deleted_probe.store(true, Ordering::Relaxed);
+            }
+            self.inner.delete(uri).await
+        }
+
+        async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
+            self.inner.list_dir(dir_uri).await
+        }
+
+        async fn list_dir_bounded(
+            &self,
+            dir_uri: &str,
+            matching_suffix: &str,
+            bounds: ListDirBounds,
+        ) -> Result<Vec<String>> {
+            self.inner
+                .list_dir_bounded(dir_uri, matching_suffix, bounds)
+                .await
+        }
+
+        async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
+            self.inner.read_text_versioned(uri).await
+        }
+
+        async fn write_text_if_match(
+            &self,
+            uri: &str,
+            contents: &str,
+            expected_version: &str,
+        ) -> Result<Option<String>> {
+            self.inner
+                .write_text_if_match(uri, contents, expected_version)
+                .await
+        }
+
+        async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
+            self.inner.delete_prefix(prefix_uri).await
+        }
+    }
+
+    /// A read-write open on a local root runs the create-if-absent probe before any
+    /// coordinator work, and a probe failure aborts the open with that error.
+    #[tokio::test]
+    async fn read_write_open_fails_fast_when_create_if_absent_probe_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let _ = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
+
+        let adapter = ProbeRefusingAdapter::wrap(storage_for_uri(uri).unwrap());
+        let err = match Omnigraph::open_with_storage(uri, adapter).await {
+            Ok(_) => panic!("read-write open must fail when the create-if-absent probe fails"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains(SENTINEL),
+            "open must surface the probe failure, got: {err}"
+        );
+    }
+
+    /// An already-existing candidate belongs to a prior or foreign writer. It
+    /// proves nothing about this bind's hard-link capability and must neither
+    /// be accepted nor deleted; the bind retries with a fresh owned name.
+    #[tokio::test]
+    async fn read_write_open_retries_without_deleting_a_colliding_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let _ = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
+
+        let adapter = ProbeRefusingAdapter::wrap_with_collision(storage_for_uri(uri).unwrap());
+        let err = match Omnigraph::open_with_storage(uri, adapter.clone()).await {
+            Ok(_) => panic!("a colliding probe must not bypass the capability check"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains(SENTINEL),
+            "the fresh retry must surface its capability failure, got: {err}"
+        );
+        assert_eq!(
+            adapter.probe_attempts.load(Ordering::Relaxed),
+            2,
+            "the bind must retry once with a fresh candidate"
+        );
+        assert!(
+            !adapter.deleted_probe.load(Ordering::Relaxed),
+            "the bind must not delete a probe candidate it did not create"
+        );
+    }
+
+    /// The probe object is removed before the open returns; it never persists
+    /// as residue in the graph root.
+    #[tokio::test]
+    async fn read_write_open_leaves_no_probe_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let _ = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
+
+        let db = Omnigraph::open(uri).await.unwrap();
+        drop(db);
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(PROBE_FILENAME_PREFIX)
+            }),
+            "capability probe must clean up after itself"
+        );
+    }
 }
