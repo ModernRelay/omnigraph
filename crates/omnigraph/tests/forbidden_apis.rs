@@ -613,14 +613,16 @@ macro_rules! durable_calls {
 // manifest implementations are included; only standalone test-only sources
 // whose parent cfg is invisible to this file walker are excluded.
 durable_calls! {
+    // The `__manifest` Create write is the manifest's entire birth: entries,
+    // genesis lineage, and the internal-schema stamp all ride the one commit,
+    // so the stamp is atomic with birth and no bootstrap write follows it.
+    // (A `table_version_management` config key is deliberately not written:
+    // neither the pinned Lance substrate nor this crate reads it.)
     ("db/manifest/graph.rs", "Dataset::write(", 2, WriteProtocol::Bootstrap),
-    ("db/manifest/graph.rs", ".update_config(", 1, WriteProtocol::Bootstrap),
-    ("db/manifest/graph.rs", "stamp_current_version(", 1, WriteProtocol::Bootstrap),
     ("db/manifest/publisher.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/manifest/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),
     ("db/manifest/publisher.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest/publisher.rs", ".execute_reader(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
-    ("db/manifest/migrations.rs", ".update_schema_metadata(", 1, WriteProtocol::Bootstrap),
     ("instrumentation.rs", ".write_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".write_text_if_absent(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".write_text_if_match(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
@@ -787,7 +789,6 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "cleanup_old_versions(",
     ".update_config(",
     ".update_schema_metadata(",
-    "stamp_current_version(",
     "write_schema_contract_staging(",
     "promote_exact_schema_staging(",
     "discard_exact_schema_staging(",

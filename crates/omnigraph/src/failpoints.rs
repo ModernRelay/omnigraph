@@ -116,6 +116,11 @@ pub mod names {
     pub const INIT_AFTER_COORDINATOR_INIT: &str = "init.after_coordinator_init";
     pub const INIT_AFTER_SCHEMA_CONTRACT_WRITTEN: &str = "init.after_schema_contract_written";
     pub const INIT_AFTER_SCHEMA_PG_WRITTEN: &str = "init.after_schema_pg_written";
+    /// Inside `init_manifest_graph`, immediately after the `__manifest`
+    /// Create commit — the manifest's entire birth (entries, genesis lineage,
+    /// and the internal-schema stamp all ride that one commit). A crash here
+    /// must leave an openable store.
+    pub const INIT_POST_MANIFEST_CREATE: &str = "init.post_manifest_create";
     /// A read-write bind of a local graph root, before the create-if-absent
     /// probe writes its probe object. Injecting here simulates a filesystem
     /// without hard-link support (issue #453) for both `init` and

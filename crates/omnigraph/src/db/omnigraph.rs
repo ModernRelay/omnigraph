@@ -1513,7 +1513,13 @@ impl Omnigraph {
     /// version this graph is stamped at). Surfaced via `omnigraph snapshot`.
     pub async fn internal_schema_version_of(&self, target: impl Into<ReadTarget>) -> Result<u32> {
         let branch = self.resolved_branch_of(target).await?;
-        crate::db::manifest::internal_schema_stamp_at(self.uri(), branch.as_deref()).await
+        crate::db::manifest::internal_schema_stamp_at(self.uri(), branch.as_deref())
+            .await?
+            .ok_or_else(|| {
+                // Unreachable through this handle: every open path runs the
+                // stamp guard, which refuses unstamped manifests.
+                OmniError::manifest_internal("opened graph has no internal-schema stamp")
+            })
     }
 
     pub async fn resolved_branch_of(

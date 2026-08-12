@@ -1716,9 +1716,95 @@ async fn test_init_stamps_internal_schema_version() {
 
     let ds = open_manifest_dataset(uri, None).await.unwrap();
     assert_eq!(
+        ds.version().version,
+        1,
+        "fresh __manifest HEAD must be its Create commit; init must not append config or stamp commits",
+    );
+    assert_eq!(
         super::migrations::read_stamp(&ds),
-        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+        Some(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION),
         "init should stamp the manifest at the current internal schema version",
+    );
+
+    // The stamp must ride the Create commit itself — checking out manifest
+    // version one (the genesis Create write) must already show it. This is the
+    // torn-init guarantee: there is no on-disk moment where `__manifest`
+    // exists unstamped.
+    let genesis = ds.checkout_version(1).await.unwrap();
+    assert_eq!(
+        super::migrations::read_stamp(&genesis),
+        Some(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION),
+        "the stamp must land in the same Lance commit that creates __manifest",
+    );
+}
+
+// The absent-stamp arm of the open guard. An unstamped manifest that carries
+// the modern (v5+) identity columns cannot be a genuine pre-stamp v1 store,
+// but the remaining metadata cannot distinguish an init interrupted under a
+// pre-atomic-stamp binary from later metadata damage. The guard must name both
+// possibilities, fail closed, and make delete-and-re-init conditional on the
+// operator independently knowing that initialization never completed.
+#[tokio::test]
+async fn unstamped_modern_manifest_is_refused_as_interrupted_init_or_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    let mut ds = open_manifest_dataset(uri, None).await.unwrap();
+    super::migrations::remove_stamp_for_test(&mut ds)
+        .await
+        .unwrap();
+
+    let ds = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(super::migrations::read_stamp(&ds), None);
+    let err = super::migrations::guard_stamp(&ds)
+        .expect_err("an unstamped manifest must be refused")
+        .to_string();
+    assert!(
+        err.contains("interrupted `omnigraph init`")
+            && err.contains("damaged or externally modified metadata"),
+        "the refusal must name both possible causes: {err}"
+    );
+    assert!(
+        err.contains("cannot safely distinguish those cases")
+            && err.contains("If you know initialization never completed")
+            && err.contains("Otherwise preserve the root"),
+        "the refusal must fail closed and make deletion conditional: {err}"
+    );
+    assert!(
+        !err.contains("holds no committed data") && !err.contains("0.3.1"),
+        "the refusal must neither assume an empty graph nor misdiagnose it as ancient: {err}"
+    );
+}
+
+// The unreadable-stamp arm: a stamp key that is present but not a version
+// number must be refused naming the raw value — never classified as absent,
+// because an explicitly corrupt value should not flow even into the modern
+// absent-stamp arm's conditional delete advice.
+#[tokio::test]
+async fn unreadable_stamp_is_refused_without_delete_advice() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    let mut ds = open_manifest_dataset(uri, None).await.unwrap();
+    super::migrations::set_raw_stamp_for_test(&mut ds, "not-a-number")
+        .await
+        .unwrap();
+
+    let ds = open_manifest_dataset(uri, None).await.unwrap();
+    let err = super::migrations::guard_stamp(&ds)
+        .expect_err("an unreadable stamp must be refused")
+        .to_string();
+    assert!(
+        err.contains("not-a-number"),
+        "the refusal must name the raw value: {err}"
+    );
+    assert!(
+        !err.contains("Delete the graph root") && !err.contains("0.3.1"),
+        "corrupt metadata must not trigger delete advice or the ancient misdiagnosis: {err}"
     );
 }
 
@@ -1742,7 +1828,7 @@ async fn branch_inherits_main_internal_schema_stamp() {
     let feature_ds = open_manifest_dataset(uri, Some("feature")).await.unwrap();
     assert_eq!(
         super::migrations::read_stamp(&main_ds),
-        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+        Some(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION),
         "fresh graph stamps main at CURRENT",
     );
     assert_eq!(

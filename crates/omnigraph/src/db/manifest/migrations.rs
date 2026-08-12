@@ -21,8 +21,10 @@
 //! message, not silently upgraded. This is the deliberate pre-release contract —
 //! storage-format changes are a cutover, not a rolling in-place migration (see
 //! `docs/user/operations/upgrade.md` and the versioning policy in `docs/dev`).
-//! `stamp_current_version` stamps fresh graphs at CURRENT, so newly initialized
-//! graphs always pass.
+//! Fresh graphs are stamped at CURRENT *inside* the init `Dataset::write`
+//! Create commit (`current_stamp_entry` rides the write's schema metadata), so
+//! the stamp is atomic with manifest birth: no crash can leave `__manifest`
+//! durable but unstamped.
 //!
 //! ## If an in-place migration is ever needed
 //!
@@ -105,21 +107,87 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
 
 const INTERNAL_SCHEMA_VERSION_KEY: &str = "omnigraph:internal_schema_version";
 
-/// Read the on-disk stamp from `__manifest`'s schema-level metadata.
-/// Absent ⇒ v1 (pre-stamp world), which is below `MIN_SUPPORTED` and so refused.
-pub(crate) fn read_stamp(dataset: &Dataset) -> u32 {
+/// The schema-metadata entry stamping a fresh manifest at CURRENT. Folded into
+/// the Arrow schema of init's `Dataset::write` so the stamp lands in the same
+/// Lance commit that creates `__manifest` — the atomic-birth half of the
+/// torn-init fix (the other half is `guard_stamp`'s absent arm).
+pub(super) fn current_stamp_entry() -> (String, String) {
+    (
+        INTERNAL_SCHEMA_VERSION_KEY.to_string(),
+        INTERNAL_MANIFEST_SCHEMA_VERSION.to_string(),
+    )
+}
+
+/// Read the on-disk stamp from `__manifest`'s schema-level metadata for
+/// display surfaces (`omnigraph snapshot`). `None` covers both an absent key
+/// and an unparseable value; the open paths never use this — they go through
+/// `guard_stamp`, which distinguishes those shapes and refuses each with its
+/// own diagnosis instead of flooring to a version.
+pub(crate) fn read_stamp(dataset: &Dataset) -> Option<u32> {
     dataset
         .schema()
         .metadata
         .get(INTERNAL_SCHEMA_VERSION_KEY)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
 }
 
-/// Stamp a freshly-initialized manifest with the current internal schema
-/// version. Idempotent — safe to call on an already-stamped dataset.
-pub(super) async fn stamp_current_version(dataset: &mut Dataset) -> Result<()> {
-    set_stamp(dataset, INTERNAL_MANIFEST_SCHEMA_VERSION).await
+/// The single stamp gate for every open path: read the stamp and refuse
+/// anything this binary cannot serve, with an honest diagnosis for each shape.
+///
+/// - A parseable stamp — the ordinary floor/ceiling refusal
+///   (`refuse_if_stamp_unsupported`).
+/// - A stamp key whose value is not a version number — refused naming the
+///   raw value. Never classified as absent: a corrupt stamp must not flow
+///   into the delete-and-re-init advice below.
+/// - No stamp key on a manifest with the modern layout — not a genuine
+///   pre-stamp (v1) manifest, because the RFC-028 identity columns arrived at
+///   v5, after stamping began. This can be an older binary's init interrupted
+///   between the `__manifest` Create commit and its separate stamp commit, or
+///   damaged/externally modified metadata on a graph that progressed further.
+///   Those cases are indistinguishable from the remaining metadata, so the
+///   guard fails closed. Delete-and-re-init is advised only when the operator
+///   independently knows initialization never completed; otherwise the root
+///   must be preserved for investigation or recovery.
+/// - No stamp key on a pre-modern layout — the genuine pre-stamp world:
+///   treated as v1 and refused through the ordinary sub-floor message naming
+///   the 0.3.1 export path.
+pub(crate) fn guard_stamp(dataset: &Dataset) -> Result<u32> {
+    match dataset.schema().metadata.get(INTERNAL_SCHEMA_VERSION_KEY) {
+        Some(value) => match value.parse::<u32>() {
+            Ok(stamp) => {
+                refuse_if_stamp_unsupported(stamp)?;
+                Ok(stamp)
+            }
+            Err(_) => Err(OmniError::manifest(format!(
+                "__manifest carries an internal-schema stamp that is not a version \
+                 number ('{value}'). The stamp metadata may be corrupt; refusing to \
+                 open rather than guess the storage format.",
+            ))),
+        },
+        None if manifest_layout_is_modern(dataset) => Err(OmniError::manifest(
+            "__manifest has the current manifest layout but no internal-schema stamp. \
+             This may be an interrupted `omnigraph init` from an older binary, which \
+             stamped `__manifest` in a separate commit, or damaged or externally \
+             modified metadata. OmniGraph cannot safely distinguish those cases and \
+             will not open the graph. If you know initialization never completed, \
+             delete the graph root and run `omnigraph init` again. Otherwise preserve \
+             the root and investigate or restore from a known-good backup; do not \
+             reinitialize it in place.",
+        )),
+        None => {
+            refuse_if_stamp_unsupported(1)?;
+            Ok(1)
+        }
+    }
+}
+
+/// Whether `__manifest`'s schema carries the RFC-028 stable-identity columns
+/// (v5+). Distinguishes an unstamped modern manifest (possible interrupted init
+/// or metadata damage) from a genuine pre-stamp v1 store — free, since the
+/// schema is already in memory when the stamp is read.
+fn manifest_layout_is_modern(dataset: &Dataset) -> bool {
+    dataset.schema().field("stable_table_id").is_some()
+        && dataset.schema().field("table_incarnation_id").is_some()
 }
 
 /// Refuse to open a manifest whose stamp this binary cannot serve — in either
@@ -155,6 +223,7 @@ pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
     dataset
         .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY.to_string(), version.to_string())])
@@ -169,6 +238,37 @@ async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
 #[cfg(test)]
 pub(crate) async fn set_stamp_for_test(dataset: &mut Dataset, version: u32) -> Result<()> {
     set_stamp(dataset, version).await
+}
+
+/// Test-only: overwrite the internal-schema stamp with a raw (possibly
+/// non-numeric) value. Used to pin `guard_stamp`'s unreadable-stamp arm.
+#[cfg(test)]
+pub(crate) async fn set_raw_stamp_for_test(dataset: &mut Dataset, value: &str) -> Result<()> {
+    dataset
+        .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY.to_string(), value.to_string())])
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    Ok(())
+}
+
+/// Test-only: strip the internal-schema stamp entirely, synthesizing the torn
+/// state a pre-atomic-stamp binary left when init died between the `__manifest`
+/// Create commit and the stamp commit. Used to pin `guard_stamp`'s absent arm.
+#[cfg(test)]
+pub(crate) async fn remove_stamp_for_test(dataset: &mut Dataset) -> Result<()> {
+    let remaining: Vec<(String, String)> = dataset
+        .schema()
+        .metadata
+        .iter()
+        .filter(|(k, _)| k.as_str() != INTERNAL_SCHEMA_VERSION_KEY)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    dataset
+        .update_schema_metadata(remaining)
+        .replace()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    Ok(())
 }
 
 #[cfg(test)]
