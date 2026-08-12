@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.9.0"
+    "version": "0.10.0"
   },
   "paths": {
     "/graphs": {
@@ -1247,7 +1247,7 @@
           "mutations"
         ],
         "summary": "Apply a GQ mutation to a branch (canonical mutation endpoint).",
-        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.",
+        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nConditional callers use `POST /mutate/if-graph-commit`. Keeping that\ncapability on a distinct path makes rolling upgrades fail closed: an older\nserver returns 404 instead of ignoring an unknown optional header and\nmutating unconditionally.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.",
         "operationId": "cluster_mutate",
         "parameters": [
           {
@@ -1313,6 +1313,143 @@
           },
           "409": {
             "description": "Write-authority conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Keyed write exceeds the per-commit row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/mutate/if-graph-commit": {
+      "post": {
+        "tags": [
+          "mutations"
+        ],
+        "summary": "Apply a mutation only while the branch still has the required graph head.",
+        "description": "The dedicated path is the rolling-safe capability signal. Clients must not\nsend this header to `/mutate`: an older server could ignore an unknown\noptional header after executing the write.",
+        "operationId": "cluster_mutate_if_graph_commit",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Omnigraph-If-Graph-Commit",
+            "in": "header",
+            "description": "Required raw graph-head commit id. The mutation runs only while the branch's effective head still equals it.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Conditional mutation results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing, duplicate, malformed, or invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Write-authority conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Graph-commit precondition failed; the write had no effect",
             "content": {
               "application/json": {
                 "schema": {
@@ -1570,13 +1707,185 @@
         ]
       }
     },
+    "/graphs/{graph_id}/queries/{name}/if-graph-commit": {
+      "post": {
+        "tags": [
+          "queries"
+        ],
+        "summary": "Invoke one stored mutation with a required graph-head precondition.",
+        "description": "A distinct path makes support observable before any mutation runs; older\nservers return 404 instead of ignoring an unknown conditional header.",
+        "operationId": "cluster_invoke_query_if_graph_commit",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Stored mutation name (the registry key)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Omnigraph-If-Graph-Commit",
+            "in": "header",
+            "description": "Required raw graph-head commit id. The stored mutation runs only while the branch's effective head still equals it.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/InvokeStoredQueryRequest"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Stored conditional mutation result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing, duplicate, malformed, read-only, or invalid invocation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden (the inner `change` gate)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown stored mutation, or `invoke_query` denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stored mutation write-authority conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Stored mutation graph-commit precondition failed; the write had no effect",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Stored keyed mutation exceeds the per-commit row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Policy evaluation error (a denial is reported as 404, not 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A stored mutation is blocked by a durable recovery intent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs/{graph_id}/query": {
       "post": {
         "tags": [
           "queries"
         ],
         "summary": "Execute an inline read query (friendlier-named alternative to `POST /read`).",
-        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. Otherwise behaves identically to `POST /read`: same\ntarget semantics (branch xor snapshot), same Cedar action (Read),\nsame response shape.",
+        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. It shares `POST /read` target semantics (branch xor\nsnapshot) and the same Cedar action (Read), while its canonical response\nadditionally carries the pinned graph-commit token.",
         "operationId": "cluster_query",
         "parameters": [
           {
@@ -1679,11 +1988,11 @@
         },
         "responses": {
           "200": {
-            "description": "Query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)",
+            "description": "Legacy token-free query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ReadOutput"
+                  "$ref": "#/components/schemas/LegacyReadOutput"
                 }
               }
             }
@@ -2309,6 +2618,17 @@
               "$ref": "#/components/schemas/MergeConflictOutput"
             }
           },
+          "precondition_failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PreconditionFailureOutput",
+                "description": "Set when a mutation's graph-commit precondition failed\n(HTTP 412). Like `recovery_required`, the meaning rides this additive\nfield — `ErrorCode` is a closed rolling wire contract."
+              }
+            ]
+          },
           "read_set_conflict": {
             "oneOf": [
               {
@@ -2656,6 +2976,35 @@
           }
         }
       },
+      "LegacyReadOutput": {
+        "type": "object",
+        "description": "Indefinitely byte-stable response shape for the deprecated `POST /read`\nroute. The canonical [`ReadOutput`] may grow additive fields; this legacy\nenvelope deliberately cannot carry them.",
+        "required": [
+          "query_name",
+          "target",
+          "row_count",
+          "rows"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "query_name": {
+            "type": "string"
+          },
+          "row_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rows": {},
+          "target": {
+            "$ref": "#/components/schemas/ReadTargetOutput"
+          }
+        }
+      },
       "LoadMode": {
         "type": "string",
         "description": "Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.",
@@ -2783,6 +3132,24 @@
           "list"
         ]
       },
+      "PreconditionFailureOutput": {
+        "type": "object",
+        "description": "Structured details for a caller write-precondition failure: HTTP 412, a\nmutation carried `Omnigraph-If-Graph-Commit: <commit_id>`, and the branch\nhead no longer matches that id. The write had no effect; the caller re-reads\nthe branch and decides again. `actual` is `None` on a branch with no commits.",
+        "required": [
+          "expected"
+        ],
+        "properties": {
+          "actual": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected": {
+            "type": "string"
+          }
+        }
+      },
       "QueriesCatalogOutput": {
         "type": "object",
         "description": "Response for `GET /queries`: every stored query in a graph's\nregistry, each with typed parameters.",
@@ -2892,6 +3259,13 @@
             "items": {
               "type": "string"
             }
+          },
+          "graph_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Effective graph head commit id of the exact snapshot this read was\nserved from. On a fresh named branch this is the inherited source head,\nso it is immediately usable as `Omnigraph-If-Graph-Commit` (CLI:\n`--if-commit`) for the branch's first conditional write. The id and rows\ncome from one pinned version, so no separate id fetch is needed."
           },
           "query_name": {
             "type": "string"

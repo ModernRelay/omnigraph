@@ -33,23 +33,21 @@ datafusion-common = "54"
 datafusion-expr = "54"
 datafusion-functions-aggregate = "54"
 
-# Lance 9.0.0 (crates.io). The 9.x prereleases were git-tags only, so this
-# workspace rev-pinned `v9.0.0-rc.1` (cec0b7df) until the stable release
-# landed on 2026-07-24; registry versions retire that git pin and restore
-# ordinary publishability. Carries lance#7480 (rowid overlap, closes #7444 ->
-# vendor pin retired) and lance#7320 (BTREE segment-merge, closes #7230).
-# See docs/dev/lance.md.
-lance = { version = "9.0.0", default-features = false, features = ["aws"] }
-lance-core = "9.0.0"
+# Lance 10.0.0 (crates.io). This closes the stable-row-id delete/index,
+# stale-index-coverage, and Blob null/empty correctness gaps carried by the
+# 9.0.0 pin. Its ordered-coalesce fix remains locally fenced for late payload
+# hydration; see docs/dev/lance.md.
+lance = { version = "10.0.0", default-features = false, features = ["aws"] }
+lance-core = "10.0.0"
 # RowAddrTreeMap moved from lance-core::utils::mask to the new lance-select crate in 9.x.
-lance-select = "9.0.0"
-lance-datafusion = "9.0.0"
-lance-file = "9.0.0"
-lance-index = "9.0.0"
-lance-linalg = "9.0.0"
-lance-namespace = "9.0.0"
-lance-namespace-impls = "9.0.0"
-lance-table = "9.0.0"
+lance-select = "10.0.0"
+lance-datafusion = "10.0.0"
+lance-file = "10.0.0"
+lance-index = "10.0.0"
+lance-linalg = "10.0.0"
+lance-namespace = "10.0.0"
+lance-namespace-impls = "10.0.0"
+lance-table = "10.0.0"
 
 ulid = "1"
 futures = "0.3"

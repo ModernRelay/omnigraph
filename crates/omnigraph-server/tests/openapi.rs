@@ -170,8 +170,10 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/export",
     "/graphs/{graph_id}/change",
     "/graphs/{graph_id}/mutate",
+    "/graphs/{graph_id}/mutate/if-graph-commit",
     "/graphs/{graph_id}/queries",
     "/graphs/{graph_id}/queries/{name}",
+    "/graphs/{graph_id}/queries/{name}/if-graph-commit",
     "/graphs/{graph_id}/schema",
     "/graphs/{graph_id}/schema/apply",
     "/graphs/{graph_id}/load",
@@ -261,6 +263,37 @@ fn openapi_change_is_post() {
 fn openapi_mutate_is_post() {
     let doc = openapi_json();
     assert!(doc["paths"]["/graphs/{graph_id}/mutate"]["post"].is_object());
+}
+
+#[test]
+fn openapi_conditional_mutation_routes_are_post() {
+    let doc = openapi_json();
+    assert!(doc["paths"]["/graphs/{graph_id}/mutate/if-graph-commit"]["post"].is_object());
+    assert!(doc["paths"]["/graphs/{graph_id}/queries/{name}/if-graph-commit"]["post"].is_object());
+    for path in [
+        "/graphs/{graph_id}/mutate/if-graph-commit",
+        "/graphs/{graph_id}/queries/{name}/if-graph-commit",
+    ] {
+        let parameters = doc["paths"][path]["post"]["parameters"].as_array().unwrap();
+        let header = parameters
+            .iter()
+            .find(|parameter| parameter["name"] == "Omnigraph-If-Graph-Commit")
+            .unwrap_or_else(|| panic!("{path} must declare its capability header"));
+        assert_eq!(header["in"], "header");
+        assert_eq!(header["required"], true);
+    }
+    for path in [
+        "/graphs/{graph_id}/mutate",
+        "/graphs/{graph_id}/queries/{name}",
+    ] {
+        let parameters = doc["paths"][path]["post"]["parameters"].as_array().unwrap();
+        assert!(
+            parameters
+                .iter()
+                .all(|parameter| parameter["name"] != "Omnigraph-If-Graph-Commit"),
+            "{path} must not advertise an unsafe optional CAS header"
+        );
+    }
 }
 
 // Deprecation flagging — `/read` and `/change` are kept indefinitely for
@@ -836,6 +869,8 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/graphs/{graph_id}/schema/apply", "post"),
         ("/graphs/{graph_id}/queries", "get"),
         ("/graphs/{graph_id}/queries/{name}", "post"),
+        ("/graphs/{graph_id}/mutate/if-graph-commit", "post"),
+        ("/graphs/{graph_id}/queries/{name}/if-graph-commit", "post"),
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/load/ndjson", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
@@ -961,15 +996,27 @@ fn openapi_operations_have_tags() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn read_endpoint_200_references_read_output_schema() {
+fn read_endpoint_200_references_legacy_read_output_schema() {
     let doc = openapi_json();
     let content = &doc["paths"]["/graphs/{graph_id}/read"]["post"]["responses"]["200"]["content"];
     let schema = &content["application/json"]["schema"];
     let ref_path = schema["$ref"].as_str().unwrap();
     assert!(
-        ref_path.contains("ReadOutput"),
-        "POST /read 200 should reference ReadOutput, got {ref_path}"
+        ref_path.contains("LegacyReadOutput"),
+        "POST /read 200 should reference LegacyReadOutput, got {ref_path}"
     );
+}
+
+#[test]
+fn legacy_read_output_schema_cannot_carry_graph_commit_id() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["LegacyReadOutput"];
+    let props = schema["properties"].as_object().unwrap();
+    assert!(props.contains_key("query_name"));
+    assert!(props.contains_key("target"));
+    assert!(props.contains_key("row_count"));
+    assert!(props.contains_key("rows"));
+    assert!(!props.contains_key("graph_commit_id"));
 }
 
 #[test]
@@ -1024,7 +1071,9 @@ fn recovery_barrier_write_endpoints_document_recovery_required() {
     for (path, method) in [
         ("/graphs/{graph_id}/change", "post"),
         ("/graphs/{graph_id}/mutate", "post"),
+        ("/graphs/{graph_id}/mutate/if-graph-commit", "post"),
         ("/graphs/{graph_id}/queries/{name}", "post"),
+        ("/graphs/{graph_id}/queries/{name}/if-graph-commit", "post"),
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/load/ndjson", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
@@ -1051,7 +1100,9 @@ fn bounded_keyed_write_endpoints_document_resource_limit() {
     for (path, method) in [
         ("/graphs/{graph_id}/change", "post"),
         ("/graphs/{graph_id}/mutate", "post"),
+        ("/graphs/{graph_id}/mutate/if-graph-commit", "post"),
         ("/graphs/{graph_id}/queries/{name}", "post"),
+        ("/graphs/{graph_id}/queries/{name}/if-graph-commit", "post"),
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/load/ndjson", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
@@ -1292,7 +1343,9 @@ const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/export",
     "/graphs/{graph_id}/change",
+    "/graphs/{graph_id}/mutate/if-graph-commit",
     "/graphs/{graph_id}/schema",
+    "/graphs/{graph_id}/queries/{name}/if-graph-commit",
     "/graphs/{graph_id}/schema/apply",
     "/graphs/{graph_id}/load",
     "/graphs/{graph_id}/load/ndjson",
@@ -1567,8 +1620,10 @@ async fn served_spec_always_nests_under_cluster_prefix() {
         "/export",
         "/change",
         "/mutate",
+        "/mutate/if-graph-commit",
         "/queries",
         "/queries/{name}",
+        "/queries/{name}/if-graph-commit",
         "/schema",
         "/schema/apply",
         "/load",

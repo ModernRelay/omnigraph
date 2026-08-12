@@ -37,7 +37,7 @@ retained `(base_version, source_version]` chain verifies:
   has a UUID, reads exactly the previous version, and carries the exact v1
   property;
 - every link is a pure insertion-only `Operation::Update`: no removed or
-  updated fragments, modified fields, merged generations, or updated-fragment
+  updated fragments, modified fields, `compacted_sstables`, or updated-fragment
   offsets; at least one new fragment; `RewriteRows` mode; and an inserted-row
   filter over exactly the physical `id` field ID;
 - `fields_for_preserving_frag_bitmap` equals the source schema's **full nested

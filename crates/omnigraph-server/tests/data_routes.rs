@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{HeaderValue, Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph_server::api::{
@@ -1050,6 +1050,17 @@ async fn read_endpoint_emits_deprecation_headers() {
         Some("<query>; rel=\"successor-version\""),
         "POST /read must point at /query via `Link` rel=successor-version (RFC 8288)"
     );
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        body_bytes.as_ref(),
+        br#"{"query_name":"get_person","target":{"branch":"main","snapshot":null},"row_count":1,"columns":["p.name","p.age"],"rows":[{"p.name":"Alice","p.age":30}]}"#,
+        "POST /read's legacy response bytes are an indefinite compatibility contract"
+    );
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(
+        body.get("graph_commit_id").is_none(),
+        "POST /read has an indefinite byte-stable body contract and must not gain the canonical route's graph_commit_id: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1083,6 +1094,12 @@ async fn query_endpoint_does_not_emit_deprecation_headers() {
     assert!(
         response.headers().get("deprecation").is_none(),
         "POST /query is canonical and must not advertise itself as deprecated"
+    );
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        body["graph_commit_id"].as_str().is_some(),
+        "POST /query must expose the pinned graph-commit token used by conditional writes: {body}"
     );
 }
 
@@ -2062,4 +2079,317 @@ async fn ingest_per_actor_admission_cap_returns_429() {
             results[*i].1,
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mutate_graph_commit_precondition_issue_365() {
+    // GitHub #365: `Omnigraph-If-Graph-Commit: <commit_id>` makes `mutate` a
+    // single-round-trip compare-and-swap. A caller that read the branch at
+    // head X must be rejected atomically (412, structured
+    // `precondition_failure`, zero effect) once the head has advanced past
+    // X; a precondition naming the current head passes.
+    fn mutate_request(body: &Value, expected_commit: Option<&str>) -> Request<Body> {
+        let path = if expected_commit.is_some() {
+            "/mutate/if-graph-commit"
+        } else {
+            "/mutate"
+        };
+        let mut builder = Request::builder()
+            .uri(g(path))
+            .method(Method::POST)
+            .header("content-type", "application/json");
+        if let Some(commit_id) = expected_commit {
+            builder = builder.header("omnigraph-if-graph-commit", commit_id);
+        }
+        builder
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+    async fn alice_age(app: &axum::Router) -> Value {
+        let (status, out) = json_response(
+            app,
+            Request::builder()
+                .uri(g("/query"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "query": FIND_PERSON_GQ,
+                        "params": { "name": "Alice" },
+                        "branch": "main",
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        out["rows"][0]["p.age"].clone()
+    }
+    async fn head_commit_id(app: &axum::Router) -> String {
+        let (status, out) = json_response(
+            app,
+            Request::builder()
+                .uri(g("/commits?branch=main"))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        out["commits"]
+            .as_array()
+            .expect("commit list")
+            .iter()
+            .max_by_key(|commit| commit["manifest_version"].as_u64().unwrap())
+            .expect("loaded graph has at least one commit")["graph_commit_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    let (_temp, app) = app_for_loaded_graph().await;
+    let stale_head = head_commit_id(&app).await;
+
+    let conditional_body = json!({
+        "query": MUTATION_QUERIES,
+        "name": "set_age",
+        "params": { "name": "Alice", "age": 77 },
+        "branch": "main",
+    });
+    let (status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/mutate/if-graph-commit"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the conditional capability route must require its header"
+    );
+    for invalid in ["W/\"weak\"", "\"quoted\"", "one,two"] {
+        let (status, _) = json_response(
+            &app,
+            Request::builder()
+                .uri(g("/mutate/if-graph-commit"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .header("omnigraph-if-graph-commit", invalid)
+                .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "entity-tag/list syntax must be refused: {invalid}"
+        );
+    }
+    let mut duplicate = Request::builder()
+        .uri(g("/mutate/if-graph-commit"))
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+        .unwrap();
+    duplicate.headers_mut().append(
+        "omnigraph-if-graph-commit",
+        HeaderValue::from_static("first"),
+    );
+    duplicate.headers_mut().append(
+        "omnigraph-if-graph-commit",
+        HeaderValue::from_static("second"),
+    );
+    let (status, _) = json_response(&app, duplicate).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "duplicate graph-head preconditions must be refused"
+    );
+    let (status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/mutate"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .header("omnigraph-if-graph-commit", &stale_head)
+            .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the ordinary mutation route must refuse an unsafe optional CAS header"
+    );
+    assert_eq!(alice_age(&app).await, 30, "both refusals are pre-effect");
+
+    // Writer A claims first (plain mutate) — the head advances past the
+    // commit both writers read.
+    let (status, body) = json_response(
+        &app,
+        mutate_request(
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "set_age",
+                "params": { "name": "Alice", "age": 31 },
+                "branch": "main",
+            }),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "writer A's plain mutate: {body}");
+
+    // Writer B lost the race: its precondition names the now-stale head, so
+    // the store must reject before any effect.
+    let (status, body) = json_response(
+        &app,
+        mutate_request(
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "set_age",
+                "params": { "name": "Alice", "age": 52 },
+                "branch": "main",
+            }),
+            Some(&stale_head),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PRECONDITION_FAILED,
+        "stale graph-commit precondition must be rejected with 412, got {status}: {body}"
+    );
+    let error: ErrorOutput = serde_json::from_value(body).unwrap();
+    // code stays None: closed wire contract (`recovery_required` precedent).
+    assert_eq!(error.code, None);
+    let failure = error
+        .precondition_failure
+        .expect("412 body must carry structured precondition_failure details");
+    assert_eq!(failure.expected, stale_head);
+    let current_head = head_commit_id(&app).await;
+    assert_eq!(failure.actual.as_deref(), Some(current_head.as_str()));
+    assert!(error.read_set_conflict.is_none());
+
+    // The rejected write had no effect: writer A's claim survives.
+    assert_eq!(alice_age(&app).await, 31);
+
+    // The read response itself carries the graph commit id of the snapshot
+    // the rows came from, so the caller needs no separate id fetch.
+    let (status, read_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/query"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "query": FIND_PERSON_GQ,
+                    "params": { "name": "Alice" },
+                    "branch": "main",
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let welded_id = read_body["graph_commit_id"]
+        .as_str()
+        .expect("read response must carry the snapshot's graph_commit_id")
+        .to_string();
+    assert_eq!(
+        welded_id, current_head,
+        "the read's id must equal the branch head it was served from"
+    );
+
+    // A precondition naming the CURRENT head passes — the CAS succeeds in a
+    // single round trip, using the id the read itself supplied.
+    let (status, body) = json_response(
+        &app,
+        mutate_request(
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "set_age",
+                "params": { "name": "Alice", "age": 33 },
+                "branch": "main",
+            }),
+            Some(&welded_id),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "graph-commit precondition naming the current head must pass: {body}"
+    );
+    assert_eq!(alice_age(&app).await, 33);
+
+    // A newly forked branch has no branch-owned graph-head row yet. Its read
+    // response must nevertheless expose main's inherited effective head — the
+    // same value the engine compares for the branch's conditional first write.
+    let inherited_head = head_commit_id(&app).await;
+    let create = BranchCreateRequest {
+        from: Some("main".to_string()),
+        name: "fresh-cas".to_string(),
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create fresh CAS branch: {body}");
+
+    let (status, fresh_read) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/query"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "query": FIND_PERSON_GQ,
+                    "params": { "name": "Alice" },
+                    "branch": "fresh-cas",
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "read fresh CAS branch: {fresh_read}"
+    );
+    assert_eq!(fresh_read["graph_commit_id"], json!(inherited_head));
+
+    let (status, body) = json_response(
+        &app,
+        mutate_request(
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "set_age",
+                "params": { "name": "Alice", "age": 35 },
+                "branch": "fresh-cas",
+            }),
+            Some(&inherited_head),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "fresh branch must accept its read token on the first write: {body}"
+    );
 }

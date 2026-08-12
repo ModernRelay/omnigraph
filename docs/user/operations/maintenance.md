@@ -15,7 +15,11 @@
 - **Uncovered drift is skipped, not interpreted.** If a table's underlying version is ahead of the version recorded in `__manifest` and no crash-recovery record covers that movement, `optimize` reports `skipped: DriftNeedsRepair` with the manifest/head versions and leaves the table untouched. Run `omnigraph repair` to classify the drift. Verified maintenance can be explicitly published; suspicious or unverifiable movement requires deliberate `--force --confirm` after review, or restoration/rebuild from a verified export or backup.
 - Bounded by `OMNIGRAPH_MAINTENANCE_CONCURRENCY` (default 8).
 - Returns per-table stats: `table_key, fragments_removed, fragments_added, committed, skipped, manifest_version, lance_head_version, pending_indexes` (the last lists any declared `@index` column the reconciler could not build this run, with the reason — e.g. a vector column with no trainable vectors yet).
-- **Blob tables use the normal compaction and reindex path.** Lance 8.0.0+ supports blob-v2 compaction, so OmniGraph no longer has a blob-specific skip or capability gate. Fragment reclamation and index-coverage repair therefore apply to blob-bearing tables like every other table.
+- **Blob tables use the normal compaction and reindex path.** Lance 10.0.0
+  preserves null, valid-empty, and non-empty Blob-v2 values through compaction,
+  so OmniGraph has no blob-specific skip or capability gate. Fragment
+  reclamation and index-coverage repair therefore apply to blob-bearing tables
+  like every other table.
 
 ## `repair` — explicit
 

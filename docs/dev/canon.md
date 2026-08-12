@@ -3,7 +3,7 @@
 **Audience:** maintainers, contributors, and coding agents — internal
 **Type:** narrative reference ("the book"), read top-to-bottom
 **Status:** living document
-**Surveyed:** OmniGraph 0.9.0 development (`main`); Lance 9.0.0; internal manifest schema v6
+**Surveyed:** OmniGraph 0.10.0 development (`main`); Lance 10.0.0; internal manifest schema v6
 
 ---
 
@@ -216,7 +216,7 @@ CLI (omnigraph)        HTTP Server (omnigraph-server: Axum + Cedar + admission)
            storage boundary     sealed TableStorage (staged writes only) +
                       │         read-only snapshot facade
                       ▼
-           Lance 9.x            columnar Arrow, per-dataset versions/branches,
+           Lance 10.x           columnar Arrow, per-dataset versions/branches,
                       │         BTREE/FTS/vector indexes, merge_insert, compaction
                       ▼
            object store         local FS · S3 · RustFS · MinIO · S3-compatible
@@ -250,7 +250,7 @@ them:
 OmniGraph's relationship with Lance is a *contract*, managed like one:
 
 - **Pinned, audited versions.** The engine pins one Lance version
-  (currently 9.0.0 stable from crates.io; the git-pin era ended 2026-07-25).
+  (currently 10.0.0 stable from crates.io).
   Every bump gets a full alignment audit — all intervening upstream commits
   reviewed, findings recorded in [lance.md](lance.md)'s dated audit stanzas.
   History has justified the paranoia: audits have caught a default flip that

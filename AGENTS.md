@@ -16,9 +16,9 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
-**Version surveyed:** 0.9.0
+**Version surveyed:** 0.10.0
 **Workspace crates:** `omnigraph-compiler`, `omnigraph-storage` (shared control-object storage), `omnigraph` (engine), `omnigraph-policy`, `omnigraph-api-types` (shared HTTP wire DTOs), `omnigraph-cluster`, `omnigraph-cli`, `omnigraph-server`
-**Storage substrate:** Lance 9.0.0 (columnar, versioned, branchable; crates.io release — the 9.x git-rev pin era ended 2026-07-25)
+**Storage substrate:** Lance 10.0.0 (columnar, versioned, branchable; crates.io release)
 **License:** MIT
 **Toolchain:** Rust stable, edition 2024
 
@@ -67,7 +67,7 @@ CLI (omnigraph)        HTTP Server (omnigraph-server, Axum)
            omnigraph (engine)  ── ManifestCoordinator, CommitGraph, GraphIndex (CSR/CSC), exec
                       │
                       ▼
-              Lance 9.x         ── columnar Arrow, fragments, per-dataset versions/branches, indexes
+              Lance 10.x        ── columnar Arrow, fragments, per-dataset versions/branches, indexes
                       │
                       ▼
         Object store (file / s3 / RustFS / MinIO / S3-compat)

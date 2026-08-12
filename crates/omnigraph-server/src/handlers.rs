@@ -508,7 +508,7 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
     operation_id = "read",
     request_body = ReadRequest,
     responses(
-        (status = 200, description = "Query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)", body = ReadOutput),
+        (status = 200, description = "Legacy token-free query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)", body = LegacyReadOutput),
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
@@ -531,8 +531,8 @@ pub(crate) async fn server_read(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<ReadRequest>,
-) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ReadOutput>), ApiError> {
-    let (selected_name, target, result) = run_query(
+) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<LegacyReadOutput>), ApiError> {
+    let (selected_name, target, result, _graph_commit_id) = run_query(
         handle,
         actor.as_ref().map(|Extension(actor)| actor),
         &request.query_source,
@@ -545,7 +545,10 @@ pub(crate) async fn server_read(
     .await?;
     Ok((
         deprecation_headers("<query>; rel=\"successor-version\""),
-        Json(api::read_output(selected_name, &target, result)),
+        // `/read` has an indefinite byte-stable response contract. The
+        // canonical `/query` route exposes the additive graph-commit token;
+        // omitting it here preserves the legacy JSON body exactly.
+        Json(api::read_output(selected_name, &target, result, None).into()),
     ))
 }
 
@@ -569,15 +572,15 @@ pub(crate) async fn server_read(
 /// names (`query`, `name`) match the CLI `-e` flag and the GQ `query`
 /// keyword. Mutations (`insert`/`update`/`delete`) are rejected with 400
 /// -- use `POST /mutate` (or its deprecated alias `POST /change`) for
-/// write queries. Otherwise behaves identically to `POST /read`: same
-/// target semantics (branch xor snapshot), same Cedar action (Read),
-/// same response shape.
+/// write queries. It shares `POST /read` target semantics (branch xor
+/// snapshot) and the same Cedar action (Read), while its canonical response
+/// additionally carries the pinned graph-commit token.
 pub(crate) async fn server_query(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<QueryRequest>,
 ) -> std::result::Result<Json<ReadOutput>, ApiError> {
-    let (selected_name, target, result) = run_query(
+    let (selected_name, target, result, graph_commit_id) = run_query(
         handle,
         actor.as_ref().map(|Extension(actor)| actor),
         &request.query,
@@ -588,7 +591,12 @@ pub(crate) async fn server_query(
         true, // /query is read-only; reject mutations
     )
     .await?;
-    Ok(Json(api::read_output(selected_name, &target, result)))
+    Ok(Json(api::read_output(
+        selected_name,
+        &target,
+        result,
+        graph_commit_id,
+    )))
 }
 
 #[utoipa::path(
@@ -689,6 +697,71 @@ pub(crate) async fn server_export(
         .into_response())
 }
 
+/// Parse a mutation's graph-head precondition, if present.
+///
+/// `Omnigraph-If-Graph-Commit` deliberately carries one raw graph commit id,
+/// not an HTTP entity tag. Keeping this graph-level CAS off `If-Match`
+/// preserves the standard header for representation-specific strong ETags
+/// (including the blob-cell contract). Duplicate values and entity-tag syntax
+/// are rejected rather than silently reinterpreted.
+fn graph_commit_expected_head(
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<Option<String>, ApiError> {
+    let mut values = headers
+        .get_all(api::GRAPH_COMMIT_PRECONDITION_HEADER)
+        .iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ApiError::bad_request(
+            "Omnigraph-If-Graph-Commit must be sent exactly once",
+        ));
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::bad_request("Omnigraph-If-Graph-Commit is not valid UTF-8"))?
+        .trim();
+    if value.is_empty() {
+        return Err(ApiError::bad_request(
+            "Omnigraph-If-Graph-Commit must name a graph commit id",
+        ));
+    }
+    if value == "*"
+        || value.starts_with("W/")
+        || value.starts_with('"')
+        || value.ends_with('"')
+        || value.contains(',')
+    {
+        return Err(ApiError::bad_request(
+            "Omnigraph-If-Graph-Commit must contain one raw graph commit id, not entity-tag syntax",
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn require_graph_commit_expected_head(
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<String, ApiError> {
+    graph_commit_expected_head(headers)?.ok_or_else(|| {
+        ApiError::bad_request(
+            "Omnigraph-If-Graph-Commit is required on this conditional mutation route",
+        )
+    })
+}
+
+fn reject_graph_commit_expected_head(
+    headers: &axum::http::HeaderMap,
+    conditional_path: &str,
+) -> std::result::Result<(), ApiError> {
+    if headers.contains_key(api::GRAPH_COMMIT_PRECONDITION_HEADER) {
+        return Err(ApiError::bad_request(format!(
+            "Omnigraph-If-Graph-Commit requires the fail-closed conditional route {conditional_path}"
+        )));
+    }
+    Ok(())
+}
+
 /// Shared implementation behind `POST /mutate` (canonical) and
 /// `POST /change` (deprecated alias). Returns the bare `ChangeOutput`;
 /// each route handler wraps it (the alias also attaches Deprecation
@@ -707,6 +780,7 @@ pub(crate) async fn run_mutate(
     name: Option<&str>,
     params_json: Option<&Value>,
     branch: String,
+    expected_head: Option<&str>,
 ) -> std::result::Result<ChangeOutput, ApiError> {
     let actor_arc = actor
         .map(|a| Arc::clone(&a.actor_id))
@@ -738,9 +812,16 @@ pub(crate) async fn run_mutate(
 
     let result = {
         let db = &handle.engine;
-        db.mutate_as(&branch, query, &selected_name, &params, actor_id)
-            .await
-            .map_err(ApiError::from_omni)?
+        db.mutate_as_with_expected_head(
+            &branch,
+            query,
+            &selected_name,
+            &params,
+            actor_id,
+            expected_head,
+        )
+        .await
+        .map_err(ApiError::from_omni)?
     };
     Ok(ChangeOutput {
         branch,
@@ -772,7 +853,15 @@ pub(crate) async fn run_query(
     branch: Option<String>,
     snapshot: Option<String>,
     reject_mutations: bool,
-) -> std::result::Result<(String, ReadTarget, omnigraph_compiler::result::QueryResult), ApiError> {
+) -> std::result::Result<
+    (
+        String,
+        ReadTarget,
+        omnigraph_compiler::result::QueryResult,
+        Option<String>,
+    ),
+    ApiError,
+> {
     if branch.is_some() && snapshot.is_some() {
         return Err(ApiError::bad_request(
             "request may specify branch or snapshot, not both",
@@ -812,13 +901,13 @@ pub(crate) async fn run_query(
     let params = query_params_from_json(&query_decl.params, params_json)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    let result = {
+    let (result, graph_commit_id) = {
         let db = &handle.engine;
-        db.query(target.clone(), query, &selected_name, &params)
+        db.query_with_head(target.clone(), query, &selected_name, &params)
             .await
             .map_err(ApiError::from_omni)?
     };
-    Ok((selected_name, target, result))
+    Ok((selected_name, target, result, graph_commit_id))
 }
 
 #[utoipa::path(
@@ -853,8 +942,10 @@ pub(crate) async fn server_change(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ChangeOutput>), ApiError> {
+    reject_graph_commit_expected_head(&headers, "/mutate/if-graph-commit")?;
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     let output = run_mutate(
         state,
@@ -864,6 +955,7 @@ pub(crate) async fn server_change(
         request.name.as_deref(),
         request.params.as_ref(),
         branch,
+        None,
     )
     .await?;
     Ok((
@@ -898,14 +990,21 @@ pub(crate) async fn server_change(
 /// mutations may still acquire locks briefly. Returns 409 when the prepared
 /// write authority changes before effects.
 ///
+/// Conditional callers use `POST /mutate/if-graph-commit`. Keeping that
+/// capability on a distinct path makes rolling upgrades fail closed: an older
+/// server returns 404 instead of ignoring an unknown optional header and
+/// mutating unconditionally.
+///
 /// Pairs with `POST /query` (read-only). The legacy `POST /change` route
 /// has identical semantics and is kept as a deprecated alias.
 pub(crate) async fn server_mutate(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
+    reject_graph_commit_expected_head(&headers, "/mutate/if-graph-commit")?;
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     Ok(Json(
         run_mutate(
@@ -916,6 +1015,58 @@ pub(crate) async fn server_mutate(
             request.name.as_deref(),
             request.params.as_ref(),
             branch,
+            None,
+        )
+        .await?,
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/mutate/if-graph-commit",
+    tag = "mutations",
+    operation_id = "mutate_if_graph_commit",
+    request_body = ChangeRequest,
+    params(
+        ("Omnigraph-If-Graph-Commit" = String, Header, description = "Required raw graph-head commit id. The mutation runs only while the branch's effective head still equals it."),
+    ),
+    responses(
+        (status = 200, description = "Conditional mutation results", body = ChangeOutput),
+        (status = 400, description = "Missing, duplicate, malformed, or invalid request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict", body = ErrorOutput),
+        (status = 412, description = "Graph-commit precondition failed; the write had no effect", body = ErrorOutput),
+        (status = 413, description = "Keyed write exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Apply a mutation only while the branch still has the required graph head.
+///
+/// The dedicated path is the rolling-safe capability signal. Clients must not
+/// send this header to `/mutate`: an older server could ignore an unknown
+/// optional header after executing the write.
+pub(crate) async fn server_mutate_if_graph_commit(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<ChangeRequest>,
+) -> std::result::Result<Json<ChangeOutput>, ApiError> {
+    let expected_head = require_graph_commit_expected_head(&headers)?;
+    let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    Ok(Json(
+        run_mutate(
+            state,
+            handle,
+            actor.as_ref().map(|Extension(actor)| actor),
+            &request.query,
+            request.name.as_deref(),
+            request.params.as_ref(),
+            branch,
+            Some(&expected_head),
         )
         .await?,
     ))
@@ -945,7 +1096,9 @@ pub(crate) fn parse_optional_invoke_body(
     path = "/queries/{name}",
     tag = "queries",
     operation_id = "invoke_query",
-    params(("name" = String, Path, description = "Stored query name (the registry key)")),
+    params(
+        ("name" = String, Path, description = "Stored query name (the registry key)"),
+    ),
     request_body = Option<InvokeStoredQueryRequest>,
     responses(
         (status = 200, description = "Read envelope (ReadOutput) or mutation envelope (ChangeOutput), serialized untagged", body = InvokeStoredQueryResponse),
@@ -977,7 +1130,61 @@ pub(crate) async fn server_invoke_query(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
+) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
+    reject_graph_commit_expected_head(&headers, &format!("/queries/{name}/if-graph-commit"))?;
+    invoke_stored_query(state, handle, actor, name, body, None).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/queries/{name}/if-graph-commit",
+    tag = "queries",
+    operation_id = "invoke_query_if_graph_commit",
+    params(
+        ("name" = String, Path, description = "Stored mutation name (the registry key)"),
+        ("Omnigraph-If-Graph-Commit" = String, Header, description = "Required raw graph-head commit id. The stored mutation runs only while the branch's effective head still equals it."),
+    ),
+    request_body = Option<InvokeStoredQueryRequest>,
+    responses(
+        (status = 200, description = "Stored conditional mutation result", body = ChangeOutput),
+        (status = 400, description = "Missing, duplicate, malformed, read-only, or invalid invocation", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden (the inner `change` gate)", body = ErrorOutput),
+        (status = 404, description = "Unknown stored mutation, or `invoke_query` denied", body = ErrorOutput),
+        (status = 409, description = "Stored mutation write-authority conflict", body = ErrorOutput),
+        (status = 412, description = "Stored mutation graph-commit precondition failed; the write had no effect", body = ErrorOutput),
+        (status = 413, description = "Stored keyed mutation exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
+        (status = 503, description = "A stored mutation is blocked by a durable recovery intent", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Invoke one stored mutation with a required graph-head precondition.
+///
+/// A distinct path makes support observable before any mutation runs; older
+/// servers return 404 instead of ignoring an unknown conditional header.
+pub(crate) async fn server_invoke_query_if_graph_commit(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Path(QueryNamePath { name }): Path<QueryNamePath>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
+    let expected_head = require_graph_commit_expected_head(&headers)?;
+    invoke_stored_query(state, handle, actor, name, body, Some(expected_head)).await
+}
+
+async fn invoke_stored_query(
+    state: AppState,
+    handle: Arc<GraphHandle>,
+    actor: Option<Extension<ResolvedActor>>,
+    name: String,
+    body: Bytes,
+    expected_head: Option<String>,
 ) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
     let req = parse_optional_invoke_body(body)?;
     // A caller without `invoke_query` can't tell a denial from a missing
@@ -1061,11 +1268,17 @@ pub(crate) async fn server_invoke_query(
             Some(&query_name),
             req.params.as_ref(),
             branch,
+            expected_head.as_deref(),
         )
         .await?;
         Ok(Json(InvokeStoredQueryResponse::Change(output)))
     } else {
-        let (selected, target, result) = run_query(
+        if expected_head.is_some() {
+            return Err(ApiError::bad_request(
+                "the graph-commit conditional route applies only to stored mutations",
+            ));
+        }
+        let (selected, target, result, graph_commit_id) = run_query(
             handle,
             actor_ref,
             &source,
@@ -1077,7 +1290,10 @@ pub(crate) async fn server_invoke_query(
         )
         .await?;
         Ok(Json(InvokeStoredQueryResponse::Read(api::read_output(
-            selected, &target, result,
+            selected,
+            &target,
+            result,
+            graph_commit_id,
         ))))
     }
 }

@@ -144,6 +144,12 @@ pub(crate) struct WriteTxn {
     /// forked named branch whose materialized `graph_head:<branch>` row is
     /// intentionally absent.
     pub(crate) effective_graph_head: Option<String>,
+    /// Optional caller compare-and-swap token for this mutation attempt.
+    /// Unlike the internal authority token, a mismatch is terminal and must
+    /// surface as `PreconditionFailed`; it is re-evaluated from fresh authority
+    /// under the pre-effect gates so update/delete behavior cannot depend on
+    /// the engine's internal reprepare policy.
+    pub(crate) caller_expected_graph_head: Option<String>,
     /// Catalog built from the exact accepted IR whose identity is recorded in
     /// `authority`. Mutation/load planning and validation must use this snapshot,
     /// never the handle-global catalog, which can lag a schema apply performed by
@@ -1022,6 +1028,7 @@ impl Omnigraph {
                     schema_identity_version: schema_state.schema_identity_version,
                 },
                 effective_graph_head,
+                caller_expected_graph_head: None,
                 catalog: Arc::new(catalog),
                 manifest_probe,
             });
@@ -1112,6 +1119,7 @@ impl Omnigraph {
                         schema_identity_version: schema_state.schema_identity_version,
                     },
                     effective_graph_head,
+                    caller_expected_graph_head: None,
                     catalog: Arc::clone(&catalog),
                     manifest_probe,
                 };
@@ -1260,17 +1268,22 @@ impl Omnigraph {
         let normalized = normalize_branch_name(branch.unwrap_or("main"))?;
         let coord = self.coordinator.read().await;
         if normalized.as_deref() == coord.current_branch() {
-            let snapshot_id = coord.head_commit_id().await?.unwrap_or_else(|| {
-                SnapshotId::synthetic(
-                    coord.current_branch(),
-                    coord.version(),
-                    coord.manifest_incarnation().e_tag.as_deref(),
-                )
-            });
+            let graph_commit_id = coord.effective_graph_head().await?;
+            let snapshot_id = graph_commit_id
+                .as_deref()
+                .map(SnapshotId::new)
+                .unwrap_or_else(|| {
+                    SnapshotId::synthetic(
+                        coord.current_branch(),
+                        coord.version(),
+                        coord.manifest_incarnation().e_tag.as_deref(),
+                    )
+                });
             return Ok(ResolvedTarget {
                 requested,
                 branch: coord.current_branch().map(str::to_string),
                 snapshot_id,
+                graph_commit_id,
                 snapshot: coord.snapshot(),
             });
         }
@@ -1304,10 +1317,7 @@ impl Omnigraph {
                     return Ok((
                         coord.branch_identifier().await?,
                         coord.exact_graph_head(),
-                        coord
-                            .head_commit_id()
-                            .await?
-                            .map(|head| head.as_str().to_string()),
+                        coord.effective_graph_head().await?,
                         coord.snapshot(),
                         coord.captured_manifest_probe(),
                     ));
@@ -1319,10 +1329,7 @@ impl Omnigraph {
         Ok((
             coord.branch_identifier().await?,
             coord.exact_graph_head(),
-            coord
-                .head_commit_id()
-                .await?
-                .map(|head| head.as_str().to_string()),
+            coord.effective_graph_head().await?,
             coord.snapshot(),
             coord.captured_manifest_probe(),
         ))
@@ -1384,13 +1391,22 @@ impl Omnigraph {
         // Recheck the durable sentinel inside that critical section so a schema
         // apply observed after preparation cannot be followed by a table effect.
         self.ensure_schema_apply_not_locked("write commit").await?;
-        let (branch_identifier, graph_head, _effective_graph_head, snapshot, _) = self
+        let (branch_identifier, graph_head, effective_graph_head, snapshot, _) = self
             .write_authority_for_known_branch(txn.branch.as_deref(), true)
             .await?;
         let (schema_ir, schema_state) =
             load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
         self.ensure_schema_apply_not_locked("write commit").await?;
         validate_schema_ir_against_snapshot(&schema_ir, &snapshot)?;
+        if let Some(expected) = txn.caller_expected_graph_head.as_deref()
+            && effective_graph_head.as_deref() != Some(expected)
+        {
+            return Err(OmniError::precondition_failed(
+                txn.branch.as_deref().unwrap_or("main"),
+                expected,
+                effective_graph_head,
+            ));
+        }
         if branch_identifier != txn.authority.branch_identifier {
             return Err(OmniError::manifest_read_set_changed(
                 format!(
@@ -1513,7 +1529,13 @@ impl Omnigraph {
     /// version this graph is stamped at). Surfaced via `omnigraph snapshot`.
     pub async fn internal_schema_version_of(&self, target: impl Into<ReadTarget>) -> Result<u32> {
         let branch = self.resolved_branch_of(target).await?;
-        crate::db::manifest::internal_schema_stamp_at(self.uri(), branch.as_deref()).await
+        crate::db::manifest::internal_schema_stamp_at(self.uri(), branch.as_deref())
+            .await?
+            .ok_or_else(|| {
+                // Unreachable through this handle: every open path runs the
+                // stamp guard, which refuses unstamped manifests.
+                OmniError::manifest_internal("opened graph has no internal-schema stamp")
+            })
     }
 
     pub async fn resolved_branch_of(
@@ -2070,9 +2092,11 @@ impl Omnigraph {
     /// Resolve a read target to its snapshot, without attaching read caches.
     /// Same-branch reads reuse the warm coordinator, gated by a cheap version
     /// probe (invariant 6: strong consistency, never a blind warm read). Reads do
-    /// not need the commit graph (the manifest version is the visibility
-    /// authority, invariant 2), so the id is synthetic and no commit-graph scan
-    /// happens on this path.
+    /// not need to reopen a separate commit store to pin visibility (the
+    /// manifest version is the authority, invariant 2). The cache id stays
+    /// synthetic. A stale refresh may remain manifest-only when that snapshot
+    /// carries an exact head row; an absent row triggers a coherent lineage
+    /// refresh before exposing the effective inherited head.
     async fn resolve_target_inner(&self, target: &ReadTarget) -> Result<ResolvedTarget> {
         if let ReadTarget::Branch(branch) = target {
             let normalized = normalize_branch_name(branch)?;
@@ -2084,7 +2108,7 @@ impl Omnigraph {
                 }
                 let held = coord.manifest_incarnation();
                 if coord.probe_latest_incarnation().await?.matches(&held) {
-                    return Ok(warm_resolved_target(&coord, target));
+                    return warm_resolved_target(&coord, target).await;
                 }
                 // Stale: refresh under the write lock below.
             }
@@ -2095,10 +2119,14 @@ impl Omnigraph {
                 let held = coord.manifest_incarnation();
                 let mut refreshed = false;
                 if !coord.probe_latest_incarnation().await?.matches(&held) {
-                    coord.refresh_manifest_only().await?;
+                    // An exact head row keeps this state-only; a fresh/recreated
+                    // branch atomically refreshes its inherited lineage too.
+                    // No fallible second phase can leave replacement rows
+                    // paired with the deleted branch's cached private head.
+                    coord.refresh_for_live_read().await?;
                     refreshed = true;
                 }
-                let resolved = warm_resolved_target(&coord, target);
+                let resolved = warm_resolved_target(&coord, target).await?;
                 drop(coord);
                 if refreshed {
                     self.invalidate_read_caches().await;
@@ -2352,7 +2380,7 @@ impl Omnigraph {
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
 
-        blobs.pop().ok_or_else(|| {
+        blobs.pop().flatten().ok_or_else(|| {
             OmniError::manifest(format!(
                 "blob '{}' on {} '{}' returned no data",
                 property, type_name, id
@@ -3040,11 +3068,14 @@ pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
 
 /// Build a `ResolvedTarget` from the warm coordinator without opening the commit
 /// graph. The live branch snapshot is pinned by the manifest incarnation, so the
-/// id is synthetic `(branch, version, e_tag when available)`; nothing on the read
-/// path needs a real commit ULID (only `RuntimeCache` keys on the id, where
-/// synthetic is consistent).
-fn warm_resolved_target(coord: &GraphCoordinator, requested: &ReadTarget) -> ResolvedTarget {
-    ResolvedTarget {
+/// cache id is synthetic `(branch, version, e_tag when available)`. The effective
+/// lineage head is derived separately from that same coordinator so a fresh fork
+/// exposes its inherited source commit as a conditional-write token.
+async fn warm_resolved_target(
+    coord: &GraphCoordinator,
+    requested: &ReadTarget,
+) -> Result<ResolvedTarget> {
+    Ok(ResolvedTarget {
         requested: requested.clone(),
         branch: coord.current_branch().map(str::to_string),
         snapshot_id: SnapshotId::synthetic(
@@ -3052,8 +3083,9 @@ fn warm_resolved_target(coord: &GraphCoordinator, requested: &ReadTarget) -> Res
             coord.version(),
             coord.manifest_incarnation().e_tag.as_deref(),
         ),
+        graph_commit_id: coord.effective_graph_head().await?,
         snapshot: coord.snapshot(),
-    }
+    })
 }
 
 pub(crate) fn ensure_public_branch_ref(branch: &str, operation: &str) -> Result<()> {

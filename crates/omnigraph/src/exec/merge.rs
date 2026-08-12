@@ -891,7 +891,7 @@ mod pure_insert_certificate_tests {
                 updated_fragments: Vec::new(),
                 new_fragments: vec![fragment],
                 fields_modified: Vec::new(),
-                merged_generations: Vec::new(),
+                compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: PREORDER_FIELDS.to_vec(),
                 update_mode: Some(UpdateMode::RewriteRows),
                 inserted_rows_filter: Some(filter.build()),

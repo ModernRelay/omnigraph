@@ -35,6 +35,26 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
+        self.query_with_head(target, query_source, query_name, params)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// [`Self::query`] additionally returning the graph head commit id of the
+    /// exact snapshot the query executed against. A fresh named branch returns
+    /// its inherited source commit even though it has no materialized
+    /// branch-owned head row yet.
+    ///
+    /// The id comes from the same pinned version as every table read — the
+    /// value a caller passes to [`Self::mutate_as_with_expected_head`] for a
+    /// read-then-write compare-and-swap.
+    pub async fn query_with_head(
+        &self,
+        target: impl Into<ReadTarget>,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+    ) -> Result<(QueryResult, Option<String>)> {
         // Capture the manifest snapshot and immutable catalog under the same
         // schema-publication gate. SchemaApply publishes its fixed manifest
         // outcome before promoting files/ArcSwap; without this gate a query on
@@ -61,7 +81,8 @@ impl Omnigraph {
             GraphIndexHandle::none()
         };
 
-        execute_query(
+        let head = resolved.graph_commit_id.clone();
+        let result = execute_query(
             &ir,
             params,
             &resolved.snapshot,
@@ -72,7 +93,8 @@ impl Omnigraph {
                 config: self.embedding_config_ref(),
             },
         )
-        .await
+        .await?;
+        Ok((result, head))
     }
 
     /// Run a named query against the graph as it existed at a prior manifest version.
@@ -1848,6 +1870,19 @@ async fn execute_expand_indexed(
                     continue;
                 };
                 for &neighbor in neighbors {
+                    // A self-edge is a valid destination that reaches nothing
+                    // new: emit it without entering the frontier, so the
+                    // seeded-source `visited` pre-mark prunes only multi-hop
+                    // cycle returns. Same-type only: this path interns both
+                    // endpoint types into one dense space, so a cross-type id
+                    // collision could alias node == neighbor.
+                    if same_type && neighbor == node {
+                        if hop >= min_hops && seen_dst[i].insert(neighbor) {
+                            src_indices.push(i as u32);
+                            dst_dense.push(neighbor);
+                        }
+                        continue;
+                    }
                     if !same_type || visited[i].insert(neighbor) {
                         next.push(neighbor);
                         if hop >= min_hops && seen_dst[i].insert(neighbor) {
@@ -2075,6 +2110,17 @@ async fn execute_expand_csr(
             for &node in &frontier {
                 let rev: &[u32] = adj_rev.map(|a| a.neighbors(node)).unwrap_or(&[]);
                 for &neighbor in adj.neighbors(node).iter().chain(rev) {
+                    // Self-edge: emit without entering the frontier — same
+                    // contract as execute_expand_indexed. Same-type only:
+                    // cross-type dense ids live in different TypeIndex
+                    // namespaces, where node == neighbor is meaningless.
+                    if same_type && neighbor == node {
+                        if hop >= min_hops && seen_dst_dense.insert(neighbor) {
+                            src_indices.push(i as u32);
+                            dst_dense_list.push(neighbor);
+                        }
+                        continue;
+                    }
                     if !same_type || visited.insert(neighbor) {
                         next_frontier.push(neighbor);
                         if hop >= min_hops && seen_dst_dense.insert(neighbor) {
@@ -2478,6 +2524,14 @@ async fn execute_node_scan(
                     scanner
                         .nearest(prop, &query_arr, k)
                         .map_err(|e| OmniError::Lance(format!("nearest: {}", e)))?;
+                    // Lance 10's late payload `LanceRead` drops the sorted
+                    // candidate stream's ordering metadata. With more than
+                    // one output partition, execute_plan may therefore use a
+                    // scheduling-ordered coalescer and scramble large-k ANN
+                    // or flat results. Keep one DataFusion output partition
+                    // until Lance preserves/remaps that ordering. Reads and
+                    // decoding inside the partition remain concurrent.
+                    scanner.target_parallelism(1);
                 }
             }
 
@@ -2519,7 +2573,6 @@ async fn execute_node_scan(
         arrow_select::concat::concat_batches(&schema, &batches)
             .map_err(|e| OmniError::Lance(e.to_string()))?
     };
-
     // Add null placeholder columns for excluded blob properties
     if has_blobs {
         return add_null_blob_columns(&scan_result, node_type);

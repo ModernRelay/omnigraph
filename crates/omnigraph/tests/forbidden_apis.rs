@@ -221,7 +221,7 @@ macro_rules! write_surfaces {
 write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options"],
     "db/omnigraph.rs" => WriteProtocol::RecoveryExecutor => ["open", "open_with_storage", "refresh"],
-    "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_as"],
+    "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_as", "mutate_as_with_expected_head"],
     "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_file", "load_graph_batch"],
     "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v9") => ["load_as", "load_file_as", "load_graph_batch_as"],
     "loader/mod.rs" => WriteProtocol::Composed("branch create when absent, then Load v9 alias") => ["ingest", "ingest_as", "ingest_file", "ingest_file_as"],
@@ -265,6 +265,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "list_commits"),
     ("exec/query.rs", "query"),
+    ("exec/query.rs", "query_with_head"),
     ("exec/query.rs", "run_query_at"),
 ];
 
@@ -304,7 +305,12 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
-        "refresh_manifest_only",
+        "effective_graph_head",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "refresh_for_live_read",
     ),
     ("db/graph_coordinator.rs", "GraphCoordinator", "branch_list"),
     (
@@ -362,11 +368,15 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     ),
     ("db/manifest.rs", "ManifestCoordinator", "open_with_lineage"),
     ("db/manifest.rs", "ManifestCoordinator", "snapshot_at"),
-    ("db/manifest.rs", "ManifestCoordinator", "refresh"),
     (
         "db/manifest.rs",
         "ManifestCoordinator",
         "refresh_with_lineage",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "refresh_for_live_read",
     ),
     (
         "db/manifest.rs",
@@ -613,14 +623,16 @@ macro_rules! durable_calls {
 // manifest implementations are included; only standalone test-only sources
 // whose parent cfg is invisible to this file walker are excluded.
 durable_calls! {
+    // The `__manifest` Create write is the manifest's entire birth: entries,
+    // genesis lineage, and the internal-schema stamp all ride the one commit,
+    // so the stamp is atomic with birth and no bootstrap write follows it.
+    // (A `table_version_management` config key is deliberately not written:
+    // neither the pinned Lance substrate nor this crate reads it.)
     ("db/manifest/graph.rs", "Dataset::write(", 2, WriteProtocol::Bootstrap),
-    ("db/manifest/graph.rs", ".update_config(", 1, WriteProtocol::Bootstrap),
-    ("db/manifest/graph.rs", "stamp_current_version(", 1, WriteProtocol::Bootstrap),
     ("db/manifest/publisher.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/manifest/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),
     ("db/manifest/publisher.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest/publisher.rs", ".execute_reader(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
-    ("db/manifest/migrations.rs", ".update_schema_metadata(", 1, WriteProtocol::Bootstrap),
     ("instrumentation.rs", ".write_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".write_text_if_absent(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".write_text_if_match(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
@@ -787,7 +799,6 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "cleanup_old_versions(",
     ".update_config(",
     ".update_schema_metadata(",
-    "stamp_current_version(",
     "write_schema_contract_staging(",
     "promote_exact_schema_staging(",
     "discard_exact_schema_staging(",

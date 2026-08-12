@@ -5,7 +5,7 @@ license: MIT (see LICENSE at repo root)
 compatibility: Requires omnigraph CLI >= 0.7.0 — the unified `load`, the two config surfaces (cluster.yaml + ~/.omnigraph/config.yaml), and cluster apply/serve all require 0.7.0. Version-gated features are marked inline (undirected traversal `<edge>` and enum widening in `schema apply` require >= 0.8.1; edge bindings `$w:EDGE`, strict `--mode append` key conflicts, the keyed per-load bounds, and `branch merge --delete-branch` require >= 0.9.0).
 metadata:
   author: ModernRelay
-  version: "0.9.0"
+  version: "0.10.0"
   repository: https://github.com/ModernRelay/omnigraph
 ---
 
