@@ -535,6 +535,39 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
     );
 }
 
+/// When the target still equals the merge base, the ordered adopt classifier
+/// already knows a changed id is present. Publication must use an
+/// update-only keyed stage rather than the insertion-capable general Upsert.
+#[tokio::test]
+async fn changed_only_adopt_uses_known_present_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+    let feature = Omnigraph::open(dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    feature
+        .mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+        )
+        .await
+        .unwrap();
+
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+        .await
+        .unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(
+        probes.stage_merge_insert_calls(),
+        0,
+        "known-present adopt updates must not use the insertion-capable general Upsert stage"
+    );
+}
+
 const WIDE_VALIDATION_SCHEMA: &str = r#"
 node Alpha {
     key: String @key
