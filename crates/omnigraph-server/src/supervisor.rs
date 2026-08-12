@@ -8,6 +8,7 @@ use omnigraph::error::{ManifestErrorKind, OmniError};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep_until;
+use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
 use omnigraph::error::StorageFailureKind;
@@ -19,6 +20,11 @@ use crate::{GraphStartupConfig, load_graph_policy, validate_and_attach};
 
 const MAX_CONCURRENT_ATTEMPTS: usize = 4;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// How long the supervisor waits on one open or recovery attempt before moving
+/// on. This bounds the *wait*, never the work: neither `Omnigraph::open` nor
+/// `refresh` is cancellation-safe mid-recovery, so the attempt keeps running
+/// and publishes its own result.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[cfg(test)]
 mod attempt_probe {
@@ -381,6 +387,11 @@ pub(crate) async fn initial_open_all(registry: Arc<GraphRegistry>) -> Vec<(Strin
 pub(crate) struct SupervisorSet {
     shutdown: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Owns every spawned attempt. An attempt mutates durable recovery state
+    /// under an armed sidecar, so it must reach a terminal result even when
+    /// nobody is waiting for it — the same ownership rule the write executor
+    /// applies to a request whose caller disconnected.
+    attempts: TaskTracker,
 }
 
 impl SupervisorSet {
@@ -389,6 +400,7 @@ impl SupervisorSet {
         Arc::new(Self {
             shutdown,
             tasks: Mutex::new(Vec::new()),
+            attempts: TaskTracker::new(),
         })
     }
 
@@ -397,6 +409,7 @@ impl SupervisorSet {
         let set = Arc::new(Self {
             shutdown,
             tasks: Mutex::new(Vec::new()),
+            attempts: TaskTracker::new(),
         });
         let semaphore = Arc::clone(attempt_permits());
         let mut tasks = Vec::with_capacity(registry.len());
@@ -404,6 +417,7 @@ impl SupervisorSet {
             tasks.push(tokio::spawn(supervise_graph(
                 entry,
                 Arc::clone(&semaphore),
+                set.attempts.clone(),
                 set.shutdown.subscribe(),
             )));
         }
@@ -422,16 +436,48 @@ impl SupervisorSet {
             }
         }
     }
+
+    /// Stop accepting new attempts and wait for the ones already owned. Bounded
+    /// by the caller; an attempt that outlives the bound keeps running and its
+    /// durable sidecar remains next-boot authority.
+    #[allow(dead_code)]
+    pub async fn drain_attempts(&self, timeout: Duration) {
+        self.attempts.close();
+        if tokio::time::timeout(timeout, self.attempts.wait())
+            .await
+            .is_err()
+        {
+            warn!(
+                timeout_seconds = timeout.as_secs(),
+                "timed out draining graph recovery attempts; durable sidecars remain next-boot authority"
+            );
+        }
+    }
 }
 
 async fn supervise_graph(
     entry: Arc<GraphEntry>,
     semaphore: Arc<Semaphore>,
+    attempts: TaskTracker,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // An attempt this loop stopped waiting for but still owns. No second
+    // attempt starts for this graph while it is set: two concurrent refreshes
+    // would contend on the engine's own gates for no benefit.
+    let mut in_flight: Option<JoinHandle<()>> = None;
     loop {
         if *shutdown.borrow() {
             return;
+        }
+        if let Some(mut running) = in_flight.take() {
+            tokio::select! {
+                _ = &mut running => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { return; }
+                    in_flight = Some(running);
+                }
+            }
+            continue;
         }
         let deadline = match entry.runtime().as_ref() {
             GraphRuntimeState::Opening { next_retry, .. } => Some(*next_retry),
@@ -471,25 +517,58 @@ async fn supervise_graph(
             }
         }
 
-        match entry.runtime().as_ref() {
+        let due = match entry.runtime().as_ref() {
             GraphRuntimeState::Opening { next_retry, .. } if *next_retry <= Instant::now() => {
-                attempt_open(&entry, &semaphore).await;
+                Some(Attempt::Open)
             }
             GraphRuntimeState::Serving {
                 writes: WriteState::Recovering { .. },
                 ..
-            } => {
-                attempt_recovery(&entry, &semaphore).await;
-            }
+            } => Some(Attempt::Recover),
             GraphRuntimeState::Serving {
                 writes: WriteState::Blocked { retry_at, .. },
                 ..
-            } if retry_at.is_some_and(|at| at <= Instant::now()) => {
-                attempt_recovery(&entry, &semaphore).await;
+            } if retry_at.is_some_and(|at| at <= Instant::now()) => Some(Attempt::Recover),
+            _ => None,
+        };
+        let Some(due) = due else { continue };
+
+        let task = {
+            let entry = Arc::clone(&entry);
+            let semaphore = Arc::clone(&semaphore);
+            attempts.spawn(async move {
+                match due {
+                    Attempt::Open => attempt_open(&entry, &semaphore).await,
+                    Attempt::Recover => attempt_recovery(&entry, &semaphore).await,
+                };
+            })
+        };
+        let mut task = task;
+        tokio::select! {
+            _ = &mut task => {}
+            _ = tokio::time::sleep(ATTEMPT_TIMEOUT) => {
+                // Stop waiting, keep owning. Dropping the future here would
+                // abandon a recovery mid-restore; the task runs to a terminal
+                // result and publishes under its own generation check.
+                warn!(
+                    graph_id = %entry.key.graph_id,
+                    timeout_seconds = ATTEMPT_TIMEOUT.as_secs(),
+                    "graph attempt exceeded its deadline; still owned, no new attempt will start"
+                );
+                in_flight = Some(task);
             }
-            _ => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return; }
+                in_flight = Some(task);
+            }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Attempt {
+    Open,
+    Recover,
 }
 
 #[cfg(test)]
