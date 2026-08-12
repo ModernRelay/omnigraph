@@ -726,6 +726,50 @@ async fn fast_forward_merge_defers_vector_index_to_reconciler() {
     assert_eq!(count_rows(&main, "node:Chunk").await, 24);
 }
 
+/// A true three-way merge must follow the same derived-index contract as the
+/// fast-forward path: publish logical rows first and leave physical coverage to
+/// `ensure_indices` / `optimize`.
+#[tokio::test]
+async fn merged_outcome_defers_vector_index_to_reconciler() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = Omnigraph::init(uri, VEC_SCHEMA).await.unwrap();
+    main.branch_create("feature").await.unwrap();
+
+    let mut source_rows = String::new();
+    for i in 0..24 {
+        let vector: Vec<String> = (0..8).map(|j| format!("{}.0", (i + j) % 5)).collect();
+        source_rows.push_str(&format!(
+            "{{\"type\":\"Chunk\",\"data\":{{\"slug\":\"source-{i}\",\"embedding\":[{}]}}}}\n",
+            vector.join(",")
+        ));
+    }
+    let feature = Omnigraph::open(uri).await.unwrap();
+    feature
+        .load("feature", &source_rows, LoadMode::Merge)
+        .await
+        .unwrap();
+    main.load(
+        "main",
+        r#"{"type":"Chunk","data":{"slug":"target-only","embedding":[0,1,2,3,4,5,6,7]}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+        .await
+        .unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(
+        probes.stage_vector_index_calls(),
+        0,
+        "three-way merge must not stage derived vector-index work inline"
+    );
+    assert_eq!(count_rows(&main, "node:Chunk").await, 25);
+}
+
 const BLOB_SCHEMA: &str =
     "node Document {\n  title: String @key\n  content: Blob?\n  note: String?\n}\n";
 const BLOB_INSERT: &str = r#"
