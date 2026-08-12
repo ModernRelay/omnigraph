@@ -110,6 +110,7 @@ fn classify_commit_range(from: GraphCommit, to: GraphCommit) -> ResolvedCommitRa
 pub(crate) struct PublishedSnapshot {
     pub manifest_version: u64,
     pub _snapshot_id: SnapshotId,
+    pub commit: GraphCommit,
 }
 
 pub(crate) struct GraphCoordinator {
@@ -572,10 +573,11 @@ impl GraphCoordinator {
             )
             .await?;
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
-        let snapshot_id = self.apply_lineage_to_cache(intent, &outcome);
+        let commit = self.apply_lineage_to_cache(intent, &outcome);
         Ok(PublishedSnapshot {
             manifest_version: outcome.version,
-            _snapshot_id: snapshot_id,
+            _snapshot_id: SnapshotId::new(commit.graph_commit_id.clone()),
+            commit,
         })
     }
 
@@ -606,7 +608,7 @@ impl GraphCoordinator {
         &mut self,
         intent: crate::db::manifest::LineageIntent,
         outcome: &crate::db::manifest::CommitOutcome,
-    ) -> SnapshotId {
+    ) -> GraphCommit {
         let commit = GraphCommit {
             graph_commit_id: intent.graph_commit_id.clone(),
             manifest_branch: intent.branch,
@@ -616,8 +618,8 @@ impl GraphCoordinator {
             actor_id: intent.actor_id,
             created_at: intent.created_at,
         };
-        self.commit_graph.insert_committed(commit);
-        SnapshotId::new(intent.graph_commit_id)
+        self.commit_graph.insert_committed(commit.clone());
+        commit
     }
 
     async fn open_commit_graph_for_branch(&self, branch: Option<&str>) -> Result<CommitGraph> {

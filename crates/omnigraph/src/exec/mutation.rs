@@ -656,8 +656,35 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<MutationResult> {
-        self.mutate_as(branch, query_source, query_name, params, None)
-            .await
+        Ok(self
+            .mutate_as_with_expected_head_receipt(
+                branch,
+                query_source,
+                query_name,
+                params,
+                None,
+                None,
+            )
+            .await?
+            .result)
+    }
+
+    pub async fn mutate_with_receipt(
+        &self,
+        branch: &str,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+    ) -> Result<crate::MutationReceipt> {
+        self.mutate_as_with_expected_head_receipt(
+            branch,
+            query_source,
+            query_name,
+            params,
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn mutate_as(
@@ -668,8 +695,36 @@ impl Omnigraph {
         params: &ParamMap,
         actor_id: Option<&str>,
     ) -> Result<MutationResult> {
-        self.mutate_as_with_expected_head(branch, query_source, query_name, params, actor_id, None)
-            .await
+        Ok(self
+            .mutate_as_with_expected_head_receipt(
+                branch,
+                query_source,
+                query_name,
+                params,
+                actor_id,
+                None,
+            )
+            .await?
+            .result)
+    }
+
+    pub async fn mutate_as_with_receipt(
+        &self,
+        branch: &str,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+        actor_id: Option<&str>,
+    ) -> Result<crate::MutationReceipt> {
+        self.mutate_as_with_expected_head_receipt(
+            branch,
+            query_source,
+            query_name,
+            params,
+            actor_id,
+            None,
+        )
+        .await
     }
 
     /// [`Self::mutate_as`] with a caller-supplied compare-and-swap
@@ -703,6 +758,32 @@ impl Omnigraph {
         actor_id: Option<&str>,
         expected_head: Option<&str>,
     ) -> Result<MutationResult> {
+        Ok(self
+            .mutate_as_with_expected_head_receipt(
+                branch,
+                query_source,
+                query_name,
+                params,
+                actor_id,
+                expected_head,
+            )
+            .await?
+            .result)
+    }
+
+    /// Receipt-returning form of [`Self::mutate_as_with_expected_head`].
+    ///
+    /// The optional commit is the exact [`crate::db::GraphCommit`] produced by the
+    /// manifest publication. A successful no-op has no commit.
+    pub async fn mutate_as_with_expected_head_receipt(
+        &self,
+        branch: &str,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+        actor_id: Option<&str>,
+        expected_head: Option<&str>,
+    ) -> Result<crate::MutationReceipt> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `Branch(branch)` to match the HTTP-layer convention at
         // `server_change` (branch=Some(branch), target_branch=None). When no
@@ -758,7 +839,7 @@ impl Omnigraph {
         params: &ParamMap,
         actor_id: Option<&str>,
         expected_head: Option<&str>,
-    ) -> Result<MutationResult> {
+    ) -> Result<crate::MutationReceipt> {
         const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
         // Resolve request-scoped values such as now() once so a safe
@@ -805,7 +886,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         expected_head: Option<&str>,
         retryable: &mut bool,
-    ) -> Result<MutationResult> {
+    ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
         // Reject internal `__run__*` / system-prefixed branches at the
         // public write boundary. Direct-publish paths assert this
@@ -897,7 +978,10 @@ impl Omnigraph {
                         .await;
                     self.revalidate_write_txn(&txn).await?;
                 }
-                Ok(total)
+                Ok(crate::MutationReceipt {
+                    result: total,
+                    commit: None,
+                })
             }
             Ok(total) => {
                 self.validate_staged_mutation(&staging, &txn).await?;
@@ -949,20 +1033,23 @@ impl Omnigraph {
                         lineage_intent,
                     )
                     .await;
-                if let Err(err) = publish_result {
-                    // A sidecar exists iff at least one table effect was
-                    // committed. Lineage-only / zero-row mutations have no
-                    // physical residual to recover, so preserve their original
-                    // publish error (notably ReadSetChanged) and let the normal
-                    // retry/409 path handle it.
-                    return match sidecar_handle.as_ref() {
-                        Some(handle) => Err(OmniError::recovery_required(
-                            handle.operation_id.clone(),
-                            err.to_string(),
-                        )),
-                        None => Err(err),
-                    };
-                }
+                let commit = match publish_result {
+                    Ok(commit) => commit,
+                    Err(err) => {
+                        // A sidecar exists iff at least one table effect was
+                        // committed. Lineage-only / zero-row mutations have no
+                        // physical residual to recover, so preserve their original
+                        // publish error (notably ReadSetChanged) and let the normal
+                        // retry/409 path handle it.
+                        return match sidecar_handle.as_ref() {
+                            Some(handle) => Err(OmniError::recovery_required(
+                                handle.operation_id.clone(),
+                                err.to_string(),
+                            )),
+                            None => Err(err),
+                        };
+                    }
+                };
                 if let Some(handle) = sidecar_handle {
                     // Best-effort cleanup: the manifest publish already
                     // succeeded, so the user's mutation is durable. A failed
@@ -980,7 +1067,10 @@ impl Omnigraph {
                         );
                     }
                 }
-                Ok(total)
+                Ok(crate::MutationReceipt {
+                    result: total,
+                    commit: Some(commit),
+                })
             }
         }
     }

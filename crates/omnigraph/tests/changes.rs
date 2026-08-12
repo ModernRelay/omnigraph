@@ -42,6 +42,102 @@ fn change_tuples(change_set: &omnigraph::changes::ChangeSet) -> Vec<(String, Str
 // ─── Same-branch diff tests ────────────────────────────────────────────────
 
 #[tokio::test]
+async fn write_receipts_identify_exact_commits_and_mutation_noops() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    let receipt = db
+        .mutate_with_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+    let commit = receipt
+        .commit
+        .expect("a row-changing mutation publishes once");
+    let stored = db.get_commit(&commit.graph_commit_id).await.unwrap();
+    assert_eq!(stored.graph_commit_id, commit.graph_commit_id);
+    assert_eq!(stored.manifest_version, commit.manifest_version);
+
+    let changes = db
+        .diff_commits(
+            commit.parent_commit_id.as_deref().unwrap(),
+            &commit.graph_commit_id,
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(changes.to_version, commit.manifest_version);
+    assert_eq!(
+        change_tuples(&changes),
+        vec![("node:Person".into(), "Eve".into(), ChangeOp::Insert)]
+    );
+
+    let head_before_no_op = snapshot_id(&db, "main").await.unwrap();
+    let no_op = db
+        .mutate_with_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Missing")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_op.result.affected_nodes, 0);
+    assert!(no_op.commit.is_none());
+    assert_eq!(snapshot_id(&db, "main").await.unwrap(), head_before_no_op);
+
+    let load_receipt = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Person","data":{"name":"LoadReceipt","age":40}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    assert_eq!(load_receipt.result.nodes_loaded.get("Person"), Some(&1));
+    let stored = db
+        .get_commit(&load_receipt.commit.graph_commit_id)
+        .await
+        .unwrap();
+    assert_eq!(stored.graph_commit_id, load_receipt.commit.graph_commit_id);
+    assert_eq!(
+        stored.manifest_version,
+        load_receipt.commit.manifest_version
+    );
+
+    // Empty Load has no table effect or recovery sidecar, but Load's public
+    // contract still publishes one lineage commit and returns that exact
+    // receipt rather than reconstructing it from a later branch-head read.
+    let head_before_empty_load = snapshot_id(&db, "main").await.unwrap();
+    let empty_load_receipt = db
+        .load_with_receipt("main", "", LoadMode::Merge)
+        .await
+        .unwrap();
+    assert!(empty_load_receipt.result.nodes_loaded.is_empty());
+    assert!(empty_load_receipt.result.edges_loaded.is_empty());
+    assert_eq!(
+        empty_load_receipt.commit.parent_commit_id.as_deref(),
+        Some(head_before_empty_load.as_str())
+    );
+    assert_eq!(
+        snapshot_id(&db, "main").await.unwrap().as_str(),
+        empty_load_receipt.commit.graph_commit_id.as_str()
+    );
+    let stored = db
+        .get_commit(&empty_load_receipt.commit.graph_commit_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.graph_commit_id,
+        empty_load_receipt.commit.graph_commit_id
+    );
+}
+
+#[tokio::test]
 async fn diff_empty_when_nothing_changed() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;

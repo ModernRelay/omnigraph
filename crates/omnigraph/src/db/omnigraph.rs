@@ -2971,7 +2971,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         txn: &crate::db::WriteTxn,
         lineage_intent: crate::db::manifest::LineageIntent,
-    ) -> Result<u64> {
+    ) -> Result<crate::db::GraphCommit> {
         table_ops::commit_updates_on_branch_with_expected(
             self,
             branch,

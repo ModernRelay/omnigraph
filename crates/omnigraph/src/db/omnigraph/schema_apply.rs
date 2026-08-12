@@ -1115,7 +1115,7 @@ where
         );
         let PublishedSnapshot {
             manifest_version,
-            _snapshot_id: _,
+            ..
         } = db
             .coordinator
             .write()
