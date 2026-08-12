@@ -9363,8 +9363,27 @@ enum MergeScenario {
     /// (`publish_adopted_delta`: append → upsert → delete).
     Adopt,
     /// main advances past base → the touched table is `RewriteMerged`
-    /// (`publish_rewritten_merge_table`: merge_insert → delete → index).
+    /// (`publish_rewritten_merge_table`: merge_insert → delete).
     Rewrite,
+}
+
+#[derive(Clone, Copy)]
+enum MergePartialFailpoint {
+    AdoptAfterAppend,
+    AdoptAfterUpsert,
+    RewriteAfterMerge,
+    RewriteAfterDelete,
+}
+
+impl MergePartialFailpoint {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::AdoptAfterAppend => names::BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT,
+            Self::AdoptAfterUpsert => names::BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE,
+            Self::RewriteAfterMerge => names::BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE,
+            Self::RewriteAfterDelete => names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM,
+        }
+    }
 }
 
 async fn sorted_person_names(db: &Omnigraph) -> Vec<String> {
@@ -9391,9 +9410,13 @@ async fn sorted_person_names(db: &Omnigraph) -> Vec<String> {
 /// `bob` present, `dave` kept) and the merge recorded. GREEN after: an Armed v4
 /// sidecar can prove only a proper prefix of its planned transaction chain, so
 /// recovery compensates it rather than treating numeric movement as completion.
-async fn assert_partial_merge_rolls_back(scenario: MergeScenario, failpoint: &str) {
+async fn assert_partial_merge_rolls_back(
+    scenario: MergeScenario,
+    failpoint: MergePartialFailpoint,
+) {
     use omnigraph::loader::load_jsonl;
 
+    let failpoint = failpoint.name();
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -9486,7 +9509,7 @@ async fn assert_partial_merge_rolls_back(scenario: MergeScenario, failpoint: &st
 async fn branch_merge_adopt_partial_after_append_rolls_back() {
     assert_partial_merge_rolls_back(
         MergeScenario::Adopt,
-        "branch_merge.adopt_after_append_pre_upsert",
+        MergePartialFailpoint::AdoptAfterAppend,
     )
     .await;
 }
@@ -9497,7 +9520,7 @@ async fn branch_merge_adopt_partial_after_append_rolls_back() {
 async fn branch_merge_adopt_partial_after_upsert_rolls_back() {
     assert_partial_merge_rolls_back(
         MergeScenario::Adopt,
-        "branch_merge.adopt_after_upsert_pre_delete",
+        MergePartialFailpoint::AdoptAfterUpsert,
     )
     .await;
 }
@@ -9508,7 +9531,7 @@ async fn branch_merge_adopt_partial_after_upsert_rolls_back() {
 async fn branch_merge_rewrite_partial_after_merge_rolls_back() {
     assert_partial_merge_rolls_back(
         MergeScenario::Rewrite,
-        "branch_merge.rewrite_after_merge_pre_delete",
+        MergePartialFailpoint::RewriteAfterMerge,
     )
     .await;
 }
@@ -9519,7 +9542,7 @@ async fn branch_merge_rewrite_partial_after_merge_rolls_back() {
 async fn branch_merge_rewrite_partial_after_delete_rolls_back() {
     assert_partial_merge_rolls_back(
         MergeScenario::Rewrite,
-        "branch_merge.rewrite_after_delete_pre_confirm",
+        MergePartialFailpoint::RewriteAfterDelete,
     )
     .await;
 }
