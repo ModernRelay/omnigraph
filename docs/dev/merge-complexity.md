@@ -441,12 +441,16 @@ without updating conflict metadata.
 
 **Review addendum (2026-08-12):** the indexed (v1) update route is additionally
 gated on a frag-bitmap proof — Lance's v1 full-schema update arm emits
-top-level-only `fields_for_preserving_frag_bitmap`, which can let an index on a
-nested field id silently claim rewritten fragments. Until a surface-guard cell
-(or upstream fix) closes that, L2's first slice is forced-v2 update-only
-(correctness narrowing, not yet a join win). Details and the full
-assumption-by-assumption review ledger:
-[merge-l1-l3-plan.md](merge-l1-l3-plan.md) → "Review ledger".
+top-level-only `fields_for_preserving_frag_bitmap`, which in principle can let
+an index on a nested field id silently claim rewritten fragments.
+**Empirically verified on Lance 9.0.0:** the hazard does not materialize for
+OmniGraph-shaped schemas — BTREE/FTS/vector index metadata all reference
+top-level field ids (a FixedSizeList child has no field id), and a direct
+v1-route UpdateAll test showed zero new-fragment claims across all three index
+types. L2's first slice remains forced-v2 update-only; the indexed follow-up is
+gated only on landing the checked-in surface-guard cell (fixture must include a
+list-typed property). Details and the full assumption-by-assumption review
+ledger: [merge-l1-l3-plan.md](merge-l1-l3-plan.md) → "Review ledger".
 
 ### L3 — Defer `RewriteMerged` inline index build (align with adopt + deny-list)
 

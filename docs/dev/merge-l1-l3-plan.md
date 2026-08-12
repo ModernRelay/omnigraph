@@ -306,13 +306,17 @@ Consequences:
   closing the insert-capable path + fail-closed stats — a correctness
   narrowing, **not yet** a join-cost win (v2 still full-joins).
 - **The indexed v1 latency win is evidence-gated**: a new
-  `lance_surface_guards` cell must prove either (a) OmniGraph's vector/FTS
-  index metadata references only top-level field ids for our schemas, or
-  (b) an upstream fix emits the full preorder on the v1 arm. Until one holds,
-  do not enable `use_index(true)` for the update adapter.
-- This lowers L2a's expected leverage vs the original ranking; if the guard
-  cell fails, the indexed win waits on upstream and **L4 overtakes L2a** in
-  practical value.
+  `lance_surface_guards` cell must prove that OmniGraph-built index metadata
+  references only top-level field ids and that a v1 UpdateAll claims no new
+  fragments. **2026-08-12 empirical result (see Review ledger): this holds on
+  Lance 9.0.0** — BTREE/FTS/vector metadata are all top-level (an FSL child
+  has no field id), and the direct v1 UpdateAll test showed zero
+  new-fragment claims. The gate is now only "land the checked-in guard
+  cell", not "wait for upstream".
+- Original ranking impact is correspondingly softened: the indexed follow-up
+  is expected to pass its gate; L4 overtakes it only if the guard cell
+  surfaces a schema shape (e.g. an index on a `List` child) we do not build
+  today.
 
 Also verified: Lance auto-falls back from the indexed route when coverage is
 missing, so once gated-on, the adapter must accept both v1 and v2 shapes. The
@@ -480,14 +484,55 @@ from "join removal for changed rows" to "insert-capability closure +
 fail-closed stats"; its join win is evidence-gated. If the guard cell fails,
 prioritize **L4 ahead of the L2a indexed follow-up**.
 
-**New open verification items:**
+**Open items — RESOLVED empirically (2026-08-12, Lance `=9.0.0` scratch
+harness with stable row IDs, schema `id: Utf8 PK / name: Utf8 / vec:
+FixedSizeList<Float32, 8>`, 256 rows):**
 
-1. Surface-guard cell: which field ids do OmniGraph's vector/FTS index
-   metadata reference (top-level vs nested child)? Decides the L2a indexed
-   gate.
-2. L3 user-visible check: behavior of `search`/`bm25` immediately after a
-   `Merged` outcome on a table whose inverted index has **never** been built
-   (fresh table). FF/adopt already defer, so this is not a new class, but
-   [docs/user/search/index.md](../user/search/index.md) says search functions
-   need the backing index — verify fallback vs error and align wording in the
-   L3 PR.
+1. **Index metadata field ids → top-level; the L2a indexed gate can pass.**
+   - `create_index` metadata: BTREE(`id`) → `fields=[0]`, inverted(`name`) →
+     `fields=[1]`, vector(`vec`) → `fields=[2]` — the **FSL parent**, not a
+     child. Lance's schema preorder for this table is exactly `[0, 1, 2]`:
+     a FixedSizeList child has **no separate field id** in Lance's model, so
+     the vector column contributes no nested id at all.
+   - Direct hazard test: v1-route `UpdateAll` + `DoNothing` (BTREE on `id`,
+     default `use_index`) emitted `inserted_rows_filter: None` (v1 route
+     confirmed), `fields_for_preserving_frag_bitmap = [0, 1, 2]`,
+     `affected_rows` present, stats `updated=2 / inserted=0`. After commit,
+     **no index claimed the new fragment** (`claims_new_frags=[]` for all
+     three), and FTS found the rewritten rows via flat search of the
+     uncovered fragment. The hazard does not materialize for
+     OmniGraph-shaped schemas because every OmniGraph-built index (BTREE /
+     FTS / vector) references a top-level field id present in the v1 list.
+   - Residual caveat to pin in the guard cell: OmniGraph **does** support
+     list-typed properties (`types.rs::to_arrow` emits `DataType::List`),
+     and a Lance `List` child *does* carry a nested field id — but no
+     OmniGraph index targets a list column or child
+     (BTREE = enum/orderable scalar, FTS = free-text String, vector = FSL).
+     The `lance_surface_guards` cell that unlocks `use_index(true)` for the
+     update adapter should therefore include one list-typed property in its
+     fixture and assert zero new-fragment claims after a v1 UpdateAll.
+   - Status: indexed follow-up is **viable**; it stays gated only on landing
+     that checked-in guard cell (invariants: performance/behavior claims
+     require a checked-in instrument), not on an upstream fix.
+
+2. **FTS after a `Merged` outcome — behavior verified, docs need one
+   clarification, no new class from L3.**
+   - Never-indexed table: `scanner.full_text_search` returns a hard Lance
+     error (*"Cannot perform full text search unless an INVERTED index has
+     been created on at least one column"*). OmniGraph's executor passes the
+     scanner error straight through as `OmniError::Lance`
+     (`exec/query.rs` ~2491) — no pre-check, no scan fallback.
+   - Never-indexed `nearest`: returns Ok via flat KNN (brute force) — the
+     documented vector fallback is real.
+   - Existing index with stale coverage: FTS **finds** rows in uncovered
+     fragments (flat-searched), so post-L3 three-way merges into
+     already-indexed tables stay fully searchable before maintenance.
+   - L3 therefore adds **no new failure class**: schema apply, load, and
+     mutate already defer FTS builds, so "bm25 errors until the first
+     `ensure_indices`/`optimize`" is reachable today on any fresh table; L3
+     only removes the last eager builder. The L3 PR should still align
+     wording: [docs/user/search/index.md](../user/search/index.md) ("needs
+     the backing index") is correct for FTS **absence**;
+     [docs/user/search/indexes.md](../user/search/indexes.md) ("falls back
+     to scans") is correct for vector and for FTS **coverage gaps**, and
+     must not be read as an FTS-absence fallback.
