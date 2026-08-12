@@ -918,7 +918,7 @@ impl ApiError {
                 format!("recovery required for operation {operation_id}: {reason}"),
                 operation_id,
             ),
-            OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
+            OmniError::Storage(failure) => Self::internal(format!("storage: {failure}")),
             OmniError::RetryableCommitConflict(message) => {
                 Self::conflict(format!("retryable storage commit conflict: {message}"))
             }
@@ -934,6 +934,11 @@ impl ApiError {
             // single canonical translation when a future runtime
             // create endpoint lands.
             err @ OmniError::AlreadyInitialized { .. } => Self::conflict(err.to_string()),
+            // `OmniError` is `#[non_exhaustive]`: a variant added by a newer
+            // engine must not stop this crate from compiling. Every arm above
+            // is an explicit, reviewed translation; anything unrecognised is an
+            // internal failure until it gets one.
+            err => Self::internal(err.to_string()),
         }
     }
 }

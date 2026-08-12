@@ -3,8 +3,31 @@
 ## Error taxonomy (`omnigraph::error::OmniError`)
 
 - `Compiler(...)` — schema/query parse/typecheck errors
-- `Lance(String)` — storage layer
-- `DataFusion(String)` — execution layer
+- `Storage(StorageFailure { kind, message })` — the storage layer (Lance, and
+  the object store beneath it). `kind` is the classification a caller uses to
+  decide whether to retry, reconfigure, or escalate; `message` keeps the
+  substrate's own wording. Classification happens once, at the boundary, and
+  travels with the error — nothing above the boundary parses error text.
+  - `StorageFailureKind::Transient` — transport failure, timeout, throttling,
+    or a retry budget the object store already exhausted. A bounded retry of
+    the same call can plausibly succeed. This is where an S3 5xx, a connection
+    reset, a DNS failure, or a TLS error arrives.
+  - `StorageFailureKind::Configuration` — credentials, permissions, an
+    unsupported operation, or a malformed URI. Retrying the same call with the
+    same configuration cannot succeed; an operator must change something.
+  - `StorageFailureKind::NotFound` — the object, dataset, version, or ref
+    genuinely does not exist.
+  - `StorageFailureKind::Permanent` — corruption, a schema mismatch, or a
+    substrate-internal failure. Never retry.
+
+  `OmniError::storage_failure()` returns the classified failure for any error
+  that is one, so a caller never matches on engine internals. The `Display`
+  form is unchanged (`storage: <message>`), so logs and existing operator
+  runbooks are unaffected.
+- `DataFusion(String)` — execution layer. A DataFusion failure that carries a
+  substrate error in its source chain is classified as `Storage` instead, since
+  the same type carries both in-memory execution failures and failures raised
+  during a Lance scan.
 - `Io(io::Error)`
 - `Manifest(ManifestError { kind: BadRequest|NotFound|Conflict|Internal, details: Option<ManifestConflictDetails>, … })`
   - `ManifestConflictDetails::ExpectedVersionMismatch { table_key, expected, actual }` — caller's `expected_table_versions` did not match the manifest's current latest non-tombstoned version (set by `OmniError::manifest_expected_version_mismatch`).
@@ -21,7 +44,9 @@
 - `RetryableCommitConflict(String)` — the typed internal signal that Lance
   rejected a stale filtered transaction. Upsert writers consume an effect-free
   instance by discarding and fully repreparing the logical operation; a strict
-  writer does the same when its fresh attempted-ID probe finds no match. No code
+  writer does the same when its fresh attempted-ID probe finds no match. Kept as
+  its own variant rather than folded into `Storage` because the effect-free key
+  fence depends on telling it apart from an arbitrary storage failure. No code
   parses Lance error text. If this signal escapes an enrolled writer, HTTP maps
   it to a generic **409** conflict.
 - `ResourceLimitExceeded { resource, limit, actual }` — a keyed Mutation/Load

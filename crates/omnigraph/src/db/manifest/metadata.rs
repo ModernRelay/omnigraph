@@ -249,15 +249,12 @@ pub(super) async fn table_version_metadata_for_state(
     )
     .await?;
     let ds = match branch {
-        Some(branch) => ds
-            .checkout_branch(branch)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?,
+        Some(branch) => ds.checkout_branch(branch).await.map_err(OmniError::from)?,
         None => ds,
     };
     let ds = ds
         .checkout_version(version)
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::from)?;
     TableVersionMetadata::from_dataset(root_uri, table_path, &ds)
 }

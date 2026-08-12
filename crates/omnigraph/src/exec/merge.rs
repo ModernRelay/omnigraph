@@ -476,7 +476,7 @@ impl OrderedTableCursor {
                     self.current_batch = None;
                     return Ok(None);
                 }
-                Err(err) => return Err(OmniError::Lance(err.to_string())),
+                Err(err) => return Err(OmniError::from(err)),
             }
         }
     }
@@ -556,8 +556,8 @@ impl StagedTableWriter {
         // and buffering many slices would retain those backing buffers. Take
         // copies exactly one row so the byte ceiling measures owned payload.
         let indices = UInt64Array::from(vec![row.row_index as u64]);
-        let batch = arrow_select::take::take_record_batch(&row.batch, &indices)
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let batch =
+            arrow_select::take::take_record_batch(&row.batch, &indices).map_err(OmniError::from)?;
         let has_blob_columns = row
             .dataset
             .schema()
@@ -581,8 +581,7 @@ impl StagedTableWriter {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        RecordBatch::try_new(self.schema.clone(), columns)
-            .map_err(|e| OmniError::Lance(e.to_string()))
+        RecordBatch::try_new(self.schema.clone(), columns).map_err(OmniError::from)
     }
 
     async fn finish(mut self) -> Result<StagedTable> {
@@ -613,8 +612,7 @@ impl StagedTableWriter {
             self.batches.pop().unwrap()
         } else {
             let batches = std::mem::take(&mut self.batches);
-            arrow_select::concat::concat_batches(&self.schema, &batches)
-                .map_err(|e| OmniError::Lance(e.to_string()))?
+            arrow_select::concat::concat_batches(&self.schema, &batches).map_err(OmniError::from)?
         };
         self.buffered_rows = 0;
         self.buffered_bytes = 0;
@@ -720,14 +718,8 @@ async fn try_proven_pure_insert_adopt(
     {
         return Ok(None);
     }
-    let base_identifier = base
-        .branch_identifier()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?;
-    let source_identifier = source
-        .branch_identifier()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let base_identifier = base.branch_identifier().await.map_err(OmniError::from)?;
+    let source_identifier = source.branch_identifier().await.map_err(OmniError::from)?;
     if base_entry.table_branch == source_entry.table_branch && source_identifier != base_identifier
     {
         return Err(OmniError::manifest_read_set_changed(
@@ -1019,11 +1011,7 @@ async fn plan_proven_pure_insert_chunks(
         .await?;
     let mut chunk_rows = Vec::new();
     let mut observed_rows = 0_u64;
-    while let Some(batch) = stream
-        .try_next()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
-    {
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::from)? {
         if batch.num_rows() == 0 {
             continue;
         }
@@ -1487,10 +1475,7 @@ fn row_signature(batch: &RecordBatch, row: usize) -> Result<String> {
         if field.name().starts_with("_row") {
             continue;
         }
-        values.push(
-            array_value_to_string(column.as_ref(), row)
-                .map_err(|e| OmniError::Lance(e.to_string()))?,
-        );
+        values.push(array_value_to_string(column.as_ref(), row).map_err(OmniError::from)?);
     }
     Ok(values.join("\u{1f}"))
 }
@@ -1728,11 +1713,7 @@ async fn scan_staged_for_validation(
             KEYED_WRITE_MAX_BYTES,
         )
         .await?;
-    while let Some(batch) = stream
-        .try_next()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
-    {
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::from)? {
         if batch.num_rows() == 0 {
             continue;
         }
@@ -1778,11 +1759,7 @@ async fn scan_proven_pure_inserts_for_validation(
         )
         .await?;
     let mut observed_rows = 0_u64;
-    while let Some(batch) = stream
-        .try_next()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
-    {
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::from)? {
         if batch.num_rows() == 0 {
             continue;
         }
@@ -2528,11 +2505,7 @@ async fn next_exact_staged_chunk(
         let batch = match carry.take() {
             Some(batch) => batch,
             None => loop {
-                match stream
-                    .try_next()
-                    .await
-                    .map_err(|error| OmniError::Lance(error.to_string()))?
-                {
+                match stream.try_next().await.map_err(OmniError::from)? {
                     Some(batch) if batch.num_rows() > 0 => break batch,
                     Some(_) => continue,
                     None => {
@@ -2553,8 +2526,7 @@ async fn next_exact_staged_chunk(
     let chunk = if slices.len() == 1 {
         slices.pop().expect("one slice")
     } else {
-        arrow_select::concat::concat_batches(schema, &slices)
-            .map_err(|error| OmniError::Lance(error.to_string()))?
+        arrow_select::concat::concat_batches(schema, &slices).map_err(OmniError::from)?
     };
     let chunk_bytes = u64::try_from(chunk.get_array_memory_size())
         .map_err(|_| OmniError::manifest_internal("branch merge chunk bytes exceed u64"))?;
@@ -2676,11 +2648,7 @@ async fn commit_keyed_stream_chunks(
 
     let mut has_extra_rows = carry.as_ref().is_some_and(|batch| batch.num_rows() > 0);
     while !has_extra_rows {
-        match stream
-            .try_next()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?
-        {
+        match stream.try_next().await.map_err(OmniError::from)? {
             Some(batch) => has_extra_rows = batch.num_rows() > 0,
             None => break,
         }

@@ -28,7 +28,7 @@ pub(crate) enum BranchCreateOutcome {
 }
 
 fn lance_error(error: lance::Error) -> OmniError {
-    OmniError::Lance(error.to_string())
+    OmniError::from(error)
 }
 
 /// Pinned Lance treats an already-absent target tree as success. OmniGraph

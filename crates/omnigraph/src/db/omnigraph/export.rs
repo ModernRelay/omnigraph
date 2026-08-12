@@ -307,11 +307,7 @@ where
                 EXPORT_SCAN_TARGET_BYTES,
             )
             .await?;
-        while let Some(batch) = batches
-            .try_next()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?
-        {
+        while let Some(batch) = batches.try_next().await.map_err(OmniError::from)? {
             emit_export_rows_from_batch(catalog, table_key, &batch, None, emit).await?;
         }
         return Ok(());
@@ -334,11 +330,7 @@ where
             EXPORT_SCAN_TARGET_BYTES,
         )
         .await?;
-    while let Some(batch) = batches
-        .try_next()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
-    {
+    while let Some(batch) = batches.try_next().await.map_err(OmniError::from)? {
         for row_index in 0..batch.num_rows() {
             let row = batch.slice(row_index, 1);
             let row_id = row
@@ -531,7 +523,7 @@ async fn export_blob_column_values(
     let sorted_blobs = Arc::new(source_ds.clone())
         .take_blobs(&sorted_ids, column_name)
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::from)?;
 
     if sorted_blobs.len() != non_null_positions.len() {
         return Err(OmniError::manifest_internal(format!(
@@ -550,10 +542,7 @@ async fn export_blob_column_values(
         let value = if let Some(uri) = blob.uri() {
             uri.to_string()
         } else {
-            let bytes = blob
-                .read()
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let bytes = blob.read().await.map_err(OmniError::from)?;
             format!(
                 "base64:{}",
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
@@ -599,7 +588,9 @@ fn named_string_value(batch: &RecordBatch, field_name: &str, row: usize) -> Resu
     let array = column
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest_internal(format!("expected Utf8 column '{}'", field_name)))?;
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("expected Utf8 column '{}'", field_name))
+        })?;
     if array.is_null(row) {
         return Err(OmniError::manifest_internal(format!(
             "unexpected null in export column '{}'",

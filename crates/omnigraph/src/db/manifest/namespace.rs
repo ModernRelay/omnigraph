@@ -127,9 +127,7 @@ impl StagedTableNamespace {
         if ds.version().version == version {
             Ok(ds)
         } else {
-            ds.checkout_version(version)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))
+            ds.checkout_version(version).await.map_err(OmniError::from)
         }
     }
 

@@ -129,7 +129,7 @@ impl RecoveryAudit {
         dataset
             .append(reader, None)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::from)?;
         self.dataset = Some(dataset);
         Ok(())
     }
@@ -145,10 +145,10 @@ impl RecoveryAudit {
             .scan()
             .try_into_stream()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .map_err(OmniError::from)?
             .try_collect()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::from)?;
 
         let mut out = Vec::new();
         for batch in batches {
@@ -214,7 +214,7 @@ async fn create_recoveries_dataset(root_uri: &str) -> Result<Dataset> {
             )
             .await
         }
-        Err(err) => Err(OmniError::Lance(err.to_string())),
+        Err(err) => Err(OmniError::from(err)),
     }
 }
 
@@ -237,7 +237,7 @@ fn recovery_record_to_batch(record: &RecoveryAuditRecord) -> Result<RecordBatch>
             Arc::new(TimestampMicrosecondArray::from(vec![record.created_at])),
         ],
     )
-    .map_err(|e| OmniError::Lance(e.to_string()))
+    .map_err(OmniError::from)
 }
 
 fn decode_row(batch: &RecordBatch, row: usize) -> Result<RecoveryAuditRecord> {

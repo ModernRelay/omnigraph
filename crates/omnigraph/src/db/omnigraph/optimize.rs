@@ -469,7 +469,7 @@ async fn prepare_optimize_table(
     let options = CompactionOptions::default();
     let will_compact = plan_compaction(snapshot.dataset(), &options)
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .map_err(OmniError::from)?
         .num_tasks()
         > 0;
     let needs_reindex = TableStore::has_unindexed_fragments(snapshot.dataset()).await?;
@@ -561,7 +561,7 @@ async fn apply_optimize_table_effects(
         let options = CompactionOptions::default();
         let plan = plan_compaction(selected.dataset(), &options)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::from)?;
         let will_compact = plan.num_tasks() > 0;
         // Even with nothing to compact, the table may still have index work
         // (needs_reindex: rows appended since the index was built; needs_index_create:
@@ -619,7 +619,7 @@ async fn apply_optimize_table_effects(
             Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
                 continue;
             }
-            Err(e) => return Err(OmniError::Lance(e.to_string())),
+            Err(e) => return Err(OmniError::from(e)),
         }
         let metrics: CompactionMetrics = if will_compact {
             match compact_files(&mut ds, options, None).await {
@@ -630,7 +630,7 @@ async fn apply_optimize_table_effects(
                 Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
                     continue;
                 }
-                Err(e) => return Err(OmniError::Lance(e.to_string())),
+                Err(e) => return Err(OmniError::from(e)),
             }
         } else {
             CompactionMetrics::default()
@@ -651,10 +651,10 @@ async fn apply_optimize_table_effects(
                 continue;
             }
             Err(e) => {
-                return Err(OmniError::Lance(format!(
-                    "optimize_indices on {}: {}",
-                    table_key, e
-                )));
+                return Err(OmniError::storage_context(
+                    e,
+                    format!("optimize_indices on {}", table_key),
+                ));
             }
         }
 
@@ -938,14 +938,14 @@ async fn compact_internal_table(
                 if attempt + 1 < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) {
                     continue;
                 }
-                return Err(OmniError::Lance(e.to_string()));
+                return Err(OmniError::from(e));
             }
         };
 
         let options = CompactionOptions::default();
         let plan = plan_compaction(&ds, &options)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::from)?;
         if plan.num_tasks() == 0 {
             // No compaction work, but a config-strip still advanced HEAD — refresh
             // the warm coordinator handles so they observe it deterministically
@@ -976,7 +976,7 @@ async fn compact_internal_table(
             Err(e) if attempt + 1 < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
                 continue;
             }
-            Err(e) => return Err(OmniError::Lance(e.to_string())),
+            Err(e) => return Err(OmniError::from(e)),
         }
     }
     Err(OmniError::manifest_conflict(format!(
@@ -1197,10 +1197,7 @@ pub async fn cleanup_all_tables(
                     // version list so `keep=N` retains exactly the newest N
                     // available versions (with HEAD as the unavoidable floor
                     // when N=0).
-                    let versions = ds
-                        .versions()
-                        .await
-                        .map_err(|error| OmniError::Lance(error.to_string()))?;
+                    let versions = ds.versions().await.map_err(OmniError::from)?;
                     let retain = (keep as usize).max(1);
                     let cutoff = if versions.len() <= retain {
                         versions.first()
@@ -1231,7 +1228,7 @@ pub async fn cleanup_all_tables(
                 };
                 lance::dataset::cleanup::cleanup_old_versions(ds, policy)
                     .await
-                    .map_err(|e| OmniError::Lance(e.to_string()))
+                    .map_err(OmniError::from)
             }
             .await;
             match outcome {

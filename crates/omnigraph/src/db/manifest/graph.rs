@@ -65,11 +65,11 @@ pub(super) async fn init_manifest_graph(
     let manifest_path = manifest_uri(root);
     let mut dataset = Dataset::write(reader, &manifest_path, Some(params))
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::from)?;
     dataset
         .update_config([(TABLE_VERSION_MANAGEMENT_KEY, Some("true"))])
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::from)?;
     stamp_current_version(&mut dataset).await?;
 
     let (known_state, lineage_rows) = read_manifest_state_and_lineage(&dataset).await?;
@@ -115,7 +115,7 @@ pub(super) async fn snapshot_state_at(
     let dataset = dataset
         .checkout_version(version)
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::from)?;
     read_manifest_state(&dataset).await
 }
 
@@ -222,7 +222,7 @@ async fn create_empty_dataset(
     };
     Dataset::write(reader, uri, Some(params))
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
+        .map_err(OmniError::from)
 }
 
 fn keyed_graph_table_schema(schema: &SchemaRef) -> Result<SchemaRef> {

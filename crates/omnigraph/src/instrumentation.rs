@@ -548,10 +548,7 @@ pub(crate) async fn open_dataset(
             ..Default::default()
         });
     }
-    builder
-        .load()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    builder.load().await.map_err(OmniError::from)
 }
 
 /// Per-method call counts for [`CountingStorageAdapter`].

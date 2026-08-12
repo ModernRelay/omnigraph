@@ -1427,7 +1427,7 @@ fn build_node_batch(
     columns.push(Arc::new(StringArray::from(ids)));
     columns.extend(property_columns);
 
-    RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(schema, columns).map_err(OmniError::from)
 }
 
 fn build_edge_batch(
@@ -1494,7 +1494,7 @@ fn build_edge_batch(
         }
     }
 
-    RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(schema, columns).map_err(OmniError::from)
 }
 
 /// Normalize a bounded group of caller-shaped rows into one dense logical
@@ -1622,7 +1622,7 @@ fn normalize_strict_node_rows(node_type: &NodeType, rows: &[JsonValue]) -> Resul
     let mut columns = Vec::with_capacity(schema.fields().len());
     columns.push(Arc::new(StringArray::from(ids)) as ArrayRef);
     columns.extend(property_columns);
-    RecordBatch::try_new(schema, columns).map_err(|error| OmniError::Lance(error.to_string()))
+    RecordBatch::try_new(schema, columns).map_err(OmniError::from)
 }
 
 fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Result<RecordBatch> {
@@ -1682,7 +1682,7 @@ fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Resul
         };
         columns.push(column);
     }
-    RecordBatch::try_new(schema, columns).map_err(|error| OmniError::Lance(error.to_string()))
+    RecordBatch::try_new(schema, columns).map_err(OmniError::from)
 }
 
 fn strict_row_objects(rows: &[JsonValue]) -> Result<Vec<&serde_json::Map<String, JsonValue>>> {
@@ -1960,14 +1960,10 @@ pub(crate) fn append_blob_value(builder: &mut BlobArrayBuilder, value: &str) -> 
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(|e| OmniError::manifest(format!("invalid base64 blob data: {}", e)))?;
-        builder
-            .push_bytes(bytes)
-            .map_err(|e| OmniError::Lance(e.to_string()))
+        builder.push_bytes(bytes).map_err(OmniError::from)
     } else {
         // Treat as URI (file://, s3://, gs://, or any other scheme)
-        builder
-            .push_uri(value)
-            .map_err(|e| OmniError::Lance(e.to_string()))
+        builder.push_uri(value).map_err(OmniError::from)
     }
 }
 
@@ -1980,9 +1976,7 @@ fn build_blob_column(name: &str, nullable: bool, rows: &[JsonValue]) -> Result<A
                 append_blob_value(&mut builder, s)?;
             }
             Some(JsonValue::Null) | None if nullable => {
-                builder
-                    .push_null()
-                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+                builder.push_null().map_err(OmniError::from)?;
             }
             Some(JsonValue::Null) | None => {
                 return Err(OmniError::manifest(format!(
@@ -1998,9 +1992,7 @@ fn build_blob_column(name: &str, nullable: bool, rows: &[JsonValue]) -> Result<A
             }
         }
     }
-    builder
-        .finish()
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    builder.finish().map_err(OmniError::from)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

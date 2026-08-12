@@ -64,6 +64,10 @@ lance-namespace-impls = { workspace = true }
 lance-io = { version = "9.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
+# Lance's error variants are snafu-generated. The error-classification tests
+# construct the exact upstream shapes rather than approximations, so a Lance
+# change to those shapes fails the build instead of silently drifting.
+snafu = "0.9"
 syn = { version = "2", features = ["full", "visit"] }
 # benches/scenarios.rs: wait4/rusage peak-RSS and benchmark memory caps.
 libc = "0.2"

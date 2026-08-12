@@ -300,7 +300,7 @@ impl GraphNamespacePublisher {
                         registration.identity,
                     )?;
                     if canonical_path != registration.table_path {
-                        return Err(OmniError::Lance(
+                        return Err(OmniError::storage_permanent(
                             NamespaceError::ConcurrentModification {
                                 message: format!(
                                     "table {} identity {} must use canonical path {}, got {}",
@@ -317,7 +317,7 @@ impl GraphNamespacePublisher {
                         if existing == registration {
                             continue;
                         }
-                        return Err(OmniError::Lance(
+                        return Err(OmniError::storage_permanent(
                             NamespaceError::ConcurrentModification {
                                 message: format!(
                                     "table identity {} is already registered as {} at {}",
@@ -359,7 +359,7 @@ impl GraphNamespacePublisher {
                         )));
                     }
                     let existing = known_tables.get(identity).ok_or_else(|| {
-                        OmniError::Lance(
+                        OmniError::storage_permanent(
                             NamespaceError::TableNotFound {
                                 message: format!("table identity {identity} not found"),
                             }
@@ -367,7 +367,7 @@ impl GraphNamespacePublisher {
                         )
                     })?;
                     if !Self::is_live_identity(*identity, existing_versions, existing_tombstones) {
-                        return Err(OmniError::Lance(
+                        return Err(OmniError::storage_permanent(
                             NamespaceError::TableNotFound {
                                 message: format!(
                                     "live table identity {identity} not found for rename"
@@ -424,10 +424,9 @@ impl GraphNamespacePublisher {
                     update.identity.validate()?;
                     let request = update.to_create_table_version_request();
                     let (table_key, table_version, row_count, table_branch, version_metadata) =
-                        parse_namespace_version_request(&request)
-                            .map_err(|e| OmniError::Lance(e.to_string()))?;
+                        parse_namespace_version_request(&request).map_err(OmniError::from)?;
                     let registration = known_tables.get(&update.identity).ok_or_else(|| {
-                        OmniError::Lance(
+                        OmniError::storage_permanent(
                             NamespaceError::TableNotFound {
                                 message: format!("table identity {} not found", update.identity),
                             }
@@ -435,7 +434,7 @@ impl GraphNamespacePublisher {
                         )
                     })?;
                     if registration.table_key != table_key {
-                        return Err(OmniError::Lance(
+                        return Err(OmniError::storage_permanent(
                             NamespaceError::ConcurrentModification {
                                 message: format!(
                                     "table identity {} is bound to {}, not {}",
@@ -449,7 +448,7 @@ impl GraphNamespacePublisher {
                         .insert((update.identity, table_version), ())
                         .is_some()
                     {
-                        return Err(OmniError::Lance(
+                        return Err(OmniError::storage_permanent(
                             NamespaceError::ConcurrentModification {
                                 message: format!(
                                     "table version {} already exists for identity {} ({})",
@@ -464,7 +463,7 @@ impl GraphNamespacePublisher {
                         let is_owner_branch_handoff = existing.row_count == row_count
                             && existing.table_branch != table_branch;
                         if !is_owner_branch_handoff {
-                            return Err(OmniError::Lance(
+                            return Err(OmniError::storage_permanent(
                                 NamespaceError::ConcurrentModification {
                                     message: format!(
                                         "table version {} already exists for identity {} ({})",
@@ -495,7 +494,7 @@ impl GraphNamespacePublisher {
                 }) => {
                     identity.validate()?;
                     let registration = known_tables.get(identity).ok_or_else(|| {
-                        OmniError::Lance(
+                        OmniError::storage_permanent(
                             NamespaceError::TableNotFound {
                                 message: format!("table identity {identity} not found"),
                             }
@@ -503,7 +502,7 @@ impl GraphNamespacePublisher {
                         )
                     })?;
                     if registration.table_key != *table_key {
-                        return Err(OmniError::Lance(
+                        return Err(OmniError::storage_permanent(
                             NamespaceError::ConcurrentModification {
                                 message: format!(
                                     "table identity {identity} is bound to {}, not {}",
@@ -514,7 +513,7 @@ impl GraphNamespacePublisher {
                         ));
                     }
                     if existing_tombstones.contains_key(&(*identity, *tombstone_version)) {
-                        return Err(OmniError::Lance(
+                        return Err(OmniError::storage_permanent(
                             NamespaceError::ConcurrentModification {
                                 message: format!(
                                     "table tombstone {} already exists for identity {} ({})",
@@ -889,7 +888,7 @@ impl GraphNamespacePublisher {
                     None,
                 ));
             }
-            Err(err) => return Err(OmniError::Lance(err.to_string())),
+            Err(err) => return Err(OmniError::from(err)),
         };
         if actual_branch_identifier != expected.branch_identifier {
             let actual = serde_json::to_string(&actual_branch_identifier).map_err(|e| {
@@ -924,7 +923,7 @@ impl GraphNamespacePublisher {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], manifest_schema());
         let dataset = Arc::new(dataset);
         let mut merge_builder = MergeInsertBuilder::try_new(dataset, vec!["object_id".to_string()])
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::from)?;
         merge_builder.when_matched(WhenMatched::UpdateAll);
         merge_builder.when_not_matched(WhenNotMatched::InsertAll);
         // 0 here is intentional: Lance's built-in retry uses transparent rebase,
@@ -941,7 +940,7 @@ impl GraphNamespacePublisher {
         merge_builder.skip_auto_cleanup(true);
         let (new_dataset, _stats) = merge_builder
             .try_build()
-            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .map_err(OmniError::from)?
             .execute_reader(Box::new(reader))
             .await
             .map_err(map_lance_publish_error)?;
@@ -958,8 +957,7 @@ impl GraphNamespacePublisher {
             .iter()
             .map(|request| {
                 let (table_key, table_version, row_count, table_branch, version_metadata) =
-                    parse_namespace_version_request(request)
-                        .map_err(|e| OmniError::Lance(e.to_string()))?;
+                    parse_namespace_version_request(request).map_err(OmniError::from)?;
                 let identity = registrations
                     .values()
                     .find(|registration| registration.table_key == table_key)
@@ -1024,7 +1022,7 @@ pub(crate) fn map_lance_publish_error(err: LanceError) -> OmniError {
             err
         ));
     }
-    OmniError::Lance(err.to_string())
+    OmniError::from(err)
 }
 
 #[async_trait]

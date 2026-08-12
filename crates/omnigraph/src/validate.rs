@@ -549,7 +549,7 @@ async fn scan_filtered(ds: &Dataset, projection: &[&str], expr: Expr) -> Result<
     .await?
     .try_collect()
     .await
-    .map_err(|e| OmniError::Lance(e.to_string()))
+    .map_err(OmniError::from)
 }
 
 /// Scan `projection` from every row (no filter). Used to enumerate a table's
@@ -559,7 +559,7 @@ async fn scan_all(ds: &Dataset, projection: &[&str]) -> Result<Vec<RecordBatch>>
         .await?
         .try_collect()
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
+        .map_err(OmniError::from)
 }
 
 /// Ids an `Overwrite` of `table_key` removes: committed ids in `base` that are

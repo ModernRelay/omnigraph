@@ -663,8 +663,7 @@ fn build_fused_batch(
     }
 
     let schema = row_slices[0].schema();
-    arrow_select::concat::concat_batches(&schema, &row_slices)
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    arrow_select::concat::concat_batches(&schema, &row_slices).map_err(OmniError::from)
 }
 
 /// Check if a filter is a text search filter that needs Lance SQL pushdown.
@@ -2182,7 +2181,7 @@ async fn hydrate_nodes(
     .await?
     .try_collect::<Vec<RecordBatch>>()
     .await
-    .map_err(|e| OmniError::Lance(e.to_string()))?;
+    .map_err(OmniError::from)?;
 
     let scan_result = if batches.is_empty() {
         return Ok(RecordBatch::new_empty(node_type.arrow_schema.clone()));
@@ -2190,8 +2189,7 @@ async fn hydrate_nodes(
         batches.into_iter().next().unwrap()
     } else {
         let schema = batches[0].schema();
-        arrow_select::concat::concat_batches(&schema, &batches)
-            .map_err(|e| OmniError::Lance(e.to_string()))?
+        arrow_select::concat::concat_batches(&schema, &batches).map_err(OmniError::from)?
     };
 
     if has_blobs {
@@ -2304,8 +2302,7 @@ async fn execute_anti_join(
     };
     // Fast path: bulk CSR existence check (O(N), zero Lance I/O)
     if let Some(mask) = try_bulk_anti_join_mask(wide, inner_pipeline, gi, catalog, outer_var) {
-        *wide = arrow_select::filter::filter_record_batch(wide, &mask)
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        *wide = arrow_select::filter::filter_record_batch(wide, &mask).map_err(OmniError::from)?;
         return Ok(());
     }
 
@@ -2348,8 +2345,8 @@ async fn execute_anti_join(
     fields.push(Field::new(tag_col.as_str(), DataType::UInt32, false));
     let mut columns: Vec<ArrayRef> = wide.columns().to_vec();
     columns.push(Arc::new(UInt32Array::from_iter_values(0..num_rows as u32)));
-    let tagged = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let tagged =
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(OmniError::from)?;
 
     let mut inner_wide: Option<RecordBatch> = Some(tagged);
     let no_search = SearchMode::default();
@@ -2392,8 +2389,7 @@ async fn execute_anti_join(
         .map(|i| !matched.contains(&i))
         .collect();
     let mask = BooleanArray::from(keep_mask);
-    *wide = arrow_select::filter::filter_record_batch(wide, &mask)
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    *wide = arrow_select::filter::filter_record_batch(wide, &mask).map_err(OmniError::from)?;
     Ok(())
 }
 
@@ -2465,7 +2461,7 @@ async fn execute_node_scan(
                 if is_search_filter(filter) {
                     if let Some(fts_query) = build_fts_query(&filter.left, params) {
                         scanner.full_text_search(fts_query).map_err(|e| {
-                            OmniError::Lance(format!("full_text_search filter: {}", e))
+                            OmniError::storage_context(e, "full_text_search filter")
                         })?;
                     }
                 }
@@ -2477,7 +2473,7 @@ async fn execute_node_scan(
                     let query_arr = Float32Array::from(vec.clone());
                     scanner
                         .nearest(prop, &query_arr, k)
-                        .map_err(|e| OmniError::Lance(format!("nearest: {}", e)))?;
+                        .map_err(|e| OmniError::storage_context(e, "nearest"))?;
                 }
             }
 
@@ -2486,10 +2482,10 @@ async fn execute_node_scan(
                 if var == variable {
                     let fts_query = lance_index::scalar::FullTextSearchQuery::new(text.clone())
                         .with_column(prop.clone())
-                        .map_err(|e| OmniError::Lance(format!("fts with_column: {}", e)))?;
+                        .map_err(|e| OmniError::storage_context(e, "fts with_column"))?;
                     scanner
                         .full_text_search(fts_query)
-                        .map_err(|e| OmniError::Lance(format!("full_text_search: {}", e)))?;
+                        .map_err(|e| OmniError::storage_context(e, "full_text_search"))?;
                 }
             }
             Ok(())
@@ -2498,7 +2494,7 @@ async fn execute_node_scan(
     .await?
     .try_collect::<Vec<RecordBatch>>()
     .await
-    .map_err(|e| OmniError::Lance(e.to_string()))?;
+    .map_err(OmniError::from)?;
 
     let scan_result = if batches.is_empty() {
         RecordBatch::new_empty(batches.first().map(|b| b.schema()).unwrap_or_else(|| {
@@ -2516,8 +2512,7 @@ async fn execute_node_scan(
         batches.into_iter().next().unwrap()
     } else {
         let schema = batches[0].schema();
-        arrow_select::concat::concat_batches(&schema, &batches)
-            .map_err(|e| OmniError::Lance(e.to_string()))?
+        arrow_select::concat::concat_batches(&schema, &batches).map_err(OmniError::from)?
     };
 
     // Add null placeholder columns for excluded blob properties
@@ -2545,14 +2540,13 @@ fn add_null_blob_columns(
             let batch_schema = batch.schema();
             let batch_field = batch_schema
                 .field_with_name(field.name())
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+                .map_err(OmniError::from)?;
             fields.push(batch_field.clone());
             columns.push(col.clone());
         }
     }
 
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(OmniError::from)
 }
 
 /// Build a FullTextSearchQuery from a search IR expression.
@@ -2883,8 +2877,7 @@ fn prefix_batch(batch: &RecordBatch, variable: &str) -> Result<RecordBatch> {
         })
         .collect();
     let schema = Arc::new(Schema::new(fields));
-    RecordBatch::try_new(schema, batch.columns().to_vec())
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(schema, batch.columns().to_vec()).map_err(OmniError::from)
 }
 
 fn cross_join_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordBatch> {
@@ -2935,8 +2928,7 @@ fn hconcat_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordBatc
     fields.extend(right.schema().fields().iter().map(|f| f.as_ref().clone()));
     let mut columns: Vec<ArrayRef> = left.columns().to_vec();
     columns.extend(right.columns().to_vec());
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(OmniError::from)
 }
 
 fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch> {
@@ -2945,8 +2937,8 @@ fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch>
         .iter()
         .map(|col| arrow_select::take::take(col.as_ref(), indices, None))
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    RecordBatch::try_new(batch.schema(), columns).map_err(|e| OmniError::Lance(e.to_string()))
+        .map_err(OmniError::from)?;
+    RecordBatch::try_new(batch.schema(), columns).map_err(OmniError::from)
 }
 
 #[cfg(test)]

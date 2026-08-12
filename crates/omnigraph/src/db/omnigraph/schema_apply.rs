@@ -1204,7 +1204,7 @@ async fn cleanup_dataset_old_versions(db: &Omnigraph, full_uri: &str) -> Result<
     };
     let _removed = lance::dataset::cleanup::cleanup_old_versions(&ds, policy)
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::from)?;
     let _ = db;
     Ok(())
 }
@@ -1369,7 +1369,7 @@ pub(super) async fn batch_for_schema_apply_rewrite(
         }
     }
 
-    RecordBatch::try_new(target_schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(target_schema, columns).map_err(OmniError::from)
 }
 
 async fn rebuild_blob_column(
@@ -1397,15 +1397,13 @@ async fn rebuild_blob_column(
         Arc::new(source_ds.dataset().clone())
             .take_blobs(&non_null_row_ids, column_name)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .map_err(OmniError::from)?
     };
 
     let mut files = blob_files.into_iter();
     for has_blob in row_has_blob {
         if !has_blob {
-            builder
-                .push_null()
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            builder.push_null().map_err(OmniError::from)?;
             continue;
         }
 
@@ -1416,17 +1414,11 @@ async fn rebuild_blob_column(
             ))
         })?;
         if let Some(uri) = blob.uri() {
-            builder
-                .push_uri(uri)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            builder.push_uri(uri).map_err(OmniError::from)?;
         } else {
             builder
-                .push_bytes(
-                    blob.read()
-                        .await
-                        .map_err(|e| OmniError::Lance(e.to_string()))?,
-                )
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+                .push_bytes(blob.read().await.map_err(OmniError::from)?)
+                .map_err(OmniError::from)?;
         }
     }
 
@@ -1437,7 +1429,5 @@ async fn rebuild_blob_column(
         )));
     }
 
-    builder
-        .finish()
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    builder.finish().map_err(OmniError::from)
 }

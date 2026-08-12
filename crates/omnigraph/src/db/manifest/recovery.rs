@@ -2981,20 +2981,14 @@ pub(crate) async fn restore_table_to_version(
     )
     .await?;
     let head = match branch {
-        Some(b) if b != "main" => head
-            .checkout_branch(b)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?,
+        Some(b) if b != "main" => head.checkout_branch(b).await.map_err(OmniError::from)?,
         _ => head,
     };
     let mut to_restore = head
         .checkout_version(target_version)
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    to_restore
-        .restore()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::from)?;
+    to_restore.restore().await.map_err(OmniError::from)?;
     Ok(())
 }
 
@@ -4230,10 +4224,7 @@ async fn observe_branch_merge_target_ref(
         .as_deref()
         .filter(|branch| *branch != "main")
     else {
-        let branch_identifier = dataset
-            .branch_identifier()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let branch_identifier = dataset.branch_identifier().await.map_err(OmniError::from)?;
         let version = dataset.version().version;
         return Ok(Some(BranchMergeRefObservation {
             dataset,
@@ -4242,17 +4233,14 @@ async fn observe_branch_merge_target_ref(
             parent_version: None,
         }));
     };
-    let branches = dataset
-        .list_branches()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let branches = dataset.list_branches().await.map_err(OmniError::from)?;
     let Some(contents) = branches.get(branch) else {
         return Ok(None);
     };
     let target = dataset
         .checkout_branch(branch)
         .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?;
+        .map_err(OmniError::from)?;
     let version = target.version().version;
     Ok(Some(BranchMergeRefObservation {
         dataset: target,
@@ -4291,15 +4279,12 @@ async fn prove_ensure_indices_create_index_operation(
     }
     for version in first_version..=head {
         let transaction = if version == head {
-            dataset
-                .read_transaction()
-                .await
-                .map_err(|error| OmniError::Lance(error.to_string()))?
+            dataset.read_transaction().await.map_err(OmniError::from)?
         } else {
             dataset
                 .read_transaction_by_version(version)
                 .await
-                .map_err(|error| OmniError::Lance(error.to_string()))?
+                .map_err(OmniError::from)?
         };
         let Some(transaction) = transaction else {
             return Ok(false);
@@ -4373,13 +4358,13 @@ async fn prove_branch_merge_multi_commit_effect(
                 .dataset
                 .read_transaction()
                 .await
-                .map_err(|error| OmniError::Lance(error.to_string()))?
+                .map_err(OmniError::from)?
         } else {
             observation
                 .dataset
                 .read_transaction_by_version(version)
                 .await
-                .map_err(|error| OmniError::Lance(error.to_string()))?
+                .map_err(OmniError::from)?
         };
         let Some(transaction) = transaction else {
             return Ok(BranchMergeMultiCommitProof::unverifiable(format!(
@@ -4789,10 +4774,7 @@ async fn roll_back_ensure_indices_v8(
             crate::instrumentation::table_wrapper(),
         )
         .await?;
-        let branches = dataset
-            .list_branches()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let branches = dataset.list_branches().await.map_err(OmniError::from)?;
         if let Some(child) = crate::branch_control::path_descendant(&branches, target_branch) {
             return Err(OmniError::manifest_internal(format!(
                 "EnsureIndices sidecar '{}' cannot reclaim first-touch '{}:{}' while path-child '{}' is live",
@@ -4833,7 +4815,7 @@ async fn roll_back_ensure_indices_v8(
                 let target = dataset
                     .checkout_branch(target_branch)
                     .await
-                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                    .map_err(OmniError::from)?;
                 if target.version().version != state.lance_head
                     || !prove_ensure_indices_create_index_operation(
                         &target,
@@ -4849,7 +4831,7 @@ async fn roll_back_ensure_indices_v8(
                 dataset
                     .force_delete_branch(target_branch)
                     .await
-                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                    .map_err(OmniError::from)?;
             }
             EffectOwnership::None => {
                 // An untouched owned fork was removed by the helper above. A
@@ -6196,10 +6178,7 @@ async fn cleanup_unpublished_no_effect_forks(
             crate::instrumentation::table_wrapper(),
         )
         .await?;
-        let branches = dataset
-            .list_branches()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let branches = dataset.list_branches().await.map_err(OmniError::from)?;
         if let Some(child) = crate::branch_control::path_descendant(&branches, target_branch) {
             // Lance cannot reclaim an ancestor tree while a slash-separated
             // path-child remains. Old stores could admit that namespace shape.
@@ -6268,7 +6247,7 @@ async fn cleanup_unpublished_no_effect_forks(
         let target = dataset
             .checkout_branch(target_branch)
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::from)?;
         if target.version().version != exact_fork_version {
             return Err(OmniError::manifest_internal(format!(
                 "OCC recovery sidecar '{}' cannot discard unpublished fork '{}:{}': \
@@ -6283,7 +6262,7 @@ async fn cleanup_unpublished_no_effect_forks(
         dataset
             .force_delete_branch(target_branch)
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::from)?;
     }
     Ok(NoEffectForkCleanup::Complete)
 }
@@ -7631,17 +7610,11 @@ async fn roll_forward_all(
         )
         .await?;
         let head_ds = match reg.table_branch.as_deref() {
-            Some(b) if b != "main" => head_ds
-                .checkout_branch(b)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?,
+            Some(b) if b != "main" => head_ds.checkout_branch(b).await.map_err(OmniError::from)?,
             _ => head_ds,
         };
         let head_version = head_ds.version().version;
-        let row_count = head_ds
-            .count_rows(None)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+        let row_count = head_ds.count_rows(None).await.map_err(OmniError::from)? as u64;
         let version_metadata = super::metadata::TableVersionMetadata::from_dataset(
             root_uri,
             &reg.table_path,
@@ -7754,24 +7727,15 @@ async fn push_table_update(
     )
     .await?;
     let ds = match branch {
-        Some(b) if b != "main" => ds
-            .checkout_branch(b)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?,
+        Some(b) if b != "main" => ds.checkout_branch(b).await.map_err(OmniError::from)?,
         _ => ds,
     };
     let ds = match target_version {
-        Some(v) => ds
-            .checkout_version(v)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?,
+        Some(v) => ds.checkout_version(v).await.map_err(OmniError::from)?,
         None => ds,
     };
     let published_version = ds.version().version;
-    let row_count = ds
-        .count_rows(None)
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+    let row_count = ds.count_rows(None).await.map_err(OmniError::from)? as u64;
     let table_relative_path = super::table_path_for_identity(table_key, identity)?;
     let version_metadata =
         super::metadata::TableVersionMetadata::from_dataset(root_uri, &table_relative_path, &ds)?;
@@ -7869,9 +7833,10 @@ async fn open_lance_head_if_present(
 ) -> Result<Option<LanceHeadObservation>> {
     let ds = if allow_missing_dataset {
         // A schema-v7 first-touch create may crash after writing staged data
-        // files but before committing version one. Preserve Lance's typed
-        // DatasetNotFound distinction here; the shared instrumented opener
-        // intentionally erases it into OmniError::Lance for ordinary callers.
+        // files but before committing version one. Recovery needs absence as a
+        // control-flow branch, not an error: the shared instrumented opener
+        // classifies a missing dataset as `StorageFailureKind::NotFound`, which
+        // is the right disposition for ordinary callers but still an `Err` here.
         let control_session = crate::lance_access::control_session();
         match lance::dataset::builder::DatasetBuilder::from_uri(table_path)
             .with_session(control_session)
@@ -7882,7 +7847,7 @@ async fn open_lance_head_if_present(
             Err(lance::Error::DatasetNotFound { .. } | lance::Error::NotFound { .. }) => {
                 return Ok(None);
             }
-            Err(error) => return Err(OmniError::Lance(error.to_string())),
+            Err(error) => return Err(OmniError::from(error)),
         }
     } else {
         crate::instrumentation::open_dataset(
@@ -7896,24 +7861,17 @@ async fn open_lance_head_if_present(
     let ds = match branch {
         Some(b) if b != "main" => {
             if allow_missing_branch {
-                let branches = ds
-                    .list_branches()
-                    .await
-                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                let branches = ds.list_branches().await.map_err(OmniError::from)?;
                 if !branches.contains_key(b) {
                     return Ok(None);
                 }
             }
-            ds.checkout_branch(b)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?
+            ds.checkout_branch(b).await.map_err(OmniError::from)?
         }
         _ => ds,
     };
     let head_transaction = if planned_effect.is_some() {
-        ds.read_transaction()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?
+        ds.read_transaction().await.map_err(OmniError::from)?
     } else {
         None
     };
@@ -7949,7 +7907,7 @@ async fn open_lance_head_if_present(
                 } else {
                     ds.read_transaction_by_version(version)
                         .await
-                        .map_err(|error| OmniError::Lance(error.to_string()))?
+                        .map_err(OmniError::from)?
                         .as_ref()
                         .map(StagedTransactionIdentity::from)
                 };

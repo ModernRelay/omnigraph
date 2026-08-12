@@ -34,16 +34,177 @@ pub struct ListDirBounds {
     pub max_uri_bytes: u64,
 }
 
+/// How a storage-layer failure should be treated by a caller deciding whether
+/// to retry, reconfigure, or escalate.
+///
+/// This models the *decision*, not the upstream taxonomy. `object_store` and
+/// Lance error enums are deliberately not re-exported through it: doing so
+/// would make every substrate bump a semver break for consumers of this crate
+/// and of the engine. Classification is derived once, at each substrate
+/// boundary, and travels as this enum from there on. Nothing above the
+/// boundary parses error text.
+///
+/// Closed on purpose. Adding a discriminant should be a compile error at every
+/// consumer that switches on it, so a new class cannot silently land in an
+/// existing bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFailureKind {
+    /// Transport failure, timeout, throttling, or retry-budget exhaustion. The
+    /// same call may succeed later; no durable effect is implied either way.
+    Transient,
+    /// Credentials, permissions, an unsupported operation, or a malformed URI.
+    /// Retrying with the same configuration cannot succeed.
+    Configuration,
+    /// The object, dataset, version, or ref genuinely does not exist.
+    NotFound,
+    /// Corruption, a schema mismatch, or a substrate-internal failure. Never
+    /// retry; escalate.
+    Permanent,
+}
+
+impl StorageFailureKind {
+    /// Whether a bounded retry of the same call can plausibly succeed.
+    pub fn is_transient(self) -> bool {
+        matches!(self, Self::Transient)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::Configuration => "configuration",
+            Self::NotFound => "not_found",
+            Self::Permanent => "permanent",
+        }
+    }
+}
+
+/// A classified storage-layer failure plus the operator-facing message.
+///
+/// The message keeps the substrate's own wording so diagnostics are unchanged;
+/// `kind` is what callers switch on.
+#[derive(Debug, Clone, Error)]
+#[error("{message}")]
+pub struct StorageFailure {
+    pub kind: StorageFailureKind,
+    pub message: String,
+}
+
+impl StorageFailure {
+    pub fn new(kind: StorageFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// Prefix caller context onto an already-classified failure. The
+    /// classification is preserved — context never changes what a failure is.
+    pub fn with_context(mut self, context: impl std::fmt::Display) -> Self {
+        self.message = format!("{context}: {}", self.message);
+        self
+    }
+}
+
+/// Depth bound for the source walk under `object_store::Error::Generic`.
+const MAX_IO_SOURCE_DEPTH: usize = 8;
+
+/// Recover a classification from a `std::io::Error` in an error's source chain.
+///
+/// `None` means the chain held no `io::Error`, or held one whose kind does not
+/// determine the answer — the caller keeps its own default rather than being
+/// handed a guess.
+fn classify_io_source(
+    source: &(dyn std::error::Error + 'static),
+    depth: usize,
+) -> Option<StorageFailureKind> {
+    if depth >= MAX_IO_SOURCE_DEPTH {
+        return None;
+    }
+    if let Some(error) = source.downcast_ref::<std::io::Error>() {
+        return match error.kind() {
+            std::io::ErrorKind::NotFound => Some(StorageFailureKind::NotFound),
+            std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::AlreadyExists => Some(StorageFailureKind::Configuration),
+            std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected => Some(StorageFailureKind::Transient),
+            // `io::ErrorKind` is `#[non_exhaustive]` and many local conditions
+            // (`NotADirectory`, `ReadOnlyFilesystem`, `StorageFull`, …) are
+            // still unstable or platform-specific. Reading the raw OS error is
+            // the portable way to separate "the path is wrong" from "the disk
+            // hiccuped": a local filesystem does not produce transport errors,
+            // so anything it reports that is not in the transient set above is
+            // a condition retrying cannot fix.
+            _ if error.raw_os_error().is_some() => Some(StorageFailureKind::Configuration),
+            _ => None,
+        };
+    }
+    source
+        .source()
+        .and_then(|inner| classify_io_source(inner, depth + 1))
+}
+
+/// Classify an `object_store` failure.
+///
+/// `Generic` is the bucket every retried-and-exhausted HTTP condition lands in:
+/// `RetryError::error` maps recognised statuses onto dedicated variants
+/// (404/304/412/409/403/401) and routes everything else — 5xx, connection
+/// resets, DNS, TLS, timeouts, budget exhaustion — to `Generic`. Treating it as
+/// transient is therefore the accurate reading, not a guess.
+///
+/// `object_store::Error` is `#[non_exhaustive]`, so the fallthrough is
+/// load-bearing. It resolves to `Transient`: a bounded retry that ultimately
+/// fails is a strictly better outcome than permanently disabling a resource
+/// over a condition this crate has not seen before.
+pub fn classify_object_store_error(error: &object_store::Error) -> StorageFailureKind {
+    match error {
+        // `LocalFileSystem` also routes plain OS errors through `Generic`, so a
+        // permanent local condition (a bad path, a read-only mount) would read
+        // as transient. Inspect the underlying `io::Error` when there is one;
+        // remote stores carry a `RetryError` instead and fall through to
+        // `Transient`, which is the accurate reading for them.
+        object_store::Error::Generic { source, .. } => {
+            classify_io_source(source.as_ref(), 0).unwrap_or(StorageFailureKind::Transient)
+        }
+        object_store::Error::JoinError { .. } => StorageFailureKind::Transient,
+        object_store::Error::NotFound { .. } | object_store::Error::NotModified { .. } => {
+            StorageFailureKind::NotFound
+        }
+        object_store::Error::PermissionDenied { .. }
+        | object_store::Error::Unauthenticated { .. }
+        | object_store::Error::NotSupported { .. }
+        | object_store::Error::NotImplemented { .. }
+        | object_store::Error::InvalidPath { .. }
+        | object_store::Error::UnknownConfigurationKey { .. } => StorageFailureKind::Configuration,
+        object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. } => {
+            StorageFailureKind::Permanent
+        }
+        _ => StorageFailureKind::Transient,
+    }
+}
+
 /// Backend-neutral failure from the shared control-object storage boundary.
 ///
 /// `Internal` preserves the engine's historical manifest-internal message
 /// verbatim when converted by the compatibility facade. `Io` remains distinct
 /// so local recursive-delete failures keep the engine's established `io: ...`
-/// display and error classification.
+/// display and error classification. `Backend` carries a classified failure
+/// from the object store itself, so callers can distinguish a transient
+/// transport condition from a permanent one without parsing text.
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("{0}")]
     Internal(String),
+    #[error("{0}")]
+    Backend(StorageFailure),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("storage resource '{resource}' for '{uri}' exceeds limit {limit} (actual {actual})")]
@@ -1008,8 +1169,15 @@ fn parse_s3_uri(uri: &str) -> Result<S3Location> {
     })
 }
 
-fn storage_backend_error(action: &str, uri: &str, err: impl std::fmt::Display) -> StorageError {
-    StorageError::internal(format!("storage {} failed for '{}': {}", action, uri, err))
+/// The one place an `object_store` failure crosses into this crate's error
+/// type. Taking the typed value rather than `impl Display` is what lets the
+/// classification survive the boundary; the message is unchanged.
+fn storage_backend_error(action: &str, uri: &str, err: object_store::Error) -> StorageError {
+    let kind = classify_object_store_error(&err);
+    StorageError::Backend(StorageFailure::new(
+        kind,
+        format!("storage {} failed for '{}': {}", action, uri, err),
+    ))
 }
 
 fn normalize_local_path(path: &Path) -> String {
@@ -1039,6 +1207,64 @@ fn env_var_truthy(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The classification an operator's availability depends on. `Generic` is
+    /// where `object_store` puts every retried-and-exhausted HTTP condition,
+    /// so reading it as anything but transient would turn an S3 blip into a
+    /// permanent outage.
+    #[test]
+    fn object_store_failures_classify_by_variant_not_by_message() {
+        assert_eq!(
+            classify_object_store_error(&object_store::Error::Generic {
+                store: "S3",
+                source: "503 Service Unavailable".into(),
+            }),
+            StorageFailureKind::Transient
+        );
+        assert_eq!(
+            classify_object_store_error(&object_store::Error::NotFound {
+                path: "graph/__manifest".to_string(),
+                source: "absent".into(),
+            }),
+            StorageFailureKind::NotFound
+        );
+        assert_eq!(
+            classify_object_store_error(&object_store::Error::PermissionDenied {
+                path: "graph/__manifest".to_string(),
+                source: "expired credentials".into(),
+            }),
+            StorageFailureKind::Configuration
+        );
+        assert_eq!(
+            classify_object_store_error(&object_store::Error::Precondition {
+                path: "graph/__manifest".to_string(),
+                source: "etag mismatch".into(),
+            }),
+            StorageFailureKind::Permanent
+        );
+    }
+
+    #[test]
+    fn backend_errors_keep_their_classification_and_message() {
+        let error = storage_backend_error(
+            "read",
+            "s3://bucket/graph/__manifest",
+            object_store::Error::Generic {
+                store: "S3",
+                source: "connection reset".into(),
+            },
+        );
+        let StorageError::Backend(failure) = &error else {
+            panic!("an object-store failure must cross the boundary classified");
+        };
+        assert_eq!(failure.kind, StorageFailureKind::Transient);
+        // The operator-facing wording is unchanged by classification.
+        assert!(
+            failure
+                .message
+                .starts_with("storage read failed for 's3://bucket/graph/__manifest': ")
+        );
+    }
 
     /// The executable backend contract: every assertion here must hold for
     /// EVERY backend (the divergence class this adapter closed was "two
@@ -1735,9 +1961,47 @@ mod tests {
         let err = StorageAdapter::write_text_if_absent(&adapter, &uri, "x")
             .await
             .expect_err("staging under a regular file must fail");
-        assert!(
-            matches!(err, StorageError::Internal(ref message) if message.contains("write_if_absent")),
-            "got: {err}"
+        let StorageError::Backend(failure) = &err else {
+            panic!("got: {err}");
+        };
+        assert!(failure.message.contains("write_if_absent"), "got: {err}");
+        // A wrong path is not something retrying fixes. `LocalFileSystem`
+        // reports it through `Generic`, so this also pins that local OS errors
+        // are not mistaken for the transport conditions `Generic` carries on a
+        // remote store.
+        assert_eq!(failure.kind, StorageFailureKind::Configuration);
+    }
+
+    /// The local and remote readings of `Generic` must stay distinguishable:
+    /// a remote transport failure has to remain retryable even though a local
+    /// OS error arrives through the same variant.
+    #[test]
+    fn remote_generic_failures_stay_transient_while_local_os_errors_do_not() {
+        let remote = object_store::Error::Generic {
+            store: "S3",
+            source: "503 Service Unavailable".into(),
+        };
+        assert_eq!(
+            classify_object_store_error(&remote),
+            StorageFailureKind::Transient
+        );
+
+        let local = object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: Box::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        };
+        assert_eq!(
+            classify_object_store_error(&local),
+            StorageFailureKind::Configuration
+        );
+
+        let local_transient = object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: Box::new(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+        };
+        assert_eq!(
+            classify_object_store_error(&local_transient),
+            StorageFailureKind::Transient
         );
     }
 }

@@ -140,13 +140,13 @@ impl GraphIndex {
             let batches: Vec<arrow_array::RecordBatch> = ds
                 .scan()
                 .project(&["src", "dst"])
-                .map_err(|e| OmniError::Lance(e.to_string()))?
+                .map_err(OmniError::from)?
                 .try_into_stream()
                 .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?
+                .map_err(OmniError::from)?
                 .try_collect()
                 .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+                .map_err(OmniError::from)?;
 
             type_indices
                 .entry(from_type.clone())

@@ -1798,7 +1798,7 @@ impl Omnigraph {
             .dataset()
             .latest_version_id()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::from)?;
         if head < expected_version {
             return Err(OmniError::manifest_internal(format!(
                 "table '{}' Lance HEAD version {} is behind manifest version {}",
@@ -2350,7 +2350,7 @@ impl Omnigraph {
         let mut blobs = ds
             .take_blobs(&[row_id], property)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::from)?;
 
         blobs.pop().ok_or_else(|| {
             OmniError::manifest(format!(
@@ -3082,8 +3082,7 @@ fn concat_or_empty_batches(schema: Arc<Schema>, batches: Vec<RecordBatch>) -> Re
         return Ok(batches.into_iter().next().unwrap());
     }
     let batch_schema = batches[0].schema();
-    arrow_select::concat::concat_batches(&batch_schema, &batches)
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    arrow_select::concat::concat_batches(&batch_schema, &batches).map_err(OmniError::from)
 }
 
 fn blob_properties_for_table_key<'a>(
@@ -3141,7 +3140,7 @@ fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bo
     let Some(kind) = kind else {
         return Ok(true);
     };
-    let kind = BlobKind::try_from(kind).map_err(|e| OmniError::Lance(e.to_string()))?;
+    let kind = BlobKind::try_from(kind).map_err(OmniError::from)?;
     if kind != BlobKind::Inline {
         return Ok(false);
     }
@@ -3428,7 +3427,9 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
             array
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected LargeStringArray".to_string()))?
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("expected LargeStringArray".to_string())
+                })?
                 .value(row)
                 .to_string(),
         )),
@@ -3475,7 +3476,10 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
                 .value(row) as f64;
             Ok(serde_json::Value::Number(
                 serde_json::Number::from_f64(value).ok_or_else(|| {
-                    OmniError::manifest_internal(format!("cannot encode f32 value '{}' as JSON", value))
+                    OmniError::manifest_internal(format!(
+                        "cannot encode f32 value '{}' as JSON",
+                        value
+                    ))
                 })?,
             ))
         }
@@ -3487,7 +3491,10 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
                 .value(row);
             Ok(serde_json::Value::Number(
                 serde_json::Number::from_f64(value).ok_or_else(|| {
-                    OmniError::manifest_internal(format!("cannot encode f64 value '{}' as JSON", value))
+                    OmniError::manifest_internal(format!(
+                        "cannot encode f64 value '{}' as JSON",
+                        value
+                    ))
                 })?,
             ))
         }
@@ -3518,7 +3525,9 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
             array
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected LargeBinaryArray".to_string()))?
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("expected LargeBinaryArray".to_string())
+                })?
                 .value(row),
         ))),
         DataType::List(_) => {
@@ -3537,7 +3546,9 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
             let list = array
                 .as_any()
                 .downcast_ref::<LargeListArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected LargeListArray".to_string()))?;
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("expected LargeListArray".to_string())
+                })?;
             let values = list.value(row);
             let mut out = Vec::with_capacity(values.len());
             for idx in 0..values.len() {
@@ -3549,7 +3560,9 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
             let list = array
                 .as_any()
                 .downcast_ref::<FixedSizeListArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected FixedSizeListArray".to_string()))?;
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("expected FixedSizeListArray".to_string())
+                })?;
             let values = list.value(row);
             let mut out = Vec::with_capacity(values.len());
             for idx in 0..values.len() {
@@ -3572,8 +3585,8 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
             Ok(serde_json::Value::Object(obj))
         }
         _ => {
-            let value = arrow_cast::display::array_value_to_string(array, row)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let value =
+                arrow_cast::display::array_value_to_string(array, row).map_err(OmniError::from)?;
             Ok(serde_json::Value::String(value))
         }
     }
