@@ -138,9 +138,15 @@ Validation canonicalizes bases, compares URI components rather than string
 prefixes, rejects overlapping bases, credentials, query/fragment components,
 path traversal, ambiguous encodings, and a `file://` server-safe entry. Local
 bases are canonicalized as directories so a symlink below an allowed directory
-cannot escape it. The normalized policy is part of the graph resource digest
-and is recorded in applied state; the server never re-reads mutable desired
-config to obtain it. Cedar still decides which actor may write the graph. The
+cannot escape it. An embedded Overwrite that retains a `file://` reference
+persists the canonical regular-file target proven during admission, not the
+caller's mutable symlink spelling. This is an admission boundary, not a durable
+filesystem sandbox or inode lease: use `embedded_only` only with a trusted,
+stable local namespace, because replacing that canonical path or an ancestor
+can redirect a later read under the same process principal. The normalized
+policy is part of the graph resource digest and is recorded in applied state;
+the server never re-reads mutable desired config to obtain it. Cedar still
+decides which actor may write the graph. The
 external Blob policy independently limits which objects any authorized writer
 may cause the process to probe or copy, and cannot be overridden per request.
 

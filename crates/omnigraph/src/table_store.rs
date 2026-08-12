@@ -1,5 +1,6 @@
 use arrow_array::{
     Array, ArrayRef, LargeBinaryArray, RecordBatch, StringArray, StructArray, UInt64Array,
+    builder::StringBuilder,
 };
 use arrow_schema::SchemaRef;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
@@ -2378,6 +2379,24 @@ impl TableStore {
         Ok(batch)
     }
 
+    /// Rewrite retained external references to the exact canonical URI proven
+    /// by the operation-wide preflight, without reading payload bytes.
+    ///
+    /// Overwrite deliberately retains external descriptors. Persisting the
+    /// caller's lexical spelling would be unsafe for `file://`: a symlink
+    /// admitted inside a base could later be retargeted outside it. The
+    /// preflight has already resolved that spelling to one canonical regular
+    /// file, so the durable descriptor must carry the same proof target.
+    pub(crate) fn prepare_overwrite_blob_references_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch> {
+        self.validate_keyed_write_batch(table_key, &batch)?;
+        canonicalize_external_blob_inputs(batch, preflight)
+    }
+
     /// Validate one physical v6 graph-table batch without staging files or
     /// touching any Lance/manifest authority. This is deliberately separate
     /// from [`Self::stage_keyed_write`]: Overwrite and deferred first-touch
@@ -4275,6 +4294,56 @@ pub(crate) fn collect_external_blob_uris(batch: &RecordBatch) -> Result<Vec<Stri
     let mut collector = ExternalBlobUriCollector::default();
     collector.include_batch(batch)?;
     Ok(collector.into_vec())
+}
+
+/// Replace each logical URI cell with the canonical spelling admitted by the
+/// preflight while preserving parent validity and the original data child.
+/// This is descriptor-only: no external payload is read and inline values are
+/// not copied into a new binary buffer.
+fn canonicalize_external_blob_inputs(
+    batch: RecordBatch,
+    preflight: &ExternalBlobPreflight,
+) -> Result<RecordBatch> {
+    let external_uris = collect_external_blob_uris(&batch)?;
+    if external_uris.is_empty() {
+        return Ok(batch);
+    }
+
+    let schema = batch.schema();
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if !lance_field.is_blob() {
+            columns.push(column.clone());
+            continue;
+        }
+        let descriptions = column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| OmniError::manifest("logical Blob input is not a struct"))?;
+        let input = logical_blob_input(descriptions, field.name())?;
+        let mut uris = StringBuilder::with_capacity(descriptions.len(), 0);
+        for row in 0..descriptions.len() {
+            if input.uris.is_null(row) {
+                uris.append_null();
+            } else if descriptions.is_null(row) {
+                // Parent validity is the sole null signal. Preserve ignored
+                // child state exactly instead of consulting policy for it.
+                uris.append_value(input.uris.value(row));
+            } else {
+                let raw = input.uris.value(row);
+                let entry = preflight.entry(raw)?;
+                uris.append_value(entry.normalized_uri.as_str());
+            }
+        }
+        columns.push(Arc::new(StructArray::new(
+            descriptions.fields().clone(),
+            vec![Arc::new(input.data.clone()), Arc::new(uris.finish())],
+            descriptions.nulls().cloned(),
+        )) as ArrayRef);
+    }
+    RecordBatch::try_new(schema, columns).map_err(|error| OmniError::Lance(error.to_string()))
 }
 
 /// Materialize logical external-URI Blob cells before keyed merge-insert.

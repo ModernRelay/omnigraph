@@ -527,16 +527,24 @@ impl MutationStaging {
         // aggregate-copy admission do we read payload bytes. Reuse remains
         // batch-bounded so this vector cannot retain an operation-sized cache.
         for (table_key, table, _, _) in &mut stage_inputs {
-            if matches!(table.mode, PendingMode::StrictInsert | PendingMode::Upsert) {
-                table.batch = db
+            table.batch = match table.mode {
+                PendingMode::StrictInsert | PendingMode::Upsert => {
+                    db.storage()
+                        .prepare_keyed_write_batch_with_preflight(
+                            table_key,
+                            table.batch.clone(),
+                            &external_blob_preflight,
+                        )
+                        .await?
+                }
+                PendingMode::Overwrite => db
                     .storage()
-                    .prepare_keyed_write_batch_with_preflight(
+                    .prepare_overwrite_blob_references_with_preflight(
                         table_key,
                         table.batch.clone(),
                         &external_blob_preflight,
-                    )
-                    .await?;
-            }
+                    )?,
+            };
         }
         let concurrency = concurrency.min(stage_inputs.len()).max(1);
         let mut staged_entries: Vec<StagedTableEntry> =

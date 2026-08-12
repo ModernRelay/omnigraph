@@ -521,6 +521,10 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
     let external_uri = url::Url::from_file_path(&external_path)
         .expect("external blob path is absolute")
         .to_string();
+    let canonical_external_uri =
+        url::Url::from_file_path(fs::canonicalize(&external_path).unwrap())
+            .expect("canonical external blob path is absolute")
+            .to_string();
     let base_uri = url::Url::from_directory_path(external_dir.path())
         .expect("external blob base is absolute")
         .to_string();
@@ -650,8 +654,8 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
         .unwrap();
     assert_eq!(
         source_uris.value(0),
-        encoded_alias,
-        "precondition: source branch must retain the external descriptor"
+        canonical_external_uri,
+        "precondition: source branch must retain the normalized external descriptor"
     );
 
     let before = snapshot_main(&main).await.unwrap();
@@ -676,7 +680,7 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
     assert!(
         matches!(
             error,
-            OmniError::ExternalBlobPolicy { ref uri, .. } if uri == &external_uri
+            OmniError::ExternalBlobPolicy { ref uri, .. } if uri == &canonical_external_uri
         ),
         "default-deny merge must return typed ExternalBlobPolicy, got {error:?}"
     );
@@ -772,7 +776,7 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
         .unwrap();
     assert_eq!(
         converged.uri(),
-        Some(external_uri.as_str()),
+        Some(canonical_external_uri.as_str()),
         "the descriptor-only decision walk and row-staging walk must both keep the identical target row out of the delta"
     );
 
@@ -785,6 +789,9 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
     fs::write(&pointer_path, b"Pointer only").unwrap();
     let pointer_uri = url::Url::from_file_path(&pointer_path)
         .expect("pointer-only external blob path is absolute")
+        .to_string();
+    let canonical_pointer_uri = url::Url::from_file_path(fs::canonicalize(&pointer_path).unwrap())
+        .expect("canonical pointer-only external blob path is absolute")
         .to_string();
     let pointer_data = serde_json::json!({
         "type": "Document",
@@ -809,7 +816,7 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
             .await
             .unwrap()
             .uri(),
-        Some(pointer_uri.as_str())
+        Some(canonical_pointer_uri.as_str())
     );
     fs::remove_file(&pointer_path).unwrap();
 

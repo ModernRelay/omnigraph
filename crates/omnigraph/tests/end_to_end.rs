@@ -1674,6 +1674,9 @@ async fn blob_load_external_file_uri() {
     let file_uri = url::Url::from_file_path(&blob_path)
         .expect("external blob path is absolute")
         .to_string();
+    let canonical_file_uri = url::Url::from_file_path(std::fs::canonicalize(&blob_path).unwrap())
+        .expect("canonical external blob path is absolute")
+        .to_string();
     let base_uri = url::Url::from_directory_path(blob_dir.path())
         .expect("external blob base is absolute")
         .to_string();
@@ -1687,21 +1690,86 @@ async fn blob_load_external_file_uri() {
         .unwrap()
         .with_external_blob_policy(policy)
         .unwrap();
-    let data = format!(
-        r#"{{"type": "Document", "data": {{"title": "from-file", "content": "{}"}}}}"#,
-        file_uri
-    );
+    let mut overwrite_rows = vec![
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "from-file", "content": file_uri.clone()},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "null"},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "valid-empty", "content": "base64:"},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "inline", "content": "base64:SW5saW5l"},
+        }),
+    ];
+    #[cfg(unix)]
+    let symlink_path = {
+        use std::os::unix::fs::symlink;
 
-    // Overwrite preserves the exact authorized reference rather than silently
-    // copying it into managed storage.
+        let path = blob_dir.path().join("admitted-link");
+        symlink(&blob_path, &path).unwrap();
+        overwrite_rows.push(serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "from-symlink",
+                "content": url::Url::from_file_path(&path).unwrap().to_string(),
+            },
+        }));
+        path
+    };
+    let data = overwrite_rows
+        .into_iter()
+        .map(|row| row.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Overwrite preserves the canonical admitted reference rather than
+    // silently copying it into managed storage or retaining a mutable symlink
+    // spelling.
     load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
 
     let blob = db
         .read_blob("Document", "from-file", "content")
         .await
         .unwrap();
-    assert_eq!(blob.uri(), Some(file_uri.as_str()));
+    assert_eq!(blob.uri(), Some(canonical_file_uri.as_str()));
     assert_eq!(&blob.read().await.unwrap()[..], b"Hello from file");
+    assert!(
+        db.read_blob("Document", "null", "content").await.is_err(),
+        "canonicalizing a sibling external URI must preserve parent-null validity"
+    );
+    let empty = db
+        .read_blob("Document", "valid-empty", "content")
+        .await
+        .unwrap();
+    assert_eq!(empty.size(), 0);
+    assert!(empty.read().await.unwrap().is_empty());
+    let inline = db.read_blob("Document", "inline", "content").await.unwrap();
+    assert_eq!(&inline.read().await.unwrap()[..], b"Inline");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.txt");
+        std::fs::write(&outside, b"Outside configured base").unwrap();
+        std::fs::remove_file(&symlink_path).unwrap();
+        symlink(&outside, &symlink_path).unwrap();
+
+        let pinned = db
+            .read_blob("Document", "from-symlink", "content")
+            .await
+            .unwrap();
+        assert_eq!(pinned.uri(), Some(canonical_file_uri.as_str()));
+        assert_eq!(&pinned.read().await.unwrap()[..], b"Hello from file");
+    }
 
     // Two raw spellings normalize to the same URI. The operation-wide
     // preflight must share one source entry (and therefore one payload read)

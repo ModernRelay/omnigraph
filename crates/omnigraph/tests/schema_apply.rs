@@ -589,6 +589,10 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
     let external_path = external_dir.path().join("external.bin");
     std::fs::write(&external_path, b"External").unwrap();
     let external_uri = format!("file://{}", external_path.display());
+    let canonical_external_uri =
+        url::Url::from_file_path(std::fs::canonicalize(&external_path).unwrap())
+            .expect("canonical external Blob path is absolute")
+            .to_string();
     let external_policy = ExternalBlobPolicy::allow(vec![
         ExternalBlobBase::new(
             url::Url::from_directory_path(external_dir.path())
@@ -715,7 +719,7 @@ node Document {
         .read_blob("Document", "external", "content")
         .await
         .unwrap();
-    assert_eq!(external.uri(), Some(external_uri.as_str()));
+    assert_eq!(external.uri(), Some(canonical_external_uri.as_str()));
     assert_eq!(&external.read().await.unwrap()[..], b"External");
 
     // (a) Current snapshot: `note` is gone from the dataset schema.
@@ -768,6 +772,127 @@ node Document {
     assert!(
         !reopened_fields.iter().any(|f| f == "note"),
         "after reopen, Document dataset schema must still lack 'note'; got fields {reopened_fields:?}",
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "failpoints")]
+#[serial_test::parallel]
+async fn schema_apply_rejects_ranged_external_blob_before_arm_or_effects() {
+    use arrow_array::{ArrayRef, RecordBatch, StringArray};
+    use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
+    use lance::blob::{BlobDescriptorArrayBuilder, BlobRange};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let initial = r#"
+node Document {
+    title: String @key
+    content: Blob?
+}
+"#;
+    let desired = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+    let mut db = Omnigraph::init(uri, initial).await.unwrap();
+    let entry = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Document")
+        .unwrap()
+        .clone();
+    let table_uri = format!("{uri}/{}", entry.table_path);
+    let mut raw = lance::Dataset::open(&table_uri).await.unwrap();
+    let logical_schema = arrow_schema::Schema::from(raw.schema());
+    let mut descriptor_builder = BlobDescriptorArrayBuilder::new("content");
+    descriptor_builder
+        .push_external("s3://bucket/object", Some(BlobRange { offset: 4, size: 8 }))
+        .unwrap();
+    let (descriptor_field, descriptor) = descriptor_builder.finish().unwrap().into_parts();
+    let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        logical_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == "content" {
+                    Arc::new(descriptor_field.clone())
+                } else {
+                    field.clone()
+                }
+            })
+            .collect::<Vec<_>>(),
+        logical_schema.metadata().clone(),
+    ));
+    let mut field_names = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    field_names.sort_unstable();
+    assert_eq!(
+        field_names,
+        ["content", "id", "title"],
+        "ranged-descriptor fixture is physical-schema specific"
+    );
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "id" | "title" => Arc::new(StringArray::from(vec!["ranged"])) as ArrayRef,
+            "content" => descriptor.clone(),
+            other => panic!("unexpected ranged-descriptor fixture field {other}"),
+        })
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(schema, columns).unwrap();
+    helpers::lance_append_inline(&mut raw, batch).await;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Document", None)
+        .await
+        .unwrap();
+
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let manifest_before = before.version();
+    let table_before = before.entry("node:Document").unwrap().table_version;
+    let physical_head_before = lance::Dataset::open(&table_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let lineage_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    assert!(sidecar_operation_ids(dir.path()).is_empty());
+
+    let error = db.apply_schema(desired).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot preserve ranged external Blob descriptor"),
+        "unexpected schema-apply refusal: {error}"
+    );
+    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(after.version(), manifest_before);
+    assert_eq!(
+        after.entry("node:Document").unwrap().table_version,
+        table_before
+    );
+    assert_eq!(
+        lance::Dataset::open(&table_uri)
+            .await
+            .unwrap()
+            .version()
+            .version,
+        physical_head_before
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "main").await.unwrap(),
+        lineage_before
+    );
+    assert!(
+        sidecar_operation_ids(dir.path()).is_empty(),
+        "ranged descriptor refusal must occur before recovery arm"
     );
 }
 

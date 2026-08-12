@@ -693,12 +693,16 @@ impl<'a> BlobDescriptorDecoder<'a> {
         let blob_uri = self.blob_uris.value(row);
 
         match self.kinds.value(row) {
-            // Inline, packed, and dedicated are one logical Managed state.
-            // Their physical discriminator still owns validation: Lance
-            // reserves blob id zero, so accepting it for a sidecar-backed
-            // descriptor would turn corrupt persisted state into a plausible
-            // logical value.
+            // Inline, packed, and dedicated are one logical Managed state, but
+            // each physical discriminator owns exact sentinel fields. Fields
+            // ignored by Lance must still be canonical here; otherwise corrupt
+            // persisted state could be normalized into plausible bytes.
             0 => {
+                if blob_id != 0 {
+                    return Err(malformed_descriptor(format!(
+                        "inline row {row} uses nonzero blob_id {blob_id}"
+                    )));
+                }
                 if !blob_uri.is_empty() {
                     return Err(malformed_descriptor(format!(
                         "managed row {row} has non-empty blob_uri"
@@ -706,11 +710,28 @@ impl<'a> BlobDescriptorDecoder<'a> {
                 }
                 Ok(BlobDescriptor::Managed { length: size })
             }
-            1 | 2 => {
+            1 => {
                 if blob_id == 0 {
                     return Err(malformed_descriptor(format!(
-                        "managed row {row} kind {} uses reserved blob_id 0",
-                        self.kinds.value(row)
+                        "packed row {row} uses reserved blob_id 0"
+                    )));
+                }
+                if !blob_uri.is_empty() {
+                    return Err(malformed_descriptor(format!(
+                        "managed row {row} has non-empty blob_uri"
+                    )));
+                }
+                Ok(BlobDescriptor::Managed { length: size })
+            }
+            2 => {
+                if blob_id == 0 {
+                    return Err(malformed_descriptor(format!(
+                        "dedicated row {row} uses reserved blob_id 0"
+                    )));
+                }
+                if position != 0 {
+                    return Err(malformed_descriptor(format!(
+                        "dedicated row {row} uses nonzero position {position}"
                     )));
                 }
                 if !blob_uri.is_empty() {
@@ -726,7 +747,11 @@ impl<'a> BlobDescriptorDecoder<'a> {
                         "external row {row} uses unsupported base-relative blob_id {blob_id}"
                     )));
                 }
-                validate_external_blob_uri_raw_limit(blob_uri)?;
+                validate_external_blob_uri_raw_limit(blob_uri).map_err(|error| {
+                    malformed_descriptor(format!(
+                        "external row {row} blob_uri exceeds the persisted URI contract: {error}"
+                    ))
+                })?;
                 url::Url::parse(blob_uri).map_err(|error| {
                     malformed_descriptor(format!(
                         "external row {row} blob_uri is not an absolute URI: {error}"
@@ -1164,6 +1189,16 @@ mod tests {
 
     #[test]
     fn managed_and_external_uri_invariants_fail_closed() {
+        let inline_with_sidecar_id = descriptor(Some(0), Some(0), Some(1), Some(9), Some(""));
+        let decoder = BlobDescriptorDecoder::try_new(&inline_with_sidecar_id).unwrap();
+        assert!(
+            decoder
+                .classify(0)
+                .unwrap_err()
+                .to_string()
+                .contains("inline row 0 uses nonzero blob_id")
+        );
+
         for kind in [1, 2] {
             let reserved_id = descriptor(Some(kind), Some(0), Some(1), Some(0), Some(""));
             let decoder = BlobDescriptorDecoder::try_new(&reserved_id).unwrap();
@@ -1173,6 +1208,16 @@ mod tests {
                 "managed kind {kind}: {error}"
             );
         }
+
+        let dedicated_with_position = descriptor(Some(2), Some(7), Some(1), Some(9), Some(""));
+        let decoder = BlobDescriptorDecoder::try_new(&dedicated_with_position).unwrap();
+        assert!(
+            decoder
+                .classify(0)
+                .unwrap_err()
+                .to_string()
+                .contains("dedicated row 0 uses nonzero position")
+        );
 
         let managed_uri = descriptor(
             Some(0),
@@ -1223,14 +1268,9 @@ mod tests {
         );
         let descriptor = descriptor(Some(3), Some(0), Some(0), Some(0), Some(&oversized));
         let decoder = BlobDescriptorDecoder::try_new(&descriptor).unwrap();
-        assert!(matches!(
-            decoder.classify(0),
-            Err(OmniError::ResourceLimitExceeded {
-                resource,
-                limit: EXTERNAL_BLOB_URI_MAX_BYTES,
-                actual,
-            }) if resource == EXTERNAL_BLOB_URI_BYTES_RESOURCE
-                && actual == EXTERNAL_BLOB_URI_MAX_BYTES + 1
-        ));
+        let error = decoder.classify(0).unwrap_err();
+        assert!(matches!(error, OmniError::Lance(_)));
+        assert!(error.to_string().contains("malformed Blob-v2 descriptor"));
+        assert!(error.to_string().contains("persisted URI contract"));
     }
 }

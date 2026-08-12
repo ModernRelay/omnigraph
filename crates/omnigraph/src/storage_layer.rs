@@ -602,6 +602,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         preflight: &ExternalBlobPreflight,
     ) -> Result<RecordBatch>;
 
+    /// Rewrite retained Overwrite URI cells to the exact normalized targets
+    /// admitted by an operation-wide preflight, without reading payloads.
+    fn prepare_overwrite_blob_references_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch>;
+
     /// Validate the physical key contract shared by every v6 graph-table
     /// write batch: exact Utf8 `id`, no nulls, and no duplicate ids within the
     /// batch. Callers preparing a deferred first-touch or Overwrite plan must
@@ -1059,6 +1068,17 @@ impl TableStorage for TableStore {
     ) -> Result<RecordBatch> {
         TableStore::prepare_keyed_write_batch_with_preflight(self, table_key, batch, preflight)
             .await
+    }
+
+    fn prepare_overwrite_blob_references_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch> {
+        TableStore::prepare_overwrite_blob_references_with_preflight(
+            self, table_key, batch, preflight,
+        )
     }
 
     fn validate_keyed_write_batch(&self, table_key: &str, batch: &RecordBatch) -> Result<()> {

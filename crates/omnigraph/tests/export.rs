@@ -928,6 +928,10 @@ node Document {
     let external_path = external_dir.path().join("external.bin");
     std::fs::write(&external_path, b"External").unwrap();
     let external_uri = format!("file://{}", external_path.display());
+    let canonical_external_uri =
+        url::Url::from_file_path(std::fs::canonicalize(&external_path).unwrap())
+            .expect("canonical external Blob path is absolute")
+            .to_string();
     let external_policy = ExternalBlobPolicy::allow(vec![
         ExternalBlobBase::new(
             url::Url::from_directory_path(external_dir.path())
@@ -995,7 +999,7 @@ node Document {
     assert_eq!(document("valid-empty")["content"], "base64:");
     assert_eq!(document("neighbor")["content"], "base64:TmVpZ2hib3I=");
     assert!(document("null")["content"].is_null());
-    assert_eq!(document("external")["content"], external_uri);
+    assert_eq!(document("external")["content"], canonical_external_uri);
 
     // Rebuild ingress is policy-aware. Restore the caller-owned source and
     // explicitly authorize the import rather than relying on ambient file
@@ -1038,7 +1042,7 @@ node Document {
         .read_blob("Document", "external", "content")
         .await
         .unwrap();
-    assert_eq!(external.uri(), Some(external_uri.as_str()));
+    assert_eq!(external.uri(), Some(canonical_external_uri.as_str()));
     assert_eq!(&external.read().await.unwrap()[..], b"External");
 
     // A later import into the already-populated v6 table must retain both the

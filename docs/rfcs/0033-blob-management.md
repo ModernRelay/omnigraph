@@ -645,7 +645,13 @@ payload cache.
 Storage semantics remain explicit while Lance lacks a keyed-write `WriteParams`
 hook:
 
-- overwrite preserves an allowed external reference;
+- overwrite preserves an allowed external reference under the exact normalized
+  URI proven by preflight; embedded `file://` symlink spellings are replaced by
+  their admitted canonical regular-file target before persistence, so
+  retargeting the discarded alias cannot change the cell. The retained URI is
+  still a pathname, not an inode lease: embedded callers opt into a trusted,
+  stable local namespace, and replacing the canonical leaf or an ancestor can
+  redirect a later read under that same process principal;
 - strict insert, upsert, load append/merge, mutation update, and a
   HEAD-advancing branch merge that writes selected rows pre-size and copy the
   allowed bytes into managed Blob storage under the operation's 32 MiB
@@ -723,6 +729,13 @@ silently materializing or dropping it.
 Every path that carries an existing Blob cell uses the central descriptor
 decoder and accounts `BlobReader::len()` before payload allocation. Zero-length
 managed values participate as values. A nullable cell alone is skipped.
+
+Schema apply carries a whole-object external descriptor without probing or
+reading its target. Lance's current logical Blob input cannot express an
+existing external offset/length range, so schema apply refuses such a valid
+ranged descriptor before recovery arm or table movement; it never silently
+widens the cell to the whole object. Supporting descriptor-preserving ranged
+schema rewrites remains part of the future ownership-proof optimization below.
 
 The current materializing rewrite is accepted as a bounded V1 implementation,
 not as an ideal physical plan. A future optimization may carry immutable
