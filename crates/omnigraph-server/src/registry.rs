@@ -8,14 +8,17 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use omnigraph::db::Omnigraph;
 use omnigraph::storage::normalize_root_uri;
 use tokio::sync::{Mutex, Notify};
+use tracing::warn;
 
 use crate::GraphStartupConfig;
+use crate::api;
 use crate::graph_id::GraphId;
 use crate::identity::GraphKey;
 use crate::policy::PolicyEngine;
@@ -47,43 +50,83 @@ pub struct GraphHandle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureClass {
+    /// A classified transient storage condition — transport, timeout,
+    /// throttling, or an exhausted object-store retry budget. The engine
+    /// derives this at the substrate boundary; the server never infers it.
+    TransientStorage,
     Io,
     Timeout,
     InvalidConfiguration,
     UnsupportedFormat,
     InvariantViolation,
+    /// A failure the engine did not classify. Not retried: the supervisor has
+    /// no evidence that retrying could help.
     Unknown,
+    /// The cluster quarantined this graph pending a control-plane recovery
+    /// sweep. Distinct from graph recovery — no amount of `refresh()` clears
+    /// it; an operator runs `cluster apply`.
+    RecoveryPending,
 }
 
 impl FailureClass {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::TransientStorage => "transient_storage",
             Self::Io => "io",
             Self::Timeout => "timeout",
             Self::InvalidConfiguration => "invalid_configuration",
             Self::UnsupportedFormat => "unsupported_format",
             Self::InvariantViolation => "invariant_violation",
             Self::Unknown => "unknown",
+            Self::RecoveryPending => "recovery_pending",
         }
     }
 
     pub fn retryable(self) -> bool {
-        matches!(self, Self::Io | Self::Timeout)
+        matches!(self, Self::TransientStorage | Self::Io | Self::Timeout)
+    }
+
+    /// A bounded, operator-facing summary. The full diagnostic stays in
+    /// structured logs: this string reaches unauthenticated 503 responses and
+    /// backend exception text can carry bucket names and filesystem paths.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::TransientStorage => "storage is temporarily unreachable",
+            Self::Io => "an I/O error occurred",
+            Self::Timeout => "the operation timed out",
+            Self::InvalidConfiguration => "the graph configuration is invalid",
+            Self::UnsupportedFormat => "the graph storage format is not supported by this binary",
+            Self::InvariantViolation => "the graph reported an internal consistency failure",
+            Self::Unknown => "the graph failed to open for an unrecognised reason",
+            Self::RecoveryPending => "the cluster has quarantined this graph pending recovery",
+        }
     }
 }
+
+/// Monotonic counter distinguishing one recovery request from the next.
+///
+/// A supervisor attempt reads state, performs I/O without holding the entry
+/// lock, then writes a result derived from that read. Without a generation it
+/// cannot tell "the state I observed" from "a newer request that arrived while
+/// I was working", and would clobber the newer one.
+pub type RecoveryGeneration = u64;
 
 #[derive(Clone)]
 pub enum WriteState {
     Ready,
     Recovering {
+        generation: RecoveryGeneration,
         attempts: u32,
         blocking_operation_id: Option<String>,
     },
     Blocked {
+        generation: RecoveryGeneration,
         attempts: u32,
-        next_retry: Instant,
+        /// `None` means no retry is scheduled: the failure is permanent and
+        /// only a new trigger will start another attempt. Reads keep working
+        /// either way.
+        retry_at: Option<Instant>,
         failure_class: FailureClass,
-        last_error: String,
         blocking_operation_id: Option<String>,
     },
 }
@@ -98,22 +141,55 @@ pub enum GraphRuntimeState {
         attempts: u32,
         next_retry: Instant,
         failure_class: Option<FailureClass>,
-        last_error: Option<String>,
     },
-    Unavailable {
-        failure_class: FailureClass,
-        last_error: String,
-    },
+    /// Never opened. Reachable only from `Opening`, never from `Serving`: a
+    /// graph that is serving reads keeps serving them. See [`WriteState`].
+    Unavailable { failure_class: FailureClass },
+}
+
+/// The states a configured graph can be in, as a type rather than a string.
+///
+/// This is the internal vocabulary; `api::GraphState` is the wire form and the
+/// conversion happens once, at the boundary. It used to be a `&'static str`
+/// re-parsed by two independent `match`es, each with a catch-all that silently
+/// reported "unavailable" for anything it did not recognise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphState {
+    Ready,
+    Recovering,
+    Degraded,
+    Opening,
+    Unavailable,
+}
+
+/// The single internal → wire conversion. Exhaustive, so adding a state is a
+/// compile error here rather than a silent "unavailable" at one call site and
+/// the correct value at another.
+impl From<GraphState> for api::GraphState {
+    fn from(state: GraphState) -> Self {
+        match state {
+            GraphState::Ready => Self::Ready,
+            GraphState::Recovering => Self::Recovering,
+            GraphState::Degraded => Self::Degraded,
+            GraphState::Opening => Self::Opening,
+            GraphState::Unavailable => Self::Unavailable,
+        }
+    }
 }
 
 /// Request- and wire-facing projection of a configured graph's state.
+///
+/// `summary` is a bounded, class-derived phrase — never backend exception
+/// text. This reaches unauthenticated 503 responses, and storage errors carry
+/// bucket names and filesystem paths. The full diagnostic lives in the
+/// structured logs the supervisor emits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphAvailability {
-    pub state: &'static str,
+    pub state: GraphState,
     pub read_ready: bool,
     pub write_ready: bool,
-    pub failure_class: Option<&'static str>,
-    pub last_error: Option<String>,
+    pub failure_class: Option<FailureClass>,
+    pub summary: Option<&'static str>,
     pub retry_after_seconds: Option<u64>,
     pub blocking_operation_id: Option<String>,
 }
@@ -126,16 +202,6 @@ fn retry_after_seconds(deadline: Instant) -> u64 {
         .max(1)
 }
 
-fn sanitize_status_error(message: &str) -> String {
-    message
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(512)
-        .collect()
-}
-
 impl GraphRuntimeState {
     pub fn availability(&self) -> GraphAvailability {
         match self {
@@ -143,11 +209,11 @@ impl GraphRuntimeState {
                 writes: WriteState::Ready,
                 ..
             } => GraphAvailability {
-                state: "ready",
+                state: GraphState::Ready,
                 read_ready: true,
                 write_ready: true,
                 failure_class: None,
-                last_error: None,
+                summary: None,
                 retry_after_seconds: None,
                 blocking_operation_id: None,
             },
@@ -159,56 +225,54 @@ impl GraphRuntimeState {
                     },
                 ..
             } => GraphAvailability {
-                state: "recovering",
+                state: GraphState::Recovering,
                 read_ready: true,
                 write_ready: false,
                 failure_class: None,
-                last_error: None,
+                summary: None,
                 retry_after_seconds: Some(1),
                 blocking_operation_id: blocking_operation_id.clone(),
             },
             Self::Serving {
                 writes:
                     WriteState::Blocked {
-                        next_retry,
+                        retry_at,
                         failure_class,
-                        last_error,
                         blocking_operation_id,
                         ..
                     },
                 ..
             } => GraphAvailability {
-                state: "degraded",
+                state: GraphState::Degraded,
+                // Reads survive every recovery failure: a failed refresh leaves
+                // the live view exactly as it was.
                 read_ready: true,
                 write_ready: false,
-                failure_class: Some(failure_class.as_str()),
-                last_error: Some(last_error.clone()),
-                retry_after_seconds: Some(retry_after_seconds(*next_retry)),
+                failure_class: Some(*failure_class),
+                summary: Some(failure_class.summary()),
+                // Only advertise a retry that is actually scheduled.
+                retry_after_seconds: retry_at.map(|at| retry_after_seconds(at)),
                 blocking_operation_id: blocking_operation_id.clone(),
             },
             Self::Opening {
                 next_retry,
                 failure_class,
-                last_error,
                 ..
             } => GraphAvailability {
-                state: "opening",
+                state: GraphState::Opening,
                 read_ready: false,
                 write_ready: false,
-                failure_class: failure_class.map(FailureClass::as_str),
-                last_error: last_error.clone(),
+                failure_class: *failure_class,
+                summary: failure_class.map(FailureClass::summary),
                 retry_after_seconds: Some(retry_after_seconds(*next_retry)),
                 blocking_operation_id: None,
             },
-            Self::Unavailable {
-                failure_class,
-                last_error,
-            } => GraphAvailability {
-                state: "unavailable",
+            Self::Unavailable { failure_class } => GraphAvailability {
+                state: GraphState::Unavailable,
                 read_ready: false,
                 write_ready: false,
-                failure_class: Some(failure_class.as_str()),
-                last_error: Some(last_error.clone()),
+                failure_class: Some(*failure_class),
+                summary: Some(failure_class.summary()),
                 retry_after_seconds: None,
                 blocking_operation_id: None,
             },
@@ -225,6 +289,10 @@ pub struct GraphEntry {
     pub policy_configured: bool,
     startup: Option<Arc<GraphStartupConfig>>,
     runtime: ArcSwap<GraphRuntimeState>,
+    /// Bumped under `mutation` on every new recovery trigger. An in-flight
+    /// attempt compares it before storing a result, so a request that arrived
+    /// mid-attempt is never clobbered by a conclusion drawn before it.
+    recovery_generation: AtomicU64,
     pub(crate) mutation: Mutex<()>,
     pub(crate) notify: Notify,
 }
@@ -241,11 +309,26 @@ impl GraphEntry {
                 handle,
                 writes: WriteState::Ready,
             }),
+            recovery_generation: AtomicU64::new(0),
             mutation: Mutex::new(()),
             notify: Notify::new(),
         })
     }
 
+    /// Build a configured entry.
+    ///
+    /// An invalid graph **id** is fatal, and the reason is mechanical rather
+    /// than philosophical: the registry is keyed by `GraphKey::cluster(GraphId)`,
+    /// so an unparseable id has no key to be stored under. A duplicate
+    /// canonical URI is fatal too, because ownership is genuinely ambiguous.
+    /// `cluster apply` validates ids, so this is reachable only from
+    /// hand-edited state.
+    ///
+    /// Everything else that is wrong with a *single* graph — an unusable URI,
+    /// stored queries that failed to parse, an embedding provider that would
+    /// not build — becomes an unavailable configured entry. Aborting the whole
+    /// server for one bad path would make a typo more fatal than a graph that
+    /// cannot open at all.
     fn from_config(mut config: GraphStartupConfig) -> Result<Self, InsertError> {
         let graph_id = GraphId::try_from(config.graph_id.clone()).map_err(|err| {
             InsertError::InvalidGraphId {
@@ -253,21 +336,31 @@ impl GraphEntry {
                 message: err.to_string(),
             }
         })?;
-        config.uri = normalize_root_uri(&config.uri).map_err(|err| InsertError::InvalidUri {
-            uri: config.uri.clone(),
-            message: err.to_string(),
-        })?;
         let policy_configured = config.policy.is_some();
-        let runtime = match config.startup_error.as_deref() {
-            Some(error) => GraphRuntimeState::Unavailable {
-                failure_class: FailureClass::InvalidConfiguration,
-                last_error: sanitize_status_error(error),
-            },
+        let mut startup_error = config.startup_error.clone();
+        match normalize_root_uri(&config.uri) {
+            Ok(canonical) => config.uri = canonical,
+            Err(err) => {
+                // Keep the raw value so `GET /graphs` can still identify which
+                // graph is misconfigured; it never becomes a routing key.
+                startup_error.get_or_insert_with(|| format!("invalid graph uri: {err}"));
+            }
+        }
+        let runtime = match startup_error.as_deref() {
+            Some(error) => {
+                warn!(
+                    graph_id = %config.graph_id,
+                    error,
+                    "configured graph is unavailable: startup settings failed to build"
+                );
+                GraphRuntimeState::Unavailable {
+                    failure_class: FailureClass::InvalidConfiguration,
+                }
+            }
             None => GraphRuntimeState::Opening {
                 attempts: 0,
                 next_retry: Instant::now(),
                 failure_class: None,
-                last_error: None,
             },
         };
         Ok(Self {
@@ -276,6 +369,7 @@ impl GraphEntry {
             policy_configured,
             startup: Some(Arc::new(config)),
             runtime: ArcSwap::from_pointee(runtime),
+            recovery_generation: AtomicU64::new(0),
             mutation: Mutex::new(()),
             notify: Notify::new(),
         })
@@ -283,6 +377,16 @@ impl GraphEntry {
 
     pub fn startup_config(&self) -> Option<Arc<GraphStartupConfig>> {
         self.startup.clone()
+    }
+
+    /// Invalidate any recovery attempt currently in flight and return the new
+    /// generation. Callers hold `mutation`.
+    pub(crate) fn bump_recovery_generation(&self) -> RecoveryGeneration {
+        self.recovery_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub(crate) fn recovery_generation(&self) -> RecoveryGeneration {
+        self.recovery_generation.load(Ordering::SeqCst)
     }
 
     pub fn runtime(&self) -> arc_swap::Guard<Arc<GraphRuntimeState>> {
@@ -435,6 +539,12 @@ impl GraphRegistry {
     /// Block new writes and coalesce a Full-recovery wake-up for a serving
     /// graph. The prior blocking operation remains the public diagnostic until
     /// recovery succeeds; later requests are never treated as replays of it.
+    ///
+    /// Coalescing preserves the attempt count and any scheduled retry deadline.
+    /// Resetting them would let write traffic against a broken graph hold the
+    /// supervisor at its shortest backoff indefinitely — every 503'd request
+    /// restarting the ladder — and each attempt is a full recovery sweep whose
+    /// cost grows with commit depth.
     pub async fn mark_recovering(
         &self,
         key: &GraphKey,
@@ -445,32 +555,54 @@ impl GraphRegistry {
         };
         let _guard = entry.mutation.lock().await;
         let current = entry.runtime().as_ref().clone();
-        let next = match current {
-            GraphRuntimeState::Serving { handle, writes } => {
-                let existing = match writes {
-                    WriteState::Ready => None,
-                    WriteState::Recovering {
-                        blocking_operation_id,
-                        ..
-                    }
-                    | WriteState::Blocked {
-                        blocking_operation_id,
-                        ..
-                    } => blocking_operation_id,
-                };
-                GraphRuntimeState::Serving {
-                    handle,
-                    writes: WriteState::Recovering {
-                        attempts: 0,
-                        blocking_operation_id: existing.or(blocking_operation_id),
-                    },
-                }
-            }
-            GraphRuntimeState::Opening { .. } | GraphRuntimeState::Unavailable { .. } => {
-                return false;
-            }
+        let GraphRuntimeState::Serving { handle, writes } = current else {
+            // Never opened, or already terminal for a reason recovery cannot
+            // address. Nothing to schedule.
+            return false;
         };
-        entry.store_runtime(next);
+        // A new trigger, so a conclusion already in flight no longer applies.
+        let generation = entry.bump_recovery_generation();
+        let writes = match writes {
+            WriteState::Ready => WriteState::Recovering {
+                generation,
+                attempts: 0,
+                blocking_operation_id,
+            },
+            WriteState::Recovering {
+                attempts,
+                blocking_operation_id: existing,
+                ..
+            } => WriteState::Recovering {
+                generation,
+                attempts,
+                blocking_operation_id: existing.or(blocking_operation_id),
+            },
+            // Already backing off. Keep the schedule — a new trigger is not a
+            // reason to retry sooner, only a reason to invalidate whatever
+            // attempt is in flight. A permanent failure (`retry_at: None`)
+            // becomes eligible again, since the trigger is new evidence.
+            WriteState::Blocked {
+                attempts,
+                retry_at,
+                failure_class,
+                blocking_operation_id: existing,
+                ..
+            } => match retry_at {
+                Some(retry_at) => WriteState::Blocked {
+                    generation,
+                    attempts,
+                    retry_at: Some(retry_at),
+                    failure_class,
+                    blocking_operation_id: existing.or(blocking_operation_id),
+                },
+                None => WriteState::Recovering {
+                    generation,
+                    attempts,
+                    blocking_operation_id: existing.or(blocking_operation_id),
+                },
+            },
+        };
+        entry.store_runtime(GraphRuntimeState::Serving { handle, writes });
         drop(_guard);
         entry.wake();
         true
@@ -604,7 +736,7 @@ mod tests {
         assert_eq!(registry.len(), 1);
         assert!(registry.snapshot_ref().any_per_graph_policy);
         let entry = registry.list().pop().unwrap();
-        assert_eq!(entry.availability().state, "opening");
+        assert_eq!(entry.availability().state, GraphState::Opening);
         assert!(!entry.availability().read_ready);
         assert!(matches!(
             registry.get(&entry.key),

@@ -699,7 +699,7 @@ async fn default_boot_serves_liveness_with_zero_open_graphs() {
     assert_eq!(state.routing().registry.len(), 1);
     assert_eq!(
         state.routing().registry.list()[0].availability().state,
-        "unavailable"
+        omnigraph_server::registry::GraphState::Unavailable
     );
     let app = build_app(state);
     let (status, body) = json_response(

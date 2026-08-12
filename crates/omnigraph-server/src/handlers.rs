@@ -79,11 +79,13 @@ pub(crate) async fn server_graphs_list(
             GraphInfo {
                 graph_id: entry.key.graph_id.as_str().to_string(),
                 uri: entry.uri.clone(),
-                state: graph_state_output(availability.state),
+                state: availability.state.into(),
                 read_ready: availability.read_ready,
                 write_ready: availability.write_ready,
-                failure_class: availability.failure_class.map(str::to_string),
-                last_error: availability.last_error,
+                failure_class: availability
+                    .failure_class
+                    .map(|class| class.as_str().to_string()),
+                last_error: availability.summary.map(str::to_string),
                 retry_after_seconds: availability.retry_after_seconds,
                 blocking_operation_id: availability.blocking_operation_id,
             }
@@ -91,16 +93,6 @@ pub(crate) async fn server_graphs_list(
         .collect();
     graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
     Ok(Json(GraphListResponse { graphs }))
-}
-
-fn graph_state_output(state: &str) -> api::GraphState {
-    match state {
-        "ready" => api::GraphState::Ready,
-        "recovering" => api::GraphState::Recovering,
-        "degraded" => api::GraphState::Degraded,
-        "opening" => api::GraphState::Opening,
-        _ => api::GraphState::Unavailable,
-    }
 }
 
 pub(crate) async fn server_openapi(

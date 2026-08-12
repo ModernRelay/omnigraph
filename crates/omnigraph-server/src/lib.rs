@@ -911,25 +911,22 @@ impl ApiError {
     }
 
     fn graph_unavailable(graph_id: &GraphId, availability: &registry::GraphAvailability) -> Self {
-        let state = match availability.state {
-            "ready" => api::GraphState::Ready,
-            "recovering" => api::GraphState::Recovering,
-            "degraded" => api::GraphState::Degraded,
-            "opening" => api::GraphState::Opening,
-            _ => api::GraphState::Unavailable,
-        };
+        let state: api::GraphState = availability.state.into();
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: None,
+            // Graph id and typed state only. This runs in middleware, before
+            // any per-graph policy check, so it reaches principals a Cedar
+            // policy would deny — and backend error text carries bucket names
+            // and filesystem paths. The full diagnostic is in the logs, and
+            // `GET /graphs` (which is policy-gated) carries the class summary.
             message: format!(
-                "graph '{}' is {}{}",
+                "graph '{}' is {}",
                 graph_id,
-                availability.state,
-                availability
-                    .last_error
-                    .as_deref()
-                    .map(|error| format!(": {error}"))
-                    .unwrap_or_default()
+                availability.failure_class.map_or_else(
+                    || format!("{:?}", availability.state).to_lowercase(),
+                    |class| class.as_str().to_string()
+                )
             ),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
@@ -1139,11 +1136,11 @@ mod api_error_tests {
     async fn configured_opening_graph_is_503_with_detail_and_retry_after() {
         let graph_id = GraphId::try_from("opening").unwrap();
         let availability = GraphAvailability {
-            state: "opening",
+            state: registry::GraphState::Opening,
             read_ready: false,
             write_ready: false,
-            failure_class: Some("io"),
-            last_error: Some("temporary object-store failure".to_string()),
+            failure_class: Some(registry::FailureClass::TransientStorage),
+            summary: Some(registry::FailureClass::TransientStorage.summary()),
             retry_after_seconds: Some(3),
             blocking_operation_id: None,
         };
@@ -1158,6 +1155,8 @@ mod api_error_tests {
         assert_eq!(detail.graph_id, "opening");
         assert_eq!(detail.state, api::GraphState::Opening);
         assert_eq!(detail.retry_after_seconds, Some(3));
+        // The public 503 carries the graph id and a class, never backend text.
+        assert_eq!(error.error, "graph 'opening' is transient_storage");
     }
 
     #[tokio::test]
