@@ -1206,8 +1206,15 @@ async fn proven_insert_delta_scan_is_interval_exact_and_batch_bounded() {
     lance_append_inline_local(&mut source, numbered_person_pk_batch(0..10_000)).await;
     let end_version = source.version().version;
 
+    let external_preflight = super::ExternalBlobPreflight::default();
     let mut stream = store
-        .scan_proven_insert_delta_bounded(&source, "Person", begin_version, end_version)
+        .scan_proven_insert_delta_bounded(
+            &source,
+            "Person",
+            begin_version,
+            end_version,
+            &external_preflight,
+        )
         .await
         .unwrap();
     let mut rows = 0_usize;
@@ -1267,8 +1274,15 @@ async fn proven_insert_delta_scan_normalizes_oversized_raw_emission() {
 
     let probes = MergeWriteProbes::default();
     let (rows, normalized_batches) = with_merge_write_probes(probes.clone(), async {
+        let external_preflight = super::ExternalBlobPreflight::default();
         let mut stream = store
-            .scan_proven_insert_delta_bounded(&source, "Person", begin_version, end_version)
+            .scan_proven_insert_delta_bounded(
+                &source,
+                "Person",
+                begin_version,
+                end_version,
+                &external_preflight,
+            )
             .await
             .unwrap();
         let mut rows = 0_usize;

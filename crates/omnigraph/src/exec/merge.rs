@@ -729,9 +729,11 @@ fn sanitize_table_key(table_key: &str) -> String {
 /// Missing/cleaned transaction files and every unfamiliar operation are a
 /// normal miss: the caller falls back to the general ordered row diff.  Once a
 /// proof is returned, however, later scan/count mismatches fail closed rather
-/// than silently changing routes after recovery planning.
-async fn try_proven_pure_insert_adopt(
-    db: &Omnigraph,
+/// than silently changing routes after recovery planning. Chunk planning is a
+/// separate pass: Blob tables must first add only this proven interval's
+/// descriptors to the operation-wide admission plan, then materialize rows
+/// with that shared preflight rather than opening external sources here.
+async fn try_proven_pure_insert_history(
     table_key: &str,
     base_snapshot: &Snapshot,
     source_snapshot: &Snapshot,
@@ -889,19 +891,6 @@ async fn try_proven_pure_insert_adopt(
         history_start.elapsed(),
     );
 
-    let Some(chunk_rows) = plan_proven_pure_insert_chunks(
-        db,
-        table_key,
-        &source,
-        base_entry.table_version,
-        source_entry.table_version,
-        inserted_rows,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-
     Ok(Some(ProvenPureInsertAdopt {
         source,
         source_identity: source_entry.identity,
@@ -912,8 +901,46 @@ async fn try_proven_pure_insert_adopt(
         base_version: base_entry.table_version,
         source_version: source_entry.table_version,
         inserted_rows,
-        chunk_rows,
+        chunk_rows: Vec::new(),
     }))
+}
+
+async fn finalize_proven_pure_insert_adopt(
+    db: &Omnigraph,
+    table_key: &str,
+    mut proven: ProvenPureInsertAdopt,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
+) -> Result<Option<ProvenPureInsertAdopt>> {
+    let Some(chunk_rows) = plan_proven_pure_insert_chunks(
+        db,
+        table_key,
+        &proven.source,
+        proven.base_version,
+        proven.source_version,
+        proven.inserted_rows,
+        external_preflight,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    proven.chunk_rows = chunk_rows;
+    Ok(Some(proven))
+}
+
+async fn try_proven_pure_insert_adopt(
+    db: &Omnigraph,
+    table_key: &str,
+    base_snapshot: &Snapshot,
+    source_snapshot: &Snapshot,
+) -> Result<Option<ProvenPureInsertAdopt>> {
+    let Some(proven) =
+        try_proven_pure_insert_history(table_key, base_snapshot, source_snapshot).await?
+    else {
+        return Ok(None);
+    };
+    let empty_external_preflight = crate::table_store::ExternalBlobPreflight::default();
+    finalize_proven_pure_insert_adopt(db, table_key, proven, &empty_external_preflight).await
 }
 
 #[cfg(test)]
@@ -1065,12 +1092,19 @@ async fn plan_proven_pure_insert_chunks(
     begin_version: u64,
     end_version: u64,
     expected_rows: u64,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
 ) -> Result<Option<Vec<usize>>> {
     let scan_start = std::time::Instant::now();
     let source = SnapshotHandle::new(source.clone());
     let mut stream = db
         .storage()
-        .scan_proven_insert_delta_bounded(&source, table_key, begin_version, end_version)
+        .scan_proven_insert_delta_bounded(
+            &source,
+            table_key,
+            begin_version,
+            end_version,
+            external_preflight,
+        )
         .await?;
     let mut chunk_rows = Vec::new();
     let mut observed_rows = 0_u64;
@@ -2191,6 +2225,31 @@ async fn classify_adopt(
         return Ok(CandidateTableState::AdoptPureInserts(proven));
     }
 
+    classify_general_adopt(
+        target_db,
+        catalog,
+        base_snapshot,
+        source_snapshot,
+        table_key,
+        advances_head,
+        external_preflight,
+    )
+    .await
+}
+
+/// Classify the general adopt route after the pure-insert proof was either
+/// unavailable or exceeded its recovery-plan ceiling. The caller has already
+/// established table identity and whether publication advances the target
+/// data HEAD.
+async fn classify_general_adopt(
+    target_db: &Omnigraph,
+    catalog: &Catalog,
+    base_snapshot: &Snapshot,
+    source_snapshot: &Snapshot,
+    table_key: &str,
+    advances_head: bool,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
+) -> Result<CandidateTableState> {
     // Compute the source-vs-target delta for the general route — it is the validation
     // input the evaluator needs, independent of how the table is published.
     // (`classify_adopt` is only reached when base == target, so the
@@ -2941,6 +3000,7 @@ async fn publish_proven_pure_insert_adopt(
     table_key: &str,
     identity: crate::db::manifest::TableIdentity,
     proven: &ProvenPureInsertAdopt,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
     prepared_target: PreparedExistingMergeTarget,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
 ) -> Result<crate::db::SubTableUpdate> {
@@ -2954,6 +3014,7 @@ async fn publish_proven_pure_insert_adopt(
             table_key,
             proven.base_version,
             proven.source_version,
+            external_preflight,
         )
         .await?;
     let schema: SchemaRef = Arc::new(proven.source.schema().into());
@@ -3418,6 +3479,9 @@ impl Omnigraph {
         let empty_external_preflight = crate::table_store::ExternalBlobPreflight::default();
         let mut blob_table_keys = HashSet::new();
         let mut blob_selection = crate::table_store::PersistedBlobSelection::default();
+        let mut blob_adopt_proof_attempted = HashSet::new();
+        let mut blob_pure_insert_histories: HashMap<String, ProvenPureInsertAdopt> = HashMap::new();
+        let materializer = self.blob_materializer();
 
         // Classify scalar tables once before any external source I/O. Blob
         // tables get a descriptor-only first pass so every row-writing managed
@@ -3481,13 +3545,46 @@ impl Omnigraph {
                 if !adopt_advances_head(target_active.as_deref(), source_entry, target_entry) {
                     continue;
                 }
-                collect_adopt_blob_selection(
-                    table_key,
-                    base_snapshot,
-                    source_snapshot,
-                    &mut blob_selection,
-                )
-                .await?;
+                blob_adopt_proof_attempted.insert(table_key.clone());
+                if let Some(proven) =
+                    try_proven_pure_insert_history(table_key, base_snapshot, source_snapshot)
+                        .await?
+                {
+                    let external_cells_before = blob_selection.external_cell_count();
+                    materializer
+                        .include_proven_insert_blob_selection(
+                            &proven.source,
+                            table_key,
+                            proven.base_version,
+                            proven.source_version,
+                            proven.inserted_rows,
+                            &mut blob_selection,
+                        )
+                        .await?;
+                    if blob_selection.external_cell_count() == external_cells_before {
+                        blob_pure_insert_histories.insert(table_key.clone(), proven);
+                    } else {
+                        // Supported insertion-capable writers materialize URI
+                        // inputs, so a retained external descriptor here is a
+                        // forged/legacy interval. Keep it on the general adopt
+                        // writer: its bounded chunk cache reads each normalized
+                        // range once. The certified planner intentionally scans
+                        // its source twice (pre-arm chunk sizing + post-arm
+                        // publish), which would duplicate external object GETs.
+                        tracing::debug!(
+                            table_key,
+                            "pure-insert history retained external Blob descriptors; using the general cached adopt path"
+                        );
+                    }
+                } else {
+                    collect_adopt_blob_selection(
+                        table_key,
+                        base_snapshot,
+                        source_snapshot,
+                        &mut blob_selection,
+                    )
+                    .await?;
+                }
             } else {
                 collect_three_way_blob_selection(
                     table_key,
@@ -3504,7 +3601,6 @@ impl Omnigraph {
             return Err(OmniError::MergeConflicts(conflicts));
         }
 
-        let materializer = self.blob_materializer();
         let external_preflight = materializer
             .preflight_persisted_blob_selection(&blob_selection)
             .await?;
@@ -3542,17 +3638,64 @@ impl Omnigraph {
                 target_entry.map(|entry| entry.identity),
             )?;
             if same_manifest_state(base_entry, target_entry) {
-                let candidate = classify_adopt(
-                    self,
-                    catalog,
-                    base_snapshot,
-                    source_snapshot,
-                    target_snapshot,
-                    table_key,
-                    target_active.as_deref(),
-                    &external_preflight,
-                )
-                .await?;
+                let candidate = if blob_adopt_proof_attempted.contains(table_key) {
+                    let advances_head = source_entry.is_some_and(|source_entry| {
+                        adopt_advances_head(target_active.as_deref(), source_entry, target_entry)
+                    });
+                    if !advances_head {
+                        return Err(OmniError::manifest_internal(format!(
+                            "branch merge Blob proof for '{table_key}' lost its HEAD-advancing classification"
+                        )));
+                    }
+                    match blob_pure_insert_histories.remove(table_key) {
+                        Some(proven) => match finalize_proven_pure_insert_adopt(
+                            self,
+                            table_key,
+                            proven,
+                            &external_preflight,
+                        )
+                        .await?
+                        {
+                            Some(proven) => CandidateTableState::AdoptPureInserts(proven),
+                            None => {
+                                classify_general_adopt(
+                                    self,
+                                    catalog,
+                                    base_snapshot,
+                                    source_snapshot,
+                                    table_key,
+                                    true,
+                                    &external_preflight,
+                                )
+                                .await?
+                            }
+                        },
+                        None => {
+                            classify_general_adopt(
+                                self,
+                                catalog,
+                                base_snapshot,
+                                source_snapshot,
+                                table_key,
+                                true,
+                                &external_preflight,
+                            )
+                            .await?
+                        }
+                    }
+                } else {
+                    classify_adopt(
+                        self,
+                        catalog,
+                        base_snapshot,
+                        source_snapshot,
+                        target_snapshot,
+                        table_key,
+                        target_active.as_deref(),
+                        &external_preflight,
+                    )
+                    .await?
+                };
                 candidates.insert(table_key.clone(), candidate);
                 continue;
             }
@@ -4057,6 +4200,7 @@ impl Omnigraph {
                             table_key,
                             identity,
                             proven,
+                            &external_preflight,
                             prepared_target,
                             planned,
                         )

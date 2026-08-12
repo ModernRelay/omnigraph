@@ -406,9 +406,12 @@ impl PreflightedExternalBlob {
 /// Effect-free, operation-wide proof for every external Blob URI admitted by
 /// an input batch. Entries retain the shared object-store client and exact
 /// observed size so keyed materialization does not repeat setup or HEAD.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ExternalBlobPreflight {
-    by_input: HashMap<String, Arc<PreflightedExternalBlob>>,
+    // The proof is cloned into bounded lazy materialization streams. Share its
+    // admitted aliases instead of cloning up to 32 MiB of URI metadata for
+    // every planning/publish pass.
+    by_input: Arc<HashMap<String, Arc<PreflightedExternalBlob>>>,
 }
 
 pub(crate) type ExternalBlobPayloadCache = HashMap<(String, u64, Option<u64>), Arc<[u8]>>;
@@ -733,15 +736,15 @@ impl TableStore {
         .try_collect::<Vec<_>>()
         .await?;
 
-        let mut preflight = ExternalBlobPreflight {
-            by_input: HashMap::with_capacity(uri_count),
-        };
+        let mut by_input = HashMap::with_capacity(uri_count);
         for (aliases, entry) in entries {
             for input in aliases {
-                preflight.by_input.insert(input, Arc::clone(&entry));
+                by_input.insert(input, Arc::clone(&entry));
             }
         }
-        Ok(preflight)
+        Ok(ExternalBlobPreflight {
+            by_input: Arc::new(by_input),
+        })
     }
 
     // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
@@ -2598,6 +2601,7 @@ impl TableStore {
         table_key: &str,
         begin_version: u64,
         end_version: u64,
+        external_preflight: &ExternalBlobPreflight,
     ) -> Result<SendableRecordBatchStream> {
         use datafusion::prelude::{col, lit};
 
@@ -2648,29 +2652,7 @@ impl TableStore {
         // conservative for blobs: it bounds payload allocation; the stream
         // normalizer below then coalesces those rows into ordinary bounded
         // recovery-transaction chunks.
-        let non_blob_columns = source
-            .schema()
-            .fields
-            .iter()
-            .filter(|field| !field.is_blob())
-            .map(|field| field.name.as_str())
-            .collect::<Vec<_>>();
-        let raw: SendableRecordBatchStream = Self::scan_stream_with(
-            source,
-            Some(&non_blob_columns),
-            None,
-            None,
-            true,
-            move |scanner| {
-                scanner.filter_expr(created_in_interval);
-                scanner.batch_size(KEYED_WRITE_MAX_ROWS);
-                scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
-                Ok(())
-            },
-        )
-        .await?
-        .into();
-        let raw = observe_proven_insert_raw_stream(raw);
+        let raw = Self::scan_proven_insert_blob_row_ids(source, begin_version, end_version).await?;
         let materialized = futures::stream::try_unfold(
             (
                 raw,
@@ -2678,8 +2660,9 @@ impl TableStore {
                 0_usize,
                 source.clone(),
                 self.clone(),
+                external_preflight.clone(),
             ),
-            |(mut raw, mut current, mut offset, source, store)| async move {
+            |(mut raw, mut current, mut offset, source, store, external_preflight)| async move {
                 loop {
                     if let Some(batch) = current.as_ref()
                         && offset < batch.num_rows()
@@ -2710,14 +2693,17 @@ impl TableStore {
                                 descriptors,
                                 &[row_id],
                                 Some(KEYED_WRITE_MAX_BYTES),
-                                None,
+                                Some(&external_preflight),
                                 None,
                             )
                             .await
                             .map_err(|error| {
                                 datafusion::error::DataFusionError::Execution(error.to_string())
                             })?;
-                        return Ok(Some((materialized, (raw, current, offset, source, store))));
+                        return Ok(Some((
+                            materialized,
+                            (raw, current, offset, source, store, external_preflight),
+                        )));
                     }
 
                     match raw.try_next().await? {
@@ -2739,6 +2725,109 @@ impl TableStore {
             materialized,
             table_key.to_string(),
         ))
+    }
+
+    /// Add only the Blob descriptors created in a provenance-proven source
+    /// interval to branch merge's operation-wide admission plan.
+    ///
+    /// The proof has already established that every logical change in the
+    /// interval is a new row, so a base/source ordered diff would repeat work
+    /// and defeat the certified path. Lance cannot safely combine the version
+    /// predicate with a Blob-v2 descriptor projection on the pinned release;
+    /// select stable row ids through ordinary columns, then take one exact
+    /// descriptor row at a time. The one-row shape is deliberate: URI limits
+    /// are charged before the selection retains a copy, and no payload or
+    /// external object is read here.
+    pub(crate) async fn include_proven_insert_blob_selection(
+        &self,
+        source: &Dataset,
+        table_key: &str,
+        begin_version: u64,
+        end_version: u64,
+        expected_rows: u64,
+        selection: &mut PersistedBlobSelection,
+    ) -> Result<()> {
+        if begin_version >= end_version {
+            return Err(OmniError::manifest_internal(format!(
+                "include_proven_insert_blob_selection for {table_key} requires begin_version < end_version, got {begin_version}..={end_version}"
+            )));
+        }
+        if source.version().version != end_version {
+            return Err(OmniError::manifest_internal(format!(
+                "include_proven_insert_blob_selection for {table_key} received source version {}, expected pinned end version {end_version}",
+                source.version().version
+            )));
+        }
+        exact_id_primary_key_field_id(source, "include_proven_insert_blob_selection source")?;
+
+        let mut raw =
+            Self::scan_proven_insert_blob_row_ids(source, begin_version, end_version).await?;
+        let mut observed_rows = 0_u64;
+        while let Some(batch) = raw
+            .try_next()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+        {
+            let row_ids = batch
+                .column_by_name("_rowid")
+                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "proven insert descriptor selection for {table_key} expected stable _rowid"
+                    ))
+                })?;
+            for row in 0..batch.num_rows() {
+                let descriptors = source
+                    .take_rows(&[row_ids.value(row)], source.schema().clone())
+                    .await
+                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                selection.include_batch(&descriptors)?;
+                observed_rows = observed_rows.checked_add(1).ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "branch merge proven-insert descriptor row count overflow",
+                    )
+                })?;
+            }
+        }
+        if observed_rows != expected_rows {
+            return Err(OmniError::manifest_internal(format!(
+                "branch merge proven-insert descriptor selection for '{table_key}' observed {observed_rows} rows against a provenance proof for {expected_rows}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn scan_proven_insert_blob_row_ids(
+        source: &Dataset,
+        begin_version: u64,
+        end_version: u64,
+    ) -> Result<SendableRecordBatchStream> {
+        use datafusion::prelude::{col, lit};
+
+        let created_in_interval = col("_row_created_at_version")
+            .gt(lit(begin_version))
+            .and(col("_row_created_at_version").lt_eq(lit(end_version)));
+        // The interval predicate and stable row id are sufficient to identify
+        // the exact descriptor rows. Keep vectors and unrelated scalar values
+        // out of this planning scan; `take_rows` below fetches the selected
+        // full row only when descriptor classification/materialization needs it.
+        let selector_columns = ["id"];
+        let raw: SendableRecordBatchStream = Self::scan_stream_with(
+            source,
+            Some(&selector_columns),
+            None,
+            None,
+            true,
+            move |scanner| {
+                scanner.filter_expr(created_in_interval);
+                scanner.batch_size(KEYED_WRITE_MAX_ROWS);
+                scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
+                Ok(())
+            },
+        )
+        .await?
+        .into();
+        Ok(observe_proven_insert_raw_stream(raw))
     }
 
     /// Stage a merge_insert (upsert): write fragment files describing the

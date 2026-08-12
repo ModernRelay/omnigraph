@@ -562,7 +562,7 @@ gateway_surfaces! {
         "open_dataset_head", "list_branches", "ensure_expected_version",
         "reopen_for_mutation", "scan_batches", "scan_batches_for_rewrite",
         "scan_stream_for_rewrite", "scan_stream_for_rewrite_bounded",
-        "scan_proven_insert_delta_bounded",
+        "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
         "materialize_blob_batch", "scan_stream", "scan_stream_bounded",
         "scan_stream_with", "scan", "scan_with", "scan_edges_by_endpoint",
         "scan_edges_by_endpoint_projected",

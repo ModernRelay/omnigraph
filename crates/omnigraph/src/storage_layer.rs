@@ -692,13 +692,16 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// full-row batches for the existing per-chunk strict keyed writer.
     /// `source` must be pinned at `end_version`; only rows whose
     /// `_row_created_at_version` lies in `(begin_version, end_version]` are
-    /// emitted. This read-only primitive writes no files and advances no HEAD.
+    /// emitted. Blob materialization consumes the caller's operation-wide
+    /// external-source proof, so it never repeats policy checks or HEADs per
+    /// row. This read-only primitive writes no files and advances no HEAD.
     async fn scan_proven_insert_delta_bounded(
         &self,
         source: &SnapshotHandle,
         table_key: &str,
         begin_version: u64,
         end_version: u64,
+        external_preflight: &ExternalBlobPreflight,
     ) -> Result<SendableRecordBatchStream>;
 
     #[cfg(test)]
@@ -1165,6 +1168,7 @@ impl TableStorage for TableStore {
         table_key: &str,
         begin_version: u64,
         end_version: u64,
+        external_preflight: &ExternalBlobPreflight,
     ) -> Result<SendableRecordBatchStream> {
         TableStore::scan_proven_insert_delta_bounded(
             self,
@@ -1172,6 +1176,7 @@ impl TableStorage for TableStore {
             table_key,
             begin_version,
             end_version,
+            external_preflight,
         )
         .await
     }
