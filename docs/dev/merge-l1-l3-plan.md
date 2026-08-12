@@ -438,6 +438,217 @@ about L1/L2 publish costs without an index-tail confounder in failpoints.
 
 ---
 
+## Implementation spec (commit-level)
+
+Repo rules applied: each commit compiles and passes tests (rule 11); docs land
+in the same PR (rule 1); `forbidden_apis.rs` occurrence counts are updated in
+the same commit as the code they pin. Run per PR before pushing:
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked --
+-D warnings -W clippy::dbg_macro`, and the canonical
+`cargo test --workspace --locked --features
+omnigraph-engine/failpoints,omnigraph-cluster/failpoints` (or at minimum the
+focused suites listed per PR).
+
+### PR-A — L3 commits
+
+**A1 — mechanical failpoint rename (pure refactor).**
+`failpoints.rs:86` `BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_INDEX` →
+`BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM`; update the two consumers
+(`exec/merge.rs:2474`, `tests/failpoints.rs:8956`). No behavior change;
+`failpoint_names_guard` keeps the compile-checked const wiring honest.
+
+**A2 — defer the index phase + test updates (one commit; old assertions would
+fail if split).**
+
+- `exec/merge.rs` `publish_rewritten_merge_table` (~2467–2493): delete the
+  `row_count` probe + `build_indices_on_dataset` call; replace the Phase 3
+  comment with the adopt-path posture (indexes reconciler-owned, invariant 7).
+  Keep the final `table_state` read.
+- New regression test (prefer `merge_fast_forward.rs`, near
+  `fast_forward_merge_defers_vector_index_to_reconciler`):
+  `merged_outcome_defers_index_build_to_reconciler` — diverge both branches on
+  one table to force `MergeOutcome::Merged`; assert via
+  `SnapshotTable::index_coverage` (the deterministic signal — BTREE/FTS
+  coverage absent immediately post-merge, present after `ensure_indices`), and
+  `with_merge_write_probes` `stage_vector_index_calls() == 0`. Do **not** rely
+  on the vector probe alone: small fixtures leave Vector untrainable, so the
+  inline build may already skip it.
+- `tests/failpoints.rs`: `branch_merge_armed_index_tail_rolls_back_after_
+  exact_transaction_prefix` (~8801) becomes a legacy-sidecar recovery cell
+  (synthetic tail, comment says legacy tolerance);
+  `branch_merge_confirmation_rejects_foreign_append_before_index_tail`
+  (~8904) becomes a no-index-tail foreign-append fail-closed cell;
+  `MergeScenario::Rewrite` comments drop the index phase.
+- `composite_flow.rs` (~761–790): rewrite comments — post-merge lookups prove
+  correctness under deferred coverage, not an inline rebuild.
+- Recovery: no constant change. `MAX_EFFECT_IDENTITY_SCAN_VERSIONS` stays
+  `+2`; comment `prove_branch_merge_multi_commit_effect`'s one-CreateIndex-tail
+  acceptance as legacy tolerance
+  (`recovery.rs` test `branch_merge_v4_accepts_only_one_derived_index_tail`
+  keeps guarding it).
+
+**A3 — docs.** `docs/user/branching/merge.md` (~52–69: three-way now defers
+like FF; also state plainly: FTS **absence** errors until first
+`ensure_indices`/`optimize`, vector brute-forces, FTS **coverage gaps**
+flat-search — the verified matrix), `docs/dev/merge.md` (1,026-version
+explanation → legacy tail), `docs/dev/merge-complexity.md` (L3 done; drop
+"optional inline index" row/scenario), `writes.md` / `execution.md` /
+`canon.md` / `constants.md` headroom wording, `invariants.md` truth matrix
+(BranchMerge joins the no-inline-index writers).
+
+Focused suites: `merge_fast_forward`, `failpoints branch_merge_`,
+`composite_flow`, `maintenance`, `recovery` in-source cells.
+
+### PR-B — L1 commits
+
+**B1 — extract the shared stager (pure refactor, no route change).**
+In `table_store.rs`, move the physical body of `stage_proven_strict_insert`
+(bounds → blob materialization → `InsertBuilder::execute_uncommitted` →
+fragment-id/row-id assignment → Append→filtered-`Update` conversion with
+`KeyExistenceFilterBuilder` over exact source ids + full `schema_preorder_
+field_ids` → `record_stage_fenced_insert`) into a private helper:
+
+```rust
+async fn stage_absence_proven_strict_insert(
+    &self,
+    ds: Dataset,                        // pinned parent; read_version source
+    table_key: &str,
+    batch: RecordBatch,                 // bounds-checked, blob-prepared
+    source_ids: Vec<String>,
+    id_field_id: i32,
+    expected_schema_preorder_ids: &[u32],
+    context: &'static str,              // error/em text ("stage_keyed_write" | "stage_proven_strict_insert chunk N")
+) -> Result<StagedWrite>
+```
+
+`stage_proven_strict_insert` keeps its `ProvenInsertChunk` validation
+(version pin, stable-row-ids, chunk_index) and delegates. Move the
+stable-row-ids requirement **into the helper** (fail loudly; every v6 table
+has them). No new `InsertBuilder::new(` occurrence — the literal moves with
+the code, so the `forbidden_apis` count `("table_store.rs",
+"InsertBuilder::new(", 3, ..)` is unchanged. `ProvenInsertChunk` minting stays
+merge-only. Green on the existing suite proves the refactor.
+
+**B2 — route general StrictInsert through the helper (+ probe assertions, one
+commit).**
+
+- `stage_keyed_write` (~1517): after `preflight_strict_insert_ids`, the
+  StrictInsert arm calls the helper instead of
+  `stage_keyed_write_from_stream`; then the existing mandatory
+  `certify_insert_absence` runs against the helper's transaction (same
+  validator, same v1 property) and `set_strict_source_ids` is kept. The
+  Upsert arm is untouched (still forced-v2 MergeInsert +
+  `validate_exact_id_filter` + optional all-new certification).
+- Delete `validate_strict_insert_merge_stats`'s StrictInsert call site (no
+  MergeInsert stats exist on this path; `certify_insert_absence` is the
+  shape/filter proof). Keep the fn if the test-only entry points still use it;
+  otherwise remove it in the same commit.
+- Probe deltas in the same commit:
+  - `staged_tests.rs::keyed_strict_insert_preflights_typed_conflict_without_
+    changing_mode` + a new assertion block: successful
+    `stage_keyed_write(StrictInsert)` shows `strict_insert_preflight == 1`,
+    `stage_fenced_insert == 1`, `stage_merge_insert == 0`.
+  - `write_cost.rs::keyed_insert_routes_through_fenced_adapter_only` (~361):
+    `staged.stage_merge_insert` `1 → 0`, add
+    `staged.stage_fenced_insert == 1`; keep `stage_append == 0` and the
+    vector-build guard.
+  - `consistency.rs` Append strict-insert cells: unchanged outcomes (typed
+    `KeyConflict`, ceilings, no partial publish) — extend one cell with the
+    probe triple to pin the route.
+  - `merge_fast_forward.rs`: existing proven-route assertions unchanged;
+    `AdoptWithDelta` insert cells now expect fenced inserts, zero
+    merge-insert.
+- `forbidden_apis.rs`: `.execute_uncommitted(` count in `table_store.rs` may
+  shift if the StrictInsert MergeInsert call disappears from the general arm
+  (`stage_keyed_write_from_stream` remains for Upsert — expect count
+  unchanged; adjust if the refactor consolidates).
+
+**B3 — docs.** `docs/dev/merge.md` strategy note (general StrictInsert no
+longer pays a target merge join), `docs/dev/merge-complexity.md` (L1 done;
+update the per-function table rows for `stage_keyed_write`), RFC-023 is
+historical — no edit; `AGENTS.md` capability-matrix keyed-writes cell gets the
+one-line update.
+
+Focused suites: `staged_tests` (in-source), `writes`, `consistency`,
+`write_cost`, `merge_fast_forward`, `forbidden_apis`, `failpoints` mutation +
+adopt cells, `benchmark_scenario_contract`.
+
+### PR-C — L2a commits
+
+**C0 — substrate guard cell (can land independently, unblocks the indexed
+follow-up).** New `lance_surface_guards.rs` cell
+`v1_update_claims_no_new_fragments_for_omnigraph_index_shapes`: fixture with
+`id Utf8 PK`, free-text `String`, orderable scalar, **one list-typed
+property**, and an FSL vector; build BTREE + inverted + vector; run
+`UpdateAll`+`DoNothing` with default `use_index` (v1); assert
+`inserted_rows_filter.is_none()`, `affected_rows.is_some()`,
+`update_mode == RewriteRows`, and **no index fragment_bitmap contains any new
+fragment id**; assert every index's `fields` are top-level ids. This checks in
+the 2026-08-12 empirical result (review ledger).
+
+**C1 — sealed adapter + unit cells (one commit).**
+`table_store.rs`:
+
+```rust
+pub(crate) async fn stage_known_present_exact_id_update(
+    &self,
+    ds: Dataset,
+    table_key: &str,
+    batch: RecordBatch,   // full-row images, ≤ 8_192 rows / 32 MiB
+) -> Result<StagedWrite>
+```
+
+Body: bounds + `exact_id_primary_key_field_id` + `validate_keyed_write_batch_
+ids` + `prepare_keyed_write_batch`; `MergeInsertBuilder` with `UpdateAll` /
+`DoNothing` / `use_index(false)` / `conflict_retries(0)` /
+`SourceDedupeBehavior::FirstSeen`; fail closed per the revised checks
+(stats exact-update, `RewriteRows`, `affected_rows.is_some()`, filter
+`Some(empty)`-or-`None`, never non-empty). New probe
+`record_stage_known_present_update` in `instrumentation.rs` (+
+`MergeWriteProbes` counter + `StagedCounts` field in `helpers/cost.rs`).
+Registry updates in the same commit: `forbidden_apis.rs`
+`("table_store.rs", "MergeInsertBuilder::try_new(", 1 → 2, ..)` and
+`.execute_uncommitted(` count +1; add the method name to both sealed-adapter
+allowlists (~530, ~566). Unit cells in `staged_tests.rs` mirror
+`keyed_upsert_forces_filter_route_and_preserves_conflict_metadata` plus an
+absent-id fail-closed cell.
+
+**C2 — wire the adopt publish (one commit).**
+`exec/merge.rs`: add `KeyedChunkStage::KnownPresentUpdate`;
+`publish_adopted_delta` upsert phase switches
+`KeyedWriteSemantics::Upsert` → the new stage kind (the
+`commit_keyed_stream_chunks` match arm calls the new adapter).
+`plan_merge_transactions` counts are unchanged (same chunk vectors).
+Read-set comments state the L2 contract explicitly (changed ids
+known-present at the classification baseline; post-arm divergence is
+`RecoveryRequired`). Test deltas: `merge_fast_forward` adopt cells assert
+`stage_known_present_update == C_upsert`, general `stage_merge_insert == 0`
+on adopt; `merge_truth_table` unchanged semantics; `failpoints` adopt
+crash-window cells re-run (identities/chain unchanged, so expect green
+without edits — verify).
+
+**C3 — docs.** `merge.md` + `merge-complexity.md` (L2a status; forced-v2
+first, indexed follow-up gated on C0's cell), `AGENTS.md` matrix line if the
+capability wording changes.
+
+**C4 (separate follow-up PR, after C0 is green in CI):** flip the adapter to
+default `use_index` (v1 when covered), extend C0's cell to pin the routing,
+and re-measure the adopt merge in the RFC-023 scenario harness. Only this
+commit claims the join-cost win.
+
+Focused suites: `staged_tests`, `merge_fast_forward`, `merge_truth_table`,
+`failpoints branch_merge_adopt`, `forbidden_apis`, `lance_surface_guards`.
+
+### Dependency graph
+
+```
+A1 → A2 → A3            (PR-A, independent)
+B1 → B2 → B3            (PR-B, independent of PR-A; textual merge only)
+C0 ─┐
+B2 ─┴→ C1 → C2 → C3     (PR-C after PR-B; C0 any time)
+C0 + C2 → C4            (indexed follow-up, separate PR)
+```
+
 ## Review ledger (2026-08-12)
 
 Assumption-by-assumption verification of this plan against OmniGraph main and
