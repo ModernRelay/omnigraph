@@ -1,8 +1,10 @@
 mod helpers;
 
+use lance::Dataset;
+use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
 use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
 use omnigraph::db::commit_graph::CommitGraph;
-use omnigraph::db::{CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 
@@ -332,12 +334,29 @@ async fn commit_changes_are_exact_ordered_and_bounded() {
     assert!(empty_page.commit_complete);
     assert!(empty_page.changes.is_empty());
 
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let person_path = &snapshot.entry("node:Person").unwrap().table_path;
+    let person_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        person_path.trim_start_matches('/')
+    );
+    let person = Dataset::open(&person_uri).await.unwrap();
+    let removed = cleanup_old_versions(
+        &person,
+        CleanupPolicy {
+            before_version: Some(person.version().version),
+            delete_unverified: true,
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        },
+    )
     .await
     .unwrap();
+    assert!(
+        removed.old_versions > 0,
+        "precondition: history was reclaimed"
+    );
     let gap = db
         .commit_changes_page(
             &inserted.commit.graph_commit_id,
