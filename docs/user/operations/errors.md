@@ -10,6 +10,12 @@
   - `ManifestConflictDetails::ExpectedVersionMismatch { table_key, expected, actual }` — caller's `expected_table_versions` did not match the manifest's current latest non-tombstoned version (set by `OmniError::manifest_expected_version_mismatch`).
   - `ManifestConflictDetails::ReadSetChanged { member, expected, actual }` — an RFC-022 prepared write's branch/head/table authority changed before physical effects. HTTP returns **409** with `read_set_conflict`. A retry must start from preparation; strict writes leave that choice to the caller.
   - `ManifestConflictDetails::RowLevelCasContention` — Lance row-level CAS rejected the publish because a concurrent writer landed the same `object_id`. Retried internally by the publisher; only surfaces if the retry budget exhausts.
+  - **Missing schema files on open**: `open` returns `NotFound` when a graph's
+    `__manifest` and data are present but `_schema.pg` is absent, naming the
+    missing files and the remedy (restore all three schema files from a backup,
+    or rebuild the graph via export onto a fresh root). A graph missing only
+    `_schema.ir.json` or `__schema_state.json` is refused with a typed error
+    by the schema-contract validation that runs at open.
   - **D₂ parse-time rejection**: a single mutation query that mixes inserts/updates with deletes errors out *before any I/O* with kind `BadRequest`. Message: `mutation '<name>' on the same query mixes inserts/updates and deletes; split into separate mutations: (1) inserts and updates, then (2) deletes`. See [query-language.md](../queries/index.md) for the rule.
   - **Blob property-lifetime refusal**: `read_blob_at` returns `BadRequest` when
     the selected field's persisted `omnigraph.stable_property_id` belongs to a
@@ -132,6 +138,11 @@
   HTTP returns **403**.
 - `AlreadyInitialized { uri }` — `init` targeted a root that already holds a
   graph. HTTP returns **409**.
+- **`init` failing after the graph is complete**: once `init` has created and
+  stamped `__manifest`, the graph is durable. A later failure in the same call
+  still returns an error, but the error states that the graph is intact, and
+  the graph opens normally — do not delete the root in response to it. Only a
+  failure *before* that point removes the schema artifacts the call wrote.
 - `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id`. Resolve the sidecar through a read-write reopen/server restart before retrying; this is intentionally not an ordinary OCC retry.
 
 For RFC-023 Mutation/Load keyed writes, `KeyConflict` is returned only after

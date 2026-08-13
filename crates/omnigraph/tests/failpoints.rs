@@ -10206,16 +10206,17 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
 // `GraphCoordinator::init`. Without cleanup, a failure between any of those
 // steps left orphan files behind, making the URI unusable for a retry of
 // `init` (it would refuse because `_schema.pg` already exists). The tests
-// below pin: on failpoint trigger at each of the three phase boundaries,
+// below pin: on failpoint trigger at the two pre-commit phase boundaries,
 // the three schema files are removed before the error is returned.
 //
-// Coverage note: the third boundary (`init.after_coordinator_init`) only
-// asserts cleanup of the schema files. Lance per-type directories and
-// `__manifest/` are NOT cleaned up — that requires a recursive
-// `StorageAdapter::delete_prefix` primitive deferred along with
-// `DELETE /graphs/{id}` (MR-668 PR 2b). The orphan Lance directories
-// after a coordinator-init-phase failure are documented as a known
-// limitation.
+// The third boundary (`init.after_coordinator_init`) sits past the graph's
+// commit point, where the cleanup must not run (issue #495 — deleting the
+// schema files there left a graph that could neither open nor re-init).
+// Its test asserts the graph survives an error at that window.
+//
+// Coverage note: orphan Lance directories after a failure DURING
+// `GraphCoordinator::init` are a known limitation — see the coverage-gap
+// comment in `init_with_storage`.
 
 #[tokio::test]
 #[serial]
@@ -10278,43 +10279,73 @@ async fn init_failpoint_after_schema_contract_written_cleans_up_all_schema_files
 
 #[tokio::test]
 #[serial]
-async fn init_failpoint_after_coordinator_init_cleans_up_schema_files() {
+async fn init_failpoint_after_coordinator_init_leaves_completed_store_intact() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
     let _failpoint = ScopedFailPoint::new(names::INIT_AFTER_COORDINATOR_INIT, "return");
 
-    let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
+    let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
         Err(e) => e,
     };
+    let msg = err.to_string();
     assert!(
-        err.to_string()
-            .contains("injected failpoint triggered: init.after_coordinator_init"),
-        "got: {err}"
+        msg.contains("injected failpoint triggered: init.after_coordinator_init"),
+        "init error must surface the original cause, got: {msg}"
+    );
+    assert!(
+        msg.contains("the graph is intact"),
+        "a post-commit-point init error must say the graph survived, got: {msg}"
     );
 
-    // Schema files are cleaned up by `best_effort_cleanup_init_artifacts`.
-    assert!(
-        !dir.path().join("_schema.pg").exists(),
-        "_schema.pg must be cleaned up after late-phase init failure"
-    );
-    assert!(
-        !dir.path().join("_schema.ir.json").exists(),
-        "_schema.ir.json must be cleaned up after late-phase init failure"
-    );
-    assert!(
-        !dir.path().join("__schema_state.json").exists(),
-        "__schema_state.json must be cleaned up after late-phase init failure"
-    );
+    // The graph was durably complete before the failpoint fired; the schema
+    // files must survive the failed init.
+    for schema_file in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
+        assert!(
+            dir.path().join(schema_file).exists(),
+            "{schema_file} must survive a post-commit-point init failure"
+        );
+    }
 
-    // Documented limitation: Lance per-type datasets and `__manifest/`
-    // created by `GraphCoordinator::init` are NOT cleaned up — recursive
-    // deletion requires the deferred `delete_prefix` primitive. This
-    // assertion does NOT check for their absence; it merely documents
-    // the boundary by noting we don't validate orphan directories here.
-    // When PR 2b lands, this test can be tightened to assert the graph
-    // root is fully empty.
+    // And the graph is not merely present but fully usable: it opens,
+    // accepts a write, and serves a read.
+    let mut db = Omnigraph::open(&uri)
+        .await
+        .expect("graph must open cleanly after a post-commit-point init failure");
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "post-commit-survivor")], &[("$age", 1)]),
+    )
+    .await
+    .expect("graph must accept writes after a post-commit-point init failure");
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
+// The floor under the schema-files-gone damage state: however a graph loses
+// its schema files while keeping its data and `__manifest`, `open` must
+// diagnose the state by name.
+#[tokio::test]
+#[serial]
+async fn open_missing_schema_pg_reports_schema_files_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    Omnigraph::init(&uri, helpers::TEST_SCHEMA)
+        .await
+        .expect("init must succeed");
+    std::fs::remove_file(dir.path().join("_schema.pg")).unwrap();
+
+    let err = match Omnigraph::open(&uri).await {
+        Ok(_) => panic!("open must fail without _schema.pg"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("missing its schema files") && msg.contains("_schema.pg"),
+        "open must name the missing schema files, got: {msg}"
+    );
 }
 
 // The torn-init regression: the `__manifest` Create commit is the manifest's

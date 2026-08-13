@@ -117,6 +117,8 @@ pub mod names {
     pub const FORK_POST_CREATE_PRE_OPEN: &str = "fork.post_create_pre_open";
     pub const GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT: &str = "graph_publish.after_manifest_commit";
     pub const GRAPH_PUBLISH_BEFORE_COMMIT_APPEND: &str = "graph_publish.before_commit_append";
+    /// Fires past init's commit point — the graph must survive errors
+    /// injected here.
     pub const INIT_AFTER_COORDINATOR_INIT: &str = "init.after_coordinator_init";
     pub const INIT_AFTER_SCHEMA_CONTRACT_WRITTEN: &str = "init.after_schema_contract_written";
     pub const INIT_AFTER_SCHEMA_PG_WRITTEN: &str = "init.after_schema_pg_written";

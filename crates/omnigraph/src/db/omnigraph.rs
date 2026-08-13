@@ -313,6 +313,10 @@ impl Omnigraph {
     /// Strict mode errors with [`OmniError::AlreadyInitialized`] if `uri`
     /// already holds any schema artifact. Force is intentionally limited to
     /// orphan artifacts and refuses a root with an existing `__manifest`.
+    ///
+    /// A failure after `__manifest` is created and stamped leaves the graph
+    /// intact and openable with [`Self::open`]; earlier failures remove the
+    /// schema artifacts this call wrote.
     pub async fn init(uri: &str, schema_source: &str) -> Result<Self> {
         Self::init_with_options(uri, schema_source, InitOptions::default()).await
     }
@@ -413,21 +417,19 @@ impl Omnigraph {
             true
         };
 
-        // Run the I/O phase. On any error, best-effort-clean schema artifacts
-        // only when this invocation owns them: strict mode owns them after the
-        // atomic `_schema.pg` claim above; force is allowed only for orphan
-        // schema artifacts after proving that no manifest exists.
+        // Run the commit phase. On any error, best-effort-clean schema
+        // artifacts only when this invocation owns them: strict mode owns
+        // them after the atomic `_schema.pg` claim above; force is allowed
+        // only for orphan schema artifacts after proving that no manifest
+        // exists.
         //
-        // Coverage gap: Lance per-type datasets and `__manifest/`
-        // directory created by `GraphCoordinator::init` are NOT cleaned
-        // up here — fully recursive directory deletion requires a
-        // `StorageAdapter::delete_prefix` primitive that's deferred
-        // along with `DELETE /graphs/{id}` (PR 2b in the MR-668 plan
-        // is currently deferred). If `init` fails after coordinator
-        // init succeeds, operators may need to remove the graph
-        // directory manually before retrying `init` on the same URI.
-        // Documented in the PR 2a commit message and `init` rustdoc.
-        let coordinator = match init_storage_phase(
+        // Coverage gap: a failure DURING `GraphCoordinator::init` can leave
+        // Lance per-type datasets and a partial `__manifest/` behind; those
+        // are not cleaned up here — recursive deletion needs the
+        // `StorageAdapter::delete_prefix` primitive deferred with
+        // `DELETE /graphs/{id}` (MR-668 PR 2b). Operators may need to
+        // remove the graph directory manually before retrying `init`.
+        let coordinator = match init_commit_phase(
             &root,
             schema_source,
             &schema_ir,
@@ -446,6 +448,13 @@ impl Omnigraph {
                 return Err(err);
             }
         };
+
+        // Past the commit point (see `init_commit_phase`): the graph is
+        // durably complete. Errors from here must not reach the schema
+        // cleanup — deleting a complete graph's schema files strands its
+        // data behind a missing contract (issue #495).
+        init_post_commit_checks(&schema_ir, &coordinator)
+            .map_err(|err| annotate_post_commit_init_error(&root, err))?;
 
         let session = lance_access.data_session();
         Ok(Self {
@@ -584,8 +593,15 @@ impl Omnigraph {
         }
         crate::failpoints::maybe_fail(crate::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ)?;
         // Read _schema.pg (post-recovery — may have just been renamed in).
+        // The stamp guard and coordinator open above both read `__manifest`,
+        // so reaching this point proves the graph's data is present; a
+        // missing schema source is the schema-files-gone damage state.
         let schema_path = schema_source_uri(&root);
-        let schema_source = storage.read_text(&schema_path).await?;
+        let Some(schema_source) = storage.read_text_if_exists(&schema_path).await? else {
+            return Err(OmniError::manifest_not_found(format!(
+                "graph at '{root}' is missing its schema files: '_schema.pg' was not found although the graph's '__manifest' and data are present; restore '_schema.pg', '_schema.ir.json', and '__schema_state.json' from a backup, or rebuild the graph via export and re-init on a fresh root"
+            )));
+        };
         let (accepted_ir, accepted_state) =
             load_validated_schema_contract_for_source(&root, Arc::clone(&storage), &schema_source)
                 .await?;
@@ -3309,9 +3325,12 @@ async fn refuse_force_init_over_existing_manifest(
     }
 }
 
-/// I/O phase of `Omnigraph::init_with_storage`. Split out so the caller
-/// can pattern-match on the result and run cleanup on error before
-/// returning the original error.
+/// Commit phase of `Omnigraph::init_with_storage`: every durable write of
+/// graph creation, ending with `GraphCoordinator::init` creating the Lance
+/// per-type datasets and the stamped `__manifest` in one Create commit —
+/// the graph's commit point. An error here means creation did not complete
+/// and the caller may clean up the schema artifacts; checks past the commit
+/// point live in `init_post_commit_checks`.
 ///
 /// Failpoints fire at the phase boundaries:
 /// * `init.after_schema_pg_written` — `_schema.pg` is on disk. In strict mode
@@ -3319,11 +3338,7 @@ async fn refuse_force_init_over_existing_manifest(
 ///   force mode it fires here after the explicit overwrite.
 /// * `init.after_schema_contract_written` — `_schema.pg` + `_schema.ir.json`
 ///   + `__schema_state.json` are on disk.
-/// * `init.after_coordinator_init` — all schema files plus Lance per-type
-///   datasets and `__manifest/` are on disk. (The cleanup wrapper can only
-///   remove the schema files; Lance directories need `delete_prefix` —
-///   deferred along with `DELETE /graphs/{id}`.)
-async fn init_storage_phase(
+async fn init_commit_phase(
     root: &str,
     schema_source: &str,
     schema_ir: &SchemaIR,
@@ -3341,17 +3356,39 @@ async fn init_storage_phase(
     write_schema_contract(root, storage.as_ref(), schema_ir).await?;
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)?;
 
-    let coordinator =
-        GraphCoordinator::init_with_session(root, catalog, Arc::clone(storage), control_session)
-            .await?;
+    GraphCoordinator::init_with_session(root, catalog, Arc::clone(storage), control_session).await
+}
+
+/// Validation past the commit point (see `init_commit_phase`): the graph is
+/// complete, so callers must not run `best_effort_cleanup_init_artifacts` on
+/// error. The `init.after_coordinator_init` failpoint fires here.
+fn init_post_commit_checks(schema_ir: &SchemaIR, coordinator: &GraphCoordinator) -> Result<()> {
     validate_schema_ir_against_snapshot(schema_ir, &coordinator.snapshot())?;
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_COORDINATOR_INIT)?;
+    Ok(())
+}
 
-    Ok(coordinator)
+/// Prefix a post-commit-point init error with a note that the graph is
+/// complete and opens normally.
+fn annotate_post_commit_init_error(root: &str, err: OmniError) -> OmniError {
+    let note = format!(
+        "init failed after the graph at '{root}' was durably complete; the graph is intact and can be opened normally"
+    );
+    match err {
+        OmniError::Manifest(mut manifest_err) => {
+            manifest_err.message = format!("{note}: {}", manifest_err.message);
+            OmniError::Manifest(manifest_err)
+        }
+        // Other variants carry a contract callers match on — retry
+        // semantics, HTTP status, recovery ownership. Keep the variant and
+        // forgo the note rather than flattening it into a manifest error.
+        other => other,
+    }
 }
 
 /// Best-effort cleanup of init-phase artifacts. Called from
-/// `init_with_storage` on any error returned by `init_storage_phase`.
+/// `init_with_storage` on an error returned by `init_commit_phase`, and
+/// never past the commit point (see the call site; issue #495).
 ///
 /// Removes the three schema files: `_schema.pg`, `_schema.ir.json`,
 /// `__schema_state.json`. Lance datasets and `__manifest/` are not
