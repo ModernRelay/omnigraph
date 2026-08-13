@@ -27,11 +27,15 @@ use super::{TableIdentity, table_path_for_identity};
 /// internal-schema stamp all ride it), genesis IS the live version at init.
 const GENESIS_MANIFEST_VERSION: u64 = 1;
 
+/// Assembles the initial entries, genesis lineage, and internal-schema
+/// stamp, and lands them all in the one `__manifest` Create commit. Nothing
+/// failable runs after the commit; reading the state back is
+/// `load_initial_manifest_state`, on the post-commit side.
 pub(super) async fn init_manifest_graph(
     root_uri: &str,
     catalog: &Catalog,
     control_session: &Arc<lance::session::Session>,
-) -> Result<(Dataset, ManifestState, Vec<GraphLineageRow>)> {
+) -> Result<Dataset> {
     let root = root_uri.trim_end_matches('/');
     let (entries, version_metadata) = build_initial_entries(root, catalog, control_session).await?;
 
@@ -79,13 +83,19 @@ pub(super) async fn init_manifest_graph(
         ..Default::default()
     };
     let manifest_path = manifest_uri(root);
-    let dataset = Dataset::write(reader, &manifest_path, Some(params))
+    Dataset::write(reader, &manifest_path, Some(params))
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_POST_MANIFEST_CREATE)?;
+        .map_err(|e| OmniError::Lance(e.to_string()))
+}
 
-    let (known_state, lineage_rows) = read_manifest_state_and_lineage(&dataset).await?;
-    Ok((dataset, known_state, lineage_rows))
+/// Reads back the state the `__manifest` Create commit landed. The
+/// `init.post_manifest_create` failpoint fires as this function's first
+/// statement.
+pub(super) async fn load_initial_manifest_state(
+    dataset: &Dataset,
+) -> Result<(ManifestState, Vec<GraphLineageRow>)> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_POST_MANIFEST_CREATE)?;
+    read_manifest_state_and_lineage(dataset).await
 }
 
 pub(super) async fn open_manifest_graph(

@@ -429,7 +429,7 @@ impl Omnigraph {
         // `StorageAdapter::delete_prefix` primitive deferred with
         // `DELETE /graphs/{id}` (MR-668 PR 2b). Operators may need to
         // remove the graph directory manually before retrying `init`.
-        let coordinator = match init_commit_phase(
+        let manifest_dataset = match init_commit_phase(
             &root,
             schema_source,
             &schema_ir,
@@ -440,7 +440,7 @@ impl Omnigraph {
         )
         .await
         {
-            Ok(coordinator) => coordinator,
+            Ok(dataset) => dataset,
             Err(err) => {
                 if schema_pg_claimed || options.force {
                     best_effort_cleanup_init_artifacts(&root, storage.as_ref()).await;
@@ -453,7 +453,8 @@ impl Omnigraph {
         // durably complete. Errors from here must not reach the schema
         // cleanup — deleting a complete graph's schema files strands its
         // data behind a missing contract (issue #495).
-        init_post_commit_checks(&schema_ir, &coordinator)
+        let coordinator = init_post_commit_checks(&root, manifest_dataset, &schema_ir, &storage)
+            .await
             .map_err(|err| annotate_post_commit_init_error(&root, err))?;
 
         let session = lance_access.data_session();
@@ -3326,11 +3327,11 @@ async fn refuse_force_init_over_existing_manifest(
 }
 
 /// Commit phase of `Omnigraph::init_with_storage`: every durable write of
-/// graph creation, ending with `GraphCoordinator::init` creating the Lance
-/// per-type datasets and the stamped `__manifest` in one Create commit —
-/// the graph's commit point. An error here means creation did not complete
-/// and the caller may clean up the schema artifacts; checks past the commit
-/// point live in `init_post_commit_checks`.
+/// graph creation, ending with the stamped `__manifest` Create commit — the
+/// graph's commit point, and this function's final operation. An error here
+/// means creation did not complete and the caller may clean up the schema
+/// artifacts; everything past the commit point lives in
+/// `init_post_commit_checks`.
 ///
 /// Failpoints fire at the phase boundaries:
 /// * `init.after_schema_pg_written` — `_schema.pg` is on disk. In strict mode
@@ -3346,7 +3347,7 @@ async fn init_commit_phase(
     storage: &Arc<dyn StorageAdapter>,
     write_schema_pg: bool,
     control_session: &Arc<lance::session::Session>,
-) -> Result<GraphCoordinator> {
+) -> Result<Dataset> {
     if write_schema_pg {
         let schema_path = join_uri(root, SCHEMA_SOURCE_FILENAME);
         storage.write_text(&schema_path, schema_source).await?;
@@ -3356,16 +3357,27 @@ async fn init_commit_phase(
     write_schema_contract(root, storage.as_ref(), schema_ir).await?;
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)?;
 
-    GraphCoordinator::init_with_session(root, catalog, Arc::clone(storage), control_session).await
+    GraphCoordinator::init_commit_with_session(root, catalog, control_session).await
 }
 
-/// Validation past the commit point (see `init_commit_phase`): the graph is
-/// complete, so callers must not run `best_effort_cleanup_init_artifacts` on
-/// error. The `init.after_coordinator_init` failpoint fires here.
-fn init_post_commit_checks(schema_ir: &SchemaIR, coordinator: &GraphCoordinator) -> Result<()> {
+/// Everything past the commit point (see `init_commit_phase`): reads the
+/// committed manifest back, assembles the coordinator, and validates. The
+/// graph is complete before this runs, so callers must not run
+/// `best_effort_cleanup_init_artifacts` on error. The
+/// `init.post_manifest_create` and `init.after_coordinator_init` failpoints
+/// both fire inside this phase.
+async fn init_post_commit_checks(
+    root: &str,
+    manifest_dataset: Dataset,
+    schema_ir: &SchemaIR,
+    storage: &Arc<dyn StorageAdapter>,
+) -> Result<GraphCoordinator> {
+    let coordinator =
+        GraphCoordinator::finish_init_with_storage(root, manifest_dataset, Arc::clone(storage))
+            .await?;
     validate_schema_ir_against_snapshot(schema_ir, &coordinator.snapshot())?;
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_COORDINATOR_INIT)?;
-    Ok(())
+    Ok(coordinator)
 }
 
 /// Prefix a post-commit-point init error with a note that the graph is

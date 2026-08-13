@@ -1,6 +1,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use lance::Dataset;
+
 use omnigraph_compiler::catalog::Catalog;
 
 use crate::error::{OmniError, Result};
@@ -122,19 +124,30 @@ pub(crate) struct GraphCoordinator {
 }
 
 impl GraphCoordinator {
-    pub(crate) async fn init_with_session(
+    /// Commit half of coordinator init: ends at the `__manifest` Create
+    /// commit (see `init_commit_phase` for the phase contract).
+    pub(crate) async fn init_commit_with_session(
         root_uri: &str,
         catalog: &Catalog,
-        storage: Arc<dyn StorageAdapter>,
         control_session: &Arc<lance::session::Session>,
-    ) -> Result<Self> {
+    ) -> Result<Dataset> {
         let root = normalize_root_uri(root_uri)?;
         // The genesis graph commit is folded into the manifest init write, so
         // `__manifest` is the single source of graph lineage from version one
-        // (RFC-013 Phase 7). State and lineage are decoded from one coherent
-        // scan, so initialization opens/scans no second manifest dataset.
-        let (manifest, lineage_rows) =
-            ManifestCoordinator::init_with_lineage(&root, catalog, control_session).await?;
+        // (RFC-013 Phase 7).
+        ManifestCoordinator::init_commit(&root, catalog, control_session).await
+    }
+
+    /// Post-commit half of coordinator init: builds the coordinator's view of
+    /// the completed graph; see `init_post_commit_checks` for the caller
+    /// contract.
+    pub(crate) async fn finish_init_with_storage(
+        root_uri: &str,
+        dataset: Dataset,
+        storage: Arc<dyn StorageAdapter>,
+    ) -> Result<Self> {
+        let root = normalize_root_uri(root_uri)?;
+        let (manifest, lineage_rows) = ManifestCoordinator::finish_init(&root, dataset).await?;
         let commit_graph = CommitGraph::from_manifest_rows(&root, None, lineage_rows);
         Ok(Self {
             root_uri: root,

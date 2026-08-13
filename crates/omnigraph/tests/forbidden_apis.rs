@@ -401,7 +401,13 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
-        "init_with_session",
+        "init_commit_with_session",
+        WriteProtocol::Bootstrap,
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "finish_init_with_storage",
         WriteProtocol::Bootstrap,
     ),
     (
@@ -437,7 +443,13 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/manifest.rs",
         "ManifestCoordinator",
-        "init_with_lineage",
+        "init_commit",
+        WriteProtocol::Bootstrap,
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "finish_init",
         WriteProtocol::Bootstrap,
     ),
     (
@@ -716,7 +728,8 @@ durable_calls! {
     ("db/schema_state.rs", ".rename_text(", 1, WriteProtocol::Composed("schema staging promotion")),
     ("db/manifest/recovery.rs", ".delete(", 2, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".delete_prefix(", 2, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph.rs", "GraphCoordinator::init_with_session(", 1, WriteProtocol::Bootstrap),
+    ("db/omnigraph.rs", "GraphCoordinator::init_commit_with_session(", 1, WriteProtocol::Bootstrap),
+    ("db/omnigraph.rs", "GraphCoordinator::finish_init_with_storage(", 1, WriteProtocol::Bootstrap),
     ("db/omnigraph.rs", "recover_manifest_drift(", 1, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph.rs", "heal_pending_sidecars_roll_forward(", 2, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph.rs", "recover_schema_state_files(", 2, WriteProtocol::RecoveryExecutor),
@@ -795,7 +808,8 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".put_opts(",
     ".rename(",
     ".rename_text(",
-    "GraphCoordinator::init_with_session(",
+    "GraphCoordinator::init_commit_with_session(",
+    "GraphCoordinator::finish_init_with_storage(",
     "recover_manifest_drift(",
     "heal_pending_sidecars_roll_forward(",
     "recover_schema_state_files(",
@@ -2289,7 +2303,8 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
     }
 
     let methods = [
-        ("db/manifest.rs", "init_with_lineage"),
+        ("db/manifest.rs", "init_commit"),
+        ("db/manifest.rs", "finish_init"),
         ("db/manifest.rs", "commit"),
         ("db/manifest.rs", "commit_with_expected"),
         ("db/manifest.rs", "commit_changes"),
@@ -2302,7 +2317,8 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
         ("db/manifest.rs", "create_branch"),
         ("db/manifest.rs", "delete_branch"),
         ("db/manifest.rs", "delete_branch_with_expected"),
-        ("db/graph_coordinator.rs", "init_with_session"),
+        ("db/graph_coordinator.rs", "init_commit_with_session"),
+        ("db/graph_coordinator.rs", "finish_init_with_storage"),
         ("db/graph_coordinator.rs", "branch_create"),
         ("db/graph_coordinator.rs", "branch_delete"),
         ("db/graph_coordinator.rs", "branch_delete_captured"),

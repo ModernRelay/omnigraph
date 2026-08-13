@@ -10324,6 +10324,51 @@ async fn init_failpoint_after_coordinator_init_leaves_completed_store_intact() {
     assert_eq!(count_rows(&db, "node:Person").await, 1);
 }
 
+// Error-return twin of `init_crash_after_manifest_create_leaves_openable_store`:
+// an error injected just past the commit point must not trigger cleanup.
+#[tokio::test]
+#[serial]
+async fn init_failpoint_post_manifest_create_leaves_completed_graph_intact() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let _failpoint = ScopedFailPoint::new(names::INIT_POST_MANIFEST_CREATE, "return");
+
+    let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
+        Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("injected failpoint triggered: init.post_manifest_create"),
+        "init error must surface the original cause, got: {msg}"
+    );
+    assert!(
+        msg.contains("the graph is intact"),
+        "a post-commit-point init error must say the graph survived, got: {msg}"
+    );
+
+    for schema_file in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
+        assert!(
+            dir.path().join(schema_file).exists(),
+            "{schema_file} must survive a post-commit-point init failure"
+        );
+    }
+
+    let mut db = Omnigraph::open(&uri)
+        .await
+        .expect("graph must open cleanly after a post-commit-point init failure");
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "post-commit-survivor")], &[("$age", 1)]),
+    )
+    .await
+    .expect("graph must accept writes after a post-commit-point init failure");
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
 // The floor under the schema-files-gone damage state: however a graph loses
 // its schema files while keeping its data and `__manifest`, `open` must
 // diagnose the state by name.
