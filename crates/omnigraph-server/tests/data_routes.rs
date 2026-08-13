@@ -1467,7 +1467,14 @@ async fn load_endpoint_loads_into_existing_branch() {
         branch: Some("main".to_string()),
         from: None,
         mode: Some(LoadMode::Merge),
-        data: r#"{"type":"Person","data":{"name":"Loaded","age":7}}"#.to_string(),
+        data: concat!(
+            r#"{"type":"Person","data":{"name":"Loaded C","age":7}}"#,
+            "\n",
+            r#"{"type":"Person","data":{"name":"Loaded A","age":7}}"#,
+            "\n",
+            r#"{"type":"Person","data":{"name":"Loaded B","age":7}}"#,
+        )
+        .to_string(),
     };
     let response = app
         .clone()
@@ -1491,9 +1498,56 @@ async fn load_endpoint_loads_into_existing_branch() {
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(body["branch"], "main");
     assert_eq!(body["tables"][0]["table_key"], "node:Person");
-    body["commit"]["graph_commit_id"]
+    let commit_id = body["commit"]["graph_commit_id"]
         .as_str()
         .expect("effectful JSON load must return a commit receipt");
+    let (status, first) = json_response(
+        &app,
+        Request::builder()
+            .uri(g(&format!(
+                "/commits/{commit_id}/changes?limit=2&max_bytes=65536"
+            )))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["commit"]["graph_commit_id"], commit_id);
+    assert_eq!(first["changes"][0]["id"], "Loaded A");
+    assert_eq!(first["changes"][0]["change_index"], 0);
+    assert_eq!(first["changes"][1]["id"], "Loaded B");
+    assert_eq!(first["changes"][1]["change_index"], 1);
+    assert_eq!(first["commit_complete"], false);
+    let cursor = first["next_cursor"].as_str().expect("first page cursor");
+
+    let (status, second) = json_response(
+        &app,
+        Request::builder()
+            .uri(g(&format!(
+                "/commits/{commit_id}/changes?limit=2&max_bytes=65536&cursor={cursor}"
+            )))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["changes"][0]["id"], "Loaded C");
+    assert_eq!(second["changes"][0]["change_index"], 2);
+    assert_eq!(second["commit_complete"], true);
+    assert!(second["next_cursor"].is_null());
+
+    let (status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/commits/not-a-commit/changes"))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test(flavor = "multi_thread")]
