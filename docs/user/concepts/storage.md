@@ -115,6 +115,14 @@ The split — L2 owns the cross-dataset catalog; L1 owns the per-dataset interna
 | `s3://bucket/prefix` | S3 object store | Honors `AWS_ENDPOINT_URL_S3`, `AWS_ALLOW_HTTP`, `AWS_S3_FORCE_PATH_STYLE` |
 | `http(s)://host:port` | HTTP client to `omnigraph-server` | Used by CLI as a target, not a storage backend |
 
+### Transient embedded graphs
+
+Rust applications can create an isolated process-memory graph with
+`Omnigraph::in_memory(schema_source).await`. It uses the same schema, query,
+mutation, manifest, and branch machinery as durable graphs, but it has no
+public URI and cannot be reopened. Data is lost when the process exits. This
+mode is embedded-only: it is not a CLI, server, or cluster storage target.
+
 ### Local filesystem requirement: hard links
 
 The local backend publishes every atomic create-if-absent write — the
