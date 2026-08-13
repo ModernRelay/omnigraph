@@ -338,19 +338,25 @@ async fn commit_changes_are_exact_ordered_and_bounded() {
     })
     .await
     .unwrap();
-    assert!(matches!(
-        db.commit_changes_page(
+    let gap = db
+        .commit_changes_page(
             &inserted.commit.graph_commit_id,
             None,
             10,
             omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
         )
-        .await,
-        Err(OmniError::ChangeFeedGap {
-            first_unreadable_commit_id,
-            ..
-        }) if first_unreadable_commit_id == inserted.commit.graph_commit_id
-    ));
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &gap,
+            OmniError::ChangeFeedGap {
+                first_unreadable_commit_id,
+                ..
+            } if first_unreadable_commit_id == &inserted.commit.graph_commit_id
+        ),
+        "unexpected retention-gap result: {gap:?}"
+    );
 }
 
 #[tokio::test]
