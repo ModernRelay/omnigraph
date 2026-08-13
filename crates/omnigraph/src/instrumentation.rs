@@ -618,7 +618,9 @@ pub(crate) async fn open_dataset(
         });
     }
     builder.load().await.map_err(|error| match error {
-        lance::Error::VersionNotFound { .. } | lance::Error::NotFound { .. }
+        lance::Error::VersionNotFound { .. }
+        | lance::Error::DatasetNotFound { .. }
+        | lance::Error::NotFound { .. }
             if matches!(version, VersionResolution::At(_)) =>
         {
             OmniError::HistoricalVersionReclaimed {
