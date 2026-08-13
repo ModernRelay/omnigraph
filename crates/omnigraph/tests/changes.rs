@@ -237,7 +237,7 @@ async fn commit_changes_are_exact_ordered_and_bounded() {
             "main",
             MUTATION_QUERIES,
             "remove_person",
-            &params(&[("", "Alice")]),
+            &params(&[("$name", "Alice")]),
         )
         .await
         .unwrap()
