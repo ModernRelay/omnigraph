@@ -3391,10 +3391,45 @@ fn annotate_post_commit_init_error(root: &str, err: OmniError) -> OmniError {
             manifest_err.message = format!("{note}: {}", manifest_err.message);
             OmniError::Manifest(manifest_err)
         }
-        // Other variants carry a contract callers match on — retry
-        // semantics, HTTP status, recovery ownership. Keep the variant and
-        // forgo the note rather than flattening it into a manifest error.
+        // The post-commit manifest read-back does Lance IO, so transient
+        // substrate failures surface here; the note rides inside the same
+        // variant.
+        OmniError::Lance(message) => OmniError::Lance(format!("{note}: {message}")),
+        // Remaining variants carry structured payloads callers match on —
+        // retry semantics, HTTP status, recovery ownership. Keep the
+        // variant and forgo the note rather than flattening it.
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod post_commit_annotation_tests {
+    use super::*;
+
+    #[test]
+    fn annotates_manifest_and_lance_keeps_other_variants() {
+        let manifest = annotate_post_commit_init_error(
+            "file:///g",
+            OmniError::manifest("scan failed".to_string()),
+        );
+        assert!(manifest.to_string().contains("the graph is intact"));
+
+        let lance = annotate_post_commit_init_error(
+            "file:///g",
+            OmniError::Lance("read timed out".to_string()),
+        );
+        assert!(matches!(lance, OmniError::Lance(_)));
+        assert!(lance.to_string().contains("the graph is intact"));
+
+        let recovery = annotate_post_commit_init_error(
+            "file:///g",
+            OmniError::RecoveryRequired {
+                operation_id: "op".to_string(),
+                reason: "armed".to_string(),
+            },
+        );
+        assert!(matches!(recovery, OmniError::RecoveryRequired { .. }));
+        assert!(!recovery.to_string().contains("the graph is intact"));
     }
 }
 
