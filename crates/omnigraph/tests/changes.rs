@@ -212,7 +212,7 @@ async fn commit_changes_are_exact_ordered_and_bounded() {
             "main",
             MUTATION_QUERIES,
             "set_age",
-            &mixed_params(&[("", "Bob")], &[("", 99)]),
+            &mixed_params(&[("$name", "Bob")], &[("$age", 99)]),
         )
         .await
         .unwrap()
