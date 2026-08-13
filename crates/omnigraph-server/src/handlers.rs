@@ -2301,7 +2301,7 @@ async fn delete_merged_source_branch(
     ) {
         Ok(Authz::Allowed) => {}
         Ok(Authz::Denied(message)) => return Err(message),
-        Err(err) => return Err(err.message),
+        Err(err) => return Err(err.message.into()),
     }
     let actor_id = actor.map(|actor| actor.actor_id.as_ref());
     handle
