@@ -10,6 +10,7 @@ pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{Snapshot, SnapshotScanner, SnapshotTable, SubTableEntry, SubTableUpdate};
 pub(crate) use omnigraph::ensure_public_branch_ref;
+pub(crate) use omnigraph::logical_row_image;
 pub use omnigraph::{
     CleanupPolicyOptions, EXPORT_CHUNK_MAX_BYTES, ExportCut, InitOptions, MergeOutcome, Omnigraph,
     OpenMode, PendingIndex, RepairAction, RepairClassification, RepairOptions, RepairStats,

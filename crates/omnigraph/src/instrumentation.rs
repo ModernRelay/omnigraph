@@ -617,10 +617,15 @@ pub(crate) async fn open_dataset(
             ..Default::default()
         });
     }
-    builder
-        .load()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    builder.load().await.map_err(|error| match error {
+        lance::Error::VersionNotFound { .. } => OmniError::HistoricalVersionReclaimed {
+            version: match version {
+                VersionResolution::At(version) => version,
+                VersionResolution::Latest => 0,
+            },
+        },
+        error => OmniError::Lance(error.to_string()),
+    })
 }
 
 /// Per-method call counts for [`CountingStorageAdapter`].

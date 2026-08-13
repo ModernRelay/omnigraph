@@ -1538,6 +1538,23 @@ async fn load_endpoint_loads_into_existing_branch() {
     assert_eq!(second["commit_complete"], true);
     assert!(second["next_cursor"].is_null());
 
+    for (query, expected) in [
+        ("limit=0", StatusCode::BAD_REQUEST),
+        ("limit=8193", StatusCode::PAYLOAD_TOO_LARGE),
+        ("max_bytes=1", StatusCode::PAYLOAD_TOO_LARGE),
+    ] {
+        let (status, _) = json_response(
+            &app,
+            Request::builder()
+                .uri(g(&format!("/commits/{commit_id}/changes?{query}")))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, expected, "query: {query}");
+    }
+
     let (status, _) = json_response(
         &app,
         Request::builder()

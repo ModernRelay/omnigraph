@@ -9,30 +9,39 @@ use crate::db::manifest::{Snapshot, TableIdentity};
 use crate::error::Result;
 use crate::storage_layer::{SnapshotHandle, TableStorage};
 use crate::table_store::TableStore;
+pub(crate) mod page;
+
+pub use page::{
+    COMMIT_CHANGES_DEFAULT_BYTES, COMMIT_CHANGES_DEFAULT_ROWS, COMMIT_CHANGES_MAX_BYTES,
+    COMMIT_CHANGES_MAX_ROWS, CommitChangesPage,
+};
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EntityKind {
     Node,
     Edge,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChangeOp {
     Insert,
     Update,
     Delete,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Endpoints {
     pub src: String,
     pub dst: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EntityChange {
+    pub change_index: usize,
     pub table_key: String,
     pub kind: EntityKind,
     pub type_name: String,
@@ -40,6 +49,8 @@ pub struct EntityChange {
     pub op: ChangeOp,
     pub manifest_version: u64,
     pub endpoints: Option<Endpoints>,
+    pub before: Option<serde_json::Value>,
+    pub after: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -622,6 +633,7 @@ fn extract_rows_with_signature(batches: &[RecordBatch], is_edge: bool) -> Vec<Sc
 
 fn entity_change_from_row(row: &ScannedRow, op: ChangeOp, is_edge: bool) -> EntityChange {
     EntityChange {
+        change_index: 0,
         table_key: String::new(),
         kind: if is_edge {
             EntityKind::Edge
@@ -632,6 +644,8 @@ fn entity_change_from_row(row: &ScannedRow, op: ChangeOp, is_edge: bool) -> Enti
         id: row.id.clone(),
         op,
         manifest_version: row.change_version.unwrap_or(0),
+        before: None,
+        after: None,
         endpoints: if is_edge {
             Some(Endpoints {
                 src: row.src.clone().unwrap_or_default(),

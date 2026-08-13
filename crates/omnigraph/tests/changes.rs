@@ -2,7 +2,8 @@ mod helpers;
 
 use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
 use omnigraph::db::commit_graph::CommitGraph;
-use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::db::{CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 
 use helpers::*;
@@ -135,6 +136,221 @@ async fn write_receipts_identify_exact_commits_and_mutation_noops() {
         stored.graph_commit_id,
         empty_load_receipt.commit.graph_commit_id
     );
+}
+
+#[tokio::test]
+async fn commit_changes_are_exact_ordered_and_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let first = db
+        .list_commits(Some("main"))
+        .await
+        .unwrap()
+        .into_iter()
+        .last()
+        .unwrap();
+    let first_page = db
+        .commit_changes_page(
+            &first.graph_commit_id,
+            None,
+            100,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert!(first_page.commit_complete);
+    assert!(first_page.changes.is_empty());
+
+    let inserted = db
+        .load_with_receipt(
+            "main",
+            "{\"type\":\"Person\",\"data\":{\"name\":\"feed-C\",\"age\":3}}\n{\"type\":\"Person\",\"data\":{\"name\":\"feed-A\",\"age\":1}}\n{\"type\":\"Person\",\"data\":{\"name\":\"feed-B\",\"age\":2}}",
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let first_page = db
+        .commit_changes_page(
+            &inserted.commit.graph_commit_id,
+            None,
+            2,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first_page
+            .changes
+            .iter()
+            .map(|change| (change.change_index, change.id.as_str(), change.op))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, "feed-A", ChangeOp::Insert),
+            (1, "feed-B", ChangeOp::Insert)
+        ]
+    );
+    assert!(!first_page.commit_complete);
+    let second_page = db
+        .commit_changes_page(
+            &inserted.commit.graph_commit_id,
+            first_page.next_cursor.as_deref(),
+            2,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_page.changes[0].change_index, 2);
+    assert_eq!(second_page.changes[0].id, "feed-C");
+    assert_eq!(second_page.changes[0].before, None);
+    assert_eq!(second_page.changes[0].after.as_ref().unwrap()["age"], 3);
+    assert!(second_page.commit_complete);
+    assert!(second_page.next_cursor.is_none());
+
+    let updated = db
+        .mutate_with_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("", "Bob")], &[("", 99)]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    let update_page = db
+        .commit_changes_page(
+            &updated.graph_commit_id,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_page.changes.len(), 1);
+    assert_eq!(update_page.changes[0].op, ChangeOp::Update);
+    assert!(update_page.changes[0].before.is_none());
+    assert_eq!(update_page.changes[0].after.as_ref().unwrap()["age"], 99);
+
+    let deleted = db
+        .mutate_with_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "remove_person",
+            &params(&[("", "Alice")]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    let delete_page = db
+        .commit_changes_page(
+            &deleted.graph_commit_id,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert!(
+        delete_page
+            .changes
+            .iter()
+            .all(|change| change.op == ChangeOp::Delete)
+    );
+    assert!(
+        delete_page
+            .changes
+            .iter()
+            .all(|change| change.before.is_some())
+    );
+    assert!(
+        delete_page
+            .changes
+            .iter()
+            .all(|change| change.after.is_none())
+    );
+    assert!(
+        delete_page
+            .changes
+            .iter()
+            .any(|change| change.kind == EntityKind::Edge)
+    );
+    assert_eq!(
+        delete_page
+            .changes
+            .iter()
+            .map(|change| change.change_index)
+            .collect::<Vec<_>>(),
+        (0..delete_page.changes.len()).collect::<Vec<_>>()
+    );
+
+    let mut cursor = None;
+    let mut paged = Vec::new();
+    loop {
+        let page = db
+            .commit_changes_page(
+                &deleted.graph_commit_id,
+                cursor.as_deref(),
+                1,
+                omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+            )
+            .await
+            .unwrap();
+        paged.extend(
+            page.changes
+                .iter()
+                .map(|change| (change.table_key.clone(), change.id.clone())),
+        );
+        if page.commit_complete {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    assert_eq!(
+        paged,
+        delete_page
+            .changes
+            .iter()
+            .map(|change| (change.table_key.clone(), change.id.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    let empty = db
+        .load_with_receipt("main", "", LoadMode::Merge)
+        .await
+        .unwrap();
+    let empty_page = db
+        .commit_changes_page(
+            &empty.commit.graph_commit_id,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert!(empty_page.commit_complete);
+    assert!(empty_page.changes.is_empty());
+
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        db.commit_changes_page(
+            &inserted.commit.graph_commit_id,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await,
+        Err(OmniError::ChangeFeedGap {
+            first_unreadable_commit_id,
+            ..
+        }) if first_unreadable_commit_id == inserted.commit.graph_commit_id
+    ));
 }
 
 #[tokio::test]

@@ -12,21 +12,29 @@ Diffing two read targets uses a three-level algorithm:
 
 - `diff_between(from: ReadTarget, to: ReadTarget, filter: Option<ChangeFilter>) -> ChangeSet`
 - `diff_commits(from_commit_id, to_commit_id, filter)` — cross-branch safe.
+- `commit_changes_page(commit_id, cursor, limit, max_bytes)` — exact first-parent change images with bounded pagination.
 
 ## Types
 
 ```
 ChangeOp: Insert | Update | Delete
 EntityKind: Node | Edge
-EntityChange { table_key, kind, type_name, id, op, manifest_version, endpoints?: {src, dst} }
+EntityChange { change_index, table_key, kind, type_name, id, op, manifest_version, endpoints?, before?, after? }
 ChangeFilter { kinds?, type_names?, ops? }
 ChangeSet { from_version, to_version, branch?, changes[], stats }
 ```
 
 ## Ordering
 
-Changed table lifetimes are grouped in ascending graph-visible `table_key`
-order, with immutable table identity as the hidden tie-breaker when one alias
-names multiple lifetimes across the compared snapshots. Entity order within one
-table is not a public guarantee; callers that need their own total order must
-sort the returned changes explicitly.
+`diff_between` retains its existing table-grouped ordering. The commit-change feed has a
+stronger ABI: `table_key`, `stable_table_id`, `table_incarnation_id`, entity `id`, then operation
+rank (`insert`, `update`, `delete`). `change_index` is zero-based across every
+page of one commit; resume only with the opaque `next_cursor`. Pages default to
+1000 rows and 4 MiB and reject requests above 8192 rows or 32 MiB. HTTP 410
+with `change_feed_gap` means retained table history can no longer reconstruct the
+requested continuation; restart from a newer application checkpoint.
+
+The current exact-image implementation streams an ordered merge of each changed
+table lifetime. This bounds retained page memory but can scan the full
+changed table; replace it with substrate candidate pruning only when Lance exposes
+a stable bounded ordered change stream.

@@ -87,6 +87,7 @@ graph id from the cluster's applied revision:
 | POST | `/graphs/{id}/branches/merge` | bearer + `branch_merge` (+ `branch_delete` only when `delete_branch` is set) | merge `source → target`; `delete_branch: true` also deletes the source after the merge lands — a delete refusal is reported via `branch_deleted`/`branch_delete_error` on the 200 response, never as an error |
 | GET | `/graphs/{id}/commits?branch=` | bearer + `read` | list |
 | GET | `/graphs/{id}/commits/{commit_id}` | bearer + `read` | show |
+| GET | `/graphs/{id}/commits/{commit_id}/changes?cursor=&limit=&max_bytes=` | bearer + `read` | bounded ordered first-parent changes |
 
 Server-level management endpoints:
 
@@ -374,7 +375,7 @@ losing request may already own durable table effects and therefore returns
 `recovery_required` (503) for recovery instead of 412.
 
 HTTP status codes used include 200, 206, 302, 304, 400, 401, 403, 404, 405,
-409, 412, 413, 415, 416, 424, 429, 500, and 503.
+409, 410, 412, 413, 415, 416, 424, 429, 500, and 503.
 
 ## Per-actor admission control
 
@@ -449,5 +450,5 @@ See [deployment.md](../deployment.md) for token-source operational details.
   `/schema/apply` (see "Per-actor
   admission control" above). No global rate limiter is configured;
   add `tower_http::limit` if a graph-wide cap is needed.
-- Pagination — none (commits/branches return everything; export streams).
+- Pagination — commit changes use an opaque bounded cursor; commit and branch listings still return everything; export streams.
 - Runtime graph add/remove — run `cluster apply` and restart.

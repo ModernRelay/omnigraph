@@ -389,6 +389,62 @@ async fn export_blob_values(
     Ok(values)
 }
 
+/// Convert one descriptor-scanned row into the same logical value shape used
+/// by export, materializing at most that row's Blob values.
+pub(crate) async fn logical_row_image(
+    source_ds: &Dataset,
+    catalog: &Catalog,
+    table_key: &str,
+    batch: &RecordBatch,
+    row: usize,
+) -> Result<serde_json::Value> {
+    let row_batch = batch.slice(row, 1);
+    let blob_properties = blob_properties_for_table_key(catalog, table_key)?;
+    let blob_values = if blob_properties.is_empty() {
+        None
+    } else {
+        let row_id = row_batch
+            .column_by_name("_rowid")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| OmniError::Lance("change row is missing _rowid".to_string()))?
+            .value(0);
+        Some(export_blob_values(source_ds, &row_batch, &[row_id], blob_properties).await?)
+    };
+
+    let mut image = serde_json::Map::new();
+    image.insert(
+        "id".to_string(),
+        json_value_from_named_column(&row_batch, "id", 0)?,
+    );
+    if table_key.starts_with("edge:") {
+        image.insert(
+            "src".to_string(),
+            json_value_from_named_column(&row_batch, "src", 0)?,
+        );
+        image.insert(
+            "dst".to_string(),
+            json_value_from_named_column(&row_batch, "dst", 0)?,
+        );
+    }
+
+    let schema = schema_for_table_key(catalog, table_key)?;
+    let first_property = if table_key.starts_with("edge:") { 3 } else { 1 };
+    for field in schema.fields().iter().skip(first_property) {
+        image.insert(
+            field.name().clone(),
+            export_value_for_field(
+                &row_batch,
+                field.name(),
+                0,
+                blob_values
+                    .as_ref()
+                    .and_then(|values| values.get(field.name())),
+            )?,
+        );
+    }
+    Ok(serde_json::Value::Object(image))
+}
+
 async fn emit_export_rows_from_batch<Emit, EmitFuture>(
     catalog: &Catalog,
     table_key: &str,

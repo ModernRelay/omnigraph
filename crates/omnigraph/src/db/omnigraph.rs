@@ -39,6 +39,8 @@ mod repair;
 mod schema_apply;
 mod table_ops;
 
+pub(crate) use export::logical_row_image;
+
 #[doc(hidden)]
 pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
@@ -2220,6 +2222,58 @@ impl Omnigraph {
         .await
     }
 
+    /// Return one bounded, deterministic page of the exact first-parent changes
+    /// introduced by a graph commit.
+    pub async fn commit_changes_page(
+        &self,
+        commit_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<crate::changes::CommitChangesPage> {
+        let coord = self.coordinator.read().await;
+        let commit = coord.resolve_commit(&SnapshotId::new(commit_id)).await?;
+        let to = coord
+            .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
+                commit.graph_commit_id.clone(),
+            )))
+            .await?;
+        let from = match commit.parent_commit_id.as_deref() {
+            Some(parent_id) => {
+                coord
+                    .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(parent_id)))
+                    .await?
+            }
+            None => to.clone(),
+        };
+        drop(coord);
+
+        let schema_view = self.schema_view.load();
+        let catalog = Arc::clone(&schema_view.catalog);
+        let graph_identity = schema_view.schema_identity_domain.clone();
+        drop(schema_view);
+
+        match crate::changes::page::commit_changes_page(
+            &self.table_store,
+            &from.snapshot,
+            &to.snapshot,
+            catalog,
+            &graph_identity,
+            commit_id,
+            cursor,
+            limit,
+            max_bytes,
+        )
+        .await
+        {
+            Err(OmniError::HistoricalVersionReclaimed { .. }) => Err(OmniError::ChangeFeedGap {
+                cursor: cursor.map(str::to_string),
+                first_unreadable_commit_id: commit_id.to_string(),
+            }),
+            result => result,
+        }
+    }
+
     pub async fn entity_at_target(
         &self,
         target: impl Into<ReadTarget>,
@@ -3407,7 +3461,10 @@ fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<Arc<Schema
     )))
 }
 
-fn record_batch_row_to_json(batch: &RecordBatch, row: usize) -> Result<serde_json::Value> {
+pub(crate) fn record_batch_row_to_json(
+    batch: &RecordBatch,
+    row: usize,
+) -> Result<serde_json::Value> {
     let mut obj = serde_json::Map::new();
     for (i, field) in batch.schema().fields().iter().enumerate() {
         obj.insert(

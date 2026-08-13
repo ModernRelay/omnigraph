@@ -464,6 +464,7 @@ pub(crate) fn precondition_failed_cli(
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
+            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
