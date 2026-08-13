@@ -1077,3 +1077,27 @@ mod local_create_if_absent_probe {
         );
     }
 }
+
+#[tokio::test]
+async fn in_memory_graph_supports_typed_mutation_and_query() {
+    let mut db = Omnigraph::in_memory(TEST_SCHEMA).await.unwrap();
+
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    let result = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Eve")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.num_rows(), 1);
+}

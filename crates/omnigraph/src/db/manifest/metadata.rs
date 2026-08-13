@@ -8,7 +8,7 @@ use lance_namespace::models::TableVersion;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{OmniError, Result};
-use crate::storage::{StorageKind, join_uri, storage_kind_for_uri};
+use crate::storage::{StorageKind, is_shared_memory_uri, join_uri, storage_kind_for_uri};
 
 use super::layout::table_id_to_key;
 
@@ -168,6 +168,12 @@ impl TableVersionMetadata {
 }
 
 fn object_store_path_from_uri(uri: &str) -> Result<String> {
+    if is_shared_memory_uri(uri) {
+        let url = url::Url::parse(uri).map_err(|e| {
+            OmniError::manifest_internal(format!("invalid object-store uri {}: {}", uri, e))
+        })?;
+        return Ok(url.path().trim_start_matches('/').to_string());
+    }
     match storage_kind_for_uri(uri) {
         StorageKind::Local => {
             if uri.strip_prefix("file://").is_some() {
@@ -186,7 +192,7 @@ fn object_store_path_from_uri(uri: &str) -> Result<String> {
         }
         StorageKind::S3 => {
             let url = url::Url::parse(uri).map_err(|e| {
-                OmniError::manifest_internal(format!("invalid s3 uri '{}': {}", uri, e))
+                OmniError::manifest_internal(format!("invalid object-store uri '{}': {}", uri, e))
             })?;
             Ok(url.path().trim_start_matches('/').to_string())
         }

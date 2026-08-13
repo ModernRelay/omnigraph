@@ -4,7 +4,7 @@ use lance::Dataset;
 use lance_namespace::Error as LanceNamespaceError;
 
 use crate::error::{OmniError, Result};
-use crate::storage::{StorageKind, join_uri, storage_kind_for_uri};
+use crate::storage::{StorageKind, is_shared_memory_uri, join_uri, storage_kind_for_uri};
 
 use super::TableIdentity;
 
@@ -91,6 +91,9 @@ pub(super) fn table_uri_for_path(root_uri: &str, table_path: &str, branch: Optio
         for segment in branch.split('/') {
             dataset_location = join_uri(&dataset_location, segment);
         }
+    }
+    if is_shared_memory_uri(root_uri) {
+        return dataset_location;
     }
     match storage_kind_for_uri(root_uri) {
         StorageKind::Local => url::Url::from_file_path(&dataset_location)

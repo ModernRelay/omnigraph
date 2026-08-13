@@ -12,7 +12,13 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
-pub use omnigraph_storage::{ListDirBounds, StorageKind, join_uri};
+pub use omnigraph_storage::{ListDirBounds, StorageKind};
+
+const SHARED_MEMORY_SCHEME: &str = "shared-memory://";
+
+pub(crate) fn is_shared_memory_uri(uri: &str) -> bool {
+    uri.starts_with(SHARED_MEMORY_SCHEME)
+}
 
 #[async_trait]
 pub trait StorageAdapter: Debug + Send + Sync {
@@ -227,6 +233,18 @@ pub fn storage_kind_for_uri(uri: &str) -> StorageKind {
     omnigraph_storage::storage_kind_for_uri(uri)
 }
 
+pub fn join_uri(root_uri: &str, relative_path: &str) -> String {
+    if is_shared_memory_uri(root_uri) {
+        format!(
+            "{}/{}",
+            root_uri.trim_end_matches('/'),
+            relative_path.trim_start_matches('/')
+        )
+    } else {
+        omnigraph_storage::join_uri(root_uri, relative_path)
+    }
+}
+
 pub fn storage_for_uri(uri: &str) -> Result<Arc<dyn StorageAdapter>> {
     match storage_kind_for_uri(uri) {
         StorageKind::Local => Ok(Arc::new(ObjectStorageAdapter::local())),
@@ -235,7 +253,11 @@ pub fn storage_for_uri(uri: &str) -> Result<Arc<dyn StorageAdapter>> {
 }
 
 pub fn normalize_root_uri(uri: &str) -> Result<String> {
-    Ok(omnigraph_storage::normalize_root_uri(uri)?)
+    if is_shared_memory_uri(uri) {
+        Ok(uri.trim_end_matches('/').to_string())
+    } else {
+        Ok(omnigraph_storage::normalize_root_uri(uri)?)
+    }
 }
 
 pub(crate) fn write_queue_root_identity(normalized_root: &str) -> Result<String> {

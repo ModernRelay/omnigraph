@@ -27,8 +27,8 @@ use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot, Resolved
 use crate::error::{OmniError, Result};
 use crate::runtime_cache::RuntimeCache;
 use crate::storage::{
-    StorageAdapter, StorageKind, join_uri, normalize_root_uri, storage_for_uri,
-    storage_kind_for_uri, write_queue_root_identity,
+    ObjectStorageAdapter, StorageAdapter, StorageKind, join_uri, normalize_root_uri,
+    storage_for_uri, storage_kind_for_uri, write_queue_root_identity,
 };
 use crate::storage_layer::SnapshotHandle;
 use crate::table_store::TableStore;
@@ -308,6 +308,23 @@ pub struct InitOptions {
 }
 
 impl Omnigraph {
+    /// Create an isolated transient graph backed entirely by process memory.
+    ///
+    /// It supports the same graph operations as a durable graph, but cannot be
+    /// reopened by URI and is discarded when the process exits.
+    pub async fn in_memory(schema_source: &str) -> Result<Self> {
+        let uri = format!("shared-memory://omnigraph-{}", Ulid::new());
+        // ponytail: Lance retains shared-memory authorities until process exit;
+        // add explicit reclamation only if long-lived embedded hosts show pressure.
+        Self::init_with_storage(
+            &uri,
+            schema_source,
+            Arc::new(ObjectStorageAdapter::in_memory()),
+            InitOptions::default(),
+        )
+        .await
+    }
+
     /// Create a new graph at `uri` from schema source.
     ///
     /// Strict mode errors with [`OmniError::AlreadyInitialized`] if `uri`
