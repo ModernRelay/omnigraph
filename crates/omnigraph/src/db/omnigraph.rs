@@ -2231,19 +2231,29 @@ impl Omnigraph {
         limit: usize,
         max_bytes: u64,
     ) -> Result<crate::changes::CommitChangesPage> {
+        let map_gap = |error| match error {
+            OmniError::HistoricalVersionReclaimed { .. } => OmniError::ChangeFeedGap {
+                cursor: cursor.map(str::to_string),
+                first_unreadable_commit_id: commit_id.to_string(),
+            },
+            error => error,
+        };
         let coord = self.coordinator.read().await;
-        let commit = coord.resolve_commit(&SnapshotId::new(commit_id)).await?;
+        let commit = coord
+            .resolve_commit(&SnapshotId::new(commit_id))
+            .await
+            .map_err(&map_gap)?;
         let to = coord
             .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
                 commit.graph_commit_id.clone(),
             )))
-            .await?;
+            .await
+            .map_err(&map_gap)?;
         let from = match commit.parent_commit_id.as_deref() {
-            Some(parent_id) => {
-                coord
-                    .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(parent_id)))
-                    .await?
-            }
+            Some(parent_id) => coord
+                .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(parent_id)))
+                .await
+                .map_err(&map_gap)?,
             None => to.clone(),
         };
         drop(coord);
@@ -2252,7 +2262,7 @@ impl Omnigraph {
         let graph_identity = schema_view.schema_identity_domain.clone();
         drop(schema_view);
 
-        match crate::changes::page::commit_changes_page(
+        crate::changes::page::commit_changes_page(
             &self.table_store,
             &from.snapshot,
             &to.snapshot,
@@ -2263,13 +2273,7 @@ impl Omnigraph {
             max_bytes,
         )
         .await
-        {
-            Err(OmniError::HistoricalVersionReclaimed { .. }) => Err(OmniError::ChangeFeedGap {
-                cursor: cursor.map(str::to_string),
-                first_unreadable_commit_id: commit_id.to_string(),
-            }),
-            result => result,
-        }
+        .map_err(map_gap)
     }
 
     pub async fn entity_at_target(
