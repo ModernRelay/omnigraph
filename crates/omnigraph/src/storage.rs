@@ -14,10 +14,8 @@ use crate::error::Result;
 
 pub use omnigraph_storage::{ListDirBounds, StorageKind};
 
-const SHARED_MEMORY_SCHEME: &str = "shared-memory://";
-
 pub(crate) fn is_shared_memory_uri(uri: &str) -> bool {
-    uri.starts_with(SHARED_MEMORY_SCHEME)
+    uri.starts_with(omnigraph_storage::SHARED_MEMORY_SCHEME)
 }
 
 #[async_trait]

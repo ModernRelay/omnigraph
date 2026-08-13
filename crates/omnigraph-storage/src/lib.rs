@@ -72,6 +72,8 @@ impl StorageError {
 
 const FILE_SCHEME_PREFIX: &str = "file://";
 const S3_SCHEME_PREFIX: &str = "s3://";
+/// Lance native shared-memory object-store scheme.
+pub const SHARED_MEMORY_SCHEME: &str = "shared-memory://";
 
 #[async_trait]
 pub trait StorageAdapter: Debug + Send + Sync {
@@ -328,9 +330,28 @@ impl ObjectStorageAdapter {
                     StorageError::internal(format!("invalid s3 object path for '{}': {}", uri, err))
                 })
             }
-            UriCodec::Memory => ObjectPath::parse(uri.trim_start_matches('/')).map_err(|err| {
-                StorageError::internal(format!("invalid memory object path for '{}': {}", uri, err))
-            }),
+            UriCodec::Memory => {
+                let key = if uri.starts_with(SHARED_MEMORY_SCHEME) {
+                    Url::parse(uri)
+                        .map_err(|err| {
+                            StorageError::internal(format!(
+                                "invalid shared-memory uri '{}': {}",
+                                uri, err
+                            ))
+                        })?
+                        .path()
+                        .trim_start_matches('/')
+                        .to_string()
+                } else {
+                    uri.trim_start_matches('/').to_string()
+                };
+                ObjectPath::parse(&key).map_err(|err| {
+                    StorageError::internal(format!(
+                        "invalid memory object path for '{}': {}",
+                        uri, err
+                    ))
+                })
+            }
         }
     }
 
