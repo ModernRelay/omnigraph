@@ -143,7 +143,7 @@ async fn write_receipts_identify_exact_commits_and_mutation_noops() {
 #[tokio::test]
 async fn commit_changes_are_exact_ordered_and_bounded() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let first = db
         .list_commits(Some("main"))
