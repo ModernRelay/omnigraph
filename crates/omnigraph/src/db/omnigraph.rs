@@ -2249,7 +2249,6 @@ impl Omnigraph {
         drop(coord);
 
         let schema_view = self.schema_view.load();
-        let catalog = Arc::clone(&schema_view.catalog);
         let graph_identity = schema_view.schema_identity_domain.clone();
         drop(schema_view);
 
@@ -2257,7 +2256,6 @@ impl Omnigraph {
             &self.table_store,
             &from.snapshot,
             &to.snapshot,
-            catalog,
             &graph_identity,
             commit_id,
             cursor,

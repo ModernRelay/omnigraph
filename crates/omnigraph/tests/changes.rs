@@ -354,6 +354,62 @@ async fn commit_changes_are_exact_ordered_and_bounded() {
 }
 
 #[tokio::test]
+async fn commit_changes_use_the_commit_era_physical_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        r#"
+node Document {
+    title: String @key
+    payload: Blob?
+}
+"#,
+    )
+    .await
+    .unwrap();
+    let inserted = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Document","data":{"title":"old","payload":"base64:T2xk"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+
+    db.apply_schema(
+        r#"
+node Article @rename_from("Document") {
+    title: String @key
+    summary: String?
+}
+"#,
+    )
+    .await
+    .unwrap();
+
+    let page = db
+        .commit_changes_page(
+            &inserted.commit.graph_commit_id,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.changes.len(), 1);
+    assert_eq!(page.changes[0].table_key, "node:Document");
+    assert_eq!(
+        page.changes[0].after,
+        Some(serde_json::json!({
+            "id": "old",
+            "title": "old",
+            "payload": "base64:T2xk",
+        }))
+    );
+}
+
+#[tokio::test]
 async fn diff_empty_when_nothing_changed() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;

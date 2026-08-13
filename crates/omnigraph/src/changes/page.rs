@@ -1,4 +1,4 @@
-use std::{pin::Pin, sync::Arc};
+use std::pin::Pin;
 
 use arrow_array::{RecordBatch, StringArray};
 use base64::Engine;
@@ -7,7 +7,6 @@ use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 use lance_core::datatypes::BlobHandling;
-use omnigraph_compiler::catalog::Catalog;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -70,8 +69,6 @@ struct OrderedRows {
     batch: Option<RecordBatch>,
     row: usize,
     peeked: Option<LogicalRow>,
-    catalog: Arc<Catalog>,
-    table_key: String,
 }
 
 impl OrderedRows {
@@ -79,8 +76,6 @@ impl OrderedRows {
         store: &TableStore,
         entry: Option<&SubTableEntry>,
         after_id: Option<&str>,
-        catalog: Arc<Catalog>,
-        table_key: &str,
     ) -> Result<Self> {
         let (dataset, stream) = if let Some(entry) = entry {
             let dataset = store.open_at_entry(entry).await?;
@@ -117,8 +112,6 @@ impl OrderedRows {
             batch: None,
             row: 0,
             peeked: None,
-            catalog,
-            table_key: table_key.to_string(),
         })
     }
 
@@ -142,8 +135,6 @@ impl OrderedRows {
                 if self.row < batch.num_rows() {
                     let row = logical_row(
                         self.dataset.as_ref().expect("stream has dataset"),
-                        self.catalog.as_ref(),
-                        &self.table_key,
                         batch,
                         self.row,
                         is_edge,
@@ -174,8 +165,6 @@ impl OrderedRows {
 
 async fn logical_row(
     dataset: &Dataset,
-    catalog: &Catalog,
-    table_key: &str,
     batch: &RecordBatch,
     row: usize,
     is_edge: bool,
@@ -186,7 +175,7 @@ async fn logical_row(
         .ok_or_else(|| OmniError::Lance("change row is missing string id".to_string()))?
         .value(row)
         .to_string();
-    let image = logical_row_image(dataset, catalog, table_key, batch, row).await?;
+    let image = logical_row_image(dataset, batch, row).await?;
     let encoded =
         serde_json::to_vec(&image).map_err(|error| OmniError::Lance(error.to_string()))?;
     let endpoints = if is_edge {
@@ -327,7 +316,6 @@ pub(crate) async fn commit_changes_page(
     store: &TableStore,
     from: &Snapshot,
     to: &Snapshot,
-    catalog: Arc<Catalog>,
     graph_identity: &str,
     commit_id: &str,
     cursor: Option<&str>,
@@ -373,22 +361,8 @@ pub(crate) async fn commit_changes_page(
             .map(|cursor| cursor.id.as_str());
         // ponytail: exact endpoint images currently scan each changed table lifetime;
         // use a stable bounded Lance change stream here when one becomes available.
-        let mut left = OrderedRows::open(
-            store,
-            interval.from,
-            after_id,
-            Arc::clone(&catalog),
-            table_key,
-        )
-        .await?;
-        let mut right = OrderedRows::open(
-            store,
-            interval.to,
-            after_id,
-            Arc::clone(&catalog),
-            table_key,
-        )
-        .await?;
+        let mut left = OrderedRows::open(store, interval.from, after_id).await?;
+        let mut right = OrderedRows::open(store, interval.to, after_id).await?;
 
         while let Some(mut change) = next_change(
             &mut left,

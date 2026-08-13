@@ -393,13 +393,24 @@ async fn export_blob_values(
 /// by export, materializing at most that row's Blob values.
 pub(crate) async fn logical_row_image(
     source_ds: &Dataset,
-    catalog: &Catalog,
-    table_key: &str,
     batch: &RecordBatch,
     row: usize,
 ) -> Result<serde_json::Value> {
     let row_batch = batch.slice(row, 1);
-    let blob_properties = blob_properties_for_table_key(catalog, table_key)?;
+    let blob_properties = row_batch
+        .schema()
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+                .map_err(|error| OmniError::Lance(error.to_string()));
+            match lance_field {
+                Ok(field) if field.is_blob() => Some(Ok(field.name.clone())),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<Result<std::collections::HashSet<_>>>()?;
     let blob_values = if blob_properties.is_empty() {
         None
     } else {
@@ -408,28 +419,18 @@ pub(crate) async fn logical_row_image(
             .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| OmniError::Lance("change row is missing _rowid".to_string()))?
             .value(0);
-        Some(export_blob_values(source_ds, &row_batch, &[row_id], blob_properties).await?)
+        Some(export_blob_values(source_ds, &row_batch, &[row_id], &blob_properties).await?)
     };
 
+    // A pinned Lance version is the commit-era schema authority. Consulting
+    // the live catalog here breaks retained commits after rename/add/drop.
     let mut image = serde_json::Map::new();
-    image.insert(
-        "id".to_string(),
-        json_value_from_named_column(&row_batch, "id", 0)?,
-    );
-    if table_key.starts_with("edge:") {
-        image.insert(
-            "src".to_string(),
-            json_value_from_named_column(&row_batch, "src", 0)?,
-        );
-        image.insert(
-            "dst".to_string(),
-            json_value_from_named_column(&row_batch, "dst", 0)?,
-        );
-    }
-
-    let schema = schema_for_table_key(catalog, table_key)?;
-    let first_property = if table_key.starts_with("edge:") { 3 } else { 1 };
-    for field in schema.fields().iter().skip(first_property) {
+    for field in row_batch
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| !field.name().starts_with("_row"))
+    {
         image.insert(
             field.name().clone(),
             export_value_for_field(
