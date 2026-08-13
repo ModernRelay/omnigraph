@@ -408,6 +408,15 @@ pub(crate) fn build_http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::new())
 }
 
+/// Blob delivery never follows the server's external-descriptor redirect.
+/// Keeping this client separate prevents a graph-level read from silently
+/// turning into an unbounded request against caller-owned object storage.
+pub(crate) fn build_blob_http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
 pub(crate) fn apply_bearer_token(
     request: reqwest::RequestBuilder,
     token: Option<&str>,

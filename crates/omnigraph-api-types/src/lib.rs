@@ -403,6 +403,111 @@ pub struct BlobReadQuery {
     pub snapshot: Option<String>,
 }
 
+/// One logical graph Blob cell, without exposing its backing Lance table or
+/// physical row identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BlobSelectorOutput {
+    pub entity: BlobEntityKind,
+    pub r#type: String,
+    pub id: String,
+    pub property: String,
+}
+
+impl From<&BlobReadQuery> for BlobSelectorOutput {
+    fn from(query: &BlobReadQuery) -> Self {
+        Self {
+            entity: query.entity,
+            r#type: query.r#type.clone(),
+            id: query.id.clone(),
+            property: query.property.clone(),
+        }
+    }
+}
+
+/// Descriptor classification returned by `blob stat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BlobContentKindOutput {
+    Managed,
+    External,
+}
+
+/// The caller's requested read target together with the immutable graph
+/// snapshot that was actually resolved.
+///
+/// `branch` and `snapshot` echo the request and are mutually exclusive. Both
+/// are absent when the caller accepted the default branch. `resolved_snapshot`
+/// is always present so embedded and remote clients can identify the exact
+/// graph view with the same output shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BlobResolvedTargetOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    pub resolved_snapshot: String,
+}
+
+impl BlobResolvedTargetOutput {
+    pub fn from_read_query(query: &BlobReadQuery, resolved_snapshot: impl Into<String>) -> Self {
+        Self {
+            branch: query.branch.clone(),
+            snapshot: query.snapshot.clone(),
+            resolved_snapshot: resolved_snapshot.into(),
+        }
+    }
+}
+
+/// Transport-neutral metadata for one non-null Blob cell.
+///
+/// Managed content carries `size` and `etag`; external content carries `uri`.
+/// Inapplicable fields are omitted rather than serialized as JSON nulls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BlobStatOutput {
+    pub selector: BlobSelectorOutput,
+    pub kind: BlobContentKindOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    pub target: BlobResolvedTargetOutput,
+}
+
+impl BlobStatOutput {
+    pub fn managed(
+        query: &BlobReadQuery,
+        resolved_snapshot: impl Into<String>,
+        size: u64,
+        etag: impl Into<String>,
+    ) -> Self {
+        Self {
+            selector: query.into(),
+            kind: BlobContentKindOutput::Managed,
+            size: Some(size),
+            etag: Some(etag.into()),
+            uri: None,
+            target: BlobResolvedTargetOutput::from_read_query(query, resolved_snapshot),
+        }
+    }
+
+    pub fn external(
+        query: &BlobReadQuery,
+        resolved_snapshot: impl Into<String>,
+        uri: impl Into<String>,
+    ) -> Self {
+        Self {
+            selector: query.into(),
+            kind: BlobContentKindOutput::External,
+            size: None,
+            etag: None,
+            uri: Some(uri.into()),
+            target: BlobResolvedTargetOutput::from_read_query(query, resolved_snapshot),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeRequest {
     /// GQ mutation source containing `insert`, `update`, or `delete` statements.
@@ -1007,4 +1112,77 @@ pub struct GraphInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GraphListResponse {
     pub graphs: Vec<GraphInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn blob_stat_output_has_one_shared_shape_and_omits_inapplicable_fields() {
+        let managed_query = BlobReadQuery {
+            entity: BlobEntityKind::Node,
+            r#type: "Document".to_string(),
+            id: "doc-1".to_string(),
+            property: "payload".to_string(),
+            branch: Some("review".to_string()),
+            snapshot: None,
+        };
+        let managed = BlobStatOutput::managed(
+            &managed_query,
+            "snapshot-review-exact",
+            0,
+            "\"etag-managed\"",
+        );
+        assert_eq!(
+            serde_json::to_value(managed).unwrap(),
+            json!({
+                "selector": {
+                    "entity": "node",
+                    "type": "Document",
+                    "id": "doc-1",
+                    "property": "payload"
+                },
+                "kind": "managed",
+                "size": 0,
+                "etag": "\"etag-managed\"",
+                "target": {
+                    "branch": "review",
+                    "resolved_snapshot": "snapshot-review-exact"
+                }
+            })
+        );
+
+        let external_query = BlobReadQuery {
+            entity: BlobEntityKind::Edge,
+            r#type: "Attachment".to_string(),
+            id: "edge-1".to_string(),
+            property: "payload".to_string(),
+            branch: None,
+            snapshot: Some("snapshot-requested".to_string()),
+        };
+        let external = BlobStatOutput::external(
+            &external_query,
+            "snapshot-requested",
+            "s3://example/blob.bin",
+        );
+        assert_eq!(
+            serde_json::to_value(external).unwrap(),
+            json!({
+                "selector": {
+                    "entity": "edge",
+                    "type": "Attachment",
+                    "id": "edge-1",
+                    "property": "payload"
+                },
+                "kind": "external",
+                "uri": "s3://example/blob.bin",
+                "target": {
+                    "snapshot": "snapshot-requested",
+                    "resolved_snapshot": "snapshot-requested"
+                }
+            })
+        );
+    }
 }

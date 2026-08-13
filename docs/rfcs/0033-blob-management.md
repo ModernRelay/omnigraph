@@ -20,10 +20,10 @@ blob-v2 (`lance.blob.v2`) on file format V2_2.
 and Lance 10.0.0 as the required implementation substrate.
 **Audience:** engine, compiler, server, CLI, security, storage, maintenance,
 and documentation maintainers.
-**Implementation:** Phases 0, 1, and 2A (HTTP read delivery) are implemented on
-the v0.10 development line. Phase 2B (CLI get/stat), Phase 3 (mutation), Phase 4
-(measured optimization), and the production delivery telemetry named in §11
-remain open.
+**Implementation:** Phases 0, 1, 2A (HTTP read delivery), and 2B (CLI read
+delivery) are implemented on the v0.10 development line. Phase 3 (mutation),
+Phase 4 (measured optimization), and the production delivery telemetry named
+in §11 remain open.
 
 This RFC is the required successor to an earlier reverted blob-delivery
 experiment. The relevant evidence and decisions are restated here; no untracked
@@ -665,37 +665,72 @@ redirect, range, conditional, 412, 413, and 416 responses. The checked-in
 The CLI adds:
 
 ```text
-omnigraph blob get   ENTITY TYPE ID PROPERTY [--branch | --snapshot] [--out PATH]
-omnigraph blob stat  ENTITY TYPE ID PROPERTY [--branch | --snapshot] [--json]
+omnigraph blob get   ENTITY TYPE ID PROPERTY [--branch NAME | --snapshot ID]
+                     [--offset N] [--length N] [--out PATH]
+omnigraph blob stat  ENTITY TYPE ID PROPERTY [--branch NAME | --snapshot ID] [--json]
 omnigraph blob put   ENTITY TYPE ID PROPERTY [--branch] [--file PATH] [--if-match TAG] [--json]
 omnigraph blob clear ENTITY TYPE ID PROPERTY [--branch] [--if-match TAG]
 ```
 
-`ENTITY` is `node` or `edge`. Graph selection uses the ordinary `--store`,
-`--server` + `--graph`, `--cluster`, `--profile`, alias, and operator-default
-rules.
+`ENTITY` is `node` or `edge`. Blob commands use the ordinary Data/Any scope:
+`--store`, `--server` plus `--graph`, a store- or server-bound `--profile`, or
+the corresponding operator default. Their positional arguments are the cell
+selector, so they do not accept a positional graph URI. They do not accept
+`--cluster`; cluster-bound profiles are likewise the wrong plane for this data
+operation. The read-only `get`/`stat` commands also reject `--as` rather than
+silently ignoring a client-supplied actor.
 
-- `get` streams to stdout unless `--out` is supplied. `--offset` and `--length`
-  map to one range; length zero is rejected because it is not representable as
-  an HTTP byte range. The embedded arm uses repeated bounded `read_range` calls.
-- `stat` performs descriptor work only. Managed output includes kind, size,
-  ETag, and resolved target. External output includes kind and URI but no size or
-  ETag. Null is a typed not-found result.
+- `get` writes raw bytes to stdout unless `--out` is supplied; it never wraps
+  the payload in JSON or base64. `--offset N --length M` selects that range,
+  `--offset N` reads from `N` to the end, and `--length M` reads the first `M`
+  bytes. As with an HTTP byte range, an end beyond the representation is
+  clamped to the end; a start at or beyond a non-empty representation's end is
+  unsatisfiable. A requested length of zero and arithmetic overflow fail before
+  graph/server resolution; every unsatisfiable range fails before payload
+  transfer. A full get of a valid empty managed Blob still succeeds with zero
+  output bytes. The embedded arm uses consecutive bounded `read_range` calls;
+  the remote arm streams the existing HTTP route.
+  If a storage or transport error occurs after streaming starts, the command
+  exits nonzero but bytes already written to stdout cannot be recalled and an
+  `--out` file may contain the successfully delivered prefix. Callers that need
+  atomic replacement write to a temporary path and rename it only after a zero
+  exit status. A failure before the first payload byte leaves an existing
+  `--out` path untouched.
+- `stat` performs descriptor work only and never reads payload bytes. Managed
+  output carries the selector, `kind=managed`, size, ETag, and requested plus
+  exactly resolved target. Whole-object external output carries the selector,
+  `kind=external`, URI, and target, while omitting size and ETag. A ranged
+  external descriptor is refused rather than widened to its whole target
+  object. Null is a typed not-found result. In JSON those shared fields are
+  `selector`, `kind`, and `target`; `target.resolved_snapshot` is always present
+  while `target.branch` or `target.snapshot` echoes only an explicit request.
+  The resolved value is an opaque exact graph-view witness, not necessarily a
+  commit ULID: live branches use a synthetic manifest witness whose ETag suffix
+  may differ across copied stores. An explicit snapshot request remains
+  separately and exactly echoed in `target.snapshot`.
 - `put` reads one file or stdin, never both. Input is retained only within the
   32 MiB envelope and passed as raw bytes. It never base64-encodes the payload.
 - `clear` asks for confirmation only according to the CLI's existing
   destructive-operation rules; it does not require the graph-cleanup `--confirm`
   flag because this is an ordinary audited mutation, not physical GC.
 
-The remote client disables automatic redirects for Blob calls. A 302 becomes a
-typed external-reference result carrying the URI; the CLI must not unexpectedly
-download a caller-owned object or fail on `s3://`/`file://` redirect schemes.
+The remote client disables automatic redirects for Blob calls. `stat` reports a
+whole-object external URI without following it. `get` refuses that external
+value, exits nonzero, includes the URI and a `blob stat` suggestion in the
+diagnostic, and performs no target-object I/O. Both verbs refuse a ranged
+external descriptor rather than silently widening it. The client must not
+unexpectedly download a caller-owned object or try to follow
+`s3://`/`file://` redirect schemes.
 
 Embedded and remote arms share API output types, If-Match parsing, validator
 formatting, range rules, and error text. The parity matrix covers managed full
-and range reads, stat, snapshot reads, PUT, clear, stale preconditions, missing
-rows, external references, zero bytes, and oversize refusal. No Blob-specific
-known divergence is accepted.
+and range reads, stat, snapshot reads, external references, zero bytes, and
+missing rows in Phase 2B; Phase 3 extends it with PUT, clear, stale
+preconditions, and oversize refusal. No Blob-specific known divergence is
+accepted.
+
+Phase 2B implements `get` and `stat`. `put` and `clear` remain the normative
+Phase 3 surface and are not exposed early merely to reserve command names.
 
 ## 7. External-reference policy
 
@@ -1072,6 +1107,11 @@ The implementation extends existing owners before creating new fixtures, per
   over the single-cell API.
 - `forbidden_apis.rs` removes the old `read_blob -> BlobFile` surface, classifies
   `read_blob_at` as read-only, and proves no durable call site was added.
+- The canonical-input owner presents Lance's prepared four-child Blob struct to
+  the shared logical Mutation/Load admission boundary, including
+  `LoadMode::Overwrite`, requires typed refusal before table or manifest
+  movement, and then proves a canonical retained external reference does not
+  poison the following keyed write.
 - Destructive-reclamation acceptance is explicit: branch/ref retention remains
   covered by `maintenance.rs`, but Phase 1 introduces no cross-process
   live-reader lease. The reader never retargets; operators quiesce readers before
@@ -1081,8 +1121,10 @@ The implementation extends existing owners before creating new fixtures, per
   clear, returned-ETag equality, and fresh/stale/`*` preconditions, including
   `If-Match: *` failing for a null cell.
 - `writes.rs`: inclusive and +1-byte PUT bounds; aggregate carried-row bound;
-  target old payload is not read; every refusal proves table HEAD, manifest,
-  lineage, and sidecar state unchanged.
+  and a two-Blob-column replacement whose old target is an unavailable external
+  reference, proving that target payload is not read while the untouched sibling
+  remains byte-identical. Every refusal proves table HEAD, manifest, lineage,
+  and sidecar state unchanged.
 - Add a deterministic retry race using the existing Mutation rendezvous: pause a
   conditional PUT after its first precondition evaluation but before effect,
   publish a competing replacement, then resume. The first request must
@@ -1134,10 +1176,28 @@ The implementation extends existing owners before creating new fixtures, per
   same owner with PUT/DELETE, 412/413, and actor attribution.
 - `openapi.rs`: regenerate and compare each phase's binary request/response
   surface; Phase 2A contains read methods only.
-- `cli_data.rs`: stdin/file PUT, stdout/file GET, stat, clear, ranges, snapshots,
-  external no-follow behavior, JSON output, and stable failure text.
-- `parity_matrix.rs`: byte and structured-output equality for every CLI verb and
-  the failures listed in §6.
+- Phase 2B's pure `crates/omnigraph-cli/src/blob_cli.rs` units own range
+  validation and clamping, whole-object external URI admission versus the
+  ranged-descriptor fail-closed behavior shared by `get` and `stat`, and
+  embedded/remote target-change diagnostic parity.
+- Phase 2B extends `cli_data.rs` with raw stdout and file GET, full/offset/
+  length/ranged reads, null versus valid empty, node and edge selectors,
+  black-box refusal of positional graph-URI, `--cluster`, and unconsumed `--as`,
+  branches and snapshots, managed/whole-object-external stat, external GET
+  no-follow, zero/overflow pre-resolution refusal, unsatisfiable-start
+  pre-transfer refusal, end-at-EOF clamping, JSON output, and stable failure
+  text. The user-facing docs explicitly record that an
+  environmental mid-stream failure exits nonzero but may leave a partial output
+  prefix. Phase 3 extends the same owner with stdin/file PUT and clear.
+- Phase 2B extends `parity_matrix.rs` with byte-identical managed full, range,
+  and snapshot reads plus exact structured stat output—including ETag—against
+  embedded and served graphs backed by one immutable hard-linked native
+  manifest and payload tree. In that identical-physical-tree fixture, the exact
+  resolved-view witness and shared failure diagnostics are equal too. This does
+  not make the opaque witness a cross-copy identity contract: independently
+  copied stores may carry different native manifest ETags. External no-follow
+  behavior matches and `KNOWN_DIVERGENCES` remains empty. Phase 3 adds
+  mutation-verb parity.
 - `write_cost.rs` and its S3 owner: fixed external-reference counts prove shared
   registry reuse, URI deduplication, bounded probes, and no per-row cold setup.
   The live S3 cell uses 64 normalized-equivalent references and requires exactly
@@ -1239,7 +1299,19 @@ correctness gate.
 
 ### Phase 2B — CLI read delivery
 
-- Add CLI get/stat and parity coverage.
+- Add graph-level CLI get/stat for node and edge cells through the ordinary
+  Data/Any `--store` or `--server` scope; do not add positional graph-URI or
+  `--cluster` addressing.
+- Stream raw managed bytes to stdout or `--out` in bounded ranges. Support
+  offset-plus-length, offset-to-end, and length-from-zero forms; reject zero
+  requested length and overflow before resolution, clamp an end beyond EOF,
+  and reject an unsatisfiable start before payload transfer. A mid-stream
+  failure is loud and may leave a partial output prefix.
+- Keep external delivery descriptor-only: stat reports a whole-object URI
+  without target I/O and get refuses with the URI and a stat suggestion rather
+  than following it; both verbs fail loudly for ranged external descriptors.
+- Share the transport-neutral stat DTO and keep embedded/remote parity with no
+  accepted Blob-specific divergence.
 
 ### Phase 3 — mutation
 

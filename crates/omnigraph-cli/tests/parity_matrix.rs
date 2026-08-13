@@ -2,9 +2,10 @@
 //!
 //! For every CLI verb with an `is_remote` fork, run the identical
 //! invocation against (a) the local graph directly and (b) a spawned
-//! server on a twin copy of the same graph, with the SAME actor on both
-//! arms (local `--as act-parity`; remote bearer token resolving to
-//! `act-parity`). Scrub the declared-volatile allowlist
+//! server on a twin copy of the same graph. Actor-bearing operations use the
+//! SAME actor on both arms (local `--as act-parity`; remote bearer token
+//! resolving to `act-parity`); read-only Blob commands reject `--as`.
+//! Scrub the declared-volatile allowlist
 //! (`support::scrub_volatile` — ids, wall-clock, transport locations);
 //! everything else must match exactly.
 //!
@@ -32,6 +33,7 @@ struct Parity {
     _temp: TempDir,
     local: std::path::PathBuf,
     server: TestServer,
+    blob_external_uri: Option<String>,
 }
 
 fn parity() -> Parity {
@@ -51,6 +53,26 @@ fn parity() -> Parity {
         _temp: temp,
         local,
         server,
+        blob_external_uri: None,
+    }
+}
+
+fn blob_parity() -> Parity {
+    let temp = tempfile::tempdir().unwrap();
+    let local = temp.path().join("blob-local.omni");
+    let (cluster_dir, blob_external_uri) = blob_parity_config(temp.path(), &local);
+    let server = spawn_server_with_cluster_env(
+        &cluster_dir,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-parity":"parity-tok"}"#,
+        )],
+    );
+    Parity {
+        _temp: temp,
+        local,
+        server,
+        blob_external_uri: Some(blob_external_uri),
     }
 }
 
@@ -124,6 +146,73 @@ fn assert_write_parity(verb: &str, local: &std::process::Output, remote: &std::p
         normalize_receipt("remote", remote),
         "{verb}: normalized write JSON diverges (left=local, right=remote)"
     );
+}
+
+fn assert_blob_bytes_parity(
+    case: &str,
+    local: &std::process::Output,
+    remote: &std::process::Output,
+    expected: &[u8],
+) {
+    assert_eq!(
+        local.status.code(),
+        remote.status.code(),
+        "{case}: exit codes diverge\nlocal: {local:?}\nremote: {remote:?}"
+    );
+    assert!(
+        local.status.success(),
+        "{case}: local arm failed: {local:?}"
+    );
+    assert!(
+        remote.status.success(),
+        "{case}: remote arm failed: {remote:?}"
+    );
+    assert_eq!(local.stdout, expected, "{case}: wrong local bytes");
+    assert_eq!(remote.stdout, expected, "{case}: wrong remote bytes");
+}
+
+fn assert_blob_stat_parity(
+    case: &str,
+    local: &std::process::Output,
+    remote: &std::process::Output,
+) -> serde_json::Value {
+    assert_eq!(
+        local.status.code(),
+        remote.status.code(),
+        "{case}: exit codes diverge\nlocal: {local:?}\nremote: {remote:?}"
+    );
+    assert!(
+        local.status.success(),
+        "{case}: local stat failed: {local:?}"
+    );
+    assert!(
+        remote.status.success(),
+        "{case}: remote stat failed: {remote:?}"
+    );
+
+    let local_json: serde_json::Value = serde_json::from_slice(&local.stdout).unwrap();
+    let remote_json: serde_json::Value = serde_json::from_slice(&remote.stdout).unwrap();
+    for (arm, value) in [("local", &local_json), ("remote", &remote_json)] {
+        let resolved = value["target"]["resolved_snapshot"].as_str().unwrap();
+        assert!(
+            !resolved.is_empty(),
+            "{case}: {arm} stat omitted its exact resolved target"
+        );
+    }
+
+    assert_eq!(
+        local_json, remote_json,
+        "{case}: exact stat metadata diverges"
+    );
+    local_json
+}
+
+fn normalized_blob_error(output: &std::process::Output) -> &str {
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    stderr
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("0: "))
+        .unwrap_or_else(|| panic!("Blob failure omitted its primary diagnostic: {stderr}"))
 }
 
 #[test]
@@ -335,6 +424,146 @@ fn parity_export() {
         local_lines, remote_lines,
         "export: JSONL streams diverge (left=local, right=remote)"
     );
+}
+
+#[test]
+fn parity_blob_get_is_byte_exact_for_full_range_empty_edge_and_snapshot_reads() {
+    let p = blob_parity();
+
+    let (local, remote) = p.run(&["blob", "get", "node", "Document", "readme", "content"]);
+    assert_blob_bytes_parity("blob get full", &local, &remote, BLOB_NODE_BYTES);
+
+    let (local, remote) = p.run(&[
+        "blob", "get", "node", "Document", "readme", "content", "--offset", "1", "--length", "4",
+    ]);
+    assert_blob_bytes_parity("blob get range", &local, &remote, &[1, 2, 3, 4]);
+
+    let (local, remote) = p.run(&["blob", "get", "node", "Document", "empty", "content"]);
+    assert_blob_bytes_parity("blob get valid empty", &local, &remote, &[]);
+
+    let (local, remote) = p.run(&[
+        "blob",
+        "get",
+        "edge",
+        "Attachment",
+        "attachment-1",
+        "payload",
+    ]);
+    assert_blob_bytes_parity("blob get edge", &local, &remote, BLOB_EDGE_BYTES);
+
+    let snapshot = resolved_snapshot_id(&p.local, "main");
+    let (local, remote) = p.run(&[
+        "blob",
+        "get",
+        "node",
+        "Document",
+        "readme",
+        "content",
+        "--snapshot",
+        &snapshot,
+    ]);
+    assert_blob_bytes_parity("blob get snapshot", &local, &remote, BLOB_NODE_BYTES);
+}
+
+#[test]
+fn parity_blob_stat_preserves_exact_managed_and_external_metadata() {
+    let p = blob_parity();
+
+    let (local, remote) = p.run(&[
+        "blob", "stat", "node", "Document", "readme", "content", "--json",
+    ]);
+    let local_managed = assert_blob_stat_parity("managed Blob stat", &local, &remote);
+    assert_eq!(local_managed["kind"], "managed");
+    assert_eq!(local_managed["size"], BLOB_NODE_BYTES.len());
+    assert!(
+        local_managed["etag"].as_str().is_some_and(|etag| {
+            etag.len() == 34 && etag.starts_with('"') && etag.ends_with('"')
+        })
+    );
+
+    let (local, remote) = p.run(&[
+        "blob", "stat", "node", "Document", "external", "content", "--json",
+    ]);
+    let local_external = assert_blob_stat_parity("external Blob stat", &local, &remote);
+    assert_eq!(local_external["kind"], "external");
+    assert_eq!(
+        local_external["uri"],
+        p.blob_external_uri.as_deref().unwrap()
+    );
+    assert!(local_external.get("size").is_none());
+    assert!(local_external.get("etag").is_none());
+}
+
+#[test]
+fn parity_blob_external_get_never_follows_the_redirect() {
+    let p = blob_parity();
+    let (local, remote) = p.run(&["blob", "get", "node", "Document", "external", "content"]);
+    assert_eq!(
+        local.status.code(),
+        remote.status.code(),
+        "external get exit codes diverge\nlocal: {local:?}\nremote: {remote:?}"
+    );
+    assert!(!local.status.success());
+    assert!(local.stdout.is_empty());
+    assert!(remote.stdout.is_empty());
+    let external_uri = p.blob_external_uri.as_deref().unwrap();
+    for (arm, output) in [("local", local), ("remote", remote)] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(external_uri), "{arm}: {stderr}");
+        assert!(stderr.contains("blob stat"), "{arm}: {stderr}");
+    }
+}
+
+#[test]
+fn parity_blob_shared_failures_keep_exit_codes_aligned() {
+    let p = blob_parity();
+    for (case, args) in [
+        (
+            "zero range",
+            vec![
+                "blob", "get", "node", "Document", "readme", "content", "--length", "0",
+            ],
+        ),
+        (
+            "out of bounds range",
+            vec![
+                "blob", "get", "node", "Document", "readme", "content", "--offset", "7",
+            ],
+        ),
+        (
+            "null cell",
+            vec![
+                "blob", "stat", "node", "Document", "null", "content", "--json",
+            ],
+        ),
+        (
+            "missing row",
+            vec![
+                "blob", "stat", "node", "Document", "missing", "content", "--json",
+            ],
+        ),
+        (
+            "non-Blob property",
+            vec![
+                "blob", "stat", "node", "Document", "readme", "note", "--json",
+            ],
+        ),
+    ] {
+        let (local, remote) = p.run(&args);
+        assert_eq!(
+            local.status.code(),
+            remote.status.code(),
+            "{case}: exit codes diverge\nlocal: {local:?}\nremote: {remote:?}"
+        );
+        assert!(!local.status.success(), "{case}: both arms must fail");
+        assert_eq!(
+            normalized_blob_error(&local),
+            normalized_blob_error(&remote),
+            "{case}: normalized diagnostics diverge\nlocal: {}\nremote: {}",
+            String::from_utf8_lossy(&local.stderr),
+            String::from_utf8_lossy(&remote.stderr),
+        );
+    }
 }
 
 // ---- error parity: exit codes must match for shared failure cases ----

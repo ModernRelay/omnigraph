@@ -854,6 +854,239 @@ pub fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
+/// Create a read-only twin whose immutable files retain the source inode
+/// identity. Blob-v2's native-manifest proof includes the local object-store
+/// ETag, so an ordinary byte copy is intentionally a different incarnation.
+pub fn hardlink_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            hardlink_dir(&entry.path(), &target);
+        } else {
+            fs::hard_link(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+pub const BLOB_CLI_SCHEMA: &str = r#"
+node Document {
+  title: String @key
+  content: Blob?
+  note: String?
+}
+
+edge Attachment: Document -> Document {
+  payload: Blob?
+}
+"#;
+
+pub const BLOB_CLI_DATA: &str = r#"{"type":"Document","data":{"title":"readme","content":"base64:AAECAwT/","note":"managed"}}
+{"type":"Document","data":{"title":"empty","content":"base64:","note":"valid empty"}}
+{"type":"Document","data":{"title":"null","note":"null"}}
+{"type":"Document","data":{"title":"peer","note":"edge target"}}
+{"edge":"Attachment","from":"readme","to":"peer","data":{"id":"attachment-1","payload":"base64:RWRnZQD/"}}"#;
+
+pub const BLOB_NODE_BYTES: &[u8] = &[0, 1, 2, 3, 4, 255];
+pub const BLOB_EDGE_BYTES: &[u8] = b"Edge\0\xff";
+
+/// Add one deterministic managed Blob without routing fixture setup through
+/// the CLI command under test.
+pub fn merge_managed_blob(graph: &Path, title: &str, bytes: &[u8]) {
+    let data = serde_json::json!({
+        "type": "Document",
+        "data": {
+            "title": title,
+            "content": format!("base64:{}", encode_base64(bytes)),
+            "note": "large managed fixture",
+        }
+    })
+    .to_string();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = omnigraph::db::Omnigraph::open(&graph.to_string_lossy())
+            .await
+            .unwrap();
+        omnigraph::loader::load_jsonl(&db, &data, omnigraph::loader::LoadMode::Merge)
+            .await
+            .unwrap();
+    });
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(ALPHABET[usize::from(first >> 2)]);
+        encoded.push(ALPHABET[usize::from((first & 0b11) << 4 | second >> 4)]);
+        encoded.push(if chunk.len() > 1 {
+            ALPHABET[usize::from((second & 0b1111) << 2 | third >> 6)]
+        } else {
+            b'='
+        });
+        encoded.push(if chunk.len() > 2 {
+            ALPHABET[usize::from(third & 0b11_1111)]
+        } else {
+            b'='
+        });
+    }
+    String::from_utf8(encoded).unwrap()
+}
+
+/// Initialize the compact node+edge Blob fixture used by the CLI delivery
+/// acceptance tests. Setup goes through the engine so the tests exercise only
+/// the CLI operation under test, not a second CLI surface while arranging it.
+pub fn init_blob_graph(graph: &Path) {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = omnigraph::db::Omnigraph::init(&graph.to_string_lossy(), BLOB_CLI_SCHEMA)
+            .await
+            .unwrap();
+        omnigraph::loader::load_jsonl(&db, BLOB_CLI_DATA, omnigraph::loader::LoadMode::Overwrite)
+            .await
+            .unwrap();
+    });
+}
+
+/// Initialize one retained external descriptor, then let the caller remove the
+/// target. `blob stat` and the external classification of `blob get` must not
+/// probe or download it.
+pub fn init_external_blob_graph(
+    graph: &Path,
+    external_uri: &str,
+    external_base: &str,
+    scope: omnigraph::ExternalBlobExecutionScope,
+) {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let policy = omnigraph::ExternalBlobPolicy::allow(vec![
+            omnigraph::ExternalBlobBase::new(external_base, scope).unwrap(),
+        ])
+        .unwrap();
+        let db = omnigraph::db::Omnigraph::init(&graph.to_string_lossy(), BLOB_CLI_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap();
+        let data = serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "external",
+                "content": external_uri,
+                "note": "descriptor only",
+            }
+        })
+        .to_string();
+        omnigraph::loader::load_jsonl(&db, &data, omnigraph::loader::LoadMode::Overwrite)
+            .await
+            .unwrap();
+    });
+}
+
+pub fn resolved_snapshot_id(graph: &Path, branch: &str) -> String {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        omnigraph::db::Omnigraph::open(&graph.to_string_lossy())
+            .await
+            .unwrap()
+            .resolve_snapshot(branch)
+            .await
+            .unwrap()
+            .to_string()
+    })
+}
+
+/// Build the Blob-specific parity fixture. The served graph is initialized
+/// once and hard-linked read-only into the embedded arm so the native-manifest
+/// ETag proof, stable identities, and payload bytes have one source.
+pub fn blob_parity_config(root: &Path, local_graph: &Path) -> (PathBuf, String) {
+    let policy = root.join("blob-parity.policy.yaml");
+    fs::write(&policy, parity_policy_yaml()).unwrap();
+
+    let external_dir = root.join("external-source");
+    fs::create_dir_all(&external_dir).unwrap();
+    let external_path = external_dir.join("payload.bin");
+    fs::write(&external_path, b"must never be read after fixture setup").unwrap();
+    let external_base = format!("file://{}/", external_dir.display());
+    let external_uri = format!("file://{}", external_path.display());
+    let canonical_external_uri = format!(
+        "file://{}",
+        fs::canonicalize(&external_path).unwrap().display()
+    );
+
+    let cluster_dir = root.join("blob-parity-cluster");
+    fs::create_dir_all(&cluster_dir).unwrap();
+    fs::write(cluster_dir.join("blob.pg"), BLOB_CLI_SCHEMA).unwrap();
+    fs::copy(&policy, cluster_dir.join("blob-parity.policy.yaml")).unwrap();
+    fs::write(
+        cluster_dir.join("cluster.yaml"),
+        format!(
+            r#"version: 1
+metadata:
+  name: blob-parity
+state:
+  backend: cluster
+  lock: true
+graphs:
+  {PARITY_GRAPH_ID}:
+    schema: ./blob.pg
+policies:
+  parity:
+    file: ./blob-parity.policy.yaml
+    applies_to: [{PARITY_GRAPH_ID}]
+"#,
+        ),
+    )
+    .unwrap();
+
+    output_success(
+        cli()
+            .arg("cluster")
+            .arg("import")
+            .arg("--config")
+            .arg(&cluster_dir),
+    );
+    output_success(
+        cli()
+            .arg("cluster")
+            .arg("apply")
+            .arg("--config")
+            .arg(&cluster_dir),
+    );
+
+    let served_root = cluster_dir
+        .join("graphs")
+        .join(format!("{PARITY_GRAPH_ID}.omni"));
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let policy = omnigraph::ExternalBlobPolicy::allow(vec![
+            omnigraph::ExternalBlobBase::new(
+                &external_base,
+                omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let db = omnigraph::db::Omnigraph::open(&served_root.to_string_lossy())
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap();
+        let data = format!(
+            "{BLOB_CLI_DATA}\n{{\"type\":\"Document\",\"data\":{{\"title\":\"external\",\"content\":\"{external_uri}\",\"note\":\"descriptor only\"}}}}"
+        );
+        omnigraph::loader::load_jsonl(&db, &data, omnigraph::loader::LoadMode::Overwrite)
+            .await
+            .unwrap();
+    });
+    fs::remove_file(external_path).unwrap();
+
+    if local_graph.exists() {
+        fs::remove_dir_all(local_graph).unwrap();
+    }
+    hardlink_dir(&served_root, local_graph);
+    (cluster_dir, canonical_external_uri)
+}
+
 /// Scrub declared-volatile fields (RFC-009 Phase 1 allowlist) so the rest
 /// of the JSON must match exactly. Key-based, recursive; both arms get the
 /// same placeholders. Everything NOT listed here is contract.
@@ -1019,9 +1252,9 @@ policies:
 }
 
 /// Run one CLI invocation per arm with identical verb args: locally against
-/// `local_graph` (--as actor) and remotely against a server URL whose token
-/// resolves to the same actor. Returns raw Outputs for exit-code + JSON
-/// comparison by the caller.
+/// `local_graph` and remotely against a server URL. Actor-bearing operations
+/// use `--as` locally and an equivalent bearer identity remotely; read-only
+/// Blob commands reject `--as`. Returns raw outputs for parity comparison.
 pub fn run_both(
     local_graph: &Path,
     server_url: &str,
@@ -1035,12 +1268,12 @@ pub fn run_both(
     // policy — the parity policy is permissive for `act-parity` on the served
     // arm, so the two arms still agree.
     let mut local = cli();
-    local
-        .args(args)
-        .arg("--store")
-        .arg(local_graph)
-        .arg("--as")
-        .arg(PARITY_ACTOR);
+    local.args(args).arg("--store").arg(local_graph);
+    if args.first() == Some(&"blob") {
+        local.env("NO_COLOR", "1");
+    } else {
+        local.arg("--as").arg(PARITY_ACTOR);
+    }
     let local_out = local.output().unwrap();
 
     let mut remote = cli();
@@ -1053,6 +1286,9 @@ pub fn run_both(
         // remote arm must name the graph it addresses.
         .arg("--graph")
         .arg(PARITY_GRAPH_ID);
+    if args.first() == Some(&"blob") {
+        remote.env("NO_COLOR", "1");
+    }
     let remote_out = remote.output().unwrap();
     (local_out, remote_out)
 }

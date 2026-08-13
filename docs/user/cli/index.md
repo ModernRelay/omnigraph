@@ -61,6 +61,99 @@ name (optional) selects which query in the source to run. The inline source
 travels through the same parser, lint, params binding, and commit machinery as a
 file-based query — only the source loader changes.
 
+## Reading Blob Cells
+
+`blob get` and `blob stat` address one logical node or edge property. They use
+graph vocabulary—not a physical table, dataset, row address, or per-table lane:
+
+```bash
+# Stream the complete managed value to a file.
+omnigraph blob get node Person ada portrait \
+  --store graph.omni --out portrait.jpg
+
+# Read bytes 1024..5119 from a served edge property.
+omnigraph blob get edge Attachment attachment-42 payload \
+  --server prod --graph knowledge --offset 1024 --length 4096 > payload.part
+
+# Inspect metadata without reading payload bytes.
+omnigraph blob stat node Person ada portrait \
+  --server prod --graph knowledge --branch main --json
+```
+
+Use `--store` for an embedded graph or `--server … --graph …` for a served
+graph. Store- and server-bound profiles/defaults work too. Blob commands do not
+accept a positional graph URI or `--cluster`; the four positional values are
+the Blob cell selector. They also reject `--as`, because these read-only verbs
+do not consume a client-supplied actor. `ENTITY` is exactly `node` or `edge`.
+Reads default to `main`; `--branch NAME` and `--snapshot ID` are mutually
+exclusive.
+
+`blob get` emits raw bytes—never JSON or base64—to stdout, or to `--out PATH`.
+The range forms are:
+
+- `--offset N --length M`: `N..N+M`
+- `--offset N`: `N` through the end
+- `--length M`: the first `M` bytes
+
+An end beyond the value is clamped to the end, matching an HTTP byte range. A
+start at or beyond the end of a non-empty value is unsatisfiable. Requested
+length zero and arithmetic overflow fail before graph/server resolution; an
+unsatisfiable start fails before payload transfer. This does not make a valid
+empty Blob an error: a full get of one succeeds and writes zero bytes. Managed
+values are streamed through consecutive bounded reads rather than buffered in
+full.
+
+A successful command writes the exact selected bytes. If storage or transport
+fails after streaming begins, the command exits nonzero, but bytes already sent
+to stdout cannot be recalled and an `--out` file may contain the successfully
+delivered prefix. A failure before the first payload byte leaves an existing
+`--out` path untouched. For atomic file replacement even after a mid-stream
+failure, write to a temporary path and rename it only after a zero exit status.
+
+`blob stat` is descriptor-only. For a managed value it reports the selector,
+`managed`, byte size, strong ETag, the requested target, and an exact opaque
+witness for the immutable graph view that resolved. For a whole-object external
+value it reports `external`, the stored URI, and the target while omitting size
+and ETag. A ranged external descriptor fails loudly rather than widening to the
+whole target object. A null cell is not an external or zero-byte value; it
+returns not found. The JSON shape is stable:
+
+```json
+{
+  "selector": {
+    "entity": "node",
+    "type": "Person",
+    "id": "ada",
+    "property": "portrait"
+  },
+  "kind": "managed",
+  "size": 58291,
+  "etag": "\"0123456789abcdef0123456789abcdef\"",
+  "target": {
+    "branch": "main",
+    "resolved_snapshot": "manifest:main:v42:etag:..."
+  }
+}
+```
+
+`target.resolved_snapshot` is always present and should be treated as opaque.
+For a live branch it is a precise manifest witness, not necessarily a commit
+ULID; a byte-for-byte graph copy can have a different ETag suffix because its
+control object lives in a different store. `target.branch` or `target.snapshot`
+appears only when that target was explicitly requested. In particular, an
+explicit `--snapshot ID` is echoed separately as `target.snapshot`; callers
+should not infer it by parsing `resolved_snapshot`.
+
+The CLI never follows an external Blob reference. For a whole-object descriptor,
+`blob stat` reports the URI with zero target-object I/O and `blob get` exits
+nonzero, prints the URI, and suggests `blob stat`. Both commands refuse a ranged
+external descriptor because redirecting it would silently widen the selected
+cell. This rule also applies remotely: the client does not follow the server's
+redirect into caller-owned storage.
+
+Blob replacement and clear commands are not part of this read surface yet;
+RFC-033 Phase 3 will add them through the ordinary graph mutation path.
+
 ## Branching And Reviewable Data Flows
 
 ```bash
