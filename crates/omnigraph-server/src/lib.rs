@@ -1106,6 +1106,9 @@ impl ApiError {
                 cursor,
                 first_unreadable_commit_id,
             } => Self::change_feed_gap(cursor, first_unreadable_commit_id),
+            OmniError::ChangeCursorRejected { reason } => {
+                Self::bad_request(format!("change cursor rejected: {reason}"))
+            }
             OmniError::RecoveryRequired {
                 operation_id,
                 reason,

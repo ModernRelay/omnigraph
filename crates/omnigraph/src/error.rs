@@ -133,6 +133,11 @@ pub enum OmniError {
         cursor: Option<String>,
         first_unreadable_commit_id: String,
     },
+    /// A commit-change cursor failed decoding or names a different scope
+    /// (graph, commit, or cursor version). Kept typed so callers can tell a
+    /// caller-side cursor bug from a retention gap without parsing text.
+    #[error("change cursor rejected: {reason}")]
+    ChangeCursorRejected { reason: String },
 
     /// A caller attempted to admit an external Blob URI that is malformed or
     /// outside this graph handle's immutable base allowlist. The URI must be a

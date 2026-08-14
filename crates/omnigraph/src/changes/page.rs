@@ -420,7 +420,7 @@ pub(crate) async fn commit_changes_page(
     }
 
     if !cursor_identity_seen {
-        return Err(OmniError::manifest(
+        return Err(cursor_rejected(
             "commit changes cursor no longer names a changed table",
         ));
     }
@@ -468,20 +468,24 @@ fn operation_rank(op: ChangeOp) -> u8 {
     }
 }
 
+fn cursor_rejected(reason: impl Into<String>) -> OmniError {
+    OmniError::ChangeCursorRejected {
+        reason: reason.into(),
+    }
+}
+
 fn validate_cursor(
     cursor: CommitChangesCursor,
     graph_identity: &str,
     commit_id: &str,
 ) -> Result<CommitChangesCursor> {
     if cursor.version != CURSOR_VERSION {
-        return Err(OmniError::manifest(
-            "unsupported commit changes cursor version",
-        ));
+        return Err(cursor_rejected("unsupported commit changes cursor version"));
     }
     if cursor.graph_identity != cursor_graph_identity(graph_identity)
         || cursor.commit_id != commit_id
     {
-        return Err(OmniError::manifest(
+        return Err(cursor_rejected(
             "commit changes cursor does not match this graph and commit",
         ));
     }
@@ -490,9 +494,7 @@ fn validate_cursor(
         || cursor.table_incarnation_id == 0
         || cursor.operation_rank > operation_rank(ChangeOp::Delete)
     {
-        return Err(OmniError::manifest(
-            "invalid commit changes cursor identity",
-        ));
+        return Err(cursor_rejected("invalid commit changes cursor identity"));
     }
     Ok(cursor)
 }
@@ -515,16 +517,14 @@ fn encode_cursor(cursor: &CommitChangesCursor) -> Result<String> {
 fn decode_cursor(cursor: &str) -> Result<CommitChangesCursor> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(cursor)
-        .map_err(|_| OmniError::manifest("invalid commit changes cursor encoding"))?;
+        .map_err(|_| cursor_rejected("invalid commit changes cursor encoding"))?;
     if bytes.len() <= CURSOR_CHECKSUM_BYTES {
-        return Err(OmniError::manifest("invalid commit changes cursor"));
+        return Err(cursor_rejected("invalid commit changes cursor"));
     }
     let (payload, checksum) = bytes.split_at(bytes.len() - CURSOR_CHECKSUM_BYTES);
     if Sha256::digest(payload).as_slice() != checksum {
-        return Err(OmniError::manifest(
-            "invalid commit changes cursor checksum",
-        ));
+        return Err(cursor_rejected("invalid commit changes cursor checksum"));
     }
     serde_json::from_slice(payload)
-        .map_err(|_| OmniError::manifest("invalid commit changes cursor payload"))
+        .map_err(|_| cursor_rejected("invalid commit changes cursor payload"))
 }

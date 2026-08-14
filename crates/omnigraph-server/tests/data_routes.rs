@@ -1555,6 +1555,26 @@ async fn load_endpoint_loads_into_existing_branch() {
         assert_eq!(status, expected, "query: {query}");
     }
 
+    let (status, rejected) = json_response(
+        &app,
+        Request::builder()
+            .uri(g(&format!(
+                "/commits/{commit_id}/changes?cursor=not-a-cursor"
+            )))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        rejected["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("change cursor rejected"),
+        "a malformed cursor is a typed 400 rejection, not a retention gap: {rejected}"
+    );
+
     let (status, _) = json_response(
         &app,
         Request::builder()
