@@ -858,6 +858,27 @@ pub(crate) fn print_commit_human(commit: &CommitOutput) {
     println!("created_at: {}", commit.created_at);
 }
 
+pub(crate) fn print_commit_changes_human(output: &CommitChangesOutput) {
+    // The cause is stated once per page, mirroring the wire block shape.
+    print_commit_human(&output.commit);
+    for change in &output.changes {
+        println!(
+            "{} {} {} {}",
+            change.change_index,
+            match change.op {
+                ChangeOpOutput::Insert => "insert",
+                ChangeOpOutput::Update => "update",
+                ChangeOpOutput::Delete => "delete",
+            },
+            change.table_key,
+            change.id
+        );
+    }
+    if let Some(cursor) = &output.next_cursor {
+        println!("next_cursor: {cursor}");
+    }
+}
+
 pub(crate) fn print_policy_explain(
     decision: &PolicyDecision,
     actor_id: &str,

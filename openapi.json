@@ -1348,6 +1348,141 @@
         ]
       }
     },
+    "/graphs/{graph_id}/commits/{commit_id}/changes": {
+      "get": {
+        "tags": [
+          "commits"
+        ],
+        "operationId": "cluster_getCommitChanges",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "commit_id",
+            "in": "path",
+            "description": "Commit identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque continuation returned by the preceding page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum changes returned. Defaults to 1000; maximum 8192.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "max_bytes",
+            "in": "query",
+            "description": "Maximum serialized change bytes retained by the page. Defaults to 4 MiB;\nmaximum 32 MiB.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded ordered changes introduced by the commit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitChangesOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid cursor or limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Commit not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Required retained history is no longer available",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Requested row or byte limit exceeds the public ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs/{graph_id}/export": {
       "post": {
         "tags": [
@@ -3176,6 +3311,32 @@
           }
         }
       },
+      "ChangeFeedGapOutput": {
+        "type": "object",
+        "description": "A requested commit-change continuation can no longer be reconstructed.",
+        "required": [
+          "first_unreadable_commit_id"
+        ],
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "first_unreadable_commit_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ChangeOpOutput": {
+        "type": "string",
+        "enum": [
+          "insert",
+          "update",
+          "delete"
+        ]
+      },
       "ChangeOutput": {
         "type": "object",
         "required": [
@@ -3247,6 +3408,34 @@
           }
         }
       },
+      "CommitChangesOutput": {
+        "type": "object",
+        "required": [
+          "commit",
+          "changes",
+          "commit_complete"
+        ],
+        "properties": {
+          "changes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EntityChangeOutput"
+            }
+          },
+          "commit": {
+            "$ref": "#/components/schemas/CommitOutput"
+          },
+          "commit_complete": {
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "CommitListOutput": {
         "type": "object",
         "required": [
@@ -3309,6 +3498,77 @@
           }
         }
       },
+      "EndpointsOutput": {
+        "type": "object",
+        "required": [
+          "src",
+          "dst"
+        ],
+        "properties": {
+          "dst": {
+            "type": "string"
+          },
+          "src": {
+            "type": "string"
+          }
+        }
+      },
+      "EntityChangeOutput": {
+        "type": "object",
+        "description": "One entity change inside a commit page. Cause (commit, actor, branch,\nsnapshot version) is stated once on the enclosing `CommitChangesOutput`\nblock, never copied per entity; physical table versions stay internal.",
+        "required": [
+          "change_index",
+          "table_key",
+          "kind",
+          "type_name",
+          "id",
+          "op"
+        ],
+        "properties": {
+          "after": {
+            "description": "Exact logical image after an insert/update; user-schema keys stay verbatim."
+          },
+          "before": {
+            "description": "Exact logical image before a delete; user-schema keys stay verbatim."
+          },
+          "change_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endpoints": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EndpointsOutput"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/EntityKindOutput"
+          },
+          "op": {
+            "$ref": "#/components/schemas/ChangeOpOutput"
+          },
+          "table_key": {
+            "type": "string"
+          },
+          "type_name": {
+            "type": "string"
+          }
+        }
+      },
+      "EntityKindOutput": {
+        "type": "string",
+        "enum": [
+          "node",
+          "edge"
+        ]
+      },
       "ErrorCode": {
         "type": "string",
         "enum": [
@@ -3336,6 +3596,17 @@
               {
                 "$ref": "#/components/schemas/BlobRangeOutput",
                 "description": "Set with HTTP 416 for a valid but unsatisfiable managed Blob byte range.\n`start..end` is half-open and `length` is the selected Blob length."
+              }
+            ]
+          },
+          "change_feed_gap": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChangeFeedGapOutput",
+                "description": "Set with HTTP 410 when retained table history cannot reconstruct the page."
               }
             ]
           },

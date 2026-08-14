@@ -364,7 +364,7 @@ where
     Ok(())
 }
 
-async fn export_blob_values(
+pub(crate) async fn export_blob_values(
     source_ds: &Dataset,
     batch: &RecordBatch,
     row_ids: &[u64],
@@ -387,6 +387,63 @@ async fn export_blob_values(
         );
     }
     Ok(values)
+}
+
+/// Convert one descriptor-scanned row into the same logical value shape used
+/// by export, materializing at most that row's Blob values.
+pub(crate) async fn logical_row_image(
+    source_ds: &Dataset,
+    batch: &RecordBatch,
+    row: usize,
+) -> Result<serde_json::Value> {
+    let row_batch = batch.slice(row, 1);
+    let blob_properties = row_batch
+        .schema()
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+                .map_err(|error| OmniError::Lance(error.to_string()));
+            match lance_field {
+                Ok(field) if field.is_blob() => Some(Ok(field.name.clone())),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<Result<std::collections::HashSet<_>>>()?;
+    let blob_values = if blob_properties.is_empty() {
+        None
+    } else {
+        let row_id = row_batch
+            .column_by_name("_rowid")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| OmniError::Lance("change row is missing _rowid".to_string()))?
+            .value(0);
+        Some(export_blob_values(source_ds, &row_batch, &[row_id], &blob_properties).await?)
+    };
+
+    // A pinned Lance version is the commit-era schema authority. Consulting
+    // the live catalog here breaks retained commits after rename/add/drop.
+    let mut image = serde_json::Map::new();
+    for field in row_batch
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| !field.name().starts_with("_row"))
+    {
+        image.insert(
+            field.name().clone(),
+            export_value_for_field(
+                &row_batch,
+                field.name(),
+                0,
+                blob_values
+                    .as_ref()
+                    .and_then(|values| values.get(field.name())),
+            )?,
+        );
+    }
+    Ok(serde_json::Value::Object(image))
 }
 
 async fn emit_export_rows_from_batch<Emit, EmitFuture>(

@@ -2301,7 +2301,7 @@ async fn delete_merged_source_branch(
     ) {
         Ok(Authz::Allowed) => {}
         Ok(Authz::Denied(message)) => return Err(message),
-        Err(err) => return Err(err.message),
+        Err(err) => return Err(err.message.into()),
     }
     let actor_id = actor.map(|actor| actor.actor_id.as_ref());
     handle
@@ -2411,6 +2411,62 @@ pub(crate) async fn server_commit_show(
             .map_err(ApiError::from_omni)?
     };
     Ok(Json(api::commit_output(&commit)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/commits/{commit_id}/changes",
+    tag = "commits",
+    operation_id = "getCommitChanges",
+    params(
+        ("commit_id" = String, Path, description = "Commit identifier"),
+        api::CommitChangesQuery,
+    ),
+    responses(
+        (status = 200, description = "Bounded ordered changes introduced by the commit", body = api::CommitChangesOutput),
+        (status = 400, description = "Invalid cursor or limit", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Commit not found", body = ErrorOutput),
+        (status = 410, description = "Required retained history is no longer available", body = ErrorOutput),
+        (status = 413, description = "Requested row or byte limit exceeds the public ceiling", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+pub(crate) async fn server_commit_changes(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Path(CommitPath { commit_id }): Path<CommitPath>,
+    Query(query): Query<api::CommitChangesQuery>,
+) -> std::result::Result<Json<api::CommitChangesOutput>, ApiError> {
+    authorize_request(
+        actor.as_ref().map(|Extension(actor)| actor),
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: None,
+            target_branch: None,
+        },
+    )?;
+    let db = &handle.engine;
+    let commit = db
+        .get_commit(&commit_id)
+        .await
+        .map_err(ApiError::from_omni)?;
+    let page = db
+        .commit_changes_page(
+            &commit_id,
+            query.cursor.as_deref(),
+            query
+                .limit
+                .unwrap_or(omnigraph::changes::COMMIT_CHANGES_DEFAULT_ROWS),
+            query
+                .max_bytes
+                .unwrap_or(omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES),
+        )
+        .await
+        .map_err(ApiError::from_omni)?;
+    Ok(Json(api::commit_changes_output(&commit, &page)))
 }
 
 pub(crate) fn read_target_from_request(

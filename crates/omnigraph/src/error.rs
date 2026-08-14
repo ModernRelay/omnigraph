@@ -86,6 +86,11 @@ pub enum OmniError {
     Compiler(#[from] omnigraph_compiler::error::CompilerError),
     #[error("storage: {0}")]
     Lance(String),
+    /// A manifest-pinned Lance version was reclaimed by cleanup. Kept typed at
+    /// the common opener so historical APIs never infer retention from error text.
+    #[error("historical table version {version} was reclaimed")]
+    HistoricalVersionReclaimed { version: u64 },
+
     /// Lance rejected a stale transaction as semantically retryable. Kept
     /// typed at the storage boundary so RFC-023 can distinguish an
     /// effect-free key fence from an arbitrary I/O or execution failure
@@ -122,6 +127,18 @@ pub enum OmniError {
         limit: u64,
         actual: u64,
     },
+    /// A commit change page can no longer be reconstructed contiguously.
+    #[error("change feed gap at commit '{first_unreadable_commit_id}'")]
+    ChangeFeedGap {
+        cursor: Option<String>,
+        first_unreadable_commit_id: String,
+    },
+    /// A commit-change cursor failed decoding or names a different scope
+    /// (graph, commit, or cursor version). Kept typed so callers can tell a
+    /// caller-side cursor bug from a retention gap without parsing text.
+    #[error("change cursor rejected: {reason}")]
+    ChangeCursorRejected { reason: String },
+
     /// A caller attempted to admit an external Blob URI that is malformed or
     /// outside this graph handle's immutable base allowlist. The URI must be a
     /// normalized, credential-free spelling (or a redacted placeholder): this
