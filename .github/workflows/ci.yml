@@ -73,7 +73,7 @@ jobs:
           for path in "${changed[@]}"; do
             case "$path" in
               docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc) ;;
-              README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
+              README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md|bnechmarks-current-state.md) ;;
               LICENSE|LICENSE.md) ;;
               *)
                 run_full_ci=true
@@ -179,6 +179,169 @@ jobs:
           cargo clippy --workspace --all-targets --locked \
             --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
             -- -D warnings -W clippy::dbg_macro
+
+  node_edge_logical_cost:
+    name: Node vs Edge Logical Cost
+    needs: classify_changes
+    # This is a deterministic logical-I/O contract, not a wall-clock benchmark.
+    # Keep it on the PR path so a new storage round-trip cannot merge unnoticed.
+    # Required contexts must report on documentation-only PRs, so this job stays
+    # present and uses step-level skips instead of a job-level `if`.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
+    steps:
+      - name: Skip for documentation-only changes
+        if: needs.classify_changes.outputs.run_full_ci != 'true'
+        run: echo "Documentation-only change detected; skipping logical-cost benchmark."
+
+      - name: Checkout source
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install system dependencies
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      # Bare install honors rust-toolchain.toml; do not override the repository
+      # pin with a floating toolchain action.
+      - name: Install pinned toolchain
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        run: rustup toolchain install
+
+      - name: Cache Rust build data
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          key: node-edge-logical-cost-v0
+          # Seed one shared cache from main; PR-local saves cannot help other PRs.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Run exact node-versus-edge logical-cost benchmark
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        env:
+          OMNIGRAPH_COST_BENCH_RESULTS: ${{ runner.temp }}/omnigraph-cost-bench/node-vs-edge.jsonl
+        run: |
+          set -euo pipefail
+          results_dir="$RUNNER_TEMP/omnigraph-cost-bench"
+          results_log="$results_dir/node-vs-edge.log"
+          mkdir -p "$results_dir"
+          rm -f "$OMNIGRAPH_COST_BENCH_RESULTS"
+          cargo test -p omnigraph-engine --locked --test write_cost \
+            node_vs_edge_insert_lance_object_store_trips \
+            -- --exact --nocapture 2>&1 | tee "$results_log"
+          grep -Fq \
+            "test node_vs_edge_insert_lance_object_store_trips ... ok" \
+            "$results_log" \
+            || { echo "::error::exact node-versus-edge benchmark did not execute normally"; exit 1; }
+          grep -Eq "test result: ok\. 1 passed; 0 failed" "$results_log" \
+            || { echo "::error::node-versus-edge filter matched the wrong test set"; exit 1; }
+
+      - name: Validate node-versus-edge JSON evidence
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        env:
+          OMNIGRAPH_COST_BENCH_RESULTS: ${{ runner.temp }}/omnigraph-cost-bench/node-vs-edge.jsonl
+        run: |
+          python3 - "$OMNIGRAPH_COST_BENCH_RESULTS" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          lines = [line for line in path.read_text().splitlines() if line.strip()]
+          if len(lines) != 1:
+              raise SystemExit(f"expected one JSONL record in {path}, found {len(lines)}")
+          record = json.loads(lines[0])
+          expected = {
+              "record_schema_version": 1,
+              "harness_version": "v0",
+              "instrument_kind": "logical_lance_object_store_ops",
+              "benchmark": "node-vs-edge-insert",
+              "outcome": "passed",
+          }
+          for field, value in expected.items():
+              if record.get(field) != value:
+                  raise SystemExit(
+                      f"unexpected {field}: {record.get(field)!r}; expected {value!r}"
+                  )
+          samples = record.get("samples", [])
+          shape = [
+              (
+                  sample.get("sample_key"),
+                  sample.get("pair_key"),
+                  sample.get("pair_order"),
+                  sample.get("position"),
+                  sample.get("operation"),
+              )
+              for sample in samples
+          ]
+          expected_shape = [
+              ("ab/node", "ab", "node-then-edge", 1, "node_insert"),
+              ("ab/edge", "ab", "node-then-edge", 2, "edge_insert"),
+              ("ba/edge", "ba", "edge-then-node", 1, "edge_insert"),
+              ("ba/node", "ba", "edge-then-node", 2, "node_insert"),
+          ]
+          if shape != expected_shape:
+              raise SystemExit(f"unexpected AB/BA samples: {shape!r}")
+          totals = [
+              sample.get("instrumentation", {})
+              .get("object_store_ops", {})
+              .get("total")
+              for sample in samples
+          ]
+          if any(
+              isinstance(total, bool) or not isinstance(total, int) or total <= 0
+              for total in totals
+          ):
+              raise SystemExit(f"vacuous local logical-op totals: {totals!r}")
+          if totals[0] != totals[3] or totals[1] != totals[2]:
+              raise SystemExit(f"local AB/BA totals are not repeatable: {totals!r}")
+          approved_limits = {"node_insert": 14, "edge_insert": 34}
+          for operation, approved_limit in approved_limits.items():
+              ceiling = (
+                  record.get("ceilings", {})
+                  .get(operation, {})
+                  .get("max_total_ops")
+              )
+              if (
+                  isinstance(ceiling, bool)
+                  or not isinstance(ceiling, int)
+                  or ceiling <= 0
+                  or ceiling > approved_limit
+              ):
+                  raise SystemExit(
+                      f"unexpected {operation} local ceiling: {ceiling!r}"
+                  )
+              operation_totals = [
+                  total
+                  for sample, total in zip(samples, totals, strict=True)
+                  if sample.get("operation") == operation
+              ]
+              if any(total > ceiling for total in operation_totals):
+                  raise SystemExit(
+                      f"{operation} local totals exceed ceiling {ceiling}: "
+                      f"{operation_totals!r}"
+                  )
+          if record.get("fixture", {}).get("backend") != "local_file":
+              raise SystemExit(f"unexpected fixture backend: {record.get('fixture')!r}")
+          PY
+
+      - name: Upload node-versus-edge cost evidence
+        if: always() && needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-vs-edge-logical-cost-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/omnigraph-cost-bench/
+          if-no-files-found: warn
+          retention-days: 14
 
   test:
     name: Test Workspace
@@ -394,12 +557,13 @@ jobs:
     # removes that dependency from the workflow's critical path.
     #
     # Two parallel feature graphs: the default graph compiles every selected
-    # engine/server/cluster/CLI test binary in one Cargo invocation, while the
-    # failpoints graph stays isolated. Presenting the full default DAG together
-    # avoids discovering it as a serial compile/link waterfall. The previous
-    # five-shard layout repeated the same ~26-29m cold substrate compile five
-    # times and maintained five target caches, pressuring GitHub's repository
-    # cache cap. `fail-fast: false` lets both graphs report independently.
+    # engine/server/cluster/CLI correctness test binary in one Cargo invocation,
+    # then the narrow v0 cost qualifier reuses that graph. The failpoints graph
+    # stays isolated. Presenting the full default DAG together avoids discovering
+    # it as a serial compile/link waterfall. The previous five-shard layout
+    # repeated the same ~26-29m cold substrate compile five times and maintained
+    # five target caches, pressuring GitHub's repository cache cap.
+    # `fail-fast: false` lets both graphs report independently.
     needs: classify_changes
     if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
@@ -494,7 +658,7 @@ jobs:
             s3api create-bucket \
             --bucket "${OMNIGRAPH_S3_TEST_BUCKET}"
 
-      # Compile and execute the selected default targets in one Cargo resolve.
+      # Compile and execute the selected default correctness targets in one Cargo resolve.
       # A superset prebuild followed by narrower commands would still rebuild
       # workspace crates under different feature fingerprints.
       - name: Run RustFS default integration graph
@@ -539,12 +703,128 @@ jobs:
               || { echo "::error::required RustFS cell '${test_name}' did not execute normally"; exit 1; }
           done
 
-      # NOTE: the RFC-013 step-3a data-table opener COST gate (write_cost_s3) used
-      # to run here. It is a deterministic IO-count gate, not a correctness test —
-      # performance/cost contracts belong in a dedicated perf harness on a stable
-      # runner + own cadence, not on the every-merge correctness path. Moved out of
-      # CI pending that harness; run it on demand with a bucket set:
-      #   OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-engine --test write_cost_s3
+      # The v0 node-versus-edge comparator is the narrow cost-harness exception:
+      # qualify its logical-count contract against RustFS after the correctness
+      # graph has passed. The other S3 cost matrices remain on demand rather than
+      # expanding the correctness job into a general performance suite.
+      - name: Qualify node-versus-edge logical cost against RustFS
+        if: matrix.shard == 'default'
+        env:
+          OMNIGRAPH_COST_BENCH_RESULTS: ${{ runner.temp }}/omnigraph-cost-bench-rustfs/node-vs-edge.jsonl
+        run: |
+          set -euo pipefail
+          results_dir="$RUNNER_TEMP/omnigraph-cost-bench-rustfs"
+          results_log="$results_dir/node-vs-edge.log"
+          mkdir -p "$results_dir"
+          rm -f "$OMNIGRAPH_COST_BENCH_RESULTS"
+          cargo test --locked -p omnigraph-engine --test write_cost_s3 \
+            node_vs_edge_insert_lance_object_store_trips_on_s3 \
+            -- --exact --nocapture 2>&1 | tee "$results_log"
+          if grep -Fq \
+            "SKIP node_vs_edge_insert_lance_object_store_trips_on_s3" \
+            "$results_log"
+          then
+            echo "::error::configured RustFS cost benchmark emitted its unconfigured skip"
+            exit 1
+          fi
+          grep -Fq \
+            "test node_vs_edge_insert_lance_object_store_trips_on_s3 ... ok" \
+            "$results_log" \
+            || { echo "::error::exact RustFS cost benchmark did not execute normally"; exit 1; }
+          grep -Eq "test result: ok\. 1 passed; 0 failed" "$results_log" \
+            || { echo "::error::RustFS cost filter matched the wrong test set"; exit 1; }
+          python3 - "$OMNIGRAPH_COST_BENCH_RESULTS" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          lines = [line for line in path.read_text().splitlines() if line.strip()]
+          if len(lines) != 1:
+              raise SystemExit(f"expected one JSONL record in {path}, found {len(lines)}")
+          record = json.loads(lines[0])
+          expected = {
+              "record_schema_version": 1,
+              "harness_version": "v0",
+              "instrument_kind": "logical_lance_object_store_ops",
+              "benchmark": "node-vs-edge-insert",
+              "outcome": "passed",
+          }
+          for field, value in expected.items():
+              if record.get(field) != value:
+                  raise SystemExit(
+                      f"unexpected {field}: {record.get(field)!r}; expected {value!r}"
+                  )
+          samples = record.get("samples", [])
+          shape = [
+              (
+                  sample.get("sample_key"),
+                  sample.get("pair_key"),
+                  sample.get("pair_order"),
+                  sample.get("position"),
+                  sample.get("operation"),
+              )
+              for sample in samples
+          ]
+          expected_shape = [
+              ("ab/node", "ab", "node-then-edge", 1, "node_insert"),
+              ("ab/edge", "ab", "node-then-edge", 2, "edge_insert"),
+              ("ba/edge", "ba", "edge-then-node", 1, "edge_insert"),
+              ("ba/node", "ba", "edge-then-node", 2, "node_insert"),
+          ]
+          if shape != expected_shape:
+              raise SystemExit(f"unexpected AB/BA samples: {shape!r}")
+          totals = [
+              sample.get("instrumentation", {})
+              .get("object_store_ops", {})
+              .get("total")
+              for sample in samples
+          ]
+          if any(
+              isinstance(total, bool) or not isinstance(total, int) or total <= 0
+              for total in totals
+          ):
+              raise SystemExit(f"vacuous RustFS logical-op totals: {totals!r}")
+          if totals[0] != totals[3] or totals[1] != totals[2]:
+              raise SystemExit(f"RustFS AB/BA totals are not repeatable: {totals!r}")
+          approved_limits = {"node_insert": 37, "edge_insert": 57}
+          for operation, approved_limit in approved_limits.items():
+              ceiling = (
+                  record.get("ceilings", {})
+                  .get(operation, {})
+                  .get("max_total_ops")
+              )
+              if (
+                  isinstance(ceiling, bool)
+                  or not isinstance(ceiling, int)
+                  or ceiling <= 0
+                  or ceiling > approved_limit
+              ):
+                  raise SystemExit(
+                      f"unexpected {operation} RustFS ceiling: {ceiling!r}"
+                  )
+              operation_totals = [
+                  total
+                  for sample, total in zip(samples, totals, strict=True)
+                  if sample.get("operation") == operation
+              ]
+              if any(total > ceiling for total in operation_totals):
+                  raise SystemExit(
+                      f"{operation} RustFS totals exceed ceiling {ceiling}: "
+                      f"{operation_totals!r}"
+                  )
+          if record.get("fixture", {}).get("backend") != "s3_compatible":
+              raise SystemExit(f"unexpected fixture backend: {record.get('fixture')!r}")
+          PY
+
+      - name: Upload RustFS node-versus-edge cost evidence
+        if: always() && matrix.shard == 'default'
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-vs-edge-logical-cost-rustfs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/omnigraph-cost-bench-rustfs/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Run RustFS recovery-sidecar lifecycle
         if: matrix.shard == 'failpoints'

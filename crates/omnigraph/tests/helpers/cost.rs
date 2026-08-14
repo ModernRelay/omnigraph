@@ -222,10 +222,11 @@ pub async fn open_attempt_tracked_lance_dataset_at_version(
 
 /// Object-store op counts for one measured operation, by table class — the
 /// vocabulary cost tests assert in (vs raw `IOTracker::stats().read_iops`).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IoCounts {
-    /// Per-table DATA opens (node/edge tables). The dominant write-path term.
+    /// Logical reads issued through node/edge-table Lance object stores.
     pub data_reads: u64,
+    /// Logical writes issued through node/edge-table Lance object stores.
     pub data_writes: u64,
     /// DATA-table reads attributed to latest-version resolution (`_versions/`,
     /// `.manifest`). This is the **opener** term step 3a flattened — isolated from
@@ -235,9 +236,11 @@ pub struct IoCounts {
     /// merge-insert/RI **scan**, which grows with fragment count (compaction's
     /// domain, not the opener).
     pub data_scan_reads: u64,
-    /// `__manifest` registry scans (publish state; includes the graph-lineage rows
-    /// folded into `__manifest` by RFC-013 Phase 7).
+    /// Logical reads issued through the `__manifest` Lance object store.
+    /// [`Self::manifest_scan_count`] separately counts full row-scan invocations.
     pub manifest_reads: u64,
+    /// Logical writes issued through the `__manifest` Lance object store.
+    pub manifest_writes: u64,
     /// Version-probe invocations (the cheap freshness check).
     pub version_probes: u64,
     /// DATA-table open CALL count through the two instrumented chokepoints — an
@@ -257,6 +260,16 @@ pub struct IoCounts {
 impl IoCounts {
     pub fn total_reads(&self) -> u64 {
         self.data_reads + self.manifest_reads
+    }
+
+    pub fn total_writes(&self) -> u64 {
+        self.data_writes + self.manifest_writes
+    }
+
+    /// Logical Lance object-store calls observed by the data and manifest
+    /// wrappers. This excludes non-Lance control-object IO and SDK retries.
+    pub fn total_ops(&self) -> u64 {
+        self.total_reads() + self.total_writes()
     }
 }
 
@@ -552,6 +565,7 @@ impl OpProbes {
             data_opener_reads: t.opener_reads,
             data_scan_reads: t.scan_reads,
             manifest_reads: manifest.read_iops,
+            manifest_writes: manifest.write_iops,
             version_probes: self.probe_count.load(Ordering::Relaxed),
             data_open_count: self.data_open_count.load(Ordering::Relaxed),
             internal_open_count: self.internal_open_count.load(Ordering::Relaxed),

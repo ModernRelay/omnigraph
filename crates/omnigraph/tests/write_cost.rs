@@ -24,6 +24,14 @@
 
 mod helpers;
 
+#[path = "helpers/bench_v0.rs"]
+mod bench_v0;
+
+use bench_v0::{
+    LogicalInsertCostCeilingV1, LogicalInsertCostCeilingsV1, LogicalInsertPairOrder,
+    emit_logical_insert_record, finalize_logical_insert_record, measure_logical_insert_pair,
+    on_big_stack,
+};
 use helpers::cost::{
     IoCounts, assert_flat, assert_grows, cost_harness, last_manifest_reads, local_graph, measure,
     measure_insert, measure_insert_as, measure_with_staged,
@@ -300,6 +308,102 @@ async fn single_insert_data_write_is_bounded() {
         "data-table write_iops should be a small constant, got {}",
         io.data_writes
     );
+}
+
+const LOCAL_LOGICAL_INSERT_CEILINGS: LogicalInsertCostCeilingsV1 = LogicalInsertCostCeilingsV1 {
+    node_insert: LogicalInsertCostCeilingV1 {
+        max_total_ops: 14,
+        max_total_reads: 12,
+        max_total_writes: 2,
+        max_counts: IoCounts {
+            data_reads: 4,
+            data_writes: 1,
+            data_opener_reads: 3,
+            data_scan_reads: 1,
+            manifest_reads: 8,
+            manifest_writes: 1,
+            version_probes: 2,
+            data_open_count: 1,
+            internal_open_count: 1,
+            manifest_scan_count: 1,
+        },
+    },
+    edge_insert: LogicalInsertCostCeilingV1 {
+        max_total_ops: 34,
+        max_total_reads: 32,
+        max_total_writes: 2,
+        max_counts: IoCounts {
+            data_reads: 24,
+            data_writes: 1,
+            data_opener_reads: 17,
+            data_scan_reads: 7,
+            manifest_reads: 8,
+            manifest_writes: 1,
+            version_probes: 2,
+            data_open_count: 3,
+            internal_open_count: 1,
+            manifest_scan_count: 1,
+        },
+    },
+};
+
+/// Compare one node insert with one edge insert at the logical Lance
+/// object-store boundary. Each arm gets a fresh, equivalently seeded graph; a
+/// second pair reverses execution order and must reproduce the same counts.
+///
+/// `IoCounts::total_ops` covers the data-table and `__manifest` Lance wrappers.
+/// It deliberately does not claim physical HTTP attempts: schema/recovery
+/// control objects and SDK retries sit outside this counter and belong to the
+/// RFC-031 proxy harness.
+#[test]
+fn node_vs_edge_insert_lance_object_store_trips() {
+    on_big_stack(|| {
+        cost_harness(async {
+            let node_ab_dir = tempfile::tempdir().unwrap();
+            let edge_ab_dir = tempfile::tempdir().unwrap();
+            let mut node_ab_db = local_graph(&node_ab_dir).await;
+            let mut edge_ab_db = local_graph(&edge_ab_dir).await;
+            let mut samples = measure_logical_insert_pair(
+                &mut node_ab_db,
+                &mut edge_ab_db,
+                "ab",
+                LogicalInsertPairOrder::NodeThenEdge,
+            )
+            .await;
+            drop((node_ab_db, edge_ab_db, node_ab_dir, edge_ab_dir));
+
+            let edge_ba_dir = tempfile::tempdir().unwrap();
+            let node_ba_dir = tempfile::tempdir().unwrap();
+            let mut edge_ba_db = local_graph(&edge_ba_dir).await;
+            let mut node_ba_db = local_graph(&node_ba_dir).await;
+            samples.extend(
+                measure_logical_insert_pair(
+                    &mut node_ba_db,
+                    &mut edge_ba_db,
+                    "ba",
+                    LogicalInsertPairOrder::EdgeThenNode,
+                )
+                .await,
+            );
+            let record = finalize_logical_insert_record(
+                "local_file",
+                samples,
+                LOCAL_LOGICAL_INSERT_CEILINGS,
+            );
+            eprintln!(
+                "node total_ops={} reads={} writes={} | edge total_ops={} reads={} writes={} | \
+             edge/node={:.2}x",
+                record.summary.node_insert.object_store_ops.total,
+                record.summary.node_insert.object_store_ops.reads.total,
+                record.summary.node_insert.object_store_ops.writes.total,
+                record.summary.edge_insert.object_store_ops.total,
+                record.summary.edge_insert.object_store_ops.reads.total,
+                record.summary.edge_insert.object_store_ops.writes.total,
+                record.summary.edge_to_node_total_ops_ratio,
+            );
+            emit_logical_insert_record(&record);
+        })
+    });
 }
 
 /// At a fixed shallow depth, the per-write object-store read count is below a

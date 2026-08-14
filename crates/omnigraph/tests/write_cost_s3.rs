@@ -23,20 +23,155 @@
 //! opener flat, scan growing.)
 //!
 //! Skips gracefully without `OMNIGRAPH_S3_TEST_BUCKET` (the `tests/s3_storage.rs`
-//! pattern). A cost (IO-count) gate, not a correctness test — run on demand
-//! against RustFS/S3, NOT in the every-merge `rustfs_integration` CI job
-//! (pulled out pending a dedicated cost/perf harness; see the backend-split
-//! note in docs/dev/testing.md § Cost-budget tests).
+//! pattern). These are cost (IO-count) gates, not timing tests. The focused v0
+//! node-versus-edge comparator qualifies against RustFS after merge; the legacy
+//! S3 cost matrices remain on demand (see docs/dev/testing.md).
 #![recursion_limit = "512"]
 
 mod helpers;
 
-use helpers::cost::{IoCounts, assert_flat, measure_insert, s3_graph};
-use helpers::{commit_many, s3_test_graph_uri};
+#[path = "helpers/bench_v0.rs"]
+mod bench_v0;
+
+use bench_v0::{
+    LogicalInsertCostCeilingV1, LogicalInsertCostCeilingsV1, LogicalInsertPairOrder,
+    emit_logical_insert_record, finalize_logical_insert_record, measure_logical_insert_pair,
+    on_big_stack, run_with_cleanup,
+};
+use helpers::cost::{IoCounts, assert_flat, cost_harness, measure_insert, s3_graph};
+use helpers::{commit_many, init_and_load_uri, s3_test_graph_uri};
 use omnigraph::db::Omnigraph;
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
+
+// Calibrated in two matching current-main runs against the pinned RustFS
+// 1.0.0-beta.12 CI image. These are
+// independent of the local-FS ceilings: S3 conditional publication expands
+// each logical wrapper write into the backend-specific object-store shape.
+const S3_LOGICAL_INSERT_CEILINGS: LogicalInsertCostCeilingsV1 = LogicalInsertCostCeilingsV1 {
+    node_insert: LogicalInsertCostCeilingV1 {
+        max_total_ops: 37,
+        max_total_reads: 30,
+        max_total_writes: 7,
+        max_counts: IoCounts {
+            data_reads: 4,
+            data_writes: 3,
+            data_opener_reads: 3,
+            data_scan_reads: 1,
+            manifest_reads: 26,
+            manifest_writes: 4,
+            version_probes: 2,
+            data_open_count: 1,
+            internal_open_count: 1,
+            manifest_scan_count: 1,
+        },
+    },
+    edge_insert: LogicalInsertCostCeilingV1 {
+        max_total_ops: 57,
+        max_total_reads: 50,
+        max_total_writes: 7,
+        max_counts: IoCounts {
+            data_reads: 24,
+            data_writes: 3,
+            data_opener_reads: 17,
+            data_scan_reads: 7,
+            manifest_reads: 26,
+            manifest_writes: 4,
+            version_probes: 2,
+            data_open_count: 3,
+            internal_open_count: 1,
+            manifest_scan_count: 1,
+        },
+    },
+};
+
+/// Object-store qualification twin of the local node-versus-edge insert gate.
+/// Every sample gets a fresh, indexed copy of the standard fixture. One unique
+/// parent prefix contains all four arms and is removed after success or panic.
+///
+/// Counts remain logical Lance wrapper calls, not physical HTTP attempts or
+/// SDK retries. The ceilings are qualified against the pinned RustFS CI image;
+/// they do not claim real-AWS physical request equivalence.
+#[test]
+fn node_vs_edge_insert_lance_object_store_trips_on_s3() {
+    on_big_stack(|| {
+        cost_harness(async {
+            let Some(base_uri) = s3_test_graph_uri("write-cost-node-vs-edge") else {
+                eprintln!(
+                    "SKIP node_vs_edge_insert_lance_object_store_trips_on_s3: \
+                     OMNIGRAPH_S3_TEST_BUCKET is unset"
+                );
+                return;
+            };
+
+            // Resolve the exact unique test prefix before creating any fixture. Cleanup
+            // never targets the bucket or the caller-owned shared parent prefix.
+            let (store, path) = lance_io::object_store::ObjectStore::from_uri(&base_uri)
+                .await
+                .expect("configured S3/RustFS node-vs-edge prefix must resolve");
+            let run_base = base_uri.clone();
+            let comparison = Box::pin(async move {
+                let mut node_ab_db = init_and_load_uri(&format!("{run_base}/node-ab")).await;
+                let mut edge_ab_db = init_and_load_uri(&format!("{run_base}/edge-ab")).await;
+                let mut samples = measure_logical_insert_pair(
+                    &mut node_ab_db,
+                    &mut edge_ab_db,
+                    "ab",
+                    LogicalInsertPairOrder::NodeThenEdge,
+                )
+                .await;
+                drop((node_ab_db, edge_ab_db));
+
+                let mut edge_ba_db = init_and_load_uri(&format!("{run_base}/edge-ba")).await;
+                let mut node_ba_db = init_and_load_uri(&format!("{run_base}/node-ba")).await;
+                samples.extend(
+                    measure_logical_insert_pair(
+                        &mut node_ba_db,
+                        &mut edge_ba_db,
+                        "ba",
+                        LogicalInsertPairOrder::EdgeThenNode,
+                    )
+                    .await,
+                );
+
+                let backend = if std::env::var_os("AWS_ENDPOINT_URL_S3").is_some()
+                    || std::env::var_os("AWS_ENDPOINT_URL").is_some()
+                {
+                    "s3_compatible"
+                } else {
+                    "aws_s3"
+                };
+                let record =
+                    finalize_logical_insert_record(backend, samples, S3_LOGICAL_INSERT_CEILINGS);
+                eprintln!(
+                    "{backend}: node total_ops={} reads={} writes={} | edge total_ops={} reads={} \
+                     writes={} | edge/node={:.2}x",
+                    record.summary.node_insert.object_store_ops.total,
+                    record.summary.node_insert.object_store_ops.reads.total,
+                    record.summary.node_insert.object_store_ops.writes.total,
+                    record.summary.edge_insert.object_store_ops.total,
+                    record.summary.edge_insert.object_store_ops.reads.total,
+                    record.summary.edge_insert.object_store_ops.writes.total,
+                    record.summary.edge_to_node_total_ops_ratio,
+                );
+                emit_logical_insert_record(&record);
+            });
+
+            run_with_cleanup(
+                comparison,
+                async move {
+                    store
+                        .remove_dir_all(path)
+                        .await
+                        .map_err(|error| error.to_string())
+                },
+                "configured S3/RustFS node-vs-edge fixture cleanup must succeed",
+            )
+            .await;
+        })
+    });
+}
 
 /// After step 3a the data-table opener term is flat across depth on a real object
 /// store (the measured win). RED on the pre-3a namespace-builder opener (O(depth)

@@ -1,5 +1,5 @@
 {
-  "_comment": "Branch protection policy for main. Applied via scripts/apply-branch-protection.sh. See docs/dev/branch-protection.md for rationale. CODEOWNERS was removed (2-person team where both maintainers own everything, so code-owner review added friction without value). Review is no longer code-owner-scoped and no approvals are required; the reporting PR checks below are the gate. The full workspace, format-fence, and RustFS suites run post-merge; a red main branch is stop-the-line until fixed or reverted.",
+  "_comment": "Branch protection policy for main. Applied via scripts/apply-branch-protection.sh. See docs/dev/branch-protection.md for rationale. CODEOWNERS was removed (2-person team where both maintainers own everything, so code-owner review added friction without value). Review is no longer code-owner-scoped and no approvals are required; the reporting PR checks below are the gate. The full workspace, format-fence, and RustFS suites run post-merge; the narrow deterministic Node vs Edge Logical Cost contract runs on pull requests. A red main branch is stop-the-line until fixed or reverted.",
   "required_status_checks": {
     "strict": true,
     "contexts": [
@@ -7,7 +7,8 @@
       "Check AGENTS.md Links",
       "Test omnigraph-server --features aws",
       "Format (rustfmt)",
-      "Lint (clippy)"
+      "Lint (clippy)",
+      "Node vs Edge Logical Cost"
     ]
   },
   "enforce_admins": false,

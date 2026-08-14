@@ -125,6 +125,13 @@ pub async fn open_dataset_head(uri: &str, branch: Option<&str>) -> lance::Datase
 /// Init a graph and load the standard test data.
 pub async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
+    init_and_load_uri(uri).await
+}
+
+/// Init a graph at any supported URI and build the same indexed standard
+/// fixture used by [`init_and_load`]. Cost comparisons use this seam so local
+/// and S3/RustFS arms start from the same logical and derived state.
+pub async fn init_and_load_uri(uri: &str) -> Omnigraph {
     let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
@@ -466,9 +473,9 @@ pub fn s3_test_graph_uri(suite: &str) -> Option<String> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "omnigraph-itests".to_string());
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    Some(format!("s3://{}/{}/{}/{}", bucket, prefix, suite, unique))
+    // Cleanup-owning tests recursively remove this leaf. Wall-clock nanoseconds
+    // alone are neither monotonic nor process-unique, so include a random ULID
+    // and PID to make concurrent invocations collision-resistant.
+    let unique = format!("{}-{}", std::process::id(), ulid::Ulid::new());
+    Some(format!("s3://{bucket}/{prefix}/{suite}/{unique}"))
 }
