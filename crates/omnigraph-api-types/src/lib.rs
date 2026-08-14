@@ -343,6 +343,9 @@ pub struct EndpointsOutput {
     pub dst: String,
 }
 
+/// One entity change inside a commit page. Cause (commit, actor, branch,
+/// snapshot version) is stated once on the enclosing `CommitChangesOutput`
+/// block, never copied per entity; physical table versions stay internal.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct EntityChangeOutput {
     pub change_index: usize,
@@ -351,7 +354,6 @@ pub struct EntityChangeOutput {
     pub type_name: String,
     pub id: String,
     pub op: ChangeOpOutput,
-    pub manifest_version: u64,
     pub endpoints: Option<EndpointsOutput>,
     /// Exact logical image before a delete; user-schema keys stay verbatim.
     pub before: Option<Value>,
@@ -1060,7 +1062,6 @@ pub fn commit_changes_output(
                     omnigraph::changes::ChangeOp::Update => ChangeOpOutput::Update,
                     omnigraph::changes::ChangeOp::Delete => ChangeOpOutput::Delete,
                 },
-                manifest_version: change.manifest_version,
                 endpoints: change.endpoints.as_ref().map(|endpoints| EndpointsOutput {
                     src: endpoints.src.clone(),
                     dst: endpoints.dst.clone(),

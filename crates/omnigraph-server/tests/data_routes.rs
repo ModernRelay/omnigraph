@@ -1519,6 +1519,10 @@ async fn load_endpoint_loads_into_existing_branch() {
     assert_eq!(first["changes"][1]["id"], "Loaded B");
     assert_eq!(first["changes"][1]["change_index"], 1);
     assert_eq!(first["commit_complete"], false);
+    assert!(
+        first["changes"][0].get("manifest_version").is_none(),
+        "cause is stated once on the commit block, never per entity"
+    );
     let cursor = first["next_cursor"].as_str().expect("first page cursor");
 
     let (status, second) = json_response(
