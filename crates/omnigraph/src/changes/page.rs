@@ -1,6 +1,8 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 
-use arrow_array::{RecordBatch, StringArray};
+use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array};
+use arrow_cast::display::array_value_to_string;
 use base64::Engine;
 use datafusion::prelude::{col, lit};
 use futures::TryStreamExt;
@@ -13,8 +15,9 @@ use sha2::{Digest, Sha256};
 use super::{
     ChangeOp, Endpoints, EntityChange, EntityKind, changed_table_intervals, parse_table_key,
 };
+use crate::blob::BlobDescriptorDecoder;
 use crate::db::manifest::{Snapshot, TableIdentity};
-use crate::db::{SubTableEntry, logical_row_image};
+use crate::db::{SubTableEntry, export_blob_values, logical_row_image};
 use crate::error::{OmniError, Result};
 use crate::table_store::TableStore;
 
@@ -22,6 +25,10 @@ pub const COMMIT_CHANGES_DEFAULT_ROWS: usize = 1_000;
 pub const COMMIT_CHANGES_MAX_ROWS: usize = 8_192;
 pub const COMMIT_CHANGES_DEFAULT_BYTES: u64 = 4 * 1024 * 1024;
 pub const COMMIT_CHANGES_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Ordered-scan batch shape, matching the other production ordered-by-id
+/// scans (branch merge, export): row estimate plus byte target, never strict.
+const COMMIT_CHANGES_SCAN_ROWS: usize = 8_192;
 
 const CURSOR_VERSION: u8 = 1;
 const CURSOR_CHECKSUM_BYTES: usize = 32;
@@ -55,20 +62,27 @@ impl CommitChangesCursor {
     }
 }
 
+/// One scanned row prepared for comparison. Holds display signatures and a
+/// zero-copy one-row slice; no JSON image and no Blob payload I/O. Images are
+/// materialized only for rows that actually enter the page.
 #[derive(Debug, Clone)]
-struct LogicalRow {
+struct RawRow {
     id: String,
-    image: serde_json::Value,
-    encoded: Vec<u8>,
-    endpoints: Option<Endpoints>,
+    /// One-row slice of the scanned batch, retaining `_rowid` and descriptor
+    /// columns for lazy image and payload access.
+    slice: RecordBatch,
+    /// Display rendering of every non-Blob, non-storage column, joined with
+    /// the same separator the diff comparator uses.
+    scalar_signature: String,
+    /// `(column, physical descriptor identity)` per Blob column, in schema
+    /// order. Equal identities on one table lifetime imply equal payloads.
+    blob_signatures: Vec<(String, String)>,
 }
 
 struct OrderedRows {
     dataset: Option<Dataset>,
     stream: Option<Pin<Box<DatasetRecordBatchStream>>>,
-    batch: Option<RecordBatch>,
-    row: usize,
-    peeked: Option<LogicalRow>,
+    pending: VecDeque<RawRow>,
 }
 
 impl OrderedRows {
@@ -91,11 +105,13 @@ impl OrderedRows {
                         if let Some(after_id) = after_id {
                             scanner.filter_expr(col("id").gt(lit(after_id)));
                         }
-                        // One row per batch makes retained scan memory bounded by
-                        // the maximum legal logical row image.
-                        scanner.batch_size(1);
+                        // Descriptor-sized batches bounded by rows AND bytes, the
+                        // same shape as every other production ordered-by-id scan.
+                        // strict_batch_size is deliberately absent: Lance's strict
+                        // stream coalesces to a row count the environment can
+                        // override and ignores the byte target while accumulating.
+                        scanner.batch_size(COMMIT_CHANGES_SCAN_ROWS);
                         scanner.batch_size_bytes(COMMIT_CHANGES_MAX_BYTES);
-                        scanner.strict_batch_size(true);
                         scanner.blob_handling(BlobHandling::BlobsDescriptions);
                         Ok(())
                     },
@@ -109,75 +125,176 @@ impl OrderedRows {
         Ok(Self {
             dataset,
             stream,
-            batch: None,
-            row: 0,
-            peeked: None,
+            pending: VecDeque::new(),
         })
     }
 
-    async fn peek(&mut self, is_edge: bool) -> Result<Option<LogicalRow>> {
-        if self.peeked.is_none() {
-            self.peeked = self.next(is_edge).await?;
-        }
-        Ok(self.peeked.clone())
+    async fn peek(&mut self) -> Result<Option<RawRow>> {
+        self.fill().await?;
+        Ok(self.pending.front().cloned())
     }
 
-    async fn pop(&mut self, is_edge: bool) -> Result<Option<LogicalRow>> {
-        if self.peeked.is_some() {
-            return Ok(self.peeked.take());
-        }
-        self.next(is_edge).await
+    async fn pop(&mut self) -> Result<Option<RawRow>> {
+        self.fill().await?;
+        Ok(self.pending.pop_front())
     }
 
-    async fn next(&mut self, is_edge: bool) -> Result<Option<LogicalRow>> {
-        loop {
-            if let Some(batch) = &self.batch {
-                if self.row < batch.num_rows() {
-                    let row = logical_row(
-                        self.dataset.as_ref().expect("stream has dataset"),
-                        batch,
-                        self.row,
-                        is_edge,
-                    )
-                    .await?;
-                    self.row += 1;
-                    return Ok(Some(row));
-                }
-            }
+    async fn fill(&mut self) -> Result<()> {
+        while self.pending.is_empty() {
             let Some(stream) = self.stream.as_mut() else {
-                return Ok(None);
+                return Ok(());
             };
             match stream.try_next().await {
-                Ok(Some(batch)) => {
-                    self.batch = Some(batch);
-                    self.row = 0;
-                }
+                Ok(Some(batch)) => self.pending = prepare_batch(&batch)?,
                 Ok(None) => {
                     self.stream = None;
-                    self.batch = None;
-                    return Ok(None);
+                    return Ok(());
                 }
                 Err(error) => return Err(OmniError::Lance(error.to_string())),
             }
         }
+        Ok(())
+    }
+
+    fn dataset(&self) -> &Dataset {
+        self.dataset
+            .as_ref()
+            .expect("a side that produced a row has a dataset")
     }
 }
 
-async fn logical_row(
-    dataset: &Dataset,
-    batch: &RecordBatch,
-    row: usize,
-    is_edge: bool,
-) -> Result<LogicalRow> {
-    let id = batch
+/// Turn one scanned batch into comparison-ready rows: display signatures for
+/// scalar columns and physical descriptor identities for Blob columns. This
+/// is pure in-memory work — Blob payloads are never touched here.
+fn prepare_batch(batch: &RecordBatch) -> Result<VecDeque<RawRow>> {
+    let ids = batch
         .column_by_name("id")
         .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| OmniError::Lance("change row is missing string id".to_string()))?
-        .value(row)
-        .to_string();
-    let image = logical_row_image(dataset, batch, row).await?;
-    let encoded =
-        serde_json::to_vec(&image).map_err(|error| OmniError::Lance(error.to_string()))?;
+        .ok_or_else(|| OmniError::Lance("change row is missing string id".to_string()))?;
+
+    enum ColumnClass<'a> {
+        Scalar(&'a dyn Array),
+        Blob(&'a str, BlobDescriptorDecoder<'a>),
+    }
+
+    let mut classes = Vec::with_capacity(batch.num_columns());
+    for (field, column) in batch.schema_ref().fields().iter().zip(batch.columns()) {
+        if field.name().starts_with("_row") {
+            continue;
+        }
+        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if lance_field.is_blob() {
+            let descriptions = column
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    OmniError::Lance(format!(
+                        "expected blob descriptions for change column '{}'",
+                        field.name()
+                    ))
+                })?;
+            classes.push(ColumnClass::Blob(
+                field.name().as_str(),
+                BlobDescriptorDecoder::try_new(descriptions)?,
+            ));
+        } else {
+            classes.push(ColumnClass::Scalar(column.as_ref()));
+        }
+    }
+
+    let mut rows = VecDeque::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let mut scalars = Vec::new();
+        let mut blob_signatures = Vec::new();
+        for class in &classes {
+            match class {
+                ColumnClass::Scalar(column) => scalars.push(
+                    array_value_to_string(*column, row)
+                        .map_err(|error| OmniError::Lance(error.to_string()))?,
+                ),
+                ColumnClass::Blob(name, decoder) => {
+                    blob_signatures.push((name.to_string(), decoder.physical_identity(row)?));
+                }
+            }
+        }
+        rows.push_back(RawRow {
+            id: ids.value(row).to_string(),
+            slice: batch.slice(row, 1),
+            scalar_signature: scalars.join("\u{1f}"),
+            blob_signatures,
+        });
+    }
+    Ok(rows)
+}
+
+/// Payload-free row equality with an exact payload tie-break.
+///
+/// Scalar columns compare by display signature; Blob columns compare by
+/// physical descriptor identity first. Only a descriptor tie — same scalars,
+/// different descriptor — pays payload I/O, because compaction can relocate
+/// identical bytes and must not surface as a phantom update. The payload
+/// comparison uses the same logical values export emits (managed bytes,
+/// external reference URI, null), so equality here is exactly image equality.
+async fn rows_equal(
+    from_dataset: &Dataset,
+    left: &RawRow,
+    to_dataset: &Dataset,
+    right: &RawRow,
+) -> Result<bool> {
+    if left.scalar_signature != right.scalar_signature {
+        return Ok(false);
+    }
+    if left.blob_signatures == right.blob_signatures {
+        return Ok(true);
+    }
+    let column_sets_match = left.blob_signatures.len() == right.blob_signatures.len()
+        && left
+            .blob_signatures
+            .iter()
+            .zip(&right.blob_signatures)
+            .all(|(l, r)| l.0 == r.0);
+    if !column_sets_match {
+        // The two pinned versions disagree on the Blob column set, so the
+        // logical image necessarily changed shape.
+        return Ok(false);
+    }
+    let differing: HashSet<String> = left
+        .blob_signatures
+        .iter()
+        .zip(&right.blob_signatures)
+        .filter(|(l, r)| l.1 != r.1)
+        .map(|(l, _)| l.0.clone())
+        .collect();
+    let left_values = blob_values_for(from_dataset, &left.slice, &differing).await?;
+    let right_values = blob_values_for(to_dataset, &right.slice, &differing).await?;
+    Ok(left_values == right_values)
+}
+
+/// Logical Blob values (managed bytes, external URI, or null) for one row's
+/// selected columns, read through the same helper export uses.
+async fn blob_values_for(
+    dataset: &Dataset,
+    slice: &RecordBatch,
+    columns: &HashSet<String>,
+) -> Result<HashMap<String, Vec<Option<String>>>> {
+    let row_id = slice
+        .column_by_name("_rowid")
+        .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+        .ok_or_else(|| OmniError::Lance("change row is missing _rowid".to_string()))?
+        .value(0);
+    export_blob_values(dataset, slice, &[row_id], columns).await
+}
+
+/// Materialize the exact logical image (and edge endpoints) for one row that
+/// is entering the page. This is the only place Blob payloads are read for
+/// emitted changes.
+async fn emitted_image(
+    dataset: &Dataset,
+    raw: &RawRow,
+    is_edge: bool,
+) -> Result<(serde_json::Value, Option<Endpoints>)> {
+    let image = logical_row_image(dataset, &raw.slice, 0).await?;
     let endpoints = if is_edge {
         let object = image
             .as_object()
@@ -197,38 +314,37 @@ async fn logical_row(
     } else {
         None
     };
-    Ok(LogicalRow {
-        id,
-        image,
-        encoded,
-        endpoints,
-    })
+    Ok((image, endpoints))
 }
 
-fn make_change(
+fn entity_change(
     table_key: &str,
     kind: EntityKind,
     type_name: &str,
     op: ChangeOp,
     manifest_version: u64,
-    before: Option<LogicalRow>,
-    after: Option<LogicalRow>,
+    id: String,
+    endpoints: Option<Endpoints>,
+    before: Option<serde_json::Value>,
+    after: Option<serde_json::Value>,
 ) -> EntityChange {
-    let row = after.as_ref().or(before.as_ref()).expect("one row image");
     EntityChange {
         table_key: table_key.to_string(),
         change_index: 0,
         kind,
         type_name: type_name.to_string(),
-        id: row.id.clone(),
+        id,
         op,
         manifest_version,
-        endpoints: row.endpoints.clone(),
-        before: before.map(|row| row.image),
-        after: after.map(|row| row.image),
+        endpoints,
+        before,
+        after,
     }
 }
 
+/// The next logical change in the ordered id merge, or `None` when both sides
+/// are exhausted. Rows that compare equal are consumed without emitting and
+/// without payload or image work.
 async fn next_change(
     from: &mut OrderedRows,
     to: &mut OrderedRows,
@@ -237,78 +353,79 @@ async fn next_change(
     type_name: &str,
     manifest_version: u64,
 ) -> Result<Option<EntityChange>> {
+    enum Emit {
+        Delete(RawRow),
+        Insert(RawRow),
+        Update(RawRow),
+    }
+    let is_edge = kind == EntityKind::Edge;
     loop {
-        let left = from.peek(kind == EntityKind::Edge).await?;
-        let right = to.peek(kind == EntityKind::Edge).await?;
-        let change = match (left, right) {
+        let left = from.peek().await?;
+        let right = to.peek().await?;
+        let emit = match (left, right) {
             (None, None) => return Ok(None),
-            (Some(left), None) => {
-                from.pop(kind == EntityKind::Edge).await?;
-                Some(make_change(
-                    table_key,
-                    kind,
-                    type_name,
-                    ChangeOp::Delete,
-                    manifest_version,
-                    Some(left),
-                    None,
-                ))
-            }
-            (None, Some(right)) => {
-                to.pop(kind == EntityKind::Edge).await?;
-                Some(make_change(
-                    table_key,
-                    kind,
-                    type_name,
-                    ChangeOp::Insert,
-                    manifest_version,
-                    None,
-                    Some(right),
-                ))
-            }
+            (Some(_), None) => Emit::Delete(from.pop().await?.expect("peeked row present")),
+            (None, Some(_)) => Emit::Insert(to.pop().await?.expect("peeked row present")),
             (Some(left), Some(right)) if left.id < right.id => {
-                from.pop(kind == EntityKind::Edge).await?;
-                Some(make_change(
-                    table_key,
-                    kind,
-                    type_name,
-                    ChangeOp::Delete,
-                    manifest_version,
-                    Some(left),
-                    None,
-                ))
+                Emit::Delete(from.pop().await?.expect("peeked row present"))
             }
             (Some(left), Some(right)) if left.id > right.id => {
-                to.pop(kind == EntityKind::Edge).await?;
-                Some(make_change(
+                Emit::Insert(to.pop().await?.expect("peeked row present"))
+            }
+            (Some(_), Some(_)) => {
+                let left = from.pop().await?.expect("peeked row present");
+                let right = to.pop().await?.expect("peeked row present");
+                if rows_equal(from.dataset(), &left, to.dataset(), &right).await? {
+                    continue;
+                }
+                Emit::Update(right)
+            }
+        };
+        let change = match emit {
+            Emit::Delete(raw) => {
+                let (image, endpoints) = emitted_image(from.dataset(), &raw, is_edge).await?;
+                entity_change(
+                    table_key,
+                    kind,
+                    type_name,
+                    ChangeOp::Delete,
+                    manifest_version,
+                    raw.id,
+                    endpoints,
+                    Some(image),
+                    None,
+                )
+            }
+            Emit::Insert(raw) => {
+                let (image, endpoints) = emitted_image(to.dataset(), &raw, is_edge).await?;
+                entity_change(
                     table_key,
                     kind,
                     type_name,
                     ChangeOp::Insert,
                     manifest_version,
+                    raw.id,
+                    endpoints,
                     None,
-                    Some(right),
-                ))
+                    Some(image),
+                )
             }
-            (Some(left), Some(right)) => {
-                from.pop(kind == EntityKind::Edge).await?;
-                to.pop(kind == EntityKind::Edge).await?;
-                (left.encoded != right.encoded).then(|| {
-                    make_change(
-                        table_key,
-                        kind,
-                        type_name,
-                        ChangeOp::Update,
-                        manifest_version,
-                        None,
-                        Some(right),
-                    )
-                })
+            Emit::Update(raw) => {
+                let (image, endpoints) = emitted_image(to.dataset(), &raw, is_edge).await?;
+                entity_change(
+                    table_key,
+                    kind,
+                    type_name,
+                    ChangeOp::Update,
+                    manifest_version,
+                    raw.id,
+                    endpoints,
+                    None,
+                    Some(image),
+                )
             }
         };
-        if change.is_some() {
-            return Ok(change);
-        }
+        return Ok(Some(change));
     }
 }
 

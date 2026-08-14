@@ -435,6 +435,102 @@ node Article @rename_from("Document") {
 }
 
 #[tokio::test]
+async fn commit_changes_suppress_unchanged_blob_rows_and_physical_only_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        r#"
+node Document {
+    title: String @key
+    note: String?
+    payload: Blob?
+}
+"#,
+    )
+    .await
+    .unwrap();
+    db.load_with_receipt(
+        "main",
+        concat!(
+            r#"{"type":"Document","data":{"title":"a","note":"one","payload":"base64:QQ=="}}"#,
+            "\n",
+            r#"{"type":"Document","data":{"title":"b","note":"two","payload":"base64:Qg=="}}"#,
+        ),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // A scalar-only update to one row: the sibling row's Blob descriptor is
+    // untouched, so the page holds exactly one change whose after-image still
+    // carries the stored payload, and the unchanged sibling never surfaces.
+    let updated = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Document","data":{"title":"a","note":"revised","payload":"base64:QQ=="}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let page = db
+        .commit_changes_page(
+            &updated.commit.graph_commit_id,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.changes
+            .iter()
+            .map(|change| (change.id.as_str(), change.op))
+            .collect::<Vec<_>>(),
+        vec![("a", ChangeOp::Update)],
+        "an unchanged sibling row must not surface as a change"
+    );
+    assert_eq!(
+        page.changes[0].after,
+        Some(serde_json::json!({
+            "id": "a",
+            "title": "a",
+            "note": "revised",
+            "payload": "base64:QQ==",
+        }))
+    );
+
+    // Compaction rewrites the Blob table and moves every descriptor without
+    // touching logical rows. The moved descriptors force the payload
+    // tie-break, which must classify every row as unchanged: the maintenance
+    // commit is an empty block, not a phantom full-table update.
+    let stats = db.optimize().await.unwrap();
+    assert!(
+        stats
+            .iter()
+            .any(|table| table.fragments_removed > 0 && table.committed),
+        "the fixture must actually compact so descriptors move"
+    );
+    let optimize_commit = head_commit_id(uri, None).await;
+    assert_ne!(optimize_commit, updated.commit.graph_commit_id);
+    let physical_only = db
+        .commit_changes_page(
+            &optimize_commit,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert!(
+        physical_only.changes.is_empty(),
+        "a physical-only commit is an empty block: {:?}",
+        physical_only.changes
+    );
+    assert!(physical_only.commit_complete);
+}
+
+#[tokio::test]
 async fn diff_empty_when_nothing_changed() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;

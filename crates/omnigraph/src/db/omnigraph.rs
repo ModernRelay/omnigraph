@@ -39,7 +39,7 @@ mod repair;
 mod schema_apply;
 mod table_ops;
 
-pub(crate) use export::logical_row_image;
+pub(crate) use export::{export_blob_values, logical_row_image};
 
 #[doc(hidden)]
 pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};

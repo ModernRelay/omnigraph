@@ -364,7 +364,7 @@ where
     Ok(())
 }
 
-async fn export_blob_values(
+pub(crate) async fn export_blob_values(
     source_ds: &Dataset,
     batch: &RecordBatch,
     row_ids: &[u64],
