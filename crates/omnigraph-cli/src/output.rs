@@ -859,6 +859,8 @@ pub(crate) fn print_commit_human(commit: &CommitOutput) {
 }
 
 pub(crate) fn print_commit_changes_human(output: &CommitChangesOutput) {
+    // The cause is stated once per page, mirroring the wire block shape.
+    print_commit_human(&output.commit);
     for change in &output.changes {
         println!(
             "{} {} {} {}",
