@@ -687,21 +687,6 @@ pub(crate) enum CommitCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List the ordered changes introduced by one graph commit
-    Changes {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        commit_id: String,
-        #[arg(long)]
-        cursor: Option<String>,
-        #[arg(long)]
-        limit: Option<usize>,
-        #[arg(long)]
-        max_bytes: Option<u64>,
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 #[derive(Debug, Subcommand)]

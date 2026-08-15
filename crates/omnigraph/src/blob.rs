@@ -910,28 +910,6 @@ impl<'a> BlobDescriptorDecoder<'a> {
             ))),
         }
     }
-
-    /// Canonical physical identity of one descriptor row, after full
-    /// classification. Within one table lifetime, equal identities reference
-    /// identical immutable stored bytes (fragments and blob files never mutate
-    /// in place), so a comparator can skip payload I/O on equality. Inequality
-    /// proves nothing about the payload — compaction relocates identical bytes
-    /// — so callers must byte-compare payloads before reporting a change.
-    /// Null uses the classified state, never sentinel child values, so the two
-    /// physical null encodings share one identity.
-    pub(crate) fn physical_identity(&self, row: usize) -> Result<String> {
-        match self.classify(row)? {
-            BlobDescriptor::Null => Ok("null".to_string()),
-            _ => Ok(format!(
-                "{}:{}:{}:{}:{}",
-                self.kinds.value(row),
-                self.positions.value(row),
-                self.sizes.value(row),
-                self.blob_ids.value(row),
-                self.blob_uris.value(row),
-            )),
-        }
-    }
 }
 
 struct ResolvedBlobCell {

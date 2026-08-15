@@ -269,27 +269,6 @@ fn parity_commit_list_branch() {
 }
 
 #[test]
-fn parity_commit_changes() {
-    let p = parity();
-    let (list, _) = p.run(&["commit", "list", "--json"]);
-    let commit_id = parse_stdout_json(&list)["commits"][0]["graph_commit_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let (l, r) = p.run(&[
-        "commit",
-        "changes",
-        &commit_id,
-        "--limit",
-        "1",
-        "--max-bytes",
-        "65536",
-        "--json",
-    ]);
-    assert_parity("commit changes", &l, &r);
-}
-
-#[test]
 fn parity_mutate() {
     let p = parity();
     let (l, r) = p.run(&[

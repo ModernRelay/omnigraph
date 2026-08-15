@@ -206,7 +206,6 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/branches/merge",
     "/graphs/{graph_id}/commits",
     "/graphs/{graph_id}/commits/{commit_id}",
-    "/graphs/{graph_id}/commits/{commit_id}/changes",
 ];
 
 #[test]
@@ -623,26 +622,6 @@ fn openapi_commit_show_is_get() {
     assert!(doc["paths"]["/graphs/{graph_id}/commits/{commit_id}"]["get"].is_object());
 }
 
-#[test]
-fn openapi_commit_changes_is_bounded_get() {
-    let doc = openapi_json();
-    let operation = &doc["paths"]["/graphs/{graph_id}/commits/{commit_id}/changes"]["get"];
-    assert!(operation.is_object());
-    let params = operation["parameters"].as_array().unwrap();
-    for (name, location) in [
-        ("commit_id", "path"),
-        ("cursor", "query"),
-        ("limit", "query"),
-        ("max_bytes", "query"),
-    ] {
-        assert!(
-            params
-                .iter()
-                .any(|parameter| parameter["name"] == name && parameter["in"] == location)
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Schema coverage tests
 // ---------------------------------------------------------------------------
@@ -661,12 +640,6 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "QueryRequest",
     "CommitListOutput",
     "CommitOutput",
-    "CommitChangesOutput",
-    "EntityChangeOutput",
-    "EntityKindOutput",
-    "ChangeOpOutput",
-    "EndpointsOutput",
-    "ChangeFeedGapOutput",
     "ErrorCode",
     "ErrorOutput",
     "BlobRangeOutput",
@@ -1180,7 +1153,6 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/graphs/{graph_id}/branches/merge", "post"),
         ("/graphs/{graph_id}/commits", "get"),
         ("/graphs/{graph_id}/commits/{commit_id}", "get"),
-        ("/graphs/{graph_id}/commits/{commit_id}/changes", "get"),
     ];
 
     for (path, method) in protected_paths {
@@ -1657,7 +1629,6 @@ const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/branches/merge",
     "/graphs/{graph_id}/commits",
     "/graphs/{graph_id}/commits/{commit_id}",
-    "/graphs/{graph_id}/commits/{commit_id}/changes",
 ];
 
 async fn app_for_multi_mode(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {
@@ -1735,7 +1706,6 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
         "/branches/merge",
         "/commits",
         "/commits/{commit_id}",
-        "/commits/{commit_id}/changes",
     ];
     for flat in flat_protected {
         assert!(
@@ -1940,7 +1910,6 @@ async fn served_spec_always_nests_under_cluster_prefix() {
         "/branches/merge",
         "/commits",
         "/commits/{commit_id}",
-        "/commits/{commit_id}/changes",
     ];
     for flat in flat_protected {
         assert!(
