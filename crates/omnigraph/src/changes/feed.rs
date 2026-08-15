@@ -149,6 +149,24 @@ impl FeedScope {
     }
 }
 
+/// Mint a durable cursor positioned after `after_commit_id` in this cut and
+/// scope — the baseline handshake's `AfterCommit(H)` equivalent.
+pub(crate) fn mint_cursor_after(
+    graph_identity: &str,
+    cut: &ChangeFeedCut,
+    scope: &super::model::ChangeFeedScope,
+    after_commit_id: &str,
+) -> Result<String> {
+    FeedScope {
+        graph_identity: token::hashed_identity(graph_identity),
+        genesis: cut.genesis.clone(),
+        branch: cut.branch.clone(),
+        witness: cut.witness.clone(),
+        filter_digest: token::filter_digest(scope),
+    }
+    .mint_cursor(after_commit_id)
+}
+
 /// Where this poll starts, after position validation.
 struct ResolvedPosition {
     /// Head of this poll's cut (commits after it stay outside the page).

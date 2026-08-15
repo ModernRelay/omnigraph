@@ -2423,6 +2423,20 @@ impl Omnigraph {
         export::export_jsonl_to_writer(self, branch, type_names, table_keys, writer).await
     }
 
+    /// The change-feed baseline handshake: stream one exact data-only entity
+    /// snapshot pinned at a coherently captured branch head into `writer` and
+    /// return that head's commit id plus the cursor that resumes the feed
+    /// immediately after it. A failed export returns `Err` — a usable cursor
+    /// never outlives a broken snapshot.
+    pub async fn capture_change_baseline<W: Write>(
+        &self,
+        branch: &str,
+        scope: &crate::changes::ChangeFeedScope,
+        writer: &mut W,
+    ) -> Result<crate::changes::ChangeBaseline> {
+        export::capture_change_baseline(self, branch, scope, writer).await
+    }
+
     // ─── Graph index ──────────────────────────────────────────────────────
 
     /// Get or build the graph index for the current snapshot.

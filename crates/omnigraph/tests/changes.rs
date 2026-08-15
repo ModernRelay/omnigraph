@@ -2262,3 +2262,132 @@ async fn change_feed_resume_is_stateless_across_handles() {
     let (_, caught_up) = boundary_cursor(&page);
     assert!(caught_up);
 }
+
+#[tokio::test]
+async fn change_feed_gap_then_baseline_reset() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedScope, ChangeFeedStart};
+    use omnigraph::error::OmniError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let (c0, _) = boundary_cursor(
+        &db.poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap(),
+    );
+    let commit_a = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Person","data":{"name":"gap-a","age":1}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    db.load_with_receipt(
+        "main",
+        r#"{"type":"Person","data":{"name":"gap-b","age":2}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // Reclaim the Person history commit A pins: the feed cannot continue
+    // contiguously and surfaces the typed gap with the caller's cursor.
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let person_path = &snapshot.entry("node:Person").unwrap().table_path;
+    let person_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        person_path.trim_start_matches('/')
+    );
+    let person = lance::Dataset::open(&person_uri).await.unwrap();
+    let removed = lance::dataset::cleanup::cleanup_old_versions(
+        &person,
+        lance::dataset::cleanup::CleanupPolicy {
+            before_version: Some(person.version().version),
+            delete_unverified: true,
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(removed.old_versions > 0, "precondition: history reclaimed");
+
+    let gap = db
+        .poll_change_feed(feed_request(None, ChangeFeedPosition::Cursor(c0.clone())))
+        .await
+        .unwrap_err();
+    match gap {
+        OmniError::ChangeFeedGap {
+            cursor,
+            first_unreadable_commit_id,
+        } => {
+            assert_eq!(cursor.as_deref(), Some(c0.as_str()));
+            assert_eq!(first_unreadable_commit_id, commit_a.commit.graph_commit_id);
+        }
+        other => panic!("expected a typed change feed gap, got: {other:?}"),
+    }
+
+    // Recovery is the exact baseline handshake: one snapshot pinned AT the
+    // captured head plus the cursor that resumes right after it.
+    let scope = ChangeFeedScope::default();
+    let mut snapshot_bytes = Vec::new();
+    let baseline = db
+        .capture_change_baseline("main", &scope, &mut snapshot_bytes)
+        .await
+        .unwrap();
+    assert_eq!(
+        baseline.snapshot_commit_id,
+        snapshot_id(&db, "main").await.unwrap().as_str(),
+        "the snapshot is pinned at the captured head"
+    );
+    let exported = String::from_utf8(snapshot_bytes).unwrap();
+    assert!(exported.contains("gap-a") && exported.contains("gap-b"));
+    let direct = db.export_jsonl("main", &[], &[]).await.unwrap();
+    assert_eq!(exported, direct, "the baseline is the exact entity export");
+
+    // A commit landing AFTER the handshake is outside the snapshot and is the
+    // first block the resumed feed yields.
+    let post = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Person","data":{"name":"post-baseline","age":3}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    assert!(!exported.contains("post-baseline"));
+    let resumed = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Cursor(baseline.resume_cursor),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resumed.blocks.len(), 1);
+    assert_eq!(
+        resumed.blocks[0].cause.graph_commit_id,
+        post.commit.graph_commit_id
+    );
+
+    // A failing writer fails the handshake: no cursor can outlive a broken
+    // snapshot.
+    struct FailingWriter;
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("sink failed"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    assert!(
+        db.capture_change_baseline("main", &scope, &mut FailingWriter)
+            .await
+            .is_err()
+    );
+}

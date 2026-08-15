@@ -186,6 +186,80 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
     .await
 }
 
+/// The baseline handshake: capture one branch head coherently, stream the
+/// data-only entity snapshot PINNED at that head into `writer`, and mint the
+/// cursor that resumes the change feed immediately after it.
+///
+/// The export-cut permit is held from before head capture until the last byte,
+/// so cleanup, schema apply, branch replacement, and root deletion cannot
+/// remove or reuse the selected coordinates mid-handshake — this closes the
+/// head-capture/export race a bare head ID plus a later export would have. A
+/// failed export returns `Err`, so a usable cursor structurally cannot outlive
+/// a broken snapshot.
+pub(super) async fn capture_change_baseline<W: Write>(
+    db: &Omnigraph,
+    branch: &str,
+    scope: &crate::changes::ChangeFeedScope,
+    writer: &mut W,
+) -> Result<crate::changes::ChangeBaseline> {
+    let _export_cut = db.write_queue().try_acquire_export_cut().ok_or_else(|| {
+        OmniError::ResourceLimitExceeded {
+            resource: "stream_export_slots".to_string(),
+            limit: 1,
+            actual: 2,
+        }
+    })?;
+    let normalized_branch = Some(branch).filter(|branch| *branch != "main");
+    let cut = db
+        .coordinator
+        .read()
+        .await
+        .capture_change_cut(normalized_branch)
+        .await?;
+
+    // Pin the export at the captured head commit, not the live branch tip: a
+    // commit landing after the capture is outside the snapshot and arrives on
+    // the first poll from the returned cursor.
+    let (resolved, catalog) = db
+        .capture_read_view(ReadTarget::Snapshot(super::SnapshotId::new(
+            cut.head.clone(),
+        )))
+        .await?;
+    let type_names = scope.type_names.clone().unwrap_or_default();
+    let selected_tables: Vec<String> = export_table_keys(&resolved.snapshot, &type_names, &[])?
+        .into_iter()
+        .filter(|table_key| {
+            let kind = if table_key.starts_with("edge:") {
+                crate::changes::ChangeEntityKind::Edge
+            } else {
+                crate::changes::ChangeEntityKind::Node
+            };
+            scope.wants_kind(kind)
+        })
+        .collect();
+    let mut emit =
+        |chunk: Vec<u8>| std::future::ready(writer.write_all(&chunk).map_err(OmniError::from));
+    export_selected_tables(
+        db,
+        &resolved.snapshot,
+        catalog.as_ref(),
+        &selected_tables,
+        &mut emit,
+    )
+    .await?;
+
+    let resume_cursor = crate::changes::feed::mint_cursor_after(
+        &db.schema_view.load().schema_identity_domain,
+        &cut,
+        scope,
+        &cut.head,
+    )?;
+    Ok(crate::changes::ChangeBaseline {
+        snapshot_commit_id: cut.head,
+        resume_cursor,
+    })
+}
+
 async fn entity_from_snapshot(
     db: &Omnigraph,
     snapshot: &Snapshot,
