@@ -704,7 +704,10 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
         ),
         "the advanced branch must observe the deletion, got {deleted:?}"
     );
+}
 
+#[tokio::test]
+async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_reads() {
     // Lance branch versions live in independent namespaces and a deleted
     // branch can be recreated at the same name and numeric table version.
     // The UUID-bearing transaction-file identity in each immutable manifest
@@ -972,6 +975,10 @@ node Marker {
 
 #[tokio::test]
 async fn branch_merge_with_external_blob_uri_materializes_payload() {
+    Box::pin(branch_merge_with_external_blob_uri_materializes_payload_body()).await;
+}
+
+async fn branch_merge_with_external_blob_uri_materializes_payload_body() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let external_dir = tempfile::tempdir().unwrap();
@@ -1327,6 +1334,10 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
 /// row total exceeds 32 MiB. Both failures are entirely pre-effect.
 #[tokio::test]
 async fn branch_merge_rejects_oversized_blob_payloads_pre_effect() {
+    Box::pin(branch_merge_rejects_oversized_blob_payloads_pre_effect_body()).await;
+}
+
+async fn branch_merge_rejects_oversized_blob_payloads_pre_effect_body() {
     const LIMIT: u64 = 32 * 1024 * 1024;
 
     for (case, first_bytes, second_bytes, split_across_tables, expected_actual) in [
