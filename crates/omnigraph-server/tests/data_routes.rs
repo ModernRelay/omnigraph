@@ -3541,3 +3541,90 @@ async fn change_baseline_streams_snapshot_then_terminal_cursor() {
     );
     assert_eq!(resumed["caught_up"], true);
 }
+
+/// The wire vocabulary gate: no change-surface response may carry physical
+/// storage vocabulary. This walks every JSON key of real commit-diff, feed,
+/// and baseline-terminal responses and rejects the forbidden set outright.
+#[tokio::test(flavor = "multi_thread")]
+async fn change_responses_carry_no_storage_vocabulary() {
+    const FORBIDDEN_KEYS: &[&str] = &[
+        "table_key",
+        "stable_table_id",
+        "table_incarnation_id",
+        "incarnation",
+        "manifest_version",
+        "table_version",
+        "table_branch",
+        "table_path",
+        "row_addr",
+        "_rowid",
+        "fragment",
+        "part",
+        "commit_complete",
+        "change_index",
+        "max_bytes",
+    ];
+
+    fn assert_clean(value: &Value, context: &str) {
+        match value {
+            Value::Object(map) => {
+                for (key, nested) in map {
+                    assert!(
+                        !FORBIDDEN_KEYS.contains(&key.as_str()),
+                        "forbidden wire key '{key}' in {context}: {value}"
+                    );
+                    assert_clean(nested, context);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    assert_clean(item, context);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let (_temp, app) = app_for_loaded_graph().await;
+    let commit_id = load_commit(
+        &app,
+        concat!(
+            r#"{"type":"Person","data":{"name":"Vocab","age":1}}"#,
+            "\n",
+            r#"{"edge":"Knows","from":"Vocab","to":"Alice"}"#,
+        ),
+    )
+    .await;
+
+    let (status, page) = get_json(&app, g(&format!("/commits/{commit_id}/changes"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_clean(&page, "commit changes page");
+
+    let (status, feed) = get_json(&app, g("/changes?start=beginning")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_clean(&feed, "change feed page");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/changes/baseline"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"branch":"main"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let terminal: Value = serde_json::from_str(
+        text.lines()
+            .filter(|line| !line.is_empty())
+            .next_back()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_clean(&terminal, "baseline terminal record");
+}

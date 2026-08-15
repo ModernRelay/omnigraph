@@ -642,3 +642,70 @@ fn known_divergences_ledger_is_current() {
         "divergences are pinned: {KNOWN_DIVERGENCES:?}"
     );
 }
+
+// ─── Change surfaces ────────────────────────────────────────────────────────
+
+/// The twin graphs share one copied history, so commit ids, opaque type ids,
+/// cursors, and page tokens are identical across the arms: parity here is
+/// byte-exact after the ordinary scrub.
+fn fixture_load_commit(p: &Parity) -> String {
+    let (l, _r) = p.run(&["commit", "list", "--json"]);
+    let commits: serde_json::Value =
+        serde_json::from_slice(&l.stdout).expect("commit list emits JSON");
+    let commits = commits["commits"].as_array().unwrap();
+    // The oldest commit WITH a parent is the fixture load — a non-empty diff.
+    commits
+        .iter()
+        .rev()
+        .find(|commit| !commit["parent_commit_id"].is_null())
+        .expect("history has a non-genesis commit")["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn parity_commit_changes() {
+    let p = parity();
+    let commit_id = fixture_load_commit(&p);
+    // --limit 1 forces the client to walk page tokens internally on BOTH arms.
+    let (l, r) = p.run(&["commit", "changes", &commit_id, "--limit", "1", "--json"]);
+    assert_parity("commit changes", &l, &r);
+}
+
+#[test]
+fn parity_commit_changes_filtered() {
+    let p = parity();
+    let commit_id = fixture_load_commit(&p);
+    let (l, r) = p.run(&[
+        "commit", "changes", &commit_id, "--kind", "node", "--op", "insert", "--json",
+    ]);
+    assert_parity("commit changes filtered", &l, &r);
+}
+
+#[test]
+fn parity_changes_poll_beginning() {
+    let p = parity();
+    let (l, r) = p.run(&["changes", "poll", "--start", "beginning", "--json"]);
+    assert_parity("changes poll", &l, &r);
+}
+
+#[test]
+fn parity_changes_baseline() {
+    let p = parity();
+    let out = p._temp.path().join("baseline.jsonl");
+    let out_arg = out.to_string_lossy().into_owned();
+    let (l, r) = p.run(&["changes", "baseline", "--out", &out_arg, "--json"]);
+    assert_parity("changes baseline", &l, &r);
+    // run_both executes local then served, so the surviving file is the served
+    // arm's snapshot; it must carry the shared fixture entities.
+    let snapshot = std::fs::read_to_string(&out).expect("baseline snapshot file");
+    assert!(
+        snapshot.lines().any(|line| line.contains("Alice")),
+        "the snapshot carries the fixture entities: {snapshot}"
+    );
+    assert!(
+        !snapshot.contains("\"baseline\""),
+        "the terminal handshake is not written into the snapshot file"
+    );
+}

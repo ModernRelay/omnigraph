@@ -324,6 +324,70 @@ fn openapi_change_baseline_is_streaming_post() {
     }
 }
 
+/// Spec-side vocabulary gate: no change-surface schema may declare a physical
+/// storage property, and no change route may accept a caller byte limit.
+#[test]
+fn openapi_change_schemas_reject_storage_vocabulary() {
+    const FORBIDDEN_PROPERTIES: &[&str] = &[
+        "table_key",
+        "stable_table_id",
+        "table_incarnation_id",
+        "manifest_version",
+        "table_version",
+        "table_branch",
+        "table_path",
+        "row_addr",
+        "part",
+        "commit_complete",
+        "change_index",
+        "max_bytes",
+    ];
+
+    fn assert_schema_clean(name: &str, value: &serde_json::Value) {
+        if let Some(properties) = value.get("properties").and_then(|v| v.as_object()) {
+            for (property, nested) in properties {
+                assert!(
+                    !FORBIDDEN_PROPERTIES.contains(&property.as_str()),
+                    "schema {name} declares forbidden property '{property}'"
+                );
+                assert_schema_clean(name, nested);
+            }
+        }
+        for key in ["items", "additionalProperties"] {
+            if let Some(nested) = value.get(key) {
+                assert_schema_clean(name, nested);
+            }
+        }
+    }
+
+    let doc = openapi_json();
+    let schemas = doc["components"]["schemas"].as_object().unwrap();
+    let mut change_schemas = 0;
+    for (name, schema) in schemas {
+        if name.starts_with("Change")
+            || name.starts_with("CommitChanges")
+            || name.starts_with("EntityChange")
+        {
+            change_schemas += 1;
+            assert_schema_clean(name, schema);
+        }
+    }
+    assert!(change_schemas >= 10, "the change schemas are registered");
+
+    for path in [
+        "/graphs/{graph_id}/commits/{commit_id}/changes",
+        "/graphs/{graph_id}/changes",
+    ] {
+        let params = doc["paths"][path]["get"]["parameters"].as_array().unwrap();
+        assert!(
+            params
+                .iter()
+                .all(|param| param["name"].as_str() != Some("max_bytes")),
+            "{path} must not accept a caller byte limit"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HTTP method tests
 // ---------------------------------------------------------------------------

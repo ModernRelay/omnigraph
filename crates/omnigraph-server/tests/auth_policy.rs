@@ -1085,3 +1085,97 @@ async fn policy_decision_parity_branch_merge_team_denied() {
         "SDK={sdk:?} HTTP={http:?} — should both Deny",
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_routes_enforce_bearer_and_policy() {
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
+        &[("act-bruno", "team-token"), ("act-ragnor", "admin-token")],
+        POLICY_YAML,
+    )
+    .await;
+
+    // Every change surface requires a bearer.
+    for (uri, method) in [
+        (g("/changes?start=now"), Method::GET),
+        (g("/changes/baseline"), Method::POST),
+    ] {
+        let mut request = Request::builder().uri(uri).method(method);
+        if request.headers_ref().is_none() {
+            unreachable!();
+        }
+        let request = request
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, _) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // A read-scoped actor may poll the feed and diff commits…
+    let (status, feed) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/changes?start=beginning"))
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let commit_id = feed["blocks"]
+        .as_array()
+        .and_then(|blocks| blocks.last())
+        .map(|block| {
+            block["cause"]["graph_commit_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .expect("history has blocks");
+    let (status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g(&format!("/commits/{commit_id}/changes")))
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // …but a baseline is a full data export and needs the export action.
+    let (status, forbidden) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/changes/baseline"))
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"branch":"main"}"#))
+            .unwrap(),
+    )
+    .await;
+    let forbidden: ErrorOutput = serde_json::from_value(forbidden).unwrap();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        forbidden.code,
+        Some(omnigraph_server::api::ErrorCode::Forbidden)
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/changes/baseline"))
+                .method(Method::POST)
+                .header("authorization", "Bearer admin-token")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"branch":"main"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
