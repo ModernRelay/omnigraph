@@ -10,7 +10,7 @@ owner: OmniGraph maintainers
 
 # RFC-030: Graph change feed and retained-history contract
 
-**Status:** Draft
+**Status:** Accepted for C0–C3 (shipped); C4+ remain design-stage
 
 **Date:** 2026-08-05
 
@@ -786,3 +786,57 @@ whose cost is justified by C1.
     captured together; a bare head ID is not a safe bootstrap.
 12. Format: no bump for the entity feed; revisit before persisting any new
     history authority.
+
+---
+
+## 14. Implementation amendment (2026-08-15)
+
+C0 through C3 shipped on the surveyed contract. Details frozen by the
+implementation, recorded here so later phases inherit them:
+
+- **v1 derivation is the exact ordered-merge authority path only.** No
+  row-version candidate pruning and no transaction-interval no-delete proof
+  shipped; both remain the sanctioned optimizations of §4.2/§4.3. The cost
+  instrument (`changes_cost.rs`) pins the O(table-extent) scan term as a
+  growing tripwire that the pruning slice must flip to a flat assertion, and
+  pins bounded per-page opens, Blob-lazy payload work, data-flat caught-up
+  polls, and the one-manifest-snapshot-per-commit backlog term.
+- **Typed structural equality** uses Arrow logical equality on one-row
+  slices for non-Blob user columns and physical descriptor identity with an
+  exact payload tie-break for Blob columns. Float comparison is bitwise.
+- **Strict schema gate:** paired lifetimes must share one user-schema
+  fingerprint (name-keyed Arrow type + nullability + stable property marker +
+  Blob marker; the five reserved Lance virtual columns excluded); a non-empty
+  added or removed lifetime refuses the commit; empty ones emit nothing. The
+  gate ignores the request filter — a boundary is a property of the commit
+  pair. The gate runs over ALL changed intervals before any emission, on
+  every page.
+- **Continuations:** three payload kinds (commit page token, feed cursor,
+  feed page token) share one checksummed opaque envelope with kind and
+  version tags; every cross-use, corruption, scope, witness, or digest
+  mismatch is one typed rejection surfaced as a stable-prefix 400. The commit
+  page token also binds the filter digest. The feed cursor binds the hashed
+  graph identity domain, the first-parent genesis, `changes/forward`, the
+  branch name plus its Lance-native incarnation witness (main uses a fixed
+  witness), the filter digest, and the last complete commit.
+- **Feed stop rules:** a mid-block page carries only a page token and its
+  block rides partially with its cause; a boundary page carries the cursor
+  plus a `caught_up` flag; an unreadable or boundary-refused commit surfaces
+  its typed error only as the FIRST commit of a poll, otherwise the page ends
+  atomically at the previous boundary and the next poll surfaces it. Commits
+  examined per poll are bounded (128 default / 512 ceiling, server-owned).
+- **Baseline framing:** the served handshake streams over the bounded export
+  transport and appends exactly one terminal `{"baseline": …}` NDJSON record,
+  sent only after every snapshot record succeeded. The snapshot honors kind
+  and type-name scope; `op` binds only the cursor. Baselines require the
+  `export` policy action; the diff and feed require `read`, with the commit
+  diff authorizing against the commit's authored branch because it returns
+  row images.
+- **Strict wire hygiene:** the change routes reject unknown query parameters
+  outright, and two vocabulary gates (response-walk and OpenAPI-walk) keep
+  physical storage vocabulary structurally absent from the contract.
+- **Known dependency for retention semantics:** historical snapshots resolve
+  by checking out `__manifest` at the commit's manifest version, so retained
+  manifest version history is a readability participant alongside table
+  versions. Bringing internal tables into `cleanup` must account for this
+  before reclaiming manifest versions.
