@@ -1,3 +1,14 @@
+pub mod model;
+
+pub use model::{
+    CHANGE_FEED_DEFAULT_COMMITS_PER_POLL, CHANGE_FEED_MAX_COMMITS_PER_POLL,
+    COMMIT_CHANGES_DEFAULT_BYTES, COMMIT_CHANGES_DEFAULT_ROWS, COMMIT_CHANGES_MAX_BYTES,
+    COMMIT_CHANGES_MAX_ROWS, ChangeBaseline, ChangeCause, ChangeEntityKind, ChangeFeedContinuation,
+    ChangeFeedPage, ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope, ChangeFeedStart,
+    ChangeOpKind, CommitChangesPage, EntityEndpoints, EntityImage, GraphChangeBlock,
+    GraphEntityChange, GraphTypeRef,
+};
+
 use std::collections::{BTreeMap, HashSet};
 
 use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
