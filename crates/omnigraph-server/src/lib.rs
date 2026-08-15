@@ -123,6 +123,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_commit_list,
         handlers::server_commit_show,
         handlers::server_commit_changes,
+        handlers::server_changes_feed,
     ),
     components(schemas(api::BlobEntityKind)),
     modifiers(&SecurityAddon),
@@ -1730,6 +1731,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/commits", get(server_commit_list))
         .route("/commits/{commit_id}", get(server_commit_show))
         .route("/commits/{commit_id}/changes", get(server_commit_changes))
+        .route("/changes", get(server_changes_feed))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             resolve_graph_handle,

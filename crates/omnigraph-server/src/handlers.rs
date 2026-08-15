@@ -2654,3 +2654,108 @@ pub(crate) async fn server_commit_changes(
         .map_err(ApiError::from_omni)?;
     Ok(Json(api::commit_changes_output(&page)))
 }
+
+pub(crate) const CHANGE_FEED_PARAMS: &[&str] = &[
+    "branch",
+    "cursor",
+    "start",
+    "page_token",
+    "limit",
+    "kind",
+    "type",
+    "op",
+];
+
+fn parse_change_feed_start(
+    start: &str,
+) -> std::result::Result<omnigraph::changes::ChangeFeedStart, ApiError> {
+    match start {
+        "now" => Ok(omnigraph::changes::ChangeFeedStart::Now),
+        "beginning" => Ok(omnigraph::changes::ChangeFeedStart::Beginning),
+        other => other
+            .strip_prefix("after:")
+            .filter(|commit_id| !commit_id.is_empty())
+            .map(|commit_id| {
+                omnigraph::changes::ChangeFeedStart::AfterCommit(commit_id.to_string())
+            })
+            .ok_or_else(|| {
+                ApiError::bad_request("start must be now | beginning | after:<commit_id>")
+            }),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/changes",
+    tag = "changes",
+    operation_id = "pollChanges",
+    params(api::ChangeFeedQuery),
+    responses(
+        (status = 200, description = "Change blocks in first-parent order. The durable cursor appears only on a terminal page, advanced only over complete commits; a mid-block page carries only next_page_token", body = api::ChangeFeedOutput),
+        (status = 400, description = "Invalid start/filter combination, or a rejected cursor or page token", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Branch not found", body = ErrorOutput),
+        (status = 409, description = "The feed crossed an unprovable schema boundary; see change_diff_refusal", body = ErrorOutput),
+        (status = 410, description = "Feed gap: required history was reclaimed; reset via the baseline handshake", body = ErrorOutput),
+        (status = 413, description = "Requested limit exceeds the public row ceiling", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+
+/// Poll the change feed of one branch.
+///
+/// At-least-once: retrying a cursor may replay the complete next commit, so
+/// consumers apply blocks idempotently by `graph_commit_id` and persist the
+/// terminal cursor together with its blocks. The server holds no consumer
+/// state.
+pub(crate) async fn server_changes_feed(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> std::result::Result<Json<api::ChangeFeedOutput>, ApiError> {
+    let params = parse_change_query(raw.as_deref(), CHANGE_FEED_PARAMS)?;
+    let branch = params.branch.clone().unwrap_or_else(|| "main".to_string());
+    authorize_request(
+        actor.as_ref().map(|Extension(actor)| actor),
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: Some(branch.clone()),
+            target_branch: None,
+        },
+    )?;
+
+    let position = match (params.cursor, params.start, params.page_token) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
+            return Err(ApiError::bad_request(
+                "cursor, start, and page_token are mutually exclusive",
+            ));
+        }
+        (Some(cursor), None, None) => omnigraph::changes::ChangeFeedPosition::Cursor(cursor),
+        (None, Some(start), None) => {
+            omnigraph::changes::ChangeFeedPosition::Start(parse_change_feed_start(&start)?)
+        }
+        (None, None, Some(token)) => omnigraph::changes::ChangeFeedPosition::PageToken(token),
+        // A missing cursor is never an implicit beginning.
+        (None, None, None) => {
+            omnigraph::changes::ChangeFeedPosition::Start(omnigraph::changes::ChangeFeedStart::Now)
+        }
+    };
+
+    let scope = api::change_scope(&params.kinds, &params.types, &params.ops);
+    let page = {
+        let db = &handle.engine;
+        db.poll_change_feed(omnigraph::changes::ChangeFeedRequest {
+            branch: Some(branch),
+            position,
+            scope,
+            max_changes: params.limit,
+            max_bytes: None,
+            max_commits: None,
+        })
+        .await
+        .map_err(ApiError::from_omni)?
+    };
+    Ok(Json(api::change_feed_output(&page)))
+}

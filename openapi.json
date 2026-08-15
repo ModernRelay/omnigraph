@@ -1202,6 +1202,192 @@
         ]
       }
     },
+    "/graphs/{graph_id}/changes": {
+      "get": {
+        "tags": [
+          "changes"
+        ],
+        "summary": "Poll the change feed of one branch.",
+        "description": "At-least-once: retrying a cursor may replay the complete next commit, so\nconsumers apply blocks idempotently by `graph_commit_id` and persist the\nterminal cursor together with its blocks. The server holds no consumer\nstate.",
+        "operationId": "cluster_pollChanges",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "Branch whose first-parent history is polled. Defaults to `main`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Durable cursor from a prior terminal page. Mutually exclusive with\n`start` and `page_token`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "description": "Explicit start mode: `now` (default) | `beginning` |\n`after:<commit_id>`. Mutually exclusive with `cursor` and `page_token`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page_token",
+            "in": "query",
+            "description": "Continuation of one bounded poll (keeps its captured cut). Mutually\nexclusive with `cursor` and `start`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ChangeEntityKind"
+              }
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "name": "op",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ChangeOpOutput"
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Change blocks in first-parent order. The durable cursor appears only on a terminal page, advanced only over complete commits; a mid-block page carries only next_page_token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeFeedOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid start/filter combination, or a rejected cursor or page token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Branch not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The feed crossed an unprovable schema boundary; see change_diff_refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Feed gap: required history was reclaimed; reset via the baseline handshake",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Requested limit exceeds the public row ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs/{graph_id}/commits": {
       "get": {
         "tags": [
@@ -3348,6 +3534,25 @@
           }
         }
       },
+      "ChangeBlockOutput": {
+        "type": "object",
+        "description": "One commit block inside a feed page.",
+        "required": [
+          "cause",
+          "changes"
+        ],
+        "properties": {
+          "cause": {
+            "$ref": "#/components/schemas/ChangeCauseOutput"
+          },
+          "changes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EntityChangeOutput"
+            }
+          }
+        }
+      },
       "ChangeCauseOutput": {
         "type": "object",
         "description": "The commit cause of one change block, stated once.",
@@ -3461,6 +3666,42 @@
           },
           "first_unreadable_commit_id": {
             "type": "string"
+          }
+        }
+      },
+      "ChangeFeedOutput": {
+        "type": "object",
+        "description": "One bounded feed poll result.",
+        "required": [
+          "blocks"
+        ],
+        "properties": {
+          "blocks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChangeBlockOutput"
+            }
+          },
+          "caught_up": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Present with `cursor` on a terminal page: true when the page reached\nits captured head, false when more complete commits already wait."
+          },
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Durable caller-owned cursor, advanced only over complete commits and\nreturned only on a terminal page — an interrupted poll never advances\nit."
+          },
+          "next_page_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Continue this poll's captured cut. Absent on a terminal page."
           }
         }
       },

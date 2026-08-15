@@ -3365,3 +3365,105 @@ async fn commit_changes_parentless_commit_is_typed_409() {
     );
     assert_eq!(refusal["change_diff_refusal"]["graph_commit_id"], genesis);
 }
+
+// ─── Change feed route ──────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_feed_poll_advances_cursor_only_after_complete_commits() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    // `start=now` captures the head: no replay, a caught-up durable cursor.
+    let (status, now) = get_json(&app, g("/changes?start=now")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(now["blocks"].as_array().unwrap().is_empty());
+    assert_eq!(now["caught_up"], true);
+    let c0 = now["cursor"].as_str().expect("terminal page cursor");
+
+    let commit_id = load_commit(
+        &app,
+        concat!(
+            r#"{"type":"Person","data":{"name":"Feed A","age":1}}"#,
+            "\n",
+            r#"{"type":"Person","data":{"name":"Feed B","age":2}}"#,
+        ),
+    )
+    .await;
+
+    // A mid-block page carries only a page token — no cursor to checkpoint.
+    let (status, partial) = get_json(&app, g(&format!("/changes?cursor={c0}&limit=1"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        partial["blocks"][0]["cause"]["graph_commit_id"],
+        commit_id.as_str()
+    );
+    assert_eq!(partial["blocks"][0]["changes"][0]["id"], "Feed A");
+    assert!(partial["cursor"].is_null(), "no durable cursor mid-block");
+    let token = partial["next_page_token"].as_str().expect("page token");
+
+    let (status, resumed) = get_json(&app, g(&format!("/changes?page_token={token}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resumed["blocks"][0]["changes"][0]["id"], "Feed B");
+    let c1 = resumed["cursor"].as_str().expect("boundary cursor");
+
+    let (status, caught_up) = get_json(&app, g(&format!("/changes?cursor={c1}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(caught_up["blocks"].as_array().unwrap().is_empty());
+    assert_eq!(caught_up["caught_up"], true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_feed_start_beginning_replays_history() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let commit_id = load_commit(
+        &app,
+        r#"{"type":"Person","data":{"name":"Replayed","age":1}}"#,
+    )
+    .await;
+
+    let (status, page) = get_json(&app, g("/changes?start=beginning")).await;
+    assert_eq!(status, StatusCode::OK);
+    let blocks = page["blocks"].as_array().unwrap();
+    assert!(!blocks.is_empty());
+    assert_eq!(
+        blocks.last().unwrap()["cause"]["graph_commit_id"],
+        commit_id.as_str(),
+        "oldest first: the newest commit is the last block"
+    );
+    assert!(page["cursor"].is_string());
+    assert_eq!(page["caught_up"], true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_feed_start_and_cursor_are_exclusive_and_validated() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let (_, now) = get_json(&app, g("/changes?start=now")).await;
+    let cursor = now["cursor"].as_str().unwrap();
+
+    for query in [
+        format!("cursor={cursor}&start=beginning"),
+        format!("cursor={cursor}&page_token={cursor}"),
+        "start=later".to_string(),
+        "start=after:".to_string(),
+        "start=after:no-such-commit".to_string(),
+    ] {
+        let (status, _) = get_json(&app, g(&format!("/changes?{query}"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "query: {query}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_feed_scope_mismatch_cursor_is_stable_400() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let (_, scoped) = get_json(&app, g("/changes?start=now&op=insert")).await;
+    let cursor = scoped["cursor"].as_str().unwrap();
+
+    let (status, rejected) = get_json(&app, g(&format!("/changes?cursor={cursor}"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        rejected["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("change cursor rejected"),
+        "{rejected}"
+    );
+}
