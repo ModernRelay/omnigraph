@@ -48,9 +48,11 @@ process, not the merit of the change.
 Labels are the state machine; an issue has exactly one status label.
 
 - `needs-triage` — default on arrival. No work should start.
-- `accepted` — a maintainer agreed the change should exist. The green light
-  for the next step in its lane: a code PR for S/M, an RFC PR for L.
-- `needs-rfc` — size L: the design must land before any code.
+- `accepted` — a maintainer agreed the change should exist; a code PR may
+  follow. For size L, this is also the state after the RFC merges.
+- `needs-rfc` — size L, accepted with the design outstanding. It replaces
+  `accepted` until the RFC PR merges (writing the RFC is authorized); the
+  issue then returns to `accepted`, and code may start.
 - `blocked` — accepted, but waiting on something named in the thread.
 - `declined` — closed, with a reason.
 

@@ -38,7 +38,7 @@ means code may follow, while `needs-rfc` means the design lands first.
 
 ```
 Issue (feature/rfc + needs-triage)
-      │ maintainer accepts the problem → accepted (+ needs-rfc)
+      │ maintainer accepts the problem → needs-rfc
       ▼
 RFC pull request  →  adds docs/rfcs/NNNN-title.md
                          (Author track: Public contribution; Status: Proposed)
