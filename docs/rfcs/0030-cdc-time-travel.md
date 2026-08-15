@@ -1,7 +1,7 @@
 ---
 type: spec
 title: "RFC-030 — Graph change feed and retained-history contract"
-description: Defines a graph-commit change feed, caller-owned cursors, and honest retention failures by composing OmniGraph lineage with Lance's native row-version tracking; it does not create a second WAL or expose physical datasets.
+description: Defines graph-vocabulary commit diffs and a graph change feed with bounded page tokens, durable cursors, and no public storage-table machinery.
 status: draft
 tags: [eng, rfc, cdc, change-feed, time-travel, provenance, lineage, audit, omnigraph]
 timestamp: 2026-08-05
@@ -21,7 +21,7 @@ publication, RFC-023 exact-`id` table fencing, and RFC-028 immutable table
 identity.
 
 **Surveyed:** OmniGraph `main` at commit
-`ad3da4170ee90cdd065256f61ebcb6634f35104b` (internal schema v6); the Lance
+`d0b4502dfe463138524ed9b53cfa5c0ab83a5deb` (internal schema v6); the Lance
 surface was revalidated against the pinned 10.0.0 release.
 
 **Audience:** engine, server, CLI, and documentation maintainers.
@@ -30,10 +30,25 @@ surface was revalidated against the pinned 10.0.0 release.
 
 ## 0. Decision
 
-OmniGraph will expose changes as an ordered sequence of **graph commit
-blocks**. A block is the logical difference between one graph commit and its
-first parent, plus the cause already recorded on that commit. The user never
-sees or resumes a feed for an individual Lance dataset.
+OmniGraph will expose entity-data changes in graph vocabulary: node or edge,
+graph type identity and name, logical entity ID, edge endpoints, operation, and
+exact logical before/after values. Public results do not expose tables,
+datasets, fragments, physical versions, row addresses, or storage ordering
+keys.
+
+Two public surfaces share one private adjacent-commit enumerator:
+
+1. A **finite commit entity diff** compares one exact graph commit with its
+   first parent. It is an inspection result. A `next_page_token` may continue a
+   bounded response, but there is no durable feed cursor.
+2. A **durable entity change feed** returns those graph commit blocks in
+   first-parent order. Its cursor means the caller has consumed every complete
+   commit through one position; it advances only after the final page of that
+   commit.
+
+A page token and feed cursor are deliberately separate. The token means
+"continue this response." The cursor means "resume the durable feed after this
+complete commit." Normal SDK/CLI usage consumes page tokens automatically.
 
 The implementation reuses the coordinator we already have:
 
@@ -45,24 +60,26 @@ The implementation reuses the coordinator we already have:
    dataset checked out at the **exact end version**.
 4. Deletes come from an exact, bounded comparison of live logical IDs at the
    begin and end snapshots. Lance 10 has no complete deleted-row feed.
-5. One opaque caller-owned cursor resumes the graph feed. OmniGraph stores no
-   per-consumer state.
+5. Opaque page tokens bound one response; a separate caller-owned cursor
+   resumes the graph feed. OmniGraph stores no per-consumer state.
 
 This is a derived read model. It adds no WAL, transaction manager, change-log
 table, server-side cursor registry, delete tombstone, or second coordinator.
 It does not expose Lance paths, branches, fragment IDs, row addresses, or
 per-table versions as public CDC concepts.
 
-The first contract is a **cause-carrying entity change feed**. Inserts and
-updates carry the exact logical after-image from the child snapshot; deletes
-carry the exact logical before-image from the parent snapshot. This is enough
-to apply retained entity changes downstream and to derive the existing `diff`
-result.
+The first contract is a **cause-carrying entity-data diff**. Inserts carry the
+exact child after-image, updates carry exact parent before- and child
+after-images, and deletes carry the exact parent before-image. Edge images
+carry their endpoints as graph references.
 
-It is not a complete empty-store graph replay log: graph-schema evolution is
-separated in §10 because the current lineage does not preserve an accepted
-SchemaIR for every historical graph commit. The limitation is schema replay,
-not row-image availability.
+Entity-data diff and graph-schema diff are separate contracts. A schema change
+is not translated into synthetic row inserts, updates, or deletes. Historical
+schema selection used to decode a retained row is private correctness
+machinery, not a user-facing schema-history feature. Because current lineage
+does not retain accepted SchemaIR for every historical commit, the initial
+entity surfaces fail with a typed error at an unproven schema boundary. A
+separate schema contract is deferred to §10.
 
 ## 1. What Lance gives us—and what it does not
 
@@ -121,6 +138,10 @@ The required durable authority already exists:
 - A historical manifest snapshot maps immutable table identity
   `(stable_table_id, table_incarnation_id)` to the exact table branch and Lance
   version visible at that graph commit.
+- Persisted accepted SchemaIR v2 owns graph-scoped type/property identity.
+  Supported renames preserve it; drop/re-add creates a new declaration
+  identity. Public `type.id` is an opaque projection of that graph authority,
+  not a second registry or a table identifier.
 - Every current v6 graph table is created with stable row IDs and exact
   non-null logical `id` as its unenforced primary key.
 - `diff_between` and `diff_commits` already know how to compare two graph
@@ -140,7 +161,7 @@ Two current names must not be allowed to overstate their meaning:
 
 ## 3. Public semantic model
 
-### 3.1 One logical block per graph commit
+### 3.1 Graph-vocabulary entity changes
 
 Conceptually, the engine returns:
 
@@ -148,17 +169,21 @@ Conceptually, the engine returns:
 GraphChangeBlock {
   cause: {
     graph_commit_id,
-    parent_commit_id,
+    parent_commit_id?,
     merged_parent_commit_id?,
     authored_branch,
-    graph_snapshot_version,
     actor_id?,
     authored_at
   },
-  part,
-  commit_complete,
   changes: [
-    { kind, type_name, id, op, endpoints?, before?, after? }
+    {
+      kind,
+      type: { id, name },
+      id,
+      op,
+      before?: { properties, endpoints?: { from: entity_id, to: entity_id } },
+      after?:  { properties, endpoints?: { from: entity_id, to: entity_id } }
+    }
   ]
 }
 ```
@@ -167,30 +192,36 @@ The exact Rust and wire DTOs land with the implementation. The semantics above
 are fixed:
 
 - `kind` is node or edge.
-- `type_name` is a graph-schema name, never a dataset name or path.
+- `type.id` is an opaque graph-scoped type identity. It survives a supported
+  rename and changes after drop/re-add. It is not a serialized table,
+  incarnation, Lance field, dataset, or path identifier.
+- `type.name` is the graph-schema name useful to humans.
 - `id` is the graph's exact logical `id`.
 - `op` is `INSERT`, `UPDATE`, or `DELETE`.
-- `endpoints` is present for edge changes, including deletes, and is read from
-  the appropriate exact snapshot.
-- `after` contains the complete user-visible logical row for inserts and
-  updates and is absent for deletes.
-- `before` contains the complete user-visible logical row for deletes and is
-  absent for inserts and updates. Update before-images are not required to
-  apply the feed and are deferred.
+- Edge endpoints use the same public `from` / `to` graph-reference vocabulary
+  as mutation and load. They belong to each image, so an endpoint-moving update
+  has distinct before and after endpoints.
+- An insert has only the exact child `after` image. An update has the exact
+  parent `before` and child `after` images. A delete has only the exact parent
+  `before` image.
 - Images use the same canonical logical value conversion as graph export.
-  Lance `_row*` and other storage-only columns are never exposed.
+  Exact reserved Lance virtual columns and other storage-only columns are never
+  exposed; a legal user property is not hidden merely because its name starts
+  with `_row`.
 - Cause is stated once on the block, not copied onto every entity.
 - `authored_branch` is the branch on which the commit originally landed. The
   selected feed branch is page/request context; inherited commits on a named
   branch do not have their cause rewritten.
-- `part` is zero-based and `commit_complete` is true only on the final part of
-  a commit split across pages. No later commit appears before that terminal
-  part. Each transmitted part repeats the same cause; parts never mix commits.
+
+`GraphChangeBlock` is the logical product. Bounded HTTP/SDK transport may split
+it into pages that repeat the cause and carry `next_page_token`; `part`,
+`commit_complete`, internal change indexes, and byte limits are not entity
+fields. A feed returns its durable cursor only on the terminal page.
 
 A physical-only graph commit such as compaction produces an empty block. The
-cursor still advances over it. A pure type rename also produces no row changes;
-future changes use the destination name because immutable identity, not alias,
-pairs the table lifetime.
+feed cursor still advances over it. Schema operations produce no synthetic
+entity changes; crossing an unprovable schema boundary fails as described in
+§10 rather than guessing from physical tables.
 
 ### 3.2 Branch and merge order
 
@@ -208,22 +239,37 @@ the CDC order and is not a cross-branch cursor.
 
 ### 3.3 Graph-level filtering
 
-Filters may select graph concepts—node/edge kind, graph type name, and
-operation. They may not select a Lance dataset, table path, native branch,
-fragment, or table version.
+Filters may select graph concepts—node/edge kind, opaque graph type identity or
+name, and operation. They may not select a Lance dataset, table alias/path,
+native branch, fragment, or physical version.
 
-The cursor binds the canonical filter and image contract. Reusing it with a
-different filter or image contract fails as `CursorScopeMismatch`; it never
-silently skips data.
+Page tokens and feed cursors bind the canonical filter and image contract.
+Reusing either with a different scope fails with its corresponding typed scope
+error; it never silently skips data.
+
+### 3.4 Finite commit diff versus feed
+
+The finite commit diff asks which entity-data changes one exact commit made
+relative to its first parent. It returns one logical block, may paginate with a
+`next_page_token`, and never returns or accepts a feed cursor.
+The parentless root has no entity diff; callers bootstrap from the exact
+baseline instead of receiving invented inserts.
+
+The feed asks for those blocks in first-parent order. It returns a durable
+cursor only after a complete block. This keeps bounded transport mechanics out
+of the user-facing entity model and avoids freezing the later feed protocol in
+an inspection command.
 
 ## 4. Exact per-commit derivation
 
 For each first-parent edge `P -> C`:
 
 1. Load the exact graph snapshots named by `P` and `C`.
-2. Pair their table entries by immutable table identity, not alias.
-3. Skip identical table branch/version pairs.
-4. Derive changes for each remaining table lifetime.
+2. Prove that their logical graph schemas are compatible for entity-data diff.
+3. Pair graph type lifetimes by stable graph identity, resolving physical table
+   entries privately rather than exposing them.
+4. Skip identical physical branch/version pairs internally.
+5. Derive changes for each remaining type lifetime.
 
 Logical operation is defined only by the two graph-visible states:
 
@@ -236,15 +282,21 @@ Lance row-version columns are candidate pruning. They do not override this
 definition. In particular, overwrite or restore can make a row look physically
 new while reusing a logical graph `id` that was already present.
 
-### 4.1 Table addition and removal
+Equality is typed and structural. It preserves null versus valid empty values,
+does not join display strings with a delimiter, and includes the complete
+logical Blob reference `(uri, offset, length)` where applicable.
 
-- A lifetime present only in `C` emits all live end rows as inserts with
-  after-images.
-- A lifetime present only in `P` emits all live begin rows as deletes with
-  before-images.
-- Drop/re-add is two lifetimes even when the public alias and logical IDs are
-  reused. The internal continuation key includes immutable lifetime identity so
-  pagination cannot conflate them.
+### 4.1 Schema and type-lifetime boundaries
+
+Adding, dropping, renaming, or recreating a type is schema evolution, not proof
+that every affected row was inserted or deleted as entity data. The entity
+diff therefore does not synthesize row events from table presence alone.
+
+The initial surface accepts only a pair whose compatible logical schema can be
+proven. A schema boundary returns a typed refusal and directs the caller to the
+separate schema/baseline contract. Drop/re-add remains two graph type lifetimes
+even when the name is reused; no page token or cursor may conflate their opaque
+graph identities.
 
 ### 4.2 Inserts and updates on one lifetime
 
@@ -257,10 +309,11 @@ predicates and partition the physical candidates as:
 
 The adapter treats these rows as candidates. For **every** candidate it performs
 a bounded parent membership/image probe: parent absence means insert; parent
-presence plus a different logical image means update; equal user-visible images
-mean no logical change. This suppresses physical no-ops and
-storage-metadata-only movement as well as closing overwrite and delete/reinsert
-cases without turning physical row lineage into graph identity.
+presence plus a different logical image means update and retains both exact
+images; equal user-visible images mean no logical change. This suppresses
+physical no-ops and storage-metadata-only movement as well as closing overwrite
+and delete/reinsert cases without turning physical row lineage into graph
+identity.
 
 Membership/image checks are coalesced into bounded structured exact-ID batches;
 the design does not authorize one object-store round trip per candidate or an
@@ -279,7 +332,8 @@ Every invocation asserts:
 - the handle is pinned to `end`, not current HEAD;
 - stable row IDs and both version columns are genuinely active;
 - every storage-only/system column is excluded from the public projection;
-- every emitted insert/update image is taken from this exact end handle.
+- every emitted insert/update after-image is taken from this exact end handle;
+- every emitted update before-image is taken from the exact parent handle.
 
 If table branch lineage changes, the end version does not advance from the
 begin version, or the exact transaction interval contains an operation whose
@@ -324,23 +378,22 @@ Each request has three independent ceilings:
 
 This prevents a sparse filter from scanning unbounded history merely to fill a
 row limit. A commit block is kept whole when it fits. A larger commit is split
-at a deterministic internal key composed from immutable table lifetime,
-logical ID, and operation rank; the key remains opaque on the wire. Replaying
-the same page input against the same retained cut returns the same ordered
-events.
+at a deterministic graph-semantic key composed from entity kind, opaque graph
+type identity, logical ID, and operation rank. The continuation is carried only
+inside an opaque page token; it is not an entity field. Replaying the same page
+token against the same retained cut returns the same ordered events.
 
 The total event order inside a block is
-`(table_key, stable_table_id, table_incarnation_id, id, operation_rank)`.
-Stable/incarnation IDs are hidden tie-breakers in the opaque cursor, not public
-dataset handles. Operation rank is frozen as `INSERT = 0`, `UPDATE = 1`,
-`DELETE = 2` for cursor v1.
+`(entity_kind, graph_type_id, id, operation_rank)`. Operation rank is frozen as
+`INSERT = 0`, `UPDATE = 1`, `DELETE = 2` for page-token v1. Physical table or
+incarnation identity may locate data internally but is not part of the public
+ordering contract or continuation payload.
 
-A consumer that needs graph-commit atomicity durably buffers non-terminal
-parts and commits that buffer together with the cursor from the
-`commit_complete = true` part. It does not apply a partial commit. Retrying from
-the cursor before a part replays that part exactly; advancing a durable cursor
-without durably retaining the corresponding part is caller data loss, just as
-with any caller-owned offset.
+Raw HTTP may return `next_page_token`; SDK and CLI helpers consume it
+automatically and stream or spool the block within explicit bounds. In a feed,
+intermediate pages carry no advanced durable cursor. The terminal page returns
+the cursor after that complete commit, so a caller never checkpoints a partial
+block by mistake.
 
 The byte ceiling is chosen at least as large as OmniGraph's maximum legal
 logical row image. If historical or blob-backed data still produces one image
@@ -351,37 +404,50 @@ The implementation must prove the ordering path is bounded. It may use Lance's
 ordered scan or a bounded merge, but it may not sort an unbounded graph commit
 in memory or depend on unspecified concurrent scan order.
 
-## 5. Cursor contract
+## 5. Continuation contracts
+
+### 5.1 Page token
+
+A page token is opaque, versioned transport state for one bounded result. It
+binds the exact commit/block, captured cut, graph/branch incarnation, canonical
+filter and image contract, ordering version, enforced bounds, and logical
+continuation key. It contains no durable consumer position and is not accepted
+as a feed cursor.
+
+The token does not expose table aliases/IDs, dataset paths, Lance versions, or
+row addresses. Private placement is re-derived after validation. A page token
+is useful to raw HTTP clients that must resume interrupted bounded work; normal
+CLI and SDK calls auto-fetch it.
+
+### 5.2 Durable feed cursor
 
 The wire cursor is opaque and versioned. Its encoding is deliberately not
 documented as colon-separated fields. Semantically it binds:
 
 - graph identity (derived from the persisted schema identity domain);
-- lineage/storage-strand incarnation (the first-parent root/genesis commit);
+- graph-history incarnation (the first-parent root/genesis commit);
 - cursor purpose and traversal direction (`changes/forward` for cursor v1);
-- normalized graph branch name;
-- Lance native branch identifier, closing delete/recreate ABA;
+- normalized graph branch name and graph branch incarnation;
 - canonical filter and logical-image contract digest;
 - last completed graph commit;
-- a captured upper-cut commit for an in-progress page sequence;
-- within-block continuation when the current commit is split;
 - cursor format version and corruption checksum.
 
 The cursor is not an authorization token. Every request is authorized normally,
 then the cursor scope is validated. Cursors from different graphs, branch
 incarnations, filters, or cursor versions fail loudly and are not comparable.
 
-On the first poll, the engine captures the branch head as the upper cut. Page
-continuations keep that cut even if new commits arrive. Once the cut is reached,
-the returned cursor is caught up; the next poll captures a new head and begins
-after the last completed commit. This gives one coherent finite replay window
-without hiding later work.
+On each poll, the engine captures the branch head as the upper cut. Page tokens
+keep that cut even if new commits arrive. Once the cut is reached, the returned
+cursor is caught up; the next poll captures a new head and begins after the
+last completed commit. A durable cursor never points inside a commit.
 
 The server persists no cursor or consumer offset. Durability belongs to the
-caller. A cursor is not a retention lease: cleanup may reclaim versions after
-the cursor is issued.
+caller. Delivery is at least once: retrying the prior cursor may replay the
+complete next commit, so consumers apply by `graph_commit_id` idempotently and
+persist the terminal cursor with the block. A cursor is not a retention lease:
+cleanup may reclaim versions after it is issued.
 
-### 5.1 Starting a feed
+### 5.3 Starting a feed
 
 The first request chooses one explicit start mode:
 
@@ -396,25 +462,27 @@ The first request chooses one explicit start mode:
 After validating the start, the same coherent branch snapshot supplies the
 upper cut. A missing cursor is not an ambiguous alias for `Beginning`.
 
-### 5.2 Exact bootstrap and reset
+### 5.4 Exact bootstrap and reset
 
-C2 ships one baseline handshake with the public feed:
+C3 ships one baseline handshake with the public feed:
 
 ```text
 capture_change_baseline(branch, feed_scope) -> {
   snapshot_commit_id,
-  exact_graph_snapshot,
+  exact_entity_snapshot,
   resume_cursor
 }
 ```
 
 The coordinator validates the filter/image scope, captures one branch
-incarnation and head `H`, exports the graph snapshot pinned to `H`, and creates
-a cursor equivalent to `AfterCommit(H)` in that same feed scope. Concurrent
-commits after `H` are picked up on the next poll. The caller durably installs
-the snapshot before it durably installs the resume cursor. If exact snapshot
-construction fails or cleanup removes a participant, the handshake returns no
-usable cursor.
+incarnation and head `H`, exports the data-only entity snapshot pinned to `H`,
+and creates a cursor equivalent to `AfterCommit(H)` in that same feed scope.
+The payload carries no schema authority; the compatible graph schema is
+established separately as required by §10. Concurrent commits after `H` are
+picked up on the next poll. The caller durably installs the entity snapshot
+before it durably installs the resume cursor. If exact snapshot construction
+fails or cleanup removes a participant, the handshake returns no usable
+cursor.
 
 This is not today's current-HEAD-only export with a commit ID added afterward;
 the export itself is opened at the captured graph commit. The same primitive is
@@ -435,25 +503,26 @@ against one numeric floor.
 Before deriving an edge, the feed verifies the exact required begin/end table
 versions. Failures are translated into graph-level typed outcomes:
 
-- `HistoricalDataReclaimed { graph_commit_id, type_name }` for direct time
-  travel to a graph snapshot whose participant is gone;
+- `HistoricalDataReclaimed { graph_commit_id, type: { id, name } }` for direct
+  time travel to a graph snapshot whose required type lifetime is gone;
 - `ChangeFeedGap { cursor, first_unreadable_commit_id }` when
   a feed cannot continue contiguously.
 
 The public error names graph concepts. Exact physical paths and table versions
 may appear in operator diagnostics/logs, not in the public CDC contract.
 
-The recovery action is §5.2's exact baseline handshake, not a suggested commit
+The recovery action is §5.4's exact baseline handshake, not a suggested commit
 ID that can race before export. Computing the oldest contiguous resumable suffix
 requires walking and validating real participant pins; if a later
 implementation exposes that answer, it must cache and cost-test the derivation
 rather than guessing from HEAD arithmetic or table minima.
 
 A page is atomic. If an endpoint becomes unreadable while constructing it, the
-request returns the typed gap and no cursor advancement; the caller retries
-from its previously durable cursor or deliberately resets from a snapshot. The
-engine streams scans into one bounded page buffer, but a transport does not
-publish that page or its cursor until construction succeeds.
+request returns the typed gap and no page token or cursor advancement; the
+caller retries from its previously durable cursor or deliberately resets from
+a snapshot. The engine streams scans into one bounded page buffer, but a
+transport does not publish that page or either continuation until construction
+succeeds.
 
 `commit list` continues to list durable lineage even when old table data is no
 longer readable. This RFC does not add `--mark-readable`: determining that for
@@ -461,8 +530,8 @@ every historical commit is a history walk, not a cheap annotation.
 
 ## 7. Time semantics
 
-Exact time travel by graph commit ID or graph snapshot version remains the
-authoritative contract.
+Exact time travel by graph commit ID or graph snapshot target remains the
+authoritative contract. Physical manifest/table versions stay private.
 
 This RFC does **not** add `--at-time` in its core phases. The former proposal
 used `GraphCommit.created_at`, called the result committed time, and promised a
@@ -487,10 +556,14 @@ proven monotonic index.
 built. It does not receive optional cause fields: a range collapsed across
 multiple commits has no single honest actor or commit.
 
-C0 makes its changed-table traversal deterministic by destination/source
-`table_key` and then immutable identity. It does not turn the existing net diff
-into the feed's per-entity cursor order; entity order within one table remains
-outside that API's contract.
+Its current table-shaped `ChangeSet` / `EntityChange` fields are transitional.
+The canonical public entity shape in §3 does not carry `table_key`, table or
+incarnation IDs, manifest/table versions, or physical ordering fields. C2
+introduces the finite adjacent-commit entity diff with that graph shape rather
+than expanding the table-shaped result into HTTP/OpenAPI/SDK contracts.
+
+C0 may still use immutable table identity to locate data internally. Public
+ordering and output are by graph type identity and logical entity ID.
 
 Once the graph feed is proven, its exact adjacent enumerator supplies most of
 the same machinery. That does **not** make arbitrary-range net diff a free
@@ -502,7 +575,7 @@ readable.
 Any future feed-backed net diff must therefore reduce against baseline
 membership/images and final membership/images, not merely fold operation
 labels. The direct endpoint snapshot algorithm remains a valid and often
-lower-cost reconciliation path. Both paths share table-identity interval
+lower-cost reconciliation path. Both paths share graph type-lifetime interval
 construction, canonical image comparison, and a conformance suite; they do not
 grow separate definitions of insert, update, or delete.
 
@@ -519,10 +592,13 @@ Extend existing owners before adding a new test silo: `changes.rs`,
   v2 value when the delta is run on a v2 handle, and is not trusted when run on
   a v3 handle for `(v1, v2]`.
 - Stable-row-ID/version-column guard on every OmniGraph-created table.
-- `DatasetDelta` batch-row, batch-byte, blob, and system/storage-only-column observations.
-  If bounds cannot be enforced, select the bounded scanner adapter before C1.
-- Exact insert/update after-images and delete before-images, including nested
-  values, blobs, edge endpoints, and exclusion of every reserved system field.
+- `DatasetDelta` batch-row, batch-byte, blob, and system/storage-only-column
+  observations. If bounds cannot be enforced, select the bounded scanner
+  adapter before C1.
+- Exact insert after-images, update before/after images, and delete
+  before-images, including nested values, blobs, edge endpoints, null versus
+  valid empty, and exclusion of exact reserved system fields without hiding a
+  legal `_row*` user property.
 - Overwrite with an existing logical `id`, delete/reinsert, restore, and a
   later update prove graph membership/image comparison—not physical
   `_row_created_at_version` alone—selects the logical operation.
@@ -536,15 +612,18 @@ Extend existing owners before adding a new test silo: `changes.rs`,
 - Interleaved main/named-branch history follows one branch incarnation's
   first-parent chain.
 - Merge output is exactly first-parent-relative and carries the merged parent.
-- Table rename is row-neutral; drop/re-add with the same alias and IDs emits
-  distinct deletes/inserts without cursor collision.
+- Type/property rename and drop/re-add are schema operations, not synthetic
+  entity updates/deletes/inserts. An unprovable schema boundary is a typed
+  refusal and cannot collide graph type identities.
 - Physical-only commits emit empty blocks and still advance the cursor.
-- Bounded graph NDJSON, ordinary mutation/load, schema table add/drop, branch
-  merge, maintenance, and recovery-completed publication share the same block
-  model.
+- Bounded graph NDJSON, ordinary mutation/load, branch merge, physical
+  maintenance, and recovery-completed publication share the block model within
+  a proven compatible schema.
 
 ### P0 — cursor and pagination
 
+- Page-token/cursor cross-use and scope mismatches are typed refusals. A finite
+  commit diff never returns or accepts a feed cursor.
 - Cursor graph/branch-incarnation/filter/version mismatches are typed refusals.
 - Cursor lineage/genesis mismatch is refused even when a rebuilt graph reuses a
   schema identity domain or main branch name.
@@ -556,9 +635,14 @@ Extend existing owners before adding a new test silo: `changes.rs`,
 - New commits arriving between pages do not enter the captured cut.
 - Oversized single commits split and replay exactly under row, byte, and
   commits-scanned ceilings.
+- SDK/CLI helpers consume page tokens automatically; the feed exposes no
+  advanced durable cursor before the terminal page.
 - Sparse filters stop at the commits-scanned bound.
 - Reopen and another process can resume from the caller's cursor with no server
   state.
+- DTO/OpenAPI tests reject `table_key`, table/incarnation IDs, physical
+  versions, row addresses, `part`, `commit_complete`, and caller byte limits in
+  the graph entity contract.
 
 ### R0 — retention
 
@@ -578,7 +662,7 @@ merge matrix is the structural proof: the classifier performs no I/O, history
 walk, or allocation proportional to lineage depth, so the storage I/O harness
 has no meaningful curve to record for it.
 
-Before C2 exposes a public feed, use `helpers::cost` and realistic history depth
+Before C3 exposes a public feed, use `helpers::cost` and realistic history depth
 to record separate curves for:
 
 - an unchanged warm caught-up poll through the existing freshness probe;
@@ -601,11 +685,22 @@ term is documented before its public surface ships.
 
 ### 10.1 Graph-schema replay
 
-The entity feed carries canonical logical row images, but it still cannot
-recreate a graph from an empty store by itself. The graph lineage does not
-retain the accepted SchemaIR for every commit. Property additions, removals,
-renames, constraints, and annotations therefore cannot be reconstructed as an
-exact historical schema stream with today's authority.
+Entity-data diff and graph-schema diff are separate public contracts. The
+entity surface emits no type/property/constraint/annotation operations and does
+not turn table add/drop/rewrite into synthetic entity changes. It therefore
+cannot recreate an empty graph by itself.
+
+Historical decoding is a different concern. To return an old entity image
+honestly, the engine must interpret that snapshot with its matching logical and
+physical schema rather than today's catalog. That is internal correctness
+machinery: the result contains the graph entity image, not a schema object,
+schema version, table field ID, or user-selectable decoder mode.
+
+Today's lineage does not retain accepted SchemaIR for every commit. Therefore
+the entity diff/feed phases cross only snapshot pairs whose compatible logical
+schema can be proven; an unprovable schema boundary returns a typed refusal. It
+is not guessed from table layout and does not silently fall back to the current
+schema.
 
 A schema-feed extension must decide:
 
@@ -615,9 +710,9 @@ A schema-feed extension must decide:
 - retention and rebuild behavior for schema history;
 - whether the required authority earns an internal-format strand.
 
-It must not infer graph property identity from Lance field IDs or physical
-column names. Until that extension lands, the entity feed is replayable only
-against a compatible graph schema established out of band.
+It must not infer graph identity from Lance field IDs or physical column names.
+Until that extension lands, the entity feed is replayable only within a proven
+compatible graph schema established out of band.
 
 ### 10.2 Other exclusions
 
@@ -635,16 +730,18 @@ against a compatible graph schema established out of band.
 
 ## 11. Format and compatibility audit
 
-The C0–C3 core below persists nothing and therefore requires no internal-schema
+The C0–C4 core below persists nothing and therefore requires no internal-schema
 or recovery-schema bump:
 
 - lineage and table pins already exist;
+- graph type identity already exists in accepted SchemaIR and is projected
+  opaquely rather than persisted again;
 - runtime path/cursor indexes are derived and rebuildable;
-- cursors are caller-owned wire values;
+- page tokens and cursors are caller-owned wire values;
 - typed errors and new read APIs are additive.
 
-The opaque cursor has its own wire version. An unsupported cursor version is a
-typed error, not best-effort decoding.
+Opaque page tokens and cursors have separate wire versions and decoders. An
+unsupported version or cross-use is a typed error, not best-effort decoding.
 
 Any implementation that proposes a stored watermark, feed offset, operation
 summary, delete tombstone, or historical SchemaIR changes this conclusion and
@@ -654,12 +751,13 @@ must return to this RFC's format audit before landing.
 
 | Phase | Ships | Safe stop |
 |---|---|---|
-| C0 — foundation correction | Identity-keyed table intervals with deterministic graph-visible table ordering; O(1) adjacent first-parent validation; Lance surface guards; remove speculative binary lifting | No new public API or persisted state; existing diff table traversal becomes deterministic |
-| C1 — engine feed | Internal graph commit blocks with exact logical images, exact-end insert/update adapter, complete delete fallback, bounded page/cursor engine, typed gaps | Engine-only contract can be exercised before wire commitment |
-| C2 — graph surfaces | SDK, exact snapshot+cursor baseline, `omnigraph changes`, HTTP/OpenAPI, docs, authorization and parity tests | Useful caller-owned entity feed; compatible schema is established out of band |
-| C3 — entity history | Newest-first history derived from the same per-commit enumerator, with a separately versioned `history/backward` cursor | Investigation surface; no new storage authority |
-| C4 — publication time, optional | Derived `published_at` and possibly a measured as-of-time selector | Lands only after its semantics and cold-history cost pass §7 |
-| C5 — schema replay, separate decision | Historical SchemaIR authority and schema-change events | Requires its own format conclusion before implementation |
+| C0 — foundation correction | Graph type-lifetime pairing with deterministic graph-semantic ordering; O(1) adjacent first-parent validation; Lance surface guards; remove speculative binary lifting | No new public API or persisted state; physical placement remains private |
+| C1 — private enumerator | Internal graph commit blocks with exact logical images, exact-end insert/update adapter, complete delete fallback, bounded page positions, typed gaps, and schema-compatibility refusal | Engine-only correctness before wire commitment |
+| C2 — finite commit entity diff | Graph-vocabulary DTO, exact commit-vs-first-parent diff, next-page token, bounded SDK/CLI auto-pagination, HTTP/OpenAPI, authorization, docs, and parity tests | Useful audit/inspection surface without a durable feed protocol |
+| C3 — public entity feed | First-parent feed cursor plus exact snapshot/cursor baseline and at-least-once consumer contract | Useful caller-owned feed within a proven compatible schema |
+| C4 — entity history | Newest-first history derived from the same per-commit enumerator, with separate backward continuation domains | Investigation surface; no new storage authority |
+| C5 — publication time, optional | Derived `published_at` and possibly a measured as-of-time selector | Lands only after its semantics and cold-history cost pass §7 |
+| C6 — schema replay, separate decision | Historical SchemaIR authority and schema-change events | Requires its own format conclusion before implementation |
 
 C0 deliberately does **not** add a second coordinator or an O(history log
 history) ancestry index. `CommitGraph` already holds the warm lineage
@@ -668,20 +766,23 @@ whose cost is justified by C1.
 
 ## 13. Resolved decisions
 
-1. Public unit: graph commit block, not table/dataset delta.
+1. Public vocabulary: graph commit, node/edge type, opaque graph type identity,
+   logical entity ID, endpoints, and logical values—not table/dataset machinery.
 2. Merge default: first parent only.
 3. Cause placement: once per block.
 4. Commit time field in v1: `authored_at`; no false `committed_at` label.
-5. Cursor: opaque, caller-owned, graph/branch/filter/purpose/direction bound,
-   fixed-cut paging.
+5. Continuation: a page token continues one bounded result; a separate opaque
+   caller-owned cursor resumes only the durable feed after a complete commit.
 6. Delete authority: exact begin/end logical-ID comparison; transaction history
    may only prove that comparison unnecessary.
 7. Retention: validate concrete participant versions; no scalar watermark.
 8. Existing `diff`: distinct net-current API with shared primitives, no
    optional multi-commit attribution.
-9. Row images: exact after-image for insert/update and exact before-image for
-   delete; graph-schema replay remains separate.
-10. Reset: one exact graph snapshot and its `AfterCommit` cursor are captured
-    together; a bare head ID is not a safe bootstrap.
-11. Format: no bump for the entity feed; revisit before persisting any new
+9. Row images: insert after, update before and after, delete before; edge
+   endpoints follow each image.
+10. Entity-data and graph-schema diffs are separate. Historical schema decoding
+    is private correctness machinery, not a public schema-history mode.
+11. Reset: one exact entity-data snapshot and its `AfterCommit` cursor are
+    captured together; a bare head ID is not a safe bootstrap.
+12. Format: no bump for the entity feed; revisit before persisting any new
     history authority.
