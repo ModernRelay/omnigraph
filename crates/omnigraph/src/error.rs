@@ -86,6 +86,11 @@ pub enum OmniError {
     Compiler(#[from] omnigraph_compiler::error::CompilerError),
     #[error("storage: {0}")]
     Lance(String),
+    /// A manifest-pinned Lance version was reclaimed by cleanup. Kept typed at
+    /// the common opener so historical APIs never infer retention from error text.
+    #[error("historical table version {version} was reclaimed")]
+    HistoricalVersionReclaimed { version: u64 },
+
     /// Lance rejected a stale transaction as semantically retryable. Kept
     /// typed at the storage boundary so RFC-023 can distinguish an
     /// effect-free key fence from an arbitrary I/O or execution failure

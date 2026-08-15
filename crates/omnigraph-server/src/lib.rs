@@ -1055,6 +1055,12 @@ impl ApiError {
                     actual,
                 },
             ),
+            // Change paths rewrite this into a typed feed gap before it can
+            // escape; anywhere else a reclaimed pinned version is an internal
+            // retention surprise, not a caller error.
+            OmniError::HistoricalVersionReclaimed { version } => {
+                Self::internal(format!("historical table version {version} was reclaimed"))
+            }
             OmniError::RecoveryRequired {
                 operation_id,
                 reason,
