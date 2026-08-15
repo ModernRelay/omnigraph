@@ -1091,3 +1091,69 @@ mod tests {
         );
     }
 }
+
+pub(crate) fn print_change_cause_human(cause: &omnigraph_api_types::ChangeCauseOutput) {
+    println!("commit: {}", cause.graph_commit_id);
+    println!("branch: {}", cause.authored_branch);
+    if let Some(parent_commit_id) = &cause.parent_commit_id {
+        println!("parent: {}", parent_commit_id);
+    }
+    if let Some(merged_parent_commit_id) = &cause.merged_parent_commit_id {
+        println!("merged_parent: {}", merged_parent_commit_id);
+    }
+    if let Some(actor_id) = &cause.actor_id {
+        println!("actor: {}", actor_id);
+    }
+    println!("authored_at: {}", cause.authored_at);
+}
+
+fn print_entity_change_row(change: &omnigraph_api_types::EntityChangeOutput) {
+    println!(
+        "{} {} {} {}",
+        change.op.as_str(),
+        change.kind.as_str(),
+        change.r#type.name,
+        change.id
+    );
+}
+
+pub(crate) fn print_commit_changes_human(page: &omnigraph_api_types::CommitChangesOutput) {
+    print_change_cause_human(&page.cause);
+    for change in &page.changes {
+        print_entity_change_row(change);
+    }
+    if let Some(next_page_token) = &page.next_page_token {
+        println!("next_page_token: {}", next_page_token);
+    }
+}
+
+pub(crate) fn print_change_feed_human(page: &omnigraph_api_types::ChangeFeedOutput) {
+    if page.blocks.is_empty() {
+        println!("(no new commits)");
+    }
+    for (index, block) in page.blocks.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        print_change_cause_human(&block.cause);
+        for change in &block.changes {
+            print_entity_change_row(change);
+        }
+    }
+    if let Some(cursor) = &page.cursor {
+        println!();
+        println!("cursor: {}", cursor);
+        if let Some(caught_up) = page.caught_up {
+            println!("caught_up: {}", caught_up);
+        }
+    }
+}
+
+pub(crate) fn print_change_baseline_human(
+    baseline: &omnigraph_api_types::ChangeBaselineOutput,
+    out_path: &std::path::Path,
+) {
+    println!("snapshot: {}", out_path.display());
+    println!("snapshot_commit_id: {}", baseline.snapshot_commit_id);
+    println!("resume_cursor: {}", baseline.resume_cursor);
+}

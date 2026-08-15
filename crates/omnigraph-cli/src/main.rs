@@ -489,6 +489,128 @@ async fn main() -> Result<()> {
                     print_commit_human(&commit);
                 }
             }
+            CommitCommand::Changes {
+                uri,
+                commit_id,
+                limit,
+                page_token,
+                kinds,
+                types,
+                ops,
+                json,
+            } => {
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let kinds: Vec<omnigraph_api_types::ChangeEntityKind> =
+                    kinds.into_iter().map(Into::into).collect();
+                let ops: Vec<omnigraph_api_types::ChangeOpOutput> =
+                    ops.into_iter().map(Into::into).collect();
+                let filter = client::ChangeFilterArgs {
+                    kinds: &kinds,
+                    types: &types,
+                    ops: &ops,
+                };
+                let page = client
+                    .commit_changes(&commit_id, page_token.as_deref(), limit, &filter)
+                    .await?;
+                if json {
+                    print_json(&page)?;
+                } else {
+                    print_commit_changes_human(&page);
+                }
+            }
+        },
+        Command::Changes { command } => match command {
+            ChangesCommand::Poll {
+                uri,
+                branch,
+                cursor,
+                start,
+                limit,
+                kinds,
+                types,
+                ops,
+                json,
+            } => {
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let kinds: Vec<omnigraph_api_types::ChangeEntityKind> =
+                    kinds.into_iter().map(Into::into).collect();
+                let ops: Vec<omnigraph_api_types::ChangeOpOutput> =
+                    ops.into_iter().map(Into::into).collect();
+                let filter = client::ChangeFilterArgs {
+                    kinds: &kinds,
+                    types: &types,
+                    ops: &ops,
+                };
+                let page = client
+                    .poll_changes(
+                        branch.as_deref(),
+                        cursor.as_deref(),
+                        start.as_deref(),
+                        limit,
+                        &filter,
+                    )
+                    .await?;
+                if json {
+                    print_json(&page)?;
+                } else {
+                    print_change_feed_human(&page);
+                }
+            }
+            ChangesCommand::Baseline {
+                uri,
+                branch,
+                kinds,
+                types,
+                ops,
+                out,
+                json,
+            } => {
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let kinds: Vec<omnigraph_api_types::ChangeEntityKind> =
+                    kinds.into_iter().map(Into::into).collect();
+                let ops: Vec<omnigraph_api_types::ChangeOpOutput> =
+                    ops.into_iter().map(Into::into).collect();
+                let filter = client::ChangeFilterArgs {
+                    kinds: &kinds,
+                    types: &types,
+                    ops: &ops,
+                };
+                let mut writer = io::BufWriter::new(fs::File::create(&out)?);
+                let baseline = client
+                    .change_baseline(branch.as_deref(), &filter, &mut writer)
+                    .await?;
+                writer.flush()?;
+                drop(writer);
+                if json {
+                    print_json(&baseline)?;
+                } else {
+                    print_change_baseline_human(&baseline, &out);
+                }
+            }
         },
         Command::Schema { command } => match command {
             SchemaCommand::Plan {

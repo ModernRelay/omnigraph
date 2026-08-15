@@ -13,7 +13,8 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use crate::cli::{
-    BlobCommand, Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand, SchemaCommand,
+    BlobCommand, ChangesCommand, Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand,
+    SchemaCommand,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +238,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Export { .. }
         | Command::Blob { .. }
         | Command::Commit { .. }
+        | Command::Changes { .. }
         | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
             command: SchemaCommand::Show { .. } | SchemaCommand::Apply { .. },
@@ -294,6 +296,10 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             BlobCommand::Stat { .. } => "blob stat",
         },
         Command::Commit { .. } => "commit",
+        Command::Changes { command } => match command {
+            ChangesCommand::Poll { .. } => "changes poll",
+            ChangesCommand::Baseline { .. } => "changes baseline",
+        },
         Command::Query { .. } => "query",
         Command::Mutate { .. } => "mutate",
         Command::Alias { .. } => "alias",
@@ -451,6 +457,20 @@ mod tests {
             (
                 parse(&["omnigraph", "graphs", "list"]),
                 [true, false, false, false, false, true],
+            ),
+            // The change surfaces are ordinary data-plane verbs: served or
+            // embedded, never cluster-addressed.
+            (
+                parse(&["omnigraph", "commit", "changes", "some-commit"]),
+                [true, false, true, true, true, true],
+            ),
+            (
+                parse(&["omnigraph", "changes", "poll"]),
+                [true, false, true, true, true, true],
+            ),
+            (
+                parse(&["omnigraph", "changes", "baseline", "--out", "b.jsonl"]),
+                [true, false, true, true, true, true],
             ),
             (
                 parse(&["omnigraph", "optimize", "g.omni"]),
