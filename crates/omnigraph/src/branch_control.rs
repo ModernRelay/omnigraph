@@ -31,6 +31,24 @@ fn lance_error(error: lance::Error) -> OmniError {
     OmniError::Lance(error.to_string())
 }
 
+/// Single classification point for `Dataset::list_branches` failures; every
+/// call site maps through here. A `NotFound` on a `_refs/branches/` file is
+/// the one shape a legal concurrent branch delete produces, and retry is
+/// always sound, so it becomes a typed retryable conflict — classified on the
+/// structured error before stringification. Everything else stays raw.
+pub(crate) fn branch_enumeration_error(error: lance::Error) -> OmniError {
+    match &error {
+        lance::Error::NotFound { uri, .. } if uri.contains("_refs/branches/") => {
+            OmniError::manifest_conflict(format!(
+                "branch enumeration raced a concurrent branch delete: ref '{uri}' vanished \
+                 between listing and read; the deleted branch is gone from the store — retry \
+                 the operation"
+            ))
+        }
+        _ => lance_error(error),
+    }
+}
+
 /// Pinned Lance treats an already-absent target tree as success. OmniGraph
 /// still normalizes `RefNotFound` / `NotFound` around the whole call because
 /// Lance's branch-contents existence check and delete are separate operations,
@@ -61,7 +79,10 @@ async fn force_delete_branch_tree_unchecked(dataset: &mut Dataset, branch: &str)
 }
 
 async fn list_branch_contents(dataset: &Dataset) -> Result<HashMap<String, BranchContents>> {
-    dataset.list_branches().await.map_err(lance_error)
+    dataset
+        .list_branches()
+        .await
+        .map_err(branch_enumeration_error)
 }
 
 async fn branch_contents(dataset: &Dataset, branch: &str) -> Result<Option<BranchContents>> {
@@ -364,6 +385,54 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use lance::dataset::{WriteMode, WriteParams};
+
+    use crate::error::ManifestErrorKind;
+
+    /// A vanished `_refs/branches/` ref must map to a typed retryable
+    /// conflict, not an unclassified storage string (rationale:
+    /// `branch_enumeration_error`).
+    #[test]
+    fn vanished_branch_ref_enumeration_error_is_retryable_conflict() {
+        let error = lance_core::error::NotFoundSnafu {
+            uri: "memory:///graph/__manifest/_refs/branches/cb1.json".to_string(),
+        }
+        .build();
+        match branch_enumeration_error(error) {
+            OmniError::Manifest(manifest) => {
+                assert_eq!(manifest.kind, ManifestErrorKind::Conflict);
+                assert!(
+                    manifest.message.contains("_refs/branches/cb1.json"),
+                    "conflict must name the vanished ref: {}",
+                    manifest.message
+                );
+            }
+            other => panic!("expected typed retryable conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_ref_not_found_enumeration_error_keeps_raw_storage_form() {
+        let error = lance_core::error::NotFoundSnafu {
+            uri: "memory:///graph/__manifest/_versions/12.manifest".to_string(),
+        }
+        .build();
+        assert!(matches!(
+            branch_enumeration_error(error),
+            OmniError::Lance(_)
+        ));
+    }
+
+    #[test]
+    fn non_not_found_enumeration_error_keeps_raw_storage_form() {
+        let error = lance_core::error::RefNotFoundSnafu {
+            message: "branch missing".to_string(),
+        }
+        .build();
+        assert!(matches!(
+            branch_enumeration_error(error),
+            OmniError::Lance(_)
+        ));
+    }
 
     async fn test_dataset(dir: &tempfile::TempDir) -> Dataset {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));

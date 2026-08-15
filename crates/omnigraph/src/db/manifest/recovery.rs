@@ -39,6 +39,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::branch_control::branch_enumeration_error;
 use crate::db::graph_coordinator::GraphCoordinator;
 use crate::db::recovery_audit::{RecoveryAudit, RecoveryAuditRecord, RecoveryKind, TableOutcome};
 use crate::db::schema_state::{
@@ -4245,7 +4246,7 @@ async fn observe_branch_merge_target_ref(
     let branches = dataset
         .list_branches()
         .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?;
+        .map_err(branch_enumeration_error)?;
     let Some(contents) = branches.get(branch) else {
         return Ok(None);
     };
@@ -4792,7 +4793,7 @@ async fn roll_back_ensure_indices_v8(
         let branches = dataset
             .list_branches()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(branch_enumeration_error)?;
         if let Some(child) = crate::branch_control::path_descendant(&branches, target_branch) {
             return Err(OmniError::manifest_internal(format!(
                 "EnsureIndices sidecar '{}' cannot reclaim first-touch '{}:{}' while path-child '{}' is live",
@@ -6199,7 +6200,7 @@ async fn cleanup_unpublished_no_effect_forks(
         let branches = dataset
             .list_branches()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(branch_enumeration_error)?;
         if let Some(child) = crate::branch_control::path_descendant(&branches, target_branch) {
             // Lance cannot reclaim an ancestor tree while a slash-separated
             // path-child remains. Old stores could admit that namespace shape.
@@ -7896,10 +7897,7 @@ async fn open_lance_head_if_present(
     let ds = match branch {
         Some(b) if b != "main" => {
             if allow_missing_branch {
-                let branches = ds
-                    .list_branches()
-                    .await
-                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                let branches = ds.list_branches().await.map_err(branch_enumeration_error)?;
                 if !branches.contains_key(b) {
                     return Ok(None);
                 }

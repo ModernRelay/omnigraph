@@ -320,7 +320,7 @@ pub(super) async fn ensure_indices_for_branch(
                 .dataset()
                 .list_branches()
                 .await
-                .map_err(|error| OmniError::Lance(error.to_string()))?;
+                .map_err(crate::branch_control::branch_enumeration_error)?;
             if branches.contains_key(target_branch) {
                 return Err(OmniError::manifest_conflict(format!(
                     "index target ref '{}:{}' already exists while the graph manifest still \

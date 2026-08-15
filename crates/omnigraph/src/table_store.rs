@@ -835,7 +835,7 @@ impl TableStore {
         let branches = ds
             .list_branches()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(crate::branch_control::branch_enumeration_error)?;
         Ok(branches.into_keys().collect())
     }
 
