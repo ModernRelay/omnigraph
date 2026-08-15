@@ -497,6 +497,76 @@ impl GraphCoordinator {
             .map(|id| id.map(SnapshotId::new))
     }
 
+    /// Capture one coherent change-feed cut of a branch: its lineage head, its
+    /// branch-incarnation witness, its first-parent genesis, and the full
+    /// commit projection — all from ONE branch-pinned coordinator open, so a
+    /// concurrent commit cannot split the head from the chain it tops.
+    pub(crate) async fn capture_change_cut(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<crate::changes::feed::ChangeFeedCut> {
+        let other = match branch {
+            Some(branch) => {
+                GraphCoordinator::open_branch_with_session(
+                    self.root_uri(),
+                    branch,
+                    Arc::clone(&self.storage),
+                    &self.manifest.control_session(),
+                )
+                .await?
+            }
+            None => {
+                GraphCoordinator::open_with_session(
+                    self.root_uri(),
+                    Arc::clone(&self.storage),
+                    &self.manifest.control_session(),
+                )
+                .await?
+            }
+        };
+        let head = other.effective_graph_head().await?.ok_or_else(|| {
+            OmniError::manifest_internal("branch has no lineage head; genesis is always published")
+        })?;
+        // Main cannot be deleted/recreated, so a fixed witness suffices; a
+        // named ref's Lance-native identifier changes on delete/recreate and
+        // fences cursor ABA.
+        let witness = match other.current_branch() {
+            None => crate::changes::token::hashed_identity("branch:main"),
+            Some(_) => {
+                let identifier = other.branch_identifier().await?;
+                let encoded = serde_json::to_string(&identifier).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to encode Lance branch identifier: {error}"
+                    ))
+                })?;
+                crate::changes::token::hashed_identity(&encoded)
+            }
+        };
+        let commits: std::collections::HashMap<String, GraphCommit> = other
+            .load_commits()
+            .await?
+            .into_iter()
+            .map(|commit| (commit.graph_commit_id.clone(), commit))
+            .collect();
+        let mut genesis = head.clone();
+        loop {
+            let commit = commits.get(&genesis).ok_or_else(|| {
+                OmniError::manifest_internal(format!("lineage chain is missing commit '{genesis}'"))
+            })?;
+            match &commit.parent_commit_id {
+                Some(parent) => genesis = parent.clone(),
+                None => break,
+            }
+        }
+        Ok(crate::changes::feed::ChangeFeedCut {
+            branch: other.bound_branch.clone(),
+            head,
+            witness,
+            genesis,
+            commits,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) async fn commit_updates_with_actor(
         &mut self,

@@ -2345,6 +2345,36 @@ impl Omnigraph {
         })
     }
 
+    /// One poll of the durable first-parent change feed. The durable cursor in
+    /// the result advances only over complete commits; the server persists no
+    /// consumer state, so any handle or process can resume from the caller's
+    /// cursor.
+    pub async fn poll_change_feed(
+        &self,
+        request: crate::changes::ChangeFeedRequest,
+    ) -> Result<crate::changes::ChangeFeedPage> {
+        let branch = request
+            .branch
+            .as_deref()
+            .filter(|branch| *branch != "main")
+            .map(str::to_string);
+        let cut = self
+            .coordinator
+            .read()
+            .await
+            .capture_change_cut(branch.as_deref())
+            .await?;
+        let graph_identity = self.schema_view.load().schema_identity_domain.clone();
+        crate::changes::feed::poll(
+            self.uri(),
+            &self.table_store,
+            &graph_identity,
+            &cut,
+            &request,
+        )
+        .await
+    }
+
     pub async fn entity_at_target(
         &self,
         target: impl Into<ReadTarget>,

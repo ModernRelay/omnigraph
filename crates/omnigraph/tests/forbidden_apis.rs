@@ -255,6 +255,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "diff_between"),
     ("db/omnigraph.rs", "diff_commits"),
     ("db/omnigraph.rs", "commit_changes_page"),
+    ("db/omnigraph.rs", "poll_change_feed"),
     ("db/omnigraph.rs", "entity_at_target"),
     ("db/omnigraph.rs", "entity_at"),
     ("db/omnigraph.rs", "snapshot_at_version"),
@@ -348,6 +349,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/graph_coordinator.rs",
         "GraphCoordinator",
         "resolve_commit_range",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "capture_change_cut",
     ),
     (
         "db/graph_coordinator.rs",

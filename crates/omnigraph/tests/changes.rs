@@ -1704,3 +1704,561 @@ node Anchor {
         .unwrap();
     assert!(page.block.changes.is_empty());
 }
+
+// ─── Durable change feed ───────────────────────────────────────────────────
+
+fn feed_request(
+    branch: Option<&str>,
+    position: omnigraph::changes::ChangeFeedPosition,
+) -> omnigraph::changes::ChangeFeedRequest {
+    omnigraph::changes::ChangeFeedRequest {
+        branch: branch.map(str::to_string),
+        position,
+        scope: omnigraph::changes::ChangeFeedScope::default(),
+        max_changes: None,
+        max_bytes: None,
+        max_commits: None,
+    }
+}
+
+fn boundary_cursor(page: &omnigraph::changes::ChangeFeedPage) -> (String, bool) {
+    match &page.continuation {
+        omnigraph::changes::ChangeFeedContinuation::AtBlockBoundary { cursor, caught_up } => {
+            (cursor.clone(), *caught_up)
+        }
+        other => panic!("expected a block-boundary continuation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn change_feed_advances_only_at_block_boundaries_and_pins_the_cut() {
+    use omnigraph::changes::{ChangeFeedContinuation, ChangeFeedPosition, ChangeFeedStart};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    // `Now` captures the head and returns a caught-up cursor with no replay.
+    let now_page = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap();
+    assert!(now_page.blocks.is_empty());
+    let (c0, caught_up) = boundary_cursor(&now_page);
+    assert!(caught_up);
+
+    let commit_a = db
+        .load_with_receipt(
+            "main",
+            "{\"type\":\"Person\",\"data\":{\"name\":\"fa-1\",\"age\":1}}\n{\"type\":\"Person\",\"data\":{\"name\":\"fa-2\",\"age\":2}}\n{\"type\":\"Person\",\"data\":{\"name\":\"fa-3\",\"age\":3}}",
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let commit_b = db
+        .load_with_receipt(
+            "main",
+            "{\"type\":\"Person\",\"data\":{\"name\":\"fb-1\",\"age\":4}}\n{\"type\":\"Person\",\"data\":{\"name\":\"fb-2\",\"age\":5}}",
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+
+    // A row budget smaller than the first block ends the page MID-BLOCK: the
+    // partial block rides with its cause and only a page token continues it —
+    // no durable cursor exists, so a partial block cannot be checkpointed.
+    let mut small = feed_request(None, ChangeFeedPosition::Cursor(c0.clone()));
+    small.max_changes = Some(2);
+    let first = db.poll_change_feed(small).await.unwrap();
+    assert_eq!(first.blocks.len(), 1);
+    assert_eq!(
+        first.blocks[0].cause.graph_commit_id,
+        commit_a.commit.graph_commit_id
+    );
+    assert_eq!(
+        first.blocks[0]
+            .changes
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fa-1", "fa-2"]
+    );
+    let page_token = match &first.continuation {
+        ChangeFeedContinuation::MidBlock { page_token } => page_token.clone(),
+        other => panic!("expected a mid-block continuation, got {other:?}"),
+    };
+
+    // A commit landing after the poll began stays outside its captured cut.
+    let commit_c = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Person","data":{"name":"fc-1","age":6}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+
+    let resumed = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::PageToken(page_token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed
+            .blocks
+            .iter()
+            .map(|block| block.cause.graph_commit_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            commit_a.commit.graph_commit_id.as_str(),
+            commit_b.commit.graph_commit_id.as_str(),
+        ],
+        "the resumed page repeats the split block's cause and excludes the post-cut commit"
+    );
+    assert_eq!(
+        resumed.blocks[0]
+            .changes
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fa-3"]
+    );
+    let (c1, caught_up) = boundary_cursor(&resumed);
+    assert!(
+        !caught_up,
+        "the token's cut was reached, but the live head has already moved past it"
+    );
+
+    // The next poll captures a fresh head and yields exactly the new commit.
+    let next = db
+        .poll_change_feed(feed_request(None, ChangeFeedPosition::Cursor(c1)))
+        .await
+        .unwrap();
+    assert_eq!(next.blocks.len(), 1);
+    assert_eq!(
+        next.blocks[0].cause.graph_commit_id,
+        commit_c.commit.graph_commit_id
+    );
+    let (_, caught_up) = boundary_cursor(&next);
+    assert!(caught_up);
+}
+
+#[tokio::test]
+async fn change_feed_start_modes_now_aftercommit_beginning() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+    use omnigraph::error::OmniError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let extra = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Person","data":{"name":"Late","age":9}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+
+    // Beginning replays the whole first-parent history in order.
+    let beginning = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Beginning),
+        ))
+        .await
+        .unwrap();
+    let (_, caught_up) = boundary_cursor(&beginning);
+    assert!(caught_up);
+    assert!(
+        beginning
+            .blocks
+            .iter()
+            .any(|block| block.changes.iter().any(|change| change.id == "Alice")),
+        "the fixture load block replays from the beginning"
+    );
+    let late_position = beginning
+        .blocks
+        .iter()
+        .position(|block| block.cause.graph_commit_id == extra.commit.graph_commit_id)
+        .expect("the late commit is on the chain");
+    assert_eq!(late_position, beginning.blocks.len() - 1, "oldest first");
+
+    // AfterCommit begins exactly after a chain commit; an off-chain id is a
+    // typed rejection.
+    let fixture_load_commit = beginning
+        .blocks
+        .iter()
+        .find(|block| block.changes.iter().any(|change| change.id == "Alice"))
+        .unwrap()
+        .cause
+        .graph_commit_id
+        .clone();
+    let after = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(fixture_load_commit.clone())),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        after
+            .blocks
+            .iter()
+            .all(|block| block.cause.graph_commit_id != fixture_load_commit)
+    );
+    assert!(
+        after
+            .blocks
+            .iter()
+            .any(|block| block.cause.graph_commit_id == extra.commit.graph_commit_id)
+    );
+    let err = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit("no-such-commit".into())),
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, OmniError::ChangeCursorRejected { .. }));
+
+    // A named branch inherits main history: Beginning includes the inherited
+    // block with its ORIGINAL cause, and the branch-owned block names the
+    // branch.
+    db.branch_create("feature").await.unwrap();
+    let feature_handle = Omnigraph::open(uri).await.unwrap();
+    drop(feature_handle);
+    let mut feature_db = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut feature_db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "FeatureOnly")], &[("$age", 1)]),
+    )
+    .await
+    .unwrap();
+    let feature_feed = feature_db
+        .poll_change_feed(feed_request(
+            Some("feature"),
+            ChangeFeedPosition::Start(ChangeFeedStart::Beginning),
+        ))
+        .await
+        .unwrap();
+    let inherited = feature_feed
+        .blocks
+        .iter()
+        .find(|block| block.cause.graph_commit_id == fixture_load_commit)
+        .expect("inherited main history rides the feature chain");
+    assert_eq!(
+        inherited.cause.authored_branch, None,
+        "an inherited commit keeps its original cause"
+    );
+    let owned = feature_feed
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .changes
+                .iter()
+                .any(|change| change.id == "FeatureOnly")
+        })
+        .expect("the branch-owned commit is on the chain");
+    assert_eq!(owned.cause.authored_branch.as_deref(), Some("feature"));
+}
+
+#[tokio::test]
+async fn change_feed_merge_commit_is_first_parent_relative_with_merged_parent_on_cause() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+    main.ensure_indices().await.unwrap();
+    let pre_merge_head = snapshot_id(&main, "main").await.unwrap();
+
+    main.branch_create("side").await.unwrap();
+    let mut side = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut side,
+        "side",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Merged")], &[("$age", 7)]),
+    )
+    .await
+    .unwrap();
+    // Diverge main so the merge is a true three-way merge commit rather than
+    // a fast-forward adoption.
+    mutate_main(
+        &mut main,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Bob")], &[("$age", 41)]),
+    )
+    .await
+    .unwrap();
+    let outcome = main.branch_merge("side", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    let feed = main
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(
+                pre_merge_head.as_str().to_string(),
+            )),
+        ))
+        .await
+        .unwrap();
+    let merge_block = feed
+        .blocks
+        .iter()
+        .find(|block| block.cause.merged_parent_commit_id.is_some())
+        .expect("the merge commit carries its merged parent for DAG-aware callers");
+    let divergence_block = feed
+        .blocks
+        .iter()
+        .find(|block| block.cause.merged_parent_commit_id.is_none())
+        .expect("main's own divergence commit rides the chain");
+    assert_eq!(
+        merge_block.cause.parent_commit_id.as_deref(),
+        Some(divergence_block.cause.graph_commit_id.as_str()),
+        "the merge block is first-parent relative to main's own head"
+    );
+    assert!(
+        merge_block
+            .changes
+            .iter()
+            .any(|change| change.id == "Merged"),
+        "the merge's first-parent delta carries the branch's row"
+    );
+    assert!(
+        merge_block.changes.iter().all(|change| change.id != "Bob"),
+        "main's own divergence is not re-attributed to the merge commit"
+    );
+}
+
+#[tokio::test]
+async fn change_feed_cursor_scope_mismatches_are_typed() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedScope, ChangeFeedStart, ChangeOpKind};
+    use omnigraph::error::OmniError;
+
+    fn assert_rejected(err: OmniError, fragment: &str) {
+        match err {
+            OmniError::ChangeCursorRejected { reason } => assert!(
+                reason.contains(fragment),
+                "reason '{reason}' should mention '{fragment}'"
+            ),
+            other => panic!("expected a typed continuation rejection, got: {other:?}"),
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+
+    let (c_main, _) = boundary_cursor(
+        &db.poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap(),
+    );
+
+    // Wrong branch.
+    assert_rejected(
+        db.poll_change_feed(feed_request(
+            Some("feature"),
+            ChangeFeedPosition::Cursor(c_main.clone()),
+        ))
+        .await
+        .unwrap_err(),
+        "different branch",
+    );
+
+    // Wrong filter scope.
+    let mut scoped = feed_request(None, ChangeFeedPosition::Cursor(c_main.clone()));
+    scoped.scope = ChangeFeedScope {
+        ops: Some(vec![ChangeOpKind::Insert]),
+        ..ChangeFeedScope::default()
+    };
+    assert_rejected(
+        db.poll_change_feed(scoped).await.unwrap_err(),
+        "different filter scope",
+    );
+
+    // Kind cross-use in both directions.
+    let inserted = db
+        .load_with_receipt(
+            "main",
+            "{\"type\":\"Person\",\"data\":{\"name\":\"x-1\",\"age\":1}}\n{\"type\":\"Person\",\"data\":{\"name\":\"x-2\",\"age\":2}}",
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let page = db
+        .commit_changes_page(
+            &inserted.commit.graph_commit_id,
+            &ChangeFeedScope::default(),
+            None,
+            Some(1),
+            None,
+        )
+        .await
+        .unwrap();
+    let commit_page_token = page.next_page_token.unwrap();
+    assert_rejected(
+        db.poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Cursor(commit_page_token.clone()),
+        ))
+        .await
+        .unwrap_err(),
+        "change feed cursor",
+    );
+    assert_rejected(
+        db.commit_changes_page(
+            &inserted.commit.graph_commit_id,
+            &ChangeFeedScope::default(),
+            Some(&c_main),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err(),
+        "commit changes page token",
+    );
+
+    // Branch delete/recreate: the incarnation witness fences cursor ABA.
+    db.branch_create("aba").await.unwrap();
+    let (c_aba, _) = boundary_cursor(
+        &db.poll_change_feed(feed_request(
+            Some("aba"),
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap(),
+    );
+    db.branch_delete("aba").await.unwrap();
+    db.branch_create("aba").await.unwrap();
+    assert_rejected(
+        db.poll_change_feed(feed_request(Some("aba"), ChangeFeedPosition::Cursor(c_aba)))
+            .await
+            .unwrap_err(),
+        "different branch incarnation",
+    );
+
+    // Another graph entirely (fresh identity domain and genesis).
+    let other_dir = tempfile::tempdir().unwrap();
+    let other_db = init_and_load(&other_dir).await;
+    let err = other_db
+        .poll_change_feed(feed_request(None, ChangeFeedPosition::Cursor(c_main)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, OmniError::ChangeCursorRejected { .. }));
+}
+
+#[tokio::test]
+async fn change_feed_commits_examined_ceiling_bounds_sparse_polls() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    for row in 0..3 {
+        db.load_with_receipt(
+            "main",
+            &format!(r#"{{"type":"Person","data":{{"name":"s-{row}","age":{row}}}}}"#),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    }
+
+    let full = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Beginning),
+        ))
+        .await
+        .unwrap();
+    let (_, caught_up) = boundary_cursor(&full);
+    assert!(caught_up);
+    let total_blocks = full.blocks.len();
+    assert!(total_blocks >= 4, "fixture history plus three loads");
+
+    // Bounded polls drain the same chain deterministically, two commits at a
+    // time, without a durable cursor ever landing inside a block.
+    let mut bounded = feed_request(None, ChangeFeedPosition::Start(ChangeFeedStart::Beginning));
+    bounded.max_commits = Some(2);
+    let mut collected = Vec::new();
+    let mut page = db.poll_change_feed(bounded).await.unwrap();
+    loop {
+        assert!(
+            page.blocks.len() <= 2,
+            "the commit ceiling bounds each poll"
+        );
+        collected.extend(
+            page.blocks
+                .iter()
+                .map(|block| block.cause.graph_commit_id.clone()),
+        );
+        let (cursor, caught_up) = boundary_cursor(&page);
+        if caught_up {
+            break;
+        }
+        let mut next = feed_request(None, ChangeFeedPosition::Cursor(cursor));
+        next.max_commits = Some(2);
+        page = db.poll_change_feed(next).await.unwrap();
+    }
+    assert_eq!(
+        collected,
+        full.blocks
+            .iter()
+            .map(|block| block.cause.graph_commit_id.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn change_feed_resume_is_stateless_across_handles() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    let (cursor, _) = boundary_cursor(
+        &db.poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap(),
+    );
+    let commit = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Person","data":{"name":"Stateless","age":1}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+
+    // A second handle resumes the first handle's cursor with no server state.
+    let other = Omnigraph::open(uri).await.unwrap();
+    let page = other
+        .poll_change_feed(feed_request(None, ChangeFeedPosition::Cursor(cursor)))
+        .await
+        .unwrap();
+    assert_eq!(page.blocks.len(), 1);
+    assert_eq!(
+        page.blocks[0].cause.graph_commit_id,
+        commit.commit.graph_commit_id
+    );
+    let (_, caught_up) = boundary_cursor(&page);
+    assert!(caught_up);
+}

@@ -201,3 +201,150 @@ node Document {
     })
     .await;
 }
+
+/// A caught-up poll examines zero commits: it captures the cut, proves the
+/// cursor current, and touches NO data tables — so data work is flat (zero
+/// opens) regardless of table extent. The manifest capture term is printed as
+/// a recorded diagnostic; it is the known `__manifest` fold cost, not claimed
+/// flat here.
+#[tokio::test]
+async fn change_feed_caught_up_poll_is_data_flat() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    cost_harness(async {
+        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        for rows in [64u64, 256] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Omnigraph::init(
+                dir.path().to_str().unwrap(),
+                "node Person {\n    name: String @key\n    age: I32?\n}\n",
+            )
+            .await
+            .unwrap();
+            let batch: Vec<String> = (0..rows)
+                .map(|i| format!(r#"{{"type":"Person","data":{{"name":"p{i:05}","age":1}}}}"#))
+                .collect();
+            db.load_with_receipt("main", &batch.join("\n"), LoadMode::Merge)
+                .await
+                .unwrap();
+            let now = db
+                .poll_change_feed(omnigraph::changes::ChangeFeedRequest {
+                    branch: None,
+                    position: ChangeFeedPosition::Start(ChangeFeedStart::Now),
+                    scope: ChangeFeedScope::default(),
+                    max_changes: None,
+                    max_bytes: None,
+                    max_commits: None,
+                })
+                .await
+                .unwrap();
+            let cursor = match now.continuation {
+                omnigraph::changes::ChangeFeedContinuation::AtBlockBoundary { cursor, .. } => {
+                    cursor
+                }
+                other => panic!("expected boundary, got {other:?}"),
+            };
+
+            let (page, io) = measure(db.poll_change_feed(omnigraph::changes::ChangeFeedRequest {
+                branch: None,
+                position: ChangeFeedPosition::Cursor(cursor),
+                scope: ChangeFeedScope::default(),
+                max_changes: None,
+                max_bytes: None,
+                max_commits: None,
+            }))
+            .await;
+            let page = page.unwrap();
+            assert!(page.blocks.is_empty(), "the poll is caught up");
+            eprintln!(
+                "CAUGHT-UP rows={rows}: data_open_count={} data_reads={} manifest_reads={}",
+                io.data_open_count, io.data_reads, io.manifest_reads,
+            );
+            curve.push((rows, io));
+        }
+        assert_flat(
+            &curve,
+            |io| io.data_open_count,
+            0,
+            "caught-up poll opens no data tables",
+        );
+        assert_flat(&curve, |io| io.data_reads, 0, "caught-up poll data reads");
+    })
+    .await;
+}
+
+/// A backlog walk pays one manifest snapshot resolution per commit examined
+/// (plus one), and at most two data opens per effectful commit — both honest
+/// linear-in-backlog terms, pinned as growing with the backlog while the
+/// per-commit open ratio stays bounded.
+#[tokio::test]
+async fn change_feed_backlog_walk_grows_with_commits_examined() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    cost_harness(async {
+        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        for backlog in [3u64, 9] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Omnigraph::init(
+                dir.path().to_str().unwrap(),
+                "node Person {\n    name: String @key\n    age: I32?\n}\n",
+            )
+            .await
+            .unwrap();
+            let now = db
+                .poll_change_feed(omnigraph::changes::ChangeFeedRequest {
+                    branch: None,
+                    position: ChangeFeedPosition::Start(ChangeFeedStart::Now),
+                    scope: ChangeFeedScope::default(),
+                    max_changes: None,
+                    max_bytes: None,
+                    max_commits: None,
+                })
+                .await
+                .unwrap();
+            let cursor = match now.continuation {
+                omnigraph::changes::ChangeFeedContinuation::AtBlockBoundary { cursor, .. } => {
+                    cursor
+                }
+                other => panic!("expected boundary, got {other:?}"),
+            };
+            for row in 0..backlog {
+                db.load_with_receipt(
+                    "main",
+                    &format!(r#"{{"type":"Person","data":{{"name":"b-{row}","age":1}}}}"#),
+                    LoadMode::Merge,
+                )
+                .await
+                .unwrap();
+            }
+
+            let (page, io) = measure(db.poll_change_feed(omnigraph::changes::ChangeFeedRequest {
+                branch: None,
+                position: ChangeFeedPosition::Cursor(cursor),
+                scope: ChangeFeedScope::default(),
+                max_changes: None,
+                max_bytes: None,
+                max_commits: None,
+            }))
+            .await;
+            let page = page.unwrap();
+            assert_eq!(page.blocks.len() as u64, backlog);
+            assert!(
+                io.data_open_count <= 2 * backlog,
+                "at most two pinned opens per effectful commit: {io:?}"
+            );
+            eprintln!(
+                "BACKLOG commits={backlog}: data_open_count={} data_reads={} manifest_reads={}",
+                io.data_open_count, io.data_reads, io.manifest_reads,
+            );
+            curve.push((backlog, io));
+        }
+        assert_grows(
+            &curve,
+            |io| io.manifest_reads,
+            1,
+            "one manifest snapshot resolution per commit examined",
+        );
+    })
+    .await;
+}
