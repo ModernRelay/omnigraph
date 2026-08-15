@@ -3176,6 +3176,56 @@
           }
         }
       },
+      "ChangeDiffRefusalOutput": {
+        "type": "object",
+        "description": "A well-formed entity-diff request this commit cannot satisfy (HTTP 409).",
+        "required": [
+          "reason",
+          "graph_commit_id"
+        ],
+        "properties": {
+          "graph_commit_id": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/ChangeDiffRefusalReason"
+          },
+          "type_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The graph type at the schema boundary, when the reason names one."
+          }
+        }
+      },
+      "ChangeDiffRefusalReason": {
+        "type": "string",
+        "description": "Why a well-formed entity-diff request was refused (HTTP 409).",
+        "enum": [
+          "parentless_commit",
+          "schema_boundary",
+          "unknown"
+        ]
+      },
+      "ChangeFeedGapOutput": {
+        "type": "object",
+        "description": "A change continuation can no longer be reconstructed from retained history\n(HTTP 410). Recovery is the baseline handshake; retrying the same cursor\ncannot succeed. `code` stays unset: [`ErrorCode`] is closed and this\nadditive detail is the machine-readable discriminator (the same rolling\ncontract as `external_blob_source`).",
+        "required": [
+          "first_unreadable_commit_id"
+        ],
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "first_unreadable_commit_id": {
+            "type": "string"
+          }
+        }
+      },
       "ChangeOutput": {
         "type": "object",
         "required": [
@@ -3336,6 +3386,28 @@
               {
                 "$ref": "#/components/schemas/BlobRangeOutput",
                 "description": "Set with HTTP 416 for a valid but unsatisfiable managed Blob byte range.\n`start..end` is half-open and `length` is the selected Blob length."
+              }
+            ]
+          },
+          "change_diff_refusal": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChangeDiffRefusalOutput",
+                "description": "Set with HTTP 409 when a commit entity diff is refused (parentless\ncommit or an unprovable schema boundary)."
+              }
+            ]
+          },
+          "change_feed_gap": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChangeFeedGapOutput",
+                "description": "Set with HTTP 410 when retained history can no longer reconstruct a\nchange continuation. Recover via the baseline handshake."
               }
             ]
           },

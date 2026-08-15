@@ -306,6 +306,8 @@ pub struct ApiError {
     external_blob_source: Option<Box<api::ExternalBlobSourceOutput>>,
     recovery_required: Option<Box<api::RecoveryRequiredOutput>>,
     precondition_failure: Option<Box<api::PreconditionFailureOutput>>,
+    change_feed_gap: Option<Box<api::ChangeFeedGapOutput>>,
+    change_diff_refusal: Option<Box<api::ChangeDiffRefusalOutput>>,
 }
 
 impl AppState {
@@ -646,6 +648,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -663,6 +667,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -680,6 +686,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -697,6 +705,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -718,6 +728,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -735,6 +747,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -752,6 +766,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -773,6 +789,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -794,6 +812,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -811,6 +831,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -833,6 +855,8 @@ impl ApiError {
             external_blob_source: Some(Box::new(api::ExternalBlobSourceOutput { uri, reason })),
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -854,6 +878,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -882,6 +908,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -899,6 +927,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -916,6 +946,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -933,6 +965,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -950,6 +984,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -970,6 +1006,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: Some(Box::new(api::RecoveryRequiredOutput { operation_id })),
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -991,6 +1029,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: Some(Box::new(details)),
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -1177,6 +1217,8 @@ impl IntoResponse for ApiError {
                 external_blob_source: self.external_blob_source.map(|d| *d),
                 recovery_required: self.recovery_required.map(|d| *d),
                 precondition_failure: self.precondition_failure.map(|d| *d),
+                change_feed_gap: self.change_feed_gap.map(|d| *d),
+                change_diff_refusal: self.change_diff_refusal.map(|d| *d),
             }),
         )
             .into_response()
