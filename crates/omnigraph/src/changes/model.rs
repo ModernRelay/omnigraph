@@ -89,15 +89,6 @@ impl ChangeOpKind {
             Self::Delete => 2,
         }
     }
-
-    pub(crate) fn from_rank(rank: u8) -> Option<Self> {
-        match rank {
-            0 => Some(Self::Insert),
-            1 => Some(Self::Update),
-            2 => Some(Self::Delete),
-            _ => None,
-        }
-    }
 }
 
 /// Opaque graph-scoped type identity plus the graph-schema name. The `id`
@@ -321,13 +312,5 @@ mod tests {
         assert_eq!(ChangeOpKind::Insert.rank(), 0);
         assert_eq!(ChangeOpKind::Update.rank(), 1);
         assert_eq!(ChangeOpKind::Delete.rank(), 2);
-        for op in [
-            ChangeOpKind::Insert,
-            ChangeOpKind::Update,
-            ChangeOpKind::Delete,
-        ] {
-            assert_eq!(ChangeOpKind::from_rank(op.rank()), Some(op));
-        }
-        assert_eq!(ChangeOpKind::from_rank(3), None);
     }
 }

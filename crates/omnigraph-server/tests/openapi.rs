@@ -206,6 +206,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/branches/merge",
     "/graphs/{graph_id}/commits",
     "/graphs/{graph_id}/commits/{commit_id}",
+    "/graphs/{graph_id}/commits/{commit_id}/changes",
 ];
 
 #[test]
@@ -233,6 +234,37 @@ fn openapi_has_no_unexpected_paths() {
             expected.contains(path.as_str()),
             "unexpected path in OpenAPI spec: {path}"
         );
+    }
+}
+
+#[test]
+fn openapi_commit_changes_is_get_with_page_token_params() {
+    let doc = openapi_json();
+    let op = &doc["paths"]["/graphs/{graph_id}/commits/{commit_id}/changes"]["get"];
+    assert!(op.is_object(), "the commit changes route is a GET");
+    let params: Vec<&str> = op["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|param| param["name"].as_str().unwrap())
+        .collect();
+    for expected in ["commit_id", "page_token", "limit", "kind", "type", "op"] {
+        assert!(
+            params.contains(&expected),
+            "missing param {expected}: {params:?}"
+        );
+    }
+    // Caller byte limits and feed-only continuations never ride the finite
+    // commit diff.
+    for forbidden in ["max_bytes", "cursor", "start"] {
+        assert!(
+            !params.contains(&forbidden),
+            "param {forbidden} must not exist on the commit diff"
+        );
+    }
+    let responses = op["responses"].as_object().unwrap();
+    for code in ["200", "400", "401", "403", "404", "409", "410", "413"] {
+        assert!(responses.contains_key(code), "missing response {code}");
     }
 }
 
@@ -643,6 +675,14 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "ErrorCode",
     "ErrorOutput",
     "ChangeFeedGapOutput",
+    "ChangeEntityKind",
+    "ChangeOpOutput",
+    "ChangeTypeOutput",
+    "ChangeEndpointsOutput",
+    "ChangeImageOutput",
+    "EntityChangeOutput",
+    "ChangeCauseOutput",
+    "CommitChangesOutput",
     "ChangeDiffRefusalOutput",
     "ChangeDiffRefusalReason",
     "BlobRangeOutput",
@@ -1156,6 +1196,7 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/graphs/{graph_id}/branches/merge", "post"),
         ("/graphs/{graph_id}/commits", "get"),
         ("/graphs/{graph_id}/commits/{commit_id}", "get"),
+        ("/graphs/{graph_id}/commits/{commit_id}/changes", "get"),
     ];
 
     for (path, method) in protected_paths {
@@ -1632,6 +1673,7 @@ const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/branches/merge",
     "/graphs/{graph_id}/commits",
     "/graphs/{graph_id}/commits/{commit_id}",
+    "/graphs/{graph_id}/commits/{commit_id}/changes",
 ];
 
 async fn app_for_multi_mode(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {

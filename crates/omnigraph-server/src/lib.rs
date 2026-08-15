@@ -122,6 +122,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_branch_merge,
         handlers::server_commit_list,
         handlers::server_commit_show,
+        handlers::server_commit_changes,
     ),
     components(schemas(api::BlobEntityKind)),
     modifiers(&SecurityAddon),
@@ -1034,6 +1035,53 @@ impl ApiError {
         }
     }
 
+    /// HTTP 410 Gone — retained history can no longer reconstruct a change
+    /// continuation. `code` stays unset ([`ErrorCode`] is closed); the
+    /// `change_feed_gap` detail is the machine-readable discriminator and the
+    /// baseline handshake is the only recovery.
+    fn change_feed_gap(cursor: Option<String>, first_unreadable_commit_id: String) -> Self {
+        Self {
+            status: StatusCode::GONE,
+            code: None,
+            message: format!("change feed gap at commit '{first_unreadable_commit_id}'"),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+            change_feed_gap: Some(Box::new(api::ChangeFeedGapOutput {
+                cursor,
+                first_unreadable_commit_id,
+            })),
+            change_diff_refusal: None,
+        }
+    }
+
+    /// HTTP 409 Conflict — a well-formed entity-diff request this commit
+    /// cannot satisfy (parentless genesis or an unprovable schema boundary).
+    fn change_diff_refusal(message: String, details: api::ChangeDiffRefusalOutput) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: Some(ErrorCode::Conflict),
+            message,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: Some(Box::new(details)),
+        }
+    }
+
     fn from_omni(err: OmniError) -> Self {
         match err {
             OmniError::Compiler(err) => Self::bad_request(err.to_string()),
@@ -1107,15 +1155,40 @@ impl ApiError {
             OmniError::ChangeCursorRejected { reason } => {
                 Self::bad_request(format!("change cursor rejected: {reason}"))
             }
-            // Retention loss under a change continuation. The change-route
-            // slice upgrades this to a typed 410 with a structured
-            // resume-hint detail; until then it must not read as a caller
-            // fault.
-            err @ OmniError::ChangeFeedGap { .. } => Self::internal(err.to_string()),
-            // Well-formed entity-diff requests this commit cannot satisfy.
-            // The change-route slice adds the structured refusal detail.
-            err @ OmniError::CommitHasNoParent { .. } => Self::conflict(err.to_string()),
-            err @ OmniError::ChangeSchemaBoundary { .. } => Self::conflict(err.to_string()),
+            // Retention loss under a change continuation: 410 with the
+            // structured resume hint. Recovery is the baseline handshake.
+            OmniError::ChangeFeedGap {
+                cursor,
+                first_unreadable_commit_id,
+            } => Self::change_feed_gap(cursor, first_unreadable_commit_id),
+            // Well-formed entity-diff requests this commit cannot satisfy:
+            // 409 with the structured refusal reason.
+            err @ OmniError::CommitHasNoParent { .. } => {
+                let OmniError::CommitHasNoParent { graph_commit_id } = &err else {
+                    unreachable!()
+                };
+                let details = api::ChangeDiffRefusalOutput {
+                    reason: api::ChangeDiffRefusalReason::ParentlessCommit,
+                    graph_commit_id: graph_commit_id.clone(),
+                    type_name: None,
+                };
+                Self::change_diff_refusal(err.to_string(), details)
+            }
+            err @ OmniError::ChangeSchemaBoundary { .. } => {
+                let OmniError::ChangeSchemaBoundary {
+                    graph_commit_id,
+                    type_name,
+                } = &err
+                else {
+                    unreachable!()
+                };
+                let details = api::ChangeDiffRefusalOutput {
+                    reason: api::ChangeDiffRefusalReason::SchemaBoundary,
+                    graph_commit_id: graph_commit_id.clone(),
+                    type_name: Some(type_name.clone()),
+                };
+                Self::change_diff_refusal(err.to_string(), details)
+            }
             OmniError::RecoveryRequired {
                 operation_id,
                 reason,
@@ -1228,6 +1301,75 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod api_error_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn change_feed_gap_is_typed_410() {
+        let response = ApiError::from_omni(OmniError::ChangeFeedGap {
+            cursor: Some("opaque-cursor".to_string()),
+            first_unreadable_commit_id: "01JTESTGAP".to_string(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::GONE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, None, "ErrorCode stays closed; the detail rides");
+        let gap = error.change_feed_gap.expect("structured feed gap");
+        assert_eq!(gap.cursor.as_deref(), Some("opaque-cursor"));
+        assert_eq!(gap.first_unreadable_commit_id, "01JTESTGAP");
+    }
+
+    #[tokio::test]
+    async fn change_diff_refusal_is_typed_409() {
+        for (err, reason, type_name) in [
+            (
+                OmniError::CommitHasNoParent {
+                    graph_commit_id: "01JTESTROOT".to_string(),
+                },
+                api::ChangeDiffRefusalReason::ParentlessCommit,
+                None,
+            ),
+            (
+                OmniError::ChangeSchemaBoundary {
+                    graph_commit_id: "01JTESTROOT".to_string(),
+                    type_name: "Person".to_string(),
+                },
+                api::ChangeDiffRefusalReason::SchemaBoundary,
+                Some("Person".to_string()),
+            ),
+        ] {
+            let response = ApiError::from_omni(err).into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            let refusal = error.change_diff_refusal.expect("structured refusal");
+            assert_eq!(refusal.reason, reason);
+            assert_eq!(refusal.graph_commit_id, "01JTESTROOT");
+            assert_eq!(refusal.type_name, type_name);
+        }
+    }
+
+    #[tokio::test]
+    async fn change_cursor_rejections_are_stable_400s() {
+        let response = ApiError::from_omni(OmniError::ChangeCursorRejected {
+            reason: "invalid change feed cursor checksum".to_string(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error.error.starts_with("change cursor rejected: "),
+            "the 400 prefix is a stable contract: {}",
+            error.error
+        );
+    }
 
     #[tokio::test]
     async fn recovery_required_503_omits_closed_error_code() {
@@ -1587,6 +1729,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/branches/merge", post(server_branch_merge))
         .route("/commits", get(server_commit_list))
         .route("/commits/{commit_id}", get(server_commit_show))
+        .route("/commits/{commit_id}/changes", get(server_commit_changes))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             resolve_graph_handle,

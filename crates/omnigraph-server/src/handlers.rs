@@ -2501,3 +2501,156 @@ mod blob_error_tests {
         assert!(!String::from_utf8_lossy(&body).contains("private-bucket"));
     }
 }
+
+// ─── Change surfaces ────────────────────────────────────────────────────────
+
+/// Parsed change-surface query parameters. axum's `Query<T>` cannot collect
+/// repeated keys into `Vec`s, so the change routes parse the raw query with a
+/// STRICT allow-list: an unknown parameter is a 400, never silently ignored —
+/// this is what keeps caller byte limits and physical vocabulary from ever
+/// riding the new surfaces.
+#[derive(Default)]
+pub(crate) struct ParsedChangeParams {
+    pub branch: Option<String>,
+    pub cursor: Option<String>,
+    pub start: Option<String>,
+    pub page_token: Option<String>,
+    pub limit: Option<usize>,
+    pub kinds: Vec<api::ChangeEntityKind>,
+    pub types: Vec<String>,
+    pub ops: Vec<api::ChangeOpOutput>,
+}
+
+pub(crate) const COMMIT_CHANGES_PARAMS: &[&str] = &["page_token", "limit", "kind", "type", "op"];
+pub(crate) fn parse_change_query(
+    raw: Option<&str>,
+    allowed: &[&str],
+) -> std::result::Result<ParsedChangeParams, ApiError> {
+    let mut params = ParsedChangeParams::default();
+    let Some(raw) = raw else { return Ok(params) };
+
+    fn set_single(
+        slot: &mut Option<String>,
+        name: &str,
+        value: String,
+    ) -> std::result::Result<(), ApiError> {
+        if slot.is_some() {
+            return Err(ApiError::bad_request(format!(
+                "query parameter '{name}' may appear at most once"
+            )));
+        }
+        *slot = Some(value);
+        Ok(())
+    }
+
+    for (name, value) in url::form_urlencoded::parse(raw.as_bytes()) {
+        let name = name.as_ref();
+        if !allowed.contains(&name) {
+            return Err(ApiError::bad_request(format!(
+                "unknown query parameter '{name}'"
+            )));
+        }
+        let value = value.into_owned();
+        match name {
+            "branch" => set_single(&mut params.branch, name, value)?,
+            "cursor" => set_single(&mut params.cursor, name, value)?,
+            "start" => set_single(&mut params.start, name, value)?,
+            "page_token" => set_single(&mut params.page_token, name, value)?,
+            "limit" => {
+                let mut slot = None;
+                set_single(&mut slot, name, value)?;
+                let parsed =
+                    slot.as_deref().unwrap().parse::<usize>().map_err(|_| {
+                        ApiError::bad_request("limit must be a non-negative integer")
+                    })?;
+                if params.limit.replace(parsed).is_some() {
+                    return Err(ApiError::bad_request(
+                        "query parameter 'limit' may appear at most once",
+                    ));
+                }
+            }
+            "kind" => params
+                .kinds
+                .push(api::ChangeEntityKind::parse(&value).ok_or_else(|| {
+                    ApiError::bad_request(format!("unknown kind '{value}' (expected node | edge)"))
+                })?),
+            "type" => params.types.push(value),
+            "op" => params
+                .ops
+                .push(api::ChangeOpOutput::parse(&value).ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "unknown op '{value}' (expected insert | update | delete)"
+                    ))
+                })?),
+            _ => unreachable!("allow-list covers every match arm"),
+        }
+    }
+    Ok(params)
+}
+
+#[utoipa::path(
+    get,
+    path = "/commits/{commit_id}/changes",
+    tag = "changes",
+    operation_id = "getCommitChanges",
+    params(
+        ("commit_id" = String, Path, description = "Commit identifier"),
+        api::CommitChangesQuery,
+    ),
+    responses(
+        (status = 200, description = "Entity changes this commit made relative to its first parent, in frozen (kind, type, id, op) order with the cause stated once", body = api::CommitChangesOutput),
+        (status = 400, description = "Invalid filter or limit, or a rejected page token", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Commit not found", body = ErrorOutput),
+        (status = 409, description = "Commit cannot be entity-diffed (parentless commit or schema boundary); see change_diff_refusal", body = ErrorOutput),
+        (status = 410, description = "Required retained history is no longer readable; see change_feed_gap and capture a new baseline", body = ErrorOutput),
+        (status = 413, description = "Requested limit exceeds the public row ceiling", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+
+/// Entity changes one commit made relative to its first parent.
+///
+/// Read-only, in graph vocabulary with exact before/after images. Bounded:
+/// a large commit continues via the opaque `page_token`.
+pub(crate) async fn server_commit_changes(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Path(CommitPath { commit_id }): Path<CommitPath>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> std::result::Result<Json<api::CommitChangesOutput>, ApiError> {
+    let params = parse_change_query(raw.as_deref(), COMMIT_CHANGES_PARAMS)?;
+    // Resolve the commit first: unlike commit-show, this response carries row
+    // images, so read authorization binds to the branch the commit landed on.
+    let db = &handle.engine;
+    let commit = db
+        .get_commit(&commit_id)
+        .await
+        .map_err(ApiError::from_omni)?;
+    let branch = commit
+        .manifest_branch
+        .clone()
+        .unwrap_or_else(|| "main".to_string());
+    authorize_request(
+        actor.as_ref().map(|Extension(actor)| actor),
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: Some(branch),
+            target_branch: None,
+        },
+    )?;
+    let scope = api::change_scope(&params.kinds, &params.types, &params.ops);
+    let page = db
+        .commit_changes_page(
+            &commit_id,
+            &scope,
+            params.page_token.as_deref(),
+            params.limit,
+            None,
+        )
+        .await
+        .map_err(ApiError::from_omni)?;
+    Ok(Json(api::commit_changes_output(&page)))
+}
