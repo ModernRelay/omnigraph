@@ -1061,6 +1061,12 @@ impl ApiError {
             OmniError::HistoricalVersionReclaimed { version } => {
                 Self::internal(format!("historical table version {version} was reclaimed"))
             }
+            // Caller-side continuation fault (decode, checksum, or scope). The
+            // "change cursor rejected: " prefix is a stable contract so raw
+            // HTTP clients can tell it from a genuine retention gap.
+            OmniError::ChangeCursorRejected { reason } => {
+                Self::bad_request(format!("change cursor rejected: {reason}"))
+            }
             OmniError::RecoveryRequired {
                 operation_id,
                 reason,

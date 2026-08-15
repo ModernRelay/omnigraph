@@ -1,4 +1,5 @@
 pub mod model;
+pub(crate) mod token;
 
 pub use model::{
     CHANGE_FEED_DEFAULT_COMMITS_PER_POLL, CHANGE_FEED_MAX_COMMITS_PER_POLL,

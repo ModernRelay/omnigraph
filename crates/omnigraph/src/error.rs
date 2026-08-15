@@ -127,6 +127,12 @@ pub enum OmniError {
         limit: u64,
         actual: u64,
     },
+    /// A change continuation (page token or feed cursor) failed decoding or
+    /// names a different scope — graph, commit, branch incarnation, filter, or
+    /// continuation kind. Kept typed so callers can tell a caller-side
+    /// continuation bug from a retention gap without parsing text.
+    #[error("change cursor rejected: {reason}")]
+    ChangeCursorRejected { reason: String },
     /// A caller attempted to admit an external Blob URI that is malformed or
     /// outside this graph handle's immutable base allowlist. The URI must be a
     /// normalized, credential-free spelling (or a redacted placeholder): this
