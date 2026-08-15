@@ -31,14 +31,14 @@ how*.
 - **RFC not required:** bug fixes for an `accepted` issue, and the trivial
   fast-lane (typos, docs, deps) — see [../../CONTRIBUTING.md](../../CONTRIBUTING.md).
 
-If you're unsure, start a [Discussion](../../../discussions); a maintainer will
-tell you whether it needs an RFC.
+If you're unsure, open the issue anyway — triage routes it: `accepted` alone
+means code may follow, while `needs-rfc` means the design lands first.
 
 ## Public contribution lifecycle
 
 ```
-Discussion (incubate, get rough consensus)
-      │ graduate
+Issue (feature/rfc + needs-triage)
+      │ maintainer accepts the problem → accepted (+ needs-rfc)
       ▼
 RFC pull request  →  adds docs/rfcs/NNNN-title.md
                          (Author track: Public contribution; Status: Proposed)

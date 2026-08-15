@@ -1,0 +1,33 @@
+name: 💡 Feature proposal
+description: Propose a change. A maintainer triages it; work starts once it is labelled `accepted`.
+labels: ["feature", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Every change starts as an issue (see [GOVERNANCE.md](https://github.com/ModernRelay/omnigraph/blob/main/GOVERNANCE.md)).
+        A maintainer triages this: **`accepted`** is the green light for a PR, and a
+        larger design gets **`needs-rfc`** and goes through an RFC first
+        ([docs/rfcs/README.md](https://github.com/ModernRelay/omnigraph/blob/main/docs/rfcs/README.md)).
+        Trivial fixes (typos, obvious small corrections) can skip the issue and go straight to a PR.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't you do today, or what costs too much? Concrete scenarios beat abstractions.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What should exist? If it adds user-visible surface (CLI, API, query/schema language), sketch it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to solve it, including doing nothing.
+    validations:
+      required: false

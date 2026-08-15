@@ -1,8 +1,6 @@
 <!--
   Thanks for contributing! See CONTRIBUTING.md and GOVERNANCE.md.
-  A substantive PR needs a backing accepted issue or accepted RFC.
-  Maintainers: your internal process applies; the link requirement below
-  is for external contributions.
+  A substantive PR needs a backing accepted issue or merged RFC.
 -->
 
 ## What & why
@@ -14,7 +12,7 @@
 <!-- Pick one. A substantive change needs (1) or (2). -->
 
 - [ ] Fixes an **accepted** issue: Closes #
-- [ ] Implements / is an **accepted** RFC: <link to docs/rfcs/NNNN-*.md>
+- [ ] Is an RFC PR, or implements a **merged** RFC: <link to docs/rfcs/NNNN-*.md>
 - [ ] **Trivial fast-lane** (typo / docs / dependency bump / comment / one-line CI) — no issue/RFC required
 
 ## Checklist
