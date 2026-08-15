@@ -116,6 +116,29 @@ impl Omnigraph {
             _slot: slot,
         })
     }
+
+    /// Capture one served baseline handshake: the pre-minted handshake plus an
+    /// export cut PINNED at the captured head commit. The transport must emit
+    /// the terminal handshake record only after the cut's chunk stream
+    /// completed Ok, so an interrupted stream never yields a usable cursor.
+    #[doc(hidden)]
+    pub async fn capture_served_change_baseline_cut(
+        self: &Arc<Self>,
+        branch: &str,
+        scope: &crate::changes::ChangeFeedScope,
+    ) -> Result<(crate::changes::ChangeBaseline, ExportCut)> {
+        let parts = capture_baseline_parts(self, branch, scope, true).await?;
+        Ok((
+            parts.handshake,
+            ExportCut {
+                db: Arc::clone(self),
+                snapshot: parts.snapshot,
+                catalog: parts.catalog,
+                selected_tables: parts.selected_tables,
+                _slot: parts.slot,
+            },
+        ))
+    }
 }
 
 pub(super) async fn entity_at_target(
@@ -196,19 +219,32 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
 /// head-capture/export race a bare head ID plus a later export would have. A
 /// failed export returns `Err`, so a usable cursor structurally cannot outlive
 /// a broken snapshot.
-pub(super) async fn capture_change_baseline<W: Write>(
+/// Everything one baseline handshake needs, captured coherently under the
+/// export-cut permit the struct retains.
+struct BaselineParts {
+    slot: crate::db::write_queue::ExportCutPermit,
+    snapshot: Snapshot,
+    catalog: Arc<Catalog>,
+    selected_tables: Vec<String>,
+    handshake: crate::changes::ChangeBaseline,
+}
+
+async fn capture_baseline_parts(
     db: &Omnigraph,
     branch: &str,
     scope: &crate::changes::ChangeFeedScope,
-    writer: &mut W,
-) -> Result<crate::changes::ChangeBaseline> {
-    let _export_cut = db.write_queue().try_acquire_export_cut().ok_or_else(|| {
+    heal: bool,
+) -> Result<BaselineParts> {
+    let slot = db.write_queue().try_acquire_export_cut().ok_or_else(|| {
         OmniError::ResourceLimitExceeded {
             resource: "stream_export_slots".to_string(),
             limit: 1,
             actual: 2,
         }
     })?;
+    if heal {
+        db.heal_pending_recovery_sidecars_outcome().await?;
+    }
     let normalized_branch = Some(branch).filter(|branch| *branch != "main");
     let cut = db
         .coordinator
@@ -237,27 +273,53 @@ pub(super) async fn capture_change_baseline<W: Write>(
             scope.wants_kind(kind)
         })
         .collect();
-    let mut emit =
-        |chunk: Vec<u8>| std::future::ready(writer.write_all(&chunk).map_err(OmniError::from));
-    export_selected_tables(
-        db,
-        &resolved.snapshot,
-        catalog.as_ref(),
-        &selected_tables,
-        &mut emit,
-    )
-    .await?;
-
     let resume_cursor = crate::changes::feed::mint_cursor_after(
         &db.schema_view.load().schema_identity_domain,
         &cut,
         scope,
         &cut.head,
     )?;
-    Ok(crate::changes::ChangeBaseline {
-        snapshot_commit_id: cut.head,
-        resume_cursor,
+    Ok(BaselineParts {
+        slot,
+        snapshot: resolved.snapshot,
+        catalog,
+        selected_tables,
+        handshake: crate::changes::ChangeBaseline {
+            snapshot_commit_id: cut.head,
+            resume_cursor,
+        },
     })
+}
+
+/// The baseline handshake: capture one branch head coherently, stream the
+/// data-only entity snapshot PINNED at that head into `writer`, and mint the
+/// cursor that resumes the change feed immediately after it.
+///
+/// The export-cut permit is held from before head capture until the last byte,
+/// so cleanup, schema apply, branch replacement, and root deletion cannot
+/// remove or reuse the selected coordinates mid-handshake — this closes the
+/// head-capture/export race a bare head ID plus a later export would have. A
+/// failed export returns `Err`, so a usable cursor structurally cannot outlive
+/// a broken snapshot.
+pub(super) async fn capture_change_baseline<W: Write>(
+    db: &Omnigraph,
+    branch: &str,
+    scope: &crate::changes::ChangeFeedScope,
+    writer: &mut W,
+) -> Result<crate::changes::ChangeBaseline> {
+    let parts = capture_baseline_parts(db, branch, scope, false).await?;
+    let _slot = parts.slot;
+    let mut emit =
+        |chunk: Vec<u8>| std::future::ready(writer.write_all(&chunk).map_err(OmniError::from));
+    export_selected_tables(
+        db,
+        &parts.snapshot,
+        parts.catalog.as_ref(),
+        &parts.selected_tables,
+        &mut emit,
+    )
+    .await?;
+    Ok(parts.handshake)
 }
 
 async fn entity_from_snapshot(

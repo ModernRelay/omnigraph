@@ -2759,3 +2759,126 @@ pub(crate) async fn server_changes_feed(
     };
     Ok(Json(api::change_feed_output(&page)))
 }
+
+#[utoipa::path(
+    post,
+    path = "/changes/baseline",
+    tag = "changes",
+    operation_id = "captureChangeBaseline",
+    request_body = api::ChangeBaselineRequest,
+    responses(
+        (status = 200, description = "NDJSON entity snapshot pinned at one captured commit. The FINAL record is {\"baseline\": {snapshot_commit_id, resume_cursor}} — an interrupted stream has no terminal record and therefore no usable cursor. Install the snapshot durably before the cursor.", content_type = "application/x-ndjson"),
+        (status = 400, description = "Invalid scope", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Branch not found", body = ErrorOutput),
+        (status = 413, description = "Baseline cut or transport capacity exhausted", body = ErrorOutput),
+        (status = 503, description = "Recovery required", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+
+/// Capture a change-feed baseline: one exact entity snapshot plus the cursor
+/// that resumes the feed immediately after it.
+///
+/// A baseline is a full data export, so it requires the export action. The
+/// snapshot honors the scope's kind and type dimensions; `op` binds only the
+/// resume cursor's feed scope.
+pub(crate) async fn server_changes_baseline(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Json(request): Json<api::ChangeBaselineRequest>,
+) -> std::result::Result<Response, ApiError> {
+    let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    authorize_request(
+        actor.as_ref().map(|Extension(actor)| actor),
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Export,
+            branch: Some(branch.clone()),
+            target_branch: None,
+        },
+    )?;
+    // Reserve the bounded response transport before capturing the cut so a
+    // saturated client population can never hold graph authority while it
+    // waits for process memory (the served-export ordering).
+    let queue_lease = state
+        .export_transport
+        .reserve()
+        .await
+        .map_err(ApiError::from_omni)?;
+    let scope = api::change_scope(&request.kind, &request.r#type, &request.op);
+    let (handshake, cut) = handle
+        .engine
+        .capture_served_change_baseline_cut(&branch, &scope)
+        .await
+        .map_err(ApiError::from_omni)?;
+    let terminal_record = {
+        let mut line = serde_json::to_vec(&api::ChangeBaselineRecord {
+            baseline: api::change_baseline_output(&handshake),
+        })
+        .map_err(|error| ApiError::internal(format!("encode baseline record: {error}")))?;
+        line.push(b'\n');
+        Bytes::from(line)
+    };
+
+    let producer_queue_lease = Arc::clone(&queue_lease);
+    let (tx, body_stream) = export_transport::channel(queue_lease);
+    tokio::spawn(async move {
+        let _producer_queue_lease = producer_queue_lease;
+        let closed_tx = tx.clone();
+        let data_tx = tx.clone();
+        let export = cut.write_chunks(move |chunk| {
+            let data_tx = data_tx.clone();
+            async move {
+                data_tx
+                    .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
+                    .await
+                    .map_err(|_| {
+                        OmniError::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "served baseline response closed",
+                        ))
+                    })
+            }
+        });
+        tokio::pin!(export);
+        tokio::select! {
+            biased;
+            _ = closed_tx.closed() => {
+                // Cancelling the pinned export future drops its move-only cut.
+            }
+            (cut, result) = &mut export => {
+                // The structural guarantee: the terminal handshake record is
+                // sent ONLY after every snapshot record succeeded. A failed or
+                // interrupted stream carries no usable cursor.
+                let error = match result {
+                    Ok(()) => {
+                        match tx
+                            .send(export_transport::ExportFrame::Data(terminal_record))
+                            .await
+                        {
+                            Ok(()) => None,
+                            Err(_) => Some(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "served baseline response closed",
+                            )),
+                        }
+                    }
+                    Err(error) => Some(std::io::Error::other(error.to_string())),
+                };
+                let _ = tx
+                    .send(export_transport::ExportFrame::Terminal { cut, error })
+                    .await;
+            }
+        }
+    });
+    let body = Body::from_stream(body_stream);
+    Ok((
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
+        body,
+    )
+        .into_response())
+}

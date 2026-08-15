@@ -124,8 +124,9 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_commit_show,
         handlers::server_commit_changes,
         handlers::server_changes_feed,
+        handlers::server_changes_baseline,
     ),
-    components(schemas(api::BlobEntityKind)),
+    components(schemas(api::BlobEntityKind, api::ChangeBaselineRecord)),
     modifiers(&SecurityAddon),
 )]
 pub struct ApiDoc;
@@ -1732,6 +1733,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/commits/{commit_id}", get(server_commit_show))
         .route("/commits/{commit_id}/changes", get(server_commit_changes))
         .route("/changes", get(server_changes_feed))
+        .route("/changes/baseline", post(server_changes_baseline))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             resolve_graph_handle,

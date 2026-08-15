@@ -208,6 +208,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/commits/{commit_id}",
     "/graphs/{graph_id}/commits/{commit_id}/changes",
     "/graphs/{graph_id}/changes",
+    "/graphs/{graph_id}/changes/baseline",
 ];
 
 #[test]
@@ -302,6 +303,24 @@ fn openapi_change_feed_is_get_with_cursor_and_start() {
     let responses = op["responses"].as_object().unwrap();
     for code in ["200", "400", "401", "403", "404", "409", "410", "413"] {
         assert!(responses.contains_key(code), "missing response {code}");
+    }
+}
+
+#[test]
+fn openapi_change_baseline_is_streaming_post() {
+    let doc = openapi_json();
+    let op = &doc["paths"]["/graphs/{graph_id}/changes/baseline"]["post"];
+    assert!(op.is_object(), "the baseline handshake is a POST");
+    let ok = &op["responses"]["200"];
+    assert!(
+        ok["content"]["application/x-ndjson"].is_object(),
+        "the baseline streams NDJSON: {ok}"
+    );
+    for code in ["400", "401", "403", "404", "413", "503"] {
+        assert!(
+            op["responses"].as_object().unwrap().contains_key(code),
+            "missing response {code}"
+        );
     }
 }
 
@@ -722,6 +741,9 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "CommitChangesOutput",
     "ChangeBlockOutput",
     "ChangeFeedOutput",
+    "ChangeBaselineRequest",
+    "ChangeBaselineOutput",
+    "ChangeBaselineRecord",
     "ChangeDiffRefusalOutput",
     "ChangeDiffRefusalReason",
     "BlobRangeOutput",
@@ -1237,6 +1259,7 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/graphs/{graph_id}/commits/{commit_id}", "get"),
         ("/graphs/{graph_id}/commits/{commit_id}/changes", "get"),
         ("/graphs/{graph_id}/changes", "get"),
+        ("/graphs/{graph_id}/changes/baseline", "post"),
     ];
 
     for (path, method) in protected_paths {
@@ -1715,6 +1738,7 @@ const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/commits/{commit_id}",
     "/graphs/{graph_id}/commits/{commit_id}/changes",
     "/graphs/{graph_id}/changes",
+    "/graphs/{graph_id}/changes/baseline",
 ];
 
 async fn app_for_multi_mode(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {

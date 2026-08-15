@@ -243,6 +243,10 @@ write_surfaces! {
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
     ("db/omnigraph/export.rs", "capture_served_export_cut"),
+    (
+        "db/omnigraph/export.rs",
+        "capture_served_change_baseline_cut",
+    ),
     ("db/omnigraph.rs", "plan_schema"),
     ("db/omnigraph.rs", "plan_schema_with_options"),
     ("db/omnigraph.rs", "preview_schema_apply_with_options"),
@@ -1481,7 +1485,12 @@ fn export_cut_is_hidden_move_only_and_non_forgeable() {
                     let syn::ImplItem::Fn(function) = member else {
                         continue;
                     };
-                    if function.sig.ident != "capture_served_export_cut" {
+                    // The two registered cut-capture surfaces: served export
+                    // and the served baseline handshake. Both return the one
+                    // move-only ExportCut type.
+                    if function.sig.ident != "capture_served_export_cut"
+                        && function.sig.ident != "capture_served_change_baseline_cut"
+                    {
                         continue;
                     }
                     capture_methods += 1;
@@ -1500,8 +1509,8 @@ fn export_cut_is_hidden_move_only_and_non_forgeable() {
 
     assert_eq!(cut_structs, 1, "exactly one export-cut type is allowed");
     assert_eq!(
-        capture_methods, 1,
-        "exactly one export-cut capture is allowed"
+        capture_methods, 2,
+        "exactly the two registered export-cut captures are allowed"
     );
     assert_eq!(
         cut_methods,

@@ -3467,3 +3467,77 @@ async fn change_feed_scope_mismatch_cursor_is_stable_400() {
         "{rejected}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_baseline_streams_snapshot_then_terminal_cursor() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    load_commit(&app, r#"{"type":"Person","data":{"name":"Base","age":1}}"#).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/changes/baseline"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"branch": "main"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-ndjson; charset=utf-8")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    assert!(
+        lines.len() >= 2,
+        "snapshot records plus the terminal record"
+    );
+
+    // Every line but the last is a snapshot record; the FINAL line is the
+    // handshake — an interrupted stream would simply lack it.
+    let (terminal, records) = lines.split_last().unwrap();
+    for record in records {
+        let value: Value = serde_json::from_str(record).unwrap();
+        assert!(
+            value.get("baseline").is_none(),
+            "the handshake appears exactly once, at the end: {record}"
+        );
+    }
+    let terminal: Value = serde_json::from_str(terminal).unwrap();
+    let snapshot_commit = terminal["baseline"]["snapshot_commit_id"]
+        .as_str()
+        .expect("terminal record names the captured commit");
+    let resume_cursor = terminal["baseline"]["resume_cursor"]
+        .as_str()
+        .expect("terminal record carries the resume cursor");
+    assert!(
+        text.contains("Base"),
+        "the snapshot carries the loaded entity"
+    );
+
+    // A commit landing after the handshake is the first block the resumed
+    // feed yields.
+    let post_commit = load_commit(
+        &app,
+        r#"{"type":"Person","data":{"name":"PostBase","age":2}}"#,
+    )
+    .await;
+    assert_ne!(post_commit, snapshot_commit);
+    let (status, resumed) = get_json(&app, g(&format!("/changes?cursor={resume_cursor}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        resumed["blocks"][0]["cause"]["graph_commit_id"],
+        post_commit.as_str()
+    );
+    assert_eq!(resumed["caught_up"], true);
+}

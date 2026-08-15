@@ -1388,6 +1388,110 @@
         ]
       }
     },
+    "/graphs/{graph_id}/changes/baseline": {
+      "post": {
+        "tags": [
+          "changes"
+        ],
+        "summary": "Capture a change-feed baseline: one exact entity snapshot plus the cursor\nthat resumes the feed immediately after it.",
+        "description": "A baseline is a full data export, so it requires the export action. The\nsnapshot honors the scope's kind and type dimensions; `op` binds only the\nresume cursor's feed scope.",
+        "operationId": "cluster_captureChangeBaseline",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangeBaselineRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "NDJSON entity snapshot pinned at one captured commit. The FINAL record is {\"baseline\": {snapshot_commit_id, resume_cursor}} — an interrupted stream has no terminal record and therefore no usable cursor. Install the snapshot durably before the cursor.",
+            "content": {
+              "application/x-ndjson": {}
+            }
+          },
+          "400": {
+            "description": "Invalid scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Branch not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Baseline cut or transport capacity exhausted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Recovery required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs/{graph_id}/commits": {
       "get": {
         "tags": [
@@ -3531,6 +3635,66 @@
               "null"
             ],
             "description": "Target branch that will receive the merge. Defaults to `main`."
+          }
+        }
+      },
+      "ChangeBaselineOutput": {
+        "type": "object",
+        "description": "Terminal payload of a baseline stream: the captured snapshot commit and\nthe cursor that resumes the feed immediately after it.",
+        "required": [
+          "snapshot_commit_id",
+          "resume_cursor"
+        ],
+        "properties": {
+          "resume_cursor": {
+            "type": "string"
+          },
+          "snapshot_commit_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ChangeBaselineRecord": {
+        "type": "object",
+        "description": "Wire envelope of the FINAL baseline stream line: `{\"baseline\": {...}}`,\ndistinguishable from snapshot records (which carry `type`/`edge` keys).\nEmitted exactly once, only after every snapshot record — an interrupted\nstream has no terminal record and therefore no usable cursor.",
+        "required": [
+          "baseline"
+        ],
+        "properties": {
+          "baseline": {
+            "$ref": "#/components/schemas/ChangeBaselineOutput"
+          }
+        }
+      },
+      "ChangeBaselineRequest": {
+        "type": "object",
+        "description": "Body for the change baseline handshake.",
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Branch to capture. Defaults to `main`."
+          },
+          "kind": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChangeEntityKind"
+            },
+            "description": "Feed scope the resume cursor is bound to. The snapshot honors `kind`\nand `type`; `op` constrains only subsequent polls."
+          },
+          "op": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChangeOpOutput"
+            }
+          },
+          "type": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
