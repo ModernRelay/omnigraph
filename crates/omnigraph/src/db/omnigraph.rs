@@ -41,6 +41,7 @@ mod table_ops;
 
 #[doc(hidden)]
 pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
+pub(crate) use export::{export_blob_values, logical_row_image};
 pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
 pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
@@ -2218,6 +2219,130 @@ impl Omnigraph {
             to_snap.branch.clone().or(from_snap.branch.clone()),
         )
         .await
+    }
+
+    /// One bounded, deterministic page of the exact entity changes a graph
+    /// commit made relative to its first parent, in graph vocabulary with
+    /// exact before/after images. The parentless genesis commit has no diff;
+    /// unprovable schema boundaries and reclaimed history return typed errors.
+    pub async fn commit_changes_page(
+        &self,
+        commit_id: &str,
+        scope: &crate::changes::ChangeFeedScope,
+        page_token: Option<&str>,
+        max_changes: Option<usize>,
+        max_bytes: Option<u64>,
+    ) -> Result<crate::changes::CommitChangesPage> {
+        use crate::changes::token;
+
+        let max_changes = max_changes.unwrap_or(crate::changes::COMMIT_CHANGES_DEFAULT_ROWS);
+        let max_bytes = max_bytes.unwrap_or(crate::changes::COMMIT_CHANGES_DEFAULT_BYTES);
+        crate::changes::enumerate::validate_change_page_limits(max_changes, max_bytes)?;
+
+        let map_gap = |error| match error {
+            OmniError::HistoricalVersionReclaimed { .. } => OmniError::ChangeFeedGap {
+                cursor: page_token.map(str::to_string),
+                first_unreadable_commit_id: commit_id.to_string(),
+            },
+            error => error,
+        };
+
+        let coord = self.coordinator.read().await;
+        let commit = coord.resolve_commit(&SnapshotId::new(commit_id)).await?;
+        let Some(parent_id) = commit.parent_commit_id.clone() else {
+            return Err(OmniError::CommitHasNoParent {
+                graph_commit_id: commit.graph_commit_id,
+            });
+        };
+        let child = coord
+            .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
+                commit.graph_commit_id.clone(),
+            )))
+            .await
+            .map_err(&map_gap)?;
+        let parent = coord
+            .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(parent_id)))
+            .await
+            .map_err(&map_gap)?;
+        drop(coord);
+
+        let graph_identity = self.schema_view.load().schema_identity_domain.clone();
+        let filter_digest = token::filter_digest(scope);
+        let resume = page_token
+            .map(|encoded| {
+                let decoded = token::decode_commit_page_token(encoded)?;
+                if decoded.graph_identity != token::hashed_identity(&graph_identity)
+                    || decoded.commit_id != commit_id
+                {
+                    return Err(token::cursor_rejected(
+                        "commit changes page token does not match this graph and commit",
+                    ));
+                }
+                if decoded.filter_digest != filter_digest {
+                    return Err(token::cursor_rejected(
+                        "commit changes page token was minted for a different filter scope",
+                    ));
+                }
+                Ok(crate::changes::enumerate::ContinuationKey {
+                    identity: decoded.identity(),
+                    id: decoded.id,
+                    operation_rank: decoded.operation_rank,
+                    change_index: decoded.change_index,
+                })
+            })
+            .transpose()?;
+
+        let mut budget = crate::changes::enumerate::PageBudget::new(max_changes, max_bytes);
+        let mut changes = Vec::new();
+        let outcome = crate::changes::enumerate::enumerate_commit_changes(
+            &self.table_store,
+            &parent.snapshot,
+            &child.snapshot,
+            &graph_identity,
+            commit_id,
+            scope,
+            resume.as_ref(),
+            &mut budget,
+            &mut changes,
+        )
+        .await
+        .map_err(map_gap)?;
+
+        let next_page_token = match outcome {
+            crate::changes::enumerate::CommitEnumeration::Complete => None,
+            crate::changes::enumerate::CommitEnumeration::Truncated(key) => {
+                Some(token::encode_token(&token::CommitPageTokenV1 {
+                    version: token::TOKEN_VERSION,
+                    kind: token::KIND_COMMIT_PAGE.to_string(),
+                    graph_identity: token::hashed_identity(&graph_identity),
+                    commit_id: commit_id.to_string(),
+                    filter_digest,
+                    stable_table_id: key.identity.stable_table_id,
+                    table_incarnation_id: key.identity.table_incarnation_id,
+                    id: key.id,
+                    operation_rank: key.operation_rank,
+                    change_index: key.change_index,
+                })?)
+            }
+            crate::changes::enumerate::CommitEnumeration::Exhausted { required_bytes } => {
+                // A fresh page could not admit even one change: the single
+                // change is larger than the byte ceiling. Never truncate the
+                // image or fall back to keys-only output.
+                return Err(OmniError::resource_limit(
+                    "commit_changes_page_bytes",
+                    max_bytes,
+                    required_bytes,
+                ));
+            }
+        };
+
+        Ok(crate::changes::CommitChangesPage {
+            block: crate::changes::GraphChangeBlock {
+                cause: crate::changes::ChangeCause::from(&commit),
+                changes,
+            },
+            next_page_token,
+        })
     }
 
     pub async fn entity_at_target(

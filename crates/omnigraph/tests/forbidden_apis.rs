@@ -254,6 +254,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "resolve_snapshot"),
     ("db/omnigraph.rs", "diff_between"),
     ("db/omnigraph.rs", "diff_commits"),
+    ("db/omnigraph.rs", "commit_changes_page"),
     ("db/omnigraph.rs", "entity_at_target"),
     ("db/omnigraph.rs", "entity_at"),
     ("db/omnigraph.rs", "snapshot_at_version"),
@@ -760,6 +761,11 @@ durable_calls! {
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/table_ops.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    // Commit-change enumeration: pinned parent/child handles for typed row
+    // comparison, lazy image materialization, and descriptor-tie payload
+    // reads. Read-only by construction — the enumerator stages no transaction
+    // and publishes nothing.
+    ("changes/enumerate.rs", ".dataset()", 6, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 2, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     ("db/omnigraph/optimize.rs", ".dataset()", 5, WriteProtocol::Composed("Optimize v9 planning + physical cleanup")),

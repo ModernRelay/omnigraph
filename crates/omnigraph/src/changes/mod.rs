@@ -1,3 +1,4 @@
+pub(crate) mod enumerate;
 pub mod model;
 pub(crate) mod token;
 

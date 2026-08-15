@@ -1067,6 +1067,15 @@ impl ApiError {
             OmniError::ChangeCursorRejected { reason } => {
                 Self::bad_request(format!("change cursor rejected: {reason}"))
             }
+            // Retention loss under a change continuation. The change-route
+            // slice upgrades this to a typed 410 with a structured
+            // resume-hint detail; until then it must not read as a caller
+            // fault.
+            err @ OmniError::ChangeFeedGap { .. } => Self::internal(err.to_string()),
+            // Well-formed entity-diff requests this commit cannot satisfy.
+            // The change-route slice adds the structured refusal detail.
+            err @ OmniError::CommitHasNoParent { .. } => Self::conflict(err.to_string()),
+            err @ OmniError::ChangeSchemaBoundary { .. } => Self::conflict(err.to_string()),
             OmniError::RecoveryRequired {
                 operation_id,
                 reason,
