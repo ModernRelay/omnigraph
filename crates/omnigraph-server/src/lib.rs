@@ -122,7 +122,6 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_branch_merge,
         handlers::server_commit_list,
         handlers::server_commit_show,
-        handlers::server_commit_changes,
     ),
     components(schemas(api::BlobEntityKind)),
     modifiers(&SecurityAddon),
@@ -297,13 +296,12 @@ struct OpenedGraph {
 pub struct ApiError {
     status: StatusCode,
     code: Option<ErrorCode>,
-    message: Box<str>,
+    message: String,
     merge_conflicts: Vec<api::MergeConflictOutput>,
     manifest_conflict: Option<Box<api::ManifestConflictOutput>>,
     read_set_conflict: Option<Box<api::ReadSetConflictOutput>>,
     key_conflict: Option<Box<api::KeyConflictOutput>>,
     resource_limit: Option<Box<api::ResourceLimitOutput>>,
-    change_feed_gap: Option<Box<api::ChangeFeedGapOutput>>,
     blob_range: Option<Box<api::BlobRangeOutput>>,
     external_blob_source: Option<Box<api::ExternalBlobSourceOutput>>,
     recovery_required: Option<Box<api::RecoveryRequiredOutput>>,
@@ -638,13 +636,12 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             code: Some(ErrorCode::Unauthorized),
-            message: message.into().into_boxed_str(),
+            message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -656,13 +653,12 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             code: Some(ErrorCode::Forbidden),
-            message: message.into().into_boxed_str(),
+            message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -674,13 +670,12 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: Some(ErrorCode::BadRequest),
-            message: message.into().into_boxed_str(),
+            message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -692,13 +687,12 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             code: Some(ErrorCode::NotFound),
-            message: message.into().into_boxed_str(),
+            message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -714,13 +708,12 @@ impl ApiError {
         Self {
             status: StatusCode::METHOD_NOT_ALLOWED,
             code: Some(ErrorCode::MethodNotAllowed),
-            message: message.into().into_boxed_str(),
+            message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -732,13 +725,12 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
-            message: message.into().into_boxed_str(),
+            message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -750,13 +742,12 @@ impl ApiError {
         Self {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             code: Some(ErrorCode::BadRequest),
-            message: message.into().into_boxed_str(),
+            message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -772,14 +763,12 @@ impl ApiError {
             // adding the structured wire fields below.
             message: format!(
                 "blob range [{start}, {end}) is not satisfiable for a value of length {length}"
-            )
-            .into_boxed_str(),
+            ),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: Some(Box::new(api::BlobRangeOutput { start, end, length })),
             external_blob_source: None,
             recovery_required: None,
@@ -795,13 +784,12 @@ impl ApiError {
         Self {
             status: StatusCode::PRECONDITION_FAILED,
             code: Some(ErrorCode::Conflict),
-            message: message.into().into_boxed_str(),
+            message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -813,13 +801,12 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: Some(ErrorCode::Internal),
-            message: message.into().into_boxed_str(),
+            message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -836,13 +823,12 @@ impl ApiError {
         Self {
             status: StatusCode::FAILED_DEPENDENCY,
             code: None,
-            message: message.into_boxed_str(),
+            message,
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: Some(Box::new(api::ExternalBlobSourceOutput { uri, reason })),
             recovery_required: None,
@@ -858,13 +844,12 @@ impl ApiError {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             code: Some(ErrorCode::TooManyRequests),
-            message: message.into().into_boxed_str(),
+            message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -887,13 +872,12 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
-            message: summarize_merge_conflicts(&conflicts).into_boxed_str(),
+            message: summarize_merge_conflicts(&conflicts),
             merge_conflicts: conflicts,
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -905,13 +889,12 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
-            message: message.into_boxed_str(),
+            message,
             merge_conflicts: Vec::new(),
             manifest_conflict: Some(Box::new(details)),
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -923,13 +906,12 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
-            message: message.into_boxed_str(),
+            message,
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: Some(Box::new(details)),
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -941,13 +923,12 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
-            message: message.into_boxed_str(),
+            message,
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: Some(Box::new(details)),
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -959,35 +940,12 @@ impl ApiError {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             code: Some(ErrorCode::BadRequest),
-            message: message.into_boxed_str(),
+            message,
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: Some(Box::new(details)),
-            change_feed_gap: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-        }
-    }
-
-    fn change_feed_gap(cursor: Option<String>, first_unreadable_commit_id: String) -> Self {
-        Self {
-            status: StatusCode::GONE,
-            code: None,
-            message: format!("change feed gap at commit \"{first_unreadable_commit_id}\"")
-                .into_boxed_str(),
-            merge_conflicts: Vec::new(),
-            manifest_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            change_feed_gap: Some(Box::new(api::ChangeFeedGapOutput {
-                cursor,
-                first_unreadable_commit_id,
-            })),
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -1002,13 +960,12 @@ impl ApiError {
             // `recovery_required` field carries the new meaning while older
             // clients continue to deserialize the otherwise familiar body.
             code: None,
-            message: message.into_boxed_str(),
+            message,
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: Some(Box::new(api::RecoveryRequiredOutput { operation_id })),
@@ -1024,13 +981,12 @@ impl ApiError {
         Self {
             status: StatusCode::PRECONDITION_FAILED,
             code: None,
-            message: message.into_boxed_str(),
+            message,
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
-            change_feed_gap: None,
             blob_range: None,
             external_blob_source: None,
             recovery_required: None,
@@ -1099,16 +1055,6 @@ impl ApiError {
                     actual,
                 },
             ),
-            OmniError::HistoricalVersionReclaimed { version } => {
-                Self::internal(format!("historical table version {version} was reclaimed"))
-            }
-            OmniError::ChangeFeedGap {
-                cursor,
-                first_unreadable_commit_id,
-            } => Self::change_feed_gap(cursor, first_unreadable_commit_id),
-            OmniError::ChangeCursorRejected { reason } => {
-                Self::bad_request(format!("change cursor rejected: {reason}"))
-            }
             OmniError::RecoveryRequired {
                 operation_id,
                 reason,
@@ -1199,14 +1145,13 @@ impl IntoResponse for ApiError {
             self.status,
             headers,
             Json(ErrorOutput {
-                error: self.message.into(),
+                error: self.message,
                 code: self.code,
                 merge_conflicts: self.merge_conflicts,
                 manifest_conflict: self.manifest_conflict.map(|d| *d),
                 read_set_conflict: self.read_set_conflict.map(|d| *d),
                 key_conflict: self.key_conflict.map(|d| *d),
                 resource_limit: self.resource_limit.map(|d| *d),
-                change_feed_gap: self.change_feed_gap.map(|d| *d),
                 blob_range: self.blob_range.map(|d| *d),
                 external_blob_source: self.external_blob_source.map(|d| *d),
                 recovery_required: self.recovery_required.map(|d| *d),
@@ -1220,25 +1165,6 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod api_error_tests {
     use super::*;
-
-    #[tokio::test]
-    async fn change_feed_gap_is_typed_410() {
-        let response = ApiError::from_omni(OmniError::ChangeFeedGap {
-            cursor: Some("resume".to_string()),
-            first_unreadable_commit_id: "01GAP".to_string(),
-        })
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::GONE);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error.code, None);
-        let gap = error.change_feed_gap.unwrap();
-        assert_eq!(gap.cursor.as_deref(), Some("resume"));
-        assert_eq!(gap.first_unreadable_commit_id, "01GAP");
-    }
 
     #[tokio::test]
     async fn recovery_required_503_omits_closed_error_code() {
@@ -1598,7 +1524,6 @@ pub fn build_app(state: AppState) -> Router {
         .route("/branches/merge", post(server_branch_merge))
         .route("/commits", get(server_commit_list))
         .route("/commits/{commit_id}", get(server_commit_show))
-        .route("/commits/{commit_id}/changes", get(server_commit_changes))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             resolve_graph_handle,

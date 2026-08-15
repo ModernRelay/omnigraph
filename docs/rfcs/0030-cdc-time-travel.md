@@ -14,10 +14,6 @@ owner: OmniGraph maintainers
 
 **Date:** 2026-08-05
 
-**Amended:** 2026-08-14 — the adjacent per-commit page surface (phase C1a
-below) shipped; decision 4 was amended, decision 12 added, and the
-§2/§3.1/§6/§9 text updated to record its contract.
-
 **Author track:** Maintainer design series
 
 **Depends on:** RFC-013 Phase 7 graph lineage, RFC-022 snapshot capture and
@@ -134,18 +130,13 @@ The required durable authority already exists:
 Two current names must not be allowed to overstate their meaning:
 
 - `GraphCommit.created_at` is minted before table effects and remains fixed
-  across retries and recovery. Public change surfaces reuse the persisted
-  **`created_at`** name — one name for one persisted value across `commit
-  list`, `commit show`, and change pages — and document it as authorship
-  time. Labeling it `committed_at` or `published_at` remains forbidden, and
-  renaming the persisted column is unnecessary and would create a format
-  change. (Amended: the original draft required an `authored_at` rename on
-  the wire; the shipped C1a surface resolved this the other way.)
+  across retries and recovery. Public CDC calls it **`authored_at`**, not
+  `committed_at` or `published_at`. Renaming the persisted column is unnecessary
+  and would create a format change.
 - `EntityChange.manifest_version` currently mixes table-local row-version
-  stamps with a graph-manifest fallback. Public change surfaces do not carry
-  this field forward: the shipped per-commit page DTO omits it. Commit cause
-  belongs on the block; physical table versions remain implementation
-  details.
+  stamps with a graph-manifest fallback. A graph feed does not carry this field
+  forward. Commit cause belongs on the block; physical table versions remain
+  implementation details.
 
 ## 3. Public semantic model
 
@@ -162,7 +153,7 @@ GraphChangeBlock {
     authored_branch,
     graph_snapshot_version,
     actor_id?,
-    created_at   // authorship time; see §2 and decision 4
+    authored_at
   },
   part,
   commit_complete,
@@ -200,13 +191,6 @@ A physical-only graph commit such as compaction produces an empty block. The
 cursor still advances over it. A pure type rename also produces no row changes;
 future changes use the destination name because immutable identity, not alias,
 pairs the table lifetime.
-
-A parentless commit is likewise an empty block by definition. Today the only
-parentless commit is the empty genesis a fresh graph mints at init — every
-data-bearing commit is parented by the publisher — so this is equivalent to
-diffing against the empty store. If a future storage change ever lets a
-parentless commit carry table changes, `Beginning`-mode replay (§5.1) must
-revisit this definition before shipping, not inherit it silently.
 
 ### 3.2 Branch and merge order
 
@@ -459,14 +443,6 @@ versions. Failures are translated into graph-level typed outcomes:
 The public error names graph concepts. Exact physical paths and table versions
 may appear in operator diagnostics/logs, not in the public CDC contract.
 
-The shipped per-commit page surface (C1a) reuses `ChangeFeedGap` for an
-unreadable participant of one commit's transition — HTTP 410 with the
-structured cursor and first-unreadable-commit fields — rather than minting a
-separate single-commit error name. Cursor decode and scope failures are not
-gaps: they surface as typed 400 rejections (`change cursor rejected: …`),
-which is the realization of §3.3's `CursorScopeMismatch` without extending the
-status-class wire enum.
-
 The recovery action is §5.2's exact baseline handshake, not a suggested commit
 ID that can race before export. Computing the oldest contiguous resumable suffix
 requires walking and validating real participant pins; if a later
@@ -621,18 +597,6 @@ that this RFC adds no O(history log history) binary-lifting state to normal
 open, refresh, or existing adjacent `diff_commits`, and that every non-flat
 term is documented before its public surface ships.
 
-C1a shipped with `changes_cost.rs` on the shared cost harness. Its bounded
-pins: dataset opens per page stay at two per changed interval with untouched
-tables contributing zero, manifest reads stay flat at equal commit depth, and
-Blob payload work tracks emitted changes rather than scanned rows (equality
-short-circuits on descriptor identity; only a descriptor tie pays a payload
-byte-compare, so compaction cannot surface phantom updates). Its honest
-non-flat pin: the exact ordered-merge fallback's data-read term grows with the
-changed table's physical extent at fixed delta — the documented cost of
-shipping the §4.3 authority path without §4.2 candidate pruning. The pruning
-slice must flip that tripwire to a flat assertion, and the multi-commit feed
-still requires the full curve set above before C2.
-
 ## 10. Explicit exclusions and future work
 
 ### 10.1 Graph-schema replay
@@ -691,7 +655,6 @@ must return to this RFC's format audit before landing.
 | Phase | Ships | Safe stop |
 |---|---|---|
 | C0 — foundation correction | Identity-keyed table intervals with deterministic graph-visible table ordering; O(1) adjacent first-parent validation; Lance surface guards; remove speculative binary lifting | No new public API or persisted state; existing diff table traversal becomes deterministic |
-| C1a — adjacent per-commit surface (**shipped**) | Engine `commit_changes_page`, HTTP `GET /graphs/{id}/commits/{commit_id}/changes`, CLI `commit changes`: exact before/after images, the §4.4 order with frozen operation ranks, an opaque within-commit cursor, row/byte ceilings, typed `ChangeFeedGap` and cursor rejections, `changes_cost.rs` bounds. Uses the exact §4.3 comparison for every changed lifetime — no §4.2 candidate pruning and no transaction no-delete proof yet | Caller-owned per-commit pages pair with write receipts; the multi-commit cursor feed remains C1/C2 |
 | C1 — engine feed | Internal graph commit blocks with exact logical images, exact-end insert/update adapter, complete delete fallback, bounded page/cursor engine, typed gaps | Engine-only contract can be exercised before wire commitment |
 | C2 — graph surfaces | SDK, exact snapshot+cursor baseline, `omnigraph changes`, HTTP/OpenAPI, docs, authorization and parity tests | Useful caller-owned entity feed; compatible schema is established out of band |
 | C3 — entity history | Newest-first history derived from the same per-commit enumerator, with a separately versioned `history/backward` cursor | Investigation surface; no new storage authority |
@@ -708,10 +671,7 @@ whose cost is justified by C1.
 1. Public unit: graph commit block, not table/dataset delta.
 2. Merge default: first parent only.
 3. Cause placement: once per block.
-4. Commit time field in v1: the persisted `created_at` name is reused across
-   commit surfaces and documented as authorship time; no false `committed_at`
-   or `published_at` label ships. (Amended from the original `authored_at`
-   rename — one name for one persisted value across surfaces.)
+4. Commit time field in v1: `authored_at`; no false `committed_at` label.
 5. Cursor: opaque, caller-owned, graph/branch/filter/purpose/direction bound,
    fixed-cut paging.
 6. Delete authority: exact begin/end logical-ID comparison; transaction history
@@ -725,7 +685,3 @@ whose cost is justified by C1.
     together; a bare head ID is not a safe bootstrap.
 11. Format: no bump for the entity feed; revisit before persisting any new
     history authority.
-12. Per-commit pages (C1a): the entity wire record carries no
-    `manifest_version` — cause is stated once on the block; a parentless
-    commit (the empty genesis) is an empty block; retention failures reuse
-    `ChangeFeedGap` and cursor scope failures are typed 400 rejections.

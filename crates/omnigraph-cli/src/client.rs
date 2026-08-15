@@ -30,11 +30,10 @@ use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent};
 use omnigraph_api_types::{
     BlobReadQuery, BlobStatOutput, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput,
     BranchListOutput, BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest,
-    CommitChangesOutput, CommitListOutput, CommitOutput, ErrorOutput, ExportRequest,
-    GraphBatchLoadOutput, GraphListResponse, IngestOutput, IngestRequest, InvokeStoredQueryRequest,
-    QueryRequest, ReadOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
-    commit_changes_output, commit_output, ingest_receipt_output, read_output, schema_apply_output,
-    snapshot_payload,
+    CommitListOutput, CommitOutput, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
+    GraphListResponse, IngestOutput, IngestRequest, InvokeStoredQueryRequest, QueryRequest,
+    ReadOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
+    ingest_receipt_output, read_output, schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::header::{CONTENT_RANGE, RANGE};
@@ -424,45 +423,6 @@ impl GraphClient {
             GraphClient::Embedded { uri, .. } => {
                 let db = Omnigraph::open(uri).await?;
                 Ok(commit_output(&db.get_commit(commit_id).await?))
-            }
-        }
-    }
-
-    pub(crate) async fn commit_changes(
-        &self,
-        commit_id: &str,
-        cursor: Option<&str>,
-        limit: usize,
-        max_bytes: u64,
-    ) -> Result<CommitChangesOutput> {
-        match self {
-            GraphClient::Remote {
-                http,
-                base_url,
-                token,
-            } => {
-                let limit = limit.to_string();
-                let max_bytes = max_bytes.to_string();
-                let mut query = vec![("limit", limit.as_str()), ("max_bytes", max_bytes.as_str())];
-                if let Some(cursor) = cursor {
-                    query.push(("cursor", cursor));
-                }
-                remote_json(
-                    http,
-                    Method::GET,
-                    remote_url(base_url, &["commits", commit_id, "changes"], &query)?,
-                    None,
-                    token.as_deref(),
-                )
-                .await
-            }
-            GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open(uri).await?;
-                let commit = db.get_commit(commit_id).await?;
-                let page = db
-                    .commit_changes_page(commit_id, cursor, limit, max_bytes)
-                    .await?;
-                Ok(commit_changes_output(&commit, &page))
             }
         }
     }

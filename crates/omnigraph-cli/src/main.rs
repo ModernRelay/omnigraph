@@ -5,9 +5,8 @@ use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
-    BlobContentKindOutput, BlobStatOutput, ChangeOpOutput, ChangeOutput, CommitChangesOutput,
-    CommitOutput, ErrorOutput, GraphBatchLoadOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
-    SnapshotTableOutput,
+    BlobContentKindOutput, BlobStatOutput, ChangeOutput, CommitOutput, ErrorOutput,
+    GraphBatchLoadOutput, IngestOutput, ReadOutput, SchemaApplyOutput, SnapshotTableOutput,
 };
 use omnigraph_cluster::{
     ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput,
@@ -488,37 +487,6 @@ async fn main() -> Result<()> {
                     print_json(&commit)?;
                 } else {
                     print_commit_human(&commit);
-                }
-            }
-            CommitCommand::Changes {
-                uri,
-                commit_id,
-                cursor,
-                limit,
-                max_bytes,
-                json,
-            } => {
-                let client = client::GraphClient::resolve(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let output = client
-                    .commit_changes(
-                        &commit_id,
-                        cursor.as_deref(),
-                        limit.unwrap_or(omnigraph::changes::COMMIT_CHANGES_DEFAULT_ROWS),
-                        max_bytes.unwrap_or(omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES),
-                    )
-                    .await?;
-                if json {
-                    print_json(&output)?;
-                } else {
-                    print_commit_changes_human(&output);
                 }
             }
         },

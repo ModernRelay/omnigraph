@@ -322,65 +322,6 @@ pub struct CommitOutput {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum EntityKindOutput {
-    Node,
-    Edge,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ChangeOpOutput {
-    Insert,
-    Update,
-    Delete,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct EndpointsOutput {
-    pub src: String,
-    pub dst: String,
-}
-
-/// One entity change inside a commit page. Cause (commit, actor, branch,
-/// snapshot version) is stated once on the enclosing `CommitChangesOutput`
-/// block, never copied per entity; physical table versions stay internal.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct EntityChangeOutput {
-    pub change_index: usize,
-    pub table_key: String,
-    pub kind: EntityKindOutput,
-    pub type_name: String,
-    pub id: String,
-    pub op: ChangeOpOutput,
-    pub endpoints: Option<EndpointsOutput>,
-    /// Exact logical image before a delete; user-schema keys stay verbatim.
-    pub before: Option<Value>,
-    /// Exact logical image after an insert/update; user-schema keys stay verbatim.
-    pub after: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CommitChangesOutput {
-    pub commit: CommitOutput,
-    pub changes: Vec<EntityChangeOutput>,
-    pub next_cursor: Option<String>,
-    pub commit_complete: bool,
-}
-
-#[derive(Debug, Clone, Deserialize, IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct CommitChangesQuery {
-    /// Opaque continuation returned by the preceding page.
-    pub cursor: Option<String>,
-    /// Maximum changes returned. Defaults to 1000; maximum 8192.
-    pub limit: Option<usize>,
-    /// Maximum serialized change bytes retained by the page. Defaults to 4 MiB;
-    /// maximum 32 MiB.
-    pub max_bytes: Option<u64>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CommitListOutput {
     pub commits: Vec<CommitOutput>,
@@ -896,13 +837,6 @@ pub struct ResourceLimitOutput {
     pub actual: u64,
 }
 
-/// A requested commit-change continuation can no longer be reconstructed.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ChangeFeedGapOutput {
-    pub cursor: Option<String>,
-    pub first_unreadable_commit_id: String,
-}
-
 /// Normalized half-open range details for an unsatisfiable managed Blob read.
 ///
 /// HTTP also returns `Content-Range: bytes */N`; these fields let SDKs inspect
@@ -967,9 +901,6 @@ pub struct ErrorOutput {
     /// rejected attempt has no durable sidecar and no table effect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limit: Option<ResourceLimitOutput>,
-    /// Set with HTTP 410 when retained table history cannot reconstruct the page.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub change_feed_gap: Option<ChangeFeedGapOutput>,
     /// Set with HTTP 416 for a valid but unsatisfiable managed Blob byte range.
     /// `start..end` is half-open and `length` is the selected Blob length.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1036,42 +967,6 @@ pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
         merged_parent_commit_id: commit.merged_parent_commit_id.clone(),
         actor_id: commit.actor_id.clone(),
         created_at: commit.created_at,
-    }
-}
-
-pub fn commit_changes_output(
-    commit: &GraphCommit,
-    page: &omnigraph::changes::CommitChangesPage,
-) -> CommitChangesOutput {
-    CommitChangesOutput {
-        commit: commit_output(commit),
-        changes: page
-            .changes
-            .iter()
-            .map(|change| EntityChangeOutput {
-                change_index: change.change_index,
-                table_key: change.table_key.clone(),
-                kind: match change.kind {
-                    omnigraph::changes::EntityKind::Node => EntityKindOutput::Node,
-                    omnigraph::changes::EntityKind::Edge => EntityKindOutput::Edge,
-                },
-                type_name: change.type_name.clone(),
-                id: change.id.clone(),
-                op: match change.op {
-                    omnigraph::changes::ChangeOp::Insert => ChangeOpOutput::Insert,
-                    omnigraph::changes::ChangeOp::Update => ChangeOpOutput::Update,
-                    omnigraph::changes::ChangeOp::Delete => ChangeOpOutput::Delete,
-                },
-                endpoints: change.endpoints.as_ref().map(|endpoints| EndpointsOutput {
-                    src: endpoints.src.clone(),
-                    dst: endpoints.dst.clone(),
-                }),
-                before: change.before.clone(),
-                after: change.after.clone(),
-            })
-            .collect(),
-        next_cursor: page.next_cursor.clone(),
-        commit_complete: page.commit_complete,
     }
 }
 
