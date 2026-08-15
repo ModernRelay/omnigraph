@@ -252,9 +252,10 @@ Notes:
 
 ## Contributing
 
-Please open an issue, spec, or design discussion before sending large code
-changes. Design feedback and concrete problem statements are the fastest way to
-collaborate on the roadmap.
+Please open an issue before sending large code changes — a maintainer triages
+it, and the `accepted` label is the green light for a PR (see
+[GOVERNANCE.md](GOVERNANCE.md)). Concrete problem statements are the fastest
+way to collaborate on the roadmap.
 
 ## Community
 
